@@ -16,6 +16,7 @@ import { locales } from "./config";
 import { getChrome } from "./dictionaries";
 import { navLinks } from "./links";
 import { isDocsPath, replacePathLocale } from "./path";
+import { siteCss } from "../site-css";
 
 const webRoot = new URL("../../", import.meta.url);
 
@@ -35,7 +36,7 @@ function advance(text: string, fontRem: number): number {
 }
 
 describe("localized chrome keeps a clickable home control", () => {
-  const css = webText("app/globals.css");
+  const css = siteCss();
   const theme = webText("components/theme-toggle.tsx");
 
   it("keeps the wordmark and locale switcher from shrinking to zero", () => {
@@ -76,7 +77,7 @@ describe("localized chrome keeps a clickable home control", () => {
     }
   });
 
-  it("fits the compact docs strip inside a 375px viewport", () => {
+  it("fits the compact nav strip inside a 375px viewport", () => {
     // --container is min(100% - 2rem, 76rem) → 343px at 375. Below 520px the
     // strip is wordmark + [theme, select, menu]: the desktop nav is
     // display:none, the wordmark tag and install CTA are hidden, and the
@@ -91,8 +92,8 @@ describe("localized chrome keeps a clickable home control", () => {
     const menuToggle = 2.25 * 16;
     const actions = themeToggle + actionGap + select + actionGap + menuToggle;
 
-    // At the width its own content asks for, the row does not fit. Docs
-    // routes are the tight case because only they carry the theme control.
+    // At the width its own content asks for, the row does not fit. Every
+    // page carries the theme control, so every page is the tight case.
     expect(9.75 * 16 + innerGap + actions).toBeGreaterThan(container);
 
     // It fits because the wordmark gives space back down to its floor. With
@@ -105,12 +106,12 @@ describe("localized chrome keeps a clickable home control", () => {
     );
   });
 
-  it("keeps locale-switch and docs-theme activation on the shared path helpers", () => {
+  it("keeps locale switching on the shared path helpers and the theme control on every page", () => {
     expect(replacePathLocale("/pt-BR/docs/guide", "ja")).toBe("/ja/docs/guide");
     expect(replacePathLocale("/de", "zh")).toBe("/zh");
     expect(isDocsPath("/pt-BR/docs/guide")).toBe(true);
     expect(isDocsPath("/id/install")).toBe(false);
     expect(webText("components/locale-switcher.tsx")).toContain("replacePathLocale");
-    expect(theme).toContain("isDocsPath(pathname)");
+    expect(theme).not.toContain("isDocsPath");
   });
 });

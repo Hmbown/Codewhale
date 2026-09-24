@@ -197,7 +197,7 @@ export function create({ exec }) {
   // successful capture a timer keeps refreshing it, so the person watches the
   // app instead of a frozen still. CODEWHALE_CU_PREVIEW_REFRESH_MS=0 disables
   // the loop (tests, headless); the floor keeps a hostile value tolerable.
-  const state = { activeDisplay: 1, lastRaster: null, inputApp: null, foregroundInput: false, previewEnabled: true, pointer: null, pointerLease: null };
+  const state = { activeDisplay: 1, lastRaster: null, inputApp: null, foregroundInput: false, previewEnabled: true, pointer: null, heldDrag: null };
   // Shared-surface politeness: front leases, real-pointer gestures,
   // foreground keys and activations wait for a gap in the user's hardware
   // input rather than interleave with their typing. The helper reads the
@@ -264,7 +264,7 @@ export function create({ exec }) {
   async function native(tool, args = {}) {
     // Window-addressed events still borrow keyboard focus. Block before even
     // starting an older installed helper, including the app-scoped fallback.
-    if (["bg_pointer", "bg_key"].includes(tool) || (tool === "pointer_sequence" && args.app_scoped)) requireFocusControl();
+    if (["bg_pointer", "bg_key"].includes(tool)) requireFocusControl();
     // Every resolved target (element center or screen point) is where the
     // action lands; tracking it here means the preview cursor follows element
     // actions, not just raw pointer events.
@@ -277,7 +277,6 @@ export function create({ exec }) {
       const last = [...(args.steps ?? [])].reverse().find((s) => Number.isFinite(s?.x) && Number.isFinite(s?.y));
       if (last) state.pointer = { x: last.x, y: last.y };
     }
-    if (tool === "pointer_sequence" && !args.app_scoped) requireSharedPointer();
     const helper = await nativeHelper();
     const r = await runL(helper, [JSON.stringify({ tool, args: { ...args, ...yieldArgs, input_app_ref: state.inputApp, foreground_input: state.foregroundInput, owner_pipe: true } })], { timeoutMs: 20_000, ownerPipe: true });
     if (r.aborted || r.timedOut || r.code !== 0) {
@@ -286,7 +285,7 @@ export function create({ exec }) {
       else error.code = nativeErrorCode(error.message) ?? undefined;
       // A deterministic native refusal sent no input. A killed/timed-out
       // helper may have posted the press before losing its response.
-      const postsPress = (tool === "key_event" && args.down) || ["type", "perform_action", "click_element", "scroll_element", "set_value", "focus_element", "select_text", "bg_pointer", "bg_key"].includes(tool) || (tool === "hit_test" && args.perform) || (tool === "pointer_sequence" && args.steps?.some((step) => [1, 3, 25].includes(step.type)));
+      const postsPress = (tool === "key_event" && args.down) || ["type", "perform_action", "click_element", "scroll_element", "set_value", "focus_element", "select_text", "bg_pointer", "bg_key"].includes(tool) || (tool === "hit_test" && args.perform);
       error.inputMayHaveBeenSent = postsPress && r.spawned === true && (r.aborted || r.timedOut);
       if (error.inputMayHaveBeenSent) error.message += "; input may already have been sent — observe the target before doing anything else";
       throw error;
@@ -294,7 +293,7 @@ export function create({ exec }) {
     const result = tryJson(r.stdout, null);
     const interference = leaseVerdict(result);
     if (interference !== null) result.user_input_during_lease = interference;
-    if (state.previewEnabled && state.inputApp && ["type", "key_event", "pointer_sequence", "bg_pointer", "bg_key", "set_value", "select_text", "perform_action", "hit_test", "click_element", "scroll_element", "focus_element"].includes(tool)) {
+    if (state.previewEnabled && state.inputApp && ["type", "key_event", "bg_pointer", "bg_key", "set_value", "select_text", "perform_action", "hit_test", "click_element", "scroll_element", "focus_element"].includes(tool)) {
       try { await updatePreview(); } catch (error) { result.preview_error = error.message; }
     }
     return result;
@@ -312,7 +311,6 @@ export function create({ exec }) {
   }
 
   async function nativeLease(tool, args) {
-    if (tool === "pointer_sequence") requireSharedPointer();
     if (!exec.runInputLease) throw new ExecError("This executor cannot safely own held input; update Computer Use");
     if ((await native("input_capabilities"))?.input_lease !== 1) throw new ExecError("The native helper needs an update for disconnect-safe held input");
     const helper = await nativeHelper();
@@ -363,40 +361,24 @@ export function create({ exec }) {
 
   function buttonCode(button) { return button === "middle" ? 2 : button === "right" ? 1 : 0; }
 
-  function requireSharedPointer() {
-    if (!state.foregroundInput) throw Object.assign(new ExecError("This action needs the shared macOS pointer and was not sent in background mode. Use an accessibility action or a separate computer; foreground control requires exclusive desktop use authorized by the user."), { code: "shared_pointer_required" });
-  }
-
-  /** Refuse a global gesture whose landing point belongs to another application. */
-  async function assertOwnsPoint(x, y) {
-    if (!state.inputApp) throw new ExecError("open_application first to choose which application receives input");
-    const w = await native("window_at_point", { x, y });
-    if (!w?.found) throw new ExecError(`no window at (${x}, ${y}) — take a fresh screenshot and choose a point inside the target window`);
-    if (w.owner_pid !== state.inputApp.pid) {
-      throw new ExecError(`(${x}, ${y}) is covered by a window owned by ${w.owner_name || "another application"} (pid ${w.owner_pid}) — use an accessibility element target or a separate computer; no pointer input was sent`);
+  /**
+   * Every pointer gesture — click, hover, drag, wheel — goes to a window of the
+   * bound application as window-routed event records. The user's hardware
+   * cursor is never posted to, warped or held: there is no shared-pointer
+   * route to fall back to. Window ownership is enforced inside the helper (the
+   * records are addressed to a window id of the bound app), so a covering
+   * window cannot receive them.
+   */
+  async function windowPointer(steps, extra = {}) {
+    requireFocusControl();
+    if ((await native("input_capabilities"))?.window_record !== 1) {
+      throw Object.assign(new ExecError("Pointer input needs the window-routed pointer, which this helper cannot resolve; update Computer Use or use an accessibility action. The user's cursor is never used instead."), { code: "bg_dispatch_unavailable" });
     }
-    return w;
-  }
-
-  /** What a global gesture cost the user: their cursor, and briefly their foreground. */
-  function pointerCost(r) {
-    return {
-      pointer_moved: true,
-      pointer_restored: !!r?.restored,
-      foreground_taken: !!r?.foreground_taken,
-      ...(r?.foreground_before ? { foreground_before: r.foreground_before } : {}),
-      ...(r?.foreground_after ? { foreground_after: r.foreground_after } : {}),
-      ...(Number.isFinite(r?.yield_ms) && r.yield_ms > 0 ? { yield_ms: r.yield_ms } : {}),
-    };
-  }
-
-  async function gesture(steps, { restore = true, guard = null } = {}) {
-    requireSharedPointer();
-    if (guard) await assertOwnsPoint(guard.x, guard.y);
-    const r = await native("pointer_sequence", { steps, restore });
-    const last = [...steps].reverse().find((s) => s.x != null);
-    if (last) state.pointer = { x: last.x, y: last.y };
-    return r;
+    const r = await native("bg_pointer", { steps, ...extra });
+    return { action_sent: true, strategy: "window-record", input_scope: "application-window", pointer_moved: false,
+             front_lease: r.front_lease === true, window: r.window ?? null, ...leaseAccounting(r),
+             ...(typeof r.front_restored === "boolean" ? { front_restored: r.front_restored } : {}),
+             ...(r.menu_lease_held ? { menu_lease_held: true } : {}) };
   }
 
   function clickSteps(button, x, y, clicks) {
@@ -430,44 +412,16 @@ export function create({ exec }) {
       }
       a11yReason = hit?.reason ?? "not_found";
       if (strategy === "a11y") {
-        throw new ExecError(`no supported accessibility click at (${x}, ${y}) in the bound application (${a11yReason}) — observe the available actions, use strategy "app" for a window-scoped pointer click, or a separate computer`);
+        throw new ExecError(`no supported accessibility click at (${x}, ${y}) in the bound application (${a11yReason}) — observe the available actions, use strategy "app" for a window-routed pointer click, or a separate computer`);
       }
     } else if (strategy === "a11y") {
       throw new ExecError(`strategy "a11y" is only available for a left single click on this backend; ${mouseName(button)} x${clicks} has no accessibility equivalent`);
     }
-    if (strategy === "app" || (strategy === "auto" && !state.foregroundInput)) {
-      // Window-routed record delivery: AppKit accepts the events as genuine
-      // input, the cursor never moves. A momentary no-raise front lease is
-      // taken and restored inside the helper; it is reported, not hidden.
-      if ((await native("input_capabilities"))?.window_record === 1) {
-        // Ownership is enforced by window containment inside the helper: the
-        // events are addressed to a window id of the bound app, so a covered
-        // background window is still safe — they cannot land on the coverer.
-        const r = await native("bg_pointer", { steps: clickSteps(button, x, y, clicks),
-          ...(a11yReason === "web_popup_requires_real_click" ? { menu_poll_ms: 6000 } : {}) });
-        return { action_sent: true, strategy: "window-record", input_scope: "application-window",
-                 at: { x, y }, button, clicks, pointer_moved: false, front_lease: r.front_lease ?? true,
-                 ...leaseAccounting(r),
-                 ...(r.menu_lease_held ? { menu_lease_held: true } : {}),
-                 window: r.window ?? null,
-                 ...(a11yReason ? { a11y_reason: a11yReason } : {}) };
-      }
-      if (strategy !== "app") {
-        // auto in background still fails closed for raw pointer; app is the
-        // explicit missing middle.
-        requireSharedPointer();
-      }
-      const owner = await assertOwnsPoint(x, y);
-      const r = await native("pointer_sequence", { steps: clickSteps(button, x, y, clicks), restore: true, app_scoped: true });
-      const last = { x, y };
-      state.pointer = last;
-      return { action_sent: true, strategy: "app-pointer", input_scope: "application-window",
-               at: last, button, clicks, window: { id: owner.window_id, owner_pid: owner.owner_pid },
-               ...pointerCost(r), ...(a11yReason ? { a11y_reason: a11yReason } : {}) };
-    }
-    const r = await gesture(clickSteps(button, x, y, clicks), { restore: true, guard: { x, y } });
-    return { action_sent: true, strategy: "event", at: { x, y }, button, clicks, ...pointerCost(r),
-             ...(a11yReason ? { a11y_reason: a11yReason } : {}) };
+    // Whatever the strategy, a raw click is a window-routed record: "app" and
+    // "event" only choose whether the accessibility hit-test runs first.
+    const r = await windowPointer(clickSteps(button, x, y, clicks),
+      a11yReason === "web_popup_requires_real_click" ? { menu_poll_ms: 6000 } : {});
+    return { ...r, at: { x, y }, button, clicks, ...(a11yReason ? { a11y_reason: a11yReason } : {}) };
   }
 
   async function withPressedKey(code, flags, action) {
@@ -761,9 +715,11 @@ export function create({ exec }) {
 
   async function openApplication({ name, bundle_id: bid, pid, url: urlArg, activate = false } = {}) {
     if (!name && !bid && !pid) throw new ExecError("open_application needs name, bundle_id or pid");
-    // Failed selection must not leave an earlier app armed for shared input.
+    // Failed selection must not leave an earlier app armed for foreground
+    // input, nor a buffered drag aimed at the previous binding.
     state.foregroundInput = false;
     state.inputApp = null;
+    state.heldDrag = null;
     // pid is the most specific identity and the only one that separates two
     // processes of the same bundle (e.g. a second Chrome on its own profile),
     // so it wins when given.
@@ -811,7 +767,7 @@ export function create({ exec }) {
       previewBusy = true;
       updatePreview(true).catch(() => {}).finally(() => { previewBusy = false; });
     }
-    return { launched, activate, keyboard_delivery: activate ? "foreground-guarded" : "process", input_scope: activate ? "shared-desktop" : "application", shared_pointer: !!activate, isolated_desktop: false, url: urlArg ?? null, resolved: p?.found ? { name: p.name, pid: p.pid, bundle_id: p.bundle_id, frontmost: p.frontmost } : null,
+    return { launched, activate, keyboard_delivery: activate ? "foreground-guarded" : "process", input_scope: activate ? "shared-desktop" : "application", shared_pointer: false, pointer_route: "window-record", isolated_desktop: false, url: urlArg ?? null, resolved: p?.found ? { name: p.name, pid: p.pid, bundle_id: p.bundle_id, frontmost: p.frontmost } : null,
       ...(Number.isFinite(p?.yield_ms) && p.yield_ms > 0 ? { yield_ms: p.yield_ms } : {}) };
   }
 
@@ -1025,43 +981,55 @@ export function create({ exec }) {
       return native("click_element", { target, context: true });
     },
     middle_click: ({ target } = {}) => pointerClick("middle", target?.x, target?.y, 1),
+    // Hover moves only the Codewhale pointer: a mouse-moved record to the
+    // window under it. While a button is held the point joins the drag path,
+    // and the whole drag is delivered to the window on left_mouse_up.
     mouse_move: async ({ target } = {}) => {
       assertInScreen(target?.x, target?.y);
-      requireSharedPointer();
-      if (state.pointerLease) {
-        try {
-          const r = await state.pointerLease.send({ point: target });
-          state.pointer = { x: target.x, y: target.y };
-          return { action_sent: true, strategy: "event", at: state.pointer, ...pointerCost(r) };
-        } catch (error) { state.pointerLease = null; throw error; }
+      if (state.heldDrag) {
+        if (state.heldDrag.path.length >= 64) throw new ExecError("a held drag takes at most 64 intermediate points; release it with left_mouse_up");
+        state.heldDrag.path.push({ x: target.x, y: target.y });
+        state.pointer = { x: target.x, y: target.y };
+        return { action_sent: false, deferred: true, strategy: "window-record", at: state.pointer, pointer_moved: false,
+                 note: "the button is held on the Codewhale pointer; the drag reaches the window on left_mouse_up" };
       }
-      // A hover has to leave the pointer where it was asked to go.
-      const r = await gesture([{ type: MOUSE_MOVED, x: target.x, y: target.y, button: 0, clickState: 0 }], { restore: false, guard: target });
-      return { action_sent: true, strategy: "event", at: { x: target.x, y: target.y }, ...pointerCost(r) };
+      const r = await windowPointer([{ type: MOUSE_MOVED, x: target.x, y: target.y, button: 0, clickState: 0 }]);
+      return { ...r, at: { x: target.x, y: target.y } };
     },
     left_mouse_down: async ({ target } = {}) => {
       assertInScreen(target?.x, target?.y);
-      requireSharedPointer();
-      if (state.pointerLease) throw new ExecError("this session already holds the left pointer button; release it first");
-      await assertOwnsPoint(target.x, target.y);
-      state.pointerLease = await nativeLease("pointer_sequence", { steps: [
-          { type: MOUSE_MOVED, x: target.x, y: target.y, button: 0, clickState: 0 },
-          { type: MOUSE.left.down, x: target.x, y: target.y, button: 0, clickState: 1 },
-        ], restore: false });
+      requireFocusControl();
+      if (state.heldDrag) throw new ExecError("this session already holds the left pointer button; release it first");
+      if ((await native("input_capabilities"))?.window_record !== 1) {
+        throw Object.assign(new ExecError("Pointer input needs the window-routed pointer, which this helper cannot resolve; update Computer Use. The user's cursor is never used instead."), { code: "bg_dispatch_unavailable" });
+      }
+      state.heldDrag = { from: { x: target.x, y: target.y }, path: [], app: state.inputApp };
       state.pointer = { x: target.x, y: target.y };
-      return { action_sent: true, strategy: "event", at: state.pointer, ...pointerCost(state.pointerLease.receipt) };
+      return { action_sent: false, deferred: true, strategy: "window-record", at: state.pointer, pointer_moved: false,
+               note: "the button is held on the Codewhale pointer; the press reaches the window with the rest of the drag on left_mouse_up" };
     },
     left_mouse_up: async ({ target } = {}) => {
-      if (!state.pointerLease) throw new ExecError("no agent pointer button is held by this session");
-      const loc = target ?? state.pointer;
-      if (!loc) throw new ExecError("no agent pointer position — mouse_move or left_mouse_down first");
+      const held = state.heldDrag;
+      if (!held) throw new ExecError("no agent pointer button is held by this session");
+      state.heldDrag = null;
+      const loc = target ?? state.pointer ?? held.from;
       assertInScreen(loc.x, loc.y);
-      // No ownership guard: the button is already held, and the drag may have
-      // legitimately left the originating window.
-      try { await withSignal(null, () => state.pointerLease.release({ point: loc })); }
-      finally { state.pointerLease = null; }
+      if (held.app?.pid !== state.inputApp?.pid) throw new ExecError("the bound application changed while the button was held; nothing was sent");
+      const { from } = held;
+      const steps = [
+        { type: MOUSE_MOVED, x: from.x, y: from.y, button: 0, clickState: 0 },
+        { type: MOUSE.left.down, x: from.x, y: from.y, button: 0, clickState: 1, delayMs: 60 },
+      ];
+      let last = from;
+      for (const p of [...held.path, loc]) {
+        const n = Math.max(1, Math.min(12, Math.ceil(Math.hypot(p.x - last.x, p.y - last.y) / 20)));
+        for (let i = 1; i <= n; i++) steps.push({ type: MOUSE.left.dragged, x: last.x + ((p.x - last.x) * i) / n, y: last.y + ((p.y - last.y) * i) / n, button: 0, clickState: 1, delayMs: 30 });
+        last = p;
+      }
+      steps.push({ type: MOUSE.left.up, x: loc.x, y: loc.y, button: 0, clickState: 1, delayMs: 80 });
+      const r = await windowPointer(steps);
       state.pointer = { x: loc.x, y: loc.y };
-      return { action_sent: true, strategy: "event", at: state.pointer, pointer_moved: true, pointer_restored: false };
+      return { ...r, from, to: state.pointer, at: state.pointer };
     },
     left_click_drag: async ({ from_target: from, to } = {}) => {
       assertInScreen(from?.x, from?.y); assertInScreen(to?.x, to?.y);
@@ -1074,15 +1042,7 @@ export function create({ exec }) {
         steps.push({ type: MOUSE.left.dragged, x: from.x + ((to.x - from.x) * i) / n, y: from.y + ((to.y - from.y) * i) / n, button: 0, clickState: 1, delayMs: 45 });
       }
       steps.push({ type: MOUSE.left.up, x: to.x, y: to.y, button: 0, clickState: 1, delayMs: 80 });
-      if (!state.foregroundInput && (await native("input_capabilities"))?.window_record === 1) {
-        const r = await native("bg_pointer", { steps });
-        return { action_sent: true, strategy: "window-record", input_scope: "application-window",
-                 from, to, pointer_moved: false, front_lease: r.front_lease === true, window: r.window ?? null,
-                 ...leaseAccounting(r),
-                 ...(typeof r.front_restored === "boolean" ? { front_restored: r.front_restored } : {}) };
-      }
-      const r = await gesture(steps, { restore: true, guard: from });
-      return { action_sent: true, strategy: "event", from, to, ...pointerCost(r) };
+      return { ...(await windowPointer(steps)), from, to };
     },
     scroll: async ({ target, direction = "down", amount = 5 } = {}) => {
       assertInScreen(target?.x, target?.y);
@@ -1095,34 +1055,18 @@ export function create({ exec }) {
         const receipt = await native("hit_test", { x: target.x, y: target.y, perform: true, direction, amount,
           operation: ["left", "right"].includes(direction) ? "scroll-horizontal" : "scroll-vertical" });
         if (receipt?.action_sent) return receipt;
-        // No AX scrollbar here (overlay scrollers, web pages): wheel events
-        // still reach the view through the window-record route.
-        if ((await native("input_capabilities"))?.window_record === 1) {
-          const dx = direction === "left" ? amount : direction === "right" ? -amount : 0;
-          const dy = direction === "up" ? amount : direction === "down" ? -amount : 0;
-          const notches = Math.max(1, Math.min(100, Math.round(amount)));
-          const steps = [];
-          for (let i = 0; i < notches; i++) steps.push({ scroll: [Math.sign(dx), Math.sign(dy)], x: target.x, y: target.y, delayMs: 15 });
-          const r = await native("bg_pointer", { steps });
-          return { action_sent: true, strategy: "window-record", input_scope: "application-window",
-                   direction, amount, pointer_moved: false, front_lease: r.front_lease === true, window: r.window ?? null,
-                   verified: false, verification_required: "observation", ...leaseAccounting(r),
-                   ...(typeof r.front_restored === "boolean" ? { front_restored: r.front_restored } : {}) };
+        if ((await native("input_capabilities"))?.window_record !== 1) {
+          throw Object.assign(new ExecError(`No background scrollbar at this point (${receipt?.reason ?? "not_found"}); choose an observed scroll area or a separate computer.`), { code: "background_scroll_unavailable" });
         }
-        throw Object.assign(new ExecError(`No background scrollbar at this point (${receipt?.reason ?? "not_found"}); choose an observed scroll area or a separate computer.`), { code: "background_scroll_unavailable" });
       }
-      const dx = direction === "left" ? -amount : direction === "right" ? amount : 0;
+      // No AX scrollbar here (overlay scrollers, web pages), or foreground
+      // control: wheel records reach the view through the window route.
+      const dx = direction === "left" ? amount : direction === "right" ? -amount : 0;
       const dy = direction === "up" ? amount : direction === "down" ? -amount : 0;
-      // A wheel sends one notch at a time. One event carrying the whole amount
-      // is clamped by the scroll view's momentum handling and moves a fraction
-      // of the distance, so emit the notches.
       const notches = Math.max(1, Math.min(100, Math.round(amount)));
-      const steps = [{ type: MOUSE_MOVED, x: target.x, y: target.y, button: 0, clickState: 0, delayMs: 40 }];
-      for (let i = 0; i < notches; i++) {
-        steps.push({ scroll: [Math.sign(dx), Math.sign(dy)], delayMs: 15 });
-      }
-      const r = await gesture(steps, { restore: true, guard: target });
-      return { action_sent: true, strategy: "event", direction, amount, ...pointerCost(r) };
+      const steps = [];
+      for (let i = 0; i < notches; i++) steps.push({ scroll: [Math.sign(dx), Math.sign(dy)], x: target.x, y: target.y, delayMs: 15 });
+      return { ...(await windowPointer(steps)), direction, amount, verified: false, verification_required: "observation" };
     },
     type: (args = {}) => native("type", args),
     key: async ({ text, repeat = 1, target } = {}) => {
@@ -1204,7 +1148,7 @@ export function create({ exec }) {
         mode: state.foregroundInput ? "foreground" : "background",
         action: null,
         ageSec: 0,
-        inputHeld: !!state.pointerLease,
+        inputHeld: !!state.heldDrag,
       }],
     }),
     kill_app: async (args = {}) => {
@@ -1219,11 +1163,8 @@ export function create({ exec }) {
     browser_type: browser.type,
     browser_screenshot: browser.screenshot,
     browser_stop: browser.stop,
-    releaseInput: async () => {
-      if (!state.pointerLease) return;
-      try { await withSignal(null, () => state.pointerLease.release({ point: state.pointer })); }
-      finally { state.pointerLease = null; }
-    },
+    // A held drag is buffered, not held on any real button: nothing to release.
+    releaseInput: async () => { state.heldDrag = null; },
   };
 }
 

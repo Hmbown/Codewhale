@@ -315,7 +315,11 @@ impl App {
         if sticky {
             self.set_sticky_status(message, level, ttl_ms);
         } else {
+            // A routine success ("Auto-compaction enabled") must not clear
+            // the one error that says no model is connected: nothing but
+            // connecting a provider resolves it (U1).
             if matches!(level, StatusToastLevel::Success)
+                && !self.onboarding_needs_api_key
                 && self
                     .sticky_status
                     .as_ref()

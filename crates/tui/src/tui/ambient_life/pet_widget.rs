@@ -22,7 +22,7 @@ impl Widget for PetWidget<'_> {
             "{} · {}{}",
             frame.channel,
             frame.arch,
-            if frame.hollow { " · unobserved" } else { "" }
+            if frame.hollow { " · resting" } else { "" }
         );
         // The creature and its non-colour cue are one unit. A narrow surface
         // withholds both instead of silently dropping uncertainty or the gait.

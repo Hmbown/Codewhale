@@ -1,0 +1,82 @@
+name: Cache janitor
+
+# The Actions cache held 11,099,951,127 bytes across 2,896 entries, past the
+# repo's 10 GiB cap, so GitHub evicted live main entries first. A cache is
+# readable only from its own ref and the default branch: once a PR closes or
+# a release finishes, its refs/pull/N or refs/tags/vX entries are dead weight.
+# This deletes them. Branch caches (main included) are never touched; see
+# scripts/release/prune-actions-caches.sh.
+on:
+  # pull_request_target so fork PRs get a token that can delete caches. It
+  # never checks out or runs PR code: the checkout below is the base branch.
+  pull_request_target:
+    types: [closed]
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: List what the sweep would delete without deleting it
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-janitor-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.workflow_run.id || 'sweep' }}
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    name: Prune dead caches
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+      # Read PR state for the sweep.
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          # Base-branch script only. Never the PR head.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Prune
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          script=scripts/release/prune-actions-caches.sh
+          case "${EVENT_NAME}" in
+            pull_request_target)
+              "${script}" --ref "refs/pull/${PR_NUMBER}/merge" --ref "refs/pull/${PR_NUMBER}/head"
+              ;;
+            workflow_run)
+              # A tag-push Release run reports the tag as head_branch. The
+              # script refuses anything that is not a refs/tags/<tag> ref.
+              "${script}" --ref "refs/tags/${RUN_HEAD_BRANCH}"
+              ;;
+            workflow_dispatch)
+              if [[ "${DRY_RUN}" == "true" ]]; then
+                "${script}" --dry-run --sweep
+              else
+                "${script}" --sweep
+              fi
+              ;;
+            *)
+              "${script}" --sweep
+              ;;
+          esac

@@ -701,3 +701,54 @@ fn export_verb_writes_agent_plugins_bundle() {
             .exists()
     );
 }
+
+#[test]
+fn plugin_dismissals_list_and_reset_both_kinds() {
+    let _lock = crate::test_support::lock_test_env();
+    let root = TempDir::new().unwrap();
+    let codewhale_home = root.path().join("home");
+    fs::create_dir_all(&codewhale_home).unwrap();
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+    let (mut app, _temp) = create_test_app(root.path());
+    crate::settings::Settings::transact_opt(|settings| {
+        Ok(settings
+            .dismissed_plugin_suggestions
+            .insert("keptaway".to_string())
+            .then_some(()))
+    })
+    .unwrap();
+    app.plugin_cta.dismissed.insert("keptaway".to_string());
+    app.plugin_cta.dismissed.insert("esconce".to_string());
+
+    let listed = plugins_with_kimi_home_override(&mut app, Some("dismissals"), None)
+        .message
+        .expect("dismissal list");
+    let kept = listed
+        .find("keptaway")
+        .unwrap_or_else(|| panic!("{listed}"));
+    let session = listed.find("esconce").unwrap_or_else(|| panic!("{listed}"));
+    assert!(listed.contains("Don't suggest again"), "{listed}");
+    assert!(listed.contains("This session only"), "{listed}");
+    assert!(kept < session, "{listed}");
+
+    let reset = plugins_with_kimi_home_override(&mut app, Some("dismissals reset KeptAway"), None)
+        .message
+        .expect("reset receipt");
+    assert!(reset.contains("keptaway"), "{reset}");
+    assert!(
+        crate::settings::Settings::load()
+            .unwrap()
+            .dismissed_plugin_suggestions
+            .is_empty(),
+        "reset must reach the saved choice"
+    );
+    assert!(!app.plugin_cta.dismissed.contains("keptaway"));
+    assert!(app.plugin_cta.dismissed.contains("esconce"));
+
+    plugins_with_kimi_home_override(&mut app, Some("dismissals reset"), None);
+    assert!(app.plugin_cta.dismissed.is_empty());
+    let empty = plugins_with_kimi_home_override(&mut app, Some("dismissals"), None)
+        .message
+        .expect("empty list");
+    assert!(empty.contains("No plugins are hidden"), "{empty}");
+}

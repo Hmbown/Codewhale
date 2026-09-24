@@ -303,6 +303,8 @@ impl CodewhaleClient {
             .await?;
 
         let stream_idle_timeout = self.stream_idle_timeout;
+        let first_byte = super::stream_entry::first_byte_timeout(stream_idle_timeout);
+        let provider_label = self.api_provider.display_name();
         let byte_stream = response.bytes_stream();
 
         let stream = async_stream::stream! {
@@ -321,7 +323,12 @@ impl CodewhaleClient {
 
             loop {
                 if !ended {
-                    match tokio::time::timeout(stream_idle_timeout, byte_stream.next()).await {
+                    let wait = super::stream_entry::next_chunk_timeout(
+                        stream_idle_timeout,
+                        first_byte,
+                        bytes_received,
+                    );
+                    match tokio::time::timeout(wait, byte_stream.next()).await {
                         Ok(Some(Ok(chunk))) => {
                             bytes_received += chunk.len();
                             last_chunk_at = std::time::Instant::now();
@@ -333,11 +340,12 @@ impl CodewhaleClient {
                         }
                         Ok(None) => ended = true,
                         Err(_) => {
-                            yield Err(anyhow::anyhow!(super::stream_entry::idle_timeout_message(
-                                stream_idle_timeout,
+                            yield Err(anyhow::anyhow!(super::stream_entry::body_timeout_message(
+                                wait,
                                 bytes_received,
                                 stream_start.elapsed(),
                                 last_chunk_at.elapsed(),
+                                provider_label,
                             )));
                             return;
                         }
@@ -2153,6 +2161,73 @@ mod tests {
         .await
         .expect("stream finishes after message_stop");
         assert!(saw_stop, "message_stop should arrive through the seam");
+    }
+
+    /// Fault injection (#6184): a provider that answers the headers and then
+    /// sends nothing fails the stream at the first-byte bound with a
+    /// distinct error and a `crashes/` stall record, instead of holding the
+    /// turn for the full idle budget.
+    #[tokio::test]
+    async fn stall_first_byte_timeout_fails_stream_and_records_stall() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::core::engine::turn_heartbeat::set_test_stall_record_dir(Some(
+            dir.path().to_path_buf(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 64 * 1024];
+            let _ = socket.read(&mut buf).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .expect("headers");
+            // Hold the connection open with no body bytes.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            drop(socket);
+        });
+
+        let mut client = deepseek_test_client(&base_url);
+        client.stream_idle_timeout = std::time::Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let mut stream = client
+            .handle_anthropic_stream(
+                &client
+                    .prepare_outbound_request(request_with("deepseek-v4", None, None, None), true)
+                    .expect("anthropic request prepares"),
+            )
+            .await
+            .expect("headers arrive");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => continue,
+                    None => panic!("stream ended without the first-byte error"),
+                }
+            }
+        })
+        .await
+        .expect("first-byte bound fires");
+        assert!(error.to_string().contains("first-byte timeout"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let records: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("record dir")
+            .flatten()
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(records[0].contains("first byte"), "{}", records[0]);
+        server.abort();
+        crate::core::engine::turn_heartbeat::set_test_stall_record_dir(None);
     }
 
     #[tokio::test]

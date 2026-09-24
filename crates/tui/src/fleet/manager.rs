@@ -90,6 +90,64 @@ pub struct FleetRunReport {
     pub warnings: Vec<String>,
 }
 
+/// What `fleet run --check` proved about a task spec without launching it.
+#[derive(Debug, Clone)]
+pub struct FleetSpecCheck {
+    pub task_count: usize,
+    /// Non-blocking dispatch warnings, the same ones a real run would print.
+    pub warnings: Vec<String>,
+}
+
+/// Empty and `"auto"` session models leave the resolver default in charge.
+fn normalize_session_model(model: String) -> Option<String> {
+    let trimmed = model.trim();
+    (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("auto")).then(|| trimmed.to_string())
+}
+
+/// Every check a run's spec must pass before anything is written: spec shape,
+/// roster members, agent profiles, and model routes. Shared by run creation
+/// and `fleet run --check`, so the check can never pass a spec the run would
+/// refuse.
+fn validate_run_document_with(
+    workspace: &Path,
+    fleet_config: &codewhale_config::FleetConfigToml,
+    session_model: Option<&str>,
+    route_config: Option<&Config>,
+    doc: &mut FleetTaskSpecDocument,
+) -> Result<Vec<String>> {
+    validate_task_spec_document(doc)?;
+    let roster = crate::fleet::identity::load_effective_roster(fleet_config, workspace, None);
+    if let Some(error) = roster.load_error() {
+        bail!("cannot create Fleet run: {error}");
+    }
+    for task in &doc.tasks {
+        if let Some(worker) = &task.worker
+            && let Some(selector) = worker.agent_profile.as_deref().or(worker.role.as_deref())
+        {
+            roster.resolve_member(selector)?;
+        }
+    }
+    worker_runtime::freeze_fleet_task_members(
+        &mut doc.tasks,
+        roster.members(),
+        roster.is_exact_selection(),
+    )?;
+    worker_runtime::validate_task_agent_profiles(&doc.tasks, roster.members())?;
+    worker_runtime::validate_fleet_task_routes(
+        &doc.tasks,
+        roster.members(),
+        session_model,
+        route_config,
+    )?;
+    Ok(doc
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            worker_runtime::network_posture_warning_for_task(task, roster.members(), session_model)
+        })
+        .collect())
+}
+
 /// Product identity captured with a managed Fleet run.
 ///
 /// CLI task-spec runs predate these fields and use the default descriptor.
@@ -245,10 +303,8 @@ impl FleetManager {
     /// task/profile model pin inherit it. Empty and `"auto"` values are
     /// ignored so the resolver default keeps applying.
     pub fn with_session_model(mut self, model: impl Into<String>) -> Self {
-        let model = model.into();
-        let trimmed = model.trim();
-        if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("auto") {
-            self.session_model = Some(trimmed.to_string());
+        if let Some(model) = normalize_session_model(model.into()) {
+            self.session_model = Some(model);
         }
         self
     }
@@ -368,46 +424,12 @@ impl FleetManager {
         max_workers: usize,
         descriptor: ManagedFleetRunDescriptor,
     ) -> Result<FleetRunReport> {
-        validate_task_spec_document(&doc)?;
-        let roster = self.agent_roster();
-        if let Some(error) = roster.load_error() {
-            bail!("cannot create Fleet run: {error}");
-        }
-        for task in &doc.tasks {
-            if let Some(worker) = &task.worker
-                && let Some(selector) = worker.agent_profile.as_deref().or(worker.role.as_deref())
-            {
-                roster.resolve_member(selector)?;
-            }
-        }
-        worker_runtime::freeze_fleet_task_members(
-            &mut doc.tasks,
-            roster.members(),
-            roster.is_exact_selection(),
-        )?;
-        worker_runtime::validate_task_agent_profiles(&doc.tasks, roster.members())?;
-        worker_runtime::validate_fleet_task_routes(
-            &doc.tasks,
-            roster.members(),
-            self.session_model(),
-            self.route_config.as_ref(),
-        )?;
+        let warnings = self.validate_run_document(&mut doc)?;
         // The single funnel: `create_run` and `create_queued_run` both land
         // here, so counting at either of those would double-count a plain
         // `fleet run`. Count only after author input, member selection, and
         // route validation succeed; a rejected spec is not a dispatch.
         codewhale_telemetry::session_counters().bump(codewhale_telemetry::Counter::FleetDispatch);
-        let warnings = doc
-            .tasks
-            .iter()
-            .filter_map(|task| {
-                worker_runtime::network_posture_warning_for_task(
-                    task,
-                    roster.members(),
-                    self.session_model(),
-                )
-            })
-            .collect::<Vec<_>>();
         let max_workers = max_workers.clamp(1, 128);
         let run_id = FleetRunId::from(format!(
             "fleet-{}",
@@ -453,6 +475,43 @@ impl FleetManager {
             leased: 0,
             queued: snapshot.queued,
             worker_ids: run.worker_specs.iter().map(|w| w.id.clone()).collect(),
+            warnings,
+        })
+    }
+
+    /// Every check a run's spec must pass before anything is written. Freezes
+    /// the selected members into `doc` and returns the non-blocking warnings.
+    fn validate_run_document(&self, doc: &mut FleetTaskSpecDocument) -> Result<Vec<String>> {
+        validate_run_document_with(
+            &self.workspace,
+            &self.fleet_config,
+            self.session_model(),
+            self.route_config.as_ref(),
+            doc,
+        )
+    }
+
+    /// `fleet run --check`: every validation `fleet run` performs, and
+    /// nothing after it — no ledger is opened or created, no run is written,
+    /// no worker starts, nothing is spent.
+    pub fn check_task_spec_path_in(
+        workspace: &Path,
+        fleet_config: codewhale_config::FleetConfigToml,
+        session_model: impl Into<String>,
+        route_config: Config,
+        path: &Path,
+    ) -> Result<FleetSpecCheck> {
+        let mut doc = Self::load_task_spec(path)?;
+        let session_model = normalize_session_model(session_model.into());
+        let warnings = validate_run_document_with(
+            workspace,
+            &fleet_config,
+            session_model.as_deref(),
+            Some(&route_config),
+            &mut doc,
+        )?;
+        Ok(FleetSpecCheck {
+            task_count: doc.tasks.len(),
             warnings,
         })
     }
@@ -2595,17 +2654,20 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_manager(workspace: impl AsRef<Path>) -> Result<FleetManager> {
+        FleetManager::open(workspace).map(|manager| manager.with_route_config(test_route_config()))
+    }
+
+    fn test_route_config() -> Config {
         let mut providers = crate::config::ProvidersConfig::default();
         providers.deepseek.api_key = Some("test-key".to_string());
         providers.xai.api_key = Some("test-key".to_string());
         providers.zai.api_key = Some("test-key".to_string());
-        let route_config = Config {
+        Config {
             provider: Some("deepseek".to_string()),
             api_key: Some("test-key".to_string()),
             providers: Some(providers),
             ..Config::default()
-        };
-        FleetManager::open(workspace).map(|manager| manager.with_route_config(route_config))
+        }
     }
 
     fn select_test_fleet(workspace: &Path, members: &[(&str, &str)]) {
@@ -3673,6 +3735,41 @@ mod tests {
         assert_eq!(status.queued, 1);
         assert_eq!(status.running, 2);
         assert_eq!(status.completed, 0);
+    }
+
+    #[test]
+    fn fleet_run_check_validates_a_spec_without_creating_the_ledger() {
+        let tmp = TempDir::new().unwrap();
+        let route_config = test_route_config();
+        let path = task_spec_file(&tmp, vec![task("task-a"), task("task-b")]);
+
+        let check = FleetManager::check_task_spec_path_in(
+            tmp.path(),
+            codewhale_config::FleetConfigToml::default(),
+            "auto",
+            route_config.clone(),
+            &path,
+        )
+        .unwrap();
+        assert_eq!(check.task_count, 2);
+
+        let mut bad = task("task-bad");
+        bad.worker.as_mut().unwrap().agent_profile = Some("missing".to_string());
+        let bad_path = task_spec_file(&tmp, vec![bad]);
+        let err = FleetManager::check_task_spec_path_in(
+            tmp.path(),
+            codewhale_config::FleetConfigToml::default(),
+            "auto",
+            route_config,
+            &bad_path,
+        )
+        .expect_err("the check refuses what the run would refuse");
+        assert!(err.to_string().contains("unknown agent profile"), "{err}");
+
+        assert!(
+            !crate::fleet::control::fleet_ledger_path(tmp.path()).exists(),
+            "--check must not create the Fleet ledger"
+        );
     }
 
     #[test]

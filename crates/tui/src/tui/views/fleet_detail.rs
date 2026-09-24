@@ -86,6 +86,10 @@ struct RouteRow {
     summary: String,
     provider: Option<String>,
     model: Option<String>,
+    /// The provider's fresh live roster no longer lists this model (#6035).
+    /// A bundled catalog row can outlive the account's roster, so offering
+    /// the route is not proof it is still listed.
+    roster_missing: bool,
 }
 
 pub struct FleetDetailView {
@@ -992,19 +996,24 @@ impl ModalView for FleetDetailView {
 
 impl FleetDetailView {
     /// A saved route pin is drifted when the `(provider, model)` pair is not
-    /// among the routes the picker can currently offer — the provider table
-    /// was removed, or the model dropped out of the provider's roster. The
-    /// pin may still serve upstream, so this only flags; it never rewrites.
+    /// among the routes the picker can currently offer (the provider table
+    /// was removed), or when the provider's fresh live roster no longer
+    /// lists the model even though a bundled row still offers it (#6035).
+    /// The pin may still serve upstream, so this only flags; it never
+    /// rewrites.
     fn pin_drifted(&self, provider: &str, model: &str) -> bool {
-        !self.routes.iter().any(|row| {
-            row.provider
-                .as_deref()
-                .is_some_and(|p| p.eq_ignore_ascii_case(provider))
-                && row
-                    .model
+        self.routes
+            .iter()
+            .find(|row| {
+                row.provider
                     .as_deref()
-                    .is_some_and(|m| m.eq_ignore_ascii_case(model))
-        })
+                    .is_some_and(|p| p.eq_ignore_ascii_case(provider))
+                    && row
+                        .model
+                        .as_deref()
+                        .is_some_and(|m| m.eq_ignore_ascii_case(model))
+            })
+            .is_none_or(|row| row.roster_missing)
     }
 
     fn render_overview(&self, area: Rect, buf: &mut Buffer) {
@@ -1210,7 +1219,7 @@ impl FleetDetailView {
             } else {
                 Style::default().fg(palette::TEXT_SECONDARY)
             };
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(if selected { "» " } else { "  " }, base),
                 Span::styled(route.label.clone(), base),
                 Span::styled("  ", Style::default()),
@@ -1218,7 +1227,15 @@ impl FleetDetailView {
                     route.summary.clone(),
                     Style::default().fg(palette::TEXT_DIM),
                 ),
-            ]));
+            ];
+            // Where the pin is edited, say so before it is picked (#6035).
+            if route.roster_missing {
+                spans.push(Span::styled(
+                    tr(self.locale, MessageId::FleetRouteNotInCatalog),
+                    Style::default().fg(palette::STATUS_WARNING),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
         Paragraph::new(ratatui::text::Text::from(lines)).render(area, buf);
     }
@@ -1233,6 +1250,7 @@ fn build_route_rows(config: &Config) -> Vec<RouteRow> {
         summary: String::new(),
         provider: None,
         model: None,
+        roster_missing: false,
     }];
     let health = crate::provider_readiness::ProviderReadinessSnapshot::default();
     let active = config
@@ -1247,11 +1265,15 @@ fn build_route_rows(config: &Config) -> Vec<RouteRow> {
             .blocked_reason()
             .map(|r| r.into_owned())
             .unwrap_or_else(|| readiness.label().into_owned());
+        let roster_missing =
+            crate::provider_catalog_live::pin_missing_from_fresh_roster(config, &provider, &model)
+                == Some(true);
         rows.push(RouteRow {
             label: format!("{provider_label}/{model}"),
             summary: readiness_label,
             provider: Some(provider),
             model: Some(model),
+            roster_missing,
         });
     }
     rows
@@ -1919,6 +1941,77 @@ mod tests {
         assert!(
             !offered_row.contains("not in current catalog"),
             "{offered_row}"
+        );
+    }
+
+    /// #6035: a bundled catalog row can outlive the provider's live roster.
+    /// A route the fresh roster dropped is flagged in the overview and in the
+    /// pin editor, and the pin is never rewritten. (`build_route_rows` asks
+    /// `pin_missing_from_fresh_roster`, which carries its own roster tests;
+    /// seeding the process-wide catalog here would leak into parallel tests.)
+    #[test]
+    fn a_pin_the_fresh_roster_dropped_is_flagged_in_overview_and_picker() {
+        let ws = tempfile::TempDir::new().unwrap();
+        // The operator pins deepseek/deepseek-v4-flash.
+        let fleet = sample_fleet("Roster");
+        save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap();
+        let mut view = FleetDetailView::open(
+            &app_in(ws.path().to_path_buf()),
+            &Config::default(),
+            "Roster",
+            FleetScope::Workspace,
+        )
+        .expect("open");
+        let dropped = |row: &RouteRow| {
+            row.provider.as_deref() == Some("deepseek")
+                && row.model.as_deref() == Some("deepseek-v4-flash")
+        };
+        match view.routes.iter_mut().find(|row| dropped(row)) {
+            Some(row) => row.roster_missing = true,
+            None => view.routes.push(RouteRow {
+                label: "DeepSeek/deepseek-v4-flash".to_string(),
+                summary: String::new(),
+                provider: Some("deepseek".to_string()),
+                model: Some("deepseek-v4-flash".to_string()),
+                roster_missing: true,
+            }),
+        }
+        assert!(view.pin_drifted("deepseek", "deepseek-v4-flash"));
+
+        let render = |view: &FleetDetailView, pick: bool| {
+            let area = Rect::new(0, 0, 160, 12);
+            let mut buf = Buffer::empty(area);
+            if pick {
+                view.render_pick_route(area, &mut buf);
+            } else {
+                view.render_overview(area, &mut buf);
+            }
+            (0..area.height)
+                .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+                .collect::<Vec<String>>()
+        };
+        let overview = render(&view, false);
+        let operator_row = overview
+            .iter()
+            .find(|row| row.contains("deepseek-v4-flash"))
+            .expect("operator row rendered");
+        assert!(
+            operator_row.contains("not in current catalog"),
+            "{operator_row}"
+        );
+
+        view.open_route_picker(FleetRouteTarget::Operator);
+        view.pick_query = "deepseek-v4-flash".to_string();
+        let picker = render(&view, true);
+        let row = picker
+            .iter()
+            .find(|row| row.contains("/deepseek-v4-flash"))
+            .expect("dropped route still offered in the picker");
+        assert!(row.contains("not in current catalog"), "{row}");
+        assert_eq!(
+            view.fleet.operator.as_ref().map(|op| op.model.as_str()),
+            Some("deepseek-v4-flash"),
+            "a warning never rewrites the pin"
         );
     }
 

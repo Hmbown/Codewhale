@@ -72,19 +72,45 @@ fn effective_keywords(candidate: &KeywordCandidate<'_>) -> Vec<String> {
     keywords
 }
 
-// Core vocabulary is not evidence that a user needs an integration. A
-// specific product name, phrase or domain is still eligible.
-/// Mechanical admissibility for a match term: long enough to be a word and
-/// free of control characters.
+/// Generic words that never trigger a proactive plugin offer (0.10.1 plugin
+/// offering policy, rule 6). Everyday requests like "fix the accessibility of
+/// the login form" or "take a screenshot" are not evidence that the user needs
+/// an integration.
 ///
-/// Deliberately **not** a semantic stoplist. It used to reject declared terms
-/// like `mcp`, `agent`, `model`, `data` and `code`, which made a catalog
-/// author's declared keywords unmatchable — the same failure mode as the
-/// deleted #6274 name suppression, one layer down. Declared keywords are the
-/// catalog author's call; the noise controls are the score threshold, the
-/// once-per-lifetime gate, and dismissal (#6290 rework).
+/// The marketplace repo's `scripts/check-marketplace.mjs` carries the same
+/// list as `STOPLIST` and rejects a manifest keyword on it, so a catalog
+/// author finds out at review time instead of the term silently never
+/// matching here. Change both together; kept sorted so the two diff cleanly.
+pub(crate) const GENERIC_TERM_STOPLIST: &[&str] = &[
+    "accessibility",
+    "automation",
+    "browser",
+    "browsers",
+    "chrome",
+    "codebase",
+    "docs",
+    "documentation",
+    "extension",
+    "extensions",
+    "screenshot",
+    "screenshots",
+    "web",
+    "website",
+    "wiki",
+];
+
+/// Admissibility for a match term: long enough to be a word, free of control
+/// characters, and not a generic word from [`GENERIC_TERM_STOPLIST`].
+///
+/// Everything else a catalog author declares stays matchable (`mcp`, `agent`,
+/// `model`, …): the stoplist is a short shared list, not a per-host judgment.
+/// The remaining noise controls are the send-time toast's shared tips switch
+/// and per-session budget, and per-plugin dismissal. There is no score
+/// threshold on the proactive path (see `recommend.rs`).
 fn is_matchable_term(term: &str) -> bool {
-    term.chars().count() >= 3 && !term.chars().any(char::is_control)
+    term.chars().count() >= 3
+        && !term.chars().any(char::is_control)
+        && !GENERIC_TERM_STOPLIST.contains(&term)
 }
 
 pub(crate) fn normalize_domain(domain: &str) -> Option<String> {
@@ -237,7 +263,8 @@ mod tests {
         // Declared keywords are the catalog author's call (#6290 rework):
         // `mcp`, `agent`, `model`, … match when declared. The remaining
         // filters are mechanical (>= 3 characters, no control characters),
-        // the `/`-command guard, and the code-hosting homepage exclusion.
+        // the shared generic-term stoplist, the `/`-command guard, and the
+        // code-hosting homepage exclusion.
         let words = [
             "mcp", "plugin", "skill", "agent", "tool", "code", "data", "model", "session",
         ];
@@ -270,6 +297,50 @@ mod tests {
         assert_eq!(
             match_plugin_keyword("add supabase auth", &candidates),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn generic_terms_never_match_even_when_declared() {
+        // Policy rule 6: "improve accessibility" and "take a screenshot" are
+        // ordinary requests, not evidence the user wants an integration.
+        let keywords = GENERIC_TERM_STOPLIST
+            .iter()
+            .map(|word| word.to_string())
+            .collect::<Vec<_>>();
+        let candidates = [candidate("computer-use", &[], &keywords)];
+        for draft in [
+            "improve accessibility",
+            "take a screenshot",
+            "fix the accessibility of the login form",
+            "open the browser and check the web page",
+            "update the docs and the wiki",
+        ] {
+            assert_eq!(match_plugin_keyword(draft, &candidates), None, "{draft}");
+        }
+        // A plugin named with a generic word is not matchable by that name.
+        let none: Vec<String> = Vec::new();
+        let named = [candidate("browser", &[], &none)];
+        assert_eq!(match_plugin_keyword("open the browser", &named), None);
+        // A specific term on the same plugin still matches.
+        let specific = vec!["accessibility".to_string(), "computer use".to_string()];
+        let candidates = [candidate("computer-use", &[], &specific)];
+        assert_eq!(
+            match_plugin_keyword("let computer use drive the app", &candidates),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn stoplist_is_sorted_lowercase_and_unique() {
+        let mut sorted = GENERIC_TERM_STOPLIST.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, GENERIC_TERM_STOPLIST);
+        assert!(
+            GENERIC_TERM_STOPLIST
+                .iter()
+                .all(|term| *term == term.to_ascii_lowercase())
         );
     }
 }

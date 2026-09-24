@@ -222,13 +222,14 @@ pub const MATRIX_TEXT_SOFT_RGB: (u8, u8, u8) = (221, 255, 221); // #DDFFDD
 pub const MATRIX_TEXT_DIM_RGB: (u8, u8, u8) = (0, 108, 0); // #006C00, lifted for 3:1
 pub const MATRIX_BORDER_RGB: (u8, u8, u8) = (0, 204, 0); // #00CC00
 
-// Shoreline — the product-client palette, shared with the GPUI desktop.
+// Shoreline — the TUI's charcoal theme.
 //
 // Warm charcoal ground and warm paper sheet, one restrained blue, and the
 // whale's ivory ink on both sides. This is the charcoal alternative to the
 // terminal's navy "Underwater" default in 0.10.0. The
 // 0.10.0 action pair uses glacial blue on charcoal and deep ocean blue on
-// paper. Shared tokens keep the terminal, desktop, and web in one system.
+// paper. The GPUI desktop does not paint these values: its theme is the
+// separate `GPUI_*` / `GPUI_LIGHT_*` set below.
 //
 // Every pair audited by `contrast::theme_contrast_violations` clears its
 // floor: body roles clear 4.5:1 on all four surfaces, hint/dim and the

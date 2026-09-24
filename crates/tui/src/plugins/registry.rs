@@ -546,6 +546,107 @@ impl PluginRegistry {
         })
     }
 
+    /// Carry a built-in bundle's review across Codewhale upgrades (K4).
+    ///
+    /// Each build materializes its built-ins under a digest-named snapshot
+    /// root and a plugin id is bound to its root, so an upgrade presents the
+    /// same built-in under a new id with no persisted state. Left alone it is
+    /// `NeverReviewed` and disabled, which turns Computer Use off for every
+    /// user who had enabled it. Once per new id, the newest review of a
+    /// same-named built-in is carried forward:
+    ///
+    /// * capability hash unchanged: the review stands for the new bytes. The
+    ///   bundle is staged and re-receipted under its new id and keeps its
+    ///   prior enablement.
+    /// * capability hash changed: the prior receipt is recorded as is, so the
+    ///   bundle reports `capabilities-changed` and stays disabled until the
+    ///   user reviews the changes.
+    ///
+    /// Fail-closed: nothing is carried when the new id already has state,
+    /// when the most recently reviewed same-named predecessor has since been
+    /// revoked, or when the state file is invalid. Older ids are left
+    /// untouched, so a still-running older binary keeps its own authority.
+    /// Only the built-in scope is ever carried; user and workspace bundles
+    /// still require review of the exact bytes on disk.
+    pub(crate) fn carry_forward_builtin_trust(&mut self) {
+        if self.state_error.is_some() || self.state_path.is_none() {
+            return;
+        }
+        let candidates: Vec<LoadedPlugin> = self
+            .plugins
+            .values()
+            .filter(|plugin| plugin.scope == super::types::PluginScope::Builtin)
+            .filter(|plugin| builtin_predecessor(&self.state, &plugin.id, plugin.name()).is_some())
+            .cloned()
+            .collect();
+        for plugin in candidates {
+            if let Err(error) = self.carry_forward_one_builtin(&plugin) {
+                tracing::warn!(
+                    target: "plugins",
+                    plugin = plugin.name(),
+                    %error,
+                    "built-in plugin review could not be carried across the upgrade; it needs review again"
+                );
+            }
+        }
+    }
+
+    fn carry_forward_one_builtin(&mut self, plugin: &LoadedPlugin) -> Result<(), String> {
+        let state_path = self
+            .state_path
+            .clone()
+            .ok_or_else(|| "Plugin registry has no persistence store".to_string())?;
+        let same_capabilities = builtin_predecessor(&self.state, &plugin.id, plugin.name())
+            .and_then(|entry| entry.trust.as_ref())
+            .is_some_and(|receipt| receipt.capability_hash == plugin.capability_hash);
+        // Staging is content-addressed and idempotent, so it runs before the
+        // state lock; the decision is re-derived from the locked state below.
+        if same_capabilities {
+            stage_bundle(&state_path, plugin)?;
+        }
+        let id = plugin.id.clone();
+        let name = plugin.name().to_string();
+        let applicable = plugin.applicable;
+        let carried = TrustReceipt {
+            content_hash: plugin.content_hash.clone(),
+            capability_hash: plugin.capability_hash.clone(),
+            reviewed_capabilities: plugin.inventory.clone(),
+            reviewed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        self.commit_state_change(|state| {
+            let Some(predecessor) = builtin_predecessor(state, &id, &name).cloned() else {
+                return Ok(());
+            };
+            let Some(prior) = predecessor.trust else {
+                return Ok(());
+            };
+            let mut entry = PersistedPluginState {
+                generation: 1,
+                enabled: false,
+                trust: None,
+                review_history: predecessor.review_history,
+            };
+            if prior.capability_hash == carried.capability_hash {
+                if !same_capabilities {
+                    // Changed under us to a state that needs a staged copy we
+                    // did not make; the next discovery carries it.
+                    return Ok(());
+                }
+                entry.enabled = predecessor.enabled && applicable;
+                entry.trust = Some(carried.clone());
+                entry.review_history.push(carried);
+                if entry.review_history.len() > MAX_REVIEW_HISTORY {
+                    let remove = entry.review_history.len() - MAX_REVIEW_HISTORY;
+                    entry.review_history.drain(..remove);
+                }
+            } else {
+                entry.trust = Some(prior);
+            }
+            state.plugins.insert(id, entry);
+            Ok(())
+        })
+    }
+
     fn commit_state_change(
         &mut self,
         mutate: impl FnOnce(&mut PluginStateFile) -> Result<(), String>,
@@ -1124,6 +1225,43 @@ pub(crate) fn harden_plugin_state_file(path: &Path) -> Result<(), String> {
 #[cfg(all(not(unix), not(windows)))]
 pub(crate) fn harden_plugin_state_file(_path: &Path) -> Result<(), String> {
     Ok(())
+}
+
+/// The newest persisted review of another built-in with this name, when it
+/// may be carried to `id`: `id` has no state yet, and the same-named built-in
+/// entry with the most recent review still holds its receipt. A revoked entry
+/// is dated by its last review, so revoking blocks carrying until the user
+/// reviews a build again; ties go to the revocation. Entries that were never
+/// reviewed (for example, disabled before any review) granted nothing and are
+/// ignored.
+fn builtin_predecessor<'a>(
+    state: &'a PluginStateFile,
+    id: &PluginId,
+    name: &str,
+) -> Option<&'a PersistedPluginState> {
+    if state.plugins.contains_key(id) {
+        return None;
+    }
+    let builtin = super::types::PluginScope::Builtin.as_str();
+    let mut newest: Option<(&PersistedPluginState, i64)> = None;
+    for (other, entry) in &state.plugins {
+        let mut parts = other.as_str().splitn(3, '/');
+        if parts.next() != Some(builtin) || parts.nth(1) != Some(name) {
+            continue;
+        }
+        let Some(last_review) = entry.trust.as_ref().or(entry.review_history.last()) else {
+            continue;
+        };
+        let reviewed = chrono::DateTime::parse_from_rfc3339(&last_review.reviewed_at)
+            .map_or(i64::MIN, |at| at.timestamp_micros());
+        let revoked = entry.trust.is_none();
+        if newest.is_none_or(|(_, at)| reviewed > at || (reviewed == at && revoked)) {
+            newest = Some((entry, reviewed));
+        }
+    }
+    newest
+        .map(|(entry, _)| entry)
+        .filter(|entry| entry.trust.is_some())
 }
 
 fn runtime_stage_path(state_path: &Path, id: &PluginId, content_hash: &str) -> PathBuf {

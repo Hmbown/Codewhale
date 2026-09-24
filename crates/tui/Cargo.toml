@@ -80,7 +80,11 @@ qrcode = { version = "0.14", default-features = false }
 similar = { version = "3", features = ["unicode"] }
 ansi-to-tui = { version = "8.0.1", default-features = false }
 # The renderer uses embedded syntax/theme dumps, not external YAML/plist loaders.
-syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+# `regex-onig` (syntect's reference engine) instead of `regex-fancy`: compiled
+# fancy-regex programs for the default syntaxes cost tens of MB of process-lifetime
+# heap once a few languages have been highlighted; Oniguruma holds the same
+# grammars in single-digit MB. The TUI already builds C (bundled SQLite, QuickJS).
+syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "regex-onig"] }
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
 schemars = { version = "1.2.1", features = ["derive", "preserve_order"] }
@@ -143,6 +147,7 @@ wiremock = "0.6"
 tiny_http = "0.12"
 pretty_assertions = "1.4"
 rio-vt = "0.5.1"
+tokio-tungstenite = "0.29"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

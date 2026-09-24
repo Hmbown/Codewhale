@@ -115,7 +115,18 @@ fn format_status(app: &App) -> String {
             &[("{count}", &app.mcp_configured_count.to_string())],
         ),
     );
-    if let Some(drift) = fleet_drift_summary(app, locale) {
+    let config =
+        crate::config::Config::load(app.config_path.clone(), app.config_profile.as_deref()).ok();
+    if let Some(notice) = config
+        .as_ref()
+        .and_then(|config| session_model_drift_notice(app, config, locale))
+    {
+        let _ = writeln!(out, "  {notice}");
+    }
+    if let Some(drift) = config
+        .as_ref()
+        .and_then(|config| fleet_drift_summary(app, config, locale))
+    {
         push_row(&mut out, locale, MessageId::StatusLabelFleet, &drift);
     }
     if let Some(notice) = crate::core::turn::snapshots_disabled_status(
@@ -349,11 +360,13 @@ fn push_row(out: &mut String, locale: Locale, label: MessageId, value: &str) {
 /// was removed, or the model dropped out of the provider's roster. A pin may
 /// still serve upstream, so this reports and never rewrites. `None` when no
 /// Fleet is selected or nothing drifted.
-fn fleet_drift_summary(app: &App, locale: Locale) -> Option<String> {
+fn fleet_drift_summary(
+    app: &App,
+    config: &crate::config::Config,
+    locale: Locale,
+) -> Option<String> {
     let selected = crate::fleet::store::selected_fleet(&app.workspace)?;
     let (fleet, _scope) = crate::fleet::store::load_fleet_at(&selected.path).ok()?;
-    let config =
-        crate::config::Config::load(app.config_path.clone(), app.config_profile.as_deref()).ok()?;
     let active = config
         .provider
         .as_deref()
@@ -361,7 +374,7 @@ fn fleet_drift_summary(app: &App, locale: Locale) -> Option<String> {
         .unwrap_or(crate::config::ApiProvider::Deepseek);
     let health = crate::provider_readiness::ProviderReadinessSnapshot::default();
     let routes =
-        crate::tui::views::fleet_setup::cross_provider_model_routes(&config, active, &health);
+        crate::tui::views::fleet_setup::cross_provider_model_routes(config, active, &health);
     let offered = |provider: &str, model: &str| {
         routes
             .iter()
@@ -391,6 +404,28 @@ fn fleet_drift_summary(app: &App, locale: Locale) -> Option<String> {
             ("{count}", &drifted.len().to_string()),
             ("{ids}", &drifted.join(", ")),
         ],
+    ))
+}
+
+/// The session's own pinned model, read-only (#6035): when the active route
+/// has a fresh live roster that no longer lists the pinned id, say so. The pin
+/// is never rewritten — the id may still answer, and a stale or missing
+/// roster proves nothing, so it stays silent then. `None` under Auto routing.
+fn session_model_drift_notice(
+    app: &App,
+    config: &crate::config::Config,
+    locale: Locale,
+) -> Option<String> {
+    if app.auto_model || app.model.trim().is_empty() {
+        return None;
+    }
+    let provider = app.provider_identity_for_persistence();
+    crate::provider_catalog_live::pin_missing_from_fresh_roster(config, provider, &app.model)
+        .filter(|missing| *missing)?;
+    Some(localized(
+        locale,
+        MessageId::StatusModelNotInRoster,
+        &[("{model}", &app.model), ("{provider}", provider)],
     ))
 }
 
@@ -641,6 +676,64 @@ mod tests {
                 .unwrap()
                 .contains("Snapshots and /undo are off")
         );
+    }
+
+    #[test]
+    fn status_warns_when_the_session_pin_left_a_fresh_roster_and_keeps_it() {
+        // #6035: warning only. The pin is never rewritten, and a route with
+        // no fresh roster proves nothing, so it stays silent.
+        let _env = crate::test_support::lock_test_env();
+        let _live = crate::provider_lake::lock_live_snapshot();
+        let root = TempDir::new().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+        let _user_home = crate::test_support::EnvVarGuard::set("HOME", root.path());
+        let _user_profile = crate::test_support::EnvVarGuard::set("USERPROFILE", root.path());
+        crate::provider_catalog_live::reset_cache_for_test();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let mut app = create_test_app(workspace);
+        app.auto_model = false;
+        app.model = "deepseek-v4-flash".to_string();
+        let notice = "is not in deepseek's current model list";
+        assert!(
+            !status(&mut app).message.unwrap().contains(notice),
+            "no fresh roster, no claim"
+        );
+
+        let config = Config::load(app.config_path.clone(), app.config_profile.as_deref())
+            .unwrap_or_default();
+        let base_url = config.base_url_for_route_identity(ApiProvider::Deepseek, "deepseek");
+        let fingerprint = codewhale_config::catalog::base_url_fingerprint(&base_url);
+        let fetched_at = codewhale_config::catalog::now_unix();
+        crate::provider_catalog_live::record_success(
+            codewhale_config::catalog::ProviderCatalogDelta {
+                provider: "deepseek".to_string(),
+                base_url_fingerprint: fingerprint.clone(),
+                fetched_at,
+                offerings: vec![codewhale_config::catalog::CatalogOffering {
+                    provider: "deepseek".to_string(),
+                    wire_model_id: "deepseek-flash".to_string(),
+                    endpoint_key: "chat".to_string(),
+                    source: codewhale_config::catalog::CatalogSource::Live {
+                        base_url_fingerprint: fingerprint,
+                        fetched_at,
+                    },
+                    ..Default::default()
+                }],
+            },
+        );
+
+        let report = status(&mut app).message.unwrap();
+        assert!(report.contains(notice), "{report}");
+        assert!(report.contains("deepseek-v4-flash"), "{report}");
+        assert_eq!(app.model, "deepseek-v4-flash", "the pin is left unchanged");
+
+        app.model = "deepseek-flash".to_string();
+        assert!(!status(&mut app).message.unwrap().contains(notice));
+        app.model = "deepseek-v4-flash".to_string();
+        app.auto_model = true;
+        assert!(!status(&mut app).message.unwrap().contains(notice));
+        crate::provider_catalog_live::reset_cache_for_test();
     }
 
     fn create_test_app(workspace: PathBuf) -> App {

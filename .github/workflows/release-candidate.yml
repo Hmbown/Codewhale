@@ -109,6 +109,15 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: npm run check
 
+  parity:
+    # The same gate release.yml runs before publish. release.yml refuses a tag
+    # unless an RC run for that exact SHA has this job green
+    # (scripts/release/require-rc-receipt.sh matches the "Parity" name).
+    name: Parity
+    needs: resolve
+    if: ${{ !cancelled() && needs.resolve.result == 'success' }}
+    uses: ./.github/workflows/release-parity.yml
+
   artifacts:
     needs: [resolve, web]
     if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.web.result == 'success' }}

@@ -462,10 +462,8 @@ impl RateLimitGovernor {
         state.paused
     }
 
-    /// Observability snapshot: `(gate capacity, window limit events, paused)`.
-    /// (Unit-test/diagnostics surface; wired into status events by the parent
-    /// repo follow-up.)
-    #[cfg(test)]
+    /// Observability snapshot: gate capacity, window limit events, paused.
+    /// Feeds the fleet throttling line (addendum F5) and tests.
     pub(crate) fn snapshot(&self, now: Instant) -> GovernorSnapshot {
         let mut state = self.state.lock().expect("rate limit governor poisoned");
         Self::prune(&mut state, now);
@@ -479,8 +477,7 @@ impl RateLimitGovernor {
     }
 }
 
-/// Point-in-time view of the governor for tests and diagnostics.
-#[cfg(test)]
+/// Point-in-time view of the governor for status surfaces and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GovernorSnapshot {
     pub(crate) launch_capacity: usize,
@@ -488,6 +485,27 @@ pub(crate) struct GovernorSnapshot {
     pub(crate) window_limited: usize,
     pub(crate) window_attempts: usize,
     pub(crate) paused: bool,
+}
+
+impl GovernorSnapshot {
+    /// One line for the fleet header and queued rows (addendum F5), or `None`
+    /// while launches run at the full configured concurrency.
+    #[must_use]
+    pub(crate) fn status_line(&self) -> Option<String> {
+        let window = RATE_LIMIT_WINDOW.as_secs();
+        if self.paused {
+            return Some(format!(
+                "launches paused after {} provider rate limit(s) in the last {window}s",
+                self.window_limited
+            ));
+        }
+        (self.launch_capacity < self.max_capacity).then(|| {
+            format!(
+                "launch slots throttled to {}/{} after {} provider rate limit(s) in the last {window}s",
+                self.launch_capacity, self.max_capacity, self.window_limited
+            )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -538,6 +556,28 @@ mod tests {
         governor.record_rate_limited(t0 + ms(3));
         let snap = governor.snapshot(t0);
         assert!(snap.paused);
+    }
+
+    #[test]
+    fn status_line_names_throttle_and_pause_only_when_active() {
+        let (governor, _gate) = RateLimitGovernor::new(8);
+        let t0 = Instant::now();
+        assert_eq!(governor.snapshot(t0).status_line(), None);
+        for i in 0..2 {
+            governor.record_attempt(t0 + ms(i));
+            governor.record_rate_limited(t0 + ms(i));
+        }
+        let throttled = governor
+            .snapshot(t0 + ms(2))
+            .status_line()
+            .expect("throttled");
+        assert!(throttled.contains("throttled to 4/8"), "{throttled}");
+        for i in 2..4 {
+            governor.record_attempt(t0 + ms(i));
+            governor.record_rate_limited(t0 + ms(i));
+        }
+        let paused = governor.snapshot(t0 + ms(4)).status_line().expect("paused");
+        assert!(paused.starts_with("launches paused"), "{paused}");
     }
 
     #[test]

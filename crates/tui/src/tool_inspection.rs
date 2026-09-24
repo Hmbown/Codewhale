@@ -75,6 +75,10 @@ pub struct TurnStopDiagnostics {
     pub transparent_stream_retries: u32,
     pub stream_resumes: u32,
     pub reasoning_only_reprompts: u32,
+    /// Re-requests after a clean terminal stop that carried no text, no
+    /// reasoning and no tool call (#6310): an exact-prefix retry, then a
+    /// nudged one, before the turn fails visibly.
+    pub empty_stop_retries: u32,
     pub soft_landing_sent: bool,
     pub final_report_requested: bool,
     pub permission_strategy_switches: u32,

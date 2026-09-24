@@ -28,7 +28,36 @@ use crate::config::{
     opencode_go_model_id, provider_is_configured_for_active,
 };
 
-static BUNDLED_SNAPSHOT: std::sync::OnceLock<CatalogSnapshot> = std::sync::OnceLock::new();
+static BUNDLED_SNAPSHOT: std::sync::OnceLock<SharedSnapshot> = std::sync::OnceLock::new();
+
+/// A catalog layer whose rows are reference-counted so the merged view can
+/// share them instead of deep-cloning every offering.
+///
+/// The Models.dev layer is several thousand rows. Holding the merge as owned
+/// `CatalogOffering`s kept a second full copy of that layer (and of the
+/// bundled layer) resident for the life of the process; sharing rows means
+/// only the rows a merge actually changes (cutlines, signed-facts patches,
+/// provider-roster completion) are materialized again.
+#[derive(Debug, Default)]
+struct SharedSnapshot {
+    offerings: Vec<Arc<CatalogOffering>>,
+}
+
+impl SharedSnapshot {
+    fn from_owned(snapshot: CatalogSnapshot) -> Self {
+        Self {
+            offerings: snapshot.offerings.into_iter().map(Arc::new).collect(),
+        }
+    }
+
+    fn offerings_for_provider(&self, provider: &str) -> Vec<&CatalogOffering> {
+        self.offerings
+            .iter()
+            .map(Arc::as_ref)
+            .filter(|row| row.provider == provider)
+            .collect()
+    }
+}
 
 /// Source tag for live-catalog rows. Models.dev is a cross-provider catalog
 /// that serves as the primary live layer; per-provider refreshes (e.g.
@@ -58,7 +87,7 @@ static LIVE_SNAPSHOT: RwLock<LiveSnapshotPartitions> = RwLock::new(LiveSnapshotP
 /// provider-specific live fetch.
 #[derive(Default)]
 struct LiveSnapshotPartitions {
-    models_dev: Option<CatalogSnapshot>,
+    models_dev: Option<SharedSnapshot>,
     per_provider: BTreeMap<LivePartitionOwner, CatalogSnapshot>,
 }
 
@@ -122,7 +151,7 @@ fn offerings_by_provider(
 /// staleness without re-merging.
 static LIVE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-type MergedCacheEntry = ((u64, u64), Arc<CatalogSnapshot>);
+type MergedCacheEntry = ((u64, u64), Arc<SharedSnapshot>);
 
 /// Memoized result of [`merged_snapshot`], tagged with the `LIVE_GENERATION`
 /// it was computed from. Re-merging ~5,700 offerings per call made every
@@ -152,9 +181,11 @@ pub(crate) struct RuntimeCatalogResolver {
     pub(crate) endpoint_catalog_authoritative: bool,
 }
 
-fn bundled_snapshot() -> &'static CatalogSnapshot {
-    BUNDLED_SNAPSHOT.get_or_init(|| CatalogSnapshot {
-        offerings: bundled_catalog_offerings(),
+fn bundled_snapshot() -> &'static SharedSnapshot {
+    BUNDLED_SNAPSHOT.get_or_init(|| {
+        SharedSnapshot::from_owned(CatalogSnapshot {
+            offerings: bundled_catalog_offerings(),
+        })
     })
 }
 
@@ -164,30 +195,61 @@ fn bundled_snapshot() -> &'static CatalogSnapshot {
 /// Anthropic Messages and Responses. Keep saved and live Go rows on the same
 /// documented protocol roster, correcting stale endpoint metadata.
 fn apply_provider_model_cutlines(mut snapshot: CatalogSnapshot) -> CatalogSnapshot {
-    // `ApiProvider::parse` scans every provider and alias list per call; the
-    // distinct provider strings in a catalog are few, so resolve each distinct
-    // string once instead of once per offering (boot-path profiles showed
-    // this loop as the largest post-parse compute block).
-    let mut resolved: std::collections::HashMap<String, Option<ApiProvider>> =
-        std::collections::HashMap::new();
+    let mut is_opencode_go = provider_parse_memo();
     snapshot.offerings = snapshot
         .offerings
         .into_iter()
         .filter_map(|mut offering| {
-            let parsed = *resolved
-                .entry(offering.provider.clone())
-                .or_insert_with(|| ApiProvider::parse(&offering.provider));
-            if parsed == Some(ApiProvider::OpencodeGo) {
-                let canonical = opencode_go_model_id(&offering.wire_model_id)?;
-                offering.provider = ApiProvider::OpencodeGo.as_str().to_string();
-                offering.wire_model_id = canonical.to_string();
-                offering.endpoint_key =
-                    codewhale_config::opencode_go_endpoint_key(canonical)?.to_string();
+            if is_opencode_go(&offering.provider) {
+                canonicalize_opencode_go_row(&mut offering)?;
             }
             Some(offering)
         })
         .collect();
     snapshot
+}
+
+/// [`apply_provider_model_cutlines`] over shared rows: only the rows the
+/// cutline rewrites are copied; every other row stays shared with its layer.
+fn apply_provider_model_cutlines_shared(rows: Vec<Arc<CatalogOffering>>) -> SharedSnapshot {
+    let mut is_opencode_go = provider_parse_memo();
+    let offerings = rows
+        .into_iter()
+        .filter_map(|mut offering| {
+            if is_opencode_go(&offering.provider) {
+                canonicalize_opencode_go_row(Arc::make_mut(&mut offering))?;
+            }
+            Some(offering)
+        })
+        .collect();
+    SharedSnapshot { offerings }
+}
+
+/// `ApiProvider::parse` scans every provider and alias list per call; the
+/// distinct provider strings in a catalog are few, so resolve each distinct
+/// string once instead of once per offering (boot-path profiles showed this
+/// loop as the largest post-parse compute block).
+fn provider_parse_memo() -> impl FnMut(&str) -> bool {
+    let mut resolved: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    move |provider: &str| {
+        if let Some(hit) = resolved.get(provider) {
+            return *hit;
+        }
+        let hit = ApiProvider::parse(provider) == Some(ApiProvider::OpencodeGo);
+        resolved.insert(provider.to_string(), hit);
+        hit
+    }
+}
+
+/// Canonicalize one OpenCode Go row onto its documented protocol roster.
+/// `None` means the row is not on that roster and must be dropped.
+fn canonicalize_opencode_go_row(offering: &mut CatalogOffering) -> Option<()> {
+    let canonical = opencode_go_model_id(&offering.wire_model_id)?;
+    let endpoint_key = codewhale_config::opencode_go_endpoint_key(canonical)?;
+    offering.provider = ApiProvider::OpencodeGo.as_str().to_string();
+    offering.wire_model_id = canonical.to_string();
+    offering.endpoint_key = endpoint_key.to_string();
+    Some(())
 }
 
 /// Set the live-catalog snapshot for a given source (#4188 race fix).
@@ -202,7 +264,7 @@ pub fn set_live_snapshot(snapshot: CatalogSnapshot, source: LiveSource) {
         let snapshot = apply_provider_model_cutlines(snapshot);
         let changed = match source {
             LiveSource::ModelsDev => {
-                guard.models_dev = Some(snapshot);
+                guard.models_dev = Some(SharedSnapshot::from_owned(snapshot));
                 true
             }
             LiveSource::PerProvider => {
@@ -359,7 +421,7 @@ pub fn live_catalog_origin(provider: ApiProvider, wire_model_id: &str) -> Option
     if guard
         .models_dev
         .as_ref()
-        .is_some_and(|snap| snap.offerings.iter().any(matches))
+        .is_some_and(|snap| snap.offerings.iter().any(|row| matches(row)))
     {
         return Some(LiveSource::ModelsDev);
     }
@@ -415,7 +477,7 @@ pub(crate) fn lock_live_snapshot() -> LiveSnapshotLock {
 /// Memoized: the merge is recomputed only after a live-layer mutation bumps
 /// `LIVE_GENERATION`; every other call returns the cached `Arc` (the picker
 /// calls this per row, so it must be cheap).
-fn merged_snapshot() -> Arc<CatalogSnapshot> {
+fn merged_snapshot() -> Arc<SharedSnapshot> {
     let generation = (
         LIVE_GENERATION.load(Ordering::SeqCst),
         codewhale_config::cloud_facts::overlay::snapshot().generation,
@@ -437,13 +499,13 @@ fn merged_snapshot() -> Arc<CatalogSnapshot> {
 }
 
 /// Uncached merge (see [`merged_snapshot`] for the caching seam).
-fn compute_merged_snapshot() -> CatalogSnapshot {
+fn compute_merged_snapshot() -> SharedSnapshot {
     let cloud = codewhale_config::cloud_facts::overlay::snapshot();
     let Ok(live) = LIVE_SNAPSHOT.read() else {
-        return apply_provider_model_cutlines(bundled_snapshot().clone());
+        return apply_provider_model_cutlines_shared(bundled_snapshot().offerings.clone());
     };
     if live.models_dev.is_none() && live.per_provider.is_empty() && cloud.facts.is_none() {
-        return apply_provider_model_cutlines(bundled_snapshot().clone());
+        return apply_provider_model_cutlines_shared(bundled_snapshot().offerings.clone());
     }
 
     let authoritative_providers: std::collections::BTreeSet<&str> = live
@@ -458,12 +520,12 @@ fn compute_merged_snapshot() -> CatalogSnapshot {
         let key = catalog_partition_key(provider);
         authoritative_providers.contains(key.as_str())
     };
-    let mut merged: BTreeMap<(String, String), CatalogOffering> = BTreeMap::new();
+    let mut merged: BTreeMap<(String, String), Arc<CatalogOffering>> = BTreeMap::new();
     for row in &bundled_snapshot().offerings {
         if !is_authoritative(&row.provider) {
             merged.insert(
                 (row.provider.clone(), row.wire_model_id.clone()),
-                row.clone(),
+                Arc::clone(row),
             );
         }
     }
@@ -472,17 +534,28 @@ fn compute_merged_snapshot() -> CatalogSnapshot {
             if !is_authoritative(&row.provider) {
                 merged.insert(
                     (row.provider.clone(), row.wire_model_id.clone()),
-                    row.clone(),
+                    Arc::clone(row),
                 );
             }
         }
     }
     if let Some(facts) = &cloud.facts {
+        // The patcher only reads, writes, or removes the keys a signed fact
+        // names, so materialize just those rows as owned values and share the
+        // rest untouched.
+        let mut patched: BTreeMap<(String, String), CatalogOffering> = BTreeMap::new();
+        for fact in &facts.models {
+            let key = (fact.provider.clone(), fact.id.clone());
+            if let Some(row) = merged.remove(&key) {
+                patched.insert(key, Arc::unwrap_or_clone(row));
+            }
+        }
         codewhale_config::cloud_facts::catalog_patch::apply_model_patches(
-            &mut merged,
+            &mut patched,
             facts,
             cloud.fetched_at.unwrap_or(0),
         );
+        merged.extend(patched.into_iter().map(|(key, row)| (key, Arc::new(row))));
         // A provider roster owns its omissions as well as the ids it lists, and
         // the loops above already withheld the lower layers for such a provider
         // — so a signed row surviving here would be one this client cannot
@@ -521,13 +594,13 @@ fn compute_merged_snapshot() -> CatalogSnapshot {
                     &mut row, facts,
                 );
             }
-            merged.insert((row.provider.clone(), row.wire_model_id.clone()), row);
+            merged.insert(
+                (row.provider.clone(), row.wire_model_id.clone()),
+                Arc::new(row),
+            );
         }
     }
-    let merged = CatalogSnapshot {
-        offerings: merged.into_values().collect(),
-    };
-    apply_provider_model_cutlines(merged)
+    apply_provider_model_cutlines_shared(merged.into_values().collect())
 }
 
 fn apply_cloud_facts_for_provider(
@@ -729,7 +802,7 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
                         .offerings
                         .iter()
                         .filter(|row| catalog_partition_key(&row.provider) == catalog_key)
-                        .cloned()
+                        .map(|row| CatalogOffering::clone(row))
                         .collect()
                 })
                 .unwrap_or_default()
@@ -747,7 +820,7 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
     let mut source_rows: BTreeMap<(String, String), CatalogOffering> = bundled_snapshot()
         .offerings
         .iter()
-        .cloned()
+        .map(|row| CatalogOffering::clone(row))
         .map(|row| ((row.provider.clone(), row.wire_model_id.clone()), row))
         .collect();
     let cloud_applies =
@@ -882,13 +955,14 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
 }
 
 fn offerings_for_provider_identity<'a>(
-    snapshot: &'a CatalogSnapshot,
+    snapshot: &'a SharedSnapshot,
     provider_id: &str,
 ) -> Vec<&'a CatalogOffering> {
     let provider_key = catalog_partition_key(provider_id);
     snapshot
         .offerings
         .iter()
+        .map(Arc::as_ref)
         .filter(|row| catalog_partition_key(&row.provider) == provider_key)
         .collect()
 }
@@ -2611,6 +2685,63 @@ mod tests {
             live_catalog_origin(ApiProvider::Fireworks, wire),
             Some(LiveSource::PerProvider)
         );
+        clear_live_snapshot();
+    }
+
+    /// Footprint: the merge holds `Arc`s into the bundled and Models.dev
+    /// layers, so only rows it rewrites exist twice in memory.
+    #[test]
+    fn merged_snapshot_shares_rows_with_its_layers_instead_of_copying_them() {
+        let _live = lock_live_snapshot();
+        clear_live_snapshot();
+
+        let live_id = "deepseek-shared-row-probe";
+        set_live_snapshot(
+            CatalogSnapshot {
+                offerings: vec![CatalogOffering {
+                    provider: "deepseek".to_string(),
+                    wire_model_id: live_id.to_string(),
+                    endpoint_key: "chat".to_string(),
+                    ..Default::default()
+                }],
+            },
+            LiveSource::ModelsDev,
+        );
+        let merged = merged_snapshot();
+        let live_row = {
+            let live = LIVE_SNAPSHOT.read().expect("live snapshot");
+            let models_dev = live.models_dev.as_ref().expect("models.dev partition");
+            Arc::clone(&models_dev.offerings[0])
+        };
+        let merged_live_row = merged
+            .offerings
+            .iter()
+            .find(|row| row.wire_model_id == live_id)
+            .expect("live row merged");
+        assert!(
+            Arc::ptr_eq(merged_live_row, &live_row),
+            "the merge must share the Models.dev row, not hold a second copy"
+        );
+
+        let bundled = bundled_snapshot();
+        let shared_bundled = merged
+            .offerings
+            .iter()
+            .filter(|row| bundled.offerings.iter().any(|b| Arc::ptr_eq(b, row)))
+            .count();
+        let untouched_bundled = bundled
+            .offerings
+            .iter()
+            .filter(|row| {
+                ApiProvider::parse(&row.provider) != Some(ApiProvider::OpencodeGo)
+                    && !(row.provider == "deepseek" && row.wire_model_id == live_id)
+            })
+            .count();
+        assert_eq!(
+            shared_bundled, untouched_bundled,
+            "every bundled row the merge does not rewrite must be shared"
+        );
+
         clear_live_snapshot();
     }
 

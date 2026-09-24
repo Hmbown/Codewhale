@@ -772,10 +772,61 @@ pub fn auto_merge_pr_args(repo: &str, pr: &str, agent: &str) -> Vec<String> {
     ]
 }
 
+/// Strictly validate an auto-merge request before any of it reaches argv.
+///
+/// The checker is spawned without a shell, but these values still become
+/// arguments to `python3` and then to `gh`, so they are held to the shapes
+/// GitHub itself allows: `repo` is `owner/name`, `pr` is a positive decimal
+/// number, and `agent` is a short role token. No value may start with `-`.
+pub fn validate_auto_merge_request(request: &AutoMergeRequest<'_>) -> Result<(), String> {
+    fn is_owner(owner: &str) -> bool {
+        (1..=39).contains(&owner.len())
+            && !owner.starts_with('-')
+            && owner
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }
+    fn is_repo_name(name: &str) -> bool {
+        (1..=100).contains(&name.len())
+            && name != "."
+            && name != ".."
+            && !name.starts_with('-')
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    }
+    let repo_ok = request
+        .repo
+        .split_once('/')
+        .is_some_and(|(owner, name)| is_owner(owner) && is_repo_name(name));
+    if !repo_ok {
+        return Err("repo must be `owner/name` using GitHub name characters".to_string());
+    }
+    let pr_ok = (1..=10).contains(&request.pr.len())
+        && request.pr.bytes().all(|b| b.is_ascii_digit())
+        && request.pr.parse::<u64>().is_ok_and(|n| n > 0);
+    if !pr_ok {
+        return Err("pr must be a positive pull request number".to_string());
+    }
+    let agent_ok = (1..=64).contains(&request.role.len())
+        && !request.role.starts_with('-')
+        && request
+            .role
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+    if !agent_ok {
+        return Err("agent must be 1-64 letters, digits, `-` or `_`".to_string());
+    }
+    Ok(())
+}
+
 pub fn evaluate_auto_merge(
     request: AutoMergeRequest<'_>,
     checker: Option<&Path>,
 ) -> AutoMergeDecision {
+    if let Err(reason) = validate_auto_merge_request(&request) {
+        return AutoMergeDecision::Deny { reason };
+    }
     let Some(checker) = checker else {
         return AutoMergeDecision::Deny {
             reason: "auto-merge checker missing; fail-closed".to_string(),
@@ -2052,6 +2103,52 @@ api_key_env = "CW_OPERATE_MISSING_TEST_KEY"
         assert!(matches!(deny, AutoMergeDecision::Deny { .. }));
         let _ = AUTO_MERGE_CHECKER_ENV;
         let _ = discover_auto_merge_checker(Path::new("/no-ops-here"));
+    }
+
+    #[test]
+    fn auto_merge_request_fields_are_validated_before_spawn() {
+        let ok = |repo, pr, role| {
+            validate_auto_merge_request(&AutoMergeRequest { pr, role, repo }).is_ok()
+        };
+        assert!(ok("Hmbown/CodeWhale", "1234", "keel"));
+        assert!(ok("a-b/c.d_e-f", "1", "scout_2"));
+        for (repo, pr, role) in [
+            ("Hmbown", "1", "keel"),
+            ("a/b/../../x", "1", "keel"),
+            ("-x/y", "1", "keel"),
+            ("x/-y", "1", "keel"),
+            ("x/..", "1", "keel"),
+            ("x y/z", "1", "keel"),
+            ("x/y", "0", "keel"),
+            ("x/y", "-1", "keel"),
+            ("x/y", "1 2", "keel"),
+            ("x/y", "12345678901", "keel"),
+            ("x/y", "", "keel"),
+            ("x/y", "1", ""),
+            ("x/y", "1", "--fixture=/x"),
+            ("x/y", "1", "keel ops"),
+        ] {
+            assert!(
+                !ok(repo, pr, role),
+                "{repo:?} {pr:?} {role:?} must be rejected"
+            );
+        }
+        // A malformed request is denied even when a checker exists, so the
+        // checker is never spawned with it.
+        let dir = TempDir::new().expect("temp");
+        let checker = dir.path().join("check-auto-merge.py");
+        fs::write(&checker, "import sys\nsys.exit(0)\n").expect("write");
+        assert!(matches!(
+            evaluate_auto_merge(
+                AutoMergeRequest {
+                    pr: "1",
+                    role: "--policy=x",
+                    repo: "x/y",
+                },
+                Some(&checker),
+            ),
+            AutoMergeDecision::Deny { .. }
+        ));
     }
 
     #[test]

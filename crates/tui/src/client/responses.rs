@@ -223,6 +223,8 @@ impl CodewhaleClient {
         }
 
         let stream_idle_timeout = self.stream_idle_timeout;
+        let first_byte = super::stream_entry::first_byte_timeout(stream_idle_timeout);
+        let provider_label = self.api_provider.display_name();
         let byte_stream = response.bytes_stream();
 
         let stream = async_stream::stream! {
@@ -267,7 +269,12 @@ impl CodewhaleClient {
 
             while !done {
                 if !ended {
-                    match tokio::time::timeout(stream_idle_timeout, byte_stream.next()).await {
+                    let wait = super::stream_entry::next_chunk_timeout(
+                        stream_idle_timeout,
+                        first_byte,
+                        bytes_received,
+                    );
+                    match tokio::time::timeout(wait, byte_stream.next()).await {
                         Ok(Some(Ok(chunk))) => {
                             bytes_received += chunk.len();
                             last_chunk_at = std::time::Instant::now();
@@ -279,11 +286,12 @@ impl CodewhaleClient {
                         }
                         Ok(None) => ended = true,
                         Err(_) => {
-                            yield Err(anyhow::anyhow!(super::stream_entry::idle_timeout_message(
-                                stream_idle_timeout,
+                            yield Err(anyhow::anyhow!(super::stream_entry::body_timeout_message(
+                                wait,
                                 bytes_received,
                                 stream_start.elapsed(),
                                 last_chunk_at.elapsed(),
+                                provider_label,
                             )));
                             return;
                         }
@@ -301,7 +309,12 @@ impl CodewhaleClient {
                         }
                     };
 
-                    if line.is_empty() || line.starts_with(':') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if line.starts_with(':') {
+                        // SSE comment keep-alive: the provider is alive (#6184).
+                        yield Ok(StreamEvent::Ping);
                         continue;
                     }
 

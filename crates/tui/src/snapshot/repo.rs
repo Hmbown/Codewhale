@@ -3,7 +3,7 @@
 //! `SnapshotRepo` shells out to the system `git` binary (we deliberately
 //! avoid `git2` to dodge its LGPL surface). The two paths that matter:
 //!
-//! - `git_dir`  → `~/.deepseek/snapshots/<project_hash>/<worktree_hash>/.git`
+//! - `git_dir`  → `<snapshot state dir>/<project_hash>/<worktree_hash>/.git`
 //! - `work_tree` → the user's actual workspace
 //!
 //! Every git invocation passes both `--git-dir` AND `--work-tree`. That is
@@ -22,11 +22,38 @@ use crate::dependencies::ExternalTool;
 
 use super::paths::{ensure_snapshot_dir, snapshot_git_dir};
 
-/// Identifier for a snapshot — currently the underlying git commit SHA.
+/// Identifier for a snapshot — the underlying git commit id.
+///
+/// The field is private: [`SnapshotId::parse`] is the only way to build one,
+/// so every value handed to `git` as a revision is a full SHA-1 or SHA-256
+/// hex object id and can never be read as an option or a revision expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotId(pub String);
+pub struct SnapshotId(String);
 
 impl SnapshotId {
+    /// Accept exactly a full hex object id: 40 (SHA-1) or 64 (SHA-256)
+    /// ASCII hex digits. Anything else is `InvalidInput`.
+    pub fn parse(id: &str) -> io::Result<Self> {
+        if Self::is_well_formed(id) {
+            Ok(Self(id.to_string()))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot id must be a full hexadecimal commit id",
+            ))
+        }
+    }
+
+    /// Whether `id` would be accepted by [`SnapshotId::parse`].
+    pub fn is_well_formed(id: &str) -> bool {
+        matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    /// Take the id string out.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
     /// Borrow the SHA as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -286,7 +313,7 @@ impl SnapshotRepo {
         let work_tree = workspace
             .canonicalize()
             .unwrap_or_else(|_| workspace.to_path_buf());
-        let git_dir = snapshot_git_dir(&work_tree);
+        let git_dir = snapshot_git_dir(&work_tree)?;
         if !git_dir.exists() || !git_dir.join("HEAD").exists() {
             return Ok(None);
         }
@@ -296,7 +323,7 @@ impl SnapshotRepo {
     /// Open or initialize the snapshot repo for `workspace`.
     ///
     /// On first use this:
-    /// 1. Creates the `~/.deepseek/snapshots/<…>/.git` dir.
+    /// 1. Creates the `.git` dir under the resolved snapshot store.
     /// 2. Runs `git init --bare=false --quiet`.
     /// 3. Sets a fixed `user.name` / `user.email` so commits don't pick up
     ///    the user's global git identity (we don't want our snapshots to
@@ -330,8 +357,7 @@ impl SnapshotRepo {
             ));
         }
 
-        let _ = ensure_snapshot_dir(&work_tree)?;
-        let git_dir = snapshot_git_dir(&work_tree);
+        let git_dir = ensure_snapshot_dir(&work_tree)?.join(".git");
 
         let needs_init = !git_dir.exists();
         if needs_init {
@@ -504,7 +530,11 @@ impl SnapshotRepo {
             )));
         }
 
-        Ok(SnapshotId(sha))
+        SnapshotId::parse(&sha).map_err(|_| {
+            io_other(format!(
+                "git commit-tree returned a malformed commit id: {sha:?}"
+            ))
+        })
     }
 
     /// Prefix a snapshot label with its owning session id, if any.
@@ -614,7 +644,7 @@ impl SnapshotRepo {
         let checkout = run_git(
             &self.git_dir,
             &self.work_tree,
-            &["checkout", id.as_str(), "--", ":/"],
+            &["checkout", "--end-of-options", id.as_str(), "--", ":/"],
         )?;
         if !checkout.status.success() {
             return Err(io_other(format!(
@@ -674,6 +704,7 @@ impl SnapshotRepo {
                 "--literal-pathspecs",
                 "ls-tree",
                 "-z",
+                "--end-of-options",
                 id.as_str(),
                 "--",
                 rel.to_str()
@@ -726,6 +757,7 @@ impl SnapshotRepo {
                         "--literal-pathspecs",
                         "diff",
                         "--quiet",
+                        "--end-of-options",
                         id.as_str(),
                         "--",
                         rel.as_str(),
@@ -826,6 +858,7 @@ impl SnapshotRepo {
             let mut args: Vec<String> = vec![
                 "--literal-pathspecs".to_string(),
                 "checkout".to_string(),
+                "--end-of-options".to_string(),
                 id.as_str().to_string(),
                 "--".to_string(),
             ];
@@ -893,7 +926,14 @@ impl SnapshotRepo {
         let diff = run_git(
             &self.git_dir,
             &self.work_tree,
-            &["diff", "--stat", id.as_str(), "--", ":/"],
+            &[
+                "diff",
+                "--stat",
+                "--end-of-options",
+                id.as_str(),
+                "--",
+                ":/",
+            ],
         )?;
         if !diff.status.success() {
             return Err(io_other(format!(
@@ -918,7 +958,14 @@ impl SnapshotRepo {
         let diff = run_git(
             &self.git_dir,
             &self.work_tree,
-            &["diff", "--quiet", id.as_str(), "--", ":/"],
+            &[
+                "diff",
+                "--quiet",
+                "--end-of-options",
+                id.as_str(),
+                "--",
+                ":/",
+            ],
         )?;
         git_diff_matches(diff)
     }
@@ -927,7 +974,14 @@ impl SnapshotRepo {
         let ls = run_git(
             &self.git_dir,
             &self.work_tree,
-            &["ls-tree", "-r", "-z", "--name-only", treeish],
+            &[
+                "ls-tree",
+                "-r",
+                "-z",
+                "--name-only",
+                "--end-of-options",
+                treeish,
+            ],
         )?;
         if !ls.status.success() {
             return Err(io_other(format!(
@@ -1018,12 +1072,14 @@ impl SnapshotRepo {
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0);
             let subject = parts.next().unwrap_or("").to_string();
-            if sha.is_empty() {
+            // `git log --pretty=format:%H` only emits full hex ids; skip anything
+            // else rather than let it become a revision argument later.
+            let Ok(id) = SnapshotId::parse(&sha) else {
                 continue;
-            }
+            };
             let (session_id, label) = Self::decode_session_label(&subject);
             out.push(Snapshot {
-                id: SnapshotId(sha),
+                id,
                 label,
                 timestamp: ts,
                 session_id,
@@ -1543,49 +1599,51 @@ mod tests {
     use std::fs::{File, FileTimes};
     use tempfile::tempdir;
 
+    #[test]
+    fn snapshot_id_parse_accepts_only_full_hex_object_ids() {
+        let sha1 = "0123456789abcdefABCDEF0123456789abcdef01";
+        let sha256 = "a".repeat(64);
+        assert_eq!(SnapshotId::parse(sha1).expect("sha1").as_str(), sha1);
+        assert!(SnapshotId::parse(&sha256).is_ok());
+        for bad in [
+            "",
+            "HEAD",
+            "abc123",
+            "--output=/tmp/x",
+            "-0123456789abcdef0123456789abcdef0123456",
+            "0123456789abcdef0123456789abcdef0123456g",
+            "0123456789abcdef0123456789abcdef01234567~1",
+            "0123456789abcdef0123456789abcdef012345678",
+        ] {
+            let err = SnapshotId::parse(bad).expect_err(bad);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+    }
+
     /// Holds the home directory pinned to a tempdir for the lifetime of a test. Also
     /// owns the process-wide env-var mutex so tests across modules
     /// don't trample each other's home env vars.
     pub(super) struct ScopedHome {
-        prev_vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _vars: Vec<crate::test_support::EnvVarGuard>,
         _guard: crate::test_support::TestEnvLock,
     }
-    impl Drop for ScopedHome {
-        fn drop(&mut self) {
-            // SAFETY: process-wide lock still held.
-            unsafe {
-                for (key, prev) in self.prev_vars.drain(..) {
-                    match prev {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-        }
-    }
     pub(super) fn scoped_home(home: &Path) -> ScopedHome {
+        use crate::test_support::EnvVarGuard;
         let guard = lock_test_env();
-        let prev_vars = ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"]
-            .into_iter()
-            .map(|key| (key, std::env::var_os(key)))
-            .collect();
-        // SAFETY: serialised by the global env lock.
-        unsafe {
-            std::env::set_var("HOME", home);
-            std::env::set_var("USERPROFILE", home);
-            std::env::remove_var("HOMEDRIVE");
-            std::env::remove_var("HOMEPATH");
-        }
         ScopedHome {
-            prev_vars,
+            _vars: vec![
+                EnvVarGuard::set("HOME", home),
+                EnvVarGuard::set("USERPROFILE", home),
+                EnvVarGuard::remove("HOMEDRIVE"),
+                EnvVarGuard::remove("HOMEPATH"),
+                EnvVarGuard::set("CODEWHALE_HOME", home.join(".codewhale")),
+            ],
             _guard: guard,
         }
     }
 
-    /// Build a side-repo whose snapshot dir lives under the same
-    /// tempdir we're using for `HOME` — so the inner `crate::config::effective_home_dir()`
-    /// lookup stays inside our sandbox. Returns the guard alongside so
-    /// the caller can keep HOME pinned for the rest of the test.
+    /// Build a side-repo inside the test's selected profile. Return its
+    /// environment guard so reads and writes stay isolated for the whole test.
     fn make_repo(tmp: &Path) -> (SnapshotRepo, ScopedHome) {
         let workspace = tmp.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -1622,7 +1680,9 @@ mod tests {
         let before = SnapshotRepo::open_existing(&workspace).expect("open existing");
         assert!(before.is_none());
         assert!(
-            !snapshot_git_dir(&workspace).exists(),
+            !snapshot_git_dir(&workspace)
+                .expect("snapshot path")
+                .exists(),
             "read-only open must not create the side repo"
         );
 

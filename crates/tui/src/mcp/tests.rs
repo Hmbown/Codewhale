@@ -2031,6 +2031,7 @@ async fn revoked_plugin_mcp_denies_catalog_tool_resource_and_prompt_operations()
         name: "echo".to_string(),
         description: None,
         input_schema: serde_json::json!({}),
+        annotations: None,
     });
     connection.resources.push(McpResource {
         uri: "memory://one".to_string(),
@@ -2137,6 +2138,7 @@ fn cached_reviewed_plugin_catalog_fixture() -> (tempfile::TempDir, PathBuf, Path
         name: "echo".to_string(),
         description: None,
         input_schema: serde_json::json!({}),
+        annotations: None,
     });
     connection.resources.push(McpResource {
         uri: "memory://one".to_string(),
@@ -3249,6 +3251,7 @@ async fn pool_stops_advertising_a_server_whose_write_side_died() {
         name: "echo".to_string(),
         description: None,
         input_schema: serde_json::json!({"type": "object"}),
+        annotations: None,
     });
     pool.connections.insert("mock".to_string(), conn);
     assert_eq!(pool.connected_servers(), vec!["mock"]);
@@ -3311,6 +3314,7 @@ async fn failed_reconnect_restores_last_good_catalog() {
         name: "echo".to_string(),
         description: None,
         input_schema: serde_json::json!({"type": "object"}),
+        annotations: None,
     });
     pool.connections.insert("mock".to_string(), conn);
 
@@ -4043,6 +4047,7 @@ async fn mcp_pool_call_tool_preserves_tool_names_with_dashes() {
         name: "company--search".to_string(),
         description: None,
         input_schema: serde_json::json!({}),
+        annotations: None,
     }];
 
     let mut pool = McpPool::new(McpConfig {
@@ -4086,6 +4091,7 @@ async fn mcp_pool_rejects_unadvertised_tool_without_sending_tools_call() {
         name: "read".to_string(),
         description: None,
         input_schema: serde_json::json!({}),
+        annotations: None,
     }];
     let mut pool = McpPool::new(McpConfig::default());
     pool.connections.insert("spy".to_string(), conn);
@@ -4165,6 +4171,7 @@ async fn mcp_pool_call_tool_preserves_server_names_with_underscores() {
         name: "execute_sql".to_string(),
         description: None,
         input_schema: serde_json::json!({}),
+        annotations: None,
     }];
 
     let mut pool = McpPool::new(McpConfig {
@@ -4208,6 +4215,7 @@ async fn mcp_pool_hides_and_rejects_ambiguous_model_tool_names() {
         name: "db_execute_sql".to_string(),
         description: None,
         input_schema: serde_json::json!({}),
+        annotations: None,
     }];
 
     let sent_long = Arc::new(Mutex::new(Vec::new()));
@@ -4225,6 +4233,7 @@ async fn mcp_pool_hides_and_rejects_ambiguous_model_tool_names() {
         name: "execute_sql".to_string(),
         description: None,
         input_schema: serde_json::json!({}),
+        annotations: None,
     }];
 
     let mut pool = McpPool::new(McpConfig {
@@ -4810,7 +4819,6 @@ fn find_sse_event_separator_bytes_matches_str_and_survives_multibyte() {
 }
 
 #[tokio::test]
-#[ignore = "flaky: requires a live TCP listener and is sensitive to port allocation races"]
 async fn mcp_connection_supports_streamable_http_event_stream_responses() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -4925,7 +4933,7 @@ async fn mcp_connection_supports_streamable_http_event_stream_responses() {
         cwd: None,
         url: Some(format!("http://{addr}/mcp")),
         transport: None,
-        connect_timeout: Some(2),
+        connect_timeout: Some(5),
         execute_timeout: None,
         read_timeout: None,
         disabled: false,
@@ -7842,6 +7850,7 @@ fn ceiling_test_connection(name: &str, sent: Arc<Mutex<Vec<serde_json::Value>>>)
             name: name.to_string(),
             description: None,
             input_schema: serde_json::json!({}),
+            annotations: None,
         })
         .collect();
     connection.resources = vec![McpResource {
@@ -8506,4 +8515,39 @@ fn mcp_transaction_fails_closed_for_malformed_document_and_symlink() {
         assert!(mutate_config(&link, None, |_| Ok(())).is_err());
         assert!(init_config(&link, true).is_err());
     }
+}
+
+#[test]
+fn only_a_reviewed_plugin_read_only_hint_relaxes_approval() {
+    let tool: McpTool = serde_json::from_value(serde_json::json!({
+        "name": "page_snapshot",
+        "inputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": true, "destructiveHint": false}
+    }))
+    .expect("annotated tool parses");
+    assert_eq!(
+        approval_hint_for(&tool, true),
+        Some(McpToolApprovalHint::TrustedReadOnly)
+    );
+    // The same claim from a server no plugin review covers is not trusted.
+    assert_eq!(approval_hint_for(&tool, false), None);
+
+    let destructive: McpTool = serde_json::from_value(serde_json::json!({
+        "name": "delete_rows",
+        "annotations": {"readOnlyHint": true, "destructiveHint": true}
+    }))
+    .expect("annotated tool parses");
+    // A tool that claims both keeps its prompt, from any server.
+    assert_eq!(
+        approval_hint_for(&destructive, true),
+        Some(McpToolApprovalHint::Destructive)
+    );
+    assert_eq!(
+        approval_hint_for(&destructive, false),
+        Some(McpToolApprovalHint::Destructive)
+    );
+
+    let bare: McpTool = serde_json::from_value(serde_json::json!({"name": "echo"}))
+        .expect("unannotated tool parses");
+    assert_eq!(approval_hint_for(&bare, true), None);
 }

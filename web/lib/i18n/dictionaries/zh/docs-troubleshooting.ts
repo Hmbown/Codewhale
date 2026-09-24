@@ -11,19 +11,19 @@ export const docsTroubleshooting: DocsTroubleshootingDict = {
   bodyClassName: "text-ink-soft leading-[1.9] tracking-wide",
   overviewTitle: "排障",
   overviewLead:
-    "先快速分诊：确认二进制与配置（codewhale --version、~/.codewhale/config.toml），需要更详细日志时用 RUST_LOG=deepseek_cli=debug 启动（HTTP 重试/重连用 RUST_LOG=deepseek_cli::client=debug），并看一眼 ~/.codewhale/sessions 与 ~/.codewhale/tasks 的当前状态。",
+    "先快速分诊：确认二进制与配置（codewhale --version、~/.codewhale/config.toml），需要更详细日志时用 RUST_LOG=codewhale_tui=debug 启动（HTTP 重试/重连用 RUST_LOG=codewhale_tui::client=debug；日志写入 ~/.codewhale/logs/），并看一眼 ~/.codewhale/sessions 与 ~/.codewhale/tasks 的当前状态。",
   incidents: [
     [
       "回合挂起或流停止",
-      "前台 shell 命令还在跑时按 Ctrl+B 把它移到后台（回合继续，命令变成 /jobs 下的后台任务）；想取消回合本身用 Esc 或 Ctrl+C。检查 deepseek_cli::client 的重试日志和端点连通性，重启后确认此前在途的回合被标记为中断，而不是停在运行态。",
+      "前台 shell 命令还在跑时按 Ctrl+B 把它移到后台（回合继续，命令变成 /jobs 下的后台任务）；想取消回合本身用 Esc 或 Ctrl+C。检查 codewhale_tui::client 的重试日志和端点连通性，重启后确认此前在途的回合被标记为中断，而不是停在运行态。",
     ],
     [
       "网络中断 / 离线行为",
-      "离线时新提示词会排队，队列持久化在 ~/.codewhale/sessions/checkpoints/offline_queue.json。用 /queue list 查看，恢复连接后重新发送（/queue edit <n> 加回车，或走正常输入流程），队列清空后文件随之清除。",
+      "离线时新提示词会排队，队列按会话持久化在 ~/.codewhale/sessions/checkpoints/<session-id>.offline_queue.json（旧的全局 offline_queue.json 会在升级时被接管一次）。用 /queue list 查看，恢复连接后重新发送（/queue edit <n> 加回车，或走正常输入流程），队列清空后文件随之清除。",
     ],
     [
       "崩溃恢复",
-      "检查点保存在 ~/.codewhale/sessions/checkpoints/latest.json；除非传入 --resume/--continue，启动会开新会话。用 codewhale --resume <id> 或 TUI 里的 Ctrl+R 显式恢复；若检查点 schema 比二进制新，升级二进制或移除过期检查点。",
+      "每个会话的检查点保存在 ~/.codewhale/sessions/checkpoints/<session-id>.json（旧的 latest.json 仍会读取，但不再写入）；除非传入 --resume/--continue，启动会开新会话。用 codewhale --resume <id> 或 TUI 里的 Ctrl+R 显式恢复；若检查点 schema 比二进制新，升级二进制或移除过期检查点。",
     ],
     [
       "持久状态 schema 错误",

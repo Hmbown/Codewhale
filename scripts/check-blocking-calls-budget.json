@@ -139,14 +139,8 @@
   "crates/tui/src/config.rs": {
     "std_fs": 4
   },
-  "crates/tui/src/config/scope_tests.rs": {
-    "std_fs": 5
-  },
   "crates/tui/src/context_report.rs": {
     "std_fs": 1
-  },
-  "crates/tui/src/core/engine/tests.rs": {
-    "std_fs": 4
   },
   "crates/tui/src/core/engine/tool_execution.rs": {
     "std_fs": 1
@@ -162,6 +156,9 @@
   },
   "crates/tui/src/fleet/artifacts.rs": {
     "std_fs": 1
+  },
+  "crates/tui/src/fleet/exact.rs": {
+    "std_fs": 2
   },
   "crates/tui/src/fleet/executor.rs": {
     "std_fs": 1
@@ -285,10 +282,6 @@
   "crates/tui/src/runtime_threads.rs": {
     "thread_sleep": 2
   },
-  "crates/tui/src/runtime_threads/tests.rs": {
-    "std_fs": 1,
-    "thread_sleep": 2
-  },
   "crates/tui/src/sandbox/bwrap.rs": {
     "std_fs": 2
   },
@@ -310,9 +303,6 @@
   "crates/tui/src/snapshot/repo.rs": {
     "std_fs": 16
   },
-  "crates/tui/src/tools/file_tool/tests.rs": {
-    "std_fs": 1
-  },
   "crates/tui/src/tools/github/report.rs": {
     "std_fs": 7
   },
@@ -321,9 +311,6 @@
   },
   "crates/tui/src/tools/mcp_registry.rs": {
     "std_fs": 1
-  },
-  "crates/tui/src/tools/pdf/tests.rs": {
-    "std_fs": 3
   },
   "crates/tui/src/tools/plugin.rs": {
     "std_fs": 3
@@ -337,10 +324,6 @@
   "crates/tui/src/tools/shell.rs": {
     "std_fs": 3,
     "thread_sleep": 1
-  },
-  "crates/tui/src/tools/shell/tests.rs": {
-    "std_fs": 1,
-    "thread_sleep": 3
   },
   "crates/tui/src/tools/skill.rs": {
     "std_fs": 1
@@ -394,9 +377,6 @@
   "crates/tui/src/tui/file_tree.rs": {
     "std_fs": 1
   },
-  "crates/tui/src/tui/infoline/tests.rs": {
-    "std_fs": 3
-  },
   "crates/tui/src/tui/onboarding/mod.rs": {
     "std_fs": 2
   },
@@ -437,10 +417,6 @@
     "std_fs": 2
   },
   "crates/tui/src/tui/ui/terminal_input.rs": {
-    "thread_sleep": 1
-  },
-  "crates/tui/src/tui/ui/tests.rs": {
-    "std_fs": 3,
     "thread_sleep": 1
   },
   "crates/tui/src/tui/views/fleet_detail.rs": {

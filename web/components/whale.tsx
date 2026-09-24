@@ -6,20 +6,16 @@ const WHALE_MARK =
 
 const VIEW_BOX = "0 0 512 512";
 
+/**
+ * The still pose. Like the GPUI whale under reduced motion, the web mark
+ * never animates: it is one filled path in the current ink.
+ */
 export function Whale({
   size = 36,
   className = "",
-  caustic = false,
 }: {
   size?: number;
   className?: string;
-  /**
-   * Ambient light passing over the mark — `ambient_life.rs`'s caustic at its
-   * literal amplitude and cadence. Exactly one whale on the page may carry it
-   * (the footer's); two caustics is chrome. The fixed gradient/clip ids are
-   * safe for the same reason.
-   */
-  caustic?: boolean;
 }) {
   return (
     <svg
@@ -30,38 +26,12 @@ export function Whale({
       aria-hidden="true"
       fill="none"
     >
-      {caustic ? (
-        <defs>
-          <clipPath id="codewhale-caustic-clip">
-            <path d={WHALE_MARK} fillRule="evenodd" />
-          </clipPath>
-          <linearGradient id="codewhale-caustic-light" x1="0" y1="0" x2="1" y2="0">
-            <stop offset="0%" stopColor="#90b9ff" stopOpacity="0" />
-            <stop offset="50%" stopColor="#90b9ff" stopOpacity="0.3" />
-            <stop offset="100%" stopColor="#90b9ff" stopOpacity="0" />
-          </linearGradient>
-        </defs>
-      ) : null}
-
       <path
         className="codewhale-mark-primary"
         d={WHALE_MARK}
         fill="currentColor"
         fillRule="evenodd"
       />
-
-      {caustic ? (
-        <g clipPath="url(#codewhale-caustic-clip)">
-          <rect
-            className="codewhale-caustic"
-            x="-40"
-            y="0"
-            width="40"
-            height="100"
-            fill="url(#codewhale-caustic-light)"
-          />
-        </g>
-      ) : null}
     </svg>
   );
 }

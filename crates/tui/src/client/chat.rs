@@ -27,16 +27,6 @@ use crate::config::{
 // (Chat Completions / Anthropic Messages / Responses) uses the same policy.
 use super::stream_entry::stream_open_timeout;
 
-fn stream_idle_timeout_message(
-    idle: Duration,
-    bytes_received: usize,
-    stream_age: Duration,
-    since_last_chunk: Duration,
-) -> String {
-    // Shared seam: Chat Completions / Anthropic / Responses keep one message shape.
-    super::stream_entry::idle_timeout_message(idle, bytes_received, stream_age, since_last_chunk)
-}
-
 use crate::config::ApiProvider;
 use crate::llm_client::StreamEventBox;
 use crate::llm_client::sanitize_http_error_body;
@@ -1469,17 +1459,20 @@ impl CodewhaleClient {
             // Skip further data-frame parsing so U+FFFD cannot enter the transcript.
             let mut decode_failed = false;
 
+            let first_byte = super::stream_entry::first_byte_timeout(idle);
             'stream: loop {
-                let chunk_result = match tokio_timeout(idle, byte_stream.next()).await {
+                let wait = super::stream_entry::next_chunk_timeout(idle, first_byte, bytes_received);
+                let chunk_result = match tokio_timeout(wait, byte_stream.next()).await {
                     Ok(Some(result)) => result,
                     Ok(None) => break, // Stream ended normally
                     Err(_elapsed) => {
                         stream_failed = true;
-                        yield Err(anyhow::anyhow!(stream_idle_timeout_message(
-                            idle,
+                        yield Err(anyhow::anyhow!(super::stream_entry::body_timeout_message(
+                            wait,
                             bytes_received,
                             stream_start.elapsed(),
                             last_event_at.elapsed(),
+                            api_provider.display_name(),
                         )));
                         break;
                     }
@@ -1587,6 +1580,15 @@ impl CodewhaleClient {
                                 }
                             }
                         }
+                        continue;
+                    }
+
+                    if line.starts_with(':') {
+                        // SSE comment (`: keep-alive`, `: OPENROUTER PROCESSING`).
+                        // Surface it as a ping so the engine counts a provider
+                        // that is alive but queued/thinking as progress
+                        // (#6184) instead of timing out on a live stream.
+                        yield Ok(StreamEvent::Ping);
                         continue;
                     }
 
@@ -4424,7 +4426,7 @@ mod stream_diagnostics_tests {
 
     #[test]
     fn stream_idle_timeout_reports_progress_and_timing() {
-        let message = stream_idle_timeout_message(
+        let message = super::super::stream_entry::idle_timeout_message(
             Duration::from_secs(240),
             8192,
             Duration::from_millis(73_500),

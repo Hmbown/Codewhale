@@ -8,6 +8,14 @@ set "SCRIPT_DIR=%~dp0"
 
 if not exist "%BIN_DIR%" mkdir "%BIN_DIR%"
 
+for %%F in (codewhale.exe codew.exe codewhale.bat) do (
+    if not exist "%SCRIPT_DIR%%%F" (
+        echo ERROR: %%F is missing from !SCRIPT_DIR!
+        echo Extract the whole release archive, then run install.bat from that folder.
+        exit /b 1
+    )
+)
+
 echo Installing codewhale to %BIN_DIR%...
 
 copy /Y "%SCRIPT_DIR%codewhale.exe" "%BIN_DIR%\codewhale.exe" >nul
@@ -38,7 +46,7 @@ echo   3. Under "User variables", select "Path" and click "Edit"
 echo   4. Click "New" and add: %BIN_DIR%
 echo   5. Click OK, then restart your terminal
 echo.
-echo Or run this in an admin PowerShell:
+echo Or run this in PowerShell (no admin needed):
 echo   [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';%BIN_DIR%', 'User')
 echo.
 echo Then run: codewhale

@@ -82,9 +82,8 @@ export default async function RuntimeApiPage({ params }: { params: Promise<{ loc
         </p>
       </section>
 
-      <section id="source" className="hairline-t pt-8">
-        <p className="text-sm text-ink-mute">{t.sourceNote}</p>
-      </section>
+      {/* Maintainer pointer: kept out of the rendered copy (experience mark 5). */}
+      <div hidden data-source-note={t.sourceNote} />
     </section>
   );
 }

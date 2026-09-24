@@ -169,16 +169,16 @@ Codewhale 没有恢复出厂设置命令，因此本文档也不会声称有。
 
 | 字段 | 来源锚点 |
 |---|---|
-| `turns` | `crates/tui/src/tui/ui/event_loop.rs:1856`——`execute_turn_end_observer_hook` 的*调用者*。绝不在其内部：该函数的第一条语句是 `if !app.hooks.has_hooks_for_event(HookEvent::TurnEnd) { return Ok(()); }`（`crates/tui/src/tui/ui.rs:1035`），而自然的未来优化会把该检查提升到调用点，从而悄悄把所有没有 hooks 的用户的计数器归零。 |
-| `tool_calls` | `crates/tui/src/core/engine/tool_execution.rs:495`——与 surface 无关，exec 和 CLI 也会触发 |
-| `fleet_dispatch` | `crates/tui/src/fleet/manager.rs:374`——单一漏斗（`create_queued_run_with_descriptor`），`create_run` 和 `create_queued_run` 都落入其中；在任一调用方计数都会使普通的 `fleet run` 被重复计数。 |
-| `workflow_run` | 从 `parse_workflow_action`（`crates/tui/src/tools/workflow.rs:752-765`）返回的 **`WorkflowAction` 变体判别值**计数，绝不从 `input["action"]` 计数。`:775-779` 处的 JSON Schema 是发布*给模型*的——是声明，不是守卫；真正的解析还接受 `spawn\|wait\|list\|inspect\|stop\|abort`，其 `:761-763` 处的拒绝分支会原样嵌入模型字符串。 |
-| `subagent_spawn` | `crates/tui/src/tui/ui/apply.rs:32` |
-| `mcp_server_connected` | `crates/tui/src/mcp.rs:4254-4261` 快照中 `.connected` 的计数；绝不统计 `name`、`command_or_url` 或 `error`——服务器名是用户自选的，往往是内部基础设施 |
-| `memory_search` | `crates/tui/src/tools/native_memory.rs:60-61` 处的工具名，在 tool_execution 瓶颈点计数 |
-| `approval_modal_shown` | `crates/tui/src/tui/ui/event_loop.rs:2372`（`Event::ApprovalRequired` 的消费者，`crates/tui/src/core/events.rs:444`） |
-| `approval_auto_allowed` | `crates/tui/src/core/engine.rs:5714`。只计数。绝不统计 `matched_rule`、`reason()`、命令或 argv——`auto_allow` 模式是用户编写的命令字符串（`crates/execpolicy/src/command_safety.rs:35/309`） |
-| `command_palette_open` | `crates/tui/src/tui/ui/event_loop.rs:3941` 和 `crates/tui/src/tui/mouse_ui.rs:1346` |
+| `turns` | `crates/tui/src/tui/ui/event_loop.rs` 中的 `run_event_loop`，紧接在它调用 `execute_turn_end_observer_hook` 之前。绝不在该 hook 内部：它的第一条语句是 `if !app.hooks.has_hooks_for_event(HookEvent::TurnEnd) { return Ok(()); }`（`crates/tui/src/tui/ui/observer_hooks.rs`），而自然的未来优化会把该检查提升到调用点，从而悄悄把所有没有 hooks 的用户的计数器归零。 |
+| `tool_calls` | `crates/tui/src/core/engine/tool_execution.rs` 中的 `execute_tool_with_lock`——与 surface 无关，exec 和 CLI 也会触发 |
+| `fleet_dispatch` | `crates/tui/src/fleet/manager.rs` 中的 `create_queued_run_with_descriptor`——单一漏斗，`create_run` 和 `create_queued_run` 都落入其中；在任一调用方计数都会使普通的 `fleet run` 被重复计数。 |
+| `workflow_run` | 在 `WorkflowTool::execute`（`crates/tui/src/tools/workflow/mod.rs`）中、仅当 `parse_workflow_action` 返回 `Ok(WorkflowAction)` 之后递增，绝不从 `input["action"]` 计数。`WorkflowTool::input_schema` 中的 JSON Schema `enum` 是发布*给模型*的——是声明，不是守卫；真正的解析还接受 `spawn\|wait\|list\|inspect\|stop\|abort`，其拒绝分支（`Invalid workflow action '…'`）会原样嵌入模型字符串，因此被拒绝的 action 永远不会被计数。 |
+| `subagent_spawn` | `crates/tui/src/tui/ui/apply.rs` 中的 `apply_agent_spawned_status_and_observer` |
+| `mcp_server_connected` | 在 `snapshot_from_config`（`crates/tui/src/mcp.rs`）中，服务器快照的 `.connected` 为 true 时递增；绝不统计 `name`、`command_or_url` 或 `error`——服务器名是用户自选的，往往是内部基础设施 |
+| `memory_search` | `tool_name == "memory_search"`（在 `crates/tui/src/tools/native_memory.rs` 中注册的工具），在同一个 `execute_tool_with_lock` 瓶颈点计数 |
+| `approval_modal_shown` | `run_event_loop` 的 `Event::ApprovalRequired` 分支（`crates/tui/src/tui/ui/event_loop.rs`；该事件定义于 `crates/tui/src/core/events.rs`） |
+| `approval_auto_allowed` | `crates/tui/src/core/engine.rs` 中的 `tool_ask_rule_decision_for_context`。只计数。绝不统计 `matched_rule`、`reason()`、命令或 argv——`auto_allow` 模式是用户编写的命令字符串（`crates/execpolicy/src/command_safety.rs:35/309`） |
+| `command_palette_open` | `run_event_loop` 中的命令面板按键路径（`crates/tui/src/tui/ui/event_loop.rs`）以及 `crates/tui/src/tui/mouse_ui.rs` 中的 `handle_context_menu_action` |
 
 **`errors`** ——封闭字段集。每个值都是**变体判别值**，绝不是 `err.to_string()`：
 
@@ -193,7 +193,7 @@ Codewhale 没有恢复出厂设置命令，因此本文档也不会声称有。
 
 为什么只要判别值：`ToolError::PathEscape` 的 `Display` *就是*一个绝对路径（`crates/tools/src/lib.rs:61`）；`fim.rs:48-50` 的 `Display` *就是*模型发出的字面源码片段；`secrets/src/lib.rs:50` 的 `Display` 携带密钥库的绝对路径；每个 `LlmError` 变体都原样携带 provider 的原始 HTTP 主体（`crates/tui/src/llm_client/mod.rs:327`），而内容过滤器的 400 通常会回显提示词。
 
-**`turn_wall`** ——按会话的计数直方图，绝不是按回合的事件。`lt_5s`、`5_30s`、`30_120s`、`gte_120s`。来源 `crates/tui/src/tui/ui/event_loop.rs:1857`，那里已经手握 `duration`。
+**`turn_wall`** ——按会话的计数直方图，绝不是按回合的事件。`lt_5s`、`5_30s`、`30_120s`、`gte_120s`。由 `run_event_loop` 中紧挨 `turns` 递增处的 `observe_turn_secs` 记录，那里已经手握本回合耗时。
 
 ### 事件：panic
 

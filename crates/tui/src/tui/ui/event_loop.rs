@@ -784,14 +784,9 @@ pub async fn run_tui(
     surface_prompt_override_notices(&mut app);
 
     if options.resume_session_id.is_none() && !app.launch.visible {
-        let opened_setup = open_setup_checkpoint_if_due(&mut app, config, options.skip_onboarding);
-        // One-time Fleet + Hotbar intro for returning (non-resuming) users.
-        // First-time users see it when they finish onboarding. Gated by a
-        // persisted flag, so it shows exactly once and never inside a resumed
-        // session transcript or behind the constitution checkpoint.
-        if !opened_setup {
-            app.maybe_show_feature_intro();
-        }
+        // The one-time Fleet intro is no longer a launch push: it appears the
+        // first time the user opens `/fleet` or enters Operate (apply.rs).
+        let _ = open_setup_checkpoint_if_due(&mut app, config, options.skip_onboarding);
     }
 
     // Load existing session if resuming.
@@ -1433,6 +1428,9 @@ pub(crate) async fn run_event_loop(
     let (translation_tx, mut translation_rx) =
         tokio::sync::mpsc::unbounded_channel::<TranslationEvent>();
     let fallback_translation_client = translation_client;
+    // Set when the telemetry disclosure cell is queued; cleared (and the
+    // disclosure recorded) by the first draw that paints it.
+    let mut telemetry_notice_awaiting_render = false;
     let mut active_translation_client = fallback_translation_client.clone();
     let mut active_translation_route: Option<crate::core::events::TurnRoute> = None;
     let mut translation_sequence = 0_u64;
@@ -1596,11 +1594,20 @@ pub(crate) async fn run_event_loop(
             force_terminal_repaint = true;
         }
 
-        if app.onboarding == OnboardingState::None && pending_telemetry_notice.take().is_some() {
-            let receipt = app.tr(MessageId::TelemetryNoticeDefaultOn);
-            app.push_status_toast(receipt.into_owned(), StatusToastLevel::Info, Some(12_000));
+        // The disclosure is a transcript cell, not a toast: a 12 s toast
+        // showed only its first sentence at 100 columns and hid the opt-out.
+        // A transcript cell would also replace the launch card, whose
+        // "no model connected" line is the first-run recovery, so the cell
+        // waits until the card starts to leave. It counts as presented only
+        // once a frame containing it was drawn; quitting first re-owes it.
+        if app.onboarding == OnboardingState::None
+            && telemetry_notice_may_enter_transcript(app)
+            && pending_telemetry_notice.take().is_some()
+        {
+            let notice = app.tr(MessageId::TelemetryNoticeDefaultOn).into_owned();
+            app.add_message(HistoryCell::System { content: notice });
             app.needs_redraw = true;
-            crate::telemetry_notice::record_presented();
+            telemetry_notice_awaiting_render = true;
         }
 
         // A manual compaction deferred by a full engine mailbox retries here
@@ -1902,7 +1909,6 @@ pub(crate) async fn run_event_loop(
         // potentially long engine batch so composer/modal input stays live.
         collect_pending_terminal_events(&terminal_input, &mut pending_terminal_events)?;
         app.maybe_poll_plugin_catalog_idle();
-        app.maybe_poll_plugin_cta();
 
         if drain_remote_control_events(app, config, &engine_handle).await? {
             app.needs_redraw = true;
@@ -2407,6 +2413,8 @@ pub(crate) async fn run_event_loop(
                         // A prior turn that died without its `TurnComplete`
                         // must not leak its provisional estimate into this one.
                         app.clear_pending_turn_cost();
+                        // A Deny is scoped to the turn it answered (UX-8).
+                        end_turn_scoped_denials(app);
                         app.goal_continuation_waiting = false;
                         app.session.last_tool_request_snapshot = None;
                         app.ocean_completion_started_at = None;
@@ -4275,26 +4283,28 @@ pub(crate) async fn run_event_loop(
         }
 
         if !app.view_stack.is_empty() {
-            let events = app.view_stack.tick();
-            if !events.is_empty() {
+            let tick = app.view_stack.tick();
+            if tick.redraw {
                 app.needs_redraw = true;
-                if handle_view_events_boxed(
+            }
+            if !tick.events.is_empty()
+                && handle_view_events_boxed(
                     terminal,
                     app,
                     config,
                     &task_manager,
                     &mut engine_handle,
-                    events,
+                    tick.events,
                 )
                 .await?
-                {
-                    return Ok(());
-                }
+            {
+                return Ok(());
             }
         }
 
         let has_running_agents = running_agent_count(app) > 0;
-        if reconcile_turn_liveness(app, Instant::now(), has_running_agents) {
+        let turn_heartbeat = engine_handle.turn_heartbeat().snapshot();
+        if reconcile_turn_liveness_supervised(app, Instant::now(), &turn_heartbeat) {
             app.needs_redraw = true;
         }
         maybe_throttled_recovery_snapshot(app, Instant::now(), &mut last_recovery_snapshot_at);
@@ -4589,6 +4599,9 @@ pub(crate) async fn run_event_loop(
             force_terminal_repaint = false;
             frame_rate_limiter.mark_emitted(Instant::now());
             app.needs_redraw = false;
+            if std::mem::take(&mut telemetry_notice_awaiting_render) {
+                crate::telemetry_notice::record_presented();
+            }
         }
 
         let mut poll_timeout =
@@ -5366,7 +5379,6 @@ pub(crate) async fn run_event_loop(
                             // pre-seeded with a first task for this folder —
                             // never another educational surface.
                             onboarding::finish_ready_and_open_composer(app);
-                            app.maybe_show_feature_intro();
                         }
                         OnboardingState::None => {}
                     },
@@ -6233,7 +6245,7 @@ pub(crate) async fn run_event_loop(
                         }
                         EscapeAction::DismissPluginCta => {
                             app.backtrack.reset();
-                            let _ = app.dismiss_plugin_cta();
+                            let _ = app.dismiss_plugin_cta_for_session();
                         }
                         EscapeAction::ClearInput => {
                             app.backtrack.reset();
@@ -6987,6 +6999,24 @@ pub(crate) async fn run_cache_warmup(app: &App, config: &Config) -> Result<Cache
     })
 }
 
+/// Whether the telemetry disclosure may become a transcript cell now: never
+/// while the launch card can still come back, since a cell hides the card,
+/// and never under a live active cell, whose tool indices address
+/// `history ++ active_cell`.
+///
+/// A dissolving card is not a departed one: Esc on an empty composer, or
+/// leaving the session picker, restores it, and it only renders over an
+/// empty history. So the cell waits until the card is dismissed or the
+/// conversation has its first entry.
+fn telemetry_notice_may_enter_transcript(app: &App) -> bool {
+    let card_leaving = !app.launch.visible || !app.history.is_empty();
+    let no_live_cell = app
+        .active_cell
+        .as_ref()
+        .is_none_or(crate::tui::active_cell::ActiveCell::is_empty);
+    card_leaving && no_live_cell
+}
+
 /// Switch a first-run / missing-key session onto a live local Ollama tag.
 async fn adopt_live_local_ollama_catalog(
     app: &mut App,
@@ -7451,6 +7481,41 @@ mod session_boot_event_tests {
 }
 
 #[cfg(test)]
+mod telemetry_notice_tests {
+    use super::telemetry_notice_may_enter_transcript;
+
+    #[test]
+    fn telemetry_notice_waits_for_the_launch_card_to_leave() {
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(std::env::temp_dir()),
+        );
+        app.launch.visible = true;
+        app.launch.dissolve_started_ms = None;
+        assert!(
+            !telemetry_notice_may_enter_transcript(&app),
+            "a transcript cell would hide the launch card's no-model line"
+        );
+        // A first keystroke only starts the dissolve; Esc on an empty
+        // composer (or leaving the picker) restores the card, which renders
+        // only over an empty history. A cell now would strand it.
+        app.launch.dissolve_card(0);
+        assert!(!telemetry_notice_may_enter_transcript(&app));
+        app.launch.restore_card();
+        assert!(crate::tui::widgets::should_render_empty_state(&app));
+        // Once the conversation has an entry, the card cannot come back.
+        app.launch.dissolve_card(0);
+        app.add_message(super::HistoryCell::System {
+            content: "first entry".to_string(),
+        });
+        assert!(telemetry_notice_may_enter_transcript(&app));
+        app.history.clear();
+        app.launch.visible = false;
+        app.launch.dissolve_started_ms = None;
+        assert!(telemetry_notice_may_enter_transcript(&app));
+    }
+}
+
+#[cfg(test)]
 mod fleet_workers_status_tests {
     use super::current_session_fleet_workers_status;
     use codewhale_localization::Locale;
@@ -7459,7 +7524,7 @@ mod fleet_workers_status_tests {
     fn current_session_fleet_worker_status_keeps_the_english_session_boundary() {
         assert_eq!(
             current_session_fleet_workers_status(Locale::En, 3),
-            "Current-session fleet workers: 3 total"
+            "Agents in this session: 3 total"
         );
     }
 }

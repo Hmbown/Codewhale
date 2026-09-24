@@ -22,6 +22,26 @@ export const APP_ID = "net.codewhale.computer-use";
 export const APP_NAME = "Codewhale Computer Use";
 export const APP_VERSION = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, "plugin.json"), "utf8")).version;
 
+/** Strict x.y.z comparison: true only when candidate is a newer release than current. */
+export function newerVersion(candidate, current) {
+  const parse = (value) => /^\d+\.\d+\.\d+$/.test(value) ? value.split(".").map(Number) : null;
+  const a = parse(candidate), b = parse(current);
+  if (!a || !b) return false;
+  for (let i = 0; i < 3; i++) { if (a[i] !== b[i]) return a[i] > b[i]; }
+  return false;
+}
+
+/**
+ * Whether a running helper at `helper` is stale next to this plugin at
+ * `bundled`. The helper owns the modules it loaded at start, so only an older
+ * helper serves a previous build; a newer notarized helper beside an older
+ * built-in plugin is expected and must not be told to restart.
+ */
+export function helperStaleness(helper, bundled = APP_VERSION) {
+  if (!newerVersion(bundled, helper)) return { stale: false, note: null };
+  return { stale: true, note: `The running helper reports ${helper} but this plugin is ${bundled} — restart the Codewhale Computer Use app to load the current build.` };
+}
+
 function shortHash(s) {
   return crypto.createHash("sha256").update(s).digest("hex").slice(0, 12);
 }

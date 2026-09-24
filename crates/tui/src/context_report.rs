@@ -1,8 +1,14 @@
 //! Diagnostic prompt source map for context pressure reports.
 //!
-//! The report is intentionally approximate for v0.8.59. It uses the same
-//! conservative token heuristic as compaction and describes the runtime sources
-//! CodeWhale already tracks, without claiming provider-tokenizer parity.
+//! The report is approximate and describes the runtime sources CodeWhale
+//! already tracks, without claiming provider-tokenizer parity. Its headline
+//! (`active_context_estimated_tokens`) is the pressure estimate the context
+//! meter and the auto-compaction gate read
+//! (`compaction::estimate_input_tokens_for_pressure`, lifted to the last
+//! provider-billed prompt). The 1.5x-inflated conservative estimate that
+//! request-overflow protection uses is reported separately as the overflow
+//! guard, never as the headline. Per-source entries keep the conservative
+//! per-text heuristic.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -10,7 +16,10 @@ use std::path::Path;
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 
-use crate::compaction::{estimate_input_tokens_conservative, estimate_text_tokens_conservative};
+use crate::compaction::{
+    estimate_input_tokens_conservative, estimate_input_tokens_for_pressure,
+    estimate_text_tokens_conservative,
+};
 use crate::config::Config;
 use crate::context_budget::PressureLevel;
 use crate::prompts::{CORE_EXECUTION_PROFILE_PROMPT, Personality};
@@ -23,7 +32,13 @@ use codewhale_models::{CacheControl, ContentBlock, Message, SystemPrompt, Tool};
 pub struct PromptSourceMap {
     pub entries: Vec<SourceEntry>,
     pub total_estimated_tokens: usize,
+    /// Headline: the same pressure estimate the context meter and the
+    /// auto-compaction gate read, so `/context` never disagrees with them.
     pub active_context_estimated_tokens: usize,
+    /// Secondary: the 1.5x-inflated conservative estimate request-overflow
+    /// protection guards with. `None` when there is no live conversation to
+    /// measure (headless doctor reports).
+    pub overflow_guard_estimated_tokens: Option<usize>,
     pub context_window_tokens: Option<u32>,
     /// Non-secret receipt for the effective context-window value.
     pub context_window_source: Option<String>,
@@ -218,6 +233,7 @@ impl ReportBuilder {
         self,
         context_window: crate::route_runtime::ContextWindowResolution,
         active_context_estimated_tokens: usize,
+        overflow_guard_estimated_tokens: Option<usize>,
         note: impl Into<String>,
     ) -> PromptSourceMap {
         let total_estimated_tokens = self
@@ -232,6 +248,7 @@ impl ReportBuilder {
             entries: self.entries,
             total_estimated_tokens,
             active_context_estimated_tokens,
+            overflow_guard_estimated_tokens,
             context_window_tokens: Some(context_window.tokens),
             context_window_source: Some(context_window.source.label().to_string()),
             budget_used_percent: Some(budget_used_percent),
@@ -245,7 +262,11 @@ pub fn build_context_report(app: &App) -> PromptSourceMap {
     // The host still stores the rung apart from the number; pair them against
     // the same route limits the pressure meter reads.
     let context_window = crate::route_runtime::ContextWindowResolution {
-        tokens: route_context_window_tokens(app.api_provider, &app.model, app.active_route_limits),
+        tokens: route_context_window_tokens(
+            app.api_provider,
+            app.effective_model_for_budget(),
+            app.active_route_limits,
+        ),
         source: app.active_context_window_source,
     };
     let mut builder = base_source_entries(
@@ -260,13 +281,28 @@ pub fn build_context_report(app: &App) -> PromptSourceMap {
         Some(context_window.tokens),
     );
     add_app_runtime_entries(&mut builder, app);
-    let active_context_estimated_tokens =
-        estimate_input_tokens_conservative(&app.api_messages, app.system_prompt.as_ref());
     builder.finish(
         context_window,
-        active_context_estimated_tokens,
-        "Diagnostic source map. Token counts are conservative estimates and may differ from provider billing.",
+        pressure_estimated_tokens(app),
+        Some(estimate_input_tokens_conservative(
+            &app.api_messages,
+            app.system_prompt.as_ref(),
+        )),
+        "Diagnostic source map. The headline is the pressure estimate the context meter and auto-compaction gate use; per-source counts are conservative estimates. All counts may differ from provider billing.",
     )
+}
+
+/// The one pressure number the context meter and the auto-compaction gate
+/// decide on: the un-inflated estimate over the live request, lifted to the
+/// provider's last billed prompt when that is higher (#5577).
+fn pressure_estimated_tokens(app: &App) -> usize {
+    let estimated =
+        estimate_input_tokens_for_pressure(&app.api_messages, app.system_prompt.as_ref());
+    let billed = app
+        .last_billed_input_tokens
+        .and_then(|tokens| usize::try_from(tokens).ok())
+        .unwrap_or(0);
+    estimated.max(billed)
 }
 
 #[must_use]
@@ -391,6 +427,7 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
     builder.finish(
         context_window,
         active_context_estimated_tokens,
+        None,
         "Headless diagnostic source map. Conversation, tool results, and live TUI state are unavailable in doctor mode.",
     )
 }
@@ -830,6 +867,7 @@ pub fn format_context_report(report: &PromptSourceMap) -> String {
         "Estimated active context: {} tokens",
         report.active_context_estimated_tokens
     );
+    write_overflow_guard_line(&mut out, report);
     match (report.context_window_tokens, report.budget_used_percent) {
         (Some(window), Some(percent)) => {
             let source = report
@@ -910,6 +948,17 @@ pub fn format_context_report(report: &PromptSourceMap) -> String {
     out
 }
 
+/// Secondary line: the inflated overflow-guard figure, labeled so nobody
+/// reads it as the pressure the meter and the compaction gate act on.
+fn write_overflow_guard_line(out: &mut String, report: &PromptSourceMap) {
+    if let Some(guard) = report.overflow_guard_estimated_tokens {
+        let _ = writeln!(
+            out,
+            "Overflow guard: {guard} tokens (conservative 1.5x estimate that blocks oversized requests; not the pressure the meter and auto-compaction read)"
+        );
+    }
+}
+
 pub fn format_context_summary(report: &PromptSourceMap) -> String {
     let mut entries = report.entries.clone();
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.estimated_tokens));
@@ -935,6 +984,7 @@ pub fn format_context_summary(report: &PromptSourceMap) -> String {
     if let Some(percent) = report.budget_used_percent {
         let _ = writeln!(out, "Budget used: {percent:.1}%");
     }
+    write_overflow_guard_line(&mut out, report);
     let _ = write!(out, "Top sources: {top}");
     out
 }
@@ -951,6 +1001,9 @@ pub fn prompt_context_json(context: &PromptContext) -> String {
         format!(r#"{{"error":"failed to serialize prompt context: {error}"}}"#)
     })
 }
+
+#[cfg(test)]
+mod pressure_fixture_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1000,12 +1053,14 @@ mod tests {
                 source: ContextWindowSource::Fallback,
             },
             123,
+            Some(185),
             "test",
         );
         let json = context_report_json(&report);
 
         assert!(json.contains("\"source_kind\": \"tool_result\""));
         assert!(json.contains("\"active_context_estimated_tokens\": 123"));
+        assert!(json.contains("\"overflow_guard_estimated_tokens\": 185"));
     }
 
     #[test]
@@ -1365,12 +1420,23 @@ mod tests {
                 source: ContextWindowSource::Fallback,
             },
             525,
+            Some(800),
             "test",
         );
         let summary = format_context_summary(&report);
 
         assert!(summary.contains("Context Summary"));
         assert!(summary.contains("Tool schemas (500)"));
+        // The headline is the pressure number; the inflated figure is only
+        // ever the labeled secondary overflow-guard line.
+        assert!(summary.contains("Estimated active context: 525 tokens"));
+        assert!(summary.contains("Overflow guard: 800 tokens"));
+        let full = format_context_report(&report);
+        let headline = full
+            .find("Estimated active context: 525 tokens")
+            .expect("pressure headline");
+        let guard = full.find("Overflow guard: 800 tokens").expect("guard line");
+        assert!(headline < guard, "{full}");
     }
 
     #[test]
@@ -1401,7 +1467,7 @@ mod tests {
         assert_eq!(resolved.source, ContextWindowSource::Catalog);
 
         let builder = ReportBuilder::new();
-        let report = builder.finish(resolved, 10_000, "test");
+        let report = builder.finish(resolved, 10_000, None, "test");
 
         assert_eq!(report.context_window_tokens, Some(route_window as u32));
         assert_eq!(report.context_window_source.as_deref(), Some("catalog"));

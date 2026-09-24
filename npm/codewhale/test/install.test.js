@@ -129,13 +129,13 @@ test("install failure hint checks configured release base when override is alrea
 test("glibc preflight message is Codewhale-branded and actionable", () => {
   const message = glibcInternal.glibcCompatibilityMessage([2, 39, 0], [2, 35, 0]);
 
-  assert.match(message, /Prebuilt Codewhale Linux binaries require GLIBC_2\.39/);
+  assert.match(message, /This Codewhale binary requires GLIBC_2\.39/);
   assert.match(message, /this system has glibc 2\.35/);
   assert.match(message, /cargo install codewhale-cli --locked/);
   assert.match(message, /ln -sf .*codewhale.*codew/);
   assert.doesNotMatch(message, /cargo install codewhale-tui/);
-  assert.match(message, /Linux x64 release asset is a static \(musl\) build/);
-  assert.match(message, /Linux arm64 asset is a GNU libc build/);
+  assert.match(message, /Linux release assets \(x64 and arm64\) are static musl builds/);
+  assert.doesNotMatch(message, /GNU libc/);
   assert.match(message, /CODEWHALE_SKIP_GLIBC_CHECK=1/);
 });
 

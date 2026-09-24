@@ -40,12 +40,167 @@ pub struct FleetTaskSpecDocument {
     pub usage_ceiling: Option<codewhale_protocol::fleet::FleetUsageCeiling>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+/// A parsed spec file in one of its three accepted shapes. The shape is
+/// chosen from the file's structure first ([`FleetTaskSpecShape::detect`]) and
+/// only then deserialized into the matching type, so a malformed spec reports
+/// the real field error instead of serde's opaque "did not match any variant
+/// of untagged enum".
+#[derive(Debug, Clone)]
 enum FleetTaskSpecFile {
     Document(FleetTaskSpecDocument),
     Tasks(Vec<FleetTaskSpec>),
     Single(Box<FleetTaskSpec>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FleetTaskSpecShape {
+    /// `{ name?, labels?, workers?, tasks = [...] }`
+    Document,
+    /// A bare JSON array of task objects.
+    Tasks,
+    /// A single task object (`{ id, name, instructions, ... }`).
+    Single,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FleetTaskSpecFormat {
+    Json,
+    Toml,
+}
+
+impl FleetTaskSpecFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Json => "JSON",
+            Self::Toml => "TOML",
+        }
+    }
+}
+
+/// Top-level keys that only a spec document carries.
+const DOCUMENT_KEYS: &[&str] = &["tasks", "workers", "worker_specs"];
+/// Top-level keys that mark a bare single-task file.
+const SINGLE_TASK_KEYS: &[&str] = &["id", "instructions"];
+
+impl FleetTaskSpecShape {
+    fn detect(value: &Value) -> Result<Self> {
+        match value {
+            Value::Array(_) => Ok(Self::Tasks),
+            Value::Object(map) => {
+                if DOCUMENT_KEYS.iter().any(|key| map.contains_key(*key)) {
+                    Ok(Self::Document)
+                } else if SINGLE_TASK_KEYS.iter().any(|key| map.contains_key(*key)) {
+                    Ok(Self::Single)
+                } else {
+                    // Name/labels-only (or empty) objects are documents; the
+                    // validator then reports the missing `tasks`.
+                    Ok(Self::Document)
+                }
+            }
+            other => bail!(
+                "a fleet task spec must be a document object with `tasks`, an array of task objects, or a single task object; found {}",
+                json_kind(other)
+            ),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Document => "spec document",
+            Self::Tasks => "task array",
+            Self::Single => "single task",
+        }
+    }
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+fn parse_task_spec_file(raw: &str, format: FleetTaskSpecFormat) -> Result<FleetTaskSpecFile> {
+    // Pass 1: syntax only, to learn the shape.
+    let value = match format {
+        FleetTaskSpecFormat::Json => serde_json::from_str::<Value>(raw)
+            .map_err(|err| anyhow::anyhow!("invalid JSON: {err}"))?,
+        FleetTaskSpecFormat::Toml => {
+            let table = toml::from_str::<toml::Table>(raw)
+                .map_err(|err| anyhow::anyhow!("invalid TOML: {err}"))?;
+            serde_json::to_value(table).context("converting TOML fleet task spec")?
+        }
+    };
+    let shape = FleetTaskSpecShape::detect(&value)?;
+
+    // Pass 2: typed deserialize of exactly that shape, from the raw text so
+    // the error keeps its line/column.
+    fn typed<T: serde::de::DeserializeOwned>(
+        raw: &str,
+        format: FleetTaskSpecFormat,
+    ) -> std::result::Result<T, String> {
+        match format {
+            FleetTaskSpecFormat::Json => serde_json::from_str::<T>(raw).map_err(|e| e.to_string()),
+            FleetTaskSpecFormat::Toml => toml::from_str::<T>(raw).map_err(|e| e.to_string()),
+        }
+    }
+    let parsed = match shape {
+        FleetTaskSpecShape::Document => {
+            typed::<FleetTaskSpecDocument>(raw, format).map(FleetTaskSpecFile::Document)
+        }
+        FleetTaskSpecShape::Tasks => {
+            typed::<Vec<FleetTaskSpec>>(raw, format).map(FleetTaskSpecFile::Tasks)
+        }
+        FleetTaskSpecShape::Single => typed::<FleetTaskSpec>(raw, format)
+            .map(|task| FleetTaskSpecFile::Single(Box::new(task))),
+    };
+    parsed.map_err(|err| {
+        let location = locate_spec_error(shape, &value)
+            .map(|loc| format!(" at {loc}"))
+            .unwrap_or_default();
+        anyhow::anyhow!(
+            "{} {}{location}: {}",
+            format.label(),
+            shape.label(),
+            err.trim()
+        )
+    })
+}
+
+/// Name the first task (or worker) entry that fails to deserialize on its
+/// own, e.g. `tasks[1] (id "review")`, so a long spec's error points at the
+/// entry and not only at a line number.
+fn locate_spec_error(shape: FleetTaskSpecShape, value: &Value) -> Option<String> {
+    fn first_bad<T: serde::de::DeserializeOwned>(prefix: &str, items: &[Value]) -> Option<String> {
+        items.iter().enumerate().find_map(|(index, item)| {
+            serde_json::from_value::<T>(item.clone()).err().map(|_| {
+                match item.get("id").and_then(Value::as_str) {
+                    Some(id) => format!("{prefix}[{index}] (id {id:?})"),
+                    None => format!("{prefix}[{index}]"),
+                }
+            })
+        })
+    }
+    match shape {
+        FleetTaskSpecShape::Document => {
+            if let Some(tasks) = value.get("tasks").and_then(Value::as_array)
+                && let Some(loc) = first_bad::<FleetTaskSpec>("tasks", tasks)
+            {
+                return Some(loc);
+            }
+            let workers = value
+                .get("workers")
+                .or_else(|| value.get("worker_specs"))
+                .and_then(Value::as_array)?;
+            first_bad::<FleetWorkerSpec>("workers", workers)
+        }
+        FleetTaskSpecShape::Tasks => first_bad::<FleetTaskSpec>("", value.as_array()?),
+        FleetTaskSpecShape::Single => None,
+    }
 }
 
 impl FleetTaskSpecFile {
@@ -138,12 +293,17 @@ pub fn load_task_spec_document(path: &Path) -> Result<FleetTaskSpecDocument> {
         .filter(|s| !s.is_empty())
         .unwrap_or("fleet-run")
         .to_string();
-    let parsed = match path.extension().and_then(|s| s.to_str()) {
-        Some("toml") => toml::from_str::<FleetTaskSpecFile>(&raw)
-            .with_context(|| format!("parsing TOML fleet task spec {}", path.display()))?,
-        _ => serde_json::from_str::<FleetTaskSpecFile>(&raw)
-            .with_context(|| format!("parsing JSON fleet task spec {}", path.display()))?,
+    let format = match path.extension().and_then(|s| s.to_str()) {
+        Some("toml") => FleetTaskSpecFormat::Toml,
+        _ => FleetTaskSpecFormat::Json,
     };
+    let parsed = parse_task_spec_file(&raw, format).with_context(|| {
+        format!(
+            "parsing {} fleet task spec {}",
+            format.label(),
+            path.display()
+        )
+    })?;
     let doc = parsed.into_document(fallback_name);
     validate_task_spec_document(&doc)?;
     Ok(doc)
@@ -1271,5 +1431,136 @@ mod tests {
         assert!(tmp.path().join(winning_path).is_file());
         assert_eq!(stale.result, FleetTaskResult::Fail);
         assert_eq!(winning.result, FleetTaskResult::Pass);
+    }
+
+    fn load_error(file_name: &str, body: &str) -> String {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(file_name);
+        std::fs::write(&path, body).unwrap();
+        let err = load_task_spec_document(&path).expect_err("spec should be rejected");
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn fleet_task_spec_document_shape_error_names_missing_field_and_task() {
+        let err = load_error(
+            "doc.json",
+            r#"{"name": "n", "tasks": [
+                {"id": "ok", "name": "ok", "instructions": "do it"},
+                {"id": "review", "name": "review"}
+            ]}"#,
+        );
+        assert!(!err.contains("untagged enum"), "{err}");
+        assert!(err.contains("JSON spec document"), "{err}");
+        assert!(err.contains("missing field `instructions`"), "{err}");
+        assert!(err.contains(r#"tasks[1] (id "review")"#), "{err}");
+    }
+
+    #[test]
+    fn fleet_task_spec_task_array_shape_error_names_missing_field() {
+        let err = load_error("tasks.json", r#"[{"id": "a", "instructions": "do it"}]"#);
+        assert!(!err.contains("untagged enum"), "{err}");
+        assert!(err.contains("JSON task array"), "{err}");
+        assert!(err.contains("missing field `name`"), "{err}");
+        assert!(err.contains(r#"[0] (id "a")"#), "{err}");
+    }
+
+    #[test]
+    fn fleet_task_spec_single_task_shape_error_names_missing_field() {
+        let err = load_error("one.json", r#"{"id": "a", "name": "a"}"#);
+        assert!(!err.contains("untagged enum"), "{err}");
+        assert!(err.contains("JSON single task"), "{err}");
+        assert!(err.contains("missing field `instructions`"), "{err}");
+    }
+
+    #[test]
+    fn fleet_task_spec_toml_document_error_names_missing_field() {
+        let err = load_error(
+            "doc.toml",
+            "name = \"n\"\n\n[[tasks]]\nid = \"a\"\ninstructions = \"do it\"\n",
+        );
+        assert!(!err.contains("untagged enum"), "{err}");
+        assert!(err.contains("TOML spec document"), "{err}");
+        assert!(err.contains("missing field `name`"), "{err}");
+        assert!(err.contains(r#"tasks[0] (id "a")"#), "{err}");
+    }
+
+    #[test]
+    fn fleet_task_spec_rejects_scalar_top_level_with_shape_hint() {
+        let err = load_error("scalar.json", "\"just a string\"");
+        assert!(err.contains("found a string"), "{err}");
+        assert!(err.contains("array of task objects"), "{err}");
+    }
+
+    #[test]
+    fn fleet_task_spec_single_and_array_shapes_load_with_fallback_name() {
+        let tmp = TempDir::new().unwrap();
+        let single = tmp.path().join("solo.json");
+        std::fs::write(
+            &single,
+            r#"{"id": "a", "name": "a", "instructions": "do it"}"#,
+        )
+        .unwrap();
+        let doc = load_task_spec_document(&single).unwrap();
+        assert_eq!(doc.name.as_deref(), Some("solo"));
+        assert_eq!(doc.tasks.len(), 1);
+
+        let array = tmp.path().join("pair.json");
+        std::fs::write(
+            &array,
+            r#"[{"id": "a", "name": "a", "instructions": "x"},
+                {"id": "b", "name": "b", "instructions": "y"}]"#,
+        )
+        .unwrap();
+        let doc = load_task_spec_document(&array).unwrap();
+        assert_eq!(doc.name.as_deref(), Some("pair"));
+        assert_eq!(doc.tasks.len(), 2);
+    }
+
+    #[test]
+    fn fleet_task_spec_toml_single_task_loads_with_fallback_name() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("solo.toml");
+        std::fs::write(
+            &path,
+            "id = \"a\"\nname = \"a\"\ninstructions = \"do it\"\n",
+        )
+        .unwrap();
+        let doc = load_task_spec_document(&path).unwrap();
+        assert_eq!(doc.name.as_deref(), Some("solo"));
+        assert_eq!(doc.tasks.len(), 1);
+    }
+
+    fn repo_doc(relative: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative)
+    }
+
+    #[test]
+    fn fleet_dogfood_example_spec_parses_and_validates() {
+        let doc = load_task_spec_document(&repo_doc("docs/examples/fleet-dogfood.toml"))
+            .expect("docs/examples/fleet-dogfood.toml must stay a valid fleet spec");
+        assert_eq!(doc.name.as_deref(), Some("dogfood smoke"));
+        let ids: Vec<_> = doc.tasks.iter().map(|task| task.id.as_str()).collect();
+        assert_eq!(ids, ["cargo-check", "protocol-review"]);
+    }
+
+    #[test]
+    fn fleet_workflow_tutorial_json_spec_parses_and_validates() {
+        let tutorial = std::fs::read_to_string(repo_doc("docs/FLEET_WORKFLOW_TUTORIAL.md"))
+            .expect("read fleet tutorial");
+        let start = tutorial
+            .find("```json\n")
+            .expect("tutorial should carry a JSON task spec")
+            + "```json\n".len();
+        let end = start + tutorial[start..].find("```").expect("closed JSON fence");
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("tasks.json");
+        std::fs::write(&path, &tutorial[start..end]).unwrap();
+        let doc = load_task_spec_document(&path)
+            .expect("the tutorial's tasks.json must stay a valid fleet spec");
+        assert_eq!(doc.name.as_deref(), Some("docs readiness check"));
+        assert_eq!(doc.tasks.len(), 2);
     }
 }

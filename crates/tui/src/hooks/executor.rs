@@ -2055,7 +2055,52 @@ impl HookExecutor {
     }
 
     /// Check whether a tool name matches a condition pattern with `*` glob support.
+    ///
+    /// DOCS-04: MCP-scoped patterns match on the owning MCP server, not on the
+    /// `mcp_` name prefix. The model calls a server tool by
+    /// [`crate::mcp::McpPool::mcp_model_tool_name`] (`mcp_<server>_<tool>`),
+    /// while the documented spelling is `mcp__<server>__<tool>`; both are
+    /// accepted. Any glob starting with `mcp_`, and any `mcp__` pattern, only
+    /// ever selects tools a server owns, so the built-in MCP helpers such as
+    /// `mcp_read_resource` are reachable by exact name only.
+    ///
+    /// Known limit: ownership is read from the model name, not the live pool,
+    /// so `mcp__<server>__…` splits at the first `__` (a server whose name
+    /// contains `__` needs the `mcp_<server>_…` spelling), and a server tool
+    /// whose model name collides with a helper name is treated as the helper.
     fn tool_name_matches_condition(tool_name: &str, pattern: &str) -> bool {
+        if tool_name == pattern {
+            return true;
+        }
+        // The shell tool is spelled `bash` / `Bash` on the model surface, and
+        // `exec_shell` is still stamped for the `shell_env` event and lives
+        // on in older hook configs. Treat the three as one tool, matching
+        // `tool_category_for`, so a condition written with any spelling fires.
+        if is_shell_tool_name(tool_name) && is_shell_tool_name(pattern) {
+            return true;
+        }
+        if let Some(rest) = pattern.strip_prefix("mcp_") {
+            let documented = rest.strip_prefix('_');
+            if documented.is_some() || pattern.contains('*') {
+                if !is_mcp_server_tool(tool_name) {
+                    return false;
+                }
+                let model_pattern = match documented {
+                    Some(rest) => match rest.split_once("__") {
+                        Some((server, tool)) => {
+                            crate::mcp::McpPool::mcp_model_tool_name(server, tool)
+                        }
+                        None => format!("mcp_{rest}"),
+                    },
+                    None => pattern.to_string(),
+                };
+                return Self::glob_matches(tool_name, &model_pattern);
+            }
+        }
+        Self::glob_matches(tool_name, pattern)
+    }
+
+    fn glob_matches(tool_name: &str, pattern: &str) -> bool {
         if !pattern.contains('*') {
             return tool_name == pattern;
         }
@@ -2073,7 +2118,8 @@ impl HookExecutor {
             None | Some(HookCondition::Always) => true,
             Some(HookCondition::ToolName { name }) => {
                 // #3026: Support `*` globs in tool_name conditions so
-                // `mcp__*` matches all MCP tools.  Exact names keep working.
+                // `mcp__*` matches every tool an MCP server owns (DOCS-04:
+                // not the built-in `mcp_*` helpers). Exact names keep working.
                 context
                     .tool_name
                     .as_ref()
@@ -2473,6 +2519,26 @@ impl HookExecutor {
     }
 }
 
+/// Whether `name` is a tool some MCP server owns, as opposed to one of the
+/// built-in MCP helpers the TUI itself registers (`McpPool::is_mcp_tool`
+/// counts both). Server tools are named by `McpPool::mcp_model_tool_name`.
+fn is_mcp_server_tool(name: &str) -> bool {
+    name.starts_with("mcp_")
+        && !matches!(
+            name,
+            "mcp_read_resource"
+                | "mcp_get_prompt"
+                | "list_mcp_resources"
+                | "list_mcp_resource_templates"
+                | "read_mcp_resource"
+        )
+}
+
+/// The spellings of the one shell tool (see `tool_category_for`).
+fn is_shell_tool_name(name: &str) -> bool {
+    matches!(name, "bash" | "Bash" | "exec_shell")
+}
+
 /// Classify a tool call for `condition = { type = "tool_category", … }`.
 ///
 /// Categories are `shell`, `file_write`, `safe`, and `other`, as documented in
@@ -2501,7 +2567,7 @@ fn tool_category_for(tool_name: &str, tool_args: Option<&str>) -> &'static str {
     match tool_name {
         // The shell surface. `exec_shell` is retired but kept here because
         // `shell.rs` still stamps it for the `shell_env` hook event.
-        "bash" | "Bash" | "exec_shell" => "shell",
+        name if is_shell_tool_name(name) => "shell",
         // The lowercase primitives ship without an action envelope.
         "read" | "todo_write" => "safe",
         "write" | "edit" => "file_write",
@@ -4299,16 +4365,36 @@ exit 7
 
     // ── #3026: glob matchers for tool_name conditions ──────────────────────
 
+    /// DOCS-04: the documented `mcp__*` glob must match the name the model
+    /// actually calls (built by `McpPool::mcp_model_tool_name`, which is
+    /// `mcp_<server>_<tool>`), and must not catch the built-in MCP helpers.
     #[test]
-    fn tool_name_glob_matches_mcp_prefix() {
-        assert!(HookExecutor::tool_name_matches_condition(
-            "mcp__github__create_issue",
-            "mcp__*"
-        ));
-        assert!(!HookExecutor::tool_name_matches_condition(
-            "read_file",
-            "mcp__*"
-        ));
+    fn mcp_glob_matches_real_model_tool_names_by_owning_server() {
+        let served = crate::mcp::McpPool::mcp_model_tool_name("github", "create_issue");
+        let other = crate::mcp::McpPool::mcp_model_tool_name("wiki", "lookup");
+        let matches = HookExecutor::tool_name_matches_condition;
+
+        assert!(matches(&served, "mcp__*"), "{served} must match mcp__*");
+        assert!(matches(&served, "mcp_*"), "{served} must match mcp_*");
+        assert!(matches(&served, "mcp__github__*"));
+        assert!(!matches(&other, "mcp__github__*"));
+        assert!(matches(&served, "mcp__github__create_issue"));
+        assert!(matches(&served, "mcp__*__create_issue"));
+        assert!(!matches(&other, "mcp__*__create_issue"));
+
+        for helper in [
+            "mcp_read_resource",
+            "mcp_get_prompt",
+            "list_mcp_resources",
+            "list_mcp_resource_templates",
+            "read_mcp_resource",
+        ] {
+            assert!(!matches(helper, "mcp__*"), "{helper} is built in");
+            assert!(!matches(helper, "mcp_*"), "{helper} is built in");
+            // Exact names still select a helper deliberately.
+            assert!(matches(helper, helper));
+        }
+        assert!(!matches("read_file", "mcp__*"));
     }
 
     #[test]
@@ -4321,6 +4407,29 @@ exit 7
             "read_files",
             "read_file"
         ));
+    }
+
+    #[test]
+    fn tool_name_shell_spellings_match_each_other_in_both_directions() {
+        let spellings = ["bash", "Bash", "exec_shell"];
+        for tool in spellings {
+            for pattern in spellings {
+                assert!(
+                    HookExecutor::tool_name_matches_condition(tool, pattern),
+                    "tool {tool} should match condition {pattern}"
+                );
+            }
+        }
+        // The alias is exact: it does not widen to other shell-ish tools.
+        assert!(!HookExecutor::tool_name_matches_condition(
+            "task_shell_start",
+            "bash"
+        ));
+        assert!(!HookExecutor::tool_name_matches_condition(
+            "bash",
+            "read_file"
+        ));
+        assert!(!HookExecutor::tool_name_matches_condition("BASH", "bash"));
     }
 
     #[test]
@@ -4343,10 +4452,6 @@ exit 7
 
     #[test]
     fn tool_name_glob_supports_infix_and_suffix_positions() {
-        assert!(HookExecutor::tool_name_matches_condition(
-            "mcp__github__create_issue",
-            "mcp__*__create_issue"
-        ));
         assert!(HookExecutor::tool_name_matches_condition(
             "task_shell_start",
             "*_shell_start"

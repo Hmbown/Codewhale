@@ -3076,7 +3076,7 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
         Ok(snapshots
             .into_iter()
             .map(|snapshot| SnapshotEntry {
-                id: snapshot.id.0,
+                id: snapshot.id.into_string(),
                 label: snapshot.label,
                 timestamp: snapshot.timestamp,
             })
@@ -3094,7 +3094,9 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
                 ));
             }
         };
-        repo.restore(&crate::snapshot::SnapshotId(id.to_string()))
+        let id = crate::snapshot::SnapshotId::parse(id)
+            .map_err(|err| format!("Restore failed: {err}"))?;
+        repo.restore(&id)
             .map_err(|err| format!("Restore failed: {err}"))
     }
 
@@ -4195,6 +4197,60 @@ impl CommandPluginContext for PluginAdapter<'_> {
         };
         drop(app);
         self.install(&spec, None)
+    }
+
+    fn suggestion_dismissals(
+        &self,
+    ) -> Result<codewhale_command_contract::facets::PluginSuggestionDismissals, String> {
+        // Stored lowercase by the CTA, but a hand-edited settings file may not
+        // be; fold here so the list matches what suggestions actually skip.
+        let persisted: std::collections::BTreeSet<String> = crate::settings::Settings::load()
+            .map_err(|err| format!("could not read saved plugin dismissals: {err}"))?
+            .dismissed_plugin_suggestions
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        let app = self.host.app.borrow();
+        let session = app
+            .plugin_cta
+            .dismissed
+            .iter()
+            .filter(|name| !persisted.contains(*name))
+            .cloned()
+            .collect();
+        Ok(
+            codewhale_command_contract::facets::PluginSuggestionDismissals {
+                persisted: persisted.into_iter().collect(),
+                session,
+            },
+        )
+    }
+
+    fn reset_suggestion_dismissals(&mut self, name: Option<&str>) -> Result<Vec<String>, String> {
+        let matches =
+            |candidate: &String| name.is_none_or(|target| candidate.eq_ignore_ascii_case(target));
+        let mut cleared = std::collections::BTreeSet::new();
+        crate::settings::Settings::transact_opt(|settings| {
+            let before = settings.dismissed_plugin_suggestions.len();
+            settings.dismissed_plugin_suggestions.retain(|candidate| {
+                let reset = matches(candidate);
+                if reset {
+                    cleared.insert(candidate.to_ascii_lowercase());
+                }
+                !reset
+            });
+            Ok((settings.dismissed_plugin_suggestions.len() != before).then_some(()))
+        })
+        .map_err(|err| format!("could not save plugin dismissals: {err}"))?;
+        let mut app = self.host.app.borrow_mut();
+        app.plugin_cta.dismissed.retain(|candidate| {
+            let reset = matches(candidate);
+            if reset {
+                cleared.insert(candidate.clone());
+            }
+            !reset
+        });
+        Ok(cleared.into_iter().collect())
     }
 }
 

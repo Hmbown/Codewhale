@@ -276,19 +276,19 @@
     "metaDescription": "Quick triage for common issues: hung turns, the offline queue, crash recovery, schema errors, MCP failures, and Docker notes.",
     "bodyClassName": "text-ink-soft leading-relaxed",
     "overviewTitle": "Troubleshooting",
-    "overviewLead": "Start with quick triage: confirm the binary and config (codewhale --version, ~/.codewhale/config.toml), enable verbose logs with RUST_LOG=deepseek_cli=debug when needed (RUST_LOG=deepseek_cli::client=debug for HTTP retries/reconnects), and capture the current state of ~/.codewhale/sessions and ~/.codewhale/tasks.",
+    "overviewLead": "Start with quick triage: confirm the binary and config (codewhale --version, ~/.codewhale/config.toml), enable verbose logs with RUST_LOG=codewhale_tui=debug when needed (RUST_LOG=codewhale_tui::client=debug for HTTP retries/reconnects; logs land in ~/.codewhale/logs/), and capture the current state of ~/.codewhale/sessions and ~/.codewhale/tasks.",
     "incidents": [
       [
         "Turn hangs or the stream stops",
-        "If a foreground shell command is still running, press Ctrl+B to move it to the background (the turn keeps running and the command becomes a background job under /jobs); use Esc or Ctrl+C to cancel the turn itself. Inspect deepseek_cli::client retry logs and endpoint connectivity, and after a restart confirm the previously in-flight turn shows as interrupted rather than running."
+        "If a foreground shell command is still running, press Ctrl+B to move it to the background (the turn keeps running and the command becomes a background job under /jobs); use Esc or Ctrl+C to cancel the turn itself. Inspect codewhale_tui::client retry logs and endpoint connectivity, and after a restart confirm the previously in-flight turn shows as interrupted rather than running."
       ],
       [
         "Network outage / offline behavior",
-        "New prompts queue while offline, persisted to ~/.codewhale/sessions/checkpoints/offline_queue.json. Inspect with /queue list, restore connectivity, then re-send queued entries (/queue edit <n> plus Enter, or the normal input flow); the queue file clears when the queue empties."
+        "New prompts queue while offline, persisted per session to ~/.codewhale/sessions/checkpoints/<session-id>.offline_queue.json (a legacy global offline_queue.json is adopted once on upgrade). Inspect with /queue list, restore connectivity, then re-send queued entries (/queue edit <n> plus Enter, or the normal input flow); the queue file clears when the queue empties."
       ],
       [
         "Crash recovery",
-        "The checkpoint lives at ~/.codewhale/sessions/checkpoints/latest.json; startup begins a fresh session unless --resume/--continue is supplied. Resume explicitly with codewhale --resume <id> or Ctrl+R in the TUI; if the checkpoint schema is newer than the binary supports, upgrade the binary or remove the stale checkpoint."
+        "Each session checkpoints to ~/.codewhale/sessions/checkpoints/<session-id>.json (a legacy latest.json is still read but no longer written); startup begins a fresh session unless --resume/--continue is supplied. Resume explicitly with codewhale --resume <id> or Ctrl+R in the TUI; if the checkpoint schema is newer than the binary supports, upgrade the binary or remove the stale checkpoint."
       ],
       [
         "Persistent state schema errors",
@@ -313,9 +313,9 @@
     "auditLead": "Inside the TUI, {auditCommand} shows which documented keys can change in the current session, which can also be persisted, and which stay file-only or restart-only — treat its “Command / reason” column as the source of truth before editing by hand.",
     "overlayTitle": "Per-project overlay",
     "overlayLead": "When a workspace contains a regular-file <workspace>/.codewhale/config.toml, the safe values it declares are merged on top of the global config (legacy <workspace>/.deepseek/config.toml files are still read when the Codewhale path is absent; symlinked project configs are rejected). This lets a repository suggest a model or tighten the local safety posture without touching the user's global config. Pass --no-project-config to skip the overlay for one launch.",
-    "overlayLimits": "The overlay is intentionally narrow: it supports model, reasoning_effort, approval_policy and sandbox_mode (tightening values only), notes_path, max_subagents (clamped to 1..=20), and allow_shell (false applies, true is ignored). Credentials, endpoints, provider selection, MCP config, hooks, skills, and instructions = [...] stay user-global — a repo-local config.toml that declares api_key, base_url, or provider is ignored, so a cloned repository cannot pick arbitrary local files into the prompt.",
+    "overlayLimits": "The overlay is intentionally narrow: it supports model, reasoning_effort, approval_policy and sandbox_mode (tightening values only), notes_path, max_subagents (clamped to 1..=128), and allow_shell (false applies, true is ignored). Credentials, endpoints, provider selection, MCP config, hooks, skills, and instructions = [...] stay user-global — a repo-local config.toml that declares api_key, base_url, or provider is ignored, so a cloned repository cannot pick arbitrary local files into the prompt.",
     "credentialsTitle": "Credential lookup",
-    "credentialsLead": "After any explicit {apiKey}, credentials resolve in config → keyring → env order. {authStatus} inspects the active provider's config file, OS keyring backend, environment variable, winning source, and last-four label without printing the key itself. Hosted, generic OpenAI-compatible, self-hosted, or native Anthropic routes are selected with {providerConfig} or {providerFlag}; the full registry lives on the Models & providers page and in docs/PROVIDERS.md.",
+    "credentialsLead": "For the active provider, the API key resolves in this order, first match wins: the route's own auth contract (OAuth routes use their consented token; auth_mode = \"none\" sends no key), then an explicit {apiKey}, then the config file api_key, then an api_key_env binding, then the secret store written by codewhale auth set (a file under ~/.codewhale/secrets/ by default; the OS keyring only when CODEWHALE_SECRET_BACKEND=system), then the provider's own environment variable, which is only sent to that provider's official endpoint. {authStatus} inspects the active provider's config file, secret-store backend, environment variable, winning source, and last-four label without printing the key itself. Hosted, generic OpenAI-compatible, self-hosted, or native Anthropic routes are selected with {providerConfig} or {providerFlag}; the full registry lives on the Models & providers page and in docs/PROVIDERS.md.",
     "legacyTitle": "Legacy .deepseek/ paths",
     "legacyLead": "Codewhale was renamed from DeepSeek-TUI. To avoid breaking existing installs, the runtime reads state from the new ~/.codewhale/ location but falls back to ~/.deepseek/ when only the legacy directory exists, and always writes to ~/.codewhale/ — read-with-fallback, write-to-new. State-dir resolution is consolidated in resolve_state_dir / ensure_state_dir in crates/config/src/lib.rs, and every legacy path reference carries an audited keep decision.",
     "sourceNote": "Source documents: docs/CONFIGURATION.md, docs/LEGACY_PATHS.md · Update docs-map.ts when changing."
@@ -391,19 +391,19 @@
         "Read-only investigation and planning. Codewhale can inspect the workspace, but it cannot run shell commands or edit files."
       ],
       [
-        "Act",
+        "Work",
         "Normal interactive coding. Codewhale can inspect, edit, and use tools; shell availability and approval prompts follow the active configuration and permission posture."
       ],
       [
         "Operate",
-        "Multitask coordination from the same composer. The parent can inspect, edit, and use shell or MCP tools under the same permission posture, sandbox, and safety rules as Act. Fleet workers are preferred for independent, parallel, background, or long-running work, but delegation is not required for every executable step. Workflow is optional unless the work needs ordered phases, gates, or deterministic fan-in."
+        "Multitask coordination from the same composer. The parent can inspect, edit, and use shell or MCP tools under the same permission posture, sandbox, and safety rules as Work. Fleet workers are preferred for independent, parallel, background, or long-running work, but delegation is not required for every executable step. Workflow is optional unless the work needs ordered phases, gates, or deterministic fan-in."
       ]
     ],
     "switchingTitle": "Switch modes",
-    "switchingLead": "When the composer is idle, press {tab} to cycle Plan → Act → Operate. When a completion menu is open, Tab accepts the completion; during an active turn, it can queue the current draft as the next follow-up.",
+    "switchingLead": "When the composer is idle, press {tab} to cycle Plan → Work → Operate. When a completion menu is open, Tab accepts the completion; during an active turn, it can queue the current draft as the next follow-up.",
     "switchingCommandLead": "Run /mode to open the picker, or switch directly:",
     "permissionsTitle": "Permission postures",
-    "permissionsLead": "Plan is always Read Only. When the composer is idle in Act or Operate, press {shiftTab} to cycle Ask → Auto-Review → Full Access. Run {configCommand} to inspect or edit the current session permission; project or managed policy may lock or tighten it.",
+    "permissionsLead": "Plan is always Read Only. When the composer is idle in Work or Operate, press {shiftTab} to cycle Ask → Auto-Review → Full Access. Run {configCommand} to inspect or edit the current session permission; project or managed policy may lock or tighten it.",
     "postures": [
       [
         "Ask",
@@ -411,7 +411,7 @@
       ],
       [
         "Auto-Review",
-        "Review tool risk automatically and ask when a decision needs you."
+        "Fully autonomous: it never stops to ask you. Proven-safe calls run, publish-like and destructive background actions are blocked, and anything else goes to a one-shot model review; high-risk calls and unresolved holds are denied rather than turned into a prompt."
       ],
       [
         "Full Access",
@@ -623,7 +623,7 @@
       ]
     ],
     "membershipTitle": "Who can dispatch",
-    "membershipLead": "Managed Agent surfaces authenticate to the same Codewhale membership — the {login} account session. Membership gates cloud agents, not local dispatch: `codewhale dispatch` with Daytona and forge credentials needs no account. Provider brands stay internal, and installing or running the local runtime needs no account at all.",
+    "membershipLead": "Managed Agent surfaces authenticate to the same Codewhale membership — the {login} account session. Membership gates cloud agents, not local dispatch: `codewhale dispatch` with Daytona and forge credentials needs no account. Managed cloud agents do not name the infrastructure behind them; local dispatch names Daytona only because you bring your own Daytona key. Installing or running the local runtime needs no account at all.",
     "leftoverTitle": "Not built yet",
     "leftover": [
       [
@@ -796,8 +796,10 @@
     "reload": "Reload the page",
     "homeLink": "Back to the home page",
     "docsIndexLink": "Open the documentation index",
-    "notFoundTitle": "There is no page at this address",
-    "notFoundBody": "The link may be old, or the page may have moved. The documentation index lists every current page.",
+    "notFoundTitle": "We all make typos.",
+    "notFoundBody": "This page doesn’t exist yet.\nNeither does this game.",
+    "notFoundHomeLink": "Return to base",
+    "notFoundPosterAlt": "A blue whale in tactical gear on the fictional Codwhale: Modern Whalefare game poster.",
     "unavailableTitle": "The live record has not loaded",
     "unavailableBody": "The source did not answer the last refresh, or this page has not refreshed since it was built. Nothing is shown in its place.",
     "offlineTitle": "You are offline",

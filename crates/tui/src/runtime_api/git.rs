@@ -91,9 +91,9 @@ async fn git_read(workspace: &FsPath, args: &[&str]) -> Result<GitRun, ApiError>
 }
 
 /// Write path for operator-driven mutations. Non-interactive by contract:
-/// no terminal prompt, no pager, and BatchMode ssh (unless the user already
-/// pins their own `GIT_SSH_COMMAND`) so a key prompt can never hang the
-/// request. Hooks and filters run exactly as they do for the user's own
+/// [`Git::tokio_command`] carries the shared no-prompt environment
+/// ([`crate::dependencies::apply_git_noninteractive_env`]) so a credential or
+/// key prompt can never hang the request. Hooks and filters run exactly as they do for the user's own
 /// `git` — a Review-sheet commit is the user's commit.
 async fn git_write(workspace: &FsPath, args: Vec<String>) -> Result<GitRun, ApiError> {
     let mut command = Git::tokio_command()
@@ -102,12 +102,7 @@ async fn git_write(workspace: &FsPath, args: Vec<String>) -> Result<GitRun, ApiE
         .args(&args)
         .current_dir(workspace)
         .stdin(Stdio::null())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_PAGER", "")
         .kill_on_drop(true);
-    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
-        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
-    }
     finish_git(command.output(), GIT_WRITE_TIMEOUT).await
 }
 

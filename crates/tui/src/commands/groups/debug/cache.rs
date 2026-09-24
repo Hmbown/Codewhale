@@ -10,11 +10,21 @@ use codewhale_models::MessageRequest;
 
 /// Show per-turn DeepSeek prefix-cache telemetry for the last N turns (#263).
 ///
-/// `arg` is parsed as a count override (default 10, capped at the ring size).
+/// `arg` is a subcommand (`inspect [--verbose|--json]`, `stats`, `zones`,
+/// `warmup`) or a count override (default 10, capped at the ring size);
+/// anything else is a usage error.
 /// Renders a fixed-width table the user can paste into a bug report.
 pub fn cache(app: &mut App, arg: Option<&str>) -> CommandResult {
     let arg = arg.map(str::trim).filter(|s| !s.is_empty());
-    if let Some(flags) = arg.and_then(|a| a.strip_prefix("inspect")) {
+    let inspect_flags = arg.and_then(|a| {
+        if a == "inspect" {
+            Some("")
+        } else {
+            a.strip_prefix("inspect")
+                .filter(|rest| rest.starts_with(char::is_whitespace))
+        }
+    });
+    if let Some(flags) = inspect_flags {
         let flags = flags.trim();
         let verbose = flags.split_whitespace().any(|flag| flag == "--verbose");
         let json_mode = flags.split_whitespace().any(|flag| flag == "--json");
@@ -30,7 +40,17 @@ pub fn cache(app: &mut App, arg: Option<&str>) -> CommandResult {
         return CommandResult::message(format_cache_zones(app));
     }
 
-    let want = arg.and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
+    let want = match arg {
+        None => 10,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                return CommandResult::error(format!(
+                    "Unknown /cache argument `{raw}`. Usage: /cache [count|inspect [--verbose|--json]|stats|zones|warmup]"
+                ));
+            }
+        },
+    };
     let cap = app.session.turn_cache_history.len();
     let count = want
         .min(cap)
@@ -448,11 +468,13 @@ fn format_cache_stats(app: &App) -> String {
 /// Render three-zone prefix contract status for `/cache zones` (#2264).
 ///
 /// Displays the PinnedPrefix fingerprint, AppendLog size, and TurnScratch
-/// state. The zones are type scaffolding only (Phase 1) — not yet
-/// enforcing the full contract at request time.
+/// state. PinnedPrefix is frozen and checked for drift each turn, and
+/// AppendLog is the backing store for the engine's session history
+/// (`core::session::Session::messages`). TurnScratch is still type
+/// scaffolding: nothing on the request path populates it.
 fn format_cache_zones(app: &App) -> String {
     let mut out = String::new();
-    out.push_str("Cache Zones (#2264 three-zone contract, Phase 1 foundation)\n");
+    out.push_str("Cache Zones (#2264 three-zone contract)\n");
 
     // ── PinnedPrefix ─────────────────────────────────────────────────
     out.push_str("\n── PinnedPrefix (system + tools, frozen baseline)\n");
@@ -485,7 +507,7 @@ fn format_cache_zones(app: &App) -> String {
 
     // ── AppendLog ────────────────────────────────────────────────────
     out.push_str("\n── AppendLog (conversation history, append-only)\n");
-    out.push_str("  Status:      Phase 1 scaffolding — not yet wired into engine\n");
+    out.push_str("  Status:      wired — backs the engine session history\n");
     let msg_count = app.api_messages.len();
     out.push_str(&format!("  Messages:    {msg_count}\n"));
     let history_count = app
@@ -497,7 +519,7 @@ fn format_cache_zones(app: &App) -> String {
 
     // ── TurnScratch ──────────────────────────────────────────────────
     out.push_str("\n── TurnScratch (per-turn ephemeral data)\n");
-    out.push_str("  Status:      Phase 1 scaffolding — not yet wired into engine\n");
+    out.push_str("  Status:      not wired — type scaffolding, unused by requests\n");
 
     // ── Zone contract summary ────────────────────────────────────────
     out.push_str("\n── Contract Status\n");
@@ -514,8 +536,8 @@ fn format_cache_zones(app: &App) -> String {
             "not frozen"
         }
     ));
-    out.push_str("  AppendLog:    Phase 1 foundation\n");
-    out.push_str("  TurnScratch:  Phase 1 foundation\n");
+    out.push_str("  AppendLog:    wired (session history)\n");
+    out.push_str("  TurnScratch:  not wired\n");
 
     out
 }
@@ -857,5 +879,94 @@ mod route_tests {
         };
 
         assert_eq!(format_turn_cache_route(&record), "lm-studio/local-code-...");
+    }
+}
+
+#[cfg(test)]
+mod zones_tests {
+    use super::*;
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    #[test]
+    fn cache_zones_output_reports_real_wiring() {
+        let mut app = App::new(
+            crate::test_support::test_tui_options(PathBuf::from(".")),
+            &Config::default(),
+        );
+        app.api_messages = std::sync::Arc::new(Vec::new());
+        app.last_pinned_prefix_hash = None;
+        app.prefix_change_count = 0;
+
+        let expected = "\
+Cache Zones (#2264 three-zone contract)
+
+── PinnedPrefix (system + tools, frozen baseline)
+  Status:    unavailable (not yet frozen)
+  Run a turn first to freeze the baseline.
+
+── AppendLog (conversation history, append-only)
+  Status:      wired — backs the engine session history
+  Messages:    0
+  History msgs: 0
+
+── TurnScratch (per-turn ephemeral data)
+  Status:      not wired — type scaffolding, unused by requests
+
+── Contract Status
+  PinnedPrefix: not frozen
+  AppendLog:    wired (session history)
+  TurnScratch:  not wired
+";
+        assert_eq!(format_cache_zones(&app), expected);
+    }
+}
+
+#[cfg(test)]
+mod arg_tests {
+    use super::*;
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    fn app() -> App {
+        App::new(
+            crate::test_support::test_tui_options(PathBuf::from(".")),
+            &Config::default(),
+        )
+    }
+
+    #[test]
+    fn cache_rejects_unknown_word_args() {
+        let mut app = app();
+        for arg in ["stat", "inspector", "inspect--json"] {
+            let result = cache(&mut app, Some(arg));
+            assert!(result.is_error, "/cache {arg} must be a usage error");
+            let text = result.message.as_deref().unwrap_or_default();
+            assert!(
+                text.contains(arg) && text.contains("Usage: /cache"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_inspect_matches_whole_word_with_optional_flags() {
+        let mut app = app();
+        for arg in ["inspect", "inspect --json", "inspect  --verbose"] {
+            let result = cache(&mut app, Some(arg));
+            let text = result.message.as_deref().unwrap_or_default();
+            assert!(!result.is_error, "/cache {arg}: {text}");
+            assert!(
+                !text.contains("Unknown /cache argument"),
+                "/cache {arg}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_numeric_arg_still_selects_count() {
+        let mut app = app();
+        let result = cache(&mut app, Some("5"));
+        assert!(!result.is_error);
     }
 }

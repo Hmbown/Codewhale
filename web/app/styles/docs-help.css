@@ -1,0 +1,147 @@
+/* ------------------------------------------------------------------ */
+/*  Docs: release truth, task index, contextual help                   */
+/* ------------------------------------------------------------------ */
+.release-truth {
+  margin-top: 1.4rem;
+  color: var(--ink-mute);
+}
+
+.release-truth-label {
+  color: var(--ink-mute);
+  font-size: 0.75rem;
+}
+
+.release-truth a {
+  color: var(--indigo);
+}
+
+.release-truth a:hover {
+  color: var(--indigo-deep);
+  text-decoration: underline;
+  text-underline-offset: 0.2rem;
+}
+
+.release-truth[data-release-state="published"] > span:not(.release-truth-label) {
+  color: var(--jade);
+}
+
+.docs-result-lead {
+  margin: -0.2rem 0 0.9rem;
+  color: var(--ink-soft);
+  font-size: 0.82rem;
+}
+
+.docs-result-heading h3 {
+  font-size: 1.05rem;
+  letter-spacing: -0.01em;
+}
+
+.docs-result-heading-topics {
+  margin-bottom: 0;
+  padding-bottom: 0.75rem;
+}
+
+.docs-result-topics {
+  display: grid;
+  gap: 2rem;
+}
+
+.docs-task-group .docs-topic-list {
+  border-top: 1px solid var(--stage-line);
+}
+
+.docs-task-row .docs-topic-source {
+  font-size: 0.75rem;
+}
+
+.docs-help {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(12rem, 0.7fr);
+  gap: clamp(1.5rem, 4vw, 3rem);
+  margin-top: 3rem;
+  padding: clamp(1.4rem, 3vw, 2rem);
+  border: 1px solid var(--stage-line);
+  border-radius: var(--radius-control);
+  background: var(--paper-card);
+}
+
+.docs-help-copy h2 {
+  font-size: 1.15rem;
+  letter-spacing: -0.015em;
+}
+
+.docs-help-copy p {
+  margin-top: 0.55rem;
+  color: var(--ink-soft);
+  font-size: 0.84rem;
+  line-height: 1.65;
+}
+
+.docs-help-source {
+  font-family: var(--font-mono);
+  font-size: 0.75rem !important;
+  color: var(--ink-mute) !important;
+}
+
+.docs-help-source a {
+  color: var(--indigo);
+}
+
+.docs-help-source a:hover { text-decoration: underline; text-underline-offset: 0.2rem; }
+
+.docs-help-links {
+  display: grid;
+  gap: 0.35rem;
+  align-content: start;
+  border-top: 1px solid var(--stage-line);
+  padding-top: 0.6rem;
+}
+
+.docs-help-links a {
+  display: inline-flex;
+  min-height: 2.5rem;
+  align-items: center;
+  color: var(--indigo);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+
+.docs-help-links a:hover { color: var(--indigo-deep); text-decoration: underline; text-underline-offset: 0.2rem; }
+
+@media (max-width: 760px) {
+  .docs-help { grid-template-columns: 1fr; }
+}
+
+/* ---------- reference tables on docs pages ---------- */
+.docs-ref-rows {
+  display: grid;
+  border-top: 1px solid var(--hairline);
+}
+
+.docs-ref-rows > div {
+  display: grid;
+  grid-template-columns: minmax(10rem, 0.42fr) minmax(0, 1fr);
+  gap: 1.25rem;
+  padding: 0.9rem 0;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.docs-ref-rows dt {
+  color: var(--ink);
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+
+.docs-ref-rows dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink-soft);
+  font-size: 0.86rem;
+  line-height: 1.6;
+}
+
+.docs-ref-rows code.inline { white-space: nowrap; }
+
+@media (max-width: 560px) {
+  .docs-ref-rows > div { grid-template-columns: 1fr; gap: 0.3rem; }
+}

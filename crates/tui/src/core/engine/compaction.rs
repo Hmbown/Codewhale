@@ -449,6 +449,12 @@ impl Engine {
         ) else {
             return false;
         };
+        // Nothing to summarize or prune: a pass cannot help, so do not make
+        // the user wait on a model call before the failure the caller will
+        // report anyway.
+        if !crate::compaction::has_compactable_history(&self.session.messages) {
+            return false;
+        }
 
         let id = format!("compact_{}", &uuid::Uuid::new_v4().to_string()[..8]);
         turn.stop_diagnostics.emergency_compaction_attempts = turn
@@ -520,8 +526,27 @@ impl Engine {
         let result = match compaction_result {
             Ok(result) => result,
             Err(err) => {
-                let message =
-                    format!("Context recovery failed: {err}. Original conversation was preserved.");
+                let message = if is_provider_rejection(&err) {
+                    // The turn's error line carries the provider's answer;
+                    // this receipt only closes the recovery attempt.
+                    "Context recovery stopped: the provider rejected the request. Original conversation was preserved.".to_string()
+                } else {
+                    let reason = format!("{err:#}");
+                    let reason = reason.trim_end().trim_end_matches('.');
+                    if reason
+                        .to_ascii_lowercase()
+                        .contains("conversation was preserved")
+                    {
+                        format!("Context recovery failed: {reason}.")
+                    } else {
+                        format!(
+                            "Context recovery failed: {reason}. Original conversation was preserved."
+                        )
+                    }
+                };
+                if is_provider_rejection(&err) {
+                    turn.context_recovery_rejection = Some(err);
+                }
                 self.emit_compaction_failed(id.clone(), true, message).await;
                 self.finish_compaction(&id);
                 return false;
@@ -653,4 +678,30 @@ impl Engine {
         };
         crate::runtime_handoff::replace_agent_topology_checkpoint(messages, &snapshots);
     }
+}
+
+/// A context-recovery failure that came from the provider refusing the
+/// request (capability, auth, reachability, quota) rather than from the
+/// summary itself. Context-length rejections are excluded: those really are
+/// the budget problem the caller already reports.
+pub(super) fn is_provider_rejection(err: &anyhow::Error) -> bool {
+    use crate::error_taxonomy::{ErrorCategory, classify_error_message};
+    let text = format!("{err:#}");
+    if super::context::is_context_length_error_message(&text)
+        || matches!(
+            err.downcast_ref::<crate::llm_client::LlmError>(),
+            Some(crate::llm_client::LlmError::ContextLengthError(_))
+        )
+    {
+        return false;
+    }
+    err.downcast_ref::<crate::llm_client::LlmError>().is_some()
+        || matches!(
+            classify_error_message(&text),
+            ErrorCategory::Authentication
+                | ErrorCategory::Authorization
+                | ErrorCategory::Network
+                | ErrorCategory::RateLimit
+                | ErrorCategory::Timeout
+        )
 }

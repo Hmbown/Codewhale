@@ -33,8 +33,10 @@ no better interface.
 - `pointer {action, target?}` — move/down/up primitives (foreground/shared only).
 - `app_script {script, language?, timeout?}` — macOS local only: AppleScript
   (default) or JXA through osascript. `result` is stdout; refusals are
-  `script_error`, `script_timeout`, `automation_denied` (-1743 consent) and
-  `unsupported_on_transport` on ssh/docker/hdc.
+  `script_error`, `script_timeout`, `automation_denied` (-1743 consent),
+  `script_refused` (shell escapes, ObjC bridge, terminal apps, or an app not
+  named with a literal) and `unsupported_on_transport` on ssh/docker/hdc.
+  Every app the script names needs consent like any other target.
 
 ## Apps & computers
 - `open_application {name|bundle_id|pid, activate?}` — bind the input target; `app_not_found` when the selector resolves nowhere.
@@ -64,8 +66,11 @@ no better interface.
   `scope:"foreground"` is the separate shared-pointer decision
   `open_application activate:true` needs. A denied app fails `app_denied`
   under every spelling; only the user can revoke it.
+  `consent {action:"allow", confirm:"<token>"}` records the user's approval
+  of one exact pay/buy/send/transfer/delete call that refused
+  `confirmation_required` — only after they approved it.
 - `list_sessions` — live sessions on this machine (content-free) and the user's control mode.
-- `trajectory {action:"start"|"stop"|"status"|"replay", id?, dry_run?}` — record this session's tool calls to a local JSONL; replay re-enters the normal pipeline and stops at the first refusal.
+- `trajectory {action:"start"|"stop"|"status"|"replay", id?, dry_run?}` — record this session's tool calls to a local, owner-only JSONL (entered text redacted; those steps do not replay); replay re-enters the normal pipeline and stops at the first refusal.
 - `stop_computer_control {reason?}` — kill switch; input for this session ends.
 - Capability grant (host config): `CODEWHALE_CU_GRANT="read-only"` or a tool list — the session can never see or call beyond it (`not_granted`).
 

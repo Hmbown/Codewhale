@@ -1220,12 +1220,7 @@ fn parse_task_options(opts_json: &str) -> Result<TaskRequest, String> {
         .map_err(|err| format!("task(): {err}"))?;
     options.write_roots = normalize_task_paths("writeRoots", options.write_roots, 32)?;
     options.exact_files = normalize_task_paths("exactFiles", options.exact_files, 32)?;
-    let cwd = options
-        .cwd
-        .take()
-        .map(|value| normalize_task_paths("cwd", vec![value], 1))
-        .transpose()?
-        .and_then(|mut paths| paths.pop());
+    let cwd = options.cwd.as_deref().map(normalize_task_cwd).transpose()?;
     options.coordination_contracts =
         normalize_task_string_list("coordinationContracts", options.coordination_contracts, 16)?;
     options.dependencies = normalize_task_string_list("dependencies", options.dependencies, 8)?;
@@ -1345,6 +1340,12 @@ fn normalize_task_string_list(
         }
     }
     Ok(normalized)
+}
+
+/// Normalize a task working directory at both plan preflight and VM dispatch.
+/// The same bounded repo-relative policy applies to both entry points.
+pub fn normalize_task_cwd(value: &str) -> Result<String, String> {
+    normalize_task_paths("cwd", vec![value.to_owned()], 1).map(|mut paths| paths.remove(0))
 }
 
 fn normalize_task_paths(

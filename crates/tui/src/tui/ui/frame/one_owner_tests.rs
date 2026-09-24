@@ -3,7 +3,7 @@
 //!
 //! Under the composer: row 1 is the posture bar (permission, mode, live
 //! counts, the one hint that applies now), row 2 is the metrics line (model,
-//! ctx, cost, ttft, tok/s, output tokens); the roster and to-do rows follow
+//! context, cost, ttft, tok/s, output tokens); the roster and to-do rows follow
 //! only when they have content. Every fact below is asserted to appear in
 //! the composed frame exactly once.
 
@@ -43,6 +43,9 @@ fn frame_app() -> App {
     // passed locally and failed on both CI legs until it was pinned. Force
     // the wider, unenforced reading so every host asserts the same row.
     app.sandbox_backend = None;
+    // The fixture config carries no key; a keyless launch paints "model not
+    // connected" (U3). These rows are about a connected route.
+    app.onboarding_needs_api_key = false;
     app
 }
 
@@ -158,13 +161,15 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         // (#5950 — it used to go silent below 50%).
         let mut facts = vec![
             ("mode chip", format!("   {mode} (")),
-            ("permission chip", format!(" {permission} (")),
+            // Mark 8: the permission in force is marked `●` and followed by
+            // what its key does, not a parenthesised chord.
+            ("permission chip", format!("● {permission}")),
             ("model", model),
             ("cost", super::session_cost_label(&app)),
             ("agent count", "2 agents".to_string()),
             ("ttft", "ttft 400ms".to_string()),
         ];
-        facts.push(("context reading", format!("ctx {pct}%")));
+        facts.push(("context reading", format!("context {pct}%")));
         facts.push(("output rate", "40 avg tok/s".to_string()));
         if width >= 120 {
             facts.push((
@@ -187,11 +192,11 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         // roster — never the other way round.
         let posture = rows
             .iter()
-            .position(|row| row.contains("(Shift+Tab)"))
+            .position(|row| row.contains("● "))
             .expect("posture bar");
         let metrics = rows
             .iter()
-            .position(|row| row.contains("ctx "))
+            .position(|row| row.contains("context "))
             .expect("metrics line");
         let composer = app
             .viewport
@@ -226,7 +231,7 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         // still just over a 120-column budget, so the hint wins here and
         // the turn half needs ~160. The shed-order contract itself lives
         // in tideline_tests.
-        let turn_needle = "sub-agents underway 1m 15s";
+        let turn_needle = "agents underway 1m 15s";
         if width >= 160 {
             assert!(rows[posture].contains(turn_needle), "{}", rows[posture]);
             assert_eq!(
@@ -276,13 +281,16 @@ fn idle_frame_keeps_two_chrome_rows_and_last_turn_metrics() {
     app.is_loading = false;
     app.turn_started_at = None;
     app.subagent_cache.clear();
-    let rows = draw(&mut app, 100, 32);
+    // 120 columns: the labeled readings ("thinking: max", "context 0%",
+    // mark 8) are wider than the bare ones, so at 100 columns the output
+    // count (shed priority 7, ahead of the help hint) is shed by design.
+    let rows = draw(&mut app, 120, 32);
     let composer = app.viewport.last_composer_area.unwrap().bottom() as usize;
-    assert!(rows[composer].contains("(Shift+Tab)"), "{}", rows[composer]);
+    assert!(rows[composer].contains("● "), "{}", rows[composer]);
     // The idle fixture sits at 0% context and says so: the reading is on
     // the row at every fullness (#5950), not only once it is a problem.
     assert!(
-        rows[composer + 1].contains("ctx 0%"),
+        rows[composer + 1].contains("context 0%"),
         "{}",
         rows[composer + 1]
     );
@@ -367,8 +375,8 @@ fn row_presets_reclaim_rows_and_quiet_them_in_the_composed_frame() {
     // halves only both fit beside the pinned unenforced-scope permission
     // chip from that width up, and this test asserts the full row's clocks.
     let (width, height) = (160u16, 32u16);
-    let posture_row = |rows: &[String]| rows.iter().position(|row| row.contains("(Shift+Tab)"));
-    let metrics_row = |rows: &[String]| rows.iter().position(|row| row.contains("ctx "));
+    let posture_row = |rows: &[String]| rows.iter().position(|row| row.contains("● "));
+    let metrics_row = |rows: &[String]| rows.iter().position(|row| row.contains("context "));
 
     let mut app = working_app();
     let full = draw(&mut app, width, height);
@@ -402,7 +410,7 @@ fn row_presets_reclaim_rows_and_quiet_them_in_the_composed_frame() {
         "the metrics line keeps its row"
     );
     assert_eq!(
-        count_rows_containing(&rows, "ctx "),
+        count_rows_containing(&rows, "context "),
         1,
         "the context reading is still painted once"
     );
@@ -439,7 +447,7 @@ fn row_presets_reclaim_rows_and_quiet_them_in_the_composed_frame() {
     );
     let pct = super::info_context_percent(&app);
     assert!(
-        rows[metrics].contains(&format!("ctx {pct}%")),
+        rows[metrics].contains(&format!("context {pct}%")),
         "{:?}",
         rows[metrics]
     );
@@ -622,7 +630,7 @@ fn statusline_full_frame_presets_preserve_transcript_composer_and_hitboxes() {
                     context.is_none() && model.is_none(),
                     "hidden chrome has no stale actions: {evidence}"
                 );
-                assert_eq!(count_rows_containing(&rows, "ctx "), 0, "{evidence}");
+                assert_eq!(count_rows_containing(&rows, "context "), 0, "{evidence}");
             } else {
                 let context = context.expect("visible context has an inspector hitbox");
                 let model = model.expect("visible model has a picker hitbox");
@@ -642,7 +650,7 @@ fn statusline_full_frame_presets_preserve_transcript_composer_and_hitboxes() {
                     );
                     assert!(!composer.intersects(target.area), "{evidence}");
                 }
-                assert_eq!(count_rows_containing(&rows, "ctx 0%"), 1, "{evidence}");
+                assert_eq!(count_rows_containing(&rows, "context 0%"), 1, "{evidence}");
             }
             if metrics == ChromeRowPreset::Compact {
                 if width >= 60 {
@@ -709,7 +717,7 @@ fn statusline_full_frame_custom_cost_preserves_evidence_and_width_shedding() {
         let (rows, _) = draw_into(&mut app, &mut terminal);
         eprintln!("{width}x{height} custom-saved-unknown\n{}", rows.join("\n"));
         let metrics = rows.last().unwrap();
-        assert!(metrics.contains("ctx 0%"), "{metrics}");
+        assert!(metrics.contains("context 0%"), "{metrics}");
         if width >= 60 {
             assert!(metrics.contains(expected), "{width}: {metrics}");
         } else {
@@ -863,7 +871,7 @@ fn statusline_full_frame_context_reading_updates_below_and_at_warning() {
             let (rows, cursor) = draw_into(&mut app, &mut terminal);
             let evidence = format!("{width}x{height} context-{pct}\n{}", rows.join("\n"));
             eprintln!("{evidence}");
-            let label = format!("ctx {pct}%");
+            let label = format!("context {pct}%");
             assert_eq!(count_rows_containing(&rows, &label), 1, "{evidence}");
             assert!(
                 rows.iter()
@@ -890,7 +898,8 @@ fn statusline_full_frame_context_reading_updates_below_and_at_warning() {
                 ChromeInk::Metadata
             };
             let buffer = terminal.backend().buffer();
-            for (x, ink) in [(context.area.x, label_ink), (context.area.x + 4, value_ink)] {
+            // The value starts after the "context " label.
+            for (x, ink) in [(context.area.x, label_ink), (context.area.x + 8, value_ink)] {
                 assert_eq!(
                     buffer[(x, context.area.y)].fg,
                     codewhale_palette::grammar::chrome_style(&app.ui_theme, ink)

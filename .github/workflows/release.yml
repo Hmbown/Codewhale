@@ -26,6 +26,10 @@ jobs:
   resolve:
     timeout-minutes: 10
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Read release-candidate.yml runs for the RC receipt check below.
+      actions: read
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       sha: ${{ steps.release.outputs.sha }}
@@ -107,6 +111,16 @@ jobs:
           ./scripts/release/check-versions.sh --require-dated-release
       - name: Require release source on main
         run: ./scripts/release/ensure-release-on-main.sh "${{ steps.release.outputs.sha }}"
+      - name: Require a green release-candidate receipt for this exact SHA
+        # Fail fast, before the long parity and artifact builds: the tag must
+        # point at a commit a release-candidate run already validated,
+        # Parity included. A missing receipt means run the RC on this SHA,
+        # never move the tag (v0.10.0 was re-pointed after the RC skipped
+        # parity).
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.release.outputs.sha }}
+        run: ./scripts/release/require-rc-receipt.sh "${GITHUB_REPOSITORY}" "${SHA}"
       - name: Refuse an existing public asset set
         env:
           GH_TOKEN: ${{ github.token }}
@@ -114,90 +128,9 @@ jobs:
         run: node scripts/release/ensure-release-assets-absent.js "${GITHUB_REPOSITORY}" "${TAG}"
 
   parity:
-    timeout-minutes: 45
+    name: Parity
     needs: resolve
-    runs-on: ubuntu-latest
-    steps:
-      # resolve already proved GITHUB_SHA equals the tag commit. Do not
-      # interpolate needs.resolve.outputs.sha into checkout or cache keys —
-      # CodeQL treats a *sha* ref as an untrusted checkout on workflow_dispatch
-      # (default-branch cache write).
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-18
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
-      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        id: sccache
-        continue-on-error: true
-      - name: Enable sccache
-        if: steps.sccache.outcome == 'success'
-        shell: bash
-        run: |
-          {
-            echo "SCCACHE_GHA_ENABLED=true"
-            echo "RUSTC_WRAPPER=sccache"
-            echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1"
-          } >> "${GITHUB_ENV}"
-      - name: Install Linux system dependencies
-        run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
-      # Restore after the trusted lockfile is on disk. Key is OS + arch +
-      # explicit stable toolchain + rust-cache's Cargo.lock / rust-toolchain
-      # hash. Never interpolate github.event, github.ref, github.sha, or inputs.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: false
-          prefix-key: v1-${{ runner.os }}-${{ runner.arch }}-stable
-      - uses: taiki-e/install-action@e88e69ecdb9658bd172693dcdc2c84e7f0ab6a11 # nextest
-        with:
-          tool: nextest
-      - name: Format check
-        run: cargo fmt --all -- --check
-      - name: Compile check
-        run: cargo check --workspace --all-targets --locked
-      - name: OHOS dependency graph
-        run: ./scripts/release/check-ohos-deps.sh
-      - name: Clippy
-        run: |
-          cargo clippy --workspace --all-targets --all-features --locked -- \
-            -D warnings \
-            -A clippy::uninlined_format_args \
-            -A clippy::too_many_arguments \
-            -A clippy::unnecessary_map_or \
-            -A clippy::collapsible_if \
-            -A clippy::assertions_on_constants
-      - name: Workspace tests
-        # Same test binaries as `cargo test`, run by cargo-nextest: one process
-        # per test. This gate used libtest, where every test shares one process,
-        # so a test that mutates process-global state leaks into its neighbours.
-        # It failed on five such tests — deterministically, and on a different
-        # set on different machines — while CI's nextest lanes were green on the
-        # same source, and every one of them passes in isolation. Match the lane
-        # that gates every merge; doctests are the next step, because nextest
-        # does not run them.
-        run: sh scripts/with-hermetic-test-home.sh cargo nextest run --workspace --all-features --locked --profile ci
-        env:
-          # Match the CI test lane: test threads get the same stack the product
-          # gives itself (main.rs CODEWHALE_MAIN_STACK_BYTES). See the note in
-          # ci.yml's "Run tests" step. Without it this gate runs the deep
-          # engine/runtime futures on a stack that never ships.
-          RUST_MIN_STACK: '16777216'
-      - name: Workspace doctests
-        run: sh scripts/with-hermetic-test-home.sh cargo test --workspace --all-features --locked --doc
-        env:
-          RUST_MIN_STACK: '16777216'
-      - name: Protocol schema parity
-        run: sh scripts/with-hermetic-test-home.sh cargo test -p codewhale-protocol --test parity_protocol --locked
-      - name: State persistence parity
-        run: sh scripts/with-hermetic-test-home.sh cargo test -p codewhale-state --test parity_state --locked
-      - name: Lockfile drift guard
-        run: git diff --exit-code -- Cargo.lock
+    uses: ./.github/workflows/release-parity.yml
 
   artifacts:
     needs: [parity, resolve]
@@ -583,3 +516,97 @@ jobs:
           TAP_REPO: Hmbown/homebrew-deepseek-tui
           TOKEN: ${{ secrets.HOMEBREW_TAP_PAT || secrets.RELEASE_TAG_PAT }}
         run: bash .github/scripts/update-homebrew-tap.sh
+
+  # Every publish used to turn Web Frontend red: `check:latest-release`
+  # compares the checked-in release record with GitHub's latest release, and
+  # nothing wrote the record, so someone hand-committed it after each release.
+  # This job writes the record, proves it against the web gates, and proposes
+  # it to main as a bot PR. It never pushes to the default branch: the ruleset
+  # requires a PR there. While the PR is open (up to 24h after publish, and
+  # only when the record is exactly one release behind), `check:latest-release`
+  # warns instead of failing on every event (see web/scripts/sync-latest-release.mjs).
+  #
+  # Known limit: repo settings stop GITHUB_TOKEN from opening PRs, so the PR is
+  # opened with RELEASE_TAG_PAT. Without it the job pushes the branch and fails
+  # with the compare link, which is still one click instead of a hand commit.
+  sync-release-record:
+    timeout-minutes: 15
+    needs: [release, resolve]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          # derive-facts.mjs dates model ids from git history (web.yml pins 0
+          # for the same reason); a shallow clone rewrites every addedAt.
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Refresh the release record from the published release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node web/scripts/sync-latest-release.mjs
+          node web/scripts/derive-facts.mjs
+      - name: Prove the record passes the web fact gates
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node web/scripts/sync-latest-release.mjs --check
+          node web/scripts/check-cloud-facts.mjs
+          node web/scripts/check-facts.mjs
+      - name: Propose the record to the default branch
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_TOKEN: ${{ secrets.RELEASE_TAG_PAT }}
+        run: |
+          set -euo pipefail
+          paths=(
+            web/data/latest-published-release.json
+            docs/public-surface-facts.json
+            docs/cloud-facts/stable.json
+            web/lib/facts.generated.ts
+          )
+          if git diff --quiet -- "${paths[@]}"; then
+            echo "Release record already current on ${DEFAULT_BRANCH}; nothing to propose."
+            exit 0
+          fi
+          # GitHub's latest may already be newer than this run's tag; the
+          # record always follows GitHub, so name the branch after what it says.
+          recorded="$(node -p "require('./web/data/latest-published-release.json').tag")"
+          branch="chore/release-record-${recorded}"
+          title="chore(web): record ${recorded} as the published release"
+
+          git config user.name "CodeWhale Bot"
+          git config user.email "bot@codewhale.net"
+          git switch --quiet -c "${branch}"
+          git add -- "${paths[@]}"
+          git commit --quiet \
+            -m "${title}" \
+            -m "Written by release.yml sync-release-record after ${TAG} published. Gates run in the job: sync-latest-release --check, check-cloud-facts, check-facts."
+          git show --stat --format='%h %s' HEAD
+
+          if git ls-remote --exit-code --heads origin "${branch}" >/dev/null; then
+            echo "::notice title=Release record already proposed::Branch ${branch} exists; leaving it for review."
+            exit 0
+          fi
+          git push origin "HEAD:refs/heads/${branch}"
+
+          compare="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${DEFAULT_BRANCH}...${branch}?expand=1"
+          if [[ -n "${PR_TOKEN}" ]] && GH_TOKEN="${PR_TOKEN}" gh pr create \
+              --repo "${GITHUB_REPOSITORY}" --base "${DEFAULT_BRANCH}" --head "${branch}" \
+              --title "${title}" \
+              --body "Written by release.yml \`sync-release-record\` after ${TAG} published. Merging it turns \`check:latest-release\` green on ${DEFAULT_BRANCH}. No-Issue: release automation."; then
+            echo "::notice title=Release record proposed::Opened a PR from ${branch}."
+            exit 0
+          fi
+          echo "::error title=Release record PR not opened::Branch ${branch} is pushed; open and merge it: ${compare}"
+          exit 1

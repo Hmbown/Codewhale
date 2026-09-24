@@ -564,6 +564,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         pending_approvals: Vec::new(),
         pending_user_inputs: Vec::new(),
         pending_dynamic_tool_calls: Vec::new(),
+        approval_grants: Vec::new(),
     };
 
     let messages = messages_from_thread_detail(&detail);
@@ -644,6 +645,7 @@ fn legacy_exact_thread_export_normalizes_provider_kind_and_id() {
         pending_approvals: Vec::new(),
         pending_user_inputs: Vec::new(),
         pending_dynamic_tool_calls: Vec::new(),
+        approval_grants: Vec::new(),
     };
     let config = Config {
         provider: Some("lm-studio".to_string()),
@@ -1249,6 +1251,7 @@ async fn build_test_server(
             }
             Arc::new(cell)
         },
+        computer: super::computer_display::ComputerState::from_env(),
         compat_stream_test_hook: overrides.compat_stream_test_hook,
     };
     let app = build_router(state);
@@ -2848,6 +2851,177 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
 }
 
 #[tokio::test]
+async fn agent_run_cancel_stops_a_live_child_and_returns_its_receipt() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-agent-run-cancel-{}", Uuid::new_v4()));
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let manager = crate::tools::subagent::new_shared_subagent_manager(workspace.clone(), 2);
+    let agent_id = {
+        let mut guard = manager.write().await;
+        let id = guard.insert_test_running_agent("stoppable", &workspace);
+        guard.assign_test_session_owner(&id, "session-stop");
+        id
+    };
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_subagents(
+            root.clone(),
+            root.join("sessions"),
+            None,
+            false,
+            workspace,
+            Some(manager.clone()),
+            None,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let response = client
+        .post(format!("http://{addr}/v1/agent-runs/{agent_id}/cancel"))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt: serde_json::Value = response.json().await?;
+    assert_eq!(receipt["spec"]["worker_id"], agent_id.as_str());
+    assert_eq!(receipt["status"], "cancelled");
+    assert_eq!(
+        manager.read().await.get_result(&agent_id)?.status,
+        crate::tools::subagent::SubAgentStatus::Cancelled
+    );
+
+    // Stopping a stopped run is a no-op that answers with the same receipt.
+    let again = client
+        .post(format!("http://{addr}/v1/agent-runs/{agent_id}/cancel"))
+        .send()
+        .await?;
+    assert_eq!(again.status(), StatusCode::OK);
+    let again: serde_json::Value = again.json().await?;
+    assert_eq!(again["status"], "cancelled");
+
+    let missing = client
+        .post(format!("http://{addr}/v1/agent-runs/missing/cancel"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(missing, StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_run_cancel_remains_idempotent_before_receipt_persistence() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().to_path_buf();
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    // A memory-only manager deterministically models a disk projection that
+    // has not caught up. Repeated stops must use its authoritative receipt.
+    let manager = Arc::new(tokio::sync::RwLock::new(
+        crate::tools::subagent::SubAgentManager::new(workspace.clone(), 2),
+    ));
+    let agent_id = {
+        let mut guard = manager.write().await;
+        let id = guard.insert_test_running_agent("not-yet-persisted", &workspace);
+        guard.assign_test_session_owner(&id, "session-stop");
+        id
+    };
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_subagents(
+            root.clone(),
+            root.join("sessions"),
+            None,
+            false,
+            workspace.clone(),
+            Some(manager),
+            None,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    for _ in 0..2 {
+        let response = client
+            .post(format!("http://{addr}/v1/agent-runs/{agent_id}/cancel"))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let receipt: serde_json::Value = response.json().await?;
+        assert_eq!(receipt["spec"]["worker_id"], agent_id.as_str());
+        assert_eq!(receipt["status"], "cancelled");
+    }
+    assert!(
+        !workspace
+            .join(".codewhale/state/subagents.v1.json")
+            .exists()
+    );
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_run_cancel_refuses_a_run_owned_by_a_session_it_does_not_host() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-agent-run-cancel-foreign-{}",
+        Uuid::new_v4()
+    ));
+    let workspace = root.join("workspace");
+    fs::create_dir_all(workspace.join(".codewhale/state"))?;
+    // A child parked on a question in another terminal session: in flight on
+    // disk, but no engine in this runtime owns it.
+    let mut record = {
+        let manager = crate::tools::subagent::new_shared_subagent_manager(workspace.clone(), 1);
+        let mut guard = manager.write().await;
+        let id = guard.insert_test_running_agent("elsewhere", &workspace);
+        guard.assign_test_session_owner(&id, "terminal-session");
+        guard
+            .list_worker_records()
+            .into_iter()
+            .find(|record| record.spec.worker_id == id)
+            .expect("seeded record")
+    };
+    record.status = crate::tools::subagent::AgentWorkerStatus::WaitingForUser;
+    fs::write(
+        workspace.join(".codewhale/state/subagents.v1.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "agents": [],
+            "workers": [record],
+        }))?,
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root.clone(),
+            root.join("sessions"),
+            None,
+            false,
+            workspace,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let response = client
+        .post(format!(
+            "http://{addr}/v1/agent-runs/agent_elsewhere/cancel"
+        ))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response.text().await?;
+    assert!(body.contains("not hosting"), "{body}");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn stream_requires_prompt() -> Result<()> {
     let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
         return Ok(());
@@ -4002,15 +4176,32 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
     .await
     .context("old Runtime did not release its store before restart")?;
 
-    let (addr, _manager, server) = spawn_test_server_with_root_token_mobile_workspace(
-        root,
-        sessions,
-        Some(token.into()),
-        false,
-        workspace,
-    )
-    .await?
-    .context("loopback listener required for restarted lookup proof")?;
+    // The old server tears its runtime down on its own thread after the
+    // abort, so its mock TaskManager can hold the execution-scope owner lock
+    // a moment longer than the thread manager above. A second owner is
+    // correctly refused; wait for the release instead of racing it.
+    let deadline = tokio::time::Instant::now() + ci_scaled(Duration::from_secs(10));
+    let (addr, _manager, server) = loop {
+        match spawn_test_server_with_root_token_mobile_workspace(
+            root.clone(),
+            sessions.clone(),
+            Some(token.into()),
+            false,
+            workspace.clone(),
+        )
+        .await
+        {
+            Err(error)
+                if format!("{error:#}").contains("execution scope is already owned")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                sleep(Duration::from_millis(20)).await;
+            }
+            started => {
+                break started?.context("loopback listener required for restarted lookup proof")?;
+            }
+        }
+    };
     // Startup recovery is complete. No Engine is installed in this Runtime.
     let before = file_bytes(&store_root)?;
     let response = client
@@ -14772,12 +14963,12 @@ async fn terminal_routes_serve_a_live_engine_session_over_http() -> Result<()> {
     )
     .map_err(anyhow::Error::msg)?;
 
-    // Input through the route, then the shell's own echo back through the
-    // route. Bytes in, bytes out, no direct access to the session object.
+    // Input and command output through the route, without direct session
+    // access. Start output on its own line even if the shell paints a prompt.
     let write: serde_json::Value = client
         .post(format!("{base}/input"))
         .json(&serde_json::json!({
-            "data": "printf 'terminal-route-proof\\n'\n",
+            "data": "printf '\\nterminal-route-proof\\n'\n",
             "encoding": "text"
         }))
         .send()
@@ -14807,12 +14998,19 @@ async fn terminal_routes_serve_a_live_engine_session_over_http() -> Result<()> {
             .await
             .expect("terminal output route answers");
         let data = chunk["data"].as_str().unwrap_or_default();
-        if data.contains("terminal-route-proof") {
-            // Reads are non-consuming: the same cursor returns the same bytes.
+        if data
+            .lines()
+            .any(|line| line.trim() == "terminal-route-proof")
+        {
+            // Wait for the command's output, not its echoed input. Reads are
+            // non-consuming, but the shell can append its prompt between them.
             let again = read_chunk(base.clone(), client.clone())
                 .await
                 .expect("terminal output route answers");
-            assert_eq!(again["data"], chunk["data"]);
+            assert!(
+                again["data"].as_str().unwrap_or_default().starts_with(data),
+                "a repeated read must retain every byte already observed"
+            );
             break;
         }
         assert!(
@@ -17540,11 +17738,21 @@ async fn diagnostics_list_and_read_bounded_windows() -> Result<()> {
     let _env_lock = crate::test_support::lock_test_env();
     let tmp = tempfile::tempdir()?;
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
-    // Crash dumps resolve under the user home (`<home>/.codewhale/crashes`),
-    // independent of the codewhale-home override that governs logs.
+    // An explicit profile owns both logs and crashes, even when ambient
+    // legacy crash files exist outside it.
     let _user_home = crate::test_support::EnvVarGuard::set("HOME", tmp.path().join("userhome"));
-    let logs = tmp.path().join("cwhome/logs");
-    let crashes = tmp.path().join("userhome/.codewhale/crashes");
+    let logs = tmp.path().join("cwhome").join("logs");
+    let crashes = tmp.path().join("cwhome").join("crashes");
+    let ambient_crashes = tmp
+        .path()
+        .join("userhome")
+        .join(".deepseek")
+        .join("crashes");
+    fs::create_dir_all(&ambient_crashes)?;
+    fs::write(
+        ambient_crashes.join("ambient-only.log"),
+        "not in this profile",
+    )?;
     fs::create_dir_all(&logs)?;
     fs::create_dir_all(&crashes)?;
     fs::write(logs.join("tui-20990101-1.log"), "line one\nline two\n")?;
@@ -17608,6 +17816,8 @@ async fn diagnostics_list_and_read_bounded_windows() -> Result<()> {
         .error_for_status()?
         .json()
         .await?;
+    assert_eq!(crashes_list["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(crashes_list["sources"][0]["dir"], json!(crashes));
     assert!(
         crashes_list["sources"][0]["files"]
             .as_array()
@@ -17624,6 +17834,14 @@ async fn diagnostics_list_and_read_bounded_windows() -> Result<()> {
         .json()
         .await?;
     assert_eq!(crash["content"], "Panic: boom\n");
+
+    let status = client
+        .get(format!("{base}/v1/crashes/ambient-only.log"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     // Traversal and missing files fail closed.
     let status = client

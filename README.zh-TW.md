@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:29c349b6f2b4 -->
+<!-- source: README.md sha256:bbb8bfb61e57 -->
 # Codewhale
 
 Codewhale 是一款開源代理，可使用你選擇的託管模型或本機模型讀取專案、編輯檔案、執行指令，並檢查自己的工作。從終端機中的一項任務開始。對於較大的工作，可以將部分任務交給使用不同模型、擔任不同角色的代理。
@@ -27,7 +27,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 
 Windows 請從 [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest) 下載對應的安裝程式或封存檔。已有的直接安裝使用 `codewhale update`；若只想檢查，使用 `codewhale update --check`。更新器會顯示執行檔路徑，並保留較新的建置版本。npm 和 Cargo 是次要套件安裝方式；套件管理器安裝的遷移與 PATH 設定請參閱[安裝指南](docs/INSTALL.md)。
 
-第一次執行時，系統會協助你連線至供應商，也可以離線設定 Codewhale。要取得模型回覆，必須連線至託管模型或本機模型。Codewhale 也支援 npm 和 Cargo 作為次要套件安裝方式，以及 Docker、Nix、Scoop、Android/Termux 與選用的 CNB 鏡像。對於既有的套件管理器安裝，系統會提供遷移說明。請參閱[安裝與 PATH 說明](docs/INSTALL.md)。
+第一次執行會直接開啟輸入框，不會引導你完成設定流程。要取得模型回覆，必須連線至託管模型或本機模型：在連線之前，啟動畫面會顯示 "no model connected"。執行 `/provider`（或按 F3）即可新增託管服務金鑰或選擇本機執行環境。如果 Ollama 已在執行且帶有聊天模型，Codewhale 會自動切換到它。Codewhale 也支援 npm 和 Cargo 作為次要套件安裝方式，以及 Docker、Nix、Scoop、Android/Termux 與選用的 CNB 鏡像。對於既有的套件管理器安裝，系統會提供遷移說明。請參閱[安裝與 PATH 說明](docs/INSTALL.md)。
 
 每種 shell 只需一個指令即可啟用 Tab 自動完成——`codewhale completion bash|zsh|fish|powershell|elvish`。請參閱 [shell 自動完成](docs/INSTALL.md#8-shell-completions)。
 
@@ -53,7 +53,7 @@ Codewhale 可以讀取你的程式碼儲存庫、編輯檔案、執行指令、�
 
 - **終端機：** `codewhale` 開啟互動介面；`codewhale exec` 可從指令碼或 CI 工作中執行任務。
 - **本機瀏覽器：** `codewhale web` 開啟隨附的[本機網頁用戶端](docs/WEB.md)，使用同一個 Runtime。
-- **Codewhale 桌面應用程式（GPUI）：** 原生 GPUI 桌面應用程式是產品客戶端方向（2026-09-14 決定；階段規劃見私有 codehwhale-gpui 儲存庫中的 docs/TRANSITION.md）。app.codewhale.net 的託管網頁應用程式將分階段退場；行銷網站、登入、計費、法律與下載頁面永久保留在網頁上。其可用情況見[產品頁面](https://codewhale.net/en/product)。
+- **Codewhale 桌面應用程式（GPUI）：** 在獨立儲存庫中開發的原生桌面應用程式是登入後產品客戶端的方向。app.codewhale.net 的託管網頁應用程式將依它的樣子重建；行銷網站、登入、計費、法律與下載頁面保留在網頁上。其可用情況見[產品頁面](https://codewhale.net/en/product)。
 
 **Computer Use 提供觀察其他應用程式並與之互動的工具。** 目前的原始碼已包含此外掛程式。使用前請檢視它要求的存取權限並啟用它；仍須符合作業系統權限與平台要求。請參閱隨附的 [Computer Use 指南](crates/tui/plugins/computer-use/README.md)與[外掛程式設定](docs/PLUGINS.md)。
 
@@ -80,7 +80,7 @@ Codewhale 在你的電腦上執行，且只擁有你授予的存取權限。核�
 - [代理團隊](docs/FLEET.md)
 - [MCP](docs/MCP.md)、[掛鉤](docs/HOOKS.md)與[設定](docs/CONFIGURATION.md)
 - [本機網頁用戶端](docs/WEB.md)
-- [所有文件](docs)
+- [所有文件](docs/README.md)
 - [儲存庫結構與貢獻指南](CONTRIBUTING.md#project-structure)
 
 ## 加入社群

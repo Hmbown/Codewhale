@@ -61,13 +61,7 @@ fn list() -> CommandResult {
     let mut out = String::new();
     out.push_str(&format!("{} parked draft(s):\n\n", entries.len()));
     for (idx, entry) in entries.iter().enumerate() {
-        let preview = preview_first_line(&entry.text, 80);
-        let ts = if entry.ts.is_empty() {
-            "(no ts)".to_string()
-        } else {
-            entry.ts.clone()
-        };
-        out.push_str(&format!("  {idx}. [{ts}] {preview}\n"));
+        out.push_str(&format_stash_line(idx, &entry.ts, &entry.text));
     }
     out.push_str("\nUse `/stash pop` to restore the most recent draft.");
     CommandResult::message(out)
@@ -107,6 +101,13 @@ fn pop(app: &mut App) -> CommandResult {
     }
 }
 
+/// One `/stash list` row. `idx` is the 0-based position; users see 1-based.
+fn format_stash_line(idx: usize, ts: &str, text: &str) -> String {
+    let ts = if ts.is_empty() { "(no ts)" } else { ts };
+    let preview = preview_first_line(text, 80);
+    format!("  {}. [{ts}] {preview}\n", idx + 1)
+}
+
 /// Take a one-line preview of `text`, capped at `max_chars`.
 /// Multi-line drafts get a single-line summary so the listing
 /// stays scannable.
@@ -123,6 +124,15 @@ fn preview_first_line(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stash_list_numbers_entries_from_one() {
+        assert_eq!(
+            format_stash_line(0, "2026-09-22T10:00:00Z", "first draft\nmore"),
+            "  1. [2026-09-22T10:00:00Z] first draft\n"
+        );
+        assert_eq!(format_stash_line(2, "", "third"), "  3. [(no ts)] third\n");
+    }
 
     #[test]
     fn preview_first_line_truncates_to_cap() {

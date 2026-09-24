@@ -283,8 +283,9 @@ Then run `/plugin enable example` again. Trust and enablement are separate:
 bits themselves and always drop into this same review — see
 [PLUGINS.md](PLUGINS.md). `/plugin suggest` ranks installed bundles and
 any locally added marketplace catalogs; sending a matching task can toast the
-same next step without installing anything, and a live composer CTA plus an
-append-only `<recommended_plugins>` user block offer the same review path.)
+same next step without installing anything. Nothing is written into the
+model's request to advertise plugins; the full offering policy is in
+[PLUGINS.md](PLUGINS.md#how-codewhale-offers-plugins).)
 
 Trust, enable, disable, revoke, and reload rebuild the current workspace's
 Skills, MCP, Commands, Agent profiles, and Hooks immediately. Each persisted

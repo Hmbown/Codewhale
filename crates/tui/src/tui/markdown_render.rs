@@ -136,6 +136,14 @@ fn theme_set() -> &'static ThemeSet {
     THEME_SET.get_or_init(ThemeSet::load_defaults)
 }
 
+/// Load the syntect syntax and theme sets ahead of the first fenced code
+/// block, so that render does not pay the one-time deserialization cost.
+/// Idempotent; intended to run once on a background thread at TUI boot.
+pub(crate) fn prewarm_syntax_highlighting() {
+    let _ = syntax_set();
+    let _ = theme_set();
+}
+
 fn syntax_color_depth() -> palette::ColorDepth {
     *COLOR_DEPTH.get_or_init(palette::ColorDepth::detect)
 }

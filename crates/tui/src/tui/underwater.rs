@@ -1498,6 +1498,8 @@ struct LaunchFit {
     context: bool,
     help: bool,
     notice: bool,
+    /// The "no model connected · run /provider" line (UX-3).
+    setup: bool,
     heading: bool,
     blanks: usize,
     shown: usize,
@@ -1520,6 +1522,7 @@ impl LaunchFit {
             + (self.context as usize)
             + (self.help as usize)
             + (self.notice as usize)
+            + (self.setup as usize)
             + self.blanks * self.gap
             + 1
             + (self.heading as usize)
@@ -1533,17 +1536,27 @@ impl LaunchFit {
 /// Shed the card down to `height`, in a fixed order: rhythm, the migration
 /// notice, the MCP block's detail, identity/help chrome, then the tail of
 /// the recent list. The overflow row keeps any hidden sessions reachable.
+/// The "no model connected" line goes last of all: on a keyless first run
+/// it is the only thing on the card that explains why nothing will answer.
 ///
 /// The MCP block gives up its rows before the recent list does (recent work
 /// is what the screen is *for*) but keeps its summary line until almost
 /// everything else has gone, because "2 failed" in one row still tells the
 /// truth that the footer chip could not.
-fn launch_fit(height: usize, recent: usize, has_more: bool, notice: bool, mcp: usize) -> LaunchFit {
+fn launch_fit(
+    height: usize,
+    recent: usize,
+    has_more: bool,
+    notice: bool,
+    mcp: usize,
+    setup: bool,
+) -> LaunchFit {
     let mut fit = LaunchFit {
         brand: true,
         context: true,
         help: true,
         notice,
+        setup,
         heading: recent > 0 || has_more,
         blanks: LAUNCH_SEPARATORS,
         shown: recent,
@@ -1576,6 +1589,7 @@ fn launch_fit(height: usize, recent: usize, has_more: bool, notice: bool, mcp: u
             }
             10 => fit.mcp = 0,
             11 => fit.see_all = false,
+            12 => fit.setup = false,
             _ => break,
         }
         step += 1;
@@ -1623,6 +1637,9 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
     }
 
     let (entries, has_more) = launch_recent_entries(app);
+    // Nothing will answer a message until a model is connected; the card
+    // says so instead of letting the first Enter fail silently (UX-3).
+    let no_model_connected = app.onboarding_needs_api_key;
     // Built before the fit ladder runs: how many rows the block wants is a
     // fact about this workspace's servers, not about the pane.
     let mcp_block = mcp_launch_lines(app, text_width);
@@ -1647,6 +1664,7 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
         has_more,
         app.launch.claude_code_detected,
         mcp_block.lines.len(),
+        no_model_connected,
     );
     if mark.is_some() && !(fit.brand && fit.context) {
         // At the absolute height floor the wordmark yields to the actions too.
@@ -1657,6 +1675,7 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
             has_more,
             app.launch.claude_code_detected,
             mcp_block.lines.len(),
+            no_model_connected,
         );
     }
     let header_width =
@@ -1728,6 +1747,18 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
             }
             text[row] = Some(Line::from(spans));
         }
+    }
+    if fit.setup {
+        let line = format!(
+            "{}{}{}",
+            tr(locale, MessageId::LaunchNoModelConnected),
+            crate::tui::session_boot::ITEM_SEPARATOR,
+            tr(locale, MessageId::LaunchRunCommand).replace("{command}", "/provider"),
+        );
+        text.push(Some(Line::from(Span::styled(
+            semantic_truncate(&line, text_width),
+            Style::default().fg(theme.warning),
+        ))));
     }
     // The migration notice, while there is still a question to answer. It
     // retires for good once `/import-claude` has been run.
@@ -2329,15 +2360,24 @@ mod launch_card_tests {
                 for has_more in [false, true] {
                     for notice in [false, true] {
                         for mcp in 0usize..=4 {
-                            let fit = launch_fit(height, recent, has_more, notice, mcp);
-                            assert!(fit.rows() <= height.max(1), "{height} {recent}: {fit:?}");
-                            assert!(fit.shown <= recent);
-                            assert!(fit.mcp <= mcp);
-                            if fit.shown < recent {
-                                assert!(
-                                    fit.see_all || fit.rows() >= height,
-                                    "shed rows became unreachable: {fit:?}",
-                                );
+                            for setup in [false, true] {
+                                let fit = launch_fit(height, recent, has_more, notice, mcp, setup);
+                                assert!(fit.rows() <= height.max(1), "{height} {recent}: {fit:?}");
+                                assert!(fit.shown <= recent);
+                                assert!(fit.mcp <= mcp);
+                                if fit.shown < recent {
+                                    assert!(
+                                        fit.see_all || fit.rows() >= height,
+                                        "shed rows became unreachable: {fit:?}",
+                                    );
+                                }
+                                if setup && !fit.setup {
+                                    assert_eq!(
+                                        (fit.shown, fit.mcp, fit.see_all),
+                                        (0, 0, false),
+                                        "the no-model line outlived other rows: {fit:?}",
+                                    );
+                                }
                             }
                         }
                     }
@@ -2347,15 +2387,31 @@ mod launch_card_tests {
     }
 
     #[test]
+    fn a_keyless_launch_says_no_model_is_connected_and_how_to_fix_it() {
+        let mut app = app_with_recent(&["Fix the parser"], 1);
+        app.onboarding_needs_api_key = true;
+        let lines = painted(&app, 100, 30).join("\n");
+        assert!(lines.contains("no model connected"), "{lines}");
+        assert!(lines.contains("/provider"), "{lines}");
+        // Even a pane too short for the recent list keeps the recovery line.
+        let short = painted(&app, 100, 3).join("\n");
+        assert!(short.contains("no model connected"), "{short}");
+
+        app.onboarding_needs_api_key = false;
+        let lines = painted(&app, 100, 30).join("\n");
+        assert!(!lines.contains("no model connected"), "{lines}");
+    }
+
+    #[test]
     fn empty_workspace_omits_recent_section_but_hidden_history_stays_reachable() {
         let app = app_with_recent(&[], 0);
         let text = painted(&app, 100, 24).join("\n");
         assert!(text.contains("New session"));
         assert!(!text.contains("Recent"));
         assert!(!text.contains("No recent sessions"));
-        assert!(!launch_fit(24, 0, false, false, 0).heading);
-        assert!(launch_fit(24, 0, true, false, 0).heading);
-        assert!(launch_fit(24, 0, true, false, 0).see_all);
+        assert!(!launch_fit(24, 0, false, false, 0, false).heading);
+        assert!(launch_fit(24, 0, true, false, 0, false).heading);
+        assert!(launch_fit(24, 0, true, false, 0, false).see_all);
     }
 
     // --- the row reads as one object -----------------------------------

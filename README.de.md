@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:29c349b6f2b4 -->
+<!-- source: README.md sha256:bbb8bfb61e57 -->
 # Codewhale
 
 Codewhale ist ein Open-Source-Agent, der dein Projekt liest, Dateien bearbeitet, Befehle ausführt und seine Arbeit mit einem gehosteten oder lokalen Modell deiner Wahl prüft. Starte mit einer Aufgabe im Terminal. Teile eine größere Aufgabe auf Agenten mit verschiedenen Modellen und Rollen auf.
@@ -27,7 +27,7 @@ Das Installationsprogramm wählt die neueste veröffentlichte Version aus. Das [
 
 Unter Windows lade das passende Installationsprogramm oder Archiv von [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest) herunter. Bestehende direkte Installationen aktualisierst du mit `codewhale update`; `codewhale update --check` prüft nur. Der Updater zeigt den Pfad der ausführbaren Datei und behält neuere Builds bei. npm und Cargo sind nachrangige Paketoptionen. Hinweise zur Migration aus einer Paketverwaltung und zu PATH stehen in der [Installationsanleitung](docs/INSTALL.md).
 
-Beim ersten Start hilft dir Codewhale, einen Anbieter zu verbinden oder Codewhale offline einzurichten. Antworten erfordern ein verbundenes gehostetes oder lokales Modell. Codewhale unterstützt außerdem npm und Cargo als nachrangige Paketoptionen sowie Docker, Nix, Scoop, Android/Termux und einen optionalen CNB-Spiegel. Bestehende Installationen über Paketverwaltungen erhalten Migrationshinweise. Siehe die [Hilfe zu Installation und PATH](docs/INSTALL.md).
+Der erste Start öffnet direkt den Editor für Nachrichten; es gibt keinen Einrichtungsassistenten. Antworten erfordern ein verbundenes gehostetes oder lokales Modell: Solange keines verbunden ist, zeigt der Startbildschirm "no model connected". Führe `/provider` aus (oder drücke F3), um einen Schlüssel für einen gehosteten Anbieter hinzuzufügen oder eine lokale Laufzeit zu wählen. Läuft Ollama bereits mit einem Chat-Modell, wechselt Codewhale von selbst dorthin. Codewhale unterstützt außerdem npm und Cargo als nachrangige Paketoptionen sowie Docker, Nix, Scoop, Android/Termux und einen optionalen CNB-Spiegel. Bestehende Installationen über Paketverwaltungen erhalten Migrationshinweise. Siehe die [Hilfe zu Installation und PATH](docs/INSTALL.md).
 
 Die Tab-Vervollständigung lässt sich für jede Shell mit einem einzigen Befehl aktivieren — `codewhale completion bash|zsh|fish|powershell|elvish`. Siehe [Shell-Vervollständigung](docs/INSTALL.md#8-shell-completions).
 
@@ -53,7 +53,7 @@ Das Terminal und die grafischen Clients verbinden sich mit der Codewhale Runtime
 
 - **Terminal:** `codewhale` öffnet die interaktive Oberfläche; `codewhale exec` führt eine Aufgabe aus einem Skript oder CI-Job aus.
 - **Lokaler Browser:** `codewhale web` öffnet den mitgelieferten [lokalen Webclient](docs/WEB.md) für dieselbe Runtime.
-- **Codewhale-Desktop-App (GPUI):** Die native GPUI-Desktop-App ist die Produkt-Client-Richtung (Beschluss vom 2026-09-14; der Phasenplan liegt in docs/TRANSITION.md im privaten codehwhale-gpui-Repo). Die gehostete Web-App unter app.codewhale.net wird schrittweise eingestellt; Marketing-Website, Anmeldung, Abrechnung, Rechts- und Download-Seiten bleiben dauerhaft im Web. Die Verfügbarkeit ist auf der [Produktseite](https://codewhale.net/en/product) angegeben.
+- **Codewhale-Desktop-App (GPUI):** Eine native Desktop-App, die in einem separaten Repository entwickelt wird, ist die Richtung für den angemeldeten Produkt-Client. Die gehostete Web-App unter app.codewhale.net wird nach ihrem Vorbild neu gebaut; Marketing-Website, Anmeldung, Abrechnung, Rechts- und Download-Seiten bleiben im Web. Die Verfügbarkeit ist auf der [Produktseite](https://codewhale.net/en/product) angegeben.
 
 **Computer Use ergänzt Werkzeuge zum Beobachten anderer Anwendungen und zur Interaktion mit ihnen.** Das Plugin ist im aktuellen Quellcode enthalten. Prüfe die angeforderten Zugriffsrechte und aktiviere es vor der Verwendung; Betriebssystemberechtigungen und Plattformanforderungen gelten weiterhin. Siehe die mitgelieferte [Anleitung zu Computer Use](crates/tui/plugins/computer-use/README.md) und die [Plugin-Einrichtung](docs/PLUGINS.md).
 
@@ -80,7 +80,7 @@ Lies die [Autorisierungsreihenfolge](docs/AUTHORIZATION_ORDER.md) für die genau
 - [Agententeams](docs/FLEET.md)
 - [MCP](docs/MCP.md), [Hooks](docs/HOOKS.md) und [Konfiguration](docs/CONFIGURATION.md)
 - [Lokaler Webclient](docs/WEB.md)
-- [Gesamte Dokumentation](docs)
+- [Gesamte Dokumentation](docs/README.md)
 - [Aufbau des Repositorys und Anleitung zum Mitwirken](CONTRIBUTING.md#project-structure)
 
 ## Der Community beitreten

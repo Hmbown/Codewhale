@@ -1,4 +1,4 @@
-  Config  ──────────────────────────────
+  Settings  ────────────────────────────
  ‹ Appearance  1/7                    › 
   Search: type to filter  (17/71)       
    Display                            █ 

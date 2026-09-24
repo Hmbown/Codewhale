@@ -4374,7 +4374,7 @@ approval_required = true
         assert_eq!(view.selected_role(), "reviewer");
         assert_eq!(
             view.roster_override_note().as_deref(),
-            Some("Replaces the built-in 'reviewer' role in the roster.")
+            Some("Replaces the built-in 'reviewer' role in the Fleet.")
         );
 
         let role_step = render_through_stack(
@@ -4420,7 +4420,7 @@ approval_required = true
         assert_eq!(custom_view.selected_role(), "custom");
         assert_eq!(
             custom_view.roster_override_note().as_deref(),
-            Some("Replaces the built-in 'custom' role in the roster.")
+            Some("Replaces the built-in 'custom' role in the Fleet.")
         );
     }
 

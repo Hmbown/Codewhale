@@ -196,7 +196,7 @@ fn install_rustls_crypto_provider() {
 #[derive(Parser, Debug)]
 #[command(
     name = "codewhale-tui",
-    bin_name = "codewhale-tui",
+    bin_name = "codewhale",
     author,
     version = env!("CODEWHALE_BUILD_VERSION"),
     about = "Codewhale terminal coding agent",
@@ -683,6 +683,10 @@ struct FleetRunArgs {
     /// Schedule once and return instead of staying in the manager loop
     #[arg(long, hide = true, default_value_t = false)]
     once: bool,
+    /// Validate the spec (shape, roster members, profiles, model routes)
+    /// without creating a run or starting any worker
+    #[arg(long, default_value_t = false)]
+    check: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1758,7 +1762,7 @@ fn run_with_args(args: Vec<String>) -> Result<()> {
     crate::tui::ui::fatal_signal_guard::install_fatal_signal_guard();
 
     // Set up process panic hook before anything else — writes crash dumps
-    // to ~/.deepseek/crashes/ even if the panic happens before tokio is up,
+    // to the selected profile's crashes/ even before tokio is up,
     // and restores the terminal so a panicked TUI doesn't leave the user's
     // shell stuck in alt-screen mode.
     let orig_hook = std::panic::take_hook();
@@ -1801,8 +1805,8 @@ fn run_with_args(args: Vec<String>) -> Result<()> {
             codewhale_telemetry::record_blocking(codewhale_telemetry::Event::Panic { site });
         }
         // Write crash dump best-effort
-        if let Some(home) = crate::config::effective_home_dir() {
-            let crash_dir = home.join(".deepseek").join("crashes");
+        if let Ok(home) = codewhale_config::codewhale_home() {
+            let crash_dir = home.join("crashes");
             let _ = std::fs::create_dir_all(&crash_dir);
             use chrono::Utc;
             let ts = Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
@@ -3307,6 +3311,31 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
     }
 
     let fleet_config = config.fleet_config();
+    // `fleet run --check` must not conjure the ledger or the sub-agent state it
+    // would write to, so it validates before either is opened below.
+    if let FleetCommand::Run(run_args) = &args.command
+        && run_args.check
+    {
+        initialize_cloud_facts(config);
+        let check = FleetManager::check_task_spec_path_in(
+            workspace,
+            fleet_config,
+            config.default_model(),
+            config.clone(),
+            &run_args.task_spec,
+        )?;
+        println!(
+            "Fleet spec ok: {} ({} task{}). Nothing was created or launched.",
+            run_args.task_spec.display(),
+            check.task_count,
+            if check.task_count == 1 { "" } else { "s" }
+        );
+        for warning in &check.warnings {
+            println!("warning: {warning}");
+        }
+        return Ok(());
+    }
+
     let provider = config.api_provider();
     let max_subagents = config.max_subagents_for_provider(provider);
     let coordination_manager = crate::tools::subagent::new_shared_subagent_manager_with_timeout(
@@ -3588,7 +3617,7 @@ fn init_skills_dir(skills_dir: &Path, force: bool) -> Result<(PathBuf, WriteStat
 fn tools_readme_template() -> &'static str {
     "# Local tools\n\n\
      Drop self-describing scripts here so they can be discovered by\n\
-     `codewhale-tui setup --status` and surfaced in `codewhale-tui doctor`.\n\n\
+     `codewhale setup --status` and surfaced in `codewhale doctor`.\n\n\
      When `[tools.plugin_dir]` is set in config.toml (or when the default\n\
      `~/.codewhale/tools/` directory exists), they are auto-discovered and\n\
      registered as model-visible tools.\n\n\
@@ -3610,7 +3639,7 @@ fn tools_example_script() -> &'static str {
      # name: example\n\
      # description: Print a confirmation that local tool discovery works\n\
      # usage: example [name]\n\
-     printf 'codewhale-tui local tool ok: %s\\n' \"${1:-world}\"\n"
+     printf 'codewhale local tool ok: %s\\n' \"${1:-world}\"\n"
 }
 
 fn init_tools_dir(tools_dir: &Path, force: bool) -> Result<(PathBuf, WriteStatus, WriteStatus)> {
@@ -4470,12 +4499,18 @@ async fn run_doctor(
             .bold()
     );
     println!("{}", "==================".truecolor(sky_r, sky_g, sky_b));
+    // Verdict first (U7): the answer and the next step, before the detail.
+    let (verdict_state, _) = doctor_setup_state(config, workspace);
+    let verdict = doctor_verdict(&verdict_state);
+    println!("{}", verdict.truecolor(aqua_r, aqua_g, aqua_b).bold());
     println!();
 
     // Version info
     println!("{}", "Version Information:".bold());
-    println!("  codewhale-tui: {}", env!("CODEWHALE_BUILD_VERSION"));
-    println!("  rust: {}", rustc_version());
+    println!("  codewhale: {}", env!("CODEWHALE_BUILD_VERSION"));
+    // A release binary needs no Rust toolchain; this line describes the host,
+    // not the build, so a missing rustc must not read as a fault.
+    println!("  host rustc: {}", rustc_version());
     println!();
 
     println!("{}", "Updates:".bold());
@@ -5415,12 +5450,65 @@ async fn run_doctor(
     }
 
     println!();
-    println!(
-        "{}",
-        "All checks complete!"
-            .truecolor(aqua_r, aqua_g, aqua_b)
-            .bold()
-    );
+    println!("{}", verdict.truecolor(aqua_r, aqua_g, aqua_b).bold());
+}
+
+/// Doctor's one-line answer: ready, or the single next step (U7). Readiness
+/// is the setup lane's own verdict; doctor never probes credential values to
+/// decide it.
+fn doctor_verdict(state: &codewhale_config::SetupState) -> &'static str {
+    // NeedsAction means a route is named but no credential is confirmed for
+    // it, which is still "no provider set up" from where the user sits.
+    // `first_run_ready` accepts NeedsAction (a failed key still reaches the
+    // wizard's ready screen), so check the provider first: finished setup
+    // with an unconfirmed key is not "Ready".
+    let provider_verified = state.status(codewhale_config::SetupStep::ProviderModel)
+        == codewhale_config::StepStatus::Verified;
+    if !provider_verified {
+        "Not ready: no model provider set up → run /provider in Codewhale, or `codewhale setup`."
+    } else if state.first_run_ready() {
+        "Ready: setup is complete."
+    } else {
+        "Not ready: first-run setup is unfinished → run `codewhale setup`."
+    }
+}
+
+#[cfg(test)]
+mod doctor_verdict_tests {
+    #[test]
+    fn a_fresh_home_is_not_ready_and_names_the_provider_step() {
+        let verdict = super::doctor_verdict(&codewhale_config::SetupState::default());
+        assert!(verdict.starts_with("Not ready"), "{verdict}");
+        assert!(verdict.contains("/provider"), "{verdict}");
+    }
+
+    #[test]
+    fn finished_setup_with_an_unconfirmed_key_is_not_ready() {
+        use codewhale_config::{
+            ConstitutionChoice, RuntimePostureSource, SetupState, SetupStep, StepEntry, StepStatus,
+        };
+        let mut state = SetupState::default();
+        state.set_step(
+            SetupStep::Language,
+            StepEntry::new(StepStatus::Verified, true, "0.10.1"),
+        );
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::NeedsAction, true, "0.10.1"),
+        );
+        state.runtime_posture_source = RuntimePostureSource::Confirmed;
+        state.constitution_choice = ConstitutionChoice::Bundled;
+        assert!(state.first_run_ready(), "fixture must be wizard-ready");
+        let verdict = super::doctor_verdict(&state);
+        assert!(verdict.starts_with("Not ready"), "{verdict}");
+        assert!(verdict.contains("/provider"), "{verdict}");
+
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::Verified, true, "0.10.1"),
+        );
+        assert_eq!(super::doctor_verdict(&state), "Ready: setup is complete.");
+    }
 }
 
 const DOCTOR_LEGACY_STATE_ITEMS: &[&str] = &[
@@ -6130,11 +6218,15 @@ fn print_doctor_setup_report(
         "  {first_run_icon} first-run: {}",
         doctor_ready_label(first_run_ready)
     );
-    println!(
-        "  {update_icon} update checkpoint {}: {}",
-        crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
-        doctor_ready_label(update_ready)
-    );
+    // An update checkpoint only means something once a prior setup exists;
+    // on a fresh home it is a stale version number with nothing to update.
+    if first_run_ready {
+        println!(
+            "  {update_icon} update checkpoint {}: {}",
+            crate::tui::setup::CONSTITUTION_CHECKPOINT_VERSION,
+            doctor_ready_label(update_ready)
+        );
+    }
     println!(
         "  {operate_icon} operate/fleet: {}",
         doctor_ready_label(operate_ready)
@@ -6565,30 +6657,13 @@ fn doctor_model_pin_drift(
     let drifted = pins
         .iter()
         .filter_map(|((provider, model), owners)| {
-            let kind = crate::config::ApiProvider::parse(provider)
-                .unwrap_or(crate::config::ApiProvider::Custom);
-            let identity = match kind {
-                crate::config::ApiProvider::Custom => provider.clone(),
-                _ => kind.as_str().to_string(),
-            };
-            let base_url = config.base_url_for_route_identity(kind, &identity);
-            if crate::provider_catalog_live::status_for_route(kind, &identity, &base_url)
-                != codewhale_config::catalog::CatalogStatus::Fresh
-            {
+            let Some(missing) = crate::provider_catalog_live::pin_missing_from_fresh_roster(
+                config, provider, model,
+            ) else {
                 unverifiable += 1;
                 return None;
-            }
-            let listed =
-                crate::provider_catalog_live::cached_entry_for_route(kind, &identity, &base_url)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|entry| {
-                        entry.offerings.iter().any(|offering| {
-                            offering.wire_model_id == *model
-                                || offering.canonical_model.as_deref() == Some(model.as_str())
-                        })
-                    });
-            (!listed).then(|| {
+            };
+            missing.then(|| {
                 json!({
                     "provider": provider,
                     "model": model,
@@ -8021,7 +8096,7 @@ fn rustc_version() -> String {
     // banner as a side effect of the probe; reuse it instead of launching a
     // second rustc process (each launch loads libLLVM).
     if !crate::dependencies::RustC::available() {
-        return "unknown".to_string();
+        return "not installed (only needed to build from source)".to_string();
     }
     crate::dependencies::rustc_version_banner().unwrap_or_else(|| "unknown".to_string())
 }
@@ -15336,6 +15411,21 @@ mod terminal_mode_tests {
     #[test]
     fn companion_binary_reports_its_own_name() {
         assert_eq!(Cli::command().get_name(), "codewhale-tui");
+    }
+
+    #[test]
+    fn usage_errors_name_the_codewhale_command() {
+        let error = Cli::try_parse_from(["codewhale-tui", "doctor", "--bogus"])
+            .expect_err("an unknown doctor flag must not parse");
+        let rendered = error.render().to_string();
+        assert!(
+            rendered.contains("codewhale doctor"),
+            "usage should name `codewhale doctor`: {rendered}"
+        );
+        assert!(
+            !rendered.contains("codewhale-tui"),
+            "usage must not name the retired binary: {rendered}"
+        );
     }
 
     #[test]

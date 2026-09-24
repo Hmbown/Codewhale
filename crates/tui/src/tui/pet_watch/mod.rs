@@ -48,6 +48,8 @@ pub struct PetWatch {
     session: Option<String>,
     last_tick: Option<Instant>,
     failed: bool,
+    /// The companion said it cannot be reached. Cleared by the next frame.
+    unavailable: bool,
     exporting: bool,
     sound_requested: bool,
     pub(crate) area: Option<Rect>,
@@ -88,6 +90,7 @@ impl PetWatch {
         self.session = session;
         self.raster = None;
         self.failed = false;
+        self.unavailable = false;
         self.last_tick = None;
         self.work_enter_pending = false;
         self.work_complete = false;
@@ -331,7 +334,11 @@ pub fn tick(app: &mut App, now: Instant) {
         && app.onboarding == crate::tui::app::OnboardingState::None
     {
         app.pet_watch.work_enter_pending = false;
-        open_habitat(app);
+        // Pet mode never hides a running turn behind a companion that is
+        // not there; the transcript stays in view until it answers again.
+        if !app.pet_watch.unavailable {
+            open_habitat(app);
+        }
     }
     // The habitat is the pet's only terminal view: it owns the whole content
     // viewport or nothing. Reduced motion follows the shell's motion setting.
@@ -372,6 +379,7 @@ pub fn tick(app: &mut App, now: Instant) {
             state.sound_requested = false;
         }
         state.raster = Some(update);
+        state.unavailable = false;
         if visible {
             app.needs_redraw = true;
         }
@@ -432,6 +440,8 @@ pub fn tick(app: &mut App, now: Instant) {
                     .replace("{path}", &path.display().to_string()),
                 StatusToastLevel::Info,
             ),
+            // A refused action (select, export, open) leaves a reachable
+            // companion and the habitat as they are.
             Notice::Message(message) => (
                 format!(
                     "{} · {message}",
@@ -439,6 +449,19 @@ pub fn tick(app: &mut App, now: Instant) {
                 ),
                 StatusToastLevel::Warning,
             ),
+            Notice::Unreachable(message) => {
+                app.pet_watch.unavailable = true;
+                if app.is_loading && is_open(app) {
+                    app.view_stack.pop();
+                }
+                (
+                    format!(
+                        "{} · {message}",
+                        tr(app.ui_locale, MessageId::PetWatchUnavailable)
+                    ),
+                    StatusToastLevel::Warning,
+                )
+            }
         };
         app.add_message(crate::tui::history::HistoryCell::System {
             content: text.clone(),
@@ -451,7 +474,7 @@ fn render_tank(frame: &mut Frame, area: Rect, app: &mut App) {
     app.pet_watch.area = Some(area);
     let raster = app.pet_watch.raster.as_ref();
     let hollow = raster.is_none_or(|r| !r.scene.producer_connected || r.scene.style.hollow);
-    let mut label = raster
+    let scene = raster
         .map(|r| {
             let mut text = format!(
                 "{} · {} · {}",
@@ -473,16 +496,24 @@ fn render_tank(frame: &mut Frame, area: Rect, app: &mut App) {
             text
         })
         .unwrap_or_default();
-    if hollow {
-        label.push_str(&format!(
-            " · {}",
-            tr(app.ui_locale, MessageId::PetUnobserved)
-        ));
-    }
-    label.push_str(&format!(
-        " · {}",
-        tr(app.ui_locale, app.pet_watch.sound_label())
-    ));
+    // With no companion frame the tank still paints the resting whale and
+    // says why, instead of a blank tank under an orphan separator.
+    let label = if raster.is_none() && app.pet_watch.unavailable {
+        tr(app.ui_locale, MessageId::PetOffline).into_owned()
+    } else {
+        let presence = hollow.then(|| tr(app.ui_locale, MessageId::PetUnobserved));
+        let sound = tr(app.ui_locale, app.pet_watch.sound_label());
+        [
+            Some(scene.as_str()),
+            presence.as_deref(),
+            Some(sound.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+    };
     let image = (app.view_stack.is_empty()
         || app.view_stack.top_kind() == Some(ModalKind::PetHabitat))
         && raster.is_some_and(|r| {
@@ -529,6 +560,40 @@ fn render_tank(frame: &mut Frame, area: Rect, app: &mut App) {
             &label,
             Style::default().fg(ink),
         );
+        if raster.is_none() {
+            paint_resting_whale(frame, area, Style::default().fg(ink));
+        }
+    }
+}
+
+/// The launch screen's braille whale, centred in the tank above its caption,
+/// at the largest rung that fits. Static: it rests until the companion's own
+/// frames take over the tank.
+fn paint_resting_whale(frame: &mut Frame, area: Rect, style: Style) {
+    use crate::tui::mark::MarkSize;
+    let tank_height = area.height.saturating_sub(1);
+    let Some(size) = [MarkSize::Large, MarkSize::Small, MarkSize::Tiny]
+        .into_iter()
+        .find(|size| {
+            let (cols, rows) = size.cells();
+            cols <= area.width && rows <= tank_height
+        })
+    else {
+        return;
+    };
+    let (cols, rows) = size.cells();
+    let x0 = area.x + (area.width - cols) / 2;
+    let y0 = area.y + (tank_height - rows) / 2;
+    let buf = frame.buffer_mut();
+    for (dy, row) in size.rows().iter().enumerate() {
+        for (dx, ch) in row.chars().enumerate() {
+            if ch == ' ' {
+                continue;
+            }
+            if let Some(cell) = buf.cell_mut((x0 + dx as u16, y0 + dy as u16)) {
+                cell.set_char(ch).set_style(style);
+            }
+        }
     }
 }
 pub fn render_full(frame: &mut Frame, app: &mut App) {
@@ -673,6 +738,96 @@ mod tests {
         assert!(text.contains("Prepared result stays in the transcript"));
         assert_eq!(app.input, "retained draft");
         assert!(app.pet_watch.worker.is_none());
+    }
+
+    #[test]
+    fn unavailable_companion_paints_the_resting_whale_and_keeps_the_turn_visible() {
+        let mut app =
+            crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        app.onboarding = crate::tui::app::OnboardingState::None;
+        app.redaction_gate = false;
+        app.pet_watch.session = app.current_session_id.clone();
+        app.pet_watch.detach_for_test();
+        app.pet_watch.unavailable = true;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 16)).unwrap();
+        terminal
+            .draw(|frame| render_tank(frame, frame.area(), &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            text.contains(crate::tui::mark::MarkSize::Large.rows()[3].trim()),
+            "the tank paints the resting whale: {text}"
+        );
+        assert!(
+            text.contains("offline — codewhale pet serve wakes it"),
+            "{text}"
+        );
+        assert!(!text.contains(" · offline"), "no orphan separator: {text}");
+
+        app.pet_watch.enabled = true;
+        observe(
+            &mut app,
+            &Event::TurnStarted {
+                turn_id: "turn".into(),
+                created_at: chrono::Utc::now(),
+                route: None,
+            },
+            Instant::now(),
+        );
+        tick(&mut app, Instant::now());
+        assert!(
+            app.view_stack.is_empty(),
+            "pet mode must not cover a turn while the companion is unavailable"
+        );
+    }
+
+    #[test]
+    fn a_refused_pet_action_keeps_the_habitat_and_only_unreachable_marks_offline() {
+        let mut app =
+            crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        app.onboarding = crate::tui::app::OnboardingState::None;
+        app.redaction_gate = false;
+        app.pet_watch.session = app.current_session_id.clone();
+        app.pet_watch.detach_for_test();
+        let (tx, _commands) = std::sync::mpsc::sync_channel(4);
+        let (notices_tx, notices) = std::sync::mpsc::sync_channel(4);
+        app.pet_watch.worker = Some(Worker {
+            tx,
+            latest: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            view: std::sync::Arc::new(std::sync::Mutex::new(live::View::default())),
+            notices,
+        });
+        open_habitat(&mut app);
+        app.is_loading = true;
+
+        notices_tx
+            .send(Notice::Message(
+                "Save the terminal session before exporting".into(),
+            ))
+            .unwrap();
+        tick(&mut app, Instant::now());
+        assert!(is_open(&app), "a refused export must not close pet mode");
+        assert!(
+            !app.pet_watch.unavailable,
+            "a refused export is not offline"
+        );
+
+        notices_tx
+            .send(Notice::Unreachable("Shared pet reconnecting".into()))
+            .unwrap();
+        tick(&mut app, Instant::now());
+        assert!(app.pet_watch.unavailable);
+        assert!(
+            !is_open(&app),
+            "an unreachable companion hands the running turn back"
+        );
     }
 
     #[test]

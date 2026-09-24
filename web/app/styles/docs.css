@@ -1,0 +1,439 @@
+/* ------------------------------------------------------------------ */
+/*  Documentation portal                                              */
+/* ------------------------------------------------------------------ */
+
+.docs-portal {
+  background: var(--paper);
+}
+
+.community-welcome-inner {
+  position: relative;
+}
+
+.community-welcome-inner h1 {
+  max-width: 50rem;
+  font-size: clamp(2rem, 4.2vw, 3.6rem);
+  line-height: 1.03;
+}
+
+.community-welcome-inner h1 {
+  margin-top: 0.85rem;
+}
+
+.community-welcome-inner p {
+  max-width: 47rem;
+  margin-top: 1rem;
+  color: var(--ink-soft);
+  font-size: 1rem;
+  line-height: 1.7;
+}
+
+.docs-portal .hero {
+  padding-block: 0.75rem;
+}
+
+.docs-portal-band {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 1rem;
+}
+
+.docs-portal-band .portal-mark,
+.docs-portal-band .release-truth {
+  margin: 0;
+}
+
+.docs-hub-lede {
+  margin: 0.8rem 0 1.5rem;
+  color: var(--ink-soft);
+}
+
+.docs-shell {
+  display: grid;
+  grid-template-columns: minmax(13rem, 0.28fr) minmax(0, 0.72fr);
+  grid-template-areas: "sidebar content";
+  gap: clamp(2rem, 5vw, 4.5rem);
+  align-items: start;
+  padding-block: clamp(2.25rem, 5vw, 4rem);
+}
+
+.docs-sidebar {
+  grid-area: sidebar;
+  border-top: 1px solid var(--hairline);
+}
+
+.docs-sidebar-heading {
+  padding-block: 0.9rem;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--ink);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.docs-sidebar-heading a {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.docs-sidebar-heading a > span:last-child {
+  color: var(--ink-mute);
+  font-size: 0.75rem;
+}
+
+.docs-sidebar-group {
+  padding-block: 0.9rem;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.docs-sidebar-category {
+  margin-bottom: 0.35rem;
+  color: var(--ink-mute);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.docs-sidebar-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  padding-block: 0.32rem;
+  color: var(--ink-soft);
+  font-size: 0.8rem;
+  line-height: 1.4;
+  transition: color var(--dur-state) var(--ease-spring);
+}
+
+.docs-sidebar-link:hover,
+.docs-sidebar-link-current {
+  color: var(--docs-accent);
+}
+
+.docs-sidebar-link-current {
+  font-weight: 600;
+}
+
+.docs-sidebar-link > span:last-child:not(:first-child) {
+  color: var(--ink-mute);
+  font-size: 0.75rem;
+}
+
+.docs-content {
+  grid-area: content;
+  width: 100%;
+  max-width: 52rem;
+}
+
+.docs-content p {
+  max-width: 70ch;
+}
+
+.docs-breadcrumb {
+  margin-bottom: 1.15rem;
+  color: var(--ink-mute);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+
+.docs-breadcrumb ol {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.docs-breadcrumb li:not(:last-child)::after {
+  content: "/";
+  margin-inline: 0.5em;
+  color: var(--ink-mute);
+}
+
+.docs-breadcrumb a {
+  color: var(--indigo);
+}
+
+.docs-breadcrumb a:hover {
+  text-decoration: underline;
+}
+
+.docs-breadcrumb [aria-current="page"] {
+  color: var(--ink);
+}
+
+.docs-search-block {
+  margin-bottom: 2.25rem;
+}
+
+.docs-search-label {
+  display: block;
+  margin-bottom: 0.55rem;
+  color: var(--ink-mute);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.docs-search-input {
+  min-height: 3rem;
+  padding-right: 3rem;
+  border-color: var(--paper-line-soft);
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--paper) 88%, transparent);
+}
+
+.docs-search-clear {
+  position: absolute;
+  right: 0.9rem;
+  top: 50%;
+  translate: 0 -50%;
+  color: var(--ink-mute);
+  font-size: 0.82rem;
+}
+
+.docs-search-clear:hover {
+  color: var(--ink);
+}
+
+.docs-search-count {
+  margin-top: 0.55rem;
+  color: var(--ink-mute);
+  font-size: 0.75rem;
+}
+
+.docs-result-groups {
+  display: grid;
+  gap: 2.5rem;
+}
+
+.docs-result-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.55rem;
+}
+
+.docs-result-heading h2 {
+  font-size: 1.28rem;
+  letter-spacing: -0.02em;
+}
+
+.docs-result-heading > span {
+  color: var(--ink-mute);
+  font-size: 0.75rem;
+}
+
+.docs-topic-list {
+  border-top: 1px solid var(--hairline);
+}
+
+.docs-topic-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(8rem, 0.34fr) auto;
+  gap: 1.25rem;
+  align-items: center;
+  padding-block: 1rem;
+  border-bottom: 1px solid var(--hairline);
+  transition: background-color var(--dur-state) var(--ease-spring), color var(--dur-state) var(--ease-spring);
+}
+
+.docs-topic-row:hover {
+  color: var(--docs-accent);
+  background: var(--hover);
+}
+
+.docs-topic-title {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: baseline;
+  color: var(--ink);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.docs-topic-title > span:last-child {
+  color: var(--ink-mute);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.docs-topic-main p {
+  margin-top: 0.28rem;
+  color: var(--ink-soft);
+  font-size: 0.78rem;
+  line-height: 1.55;
+}
+
+.docs-topic-source {
+  overflow: hidden;
+  color: var(--ink-mute);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+}
+
+.docs-topic-source span {
+  overflow-wrap: anywhere;
+}
+
+.docs-topic-arrow {
+  color: var(--ink-mute);
+  font-size: 0.78rem;
+}
+
+.docs-empty {
+  padding-block: 3.5rem;
+  border-block: 1px solid var(--hairline);
+  text-align: center;
+}
+
+.docs-empty > p:first-child {
+  color: var(--ink);
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.docs-empty > p:nth-child(2) {
+  margin: 0.5rem auto 1.25rem;
+  color: var(--ink-mute);
+  font-size: 0.8rem;
+}
+
+.docs-source-note {
+  margin-top: 2.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--hairline);
+}
+
+.docs-source-note p {
+  max-width: 70ch;
+  color: var(--ink-mute);
+  font-size: 0.75rem;
+  line-height: 1.6;
+}
+
+@media (max-width: 900px) {
+  .docs-shell {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "content"
+      "sidebar";
+  }
+
+  /* The one docs nav stays reachable below the article: the groups reflow
+     into columns so 23 topics read as an index, not a scroll of links. */
+  .docs-sidebar nav {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+    column-gap: 2rem;
+  }
+
+  .docs-sidebar-group:last-child { border-bottom: 0; }
+}
+
+@media (max-width: 640px) {
+  .docs-topic-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.6rem 1rem;
+  }
+
+  .docs-topic-source {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .docs-topic-arrow {
+    grid-column: 2;
+    grid-row: 1;
+  }
+}
+
+/* ---------- community release record ---------- */
+.community-credit-section {
+  border-bottom: 0;
+}
+
+.community-record-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem 1.25rem;
+  margin-top: 1.25rem;
+}
+
+.community-record-links a {
+  color: var(--indigo-deep);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.community-record-links a:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.22rem;
+}
+
+.community-credit-groups {
+  display: grid;
+  gap: 2rem;
+}
+
+.community-credit-groups section {
+  padding-top: 1rem;
+  border-top: 1px solid var(--hairline);
+}
+
+.community-credit-groups h3 {
+  margin-bottom: 0.9rem;
+  color: var(--ink-mute);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.community-credit-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.community-credit-list a {
+  padding: 0.3rem 0.45rem;
+  border: 1px solid var(--hairline);
+  color: var(--ink-soft);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+
+.community-credit-list a:hover {
+  border-color: var(--indigo);
+  color: var(--indigo-deep);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Docs theme                                                        */
+/*                                                                    */
+/*  The docs sheet follows the site-wide theme like every other page:  */
+/*  the OS appearance by default, or the choice pinned by the theme    */
+/*  toggle. The sheet inks (`--docs-*`) are declared beside :root in   */
+/*  both schemes, so nothing here is scoped to a dark region.          */
+/* ------------------------------------------------------------------ */
+
+.docs-theme {
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.docs-theme .portal-button-secondary {
+  border-color: var(--docs-button-border);
+  background: var(--docs-button-bg);
+  color: var(--docs-button-text);
+}
+
+.docs-theme .portal-button-secondary:hover {
+  background: var(--hover);
+}
+

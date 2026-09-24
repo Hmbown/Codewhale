@@ -203,7 +203,7 @@ Codewhale works best when you let investigation and implementation happen in
 separate steps for unfamiliar code. For small, well-understood changes, a
 single implementation request is fine.
 
-Next: [MODES.md](MODES.md) explains when to use Plan, Act, and Operate.
+Next: [MODES.md](MODES.md) explains when to use Plan, Work, and Operate.
 
 ## 4. Understanding the Interface
 
@@ -310,7 +310,7 @@ Codewhale has three visible TUI modes:
 | Mode | Use it for | Default posture |
 | --- | --- | --- |
 | Plan | Exploration, design, and review before changes | Read-only investigation |
-| Act | Normal multi-step coding work | Tool use with approval gates |
+| Work | Normal multi-step coding work | Tool use with approval gates |
 | Operate | Direct work plus parallel or background coordination | Tools follow the active posture; delegate when useful |
 
 Switch modes from the TUI with the mode picker:
@@ -323,7 +323,7 @@ Or switch directly:
 
 ```text
 /mode plan
-/mode act
+/mode work
 /mode operate
 ```
 
@@ -335,7 +335,7 @@ approach, verification plan, risks, and handoff notes. Empty sections are
 visible when the agent uses the rich artifact shape, so you can ask for a
 revision instead of accepting an under-specified plan.
 
-Act mode is the default for most contribution work. It lets Codewhale read,
+Work mode is the default for most contribution work. It lets Codewhale read,
 run checks, and edit files while keeping risky actions behind approval gates.
 
 Operate keeps that direct tool surface and its approval, sandbox, shell,
@@ -460,7 +460,7 @@ Examples of tool-backed work include:
 
 Tool use is governed by mode, approvals, and sandbox policy. The exact behavior
 depends on the current mode and config, but the basic rule is simple: start in
-Plan for read-only exploration, use Act for normal changes, and reserve Full
+Plan for read-only exploration, use Work for normal changes, and reserve Full
 Access for trusted automation.
 
 The workspace boundary matters. Codewhale is expected to work in the directory
@@ -640,7 +640,7 @@ open when configuring a non-default route.
 
 ### Which mode should I use first?
 
-Use Plan for unfamiliar code, Act for normal implementation, and Full Access
+Use Plan for unfamiliar code, Work for normal implementation, and Full Access
 only for trusted repositories where automatic execution is acceptable.
 
 ### Why does Codewhale ask before running commands?

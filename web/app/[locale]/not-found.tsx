@@ -18,9 +18,5 @@ export const metadata: Metadata = {
  * instead of the framework's bare page.
  */
 export default function NotFound() {
-  return (
-    <div className="route-state">
-      <NotFoundRoute />
-    </div>
-  );
+  return <NotFoundRoute />;
 }

@@ -12,7 +12,24 @@ set -eu
 HOST_DISPLAY="${CU_HOST_DISPLAY:-:0}"
 HOST_GEOMETRY="${CU_HOST_GEOMETRY:-1600x1200x24}"
 
+# Reap the display before PID 1 exits, so a normal container restart does
+# not inherit an Xvfb lock for the previous container's process IDs.
+xvfb_pid= wm_pid= session_pid=
+cleanup() {
+  trap - EXIT INT TERM
+  for child_pid in $session_pid $wm_pid $xvfb_pid; do
+    kill -TERM "$child_pid" 2>/dev/null || true
+  done
+  for child_pid in $session_pid $wm_pid $xvfb_pid; do
+    wait "$child_pid" 2>/dev/null || true
+  done
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 Xvfb "$HOST_DISPLAY" -screen 0 "$HOST_GEOMETRY" -nolisten tcp >/tmp/xvfb-host.log 2>&1 &
+xvfb_pid=$!
 i=0
 until DISPLAY="$HOST_DISPLAY" xdotool getdisplaygeometry >/dev/null 2>&1; do
   i=$((i + 1))
@@ -25,6 +42,7 @@ until DISPLAY="$HOST_DISPLAY" xdotool getdisplaygeometry >/dev/null 2>&1; do
 done
 
 DISPLAY="$HOST_DISPLAY" openbox >/tmp/openbox-host.log 2>&1 &
+wm_pid=$!
 sleep 0.5
 
 export DISPLAY="$HOST_DISPLAY"
@@ -35,4 +53,6 @@ export DISPLAY="$HOST_DISPLAY"
 # address is inherited. The inner sh also records the session env for
 # docker/agent-exec.sh, so `docker exec`'d agents join this same display+bus
 # instead of starting blind.
-exec dbus-run-session -- sh -c 'printf "DISPLAY=%s\nDBUS_SESSION_BUS_ADDRESS=%s\n" "$DISPLAY" "$DBUS_SESSION_BUS_ADDRESS" > /tmp/cu-session.env; exec "$@"' sh "$@"
+dbus-run-session -- sh -c 'printf "DISPLAY=%s\nDBUS_SESSION_BUS_ADDRESS=%s\n" "$DISPLAY" "$DBUS_SESSION_BUS_ADDRESS" > /tmp/cu-session.env; exec "$@"' sh "$@" &
+session_pid=$!
+wait "$session_pid"

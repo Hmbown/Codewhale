@@ -718,6 +718,41 @@ pub(crate) fn cached_entry_for_route(
         .cloned())
 }
 
+/// Whether a saved `(provider, model)` pin is absent from that exact route's
+/// FRESH live roster (#6035). `None` when no fresh roster exists: a stale,
+/// failed, or absent roster cannot prove drift, and bundled catalog rows say
+/// nothing about what the account serves today. Absence is a warning, never a
+/// reason to rewrite the pin: the id may still answer (soft deprecation) and
+/// other hosts may serve it on their own routes.
+pub(crate) fn pin_missing_from_fresh_roster(
+    config: &Config,
+    provider: &str,
+    model: &str,
+) -> Option<bool> {
+    let kind = ApiProvider::parse(provider).unwrap_or(ApiProvider::Custom);
+    let identity = match kind {
+        ApiProvider::Custom => provider.to_string(),
+        _ => kind.as_str().to_string(),
+    };
+    let base_url = config.base_url_for_route_identity(kind, &identity);
+    // `status_for_route` reads memory only. A fresh process (doctor, a
+    // just-started TUI) must see the roster an earlier process persisted.
+    ensure_cache_loaded().ok()?;
+    if status_for_route(kind, &identity, &base_url) != CatalogStatus::Fresh {
+        return None;
+    }
+    let listed = cached_entry_for_route(kind, &identity, &base_url)
+        .ok()
+        .flatten()
+        .is_some_and(|entry| {
+            entry.offerings.iter().any(|offering| {
+                offering.wire_model_id == model
+                    || offering.canonical_model.as_deref() == Some(model)
+            })
+        });
+    Some(!listed)
+}
+
 fn merge_durable_scope(
     mut durable_cache: ProviderCatalogCache,
     process_cache: &ProviderCatalogCache,
@@ -2729,5 +2764,34 @@ mod tests {
             fs::write(&path, serde_json::to_vec(&forged).unwrap()).unwrap();
             assert!(load_from_disk_unlocked(&path).is_none());
         }
+    }
+
+    #[test]
+    fn pin_drift_reads_a_fresh_roster_persisted_by_an_earlier_process() {
+        // #6035: `codewhale doctor` and a just-started TUI have not touched
+        // the in-process cache yet; the durable fresh roster must still count.
+        let _env = lock_test_env();
+        let _live = crate::provider_lake::lock_live_snapshot();
+        let home = tempfile::tempdir().expect("home");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        reset_cache_for_test();
+        let config = Config::default();
+        let base_url = config.base_url_for_route_identity(ApiProvider::Deepseek, "deepseek");
+        let fingerprint = base_url_fingerprint(&base_url);
+        assert_eq!(
+            record_success(delta("deepseek", &fingerprint, &["deepseek-flash"])),
+            CatalogStatus::Fresh
+        );
+        // A new process: nothing loaded in memory, the roster only on disk.
+        reset_cache_for_test();
+        assert_eq!(
+            pin_missing_from_fresh_roster(&config, "deepseek", "deepseek-retired"),
+            Some(true)
+        );
+        assert_eq!(
+            pin_missing_from_fresh_roster(&config, "deepseek", "deepseek-flash"),
+            Some(false)
+        );
+        reset_cache_for_test();
     }
 }

@@ -2988,8 +2988,8 @@ mod tests {
         use crate::config::SearchProvider;
         use crate::tools::spec::{ToolContext, ToolSpec};
 
-        let prev = std::env::var_os("BAIDU_SEARCH_API_KEY");
-        unsafe { std::env::remove_var("BAIDU_SEARCH_API_KEY") };
+        let _env = crate::test_support::lock_test_env();
+        let _baidu_key = crate::test_support::EnvVarGuard::remove("BAIDU_SEARCH_API_KEY");
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut ctx = ToolContext::new(tmp.path().to_path_buf());
@@ -2999,11 +2999,6 @@ mod tests {
             .execute(json!({"query": "anything"}), &ctx)
             .await
             .expect_err("missing api_key must surface as ToolError");
-
-        match prev {
-            Some(value) => unsafe { std::env::set_var("BAIDU_SEARCH_API_KEY", value) },
-            None => unsafe { std::env::remove_var("BAIDU_SEARCH_API_KEY") },
-        }
 
         let msg = err.to_string();
         assert!(

@@ -199,3 +199,35 @@ test('disposable desktops require a live Linux Docker engine, including on Windo
     assert.equal(await spawnMod.dockerAvailable(async args => { assert.deepEqual(args,['info','--format','{{.OSType}}']); return response; }),expected);
   }
 });
+
+
+test("Docker desktop entrypoint survives repeated orderly restarts", { ...NEED_DOCKER, timeout: 90_000 }, async t => {
+  const name = `cu-restart-${process.pid}-${Date.now()}`;
+  containers.add(name);
+  t.after(() => rmContainer(name));
+  const started = await run("docker", [
+    "run", "-d", "--name", name, "--init", "--network", "none",
+    // Exercise the current entrypoint even if this developer has an older
+    // cached desktop image. No host display or input device is mounted.
+    "--mount", `type=bind,src=${path.join(ROOT, "docker", "entrypoint.sh")},dst=/app/docker/entrypoint.sh,readonly`,
+    spawnMod.DEFAULT_IMAGE, "sleep", "infinity",
+  ], { timeoutMs: 30_000 });
+  assert.equal(started.code, 0, started.stderr);
+  const request = Buffer.from(JSON.stringify({ tool: "list_windows", args: {} })).toString("base64");
+  for (let cycle = 0; cycle < 3; cycle++) {
+    if (cycle) {
+      const restarted = await run("docker", ["restart", name], { timeoutMs: 15_000 });
+      assert.equal(restarted.code, 0, restarted.stderr);
+    }
+    const deadline = Date.now() + 20_000;
+    let observed = false, last = "";
+    while (Date.now() < deadline) {
+      const probe = await run("docker", ["exec", name, "/bin/sh", "/app/docker/agent-exec.sh", request], { timeoutMs: 5_000 });
+      last = probe.stdout || probe.stderr;
+      try { observed = probe.code === 0 && JSON.parse(probe.stdout).ok === true; } catch {}
+      if (observed) break;
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    assert.equal(observed, true, `desktop unavailable after restart ${cycle}: ${last}`);
+  }
+});

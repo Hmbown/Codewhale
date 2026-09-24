@@ -579,11 +579,50 @@ fn collect_entries(dir: &Path, scope: FleetScope, out: &mut Vec<FleetEntry>) {
     }
 }
 
+/// Every v2 Fleet file that answers to `name`, personal first.
+///
+/// Only files that declare `schema = "fleet"` count. The personal `fleets/`
+/// directory is shared with the workflow crate's legacy/exact files, and a
+/// file in another schema is a different Fleet form, not a v2 Fleet that
+/// failed to parse — the caller that owns that form reports on it.
+pub(crate) fn v2_fleet_candidates(name: &str, workspace: &Path) -> Vec<(FleetScope, PathBuf)> {
+    let file_name = format!("{}.toml", slugify(name.trim()));
+    let mut found = Vec::new();
+    let personal = personal_fleets_dir().ok().map(|dir| dir.join(&file_name));
+    let workspace = Some(workspace_fleets_dir(workspace).join(&file_name));
+    for (scope, path) in [
+        (FleetScope::Personal, personal),
+        (FleetScope::Workspace, workspace),
+    ] {
+        if let Some(path) = path
+            && path.is_file()
+            && declares_v2_schema(&path)
+        {
+            found.push((scope, path));
+        }
+    }
+    found
+}
+
+/// Whether a file declares the v2 `schema = "fleet"`. Unreadable or
+/// malformed TOML is not a v2 declaration.
+fn declares_v2_schema(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get("schema")
+                .and_then(toml::Value::as_str)
+                .map(|schema| schema.trim().eq_ignore_ascii_case(FLEET_SCHEMA_KIND))
+        })
+        .unwrap_or(false)
+}
+
 /// Load a v2 Fleet by name. Ambiguity between the two scopes is an error that
-/// names both origins — the caller (UI) resolves it by asking for a scope.
-/// (Kept for the qualified-name flow and the ambiguity tests; the list/detail
-/// UI resolves by scope via load_fleet_in_scope.)
-#[cfg_attr(not(test), expect(dead_code))]
+/// names both origins — the caller resolves it by asking for a scope. A file
+/// under the same name in another schema (legacy/exact) is not a v2 hit.
+/// Used by `workflow(fleet:)` through `fleet::exact::load_fleet_document`.
 pub fn load_fleet(
     name: &str,
     workspace: &Path,
@@ -592,17 +631,7 @@ pub fn load_fleet(
     if name.is_empty() {
         return Err(FleetStoreError::NotFound("<empty name>".to_string()));
     }
-    let mut found: Vec<(FleetScope, PathBuf)> = Vec::new();
-    if let Ok(dir) = personal_fleets_dir() {
-        let path = dir.join(format!("{}.toml", slugify(name)));
-        if path.is_file() {
-            found.push((FleetScope::Personal, path));
-        }
-    }
-    let ws_path = workspace_fleets_dir(workspace).join(format!("{}.toml", slugify(name)));
-    if ws_path.is_file() {
-        found.push((FleetScope::Workspace, ws_path));
-    }
+    let mut found = v2_fleet_candidates(name, workspace);
     if found.len() > 1 {
         return Err(FleetStoreError::Ambiguous(
             name.to_string(),

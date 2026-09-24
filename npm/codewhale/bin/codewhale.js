@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-const { runCodeWhale } = require("../scripts/run");
+const { runCodeWhale, reportStartFailure } = require("../scripts/run");
 
 runCodeWhale().catch((error) => {
-  console.error("Failed to start codewhale:", error.message);
+  reportStartFailure("codewhale", error);
   process.exit(1);
 });

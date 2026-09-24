@@ -16,6 +16,7 @@ import { SNIPPETS, VERIFY } from "./install-binary-snippets";
 import { getChrome, getHome } from "./i18n/dictionaries";
 import { footerProjectLinks } from "./i18n/links";
 import { TERMINAL_SCREENSHOT } from "./media-manifest";
+import { siteCss } from "./site-css";
 
 const root = new URL("../../", import.meta.url);
 
@@ -643,7 +644,7 @@ done
   });
 
   it("keeps reduced motion static without hiding the reasoning trace", () => {
-    const css = text("web/app/globals.css");
+    const css = siteCss();
 
     expect(css).toMatch(
       /@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\.ticker-track\s*\{\s*animation:\s*none;\s*\}[\s\S]*?\}/,

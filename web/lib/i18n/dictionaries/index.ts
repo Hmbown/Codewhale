@@ -34,6 +34,8 @@ import type {
   DocsWebDict,
   DocsWorkDict,
   HomeDict,
+  LegalPrivacyDict,
+  LegalTermsDict,
   StatesDict,
 } from "./types";
 import { chrome as enChrome } from "./en/chrome";
@@ -94,6 +96,10 @@ import { states as enStates } from "./en/states";
 import { states as zhStates } from "./zh/states";
 import { changelog as enChangelog } from "./en/changelog";
 import { changelog as zhChangelog } from "./zh/changelog";
+import { legalTerms as enLegalTerms } from "./en/legal-terms";
+import { legalTerms as zhLegalTerms } from "./zh/legal-terms";
+import { legalPrivacy as enLegalPrivacy } from "./en/legal-privacy";
+import { legalPrivacy as zhLegalPrivacy } from "./zh/legal-privacy";
 import { chrome as zhChrome } from "./zh/chrome";
 import { home as zhHome } from "./zh/home";
 import { chrome as jaChrome } from "./ja/chrome";
@@ -284,9 +290,9 @@ const DOCS_TRUST: Record<string, DocsTrustDict> = {
 };
 
 /**
- * Shared surface states and the changelog page follow the same optional
- * per-locale rule as the docs page dictionaries: English is the reference,
- * every other locale falls back to it at lookup time.
+ * Shared surface states, the changelog page and the two legal pages follow
+ * the same optional per-locale rule as the docs page dictionaries: English is
+ * the reference, every other locale falls back to it at lookup time.
  */
 const STATES: Record<string, StatesDict> = {
   zh: zhStates,
@@ -294,6 +300,14 @@ const STATES: Record<string, StatesDict> = {
 
 const CHANGELOG: Record<string, ChangelogDict> = {
   zh: zhChangelog,
+};
+
+const LEGAL_TERMS: Record<string, LegalTermsDict> = {
+  zh: zhLegalTerms,
+};
+
+const LEGAL_PRIVACY: Record<string, LegalPrivacyDict> = {
+  zh: zhLegalPrivacy,
 };
 
 export function getChrome(locale: string): ChromeDict {
@@ -384,6 +398,14 @@ export function getChangelog(locale: string): ChangelogDict {
   return CHANGELOG[locale] ?? enChangelog;
 }
 
+export function getLegalTerms(locale: string): LegalTermsDict {
+  return LEGAL_TERMS[locale] ?? enLegalTerms;
+}
+
+export function getLegalPrivacy(locale: string): LegalPrivacyDict {
+  return LEGAL_PRIVACY[locale] ?? enLegalPrivacy;
+}
+
 /**
  * Select one side of a legacy `{ en, zh }` content pair by locale. This is
  * the transitional bridge for `web/lib/content/` modules that still carry
@@ -418,6 +440,8 @@ export const EN_DOCS_TRUST = enDocsTrust;
 export const EN_COMPUTER_USE = enComputerUse;
 export const EN_STATES = enStates;
 export const EN_CHANGELOG = enChangelog;
+export const EN_LEGAL_TERMS = enLegalTerms;
+export const EN_LEGAL_PRIVACY = enLegalPrivacy;
 
 /** Interpolate `{name}` tokens in a dictionary template. Unknown tokens are
  * left intact so a template/variable drift is visible in review, not silent. */

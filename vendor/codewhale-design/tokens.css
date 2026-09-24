@@ -1,0 +1,50 @@
+/* Generated from Codewhale GPUI design 1.0.0; sha256 a0c23f8a235bbc61e42fb8a60795ae7d9825dbbd1730142acc9ffec9c0abb3af. Do not edit. */
+:root {
+  --outside: #191a1c;
+  --surface: #202123;
+  --panel: #2a2b2e;
+  --text: #efeeeb;
+  --muted: #b1b1ad;
+  --line: #3b3c3f;
+  --accent: #90b9ff;
+  --button: #90b9ff;
+  --button-text: #15243e;
+  --attention: #e8b077;
+  --hover: #303134;
+  --selected: #37393d;
+  --selection: #90b9ff47;
+  color-scheme: dark;
+}
+[data-theme="light"] {
+  --outside: #f0ede8;
+  --surface: #faf8f5;
+  --panel: #ffffff;
+  --text: #28292b;
+  --muted: #5f605d;
+  --line: #d9d5cf;
+  --accent: #245bc7;
+  --button: #245bc7;
+  --button-text: #fbf5ee;
+  --attention: #86520d;
+  --hover: #e8e5e0;
+  --selected: #dfdcd6;
+  --selection: #245bc747;
+  color-scheme: light;
+}
+:root {
+  --spacing-compact: 4px;
+  --spacing-control: 8px;
+  --spacing-group: 12px;
+  --spacing-section: 16px;
+  --spacing-large: 24px;
+  --spacing-page: 32px;
+  --radius-control: 6px;
+  --radius-panel: 10px;
+  --focus-width: 2px;
+  --focus-offset: 3px;
+  --icon-stroke: 1.7;
+  --font-family: "Shannon Sans";
+  --font-fallbacks: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC";
+  --font-body-size: 14px;
+  --font-code-size: 13px;
+}

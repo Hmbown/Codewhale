@@ -1,0 +1,201 @@
+/* ---------- /product: the availability table on paper ---------- */
+/* The same list the homepage sets in the water, re-inked for the sheet. */
+.product-availability-paper,
+.product-availability-paper > div {
+  border-color: var(--hairline);
+}
+.product-availability-paper dt,
+.product-availability-paper dd strong {
+  color: var(--ink);
+}
+.product-availability-paper dd {
+  color: var(--ink-soft);
+}
+
+/* ---------- usage counting: the consent sheet and its footer control ---------- */
+/* A quiet sheet at the foot of the viewport, on paper, with the site's own
+   inks. It is not a modal: the page stays usable, and the choice is one
+   click either way. */
+.usage-counting {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+.usage-counting-status {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.usage-counting-elsewhere {
+  color: var(--ink-mute);
+  font-size: 0.9rem;
+}
+
+.usage-counting-button {
+  display: inline-flex;
+  justify-self: start;
+  min-height: 2.75rem;
+  align-items: center;
+  padding: 0.5rem 1.1rem;
+  border: 1px solid var(--indigo);
+  border-radius: var(--radius-control);
+  color: var(--indigo);
+  font-size: 0.95rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color var(--dur-state) var(--ease-spring), color var(--dur-state) var(--ease-spring);
+}
+
+.usage-counting-button:hover {
+  background: var(--hover);
+}
+
+/* ---------- docs: the reading sheet ---------- */
+/* Read mode: comprehension first. The article gets a book measure, the
+   Shannon Sans heading voice, generous leading, and a contents rail that
+   stays put while the sheet scrolls. */
+.docs-content {
+  max-width: 46rem;
+}
+
+.docs-content h1 {
+  font-size: clamp(2.2rem, 3.6vw, 3rem);
+  line-height: 1.05;
+  margin-bottom: 0.35rem;
+}
+
+.docs-content h2 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: clamp(1.5rem, 2.2vw, 1.9rem);
+  line-height: 1.15;
+  letter-spacing: -0.015em;
+  margin-bottom: 0.25rem;
+}
+
+.docs-content h3 {
+  font-size: 1.05rem;
+}
+
+.docs-content p,
+.docs-content li {
+  max-width: 66ch;
+  font-size: var(--text-prose);
+  line-height: var(--leading-prose);
+}
+
+.docs-content > section + section {
+  padding-top: 0.5rem;
+}
+
+.docs-content code.inline {
+  background: var(--paper-card);
+  border-color: var(--hairline);
+}
+
+.docs-content pre.code-block {
+  margin-block: 1rem;
+}
+
+/* The contents rail: a running index in the margin, sticky on tall screens. */
+@media (min-width: 901px) {
+  .docs-sidebar {
+    position: sticky;
+    top: 5.25rem;
+    max-height: calc(100vh - 6rem);
+    overflow-y: auto;
+    padding-right: 0.5rem;
+  }
+}
+
+.docs-sidebar-heading {
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.docs-sidebar-category {
+  font-family: var(--font-body);
+  font-size: 0.75rem;
+}
+
+.docs-sidebar-link {
+  font-size: 0.86rem;
+  padding-block: 0.36rem;
+}
+
+.docs-sidebar-link-current {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.docs-sidebar-link-current::before {
+  content: "";
+  display: inline-block;
+  width: 0.4rem;
+  height: 1px;
+  margin-right: 0.45rem;
+  vertical-align: middle;
+  background: var(--indigo);
+}
+
+/* Topic rows on the hub: a title with room to breathe, the source path quiet. */
+.docs-topic-title {
+  font-size: 0.98rem;
+}
+
+.docs-topic-main p {
+  font-size: 0.86rem;
+  line-height: 1.6;
+}
+
+.docs-result-heading h2 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 1.6rem;
+}
+
+/* The docs hero band: the mark and the release line as one running head. */
+.docs-portal .hero {
+  padding-block: 1rem;
+  background: var(--paper-deep);
+}
+
+.docs-portal .portal-mark {
+  color: var(--ink);
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.release-truth {
+  margin-top: 0;
+}
+
+/* Contextual help plate at the foot of every page, on the sheet's own card. */
+.docs-help {
+  background: var(--paper-card);
+  border-color: var(--hairline);
+}
+
+.docs-help-copy h2 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 1.4rem;
+}
+
+/* Keep the terminal centered and compact beneath the introductory copy. */
+.folio-hero-grid { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto auto; row-gap: 2rem; }
+.folio-hero-copy { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: clamp(2rem, 5vw, 5rem); max-width: none; grid-column: 1; grid-row: 1; padding-bottom: 0; }
+.folio-hero-copy h1 { grid-column: 1; grid-row: 1 / 3; max-width: none; font-size: clamp(2.75rem, 5vw, 4.5rem); line-height: 1.06; text-wrap: balance; }
+.folio-hero-copy .folio-lede { grid-column: 2; grid-row: 1; margin-top: 0; align-self: end; }
+.folio-hero-copy .folio-actions { grid-column: 2; grid-row: 2; align-self: start; margin-top: 1.25rem; }
+.folio-shot { grid-column: 1; grid-row: 2; width: min(100%, 56rem); justify-self: center; margin-top: 0; }
+.folio-chapter { grid-column: 1; grid-row: 3; justify-self: start; }
+.product-install-grid > div, .product-composer, .product-composer > div { min-width: 0; }
+@media (max-width: 760px) {
+  .folio-hero-copy { display: block; }
+  .folio-hero-copy .folio-lede { margin-top: 1.25rem; }
+  .folio-shot { width: 100%; }
+}

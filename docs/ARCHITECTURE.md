@@ -90,12 +90,22 @@ boundary has held since v0.9.1):
 
 ### Workspace Crates
 
+- **`crates/cli`** - The `codewhale` binary: a command-line facade that owns
+  commands such as `auth`, `metrics` and `update` itself and passes the rest
+  (`run`, `exec`, `doctor`, `sessions`, ...) through to the `codewhale-tui`
+  binary built from `crates/tui`.
 - **`crates/tools`** - Shared tool invocation primitives, including tool result/error/capability types used by the TUI runtime.
 - **`crates/agent`** - Model/provider registry (ModelRegistry) for resolving model IDs to provider endpoints.
 - **`crates/app-server`** - HTTP/SSE + JSON-RPC app server transport for
   headless agent workflows. Note that `app-server --http`/`--mobile` delegate
   to the TUI binary, which is where the runtime API actually lives.
 - **`crates/config`** - Config loading, profiles, environment variable precedence, CLI runtime overrides.
+- **`crates/cloud-facts`** - Fetches the signed Codewhale cloud facts channel
+  (`facts/v1`), verifies its Ed25519 envelope, and keeps a verified disk cache;
+  never a startup dependency.
+- **`crates/command-contract`** - Prototype command capability and dispatch
+  shapes for the staged extraction of TUI commands; shapes only, not yet the
+  production dispatch path.
 - **`crates/core`** - Provider-neutral request construction (`request.rs`),
   bounded context fragments, the tool-call parser, and thread/session types.
   It does **not** own the agent loop: the live turn loop is
@@ -105,11 +115,28 @@ boundary has held since v0.9.1):
   and emitted `TurnComplete` without contacting a model — and was removed in
   v0.9.11 so there is exactly one turn loop in the workspace.
 - **`crates/execpolicy`** - Approval/sandbox policy engine for tool execution decisions.
-- **`crates/hooks`** - Lifecycle hooks (stdout, jsonl, webhook) for pre/post tool events.
+- **`crates/hooks`** - Event sinks (stdout, JSONL file, webhook, Unix socket)
+  for response, tool, job and approval lifecycle events, plus the opt-in
+  lifecycle outbox. User-configured shell hooks that run commands around tool
+  calls are a separate system in `crates/tui/src/hooks.rs`.
+- **`crates/localization`** - Locale registry for user-facing UI chrome strings
+  (`crates/localization/locales/*.json`); it never changes prompts or model
+  output language.
 - **`crates/mcp`** - MCP client + stdio server for Model Context Protocol tool servers.
+- **`crates/memory`** - Local, scoped, provenance-bearing memory and
+  resumable state (a library, not a second agent loop).
+- **`crates/models`** - Provider request/response models and the offline model
+  metadata catalog.
+- **`crates/palette`** - Colour tokens, themes, and contrast math for the
+  terminal UI.
+- **`crates/paths`** - User-scoped runtime path authority (`CODEWHALE_HOME`
+  and platform home resolution).
 - **`crates/protocol`** - Request/response framing and protocol types.
 - **`crates/secrets`** - OS keyring integration for API key storage.
 - **`crates/state`** - SQLite thread/session persistence layer.
+- **`crates/telemetry`** - Anonymous, user-disableable aggregate usage
+  counting; the only crate allowed to build or send a telemetry payload
+  (`docs/TELEMETRY.md`).
 - **`crates/workflow`** / **`crates/workflow-js`** - Workflow engine and its
   QuickJS scripting layer (renamed from the whaleflow crates).
 - **`crates/lane`** - Lane runtime: durable, attachable running instances of
@@ -126,7 +153,8 @@ boundary has held since v0.9.1):
 - **`llm_client/`** - LLM client trait, retry logic, and error classification
   (`LlmClient`, `RetryConfig`, `with_retry`) consumed by `client.rs`; `mock.rs`
   is test-only (`#[cfg(test)]`).
-- **`models.rs`** - Data structures for API requests/responses
+- **`crates/models`** (`codewhale_models`) - Data structures for API
+  requests/responses; the TUI crate has no local `models.rs`.
 
 #### DeepSeek API Endpoints
 
@@ -156,16 +184,19 @@ drives turns through Chat Completions.
     discoverable through `tool_search`
   - `automation.rs` - Model-visible scheduling tools over `AutomationManager`
   - `plan.rs` - Planning tools
-  - `subagent/` - Sub-agent launch and supervision. The one model-facing tool
-    is `agent`; the `agent_open`/`agent_eval`/`agent_close` lifecycle surface
-    was retired (see `subagent/coord.rs:5`)
+  - `subagent/` - Sub-agent launch and supervision. `agent` is the one
+    creation surface; `subagent/coord.rs` adds narrow coordination tools
+    (`agents/list`, `agents/message`, `agents/followup`, `agents/interrupt`,
+    `agents/wait`, `agents/coordinate`) over the existing manager. The
+    `agent_open`/`agent_eval`/`agent_close` lifecycle surface was retired
+    (see the `subagent/coord.rs` module doc)
   - `spec.rs` - Tool specifications
   - `rlm.rs` - Persistent Recursive Language Model (RLM) sessions — sandboxed Python REPLs with semantic helper calls and `var_handle` output support
 
 ### Extension Systems
 
 - **`mcp.rs`** - Model Context Protocol client for external tool servers
-- **`skills.rs`** - Plugin/skill loading and execution
+- **`skills/`** - Skill discovery and registry for local `SKILL.md` files, plus install and audit
 - **`hooks.rs`** - Pre/post execution hooks with conditions
 
 ### User Interface

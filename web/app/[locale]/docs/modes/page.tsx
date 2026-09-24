@@ -60,7 +60,7 @@ export default async function ModesPage({ params }: { params: Promise<{ locale: 
         <p className={`${t.bodyClassName} mt-3`}>{renderRichText(t.switchingLead)}</p>
         <p className={`${t.bodyClassName} mt-3`}>{t.switchingCommandLead}</p>
         <pre className="code-block mt-4">{`/mode plan
-/mode act
+/mode work
 /mode operate`}</pre>
       </section>
 
@@ -77,9 +77,8 @@ export default async function ModesPage({ params }: { params: Promise<{ locale: 
         </div>
       </section>
 
-      <section id="source" className="hairline-t pt-8">
-        <p className="text-sm text-ink-mute">{t.sourceNote}</p>
-      </section>
+      {/* Maintainer pointer: kept out of the rendered copy (experience mark 5). */}
+      <div hidden data-source-note={t.sourceNote} />
     </section>
   );
 }

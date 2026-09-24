@@ -72,7 +72,7 @@ pub use driver::{
 };
 pub use error::{DriverError, TaskErrorKind, WorkflowJsError};
 pub use schema::{SCHEMA_RAW_CARRY_CHARS, SCHEMA_RAW_PREVIEW_CHARS, SCHEMA_REPAIR_MAX_ATTEMPTS};
-pub use vm::{VmLimits, WorkflowRunCancel, WorkflowVm};
+pub use vm::{VmLimits, WorkflowRunCancel, WorkflowVm, normalize_task_cwd};
 
 /// Maximum `task()` spawn attempts per run (design §4.3). Counted in the VM
 /// before the driver is consulted, so a runaway `loop-until-dry` terminates

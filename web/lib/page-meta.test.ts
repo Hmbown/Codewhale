@@ -124,4 +124,15 @@ describe("page metadata", () => {
       expect(source, route).toContain(`path: "${path}"`);
     }
   });
+
+  it("omits robots by default and passes an explicit noindex through", () => {
+    const base = { path: "/digest", locale: "en", title: "Digest · Codewhale", description: "d" };
+    expect(buildPageMetadata(base)).not.toHaveProperty("robots");
+
+    const noindex = buildPageMetadata({ ...base, robots: { index: false, follow: true } });
+    expect(noindex.robots).toEqual({ index: false, follow: true });
+    // Canonical and social fields are unchanged by the robots option.
+    expect(noindex.alternates).toEqual(buildPageMetadata(base).alternates);
+    expect(noindex.openGraph).toEqual(buildPageMetadata(base).openGraph);
+  });
 });

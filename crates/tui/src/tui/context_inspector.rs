@@ -1464,10 +1464,10 @@ mod tests {
             messages_after: 4,
         });
         let text = build_context_inspector_text(&app, Locale::En);
-        assert!(text.contains("compaction"), "{text}");
+        assert!(text.contains("making room"), "{text}");
         assert!(text.contains("16 → 4 messages"), "{text}");
         let view = ContextInspectorView::new(&app);
-        assert!(view.row_labels().iter().any(|label| label == "compaction"));
+        assert!(view.row_labels().iter().any(|label| label == "making room"));
         assert!(view.row_labels().iter().any(|label| label == "anchors"));
     }
 }

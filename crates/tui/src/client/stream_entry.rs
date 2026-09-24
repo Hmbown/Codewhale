@@ -41,6 +41,94 @@ pub(crate) fn stream_open_timeout_from_env(value: Option<&str>) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Default wait for the first body byte after the response headers (#6184).
+/// Well under the 900s default inter-chunk idle budget: a provider that has
+/// answered the headers and then sends nothing at all — not even an SSE
+/// keep-alive — for five minutes has stopped, it is not thinking. Applies only
+/// while the idle budget is the default; an explicitly configured
+/// `stream_chunk_timeout_secs` is respected for the first byte too, so a user
+/// who raised it for long silent reasoning keeps that allowance.
+pub(crate) const DEFAULT_STREAM_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Resolve the first-body-byte bound for a stream whose inter-chunk idle
+/// budget is `idle`. `CODEWHALE_STREAM_FIRST_BYTE_TIMEOUT_SECS` overrides it
+/// (clamped to 5..=3600).
+#[must_use]
+pub(crate) fn first_byte_timeout(idle: Duration) -> Duration {
+    first_byte_timeout_from_env(
+        idle,
+        std::env::var("CODEWHALE_STREAM_FIRST_BYTE_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub(crate) fn first_byte_timeout_from_env(idle: Duration, value: Option<&str>) -> Duration {
+    if let Some(secs) = value.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return Duration::from_secs(secs.clamp(5, 3600));
+    }
+    let default_idle = Duration::from_secs(crate::config::DEFAULT_STREAM_CHUNK_TIMEOUT_SECS);
+    if idle == default_idle {
+        DEFAULT_STREAM_FIRST_BYTE_TIMEOUT.min(idle)
+    } else {
+        idle
+    }
+}
+
+/// Bound for the next body read: the first-byte bound until any byte arrived,
+/// the inter-chunk idle budget after.
+#[must_use]
+pub(crate) fn next_chunk_timeout(
+    idle: Duration,
+    first_byte: Duration,
+    bytes_received: usize,
+) -> Duration {
+    if bytes_received == 0 {
+        first_byte
+    } else {
+        idle
+    }
+}
+
+/// Message and stall record for a body read that timed out. A first-byte
+/// timeout is a stall worth a `crashes/` record (#6184); a later idle timeout
+/// is reported the same way so every silent provider wait leaves a trace.
+pub(crate) fn body_timeout_message(
+    timeout: Duration,
+    bytes_received: usize,
+    stream_age: Duration,
+    since_last_chunk: Duration,
+    provider: &str,
+) -> String {
+    let message = if bytes_received == 0 {
+        format!(
+            "SSE stream first-byte timeout after {}s — the provider sent headers but no data \
+             (stream_age_ms={})",
+            timeout.as_secs(),
+            stream_age.as_millis(),
+        )
+    } else {
+        idle_timeout_message(timeout, bytes_received, stream_age, since_last_chunk)
+    };
+    let phase = if bytes_received == 0 {
+        "waiting for the provider's first byte"
+    } else {
+        "waiting for the next stream chunk"
+    };
+    crate::core::engine::turn_heartbeat::report_stall(
+        &crate::core::engine::turn_heartbeat::StallReport {
+            source: "client",
+            phase: format!("while {phase}"),
+            detail: Some(provider.to_string()),
+            turn_id: None,
+            provider_request: None,
+            since_progress: since_last_chunk,
+            bound: Some(timeout),
+        },
+    );
+    message
+}
+
 /// How the shared stream open path should pin HTTP version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamHttpPolicy {
@@ -509,6 +597,33 @@ mod tests {
             StreamHttpPolicy::Http1Only,
             "http2 protocol error"
         ));
+    }
+
+    #[test]
+    fn stall_first_byte_timeout_is_well_under_default_idle_budget() {
+        let default_idle = Duration::from_secs(crate::config::DEFAULT_STREAM_CHUNK_TIMEOUT_SECS);
+        let first_byte = first_byte_timeout_from_env(default_idle, None);
+        assert_eq!(first_byte, DEFAULT_STREAM_FIRST_BYTE_TIMEOUT);
+        assert!(
+            first_byte * 3 <= default_idle,
+            "{first_byte:?} vs {default_idle:?}"
+        );
+        // An explicitly configured idle budget is respected for the first byte.
+        let custom = Duration::from_secs(1800);
+        assert_eq!(first_byte_timeout_from_env(custom, None), custom);
+        assert_eq!(
+            first_byte_timeout_from_env(Duration::from_secs(60), None),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            first_byte_timeout_from_env(default_idle, Some("90")),
+            Duration::from_secs(90)
+        );
+        assert_eq!(next_chunk_timeout(default_idle, first_byte, 0), first_byte);
+        assert_eq!(
+            next_chunk_timeout(default_idle, first_byte, 1),
+            default_idle
+        );
     }
 
     #[test]

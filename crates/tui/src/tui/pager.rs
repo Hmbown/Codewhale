@@ -753,7 +753,8 @@ impl ModalView for PagerView {
                 if absolute_idx >= page.lines.len() {
                     break;
                 }
-                if !self.search_matches.contains(&absolute_idx) {
+                // `search_matches` is built in ascending line order.
+                if self.search_matches.binary_search(&absolute_idx).is_err() {
                     continue;
                 }
                 let is_current = current_match_line == Some(absolute_idx);

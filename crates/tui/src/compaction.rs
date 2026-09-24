@@ -685,6 +685,17 @@ pub fn compaction_decision_with_billed(
     CompactionDecision::Compact
 }
 
+/// Whether a compaction pass could shrink this history at all: enough
+/// messages to summarize, or old tool output to prune. A one- or two-message
+/// conversation that is over budget is over budget because of its fixed
+/// prefix or its newest message, and summarizing it only spends a model call
+/// before the same failure (experience mark 2).
+#[must_use]
+pub fn has_compactable_history(messages: &[Message]) -> bool {
+    messages.len() >= MIN_SUMMARIZE_MESSAGES
+        || !plan_tool_result_prunes(messages, KEEP_RECENT_MESSAGES).is_empty()
+}
+
 fn truncate_chars(text: &str, max_chars: usize) -> &str {
     if max_chars == 0 {
         return "";

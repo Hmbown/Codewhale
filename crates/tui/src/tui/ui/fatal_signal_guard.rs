@@ -73,8 +73,8 @@ pub(crate) fn install_fatal_signal_guard() {
             tracing::debug!("Fatal-signal terminal guard skipped: stdout is not a TTY");
             return;
         }
-        if let Some(home) = crate::config::effective_home_dir() {
-            let dir = home.join(".codewhale").join("crashes");
+        if let Ok(home) = codewhale_config::codewhale_home() {
+            let dir = home.join("crashes");
             // Pre-create so the handler's open(2) cannot fail on ENOENT and
             // so a first crash needs no directory creation mid-signal.
             if std::fs::create_dir_all(&dir).is_ok() {

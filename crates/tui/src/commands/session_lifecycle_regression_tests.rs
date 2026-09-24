@@ -331,6 +331,31 @@ fn new_session_from_resumed_state_creates_distinct_empty_session() {
 }
 
 #[test]
+fn new_session_forgets_denials_and_session_grants() {
+    // UX-8: a Deny used to outlive `/new` for the whole process ("Restart
+    // Codewhale to reconsider it"); a fresh conversation starts clean.
+    let tmpdir = TempDir::new().unwrap();
+    let mut app = create_test_app_with_tmpdir(&tmpdir);
+    app.current_session_id = Some("old-session".to_string());
+    app.approval_session_denied
+        .insert("shell:rm -rf build:call-1".to_string());
+    app.approval_session_approved
+        .insert("shell:git status".to_string());
+
+    let result = new_session(&mut app, None);
+
+    assert!(matches!(result.action, Some(AppAction::SyncSession { .. })));
+    assert!(
+        app.approval_session_denied.is_empty(),
+        "a denied call must prompt again after /new"
+    );
+    assert!(
+        app.approval_session_approved.is_empty(),
+        "an approve-for-session grant must not follow the user into /new"
+    );
+}
+
+#[test]
 fn new_session_blocks_unsent_input_without_force() {
     let tmpdir = TempDir::new().unwrap();
     let mut app = create_test_app_with_tmpdir(&tmpdir);

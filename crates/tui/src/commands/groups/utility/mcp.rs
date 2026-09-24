@@ -249,10 +249,7 @@ fn mcp_unknown_id(presentation: &mut dyn CommandPresentationContext) -> String {
 fn recommended_mcp_text(presentation: &mut dyn CommandPresentationContext) -> String {
     let heading = presentation
         .translate("mcp_recommendations_heading", &[])
-        .unwrap_or_else(|_| {
-            "Suggested Codewhale plugins (MCP components; nothing installs automatically)"
-                .to_string()
-        });
+        .unwrap_or_else(|_| "Suggested MCP servers (nothing installs automatically)".to_string());
     let safety = presentation
         .translate(
             "mcp_recommendations_safety",
@@ -387,8 +384,7 @@ mod tests {
                     "Unknown MCP suggestion. Run {recommendations_command} to see the list.".to_string()
                 }
                 "mcp_recommendations_heading" => {
-                    "Suggested Codewhale plugins (MCP components; nothing installs automatically)"
-                        .to_string()
+                    "Suggested MCP servers (nothing installs automatically)".to_string()
                 }
                 "mcp_recommendations_safety" => {
                     "Looking adds nothing. Adding writes config only — review it before {restart_command} connects anything."
@@ -600,7 +596,7 @@ mod tests {
     fn recommendations_state_execution_and_install_boundaries() {
         let text = recommended_mcp_text(&mut FakePresentation);
         assert!(text.contains("nothing installs automatically"));
-        assert!(text.contains("Suggested Codewhale plugins"));
+        assert!(text.contains("Suggested MCP servers"));
         assert!(text.contains("never downloads or"));
         assert!(text.contains("installs this binary"));
         assert!(text.contains("experimental"));

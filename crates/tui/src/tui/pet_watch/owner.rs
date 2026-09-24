@@ -486,7 +486,10 @@ fn run_world(
             // offline wall time never invents activity or historical sound.
             let count = (elapsed * 30.0).floor().min(3.0) as u64;
             if elapsed > 0.25 {
-                producer = None;
+                // A delayed clock tick loses observation coverage, not the
+                // producer's transport sequence. Keep its lease until LEASE
+                // expires above; ordinary scheduler stalls must not reject
+                // the next valid packet as an unknown producer.
                 waiting = false;
                 context.with(|ctx| ctx.eval::<(), _>("pet.disconnectEngine()"))?;
             }

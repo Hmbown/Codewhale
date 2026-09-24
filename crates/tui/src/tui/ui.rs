@@ -195,13 +195,10 @@ const UI_IDLE_POLL_MS: u64 = 48;
 const UI_ACTIVE_POLL_MS: u64 = 24;
 const SUBAGENT_HOOK_PREVIEW_LIMIT: usize = 2_048;
 const DISPATCH_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
-/// Minimum wall-clock time a turn may stay in `"in_progress"` before the UI
-/// assumes the engine stalled (e.g. sub-agent hang, lost completion event,
-/// engine panic).  The effective watchdog also respects the configured stream
-/// idle timeout so legitimate long model-reasoning pauses are not interrupted
-/// prematurely.
+/// Wall-clock time a turn may stay in `"in_progress"` with no activity before
+/// the UI assumes the engine stalled (sub-agent hang, lost completion event,
+/// engine panic) — unless the engine heartbeat reports a live bounded wait.
 const TURN_STALL_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(300);
-const TURN_STALL_WATCHDOG_GRACE: Duration = Duration::from_secs(30);
 /// Running tools can legitimately exceed the silent-turn timeout, but a tool
 /// with no progress heartbeat or output beyond this ceiling is treated as hung.
 // Must stay comfortably above `turn_stall_watchdog_timeout` so a running tool
@@ -718,10 +715,15 @@ fn is_work_graph_mutation_tool(name: &str) -> bool {
     )
 }
 
-fn turn_stall_watchdog_timeout(app: &App) -> Duration {
-    let stream_budget = Duration::from_secs(app.stream_chunk_timeout_secs)
-        .saturating_add(TURN_STALL_WATCHDOG_GRACE);
-    TURN_STALL_WATCHDOG_TIMEOUT.max(stream_budget)
+/// UI watchdog bound for an in-progress turn with no activity (#6184).
+///
+/// Decoupled from `stream_chunk_timeout_secs`: tying it to that budget made
+/// the UI watchdog unable to fire before the 900s stream idle timeout. A
+/// quiet model wait is protected by the engine heartbeat instead — while the
+/// engine reports a bounded wait it has not flagged as overdue, the UI defers
+/// to it (`reconcile_turn_liveness_with`).
+fn turn_stall_watchdog_timeout(_app: &App) -> Duration {
+    TURN_STALL_WATCHDOG_TIMEOUT
 }
 
 fn active_turn_has_running_tool(app: &App) -> bool {

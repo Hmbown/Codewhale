@@ -56,7 +56,15 @@ try:
     request(d,'/v1/action',select);a=frame_when(d,lambda f:f['source']=='contract-source')
     producer={'identity':d['identity'],'epoch':a['epoch'],'client':str(uuid.uuid4()),'source':a['source'],'source_revision':a['sourceRevision'],'seq':0,'waiting':False,'events':[]}
     request(d,'/v1/producer',producer)
+    # The macOS/Unix owner may miss a 250 ms clock deadline under CI load.
+    # Coverage becomes unknown, but a delay shorter than the 2 s producer
+    # lease must not discard its sequence and reject the next valid packet.
+    child.send_signal(signal.SIGSTOP)
+    try: time.sleep(.4)
+    finally: child.send_signal(signal.SIGCONT)
     packet=dict(producer,seq=1,events=[{'event':'thinking_started','index':1}]);r=request(d,'/v1/producer',packet)
+    assert not r.get('duplicate',False) and r['seq']==1
+    passed('a scheduling pause inside the lease preserves the producer sequence')
     assert request(d,'/v1/producer',packet)['duplicate']
     reject(d,'/v1/producer',dict(producer,seq=3));request(d,'/v1/producer',producer)
     reject(d,'/v1/producer',dict(producer,seq=1,events=[{'event':'thinking_started','index':2},{'event':'response_delta','index':2,'content':'PRIVATE'}]))

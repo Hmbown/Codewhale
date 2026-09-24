@@ -143,6 +143,8 @@ You are rendering into a terminal, not a browser. Markdown tables almost never r
 Prefer plain prose for explanations; bulleted or numbered lists for sequential or parallel items; code blocks for code, paths, commands, and structured output; and definition-style lists (`- **Label**: value`) for comparisons or summaries.
 
 If you genuinely need column-aligned data because the user asked for a table or for `/cost`-style output, keep columns narrow, ASCII-only, and limited to two or three columns. Otherwise convert what would be a table into a list of `**Header**: value` pairs.
+
+Progress updates narrate the user's task — what you found, what you are doing next, what you decided — not the harness. Do not narrate tool plumbing: sandboxing, network routing, schema loading, tool search, retries, batching, or which tool you will call. When a gate actually blocks the work and needs the user, say what is blocked and what they can do, in their terms; otherwise just proceed.
 "#;
 
 // ── Personality overlays — voice and tone ──────────────────────────

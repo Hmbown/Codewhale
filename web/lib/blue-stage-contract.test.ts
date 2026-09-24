@@ -1,8 +1,9 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { resolveWhale } from "./whale-tokens";
+import { siteCss } from "./site-css";
 
-const CSS = readFileSync(new URL("../app/globals.css", import.meta.url), "utf8");
+const CSS = siteCss();
 
 function selectorBlock(selector: string): string {
   const match = CSS.match(
@@ -12,7 +13,7 @@ function selectorBlock(selector: string): string {
   return match[1];
 }
 
-// globals.css names the palette token (`--paper: var(--gpui-paper)`)
+// The site stylesheet (app/styles/*.css) names the palette token (`--paper: var(--gpui-paper)`)
 // rather than repeating its hex; resolve one hop through the generated
 // app/tokens.css plus the hand-kept --gpui-* block.
 function cssHexIn(block: string, name: string): string {
@@ -27,46 +28,48 @@ function cssHexIn(block: string, name: string): string {
 
 const ROOT = selectorBlock(":root");
 const BELOW_WATERLINE = selectorBlock(
-  '.ocean-column,\n.site-footer,\nhtml[data-theme="dark"] .docs-portal',
+  '.ocean-column,\n.site-footer,\n:root[data-theme="dark"]',
 );
 
 describe("GPUI public-surface contract", () => {
   it("grounds the paper sheet in the GPUI light theme's warm paper and inks", () => {
     // Above the waterline the field is the GPUI light background — warm
-    // paper — and the ink is its plum-charcoal foreground. The literals are
-    // the Shoreline theme constants in crates/palette/src/tokens.rs, reached
-    // through the generated tokens in app/tokens.css.
-    expect(cssHexIn(ROOT, "paper")).toBe("#f5f0e9");
-    expect(cssHexIn(ROOT, "paper-deep")).toBe("#ece5e0");
-    expect(cssHexIn(ROOT, "paper-edge")).toBe("#d7ced5");
-    expect(cssHexIn(ROOT, "paper-card")).toBe("#fffcf7");
-    expect(cssHexIn(ROOT, "ink")).toBe("#302832");
-    expect(cssHexIn(ROOT, "ink-soft")).toBe("#4a414c");
-    expect(cssHexIn(ROOT, "ink-mute")).toBe("#6b606e");
-    // Action on paper is the GPUI light primary; hover sinks to its hover.
-    expect(cssHexIn(ROOT, "indigo")).toBe("#006684");
-    expect(cssHexIn(ROOT, "indigo-deep")).toBe("#00536d");
-    expect(cssHexIn(ROOT, "mark-ink")).toBe("#302832");
+    // paper — and the ink is its foreground. Values come from the versioned
+    // vendor/codewhale-design/tokens.json artifact,
+    // reached through the generated tokens in app/tokens.css.
+    expect(cssHexIn(ROOT, "paper")).toBe("#faf8f5");
+    expect(cssHexIn(ROOT, "paper-deep")).toBe("#f0ede8");
+    expect(cssHexIn(ROOT, "paper-edge")).toBe("#d9d5cf");
+    expect(cssHexIn(ROOT, "paper-card")).toBe("#ffffff");
+    expect(cssHexIn(ROOT, "ink")).toBe("#28292b");
+    expect(cssHexIn(ROOT, "ink-soft")).toBe("#5f605d");
+    expect(cssHexIn(ROOT, "ink-mute")).toBe("#5f605d");
+    // Action on paper is the GPUI light primary; hover is the same hue at
+    // 0.9 opacity (`button_primary_hover`), not a second blue.
+    expect(cssHexIn(ROOT, "indigo")).toBe("#245bc7");
+    expect(resolveWhale("var(--gpui-primary-hover)")).toBe("rgb(var(--gpui-light-primary-rgb) / var(--gpui-primary-hover-opacity))");
+    expect(ROOT).toMatch(/--indigo-deep:\s*var\(--gpui-primary-hover\);/);
+    expect(cssHexIn(ROOT, "mark-ink")).toBe("#28292b");
     // The deep field is always the stage's darkest, and code plates keep the
     // stage deep on either side of the waterline.
-    expect(cssHexIn(ROOT, "ocean-deep")).toBe("#1a181c");
-    expect(cssHexIn(ROOT, "action-on-dark")).toBe("#67b8d6");
-    expect(cssHexIn(ROOT, "ocean-current")).toBe("#67b8d6");
-    expect(cssHexIn(ROOT, "code-bg")).toBe("#1a181c");
+    expect(cssHexIn(ROOT, "ocean-deep")).toBe("#191a1c");
+    expect(cssHexIn(ROOT, "action-on-dark")).toBe("#90b9ff");
+    expect(cssHexIn(ROOT, "ocean-current")).toBe("#90b9ff");
+    expect(cssHexIn(ROOT, "code-bg")).toBe("#191a1c");
   });
 
   it("re-inks every dark subtree with the GPUI charcoal tokens through one rule", () => {
-    // The ocean column, the footer seabed, and the opt-in docs dark sheet
-    // share one below-the-waterline rule, so a component never needs to know
-    // which side of the surface it is on.
-    expect(CSS).toMatch(/\.ocean-column,\s*\.site-footer,\s*html\[data-theme="dark"\] \.docs-portal\s*\{/);
-    expect(cssHexIn(BELOW_WATERLINE, "paper")).toBe("#211f23");
-    expect(cssHexIn(BELOW_WATERLINE, "paper-deep")).toBe("#2b282e");
-    expect(cssHexIn(BELOW_WATERLINE, "paper-edge")).toBe("#49424d");
-    expect(cssHexIn(BELOW_WATERLINE, "ink")).toBe("#f2ece5");
-    expect(cssHexIn(BELOW_WATERLINE, "ink-soft")).toBe("#b0a7b2");
-    expect(cssHexIn(BELOW_WATERLINE, "ink-mute")).toBe("#7e7583");
-    expect(cssHexIn(BELOW_WATERLINE, "indigo")).toBe("#67b8d6");
+    // The ocean column, the footer seabed, and the pinned dark scheme share
+    // one dark rule (the OS-dark block repeats it), so a component never
+    // needs to know which side of the surface it is on.
+    expect(CSS).toMatch(/\.ocean-column,\s*\.site-footer,\s*:root\[data-theme="dark"\]\s*\{/);
+    expect(cssHexIn(BELOW_WATERLINE, "paper")).toBe("#202123");
+    expect(cssHexIn(BELOW_WATERLINE, "paper-deep")).toBe("#2a2b2e");
+    expect(cssHexIn(BELOW_WATERLINE, "paper-edge")).toBe("#3b3c3f");
+    expect(cssHexIn(BELOW_WATERLINE, "ink")).toBe("#efeeeb");
+    expect(cssHexIn(BELOW_WATERLINE, "ink-soft")).toBe("#b1b1ad");
+    expect(cssHexIn(BELOW_WATERLINE, "ink-mute")).toBe("#b1b1ad");
+    expect(cssHexIn(BELOW_WATERLINE, "indigo")).toBe("#90b9ff");
     expect(cssHexIn(BELOW_WATERLINE, "jade")).toBe("#9ec7b2");
     expect(cssHexIn(BELOW_WATERLINE, "signal-gold")).toBe("#d6c78f");
   });

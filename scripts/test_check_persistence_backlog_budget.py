@@ -5,9 +5,14 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import io
+import json
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -281,6 +286,76 @@ class PersistenceBacklogBudgetTests(unittest.TestCase):
         stale_source["source_sha"] = "f" * 40
         with self.assertRaisesRegex(mod.PersistenceBacklogError, "does not match"):
             mod.validate_baseline_receipt(budget, stale_source)
+
+    def _run_cli(self, receipt: dict, budget: dict, *extra: str) -> tuple[int, str, dict]:
+        """Run main() against temp files with the source identity pinned to ``receipt``."""
+        source = {
+            field: receipt[field]
+            for field in (
+                "source_sha",
+                "source_dirty",
+                "rustc_version",
+                "cargo_version",
+                "build_profile",
+                "sample_count",
+            )
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt_path = Path(tmp) / "receipt.json"
+            budget_path = Path(tmp) / "budget.json"
+            baseline_path = Path(tmp) / "baseline.json"
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            budget_path.write_text(json.dumps(budget, indent=2) + "\n", encoding="utf-8")
+            baseline_path.write_text(json.dumps(receipt_fixture()), encoding="utf-8")
+            output = io.StringIO()
+            argv = [
+                "check",
+                "--receipt",
+                str(receipt_path),
+                "--budget",
+                str(budget_path),
+                *extra,
+            ]
+            with (
+                mock.patch.object(mod, "current_source_identity", return_value=source),
+                mock.patch.object(mod, "BASELINE_RECEIPT_PATH", baseline_path),
+                mock.patch.object(sys, "argv", argv),
+                redirect_stdout(output),
+                redirect_stderr(output),
+            ):
+                result = mod.main()
+            written = json.loads(budget_path.read_text(encoding="utf-8"))
+        return result, output.getvalue(), written
+
+    def test_failure_prints_update_receipt_and_update_raises_only_exceeded(self) -> None:
+        budget = budget_fixture()
+        receipt = receipt_fixture()
+        receipt["enqueue_elapsed_ns"] = budget["ceilings"]["enqueue_elapsed_ns"] + 7
+        receipt["retained_queued_requests"] -= 1
+
+        result, output, unchanged = self._run_cli(receipt, budget)
+        self.assertEqual(result, 1)
+        self.assertIn("check-persistence-backlog-budget.py", output)
+        self.assertIn("--update", output)
+        self.assertEqual(unchanged, budget)
+
+        result, output, updated = self._run_cli(receipt, budget, "--update")
+        self.assertEqual(result, 0, output)
+        self.assertEqual(
+            updated["ceilings"]["enqueue_elapsed_ns"], receipt["enqueue_elapsed_ns"]
+        )
+        # Decreases keep their noise headroom: --update never lowers a ceiling.
+        self.assertEqual(
+            updated["ceilings"]["retained_queued_requests"],
+            budget["ceilings"]["retained_queued_requests"],
+        )
+        self.assertEqual(updated["baseline_observation"], budget["baseline_observation"])
+
+    def test_update_without_growth_leaves_budget_untouched(self) -> None:
+        budget = budget_fixture()
+        result, output, written = self._run_cli(receipt_fixture(), budget, "--update")
+        self.assertEqual(result, 0, output)
+        self.assertEqual(written, budget)
 
 
 if __name__ == "__main__":

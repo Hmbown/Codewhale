@@ -1,0 +1,33 @@
+# CodeQL configuration for code scanning.
+#
+# Test code is out of scope for security alerts: it runs only in CI, talks to
+# in-process loopback servers, and routinely prints fixture secrets in
+# assertion messages to prove they are redacted elsewhere. Those paths are
+# excluded here so alerts point at product code.
+#
+# Inline `#[cfg(test)] mod tests` blocks inside product files cannot be
+# excluded by path; alerts there are dismissed as "used in tests".
+#
+# This file takes effect only with CodeQL advanced setup:
+# .github/workflows/codeql.yml passes it to `github/codeql-action/init`.
+# Default setup ignores it, so the repository's code scanning setting must be
+# switched from Default to Advanced for either to apply.
+name: codewhale-codeql
+
+paths-ignore:
+  # Rust integration tests and split-out unit test modules.
+  - "**/tests/**"
+  - "**/tests.rs"
+  - "**/*_tests.rs"
+  - "**/test_support.rs"
+  - "**/*_test_support.rs"
+  # JavaScript / TypeScript test suites.
+  - "**/test/**"
+  - "**/__tests__/**"
+  - "**/*.test.js"
+  - "**/*.test.mjs"
+  - "**/*.test.ts"
+  - "**/*.test.tsx"
+  - "**/*.spec.js"
+  - "**/*.spec.ts"
+  - "**/*.spec.tsx"

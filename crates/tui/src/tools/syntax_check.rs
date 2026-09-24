@@ -151,7 +151,7 @@ pub(super) fn guard_edit(
     }
     Err(ToolError::execution_failed(format!(
         "Edit refused: it would leave {display_path} unparseable — {issue}. Nothing was written; \
-         the file is unchanged. Recovery: re-read the file with File action=\"read\", check the \
+         the file is unchanged. Recovery: re-read the file with `read` (path=...), check the \
          replacement for unbalanced delimiters or a truncated block, and retry."
     )))
 }
@@ -338,6 +338,10 @@ mod tests {
         assert!(message.contains("src/lib.rs"), "{message}");
         assert!(message.contains("Rust syntax error at line"), "{message}");
         assert!(message.contains("Nothing was written"), "{message}");
+        // Recovery must point at the model-visible `read` tool, never the
+        // hidden compatibility `File` tool.
+        assert!(message.contains("`read` (path=...)"), "{message}");
+        assert!(!message.contains("File action="), "{message}");
     }
 
     #[test]

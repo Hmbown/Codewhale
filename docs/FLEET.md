@@ -26,7 +26,9 @@ existing workspaces, receipts, or scripts:
 
 - the durable ledger `.codewhale/fleet.jsonl` and the log directories
   `.codewhale/fleet/` and `.codewhale/fleet-host/`;
-- saved rosters `fleets/<name>.toml` and their `schema = "fleet"` header;
+- saved rosters `fleets/<name>.toml` and their `schema = "fleet"` header, under
+  `$CODEWHALE_HOME/` or the workspace's `.codewhale/` (checked-in rosters at the
+  workspace root's `fleets/` are still read);
 - the `[fleet]` config table (inline `[fleets.*]` tables were removed in 0.9.14; named fleets live in `fleets/<name>.toml` files);
 - the `codewhale workflow run --fleet <name>` flag;
 - wire, receipt, and control-plane operation ids such as `fleet.status`.
@@ -44,6 +46,7 @@ Workflow authoring, see [fleet + Workflow Tutorial](FLEET_WORKFLOW_TUTORIAL.md).
 
 ```sh
 codewhale fleet init
+codewhale fleet run tasks.json --check   # validate only; nothing is created or launched
 codewhale fleet run tasks.json --max-workers 4
 codewhale fleet status
 codewhale fleet inspect <worker-id>
@@ -158,8 +161,8 @@ neither creates the ledger as a side effect of reading it.
 The current interactive session's sub-agents are a **different set**, and now
 have their own name:
 
-- `/fleet workers` (or `/subagents`, or `n`) shows sub-agents attached to the
-  current TUI session. It does not read the persistent ledger.
+- `/fleet workers` (or `/subagents`, or Tab / `w` from the `/fleet` roster)
+  shows sub-agents attached to the current TUI session. It does not read the persistent ledger.
 - `/fleet list|status|interrupt|resume` and `codewhale fleet
   list|status|interrupt|resume` act on the durable ledger.
 - `codewhale fleet restart <worker-id>` is CLI-only: it re-leases the task and
@@ -313,7 +316,9 @@ header/status signal; avoid repeating emoji-heavy rows for every worker.
 
 A selected v2 fleet freezes each selected member's id, semantic role, provider,
 and model identity into the durable run before a Workflow starts. Save the
-fleet as `fleets/<name>.toml` in the workspace or under `$CODEWHALE_HOME`.
+fleet as `fleets/<name>.toml` under the workspace's `.codewhale/` (where the
+fleet editor saves folder fleets) or under `$CODEWHALE_HOME`; a checked-in
+`fleets/<name>.toml` at the workspace root is also read.
 Models cannot replace those identity or route assignments at runtime:
 
 ```toml
@@ -343,9 +348,18 @@ The workflow crate's older `schema = "exact"`, revision 1 files are migration
 input only. Do not author revision-1 files; the selected roster and setup UI
 read and write only `schema = "fleet"`, revision 2.
 
+`workflow(fleet: "release")` runs a saved Fleet without selecting it. At
+Workflow start, a member with no pin takes the Fleet's `[operator]` route or,
+without one, the session route and reasoning tier; that frozen route is what
+runs and what receipts name, and editing the file mid-run changes only the next
+Workflow. If a saved Fleet and an older exact/legacy file share a name, the
+Workflow refuses to guess; qualify the saved one as `user/<name>` or
+`folder/<name>`. Members with `instructions` or `requires` cannot run in a
+Workflow yet.
+
 Reasoning is a separate route-execution decision, not fleet identity. The
 optional Reasoning Router is a reusable Runtime service, not a fleet member.
-Save one profile at `routers/<name>.toml` in either search root and reference it
+Save one profile at `routers/<name>.toml` in any search root and reference it
 from any number of fleets:
 
 ```toml
@@ -363,8 +377,9 @@ Router call itself is capped at `off` or `low`; more expensive values are
 rejected. A manually selected worker reasoning tier makes no Router call. Route
 and reasoning receipts name the worker model and, when used, the Router's exact
 provider/model so the operator can see which model did which job. If the same
-bare Router or fleet name exists in both roots, qualify it as
-`workspace/<name>` or `codewhale_home/<name>` instead of relying on shadowing.
+bare Router or fleet name exists in more than one root, qualify it as
+`codewhale_home/<name>`, `workspace/<name>` (the workspace's `.codewhale/`), or
+`workspace_root/<name>` (the workspace root) instead of relying on shadowing.
 
 Compatibility schemas may serialize `reasoning`, `permissions`, tool hints, or
 other execution settings beside a member. Those values are not fleet identity,
@@ -480,7 +495,11 @@ next recursive ring rather than trying to show the whole tree at once.
 
 ## Task Spec
 
-`codewhale fleet run` accepts JSON or TOML. A minimal JSON spec:
+`codewhale fleet run` accepts JSON or TOML. `codewhale fleet run <spec> --check`
+runs every validation a real run performs (spec shape, roster members, agent
+profiles, model routes) and prints the same warnings, then stops: no ledger is
+created, no run is written, no worker starts, and nothing is spent. A minimal
+JSON spec:
 
 ```json
 {
@@ -498,6 +517,22 @@ next recursive ring rather than trying to show the whole tree at once.
 
 Workers are optional. If omitted, Codewhale creates local worker slots up to
 `--max-workers`.
+
+A spec file takes one of three shapes, chosen by its structure before any
+field is read:
+
+- a **document** — an object with `tasks` (and optionally `name`, `labels`,
+  `workers`, `usage_ceiling`);
+- a **task array** — a bare JSON array of task objects;
+- a **single task** — one task object with `id` / `instructions` at the top
+  level (JSON or TOML; a TOML file is never a task array).
+
+Array and single-task files take their run name from the file name. Because
+the shape is picked first, a malformed spec reports the real problem, for
+example ``JSON spec document at tasks[1] (id "review"): missing field
+`instructions` at line 7 column 5``. The checked-in
+[`docs/examples/fleet-dogfood.toml`](examples/fleet-dogfood.toml) and the
+tutorial's `tasks.json` are parsed by the test suite, so they stay valid.
 
 Task specs are typed in Rust and keep verification data separate from worker
 transcripts. Only the `worker` member/role reference participates in fleet
@@ -843,3 +878,42 @@ For current enforcement behavior, use [Modes](MODES.md),
 [Command Control Plane](COMMAND_CONTROL_PLANE.md). Keep secret values out of
 task instructions, arguments, logs, and receipts; adapter and Runtime layers
 must continue to redact or reject them independently of fleet selection.
+
+## Child grants: 0.10.1 scope and the 0.11 rework (#6298)
+
+Today a child's authority is assembled from several layers: role postures, a
+permission ceiling, the shell policy, inherited tool scope, deny-list unions,
+sentinels, and a single-command read-only grammar. That grammar is both too
+narrow and not a real boundary. A verifier cannot run the builds and fetches
+it is handed, and the grammar is a classifier, not a sandbox.
+
+**Shipped before 0.10.1** (narrow fixes on the current model):
+
+- Children never inherit desktop or computer-control tools (b5e48cd31, #6296).
+- A bounded verify surface for Git: `fetch` against a configured remote name
+  and a read-only `merge_tree` (b89349286).
+- Refusals name the sanctioned alternative and tell a child to report a
+  blocked probe to its parent instead of working around it (23747acea).
+- One reasoning vocabulary (c2bc1244d). Token budgets are tracked but never
+  enforced (a7a8bdb33).
+
+**0.10.1 re-scope.** This release adds no grant-model code. #6298 is re-scoped
+to the design below, and the rework lands in 0.11 as its own slices.
+
+**0.11 rework** (size L, one slice at a time):
+
+1. **One grant object per child.** It has `files` (none / read / write),
+   `shell` (none / inspect / verify / full), `network`, `desktop` (off unless
+   granted), and a preset tool allowlist. Roles become presets over it. Catalog
+   visibility and execution denial come from the same grant, which retires the
+   ceiling, sentinel, and posture re-mapping layers.
+2. **A `verify` shell mode that works.** `cargo test`/`check` and Git fetch run
+   under an explicit, bounded write scope (`target/`, refs), replacing the
+   command allowlist that pretends to be read-only.
+3. **Classified tool families that fail closed.** MCP and desktop tools form a
+   labeled family. A child gets that family only when the spawn grants it with
+   a reason, and an unclassified tool is not granted.
+4. **Legible grants.** The role picker, roster, and receipts show the effective
+   grant, model, and thinking tier in plain words.
+
+Related work is tracked in #6015, #5633, #6194, and #6232.

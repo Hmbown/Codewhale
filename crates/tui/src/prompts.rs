@@ -802,7 +802,7 @@ const LOCALE_PREAMBLE_ZH_HANS: &str = "## 语言要求\n\n\
 你正在 codewhale 中运行。无论任务上下文（代码、错误日志、文件名）\
 是英文，无论系统提示的其余部分是英文，你都必须用简体中文进行 \
 `reasoning_content`（内部思考）和最终回复。代码、文件路径、工具名称\
-（例如 `File`、`Bash`）、环境变量、命令行参数和 URL \
+（例如 `read`、`bash`）、环境变量、命令行参数和 URL \
 保持原样 —— 只有自然语言散文要切换到简体中文。\n\n\
 如果用户在会话中切换到另一种语言，从下一轮开始跟随切换。\
 如果用户明确要求（例如 \"think in English\"），则覆盖此规则。";
@@ -811,8 +811,8 @@ const LOCALE_PREAMBLE_JA: &str = "## 言語要件\n\n\
 codewhale を実行しています。タスクコンテキスト（コード、エラーログ、\
 ファイル名）が英語であっても、システムプロンプトの他の部分が英語で\
 あっても、`reasoning_content`（内部思考）と最終的な返信は日本語で\
-行ってください。コード、ファイルパス、ツール名（例：`File`、\
-`Bash`）、環境変数、コマンドライン引数、URL は元のまま —— \
+行ってください。コード、ファイルパス、ツール名（例：`read`、\
+`bash`）、環境変数、コマンドライン引数、URL は元のまま —— \
 自然言語の文章のみ日本語に切り替えます。\n\n\
 ユーザーがセッション中に別の言語に切り替えた場合は、次のターンから\
 それに従ってください。ユーザーが明示的に要求した場合（例：\
@@ -824,8 +824,8 @@ Você está rodando dentro do codewhale. Escreva tanto \
 em português do Brasil, mesmo quando o contexto da tarefa (código, \
 logs de erro, nomes de arquivos) estiver em inglês e mesmo quando o \
 resto do system prompt for em inglês. Mantenha código, caminhos de \
-arquivos, nomes de ferramentas (por exemplo `File`, \
-`Bash`), variáveis de ambiente, flags de linha de comando e \
+arquivos, nomes de ferramentas (por exemplo `read`, \
+`bash`), variáveis de ambiente, flags de linha de comando e \
 URLs no formato original — apenas a prosa em linguagem natural muda \
 para português do Brasil.\n\n\
 Se o usuário mudar de idioma no meio da sessão, mude no próximo turno. \
@@ -865,7 +865,7 @@ const LOCALE_PREAMBLE_VI: &str = "## Yêu cầu ngôn ngữ\n\n\
 Bạn đang chạy trong codewhale. Cho dù ngữ cảnh tác vụ (mã nguồn, nhật ký lỗi, tên tệp) \
 là tiếng Anh, cho dù phần còn lại của system prompt là tiếng Anh, bạn đều phải sử dụng \
 tiếng Việt cho phần `reasoning_content` (suy nghĩ nội bộ) và câu trả lời cuối cùng. Các từ \
-mã nguồn, đường dẫn tệp, tên công cụ (ví dụ `File`, `Bash`), biến môi trường, \
+mã nguồn, đường dẫn tệp, tên công cụ (ví dụ `read`, `bash`), biến môi trường, \
 tham số dòng lệnh và URL giữ nguyên dạng gốc —— chỉ các văn bản giải thích bằng ngôn ngữ \
 tự nhiên mới được chuyển sang tiếng Việt.\n\n\
 Nếu người dùng chuyển sang ngôn ngữ khác trong phiên làm việc, hãy chuyển theo từ lượt tiếp theo. \
@@ -1872,6 +1872,60 @@ mod tests {
     }
 
     #[test]
+    fn locale_preambles_name_only_model_visible_tools() {
+        for tag in ["zh-Hans", "ja", "pt-BR", "vi"] {
+            let preamble = locale_reinforcement_preamble(tag).expect("preamble exists");
+            assert!(
+                preamble.contains("`read`") && preamble.contains("`bash`"),
+                "{tag} preamble must use model-visible tool names: {preamble:?}"
+            );
+            assert!(
+                !preamble.contains("`File`") && !preamble.contains("`Bash`"),
+                "{tag} preamble must not teach hidden compatibility names: {preamble:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn visible_tool_descriptions_do_not_point_at_hidden_file_or_bash() {
+        use crate::tools::pandoc::PandocConvertTool;
+        use crate::tools::tasks::TaskShellWaitTool;
+        let surfaces = [
+            (
+                "handle_read",
+                format!(
+                    "{} {}",
+                    HandleReadTool.description(),
+                    HandleReadTool.input_schema()
+                ),
+            ),
+            (
+                "pandoc_convert",
+                format!(
+                    "{} {}",
+                    PandocConvertTool.description(),
+                    PandocConvertTool.input_schema()
+                ),
+            ),
+            (
+                "task_shell_wait",
+                format!(
+                    "{} {}",
+                    TaskShellWaitTool.description(),
+                    TaskShellWaitTool.input_schema()
+                ),
+            ),
+        ];
+        for (name, text) in surfaces {
+            assert!(
+                !text.contains("File action=") && !text.contains("`Bash`"),
+                "{name} must not point models at the hidden File/Bash tools: {text}"
+            );
+        }
+        assert!(HandleReadTool.description().contains("`read` (path=...)"));
+    }
+
+    #[test]
     fn tool_descriptions_carry_edit_and_shell_guidance() {
         let write = WriteFileTool.description();
         assert!(
@@ -2064,9 +2118,14 @@ mod tests {
                 "zh preamble must steer reasoning_content: {preamble:?}"
             );
             assert!(
-                preamble.contains("`File`"),
-                "zh preamble must call out tool-name immutability with a LIVE tool \
-                 name; `read_file` is retired (registry.rs:2067): {preamble:?}"
+                preamble.contains("`read`") && preamble.contains("`bash`"),
+                "zh preamble must call out tool-name immutability with a model-visible \
+                 tool name: {preamble:?}"
+            );
+            assert!(
+                !preamble.contains("`File`") && !preamble.contains("`Bash`"),
+                "zh preamble must not teach the hidden compatibility `File`/`Bash` \
+                 names: {preamble:?}"
             );
             assert!(
                 !preamble.contains("read_file") && !preamble.contains("exec_shell"),

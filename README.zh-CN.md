@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:29c349b6f2b4 -->
+<!-- source: README.md sha256:bbb8bfb61e57 -->
 # Codewhale
 
 Codewhale 是一款开源智能体，可使用你选择的托管模型或本地模型读取项目、编辑文件、运行命令并检查自己的工作。从终端中的一项任务开始。对于较大的工作，可以将其中的部分任务交给使用不同模型、承担不同角色的智能体。
@@ -30,7 +30,7 @@ Windows 请使用 [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases
 并保留比已发布版本更新的构建。npm 和 Cargo 是次要打包选项。
 迁移与 PATH 排查见[安装指南](docs/zh_hans/INSTALL.md)。
 
-首次运行会帮助你连接提供商，也可以离线配置 Codewhale。要获得模型回复，必须连接托管模型或本地模型。Codewhale 还支持 npm 和 Cargo 作为次要打包方式，以及 Docker、Nix、Scoop、Android/Termux 和可选的 CNB 镜像。对于现有的软件包管理器安装，系统会提供迁移说明。请参阅[安装与 PATH 帮助](docs/INSTALL.md)。
+首次运行会直接打开输入框，不会引导你完成设置流程。要获得模型回复，必须连接托管模型或本地模型：在连接之前，启动界面会显示 "no model connected"。运行 `/provider`（或按 F3）即可添加托管服务密钥或选择本地运行时。如果 Ollama 已在运行且带有聊天模型，Codewhale 会自动切换到它。Codewhale 还支持 npm 和 Cargo 作为次要打包方式，以及 Docker、Nix、Scoop、Android/Termux 和可选的 CNB 镜像。对于现有的软件包管理器安装，系统会提供迁移说明。请参阅[安装与 PATH 帮助](docs/INSTALL.md)。
 
 每种 shell 只需一条命令即可启用 Tab 补全——`codewhale completion bash|zsh|fish|powershell|elvish`。请参阅 [shell 补全](docs/INSTALL.md#8-shell-completions)。
 
@@ -56,7 +56,7 @@ Codewhale 可以读取你的代码仓库、编辑文件、运行命令、检查�
 
 - **终端：** `codewhale` 打开交互界面；`codewhale exec` 可从脚本或 CI 作业中运行任务。
 - **本地浏览器：** `codewhale web` 打开随附的[本地 Web 客户端](docs/WEB.md)，使用同一个 Runtime。
-- **Codewhale 桌面应用（GPUI）：** 原生 GPUI 桌面应用是产品客户端方向（2026-09-14 决定；阶段规划见私有 codehwhale-gpui 仓库中的 docs/TRANSITION.md）。app.codewhale.net 的托管网页应用将分阶段下线；营销站点、登录、计费、法律和下载页面永久保留在网页上。其可用情况见[产品页面](https://codewhale.net/en/product)。
+- **Codewhale 桌面应用（GPUI）：** 在独立仓库中开发的原生桌面应用是登录后产品客户端的方向。app.codewhale.net 的托管网页应用将按它的样子重建；营销站点、登录、计费、法律和下载页面保留在网页上。其可用情况见[产品页面](https://codewhale.net/en/product)。
 
 **Computer Use 提供观察其他应用并与之交互的工具。** 当前源码已包含此插件。使用前请查看它请求的访问权限并启用它；仍须满足操作系统权限和平台要求。请参阅随附的 [Computer Use 指南](crates/tui/plugins/computer-use/README.md)和[插件设置](docs/PLUGINS.md)。
 
@@ -83,7 +83,7 @@ Codewhale 在你的机器上运行，并仅拥有你授予的访问权限。审�
 - [智能体团队](docs/FLEET.md)
 - [MCP](docs/MCP.md)、[钩子](docs/HOOKS.md)和[配置](docs/CONFIGURATION.md)
 - [本地 Web 客户端](docs/WEB.md)
-- [全部文档](docs)
+- [全部文档](docs/README.md)
 - [仓库结构与贡献指南](CONTRIBUTING.md#project-structure)
 
 ## 加入社区

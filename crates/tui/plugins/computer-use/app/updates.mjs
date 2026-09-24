@@ -6,7 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { inflateRawSync } from "node:zlib";
 import { replaceMacBundle, verifyReleaseBundle } from "./install-macos.mjs";
-import { APP_VERSION, APP_NAME } from "../src/app-socket.mjs";
+import { APP_VERSION, APP_NAME, newerVersion } from "../src/app-socket.mjs";
 import { stateDir } from "../src/registry.mjs";
 
 const repository="https://github.com/Hmbown/codewhale-cu-plugin";
@@ -25,11 +25,7 @@ async function responseBytes(response, maximum) {
   for await(const chunk of response.body) { size+=chunk.length; if(size>maximum) throw new Error("The update service exceeded its response size limit."); chunks.push(chunk); }
   return Buffer.concat(chunks);
 }
-export function newerVersion(candidate,current) {
-  const parse=value=>/^\d+\.\d+\.\d+$/.test(value)?value.split(".").map(Number):null;
-  const a=parse(candidate),b=parse(current); if(!a||!b) return false;
-  for(let i=0;i<3;i++) { if(a[i]!==b[i]) return a[i]>b[i]; } return false;
-}
+export { newerVersion };
 export function releaseUpdate(release,current=APP_VERSION) {
   const version=release?.tag_name?.replace(/^v/,"");
   if(!version||release.draft||release.prerelease||!newerVersion(version,current)) return {available:false,message:`You have Computer Use ${current}. No newer stable installer is available.`};

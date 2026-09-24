@@ -672,7 +672,11 @@ enum LaneCommand {
     ///
     /// Compatibility spelling for `lane interrupt`; both resolve to the
     /// `lane.interrupt` control-plane verb (#1888).
-    Stop { lane_id: String },
+    Stop {
+        lane_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Interrupt a running lane (durable `lane.interrupt`).
     ///
     /// Accepts an exact lane id, optionally fenced as `<lane-id>@<seq>` so the
@@ -815,22 +819,21 @@ fn start_lane(request: LaneStartRequest) -> Result<()> {
         cwd,
     } = request;
     let kind = RuntimeBackendKind::parse(&runtime)?;
+    // Validate the worktree flags before creating the pending record, so a
+    // bad pairing never leaves an orphaned `pending` lane in the registry.
+    let worktree_request = validate_lane_worktree_flags(worktree_repo, branch, worktree_path)?;
     let reg = LaneRegistry::open_default()?;
     let mut record = reg.create_pending(workflow, fleet, issue, goal, kind, worktree_ttl_secs)?;
-    let worktree = match (worktree_repo, branch) {
-        (Some(repo_root), Some(branch_name)) => {
-            let path = worktree_path
-                .unwrap_or_else(|| repo_root.join(".codewhale").join("lanes").join(&record.id));
-            Some(WorktreeProvision {
-                repo_root,
-                branch: branch_name,
-                path,
-                base_ref: None,
-            })
+    let worktree = worktree_request.map(|(repo_root, branch_name, worktree_path)| {
+        let path = worktree_path
+            .unwrap_or_else(|| repo_root.join(".codewhale").join("lanes").join(&record.id));
+        WorktreeProvision {
+            repo_root,
+            branch: branch_name,
+            path,
+            base_ref: None,
         }
-        (None, None) => None,
-        _ => bail!("--worktree-repo and --branch must be provided together"),
-    };
+    });
     let cmd = if command.is_empty() {
         vec![
             "sh".into(),
@@ -860,6 +863,23 @@ fn start_lane(request: LaneStartRequest) -> Result<()> {
         println!("attach:  {attach}");
     }
     Ok(())
+}
+
+/// Check the `lane start` worktree flags as a set: `--worktree-repo` and
+/// `--branch` come together, and `--worktree-path` needs both.
+fn validate_lane_worktree_flags(
+    worktree_repo: Option<PathBuf>,
+    branch: Option<String>,
+    worktree_path: Option<PathBuf>,
+) -> Result<Option<(PathBuf, String, Option<PathBuf>)>> {
+    match (worktree_repo, branch) {
+        (Some(repo_root), Some(branch_name)) => Ok(Some((repo_root, branch_name, worktree_path))),
+        (None, None) if worktree_path.is_some() => {
+            bail!("--worktree-path requires --worktree-repo and --branch")
+        }
+        (None, None) => Ok(None),
+        _ => bail!("--worktree-repo and --branch must be provided together"),
+    }
 }
 
 /// Print one shared control receipt on the CLI surface.
@@ -1033,8 +1053,8 @@ fn run_lane_command(args: LaneArgs) -> Result<()> {
         // `stop` is the historical spelling of `interrupt`. Both go through
         // the same verb so the durable transition, the lifecycle fence, and
         // the receipt are identical.
-        LaneCommand::Stop { lane_id } => {
-            run_lane_control(ControlOperation::LaneInterrupt, Some(&lane_id), false)
+        LaneCommand::Stop { lane_id, json } => {
+            run_lane_control(ControlOperation::LaneInterrupt, Some(&lane_id), json)
         }
         LaneCommand::Start {
             workflow,
@@ -1260,11 +1280,15 @@ fn validate_workflow_source_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The same roots, in the same order, as the TUI's `fleet_search_roots`:
+/// `$CODEWHALE_HOME`, then `<workspace>/.codewhale` (where the Fleet store
+/// saves folder Fleets), then the workspace root for checked-in rosters.
 fn named_fleet_search_roots(workspace: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(home) = codewhale_config::codewhale_home() {
         roots.push(home);
     }
+    roots.push(workspace.join(".codewhale"));
     roots.push(workspace.to_path_buf());
     roots
 }
@@ -1439,8 +1463,14 @@ struct RemoteSetupArgs {
     /// Emit the bundle, do not provision (default).
     #[arg(long, default_value_t = false)]
     generate_only: bool,
-    /// Run the cloud CLI to auto-provision (not yet implemented).
-    #[arg(long, default_value_t = false, conflicts_with = "generate_only")]
+    /// Reserved for cloud auto-provisioning, which is not implemented.
+    /// Hidden from `--help`; passing it makes `remote-setup` fail.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "generate_only",
+        hide = true
+    )]
     apply: bool,
     /// Skip the final confirmation gate (CI / non-interactive).
     #[arg(long, default_value_t = false)]
@@ -4259,6 +4289,7 @@ fn run_auth_command_with_secrets_and_runtime(
             } else {
                 println!("saved API key for {slot} to {}", store.path().display());
             }
+            println!("model unchanged; run `codewhale model resolve` to see the active model");
             Ok(())
         }
         AuthCommand::Get { provider } => {
@@ -7409,6 +7440,67 @@ verbosity = "project-imported"
     }
 
     #[test]
+    fn named_fleet_search_roots_include_the_saved_workspace_dir() {
+        let workspace = Path::new("/ws");
+        let roots = named_fleet_search_roots(workspace);
+        let tail: Vec<&Path> = roots
+            .iter()
+            .rev()
+            .take(2)
+            .rev()
+            .map(PathBuf::as_path)
+            .collect();
+        assert_eq!(tail, [Path::new("/ws/.codewhale"), Path::new("/ws")]);
+    }
+
+    #[test]
+    fn lane_stop_accepts_json_like_interrupt() {
+        let stop = parse_ok(&["codewhale", "lane", "stop", "lane-a1b2c3d4", "--json"]);
+        assert!(matches!(
+            stop.command,
+            Some(Commands::Lane(LaneArgs {
+                command: LaneCommand::Stop { ref lane_id, json: true }
+            })) if lane_id == "lane-a1b2c3d4"
+        ));
+        let plain = parse_ok(&["codewhale", "lane", "stop", "lane-a1b2c3d4"]);
+        assert!(matches!(
+            plain.command,
+            Some(Commands::Lane(LaneArgs {
+                command: LaneCommand::Stop { json: false, .. }
+            }))
+        ));
+    }
+
+    #[test]
+    fn lane_worktree_flags_are_validated_as_a_set() {
+        let repo = PathBuf::from("/repo");
+        let custom = PathBuf::from("/elsewhere/wt");
+
+        assert!(
+            validate_lane_worktree_flags(None, None, None)
+                .unwrap()
+                .is_none()
+        );
+        let (root, branch, path) = validate_lane_worktree_flags(
+            Some(repo.clone()),
+            Some("feat".to_string()),
+            Some(custom.clone()),
+        )
+        .unwrap()
+        .expect("paired flags provision a worktree");
+        assert_eq!(root, repo);
+        assert_eq!(branch, "feat");
+        assert_eq!(path, Some(custom.clone()));
+
+        let err = validate_lane_worktree_flags(None, None, Some(custom))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--worktree-path requires"), "{err}");
+        assert!(validate_lane_worktree_flags(Some(repo), None, None).is_err());
+        assert!(validate_lane_worktree_flags(None, Some("feat".into()), None).is_err());
+    }
+
+    #[test]
     fn short_workflow_names_do_not_resolve_version_pinned_files() {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -7658,10 +7750,11 @@ verbosity = "project-imported"
 
         assert!(store.config.api_key.is_none());
         assert!(store.config.providers.deepseek.api_key.is_none());
-        assert_eq!(
-            store.config.default_text_model.as_deref(),
-            Some("deepseek-v4-pro")
-        );
+        // Intentional change: auth set used to pin `deepseek-v4-pro` here,
+        // silently moving a fresh install off the cheaper `deepseek-flash`
+        // provider default. Saving a key must not choose a model.
+        assert!(store.config.default_text_model.is_none());
+        assert!(store.config.providers.deepseek.model.is_none());
         let saved = std::fs::read_to_string(&path).expect("config should be written");
         assert!(!saved.contains("sk-test"), "{saved}");
         assert!(
@@ -7669,7 +7762,7 @@ verbosity = "project-imported"
                 .lines()
                 .any(|line| line.trim_start().starts_with("api_key="))
         );
-        assert!(saved.contains("default_text_model = \"deepseek-v4-pro\""));
+        assert!(!saved.contains("default_text_model"), "{saved}");
         assert_eq!(
             secrets.get("deepseek").expect("read secret").as_deref(),
             Some("sk-test")

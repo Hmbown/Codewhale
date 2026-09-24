@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:29c349b6f2b4 -->
+<!-- source: README.md sha256:bbb8bfb61e57 -->
 # Codewhale
 
 Codewhale adalah agen sumber terbuka yang membaca proyek, mengedit berkas, menjalankan perintah, dan memeriksa hasil kerjanya dengan model yang dihosting atau model lokal pilihan Anda. Mulailah dengan satu tugas di terminal. Untuk pekerjaan yang lebih besar, bagikan sebagian pekerjaan kepada agen dengan model dan peran yang berbeda.
@@ -27,7 +27,7 @@ Installer memilih rilis terbaru yang sudah dipublikasikan. [Catatan perubahan](C
 
 Di Windows, unduh installer atau arsip yang sesuai dari [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest). Untuk instalasi biner langsung yang sudah ada, jalankan `codewhale update`, atau `codewhale update --check` untuk memeriksa tanpa memasang. Updater menampilkan jalur executable dan mempertahankan build yang lebih baru. npm dan Cargo adalah pilihan sekunder; lihat [panduan instalasi](docs/INSTALL.md) untuk migrasi dari pengelola paket dan pengaturan PATH.
 
-Saat pertama dijalankan, Codewhale membantu Anda menghubungkan penyedia atau mengonfigurasi Codewhale secara luring. Respons model memerlukan koneksi ke model yang dihosting atau model lokal. Codewhale juga mendukung npm dan Cargo sebagai jalur pengemasan sekunder, serta Docker, Nix, Scoop, Android/Termux, dan mirror CNB opsional. Instalasi yang sudah ada melalui pengelola paket akan menerima petunjuk migrasi. Lihat [bantuan instalasi dan PATH](docs/INSTALL.md).
+Saat pertama dijalankan, Codewhale langsung membuka composer; tidak ada panduan penyiapan. Respons model memerlukan koneksi ke model yang dihosting atau model lokal: sampai ada yang terhubung, layar awal menampilkan "no model connected". Jalankan `/provider` (atau tekan F3) untuk menambahkan kunci layanan yang dihosting atau memilih runtime lokal. Jika Ollama sudah berjalan dengan model chat, Codewhale beralih ke sana dengan sendirinya. Codewhale juga mendukung npm dan Cargo sebagai jalur pengemasan sekunder, serta Docker, Nix, Scoop, Android/Termux, dan mirror CNB opsional. Instalasi yang sudah ada melalui pengelola paket akan menerima petunjuk migrasi. Lihat [bantuan instalasi dan PATH](docs/INSTALL.md).
 
 Penyelesaian Tab cukup diaktifkan dengan satu perintah per shell — `codewhale completion bash|zsh|fish|powershell|elvish`. Lihat [penyelesaian shell](docs/INSTALL.md#8-shell-completions).
 
@@ -53,7 +53,7 @@ Terminal dan klien grafis terhubung ke Codewhale Runtime, yang menjalankan agen 
 
 - **Terminal:** `codewhale` membuka antarmuka interaktif; `codewhale exec` menjalankan tugas dari skrip atau job CI.
 - **Browser lokal:** `codewhale web` membuka [klien web lokal](docs/WEB.md) bawaan untuk Runtime yang sama.
-- **Aplikasi desktop Codewhale (GPUI):** aplikasi desktop native GPUI adalah arah klien produk (diputuskan 2026-09-14; peta tahap ada di docs/TRANSITION.md pada repo privat codehwhale-gpui). Aplikasi web yang dihosting di app.codewhale.net dihentikan bertahap; situs pemasaran, masuk, penagihan, halaman legal, dan unduhan tetap di web secara permanen. Ketersediaannya tercantum di [halaman produk](https://codewhale.net/en/product).
+- **Aplikasi desktop Codewhale (GPUI):** aplikasi desktop native, yang dikembangkan di repositori terpisah, adalah arah klien produk untuk pengguna yang masuk. Aplikasi web yang dihosting di app.codewhale.net akan dibangun ulang mengikutinya; situs pemasaran, masuk, penagihan, halaman legal, dan unduhan tetap di web. Ketersediaannya tercantum di [halaman produk](https://codewhale.net/en/product).
 
 **Computer Use menambahkan alat untuk mengamati dan berinteraksi dengan aplikasi lain.** Plugin ini disertakan dalam kode sumber saat ini. Tinjau akses yang diminta dan aktifkan plugin sebelum digunakan; izin OS dan persyaratan platform tetap berlaku. Lihat [panduan Computer Use](crates/tui/plugins/computer-use/README.md) yang disertakan dan [pengaturan plugin](docs/PLUGINS.md).
 
@@ -80,7 +80,7 @@ Baca [urutan otorisasi](docs/AUTHORIZATION_ORDER.md) untuk susunan kebijakan yan
 - [Tim agen](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hook](docs/HOOKS.md), dan [konfigurasi](docs/CONFIGURATION.md)
 - [Klien web lokal](docs/WEB.md)
-- [Semua dokumentasi](docs)
+- [Semua dokumentasi](docs/README.md)
 - [Struktur repositori dan panduan kontribusi](CONTRIBUTING.md#project-structure)
 
 ## Bergabung dengan komunitas

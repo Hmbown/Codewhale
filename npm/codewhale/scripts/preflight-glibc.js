@@ -96,13 +96,13 @@ function skipGlibcCheck() {
 function glibcCompatibilityMessage(required, host) {
   const hostLine = host
     ? `this system has glibc ${formatVersion(host)}, which is too old for that asset.`
-    : "this system does not appear to provide GNU libc.";
+    : "this system does not appear to provide glibc.";
   return [
-    `Prebuilt Codewhale Linux binaries require GLIBC_${formatVersion(required)}, but ${hostLine}`,
+    `This Codewhale binary requires GLIBC_${formatVersion(required)}, but ${hostLine}`,
     "",
-    "The Linux x64 release asset is a static (musl) build that runs on any glibc,",
-    "but the Linux arm64 asset is a GNU libc build linked against",
-    "Ubuntu 24.04/glibc 2.39, which Ubuntu 22.04 (glibc 2.35) cannot run.",
+    "Official Codewhale Linux release assets (x64 and arm64) are static musl builds",
+    "with no glibc dependency, so this binary is not an official release asset.",
+    "Check where it came from, or build from source on this host.",
     "",
     buildFromSourceHint(),
     "",

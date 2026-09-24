@@ -17,10 +17,19 @@ const ROOT = path.resolve(import.meta.dirname, "..");
 // Every control/catalog write the child or server reads must be atomic:
 // a plain writeFileSync is observable mid-write by the polling readers and
 // surfaces as "Unexpected end of JSON input" instead of the fixture's error.
+// On Windows a rename over a file a fixture process holds open for reading
+// fails EPERM/EACCES/EBUSY (the v0.11.2 tag CI failure); the reader closes
+// within milliseconds, so retry briefly instead of failing the test.
 function writeJsonAtomic(file, value) {
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(value));
-  fs.renameSync(tmp, file);
+  for (let attempt = 0; ; attempt++) {
+    try { fs.renameSync(tmp, file); return; }
+    catch (error) {
+      if (attempt >= 50 || !["EPERM", "EACCES", "EBUSY"].includes(error?.code)) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+  }
 }
 
 function fixture(t, backendSource, sshSource) {

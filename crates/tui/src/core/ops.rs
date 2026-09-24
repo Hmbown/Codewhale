@@ -50,8 +50,9 @@ pub struct SessionContextBudget {
     /// Total context window for the active route (input + output), in tokens.
     pub window_tokens: u64,
     /// Estimated input tokens on the same basis the visible context meter
-    /// uses (`estimate_input_tokens_conservative`, including its safety
-    /// inflation). This is the number a "context filling up" indicator shows.
+    /// and the auto-compaction gate use (`estimate_input_tokens_for_pressure`,
+    /// without the overflow guard's 1.5x inflation). This is the number a
+    /// "context filling up" indicator shows.
     pub input_tokens: u64,
     /// Provider-billed prompt tokens from the most recent parent-route
     /// request that still describes the live message list. `None` when no

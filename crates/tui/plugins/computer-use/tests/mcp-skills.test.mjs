@@ -122,6 +122,12 @@ test("initialize advertises resources and the skills extension", async () => {
   assert.ok(init.result.capabilities.experimental["io.modelcontextprotocol/skills"], "the skills extension is advertised");
 });
 
+test("resources/templates/list answers with an empty template list, never method-not-found", async () => {
+  const res = await rpc("resources/templates/list", {});
+  assert.equal(res.error, undefined, "a method implied by the advertised resources capability must not 404");
+  assert.deepEqual(res.result.resourceTemplates, []);
+});
+
 test("resources/list names the pack; resources/read returns exact bytes with hashes", async () => {
   const list = await rpc("resources/list", {});
   const uris = list.result.resources.map((r) => r.uri);

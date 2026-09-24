@@ -925,8 +925,29 @@ The raw provider call ID travels separately as `tool_call_id` on
 `pending_approvals[]` and on the approval events. It is a correlator for
 attaching a prompt to the tool row it gates, and never accepted as a decision.
 Each thread-detail `pending_approvals[]` entry is
-`{ "id", "turn_id", "tool_name", "description", "intent_summary"?, "tool_call_id"? }`,
-where `id` is the capability above.
+`{ "id", "turn_id", "tool_name", "description", "intent_summary"?, "tool_call_id"?, "summary"? }`,
+where `id` is the capability above. `summary` (also on `approval.required`) is
+a one-line description of the gated call built from the tool name and its
+arguments only, never from model text ("Search the web for 'espresso'",
+"Write notes/espresso.md"); paths inside the workspace are workspace-relative.
+Clients show it first and keep the raw arguments behind it.
+
+`"remember": true` on an `allow` records a **session grant** for that tool and
+argument class (the approval grouping key: a shell command family, a patch's
+file set, a `fetch_url` host, an MCP tool, a `web.run` action kind — for
+`open`, the hosts it opened). Computer Use consent and `app_script` calls, and
+any tool without a class, are granted for the exact call only. A grant never
+changes the thread's permission posture. Later matching calls on the thread are
+approved without a prompt: they still emit `approval.required`, then
+`approval.decided` with `"auto": true` and the `grant_id`. Creating a grant
+emits `approval.grant_added` with `{ "grant": { "grant_id", "tool_name",
+"scope", "summary", "granted_at" } }`; thread detail lists live grants in
+`approval_grants[]`. `DELETE /v1/threads/{id}/approval-grants/{grant_id}`
+revokes one (emitting `approval.grant_revoked`); the next matching call
+prompts again. Archiving or deleting the thread ends all of its grants
+(archiving emits `approval.grant_revoked` for each; unarchiving does not
+restore them). Grants live in memory for the Runtime process: a restart
+forgets them, and a forced (non-bypassable) prompt is never answered by one.
 
 **User input**
 - `POST /v1/user-input/{thread_id}/{input_id}` with body
@@ -1982,6 +2003,7 @@ a read-only inspection surface:
 |---|---|
 | List persisted agent runs | `GET /v1/agent-runs` |
 | Inspect one run | `GET /v1/agent-runs/{run_id}` |
+| Stop one run | `POST /v1/agent-runs/{run_id}/cancel` |
 
 The response is the same worker-record shape surfaced by `agent` receipts:
 `spec.run_id`, `actor_kind`, lifecycle `status`, bounded `events`,
@@ -1989,9 +2011,22 @@ The response is the same worker-record shape surfaced by `agent` receipts:
 falls back to the worker id for older records, and `{run_id}` may be either the
 run id or the worker id.
 
-These endpoints do not start, cancel, or steer sub-agents. The API surface
-exists so app/editor/headless clients can inspect the same handoff receipts that
-the TUI and parent model see.
+These endpoints do not start or steer sub-agents. The API surface exists so
+app/editor/headless clients can inspect the same handoff receipts that the TUI
+and parent model see, and stop a run they are showing.
+
+`POST /v1/agent-runs/{run_id}/cancel` takes no body. It stops the run through
+the same session-scoped path as the TUI's stop and the `agent/cancel` tool:
+descendants stop with it, and a write-scoped child's changed files are named in
+its result rather than dropped. It answers with the worker record:
+
+- `200` when the record is terminal (stopping an already-finished run is a
+  no-op that returns its receipt);
+- `202` when the owning engine accepted the stop but has not recorded the
+  terminal receipt within a few seconds; poll `GET /v1/agent-runs/{run_id}`;
+- `404` for an unknown run;
+- `409` when the run belongs to a session this runtime is not hosting (for
+  example a separate terminal session); stop it from that session.
 
 ## Session lifecycle (native UI supervision)
 

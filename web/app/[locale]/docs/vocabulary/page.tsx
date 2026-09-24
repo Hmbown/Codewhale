@@ -129,13 +129,10 @@ export default async function VocabularyPage({ params }: { params: Promise<{ loc
         </p>
       </section>
 
-      <section id="source" className="hairline-t pt-8">
-        <p className="text-sm text-ink-mute">
-          {isZh
+      {/* Maintainer pointer: kept out of the rendered copy (experience mark 5). */}
+      <div hidden data-source-note={isZh
             ? "来源文档：docs/FLEET.md, docs/MODES.md, docs/public-surface-facts.json · 名词文案来自 web/lib/content/vocabulary.ts；更新时请同步修改 docs-map.ts。"
-            : "Source documents: docs/FLEET.md, docs/MODES.md, docs/public-surface-facts.json · Vocabulary copy lives in web/lib/content/vocabulary.ts; update docs-map.ts when changing."}
-        </p>
-      </section>
+            : "Source documents: docs/FLEET.md, docs/MODES.md, docs/public-surface-facts.json · Vocabulary copy lives in web/lib/content/vocabulary.ts; update docs-map.ts when changing."} />
     </section>
   );
 }

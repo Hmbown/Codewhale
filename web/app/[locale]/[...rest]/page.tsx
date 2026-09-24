@@ -1,5 +1,7 @@
 import { notFound } from "next/navigation";
 
+export { metadata } from "../not-found";
+
 /**
  * Catch-all inside the locale shell. Any path that matches no page raises
  * `notFound()` here, so the locale's `not-found.tsx` — nav, footer, and the

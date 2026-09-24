@@ -1,5 +1,17 @@
-//! In-context plugin reminders: prompt matching, live composer CTA, and idle
-//! catalog polling.
+//! In-context plugin reminders: the send-time toast, the model-requested
+//! review row, and idle catalog polling.
+//!
+//! 0.10.1 plugin offering policy ("helpful, not pushy"):
+//! - The only unprompted surface is the send-time toast. There is no live
+//!   as-you-type matching.
+//! - The review row appears only when the model calls `request_plugin_install`
+//!   (once per session), and only while contextual tips are on and the shared
+//!   per-session guidance budget has room.
+//! - The row names the true next step (Install, Review trust, Enable). Only
+//!   that button acts, and it opens `/plugin show <name>`; it never runs
+//!   install, trust, or enable directly.
+//! - Esc hides the row for this session only. "Don't suggest again" is the
+//!   explicit, persisted dismissal.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -18,12 +30,40 @@ use crate::tui::app::{App, StatusToast, StatusToastKind, StatusToastLevel};
 use codewhale_localization::{MessageId, tr};
 
 const CATALOG_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const CTA_DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// The step a plugin actually needs next, as named on the review button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginCtaStep {
+    Install,
+    ReviewTrust,
+    Enable,
+}
+
+impl PluginCtaStep {
+    /// Derive the step from the review command the tool returned. Anything
+    /// that is not trust or enable is an install path.
+    fn from_command(command: &str) -> Self {
+        let mut words = command.split_whitespace();
+        match (words.next(), words.next()) {
+            (Some("/plugin"), Some("trust")) => Self::ReviewTrust,
+            (Some("/plugin"), Some("enable")) => Self::Enable,
+            _ => Self::Install,
+        }
+    }
+
+    fn label(self) -> MessageId {
+        match self {
+            Self::Install => MessageId::PluginCtaInstall,
+            Self::ReviewTrust => MessageId::PluginCtaReviewTrust,
+            Self::Enable => MessageId::PluginCtaEnable,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginCtaPhase {
     Hidden,
-    Matched { name: String, command: String },
+    Matched { name: String, step: PluginCtaStep },
 }
 
 impl PluginCtaPhase {
@@ -44,10 +84,9 @@ impl PluginCtaPhase {
 #[derive(Debug, Clone)]
 pub struct PluginCtaState {
     pub phase: PluginCtaPhase,
+    /// Lowercased names hidden from every proactive path: persisted "Don't
+    /// suggest again" choices plus this session's Esc dismissals.
     pub dismissed: BTreeSet<String>,
-    matched_term: Option<String>,
-    debounce_at: Option<Instant>,
-    last_draft: String,
 }
 
 impl Default for PluginCtaState {
@@ -55,9 +94,6 @@ impl Default for PluginCtaState {
         Self {
             phase: PluginCtaPhase::Hidden,
             dismissed: BTreeSet::new(),
-            matched_term: None,
-            debounce_at: None,
-            last_draft: String::new(),
         }
     }
 }
@@ -137,67 +173,30 @@ impl App {
         }
     }
 
-    /// Arm a short debounce whenever the composer draft changes.
-    pub fn notify_plugin_cta_text_changed(&mut self) {
-        if self.input == self.plugin_cta.last_draft {
-            return;
-        }
-        self.plugin_cta.last_draft = self.input.clone();
-        self.plugin_cta.debounce_at = Some(Instant::now() + CTA_DEBOUNCE);
-    }
-
-    /// Recompute the live CTA after the debounce window. One match at a
-    /// time; already-active plugins stay hidden; a dismissed name stays
-    /// dismissed across sessions. Never auto-installs.
-    pub fn handle_plugin_cta_debounce_expired(&mut self) {
-        self.plugin_cta.debounce_at = None;
-        self.plugin_cta.last_draft = self.input.clone();
-        let marketplace = load_marketplace_candidates(self.plugin_registry.state_path());
-        let Some(matched) = match_plugin_for_draft(
-            &self.input,
-            self.plugin_registry.as_ref(),
-            &marketplace,
-            &self.plugin_cta.dismissed,
-        ) else {
-            if self.plugin_cta.phase.is_visible() {
-                self.plugin_cta.phase = PluginCtaPhase::Hidden;
-                self.needs_redraw = true;
-            }
-            return;
-        };
-        let command = matched.command();
-        let new_phase = PluginCtaPhase::Matched {
-            name: matched.name,
-            command,
-        };
-        if self.plugin_cta.phase != new_phase
-            || self.plugin_cta.matched_term != matched.matched_term
-        {
-            self.plugin_cta.matched_term = matched.matched_term;
-            self.plugin_cta.phase = new_phase;
-            self.needs_redraw = true;
-        }
-    }
-
-    /// Poll draft changes and fire the CTA debounce without a dedicated timer
-    /// task. The event loop already ticks this often.
-    pub fn maybe_poll_plugin_cta(&mut self) {
-        self.notify_plugin_cta_text_changed();
-        let Some(at) = self.plugin_cta.debounce_at else {
-            return;
-        };
-        if Instant::now() < at {
-            return;
-        }
-        self.handle_plugin_cta_debounce_expired();
-    }
-
     #[must_use]
     pub fn plugin_cta_row_height(&self) -> u16 {
         u16::from(self.plugin_cta.phase.is_visible())
     }
 
-    /// Persist an explicit dismissal while hiding it immediately this session.
+    /// Esc: hide the row and skip this plugin for the rest of the session.
+    /// Persists nothing, so the next session may offer it again.
+    pub fn dismiss_plugin_cta_for_session(&mut self) -> bool {
+        let Some(name) = self
+            .plugin_cta
+            .phase
+            .matched_name()
+            .map(str::to_ascii_lowercase)
+        else {
+            return false;
+        };
+        self.plugin_cta.dismissed.insert(name);
+        self.plugin_cta.phase = PluginCtaPhase::Hidden;
+        self.needs_redraw = true;
+        true
+    }
+
+    /// "Don't suggest again": the explicit, persisted dismissal. Also hides
+    /// the row immediately for this session, even if saving fails.
     pub fn dismiss_plugin_cta(&mut self) -> bool {
         let Some(name) = self.plugin_cta.phase.matched_name().map(str::to_string) else {
             return false;
@@ -222,26 +221,29 @@ impl App {
         true
     }
 
-    /// Human-initiated review: return the slash command so the TUI can run
-    /// the existing `/plugin trust` / marketplace-install / `/plugin install`
-    /// path. Never runs it here.
+    /// Human-initiated review from the labelled button: open the plugin's
+    /// detail page, where install, trust, or enable is the person's own next
+    /// command. Never runs install, trust, or enable directly.
     #[must_use]
     pub fn accept_plugin_cta_command(&mut self) -> Option<String> {
-        let (command, name) = match &self.plugin_cta.phase {
-            PluginCtaPhase::Matched { command, name } => (command.clone(), name.clone()),
+        let name = match &self.plugin_cta.phase {
+            PluginCtaPhase::Matched { name, .. } => name.clone(),
             PluginCtaPhase::Hidden => return None,
         };
         self.plugin_cta.dismissed.insert(name.to_ascii_lowercase());
         self.plugin_cta.phase = PluginCtaPhase::Hidden;
         self.needs_redraw = true;
-        Some(command)
+        Some(format!("/plugin show {name}"))
     }
 
-    /// Model-requested review: show the live CTA and a toast. Does not run
-    /// the command, so nothing is installed, trusted, or enabled.
+    /// Model-requested review: show the review row and a toast naming the
+    /// command. Does not run it, so nothing is installed, trusted, or
+    /// enabled. Obeys the tips switch and draws from the shared per-session
+    /// guidance budget like every other proactive offer.
     pub fn surface_plugin_review_request(&mut self, name: &str, command: &str) {
         if name.trim().is_empty()
             || command.trim().is_empty()
+            || !self.behavioral_tips.guidance_available()
             || self
                 .plugin_cta
                 .dismissed
@@ -249,36 +251,32 @@ impl App {
         {
             return;
         }
-        self.plugin_cta.matched_term = None;
+        self.behavioral_tips.record_guidance_impression();
         self.plugin_cta.phase = PluginCtaPhase::Matched {
             name: name.to_string(),
-            command: command.to_string(),
+            step: PluginCtaStep::from_command(command),
         };
-        self.push_status_toast(command.to_string(), StatusToastLevel::Info, Some(8_000));
+        let mut toast = StatusToast::new(command.to_string(), StatusToastLevel::Info, Some(8_000));
+        toast.kind = StatusToastKind::PluginSuggestion;
+        self.push_status_toast_record(toast);
         self.needs_redraw = true;
     }
 }
 
-/// Draw the one-line live CTA above the composer. No-op when hidden.
+/// Draw the one-line review row above the composer. No-op when hidden.
 pub fn draw_plugin_cta(app: &mut App, area: Rect, buf: &mut Buffer) {
     app.viewport.last_plugin_cta_area = None;
     app.viewport.last_plugin_cta_review_area = None;
     app.viewport.last_plugin_cta_dismiss_area = None;
-    let PluginCtaPhase::Matched { name, .. } = &app.plugin_cta.phase else {
+    let PluginCtaPhase::Matched { name, step } = &app.plugin_cta.phase else {
         return;
     };
-    let name = name.clone();
+    let (name, step) = (name.clone(), *step);
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let mut prompt = tr(app.ui_locale, MessageId::PluginCtaInstallPrompt).replace("{name}", &name);
-    if let Some(term) = &app.plugin_cta.matched_term {
-        prompt.push_str(" · ");
-        prompt.push_str(
-            &tr(app.ui_locale, MessageId::PluginSuggestionReason).replace("{trigger}", term),
-        );
-    }
-    let review = tr(app.ui_locale, MessageId::PluginCtaReview);
+    let prompt = tr(app.ui_locale, MessageId::PluginCtaInstallPrompt).replace("{name}", &name);
+    let review = tr(app.ui_locale, step.label());
     let dismiss = tr(app.ui_locale, MessageId::PluginCtaDismiss);
     let review_label = format!("[{review}]");
     let dismiss_label = format!("[{dismiss}]");
@@ -392,30 +390,36 @@ mod tests {
     }
 
     #[test]
-    fn tips_off_removes_plugin_guidance_but_preserves_required_notices_and_explicit_review() {
+    fn tips_off_removes_every_plugin_offer_but_preserves_required_notices() {
         let _lock = crate::test_support::lock_test_env();
         let (mut app, _root, _home) = app_with_supabase_plugin();
         app.set_contextual_tips_enabled(false);
         assert!(!app.maybe_nudge_plugin_for_prompt("add supabase auth"));
+        app.surface_plugin_review_request("supabase", "/plugin trust supabase");
+        assert!(
+            !app.plugin_cta.phase.is_visible(),
+            "tips off: no review row, even when the model asks"
+        );
+        assert_eq!(app.plugin_cta_row_height(), 0);
+        assert!(app.status_toasts.is_empty());
+
         app.set_contextual_tips_enabled(true);
-        assert!(app.maybe_nudge_plugin_for_prompt("add supabase auth"));
+        app.surface_plugin_review_request("supabase", "/plugin trust supabase");
+        assert!(app.plugin_cta.phase.is_visible());
         app.push_status_toast_record(
             StatusToast::new("Review required", StatusToastLevel::Warning, None).for_action("a"),
         );
         app.push_status_toast("Keep this error", StatusToastLevel::Error, None);
         app.set_contextual_tips_enabled(false);
+        assert!(
+            !app.plugin_cta.phase.is_visible(),
+            "turning tips off hides the row"
+        );
         assert_eq!(app.status_toasts.len(), 2);
         assert!(
             app.status_toasts
                 .iter()
                 .all(|toast| toast.kind != StatusToastKind::PluginSuggestion)
-        );
-        app.surface_plugin_review_request("supabase", "/plugin trust supabase");
-        assert!(app.plugin_cta.phase.is_visible());
-        assert_eq!(
-            app.status_toasts.len(),
-            3,
-            "explicit review is not unsolicited guidance"
         );
         app.set_contextual_tips_enabled(true);
         assert!(
@@ -425,60 +429,101 @@ mod tests {
     }
 
     #[test]
-    fn live_cta_shows_for_a_matching_idle_plugin() {
+    fn model_requested_review_draws_from_the_shared_budget() {
         let _lock = crate::test_support::lock_test_env();
         let (mut app, _root, _home) = app_with_supabase_plugin();
-        app.input = "add supabase auth to login".to_string();
-        app.handle_plugin_cta_debounce_expired();
-        assert_eq!(
-            app.plugin_cta.phase.matched_name(),
-            Some("supabase"),
-            "{:?}",
-            app.plugin_cta.phase
-        );
-        assert_eq!(app.plugin_cta_row_height(), 1);
-        assert_eq!(app.plugin_cta.matched_term.as_deref(), Some("supabase"));
-        let area = Rect::new(0, 0, 140, 1);
-        let mut buffer = Buffer::empty(area);
-        draw_plugin_cta(&mut app, area, &mut buffer);
-        let row = buffer
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(row.contains("Matched “supabase”"), "{row}");
-    }
-
-    #[test]
-    fn live_cta_hides_when_the_plugin_is_already_active() {
-        let _lock = crate::test_support::lock_test_env();
-        let (mut app, _root, _home) = app_with_supabase_plugin();
-        let registry = std::sync::Arc::make_mut(&mut app.plugin_registry);
-        registry.trust("supabase").unwrap();
-        registry.enable("supabase").unwrap();
-        app.input = "add supabase auth to login".to_string();
-        app.handle_plugin_cta_debounce_expired();
+        assert!(app.maybe_nudge_plugin_for_prompt("add supabase auth"));
+        app.surface_plugin_review_request("supabase", "/plugin trust supabase");
         assert!(
             !app.plugin_cta.phase.is_visible(),
-            "{:?}",
-            app.plugin_cta.phase
+            "the send-time toast already spent this session's budget"
         );
     }
 
     #[test]
-    fn live_cta_dismiss_stays_dismissed_for_that_name_this_session() {
+    fn typing_a_matching_draft_never_shows_a_row() {
         let _lock = crate::test_support::lock_test_env();
         let (mut app, _root, _home) = app_with_supabase_plugin();
         app.input = "add supabase auth to login".to_string();
-        app.handle_plugin_cta_debounce_expired();
-        assert!(app.dismiss_plugin_cta());
+        app.maybe_poll_plugin_catalog_idle();
         assert!(!app.plugin_cta.phase.is_visible());
-        app.handle_plugin_cta_debounce_expired();
-        assert!(
-            !app.plugin_cta.phase.is_visible(),
-            "dismissed names must not reappear this session: {:?}",
-            app.plugin_cta.phase
+        assert_eq!(app.plugin_cta_row_height(), 0);
+    }
+
+    #[test]
+    fn review_row_names_the_true_next_step_and_only_opens_plugin_show() {
+        let _lock = crate::test_support::lock_test_env();
+        for (command, step, label) in [
+            (
+                "/plugin trust supabase",
+                PluginCtaStep::ReviewTrust,
+                "[Review trust]",
+            ),
+            ("/plugin enable supabase", PluginCtaStep::Enable, "[Enable]"),
+            (
+                "/plugin marketplace install official supabase",
+                PluginCtaStep::Install,
+                "[Install]",
+            ),
+        ] {
+            let (mut app, _root, _home) = app_with_supabase_plugin();
+            app.surface_plugin_review_request("supabase", command);
+            assert_eq!(
+                app.plugin_cta.phase,
+                PluginCtaPhase::Matched {
+                    name: "supabase".into(),
+                    step
+                }
+            );
+            let area = Rect::new(0, 0, 140, 1);
+            let mut buffer = Buffer::empty(area);
+            draw_plugin_cta(&mut app, area, &mut buffer);
+            let row = buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(row.contains("supabase"), "{row}");
+            assert!(row.contains(label), "{row}");
+            assert!(row.contains("[Don't suggest again]"), "{row}");
+            assert_eq!(
+                app.accept_plugin_cta_command().as_deref(),
+                Some("/plugin show supabase"),
+                "accepting opens the detail page, never {command}"
+            );
+            assert!(!app.plugin_cta.phase.is_visible());
+        }
+    }
+
+    #[test]
+    fn esc_clears_a_draft_first_then_dismisses_for_the_session_only() {
+        use crate::settings::Settings;
+        use crate::tui::composer_ui::{EscapeAction, next_escape_action};
+        let _lock = crate::test_support::lock_test_env();
+        let (mut app, root, _home) = app_with_supabase_plugin();
+        app.surface_plugin_review_request("supabase", "/plugin trust supabase");
+        app.input = "half-written draft".into();
+        assert_eq!(next_escape_action(&app, false), EscapeAction::ClearInput);
+        app.input.clear();
+        assert_eq!(
+            next_escape_action(&app, false),
+            EscapeAction::DismissPluginCta
         );
+
+        assert!(app.dismiss_plugin_cta_for_session());
+        assert!(!app.plugin_cta.phase.is_visible());
+        assert!(!app.maybe_nudge_plugin_for_prompt("add supabase auth"));
+        let saved = Settings::load_read_only().unwrap_or_default();
+        assert!(
+            saved.dismissed_plugin_suggestions.is_empty(),
+            "Esc persists nothing"
+        );
+        let restarted = App::new_with_plugin_registry(
+            crate::test_support::test_tui_options(root.path()),
+            &Config::default(),
+            app.plugin_registry.clone(),
+        );
+        assert!(!restarted.plugin_cta.dismissed.contains("supabase"));
     }
 
     #[test]
@@ -487,8 +532,7 @@ mod tests {
         let _lock = crate::test_support::lock_test_env();
         let (mut app, root, _home) = app_with_supabase_plugin();
         Settings::transact(|settings| settings.set("max_history", "321")).unwrap();
-        app.input = "add supabase auth to login".into();
-        app.handle_plugin_cta_debounce_expired();
+        app.surface_plugin_review_request("supabase", "/plugin trust supabase");
         assert!(app.dismiss_plugin_cta());
         let saved = Settings::load_read_only().unwrap();
         assert_eq!(saved.max_input_history, 321);
@@ -499,21 +543,9 @@ mod tests {
             &Config::default(),
             app.plugin_registry.clone(),
         );
-        restarted.input = app.input.clone();
-        restarted.handle_plugin_cta_debounce_expired();
-        assert!(!restarted.plugin_cta.phase.is_visible());
-        assert!(!restarted.maybe_nudge_plugin_for_prompt(&app.input));
+        assert!(!restarted.maybe_nudge_plugin_for_prompt("add supabase auth to login"));
         restarted.surface_plugin_review_request("supabase", "/plugin trust supabase");
         assert!(!restarted.plugin_cta.phase.is_visible());
-        assert!(
-            crate::plugins::recommend::recommended_plugins_user_fragment(
-                &app.input,
-                restarted.plugin_registry.as_ref(),
-                &[],
-                &mut crate::plugins::recommend::RecommendedPluginGate::default(),
-            )
-            .is_none()
-        );
         assert!(
             crate::plugins::recommend::lookup_reviewable_plugin(
                 "supabase",
@@ -529,8 +561,7 @@ mod tests {
     fn failed_dismissal_save_preserves_malformed_preferences_and_hides_this_session() {
         let _lock = crate::test_support::lock_test_env();
         let (mut app, root, _home) = app_with_supabase_plugin();
-        app.input = "add supabase auth".into();
-        app.handle_plugin_cta_debounce_expired();
+        app.surface_plugin_review_request("supabase", "/plugin trust supabase");
         let path = crate::settings::Settings::path().unwrap();
         assert!(path.starts_with(root.path()));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -538,9 +569,7 @@ mod tests {
         fs::write(&path, malformed).unwrap();
         assert!(app.dismiss_plugin_cta());
         assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
-        app.handle_plugin_cta_debounce_expired();
         assert!(!app.plugin_cta.phase.is_visible());
-        assert!(!app.maybe_nudge_plugin_for_prompt("add supabase auth"));
         let toast = app.status_toasts.back().expect("save failure receipt");
         assert!(toast.text.contains("could not save"));
         assert!(!toast.text.contains("private_fixture_payload"));

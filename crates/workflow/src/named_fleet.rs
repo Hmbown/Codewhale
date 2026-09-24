@@ -130,7 +130,11 @@ impl FleetDocument {
             Some(other) => {
                 return Err(NamedFleetError::Parse {
                     path: "<memory>".into(),
-                    message: format!("unknown fleet schema `{other}`; expected `exact`"),
+                    message: format!(
+                        "unknown fleet schema `{other}`; expected `exact` or a saved Fleet \
+                         (`schema = \"fleet\"`, loaded from `.codewhale/fleets/` or \
+                         `$CODEWHALE_HOME/fleets/`)"
+                    ),
                 });
             }
             None => FleetSchema::Legacy(parse_named_fleet(text)?),
@@ -325,6 +329,34 @@ impl FleetDocument {
     #[must_use]
     pub fn source_path(&self) -> Option<&Path> {
         self.source.as_deref()
+    }
+
+    /// An exact document frozen from a saved v2 Fleet at Workflow start.
+    ///
+    /// `frozen_text` is the exact-schema rendering of the saved Fleet with every
+    /// route and reasoning request resolved; it goes through the same exact
+    /// parser as a hand-written file, and [`Self::source_hash`] covers those
+    /// frozen bytes — what actually runs — while [`Self::source_path`] names the
+    /// saved Fleet file it came from.
+    pub fn from_frozen_saved_fleet(
+        frozen_text: &str,
+        source: &Path,
+    ) -> Result<Self, NamedFleetError> {
+        if declared_schema_kind(frozen_text).as_deref() != Some(EXACT_FLEET_SCHEMA_KIND) {
+            return Err(NamedFleetError::Parse {
+                path: source.display().to_string(),
+                message: "a frozen saved Fleet must be in the exact schema".to_string(),
+            });
+        }
+        let mut document = Self::parse(frozen_text).map_err(|error| match error {
+            NamedFleetError::Exact { source: inner, .. } => NamedFleetError::Exact {
+                fleet: source.display().to_string(),
+                source: inner,
+            },
+            other => other,
+        })?;
+        document.source = Some(source.to_path_buf());
+        Ok(document)
     }
 
     /// Build a document around an already-constructed exact roster.
@@ -679,5 +711,37 @@ model = "glm-5-turbo"
             .join("..");
         let fleet = load_named_fleet("stopship", &[root]).expect("load workspace fleet");
         fleet.validate_stopship_roles().unwrap();
+    }
+
+    #[test]
+    fn a_frozen_saved_fleet_is_exact_and_names_its_source_file() {
+        let source = Path::new("/saved/.codewhale/fleets/release.toml");
+        let frozen = "schema = \"exact\"\nschema_revision = 1\nname = \"release\"\n\n\
+                      [[members]]\nid = \"builder\"\nrole = \"implement\"\n\
+                      provider = \"zai\"\nmodel = \"glm-5\"\nreasoning = \"high\"\n";
+        let document = FleetDocument::from_frozen_saved_fleet(frozen, source).expect("frozen");
+        assert!(document.exact().is_some());
+        assert_eq!(document.source_path(), Some(source));
+        assert_eq!(document.source_hash(), content_hash(frozen));
+
+        // Anything that is not the exact schema is refused, never parsed as a
+        // legacy role map.
+        let error = FleetDocument::from_frozen_saved_fleet(
+            "name = \"release\"\n[roles]\nimplement = \"builder\"\n",
+            source,
+        )
+        .expect_err("legacy text is not a frozen snapshot");
+        assert!(error.to_string().contains("exact schema"), "{error}");
+    }
+
+    #[test]
+    fn a_saved_fleet_schema_is_named_in_the_unknown_schema_error() {
+        let error = FleetDocument::parse("schema = \"fleet\"\nname = \"x\"\n").unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("expected `exact` or a saved Fleet"),
+            "{message}"
+        );
+        assert!(message.contains(".codewhale/fleets/"), "{message}");
     }
 }

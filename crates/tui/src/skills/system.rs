@@ -29,7 +29,10 @@ use std::path::Path;
 /// `contributor-onboarding` as a repo-local project skill.
 /// Generation 14 corrects account setup, Photos export, forgetting and plugin
 /// lifecycle guidance; exact generation-13 bodies allow safe upgrades.
-const BUNDLED_SKILL_VERSION: &str = "14";
+/// Generation 15 points `help` and `pdf` at the model-visible `read`/`bash`
+/// tools instead of the hidden compatibility `File` tool; exact
+/// generation-14 bodies allow safe upgrades.
+const BUNDLED_SKILL_VERSION: &str = "15";
 
 // ── system & extension (meta) ───────────────────────────────────────────────
 const SKILL_CREATOR_BODY: &str = include_str!("../../assets/skills/skill-creator/SKILL.md");
@@ -135,6 +138,14 @@ const SUPERSEDED_BODIES: &[(&str, &str)] = &[
     (
         "plugin-creator",
         include_str!("../../assets/skills/plugin-creator/SKILL.generation-13.md"),
+    ),
+    (
+        "help",
+        include_str!("../../assets/skills/help/SKILL.generation-14.md"),
+    ),
+    (
+        "pdf",
+        include_str!("../../assets/skills/pdf/SKILL.generation-14.md"),
     ),
 ];
 

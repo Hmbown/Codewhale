@@ -714,6 +714,9 @@ pub(crate) fn start_user_dispatch(
         }
     };
     app.dispatch_in_flight = true;
+    // Supervised: `spawned_dispatch_execute` owns the whole dispatch future,
+    // so its completion callback always arrives — on success, on a panic, or
+    // when the dispatch exceeds its bound (#6184).
     tokio::spawn(spawned_dispatch_execute(
         prepare,
         recovery,
@@ -723,14 +726,85 @@ pub(crate) fn start_user_dispatch(
     Ok(())
 }
 
+/// Longest a dispatch may spend routing and waiting for engine admission
+/// before it is failed back to the composer (#6184). An engine whose op
+/// mailbox never frees (a wedged turn) used to hold the dispatch — and the
+/// user's message — forever.
+pub(crate) const DISPATCH_TASK_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub(crate) async fn spawned_dispatch_execute(
     prepare: UserDispatchPrepare,
     recovery: DispatchRecovery,
     engine_handle: EngineHandle,
     completion_permit: tokio::sync::mpsc::OwnedPermit<crate::tui::app::DispatchApplyFn>,
 ) {
-    let apply = spawned_dispatch_inner(prepare, recovery, engine_handle).await;
+    let apply = supervised_dispatch(
+        prepare,
+        recovery,
+        DISPATCH_TASK_BOUND,
+        |prepare, recovery| spawned_dispatch_inner(prepare, recovery, engine_handle),
+    )
+    .await;
     completion_permit.send(apply);
+}
+
+/// Run one dispatch future under supervision. A dropped JoinHandle used to
+/// turn a panic or a hang into a dispatch that never reported back: the
+/// completion permit was dropped, `dispatch_in_flight` stayed set and the
+/// message sat in limbo. Every outcome now yields a callback; a panic or an
+/// overrun also leaves a log line and a `crashes/` record.
+pub(crate) async fn supervised_dispatch<F, Fut>(
+    prepare: UserDispatchPrepare,
+    recovery: DispatchRecovery,
+    bound: std::time::Duration,
+    run: F,
+) -> crate::tui::app::DispatchApplyFn
+where
+    F: FnOnce(UserDispatchPrepare, DispatchRecovery) -> Fut,
+    Fut: std::future::Future<Output = crate::tui::app::DispatchApplyFn>,
+{
+    use futures_util::FutureExt as _;
+    let fallback = prepare.clone();
+    let started = std::time::Instant::now();
+    let supervised = std::panic::AssertUnwindSafe(run(prepare, recovery)).catch_unwind();
+    match tokio::time::timeout(bound, supervised).await {
+        Ok(Ok(apply)) => apply,
+        Ok(Err(panic)) => {
+            let detail = crate::utils::panic_message(&*panic);
+            crate::utils::record_caught_panic("user-dispatch", &detail);
+            build_dispatch_error_closure(
+                fallback,
+                recovery,
+                format!("Message dispatch hit an internal error: {detail}"),
+            )
+        }
+        Err(_elapsed) => {
+            crate::core::engine::turn_heartbeat::report_stall(
+                &crate::core::engine::turn_heartbeat::StallReport {
+                    source: "ui",
+                    phase: "while dispatching the message (route planning / engine admission)"
+                        .to_string(),
+                    detail: Some(format!(
+                        "{} / {}",
+                        fallback.api_provider.display_name(),
+                        fallback.app_model
+                    )),
+                    turn_id: None,
+                    provider_request: None,
+                    since_progress: started.elapsed(),
+                    bound: Some(bound),
+                },
+            );
+            build_dispatch_error_closure(
+                fallback,
+                recovery,
+                format!(
+                    "Message dispatch stalled for {}s before the engine accepted it; your message was restored. Press Esc to cancel the running turn, then retry.",
+                    bound.as_secs()
+                ),
+            )
+        }
+    }
 }
 
 /// Keep classifier receipts owned until the UI admits the operation to Engine.

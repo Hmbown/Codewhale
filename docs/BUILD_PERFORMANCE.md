@@ -155,8 +155,10 @@ scripts/dev-test.sh crates/tui/src/elapsed.rs
 CARGO_INCREMENTAL=0 scripts/dev-cargo.sh test -p codewhale-config --lib --locked --no-run
 ```
 
-Hermetic script tests (no rustc compile): `sh scripts/dev-cache.test.sh` and
-`sh scripts/dev-test.test.sh`.
+Hermetic script test (no rustc compile): `sh scripts/dev-cache.test.sh`.
+`scripts/dev-test.sh --self-check` reports the helper's resolved cache
+topology; its own script test, `scripts/dev-test.test.sh`, was removed in
+`d64b9429b7`.
 
 ### Helper verification (2026-08-15, this worktree)
 
@@ -193,8 +195,9 @@ The 268 s → ~100 s nextest win remains the earlier tui-unit-suite receipt.
 Config is too small for that win; nextest is still the right default for
 unfiltered crate/workspace runs.
 
-**Ergonomics:** `sh` and `dash` both pass `dev-cache.test.sh` (22) and
-`dev-test.test.sh` (27). Missing sccache is a fallback. `--list` covers
+**Ergonomics:** `sh` and `dash` both passed `dev-cache.test.sh` (22) and
+`dev-test.test.sh` (27) at the time; `dev-test.test.sh` has since been removed
+(`d64b9429b7`). Missing sccache is a fallback. `--list` covers
 every workspace crate.
 
 ### A2 nextest in CI
@@ -352,7 +355,8 @@ TUI-DOG-017) — left as they are.
    isolated build-dir topology** from `scripts/dev-test.sh`. New worktrees
    no longer compile into a private cold `./target` unless the helper is
    disabled. sccache is opt-in and incremental-gated. Script self-checks
-   live in `scripts/dev-cache.test.sh` and `scripts/dev-test.test.sh`.
+   live in `scripts/dev-cache.test.sh` and `scripts/dev-test.sh --self-check`
+   (`scripts/dev-test.test.sh` was removed in `d64b9429b7`).
 2. **`cargo nextest` is supported and documented** (`.config/nextest.toml`).
    Same test binaries, one process per test, so the tui unit suite runs in
    ~100 s instead of ~270 s here and slow or hanging tests are named instead

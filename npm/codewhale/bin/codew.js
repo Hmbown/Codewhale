@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-const { run } = require("../scripts/run");
+const { run, reportStartFailure } = require("../scripts/run");
 
 run("codew").catch((error) => {
-  console.error("Failed to start codew:", error.message);
+  reportStartFailure("codew", error);
   process.exit(1);
 });

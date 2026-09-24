@@ -581,6 +581,16 @@ pub struct PluginSuggestion {
     pub next_step: String,
 }
 
+/// Plugins hidden from proactive suggestions (plugin policy rule 9). Names
+/// are lowercase; each list is sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginSuggestionDismissals {
+    /// "Don't suggest again": kept across sessions until reset.
+    pub persisted: Vec<String>,
+    /// Hidden for this session only (Esc, or a review the user already opened).
+    pub session: Vec<String>,
+}
+
 /// Host plugin data for the plugin command group (FEAT-020 D1).
 ///
 /// One object-safe, synchronous facet exposing the exact-minimum typed
@@ -671,6 +681,12 @@ pub trait CommandPluginContext {
         catalog: &str,
         candidate: &str,
     ) -> Result<PluginMutationReceipt, String>;
+    /// Read-only: which plugins proactive suggestions currently skip.
+    fn suggestion_dismissals(&self) -> Result<PluginSuggestionDismissals, String>;
+    /// Mutation: let suggestions offer `name` again (every dismissed plugin
+    /// when `None`), in this session and future ones. Returns the names
+    /// cleared, sorted.
+    fn reset_suggestion_dismissals(&mut self, name: Option<&str>) -> Result<Vec<String>, String>;
 }
 
 // ---------------------------------------------------------------------------

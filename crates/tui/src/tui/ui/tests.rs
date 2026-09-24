@@ -240,6 +240,9 @@ fn composer_rows_stay_pinned_across_turn_state_transitions() {
         app.onboarding = crate::tui::app::OnboardingState::None;
         app.launch.visible = false;
         app.ui_locale = codewhale_localization::Locale::En;
+        // A keyless fixture paints "model not connected" (U3); this one is
+        // about a connected route.
+        app.onboarding_needs_api_key = false;
         // The empty launch shell intentionally hides session metrics. This
         // fixture covers stable geometry once a conversation exists.
         app.history.push(HistoryCell::User {
@@ -5817,6 +5820,46 @@ fn session_denied_cache_matches_only_approval_key() {
     assert!(is_session_denied_for_key(&app, "file:edit_file:retry"));
 }
 
+#[test]
+fn a_deny_holds_for_its_turn_and_prompts_again_after_the_next_message() {
+    let mut app = create_test_app();
+    let denied_key = "shell:rm -rf build:call-1";
+    app.approval_session_denied.insert(denied_key.to_string());
+    app.approval_session_approved
+        .insert("shell:git status".to_string());
+    assert!(
+        is_session_denied_for_key(&app, denied_key),
+        "the model's retry inside the same turn stays auto-denied"
+    );
+
+    // What the event loop runs on `TurnStarted` for the user's next message.
+    end_turn_scoped_denials(&mut app);
+
+    assert!(
+        !is_session_denied_for_key(&app, denied_key),
+        "a new user message must be able to reconsider the Deny"
+    );
+    assert!(
+        is_session_approved_for_tool(&app, "exec_shell", "shell:git status"),
+        "an approve-for-session grant is session-scoped, not turn-scoped"
+    );
+}
+
+#[test]
+fn switching_sessions_drops_denials_and_session_grants() {
+    let mut app = create_test_app();
+    app.approval_session_denied
+        .insert("shell:rm -rf build:call-1".to_string());
+    app.approval_session_approved
+        .insert("shell:git status".to_string());
+    let session = saved_session_with_messages(vec![]);
+
+    apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
+
+    assert!(app.approval_session_denied.is_empty());
+    assert!(app.approval_session_approved.is_empty());
+}
+
 fn render_underwater_test_app(app: &mut App, width: u16, height: u16) -> String {
     app.onboarding_workspace_trust_gate = false;
     app.onboarding = OnboardingState::None;
@@ -6638,15 +6681,20 @@ fn raw_paste_beginning_with_space_preserves_payload_over_reasoning_action() {
 }
 
 #[test]
-fn paste_safety_expiry_repaints_the_submit_cue_without_another_key() {
+fn paste_safety_window_keeps_the_submit_cue_steady_while_routing_waits() {
+    // #6397: the `[↵]` chip follows the time-independent draft predicate,
+    // so an open paste-burst window (re-extended on every fast keystroke)
+    // must not flip it to `[·]`. Enter routing still waits on the window.
     let mut app = create_test_app();
     app.use_paste_burst_detection = true;
     app.insert_str("/mcp");
     let now = Instant::now();
     app.paste_burst.extend_window(now);
     assert!(!app.composer_enter_would_submit());
+    assert!(app.composer_draft_is_submittable());
     let waiting = render_underwater_test_app(&mut app, 80, 24);
-    assert!(waiting.contains("[·]"), "{waiting}");
+    assert!(waiting.contains("[↵]"), "{waiting}");
+    assert!(!waiting.contains("[·]"), "{waiting}");
     app.needs_redraw = false;
     assert!(flush_paste_burst_before_composer(
         &mut app,
@@ -6725,13 +6773,15 @@ fn empty_shell_keeps_model_identity_without_session_metrics() {
     for (width, height) in [(40, 12), (60, 16), (100, 32), (140, 40)] {
         let mut app = create_test_app();
         app.model = "gpt-4.1".into();
+        // A connected route: keyless, the chip says "model not connected" (U3).
+        app.onboarding_needs_api_key = false;
         app.history.clear();
         app.resync_history_revisions();
         assert!(crate::tui::widgets::should_render_empty_state(&app));
         let body = render_underwater_test_app(&mut app, width, height);
         assert!(body.contains("gpt-4.1"), "{width}x{height}: {body}");
         assert!(
-            !body.contains("ctx 0%"),
+            !body.contains("context 0%"),
             "empty metrics must stay quiet: {body}"
         );
         assert!(
@@ -7241,9 +7291,9 @@ async fn session_denied_cache_auto_deny_explains_the_cached_rejection() {
     let toast = app.status_toasts.back().expect("auto-deny warning toast");
     assert_eq!(toast.level, StatusToastLevel::Warning);
     assert_eq!(toast.ttl_ms, Some(12_000));
-    assert!(toast.text.contains("matching request was denied earlier"));
-    assert!(toast.text.contains("during this Codewhale run"));
-    assert!(toast.text.contains("Restart Codewhale"));
+    assert!(toast.text.contains("denied a matching request earlier"));
+    assert!(toast.text.contains("in this turn"));
+    assert!(toast.text.contains("Send a new message"));
     assert!(toast.text.contains("exec_shell"));
     let history_notice = app
         .history
@@ -7268,10 +7318,7 @@ async fn session_denied_cache_auto_deny_explains_the_cached_rejection() {
 
     let rendered = render_underwater_test_app(&mut app, 40, 12);
     assert!(rendered.contains("Auto-denied"), "{rendered:?}");
-    assert!(
-        rendered.contains("Restart") && rendered.contains("Codewhale"),
-        "{rendered:?}"
-    );
+    assert!(rendered.contains("Send a new message"), "{rendered:?}");
 }
 
 #[tokio::test]
@@ -7496,7 +7543,7 @@ async fn session_denied_cache_notice_renders_host_scope_in_zh_hans() {
             _ => None,
         })
         .expect("localized persistent auto-deny explanation");
-    assert!(notice.contains("本次 Codewhale 运行期间"));
+    assert!(notice.contains("本轮"));
     assert!(notice.contains("匹配请求"));
     assert!(!notice.contains("example.com"));
 
@@ -7508,7 +7555,7 @@ async fn session_denied_cache_notice_renders_host_scope_in_zh_hans() {
     assert!(rendered_compact.contains("已自动拒绝"), "{rendered:?}");
     assert!(rendered_compact.contains("匹配请求"), "{rendered:?}");
     assert!(
-        rendered_compact.contains("重启") && rendered_compact.contains("Codewhale"),
+        rendered_compact.contains("发送") && rendered_compact.contains("新消息"),
         "{rendered:?}"
     );
 }
@@ -7519,9 +7566,9 @@ fn session_denied_notice_explains_cached_decision_and_recovery() {
     let notice = session_denied_notice(&app, "exec_shell");
 
     assert!(notice.contains("exec_shell"));
-    assert!(notice.contains("matching request was denied earlier"));
-    assert!(notice.contains("during this Codewhale run"));
-    assert!(notice.contains("Restart Codewhale"));
+    assert!(notice.contains("denied a matching request earlier"));
+    assert!(notice.contains("in this turn"));
+    assert!(notice.contains("Send a new message"));
 }
 
 #[tokio::test]
@@ -7590,7 +7637,7 @@ async fn cached_denial_explanation_survives_tool_completion_and_done_render() {
                 cell,
                 HistoryCell::System { content }
                     if content.contains("Auto-denied exec_shell")
-                        && content.contains("Restart Codewhale")
+                        && content.contains("Send a new message")
             )
         })
         .expect("cached denial must leave a durable recovery receipt");
@@ -7627,7 +7674,7 @@ async fn cached_denial_explanation_survives_tool_completion_and_done_render() {
         "cached-decision explanation disappeared after completion:\n{rendered}"
     );
     assert!(
-        rendered.contains("Restart Codewhale"),
+        rendered.contains("new message to be asked again"),
         "cached-denial recovery path disappeared after completion:\n{rendered}"
     );
     assert_eq!(
@@ -11782,7 +11829,7 @@ fn manual_compaction_queues_once_after_active_turn_without_blocking() {
     );
     assert_eq!(
         app.status_message.as_deref(),
-        Some("Compaction queued — runs after this turn.")
+        Some("Making room is queued — it runs after this turn.")
     );
     match engine.rx_op.try_recv().expect("one queued compact op") {
         crate::core::ops::Op::CompactContext { compaction, .. } => {
@@ -11799,10 +11846,7 @@ fn manual_compaction_queues_once_after_active_turn_without_blocking() {
         engine.rx_op.try_recv().is_err(),
         "duplicate op must not queue"
     );
-    assert_eq!(
-        app.status_message.as_deref(),
-        Some("Compaction is already running.")
-    );
+    assert_eq!(app.status_message.as_deref(), Some("Already making room."));
 }
 
 #[test]
@@ -11828,15 +11872,12 @@ fn full_engine_mailbox_defers_manual_compaction_and_flushes_once_drained() {
     assert!(app.deferred_manual_compaction.is_some());
     assert_eq!(
         app.status_message.as_deref(),
-        Some("Compaction queued — runs after this turn.")
+        Some("Making room is queued — it runs after this turn.")
     );
 
     // A repeat during deferral is the single queued pass, not a second one.
     try_queue_manual_compaction(&mut app, &config, &engine.handle, None);
-    assert_eq!(
-        app.status_message.as_deref(),
-        Some("Compaction is already running.")
-    );
+    assert_eq!(app.status_message.as_deref(), Some("Already making room."));
 
     // The mailbox is still full: the flush waits without dropping the request.
     flush_deferred_manual_compaction(&mut app, &config, &engine.handle);
@@ -11958,15 +11999,23 @@ fn automatic_compaction_stays_quiet_until_a_real_failure() {
             .as_ref()
             .is_some_and(|receipt| receipt.auto)
     );
+    let cells_before = app.history.len();
     apply_compaction_failed(
         &mut app,
         "compact-failure",
         true,
         "Summary failed; conversation preserved".into(),
     );
-    assert!(app.sticky_status.as_ref().is_some_and(|toast| {
-        toast.level == StatusToastLevel::Error && toast.text.contains("conversation preserved")
-    }));
+    // An automatic pass's failure is recorded once, in the transcript; the
+    // footer does not echo it (experience mark 2).
+    assert_eq!(app.history.len(), cells_before + 1);
+    assert!(matches!(
+        app.history.last(),
+        Some(HistoryCell::System { content }) if content.contains("conversation preserved")
+    ));
+    assert!(app.sticky_status.is_none());
+    assert!(app.status_toasts.is_empty());
+    assert!(app.status_message.is_none());
 }
 
 #[test]
@@ -13084,7 +13133,7 @@ fn subagent_event_handlers_preserve_dispatch_failures_as_separate_toasts() {
     );
     assert!(app.status_toasts.iter().any(|toast| {
         toast.level == StatusToastLevel::Success
-            && toast.text == "Sub-agent complete · Agent 1 · finished cleanly"
+            && toast.text == "Agent complete · Agent 1 · finished cleanly"
     }));
     assert!(app.status_toasts.back().is_some_and(|toast| {
         toast
@@ -14126,22 +14175,310 @@ fn turn_liveness_keeps_max_duration_exec_shell_wait_alive_with_heartbeat() {
     assert!(app.status_toasts.is_empty());
 }
 
+fn stall_heartbeat(
+    phase: crate::core::engine::turn_heartbeat::TurnPhase,
+    bound: Option<Duration>,
+    stall: Option<crate::core::engine::turn_heartbeat::StallReport>,
+) -> crate::core::engine::turn_heartbeat::HeartbeatSnapshot {
+    crate::core::engine::turn_heartbeat::HeartbeatSnapshot {
+        phase,
+        since_progress: Duration::from_secs(1),
+        bound,
+        stall,
+    }
+}
+
+fn stall_report(phase: &str) -> crate::core::engine::turn_heartbeat::StallReport {
+    crate::core::engine::turn_heartbeat::StallReport {
+        source: "engine",
+        phase: phase.to_string(),
+        detail: Some("mock / model".to_string()),
+        turn_id: Some("turn-1".to_string()),
+        provider_request: None,
+        since_progress: Duration::from_secs(360),
+        bound: Some(Duration::from_secs(330)),
+    }
+}
+
+fn stall_records(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[test]
-fn turn_liveness_respects_stream_idle_budget_for_quiet_model_waits() {
+fn stall_ui_watchdog_bound_is_decoupled_from_chunk_timeout() {
     let mut app = create_test_app();
-    let started_at = Instant::now();
-    app.is_loading = true;
-    app.runtime_turn_status = Some("in_progress".to_string());
-    app.stream_chunk_timeout_secs = 900;
-    app.turn_started_at = Some(started_at);
-    app.turn_last_activity_at = Some(started_at);
-    let now = started_at + TURN_STALL_WATCHDOG_TIMEOUT + Duration::from_secs(31);
+    app.stream_chunk_timeout_secs = crate::config::DEFAULT_STREAM_CHUNK_TIMEOUT_SECS;
+    let default_chunk = Duration::from_secs(crate::config::DEFAULT_STREAM_CHUNK_TIMEOUT_SECS);
+    assert!(turn_stall_watchdog_timeout(&app) < default_chunk);
+    let bound = turn_stall_watchdog_timeout(&app);
+    app.stream_chunk_timeout_secs = 3600;
+    assert_eq!(
+        turn_stall_watchdog_timeout(&app),
+        bound,
+        "no longer tracks the chunk budget"
+    );
+}
 
-    let recovered = reconcile_turn_liveness(&mut app, now, false);
+#[test]
+fn turn_liveness_defers_to_engine_heartbeat_for_quiet_model_waits() {
+    use crate::core::engine::turn_heartbeat::TurnPhase;
+    let quiet_turn = || {
+        let mut app = create_test_app();
+        let started_at = Instant::now();
+        app.is_loading = true;
+        app.runtime_turn_status = Some("in_progress".to_string());
+        app.turn_started_at = Some(started_at);
+        app.turn_last_activity_at = Some(started_at);
+        (
+            app,
+            started_at + TURN_STALL_WATCHDOG_TIMEOUT + Duration::from_secs(31),
+        )
+    };
 
-    assert!(!recovered);
+    // A live, bounded model wait the engine has not flagged: the UI defers.
+    let (mut app, now) = quiet_turn();
+    let live = stall_heartbeat(TurnPhase::Streaming, Some(Duration::from_secs(330)), None);
+    assert!(!reconcile_turn_liveness_with(
+        &mut app,
+        now,
+        false,
+        Some(&live)
+    ));
     assert!(app.is_loading);
     assert!(app.status_toasts.is_empty());
+
+    // The engine reported that wait overdue: the UI recovers.
+    let (mut app, now) = quiet_turn();
+    let stalled = stall_heartbeat(
+        TurnPhase::Streaming,
+        Some(Duration::from_secs(330)),
+        Some(stall_report("while streaming the model response")),
+    );
+    assert!(reconcile_turn_liveness_with(
+        &mut app,
+        now,
+        false,
+        Some(&stalled)
+    ));
+    assert!(!app.is_loading);
+
+    // The engine is idle (a lost completion): the UI recovers.
+    let (mut app, now) = quiet_turn();
+    let idle = stall_heartbeat(TurnPhase::Idle, None, None);
+    assert!(reconcile_turn_liveness_with(
+        &mut app,
+        now,
+        false,
+        Some(&idle)
+    ));
+}
+
+#[test]
+fn stall_engine_report_shows_phase_and_held_queue() {
+    use crate::core::engine::turn_heartbeat::TurnPhase;
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".to_string());
+    app.turn_started_at = Some(Instant::now());
+    app.queue_message(QueuedMessage::new("follow-up".into(), None));
+    let stalled = stall_heartbeat(
+        TurnPhase::Streaming,
+        Some(Duration::from_secs(330)),
+        Some(stall_report("while streaming the model response")),
+    );
+
+    reconcile_turn_liveness_supervised(&mut app, Instant::now(), &stalled);
+    reconcile_turn_liveness_supervised(&mut app, Instant::now(), &stalled);
+
+    let stall_toasts: Vec<_> = app
+        .status_toasts
+        .iter()
+        .filter(|toast| toast.text.contains("Turn stalled while streaming"))
+        .collect();
+    assert_eq!(stall_toasts.len(), 1, "one toast per stall episode");
+    assert!(stall_toasts[0].text.contains("Esc to cancel and retry"));
+    assert!(stall_toasts[0].text.contains("1 queued message is held"));
+}
+
+/// Fault injection: a sub-agent still marked Running long past every child's
+/// wall budget (its AgentComplete was lost) no longer vetoes recovery; the
+/// recovery leaves a log line, a `crashes/` record naming the suspect, and a
+/// UI status.
+#[test]
+fn stall_parked_subagent_past_bound_is_suspect_not_a_veto() {
+    use crate::core::engine::turn_heartbeat::{TurnPhase, set_test_stall_record_dir};
+    let dir = tempfile::tempdir().expect("tempdir");
+    set_test_stall_record_dir(Some(dir.path().to_path_buf()));
+
+    let mut app = create_test_app();
+    let now = Instant::now();
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".to_string());
+    app.runtime_turn_id = Some("turn-with-ghost".to_string());
+    let last_activity = now
+        .checked_sub(TURN_STALL_WATCHDOG_TIMEOUT + Duration::from_secs(1))
+        .expect("monotonic clock has run long enough");
+    app.turn_started_at = Some(last_activity);
+    app.turn_last_activity_at = Some(last_activity);
+    let mut ghost = make_subagent(
+        "agent_ghost",
+        crate::tools::subagent::SubAgentStatus::Running,
+    );
+    ghost.started_at = now.checked_sub(SUBAGENT_SUSPECT_AFTER + Duration::from_secs(1));
+    assert!(
+        ghost.started_at.is_some(),
+        "monotonic clock has run long enough"
+    );
+    app.subagent_cache = vec![ghost];
+    let idle = stall_heartbeat(TurnPhase::Idle, None, None);
+
+    assert_eq!(
+        suspect_running_agents(&app, now),
+        vec!["agent_ghost".to_string()]
+    );
+    assert_eq!(live_running_agent_count(&app, now), 0);
+    assert!(reconcile_turn_liveness_supervised(&mut app, now, &idle));
+    assert!(!app.is_loading);
+    assert!(
+        app.status_toasts
+            .iter()
+            .any(|toast| toast.text.contains("Turn stalled")),
+        "UI status names the stall"
+    );
+    let records = stall_records(dir.path());
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert!(records[0].contains("Kind: turn-stall"));
+    assert!(records[0].contains("agent_ghost"), "{}", records[0]);
+    assert!(records[0].contains("Turn: turn-with-ghost"));
+
+    // A fresh Running child still holds the turn open.
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".to_string());
+    app.turn_started_at = Some(last_activity);
+    app.turn_last_activity_at = Some(last_activity);
+    let mut fresh = make_subagent(
+        "agent_fresh",
+        crate::tools::subagent::SubAgentStatus::Running,
+    );
+    fresh.started_at = Some(now);
+    app.subagent_cache = vec![fresh];
+    assert!(!reconcile_turn_liveness_supervised(&mut app, now, &idle));
+    assert!(app.is_loading);
+    set_test_stall_record_dir(None);
+}
+
+#[test]
+fn stall_recovery_hands_held_queued_message_back_to_composer() {
+    let mut app = create_test_app();
+    let now = Instant::now();
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".to_string());
+    let last_activity = now
+        .checked_sub(TURN_STALL_WATCHDOG_TIMEOUT + Duration::from_secs(1))
+        .expect("monotonic clock has run long enough");
+    app.turn_started_at = Some(last_activity);
+    app.queue_message(QueuedMessage::new("first follow-up".into(), None));
+    app.queue_message(QueuedMessage::new("second follow-up".into(), None));
+
+    assert!(reconcile_turn_liveness(&mut app, now, false));
+
+    assert_eq!(app.input, "second follow-up");
+    assert!(app.queued_draft.is_some());
+    assert_eq!(app.queued_messages.len(), 1);
+    let toast = app.status_toasts.back().expect("recovery toast");
+    assert!(
+        toast.text.contains("back in the composer"),
+        "{}",
+        toast.text
+    );
+    assert!(
+        toast.text.contains("1 more queued message"),
+        "{}",
+        toast.text
+    );
+}
+
+/// Fault injection: a dispatch whose route planning / engine admission never
+/// finishes is failed back within its bound, restores the message, and leaves
+/// a stall record.
+#[tokio::test]
+async fn stall_dispatch_task_overrun_reports_and_restores_message() {
+    use crate::core::engine::turn_heartbeat::set_test_stall_record_dir;
+    let dir = tempfile::tempdir().expect("tempdir");
+    set_test_stall_record_dir(Some(dir.path().to_path_buf()));
+    let mut app = create_test_app();
+    let config = Config::default();
+    let prepare = prepare_user_dispatch(
+        &mut app,
+        &config,
+        QueuedMessage::new("never admitted".into(), None),
+    )
+    .expect("prepare");
+    app.dispatch_in_flight = true;
+
+    let bound = Duration::from_millis(100);
+    let apply = tokio::time::timeout(
+        Duration::from_secs(10),
+        super::dispatch::supervised_dispatch(
+            prepare,
+            DispatchRecovery::Immediate,
+            bound,
+            |_prepare, _recovery| std::future::pending(),
+        ),
+    )
+    .await
+    .expect("supervision returns within the bound");
+    let engine = mock_engine_handle();
+    let error = apply(&mut app, &engine.handle, &config).expect_err("dispatch fails back");
+
+    assert!(error.to_string().contains("dispatch stalled"), "{error}");
+    assert!(!app.dispatch_in_flight);
+    assert_eq!(
+        app.input, "never admitted",
+        "message restored to the composer"
+    );
+    let records = stall_records(dir.path());
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert!(records[0].contains("while dispatching the message"));
+    set_test_stall_record_dir(None);
+}
+
+#[tokio::test]
+async fn stall_dispatch_task_panic_still_reports_back() {
+    let mut app = create_test_app();
+    let config = Config::default();
+    let prepare = prepare_user_dispatch(
+        &mut app,
+        &config,
+        QueuedMessage::new("panicking dispatch".into(), None),
+    )
+    .expect("prepare");
+    app.dispatch_in_flight = true;
+
+    let apply = super::dispatch::supervised_dispatch(
+        prepare,
+        DispatchRecovery::Immediate,
+        Duration::from_secs(60),
+        |_prepare, _recovery| async { panic!("route planner exploded") },
+    )
+    .await;
+    let engine = mock_engine_handle();
+    let error = apply(&mut app, &engine.handle, &config).expect_err("dispatch fails back");
+
+    assert!(
+        error.to_string().contains("route planner exploded"),
+        "{error}"
+    );
+    assert!(!app.dispatch_in_flight);
+    assert_eq!(app.input, "panicking dispatch");
 }
 
 #[test]
@@ -26014,7 +26351,7 @@ fn subagent_completion_notification_uses_summary_line_not_sentinel() {
         Duration::from_secs(42),
     );
 
-    assert_eq!(payload.headline(), "Sub-agent complete");
+    assert_eq!(payload.headline(), "Agent complete");
     assert_eq!(payload.detail(), Some("agent_live"));
     assert_eq!(payload.preview(), Some("Finished the docs audit."));
     assert!(!payload.render_inline().contains("codewhale:subagent.done"));
@@ -26031,7 +26368,7 @@ fn subagent_completion_notification_can_include_elapsed_summary() {
         Duration::from_secs(65),
     );
 
-    assert_eq!(payload.headline(), "Sub-agent complete (1m 05s)");
+    assert_eq!(payload.headline(), "Agent complete (1m 05s)");
     assert_eq!(payload.detail(), Some("agent_live"));
     assert_eq!(payload.preview(), None);
 }
@@ -26047,10 +26384,10 @@ fn subagent_cancelled_notification_never_claims_completion() {
         Duration::from_secs(2),
     );
 
-    assert_eq!(payload.headline(), "Sub-agent cancelled");
+    assert_eq!(payload.headline(), "Agent cancelled");
     assert_eq!(payload.detail(), Some("agent_stopped"));
     assert_eq!(payload.preview(), Some("Cancelled"));
-    assert!(!payload.render_inline().contains("Sub-agent complete"));
+    assert!(!payload.render_inline().contains("Agent complete"));
 }
 
 #[test]

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:29c349b6f2b4 -->
+<!-- source: README.md sha256:bbb8bfb61e57 -->
 # Codewhale
 
 Codewhale es un agente de código abierto que lee tu proyecto, edita archivos, ejecuta comandos y comprueba su trabajo con un modelo alojado o local que tú eliges. Empieza con una tarea en la terminal. Para un trabajo más grande, asigna partes del trabajo a agentes con distintos modelos y roles.
@@ -27,7 +27,7 @@ El instalador selecciona la última versión publicada. El [registro de cambios]
 
 En Windows, descarga el instalador o archivo correspondiente de [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest). Para actualizar una instalación directa existente, ejecuta `codewhale update`, o `codewhale update --check` para consultar sin instalar. El actualizador muestra la ruta del ejecutable y conserva las compilaciones más recientes. npm y Cargo son opciones secundarias; consulta la [guía de instalación](docs/INSTALL.md) para migrar desde un gestor de paquetes y configurar PATH.
 
-La primera vez que se ejecuta, Codewhale te ayuda a conectar un proveedor o a configurar Codewhale sin conexión. Las respuestas requieren un modelo alojado o local conectado. Codewhale también admite npm y Cargo como opciones secundarias de distribución, además de Docker, Nix, Scoop, Android/Termux y un espejo opcional de CNB. Las instalaciones existentes gestionadas por paquetes reciben instrucciones de migración. Consulta la [ayuda de instalación y PATH](docs/INSTALL.md).
+La primera ejecución abre directamente el compositor; no te guía por ninguna configuración. Las respuestas del modelo requieren un modelo alojado o local conectado: mientras no haya uno, la pantalla de inicio indica "no model connected". Ejecuta `/provider` (o presiona F3) para agregar una clave alojada o elegir un entorno local. Si Ollama ya se está ejecutando con un modelo de chat, Codewhale cambia a él por sí solo. Codewhale también admite npm y Cargo como opciones secundarias de distribución, además de Docker, Nix, Scoop, Android/Termux y un espejo opcional de CNB. Las instalaciones existentes gestionadas por paquetes reciben instrucciones de migración. Consulta la [ayuda de instalación y PATH](docs/INSTALL.md).
 
 El completado con Tab se configura con un comando por shell — `codewhale completion bash|zsh|fish|powershell|elvish`. Consulta el [completado de shell](docs/INSTALL.md#8-shell-completions).
 
@@ -53,7 +53,7 @@ La terminal y los clientes gráficos se conectan al Runtime de Codewhale, que ej
 
 - **Terminal:** `codewhale` abre la interfaz interactiva; `codewhale exec` ejecuta una tarea desde un script o un trabajo de CI.
 - **Navegador local:** `codewhale web` abre el [cliente web local](docs/WEB.md) incluido, que usa el mismo runtime.
-- **Aplicación de escritorio Codewhale (GPUI):** la aplicación de escritorio nativa GPUI es la dirección del cliente de producto (decisión del 2026-09-14; el mapa de fases está en docs/TRANSITION.md del repositorio privado codehwhale-gpui). La aplicación web alojada en app.codewhale.net se retira por fases; el sitio de marketing, el inicio de sesión, la facturación y las páginas legales y de descarga permanecen en la web de forma permanente. Su disponibilidad se indica en la [página del producto](https://codewhale.net/en/product).
+- **Aplicación de escritorio Codewhale (GPUI):** una aplicación de escritorio nativa, desarrollada en un repositorio separado, es la dirección del cliente de producto con sesión iniciada. La aplicación web alojada en app.codewhale.net se reconstruirá a su imagen; el sitio de marketing, el inicio de sesión, la facturación y las páginas legales y de descarga permanecen en la web. Su disponibilidad se indica en la [página del producto](https://codewhale.net/en/product).
 
 **Computer Use agrega herramientas para observar otras aplicaciones e interactuar con ellas.** El plugin está incluido en el código fuente actual. Revisa el acceso que solicita y habilítalo antes de usarlo; los permisos del sistema operativo y los requisitos de la plataforma siguen siendo necesarios. Consulta la [guía de Computer Use](crates/tui/plugins/computer-use/README.md) incluida y la [configuración de plugins](docs/PLUGINS.md).
 
@@ -80,7 +80,7 @@ Lee el [orden de autorización](docs/AUTHORIZATION_ORDER.md) para conocer la jer
 - [Equipos de agentes](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hooks](docs/HOOKS.md) y [configuración](docs/CONFIGURATION.md)
 - [Cliente web local](docs/WEB.md)
-- [Toda la documentación](docs)
+- [Toda la documentación](docs/README.md)
 - [Estructura del repositorio y guía de contribución](CONTRIBUTING.md#project-structure)
 
 ## Únete a la comunidad

@@ -129,6 +129,13 @@ pub struct GoalState {
     last_gap_pass: Option<u32>,
     /// Latest reported progress, kept out of the stall accounting entirely.
     progress: Option<GoalProgressReport>,
+    /// The current blocker was set by the runtime (a continuation turn that
+    /// failed, timed out or never started), not reported by the model or the
+    /// user. Such a stop is not a judgement about the work, so the user's next
+    /// message resumes the goal (see [`Self::resume_after_runtime_block`]).
+    /// Known limitation: session-local, like the rest of this state's
+    /// lifecycle detail; a restored Blocked goal needs `/goal resume`.
+    runtime_blocked: bool,
 }
 
 impl GoalState {
@@ -284,6 +291,9 @@ impl GoalState {
             repeated_gap_count: 0,
             last_gap_pass: None,
             progress: None,
+            // The origin of a persisted blocker is not recorded; treat it as
+            // reported so only an explicit resume clears it.
+            runtime_blocked: false,
         }
     }
 
@@ -477,10 +487,31 @@ impl GoalState {
         Ok(())
     }
 
+    /// Block on a runtime stop rather than a reported blocker; see
+    /// [`Self::runtime_blocked`].
+    pub fn mark_runtime_blocked(&mut self, blocker: String) -> Result<(), &'static str> {
+        self.mark_blocked(blocker)?;
+        self.runtime_blocked = true;
+        Ok(())
+    }
+
+    /// Resume a goal whose only blocker was a runtime stop, as a new control
+    /// revision. Returns false, changing nothing, for any other state: a
+    /// reported blocker stays until an explicit resume.
+    pub fn resume_after_runtime_block(&mut self) -> bool {
+        if !(self.runtime_blocked && self.status == Some(GoalStatus::Blocked)) {
+            return false;
+        }
+        self.resume(None);
+        self.runtime_blocked = false;
+        true
+    }
+
     pub fn mark_blocked(&mut self, blocker: String) -> Result<(), &'static str> {
         if self.objective.is_none() {
             return Err("No active goal exists to block.");
         }
+        self.runtime_blocked = false;
         self.status = Some(GoalStatus::Blocked);
         self.finished_at = Some(Instant::now());
         self.blocker = Some(blocker);

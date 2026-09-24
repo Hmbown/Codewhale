@@ -1,7 +1,7 @@
 //! Path resolution for the per-workspace snapshot side-repos.
 //!
-//! Snapshots live under the resolved state directory
-//! (`~/.codewhale/snapshots` or legacy `~/.deepseek/snapshots`) with
+//! Snapshots live under the shared resolved state directory (including an
+//! explicit `CODEWHALE_HOME`, or the existing primary/legacy snapshot store) with
 //! a two-level hash split so we can snapshot multiple worktrees of the
 //! same project independently — `git worktree list` users won't get
 //! cross-talk between feature branches.
@@ -11,53 +11,41 @@ use std::path::{Path, PathBuf};
 
 /// Compute the snapshot directory for a given workspace path.
 ///
-/// Returns `$STATE_DIR/snapshots/<project_hash>/<worktree_hash>/` where
-/// `$STATE_DIR` is resolved via `codewhale_config::resolve_state_dir`.
-/// The caller is responsible for creating it on disk; we purposefully
-/// don't touch the filesystem here so this is cheap to call repeatedly.
+/// Returns `<snapshot state dir>/<project_hash>/<worktree_hash>/`, using
+/// `codewhale_config::resolve_state_dir("snapshots")` for the shared base.
+/// This resolves paths without creating directories or migrating state.
 ///
 /// The `project_hash` is derived from the canonicalized workspace path
 /// after stripping any `.worktrees/<name>` suffix — multiple worktrees
 /// of the same repo share the same `project_hash` so users can browse
 /// snapshots cross-worktree if they want, but the `worktree_hash` keeps
 /// commits isolated by default.
-pub fn snapshot_dir_for(workspace: &Path) -> PathBuf {
-    snapshot_dir_with_home(workspace, crate::config::effective_home_dir())
+pub fn snapshot_dir_for(workspace: &Path) -> io::Result<PathBuf> {
+    // An explicit profile must never read or create ambient snapshots. The
+    // shared resolver also preserves legacy stores and rejects invalid
+    // overrides; do not silently fall back to the OS home or working directory.
+    let base = codewhale_config::resolve_state_dir("snapshots").map_err(io::Error::other)?;
+    Ok(snapshot_dir_with_base(workspace, &base))
 }
 
-/// Same as [`snapshot_dir_for`] but with an injectable home directory.
-/// Used by tests so they never touch the user's real state directory.
-pub fn snapshot_dir_with_home(workspace: &Path, home: Option<PathBuf>) -> PathBuf {
-    let home = home.unwrap_or_else(|| PathBuf::from("."));
+fn snapshot_dir_with_base(workspace: &Path, base: &Path) -> PathBuf {
     let canonical = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
     let project_root = strip_worktree_suffix(&canonical);
     let project_hash = stable_hex(&project_root);
     let worktree_hash = stable_hex(&canonical);
-    snapshot_base_with_home(Some(home))
-        .join(project_hash)
-        .join(worktree_hash)
-}
-
-fn snapshot_base_with_home(home: Option<PathBuf>) -> PathBuf {
-    let home = home.unwrap_or_else(|| PathBuf::from("."));
-    // Prefer .codewhale, fall back to .deepseek
-    let primary = home.join(".codewhale").join("snapshots");
-    if primary.exists() {
-        return primary;
-    }
-    home.join(".deepseek").join("snapshots")
+    base.join(project_hash).join(worktree_hash)
 }
 
 /// Resolve the `.git` directory inside the snapshot dir.
-pub fn snapshot_git_dir(workspace: &Path) -> PathBuf {
-    snapshot_dir_for(workspace).join(".git")
+pub fn snapshot_git_dir(workspace: &Path) -> io::Result<PathBuf> {
+    Ok(snapshot_dir_for(workspace)?.join(".git"))
 }
 
 /// Ensure the snapshot dir exists on disk and return its path.
 pub fn ensure_snapshot_dir(workspace: &Path) -> io::Result<PathBuf> {
-    let dir = snapshot_dir_for(workspace);
+    let dir = snapshot_dir_for(workspace)?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -98,12 +86,11 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn snapshot_dir_layout_two_levels_under_deepseek() {
+    fn snapshot_dir_layout_keeps_two_hash_levels_under_selected_base() {
         let tmp = tempdir().expect("tempdir");
-        let dir = snapshot_dir_with_home(tmp.path(), Some(tmp.path().to_path_buf()));
-        let mut iter = dir.strip_prefix(tmp.path()).unwrap().components();
-        assert_eq!(iter.next().unwrap().as_os_str(), ".deepseek");
-        assert_eq!(iter.next().unwrap().as_os_str(), "snapshots");
+        let base = tmp.path().join("snapshots");
+        let dir = snapshot_dir_with_base(tmp.path(), &base);
+        let mut iter = dir.strip_prefix(&base).unwrap().components();
         assert!(iter.next().is_some()); // project_hash
         assert!(iter.next().is_some()); // worktree_hash
         assert!(iter.next().is_none());
@@ -117,8 +104,9 @@ mod tests {
         std::fs::create_dir_all(&main_path).unwrap();
         std::fs::create_dir_all(&wt_path).unwrap();
 
-        let main_dir = snapshot_dir_with_home(&main_path, Some(tmp.path().to_path_buf()));
-        let wt_dir = snapshot_dir_with_home(&wt_path, Some(tmp.path().to_path_buf()));
+        let base = tmp.path().join("snapshots");
+        let main_dir = snapshot_dir_with_base(&main_path, &base);
+        let wt_dir = snapshot_dir_with_base(&wt_path, &base);
 
         // Same project_hash (parent component before the worktree-specific tail).
         let main_components: Vec<_> = main_dir.components().collect();
@@ -133,18 +121,41 @@ mod tests {
     }
 
     #[test]
-    fn ensure_snapshot_dir_creates_path() {
+    fn explicit_profile_owns_snapshot_creation_and_lookup() {
+        let _lock = crate::test_support::lock_test_env();
         let tmp = tempdir().expect("tempdir");
-        // Use scoped HOME so we don't pollute the real one.
-        let dir = snapshot_dir_with_home(tmp.path(), Some(tmp.path().to_path_buf()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let profile = tmp.path().join("selected-profile");
+        let _profile = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &profile);
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let expected = snapshot_dir_with_base(&workspace, &profile.join("snapshots"));
+        let dir = ensure_snapshot_dir(&workspace).expect("create selected snapshot directory");
+        assert_eq!(
+            dir, expected,
+            "snapshot writes must use the selected profile"
+        );
         assert!(dir.exists());
+        assert_eq!(
+            snapshot_git_dir(&workspace).expect("lookup"),
+            dir.join(".git"),
+            "snapshot reads must use the same selected profile as writes"
+        );
     }
 
     #[test]
-    fn snapshot_git_dir_appends_dot_git() {
+    fn invalid_profile_is_an_error_without_ambient_fallback() {
+        let _lock = crate::test_support::lock_test_env();
         let tmp = tempdir().expect("tempdir");
-        let git_dir = snapshot_git_dir(tmp.path());
-        assert_eq!(git_dir.file_name().unwrap(), ".git");
+        let _profile = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", "relative-profile");
+        assert!(snapshot_dir_for(tmp.path()).is_err());
+        assert!(snapshot_git_dir(tmp.path()).is_err());
+        assert!(ensure_snapshot_dir(tmp.path()).is_err());
+        assert!(
+            tmp.path()
+                .read_dir()
+                .expect("unchanged workspace")
+                .next()
+                .is_none()
+        );
     }
 }

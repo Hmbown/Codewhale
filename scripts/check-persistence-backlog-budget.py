@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Check the paused persistence backlog against one-way local ceilings."""
+"""Check the paused persistence backlog against one-way local ceilings.
+
+Usage:
+    python3 scripts/check-persistence-backlog-budget.py
+    python3 scripts/check-persistence-backlog-budget.py --receipt receipt.json
+    python3 scripts/check-persistence-backlog-budget.py --update
+
+``--update`` is the receipt command a failing PR runs to land an intended
+increase in the same PR: it raises only the exceeded ceilings to the measured
+values and never lowers one, because the ceilings carry deliberate measurement
+noise headroom. Tighten by hand, with the reason recorded in the budget.
+"""
 
 from __future__ import annotations
 
@@ -393,10 +404,36 @@ def measure() -> dict[str, Any]:
     return receipt
 
 
+def update_command(receipt_path: Path | None, budget_path: Path) -> str:
+    parts = ["python3", "scripts/check-persistence-backlog-budget.py"]
+    if receipt_path is not None:
+        parts.extend(["--receipt", str(receipt_path)])
+    if budget_path != BUDGET_PATH:
+        parts.extend(["--budget", str(budget_path)])
+    parts.append("--update")
+    return " ".join(parts)
+
+
+def raise_ceilings(
+    budget: dict[str, Any], increases: list[tuple[str, int, int]]
+) -> dict[str, Any]:
+    """Return a copy of ``budget`` with each exceeded ceiling set to its measurement."""
+    updated = json.loads(json.dumps(budget))
+    for field, current, _ceiling in increases:
+        updated["ceilings"][field] = current
+    validate_budget(updated)
+    return updated
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--receipt", type=Path, help="check an existing receipt")
     parser.add_argument("--budget", type=Path, default=BUDGET_PATH)
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="raise exceeded ceilings to the measured values (never lowers one)",
+    )
     args = parser.parse_args()
     try:
         expected_source = current_source_identity()
@@ -408,17 +445,48 @@ def main() -> int:
             receipt,
             budget,
             expected_source=expected_source,
-            require_clean_source=True,
+            # An update runs while the author is mid-change; the measurement
+            # still names its exact SHA and dirty bit, so only the enforcing
+            # check insists on a clean tree.
+            require_clean_source=not args.update,
         )
     except PersistenceBacklogError as error:
         print(f"[persistence-backlog-budget] ERROR: {error}", file=sys.stderr)
         return 2
+    if args.update:
+        if not increases:
+            print(
+                "[persistence-backlog-budget] --update: no ceiling exceeded; "
+                f"{args.budget} left unchanged"
+            )
+            return 0
+        try:
+            updated = raise_ceilings(budget, increases)
+            args.budget.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
+        except (OSError, PersistenceBacklogError) as error:
+            print(
+                f"[persistence-backlog-budget] ERROR: failed to update budget: {error}",
+                file=sys.stderr,
+            )
+            return 2
+        for field, current, ceiling in increases:
+            print(f"[persistence-backlog-budget] raised {field}: {ceiling} -> {current}")
+        print(
+            f"[persistence-backlog-budget] wrote {args.budget}; say why in the PR "
+            "description, or add a dated _rebaseline note to the budget."
+        )
+        return 0
     if increases:
         for field, current, ceiling in increases:
             print(
                 f"[persistence-backlog-budget] FAIL: {field}={current} exceeds {ceiling}",
                 file=sys.stderr,
             )
+        print(
+            "\nShrink the retained backlog, or if the growth is intended land the new "
+            f"ceiling in this PR:\n  {update_command(args.receipt, args.budget)}",
+            file=sys.stderr,
+        )
         return 1
     print("[persistence-backlog-budget] PASS: one-way ceilings respected")
     for field, current, ceiling in decreases:

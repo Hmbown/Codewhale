@@ -1,4 +1,4 @@
-/* generated from crates/palette/src/tokens.rs — do not edit */
+/* generated from crates/palette/src/tokens.rs + vendor/codewhale-design/tokens.json — do not edit */
 /* regenerate: scripts/export-design-tokens.py (in the codewhale repo) */
 :root {
   --whale-bg: #070c1d;
@@ -245,4 +245,61 @@
   --shoreline-light-diff-deleted-fg-rgb: 168 40 80;
   --shoreline-light-diff-deleted-bg: #fbe6ec;
   --shoreline-light-diff-deleted-bg-rgb: 251 230 236;
+  --gpui-dark-bg: #202123;
+  --gpui-dark-bg-rgb: 32 33 35;
+  --gpui-dark-text: #efeeeb;
+  --gpui-dark-text-rgb: 239 238 235;
+  --gpui-dark-panel: #2a2b2e;
+  --gpui-dark-panel-rgb: 42 43 46;
+  --gpui-dark-text-muted: #b1b1ad;
+  --gpui-dark-text-muted-rgb: 177 177 173;
+  --gpui-dark-border: #3b3c3f;
+  --gpui-dark-border-rgb: 59 60 63;
+  --gpui-dark-sidebar: #191a1c;
+  --gpui-dark-sidebar-rgb: 25 26 28;
+  --gpui-dark-primary: #90b9ff;
+  --gpui-dark-primary-rgb: 144 185 255;
+  --gpui-dark-on-primary: #15243e;
+  --gpui-dark-on-primary-rgb: 21 36 62;
+  --gpui-dark-accent: #303134;
+  --gpui-dark-accent-rgb: 48 49 52;
+  --gpui-dark-list-active: #37393d;
+  --gpui-dark-list-active-rgb: 55 57 61;
+  --gpui-light-bg: #faf8f5;
+  --gpui-light-bg-rgb: 250 248 245;
+  --gpui-light-text: #28292b;
+  --gpui-light-text-rgb: 40 41 43;
+  --gpui-light-panel: #ffffff;
+  --gpui-light-panel-rgb: 255 255 255;
+  --gpui-light-text-muted: #5f605d;
+  --gpui-light-text-muted-rgb: 95 96 93;
+  --gpui-light-border: #d9d5cf;
+  --gpui-light-border-rgb: 217 213 207;
+  --gpui-light-sidebar: #f0ede8;
+  --gpui-light-sidebar-rgb: 240 237 232;
+  --gpui-light-primary: #245bc7;
+  --gpui-light-primary-rgb: 36 91 199;
+  --gpui-light-on-primary: #fbf5ee;
+  --gpui-light-on-primary-rgb: 251 245 238;
+  --gpui-light-accent: #e8e5e0;
+  --gpui-light-accent-rgb: 232 229 224;
+  --gpui-light-list-active: #dfdcd6;
+  --gpui-light-list-active-rgb: 223 220 214;
+}
+/* GPUI design 1.0.0; sha256 a0c23f8a235bbc61e42fb8a60795ae7d9825dbbd1730142acc9ffec9c0abb3af. */
+:root {
+  --gpui-radius-control: 6px;
+  --gpui-radius-panel: 10px;
+  --gpui-focus-width: 2px;
+  --gpui-focus-offset: 3px;
+  --gpui-spacing-compact: 4px;
+  --gpui-spacing-control: 8px;
+  --gpui-spacing-group: 12px;
+  --gpui-spacing-section: 16px;
+  --gpui-spacing-large: 24px;
+  --gpui-spacing-page: 32px;
+  --gpui-selection-opacity: 0.28;
+  --gpui-primary-hover-opacity: 0.9;
+  --gpui-font-fallbacks: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC";
+  --gpui-mono-size: 0.8125rem;
 }

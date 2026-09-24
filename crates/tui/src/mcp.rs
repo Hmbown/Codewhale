@@ -1195,6 +1195,82 @@ pub struct McpTool {
     pub description: Option<String>,
     #[serde(rename = "inputSchema", default)]
     pub input_schema: serde_json::Value,
+    /// Behaviour hints the server declares (MCP `ToolAnnotations`). They are
+    /// claims, not proof: only a reviewed plugin's hints relax approval, and
+    /// only toward what the plugin review already covers (CW-11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<McpToolAnnotations>,
+}
+
+/// The subset of MCP `ToolAnnotations` the approval path reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct McpToolAnnotations {
+    #[serde(
+        rename = "readOnlyHint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub read_only_hint: Option<bool>,
+    #[serde(
+        rename = "destructiveHint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub destructive_hint: Option<bool>,
+}
+
+/// How the approval path may treat one model-visible MCP tool, from its
+/// server's declared annotations (CW-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpToolApprovalHint {
+    /// A reviewed, enabled plugin declares the tool read-only and not
+    /// destructive: it runs without a prompt, like the built-in read tools.
+    TrustedReadOnly,
+    /// The server declares the tool destructive: session-wide auto-approve
+    /// does not cover it, so each call keeps its prompt.
+    Destructive,
+}
+
+/// Annotation-derived approval hints for the MCP tools of every live
+/// catalog, keyed by model tool name. Filled where the catalog is built
+/// (`McpPool::to_api_tools`, once per turn) and read by the side-effect-free
+/// call preparation, which has no pool handle.
+///
+/// Known limitation: the map is process-wide. Two pools in one process that
+/// expose the same model tool name from different servers overwrite each
+/// other's hint; the last catalog built wins. Plugin servers carry
+/// synthesized `plugin-…` names, so this needs a user server deliberately
+/// named like a plugin server.
+static MCP_TOOL_APPROVAL_HINTS: std::sync::LazyLock<RwLock<HashMap<String, McpToolApprovalHint>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// The approval hint recorded for a model-visible MCP tool name, if any.
+#[must_use]
+pub fn mcp_tool_approval_hint(model_tool_name: &str) -> Option<McpToolApprovalHint> {
+    MCP_TOOL_APPROVAL_HINTS.read().get(model_tool_name).copied()
+}
+
+#[cfg(test)]
+pub(crate) fn set_mcp_tool_approval_hint_for_test(
+    model_tool_name: &str,
+    hint: Option<McpToolApprovalHint>,
+) {
+    let mut hints = MCP_TOOL_APPROVAL_HINTS.write();
+    match hint {
+        Some(hint) => hints.insert(model_tool_name.to_string(), hint),
+        None => hints.remove(model_tool_name),
+    };
+}
+
+fn approval_hint_for(tool: &McpTool, reviewed_plugin: bool) -> Option<McpToolApprovalHint> {
+    let annotations = tool.annotations.unwrap_or_default();
+    // An absent destructiveHint defaults to true in the MCP spec, but only
+    // when readOnlyHint is false; a read-only tool is not destructive.
+    if annotations.destructive_hint == Some(true) {
+        return Some(McpToolApprovalHint::Destructive);
+    }
+    (reviewed_plugin && annotations.read_only_hint == Some(true))
+        .then_some(McpToolApprovalHint::TrustedReadOnly)
 }
 
 const MCP_TOOL_DESCRIPTION_MAX_CHARS: usize = 80;
@@ -4573,8 +4649,31 @@ impl McpPool {
         names
     }
 
+    /// Record the approval hints for this catalog's tools (CW-11). Every
+    /// server this pool lists is rewritten, so a tool whose server lost its
+    /// plugin review, or dropped a hint, loses the relaxation with it.
+    fn record_tool_approval_hints(&self) {
+        let mut hints = MCP_TOOL_APPROVAL_HINTS.write();
+        for (server, conn) in &self.connections {
+            let authorized = self.server_allowed(server) && conn.catalog_authorized();
+            let reviewed_plugin = conn.config().reviewed_plugin.is_some();
+            for tool in conn.tools() {
+                let name = Self::mcp_model_tool_name(server, &tool.name);
+                match approval_hint_for(tool, reviewed_plugin).filter(|_| authorized) {
+                    Some(hint) => {
+                        hints.insert(name, hint);
+                    }
+                    None => {
+                        hints.remove(&name);
+                    }
+                }
+            }
+        }
+    }
+
     /// Convert discovered tools to API Tool format
     pub fn to_api_tools(&self) -> Vec<codewhale_models::Tool> {
+        self.record_tool_approval_hints();
         let mut api_tools = Vec::new();
         // Add regular tools
         for (name, tool) in self.all_tools() {

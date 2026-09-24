@@ -23,6 +23,22 @@ pub(super) fn is_session_denied_for_key(app: &App, approval_key: &str) -> bool {
     app.approval_session_denied.contains(approval_key)
 }
 
+/// A Deny holds for the rest of the user turn it was given in: the model's
+/// retry loop must not re-prompt for the same call, but the user's next
+/// message is a new intent and may deserve a different answer.
+pub(super) fn end_turn_scoped_denials(app: &mut App) {
+    app.approval_session_denied.clear();
+}
+
+/// A different conversation (a session switch or resume) inherits neither
+/// this conversation's denials nor its "approve for session" grants: both
+/// describe work the user was looking at here. `/new` and `/clear` do the
+/// same in `reset_conversation_state`.
+pub(super) fn reset_approval_scope_for_new_conversation(app: &mut App) {
+    app.approval_session_denied.clear();
+    app.approval_session_approved.clear();
+}
+
 pub(super) fn session_denied_notice(app: &App, tool_name: &str) -> String {
     app.tr(MessageId::ApprovalAutoDeniedSession)
         .replace("{tool}", tool_name)

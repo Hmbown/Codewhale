@@ -301,7 +301,7 @@ fn format_skill_body(skill: &Skill) -> String {
     if !companions.is_empty() {
         out.push_str("\n## Companion files\n\n");
         out.push_str(
-            "Sibling files in the skill directory. Open one with File action=\"read\" when the task requires it; a skill stored outside the workspace has to be read through Bash instead.\n\n",
+            "Sibling files in the skill directory. Open one with `read` (path=...) when the task requires it; a skill stored outside the workspace has to be read through `bash` instead.\n\n",
         );
         for path in &companions {
             out.push_str(&format!("- `{}`\n", path.display()));
@@ -573,6 +573,13 @@ mod tests {
         let body = format_skill_body(skill);
         assert!(body.contains("## Companion files"));
         assert!(body.contains("helper.sh"));
+        // Companion guidance names the model-visible tools only.
+        assert!(body.contains("`read` (path=...)"), "{body}");
+        assert!(body.contains("`bash`"), "{body}");
+        assert!(
+            !body.contains("File action=") && !body.contains("through Bash"),
+            "{body}"
+        );
     }
 
     #[test]

@@ -262,8 +262,15 @@ def cfg_test_module_files() -> set[Path]:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
+        # `mod foo;` in `mod.rs`/`lib.rs`/`main.rs` resolves beside the file;
+        # in any other `bar.rs` it resolves under `bar/` (non-mod-rs layout).
+        base = (
+            path.parent
+            if path.name in ("mod.rs", "lib.rs", "main.rs")
+            else path.parent / path.stem
+        )
         for name in CFG_TEST_MOD.findall(text):
-            for candidate in (path.parent / f"{name}.rs", path.parent / name / "mod.rs"):
+            for candidate in (base / f"{name}.rs", base / name / "mod.rs"):
                 if candidate.is_file():
                     excluded.add(candidate.resolve())
     return excluded
@@ -338,8 +345,10 @@ def main() -> int:
             print(f"  {line}", file=sys.stderr)
         print(
             "Move the work into `tokio::task::spawn_blocking` (or use tokio::fs "
-            "/ tokio::time), or raise the budget with --update if the site can "
-            "only run on synchronous code. See #6149.",
+            "/ tokio::time). If the site can only run on synchronous code, land "
+            "the raised budget in this PR and say why in the PR description:\n"
+            "  python3 scripts/check-blocking-calls-budget.py --update\n"
+            "See #6149.",
             file=sys.stderr,
         )
         return 1

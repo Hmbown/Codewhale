@@ -34,6 +34,7 @@ pub(crate) struct FetchOptions {
     pub(crate) timeout: Duration,
     pub(crate) max_bytes: usize,
     pub(crate) accept: &'static str,
+    pub(crate) user_agent: &'static str,
 }
 
 impl FetchOptions {
@@ -42,7 +43,17 @@ impl FetchOptions {
             timeout: timeout.min(HARD_MAX_TIMEOUT),
             max_bytes: max_bytes.clamp(1, HARD_MAX_BYTES),
             accept,
+            user_agent: USER_AGENT,
         }
+    }
+
+    /// Request with the shared browser user-agent instead of the Codewhale
+    /// one. Only the `web.run` browse surface uses this, and only as the
+    /// one-shot fallback after a site refused the default agent.
+    #[must_use]
+    pub(crate) fn with_browser_user_agent(mut self) -> Self {
+        self.user_agent = super::scrape::BROWSER_USER_AGENT;
+        self
     }
 }
 
@@ -496,7 +507,7 @@ async fn fetch_attempt(
         }
         let mut builder = guarded_reqwest_client_builder()
             .timeout(remaining)
-            .user_agent(USER_AGENT)
+            .user_agent(options.user_agent)
             .redirect(reqwest::redirect::Policy::none());
         if let Some((hostname, validated_ip)) = dns_pin {
             builder = builder.resolve(&hostname, std::net::SocketAddr::new(validated_ip, 0));

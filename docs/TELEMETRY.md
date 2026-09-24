@@ -280,16 +280,16 @@ The workhorse. Everything a session accumulated ships here, once.
 
 | field | source anchor |
 |---|---|
-| `turns` | `crates/tui/src/tui/ui/event_loop.rs:1856` — the *caller* of `execute_turn_end_observer_hook`. Never inside it: that function's first statement is `if !app.hooks.has_hooks_for_event(HookEvent::TurnEnd) { return Ok(()); }` (`crates/tui/src/tui/ui.rs:1035`), and the natural future optimization hoists that check to the call site, silently zeroing the counter for every user without hooks. |
-| `tool_calls` | `crates/tui/src/core/engine/tool_execution.rs:495` — surface-agnostic, fires for exec and CLI too |
-| `fleet_dispatch` | `crates/tui/src/fleet/manager.rs:374` — the single funnel (`create_queued_run_with_descriptor`) that `create_run` and `create_queued_run` both land in; counting at either caller would double-count a plain `fleet run`. |
-| `workflow_run` | counted from the **`WorkflowAction` variant discriminant** returned by `parse_workflow_action` (`crates/tui/src/tools/workflow.rs:752-765`), never from `input["action"]`. The JSON Schema at `:775-779` is what is published *to the model* — a declaration, not a guard; the real parse also accepts `spawn\|wait\|list\|inspect\|stop\|abort`, and its reject arm at `:761-763` embeds the model string verbatim. |
-| `subagent_spawn` | `crates/tui/src/tui/ui/apply.rs:32` |
-| `mcp_server_connected` | count of `.connected` in the snapshot at `crates/tui/src/mcp.rs:4254-4261`; never `name`, `command_or_url`, or `error` — server names are user-chosen and routinely internal infra |
-| `memory_search` | tool name at `crates/tui/src/tools/native_memory.rs:60-61`, counted at the tool_execution choke point |
-| `approval_modal_shown` | `crates/tui/src/tui/ui/event_loop.rs:2372` (consumer of `Event::ApprovalRequired`, `crates/tui/src/core/events.rs:444`) |
-| `approval_auto_allowed` | `crates/tui/src/core/engine.rs:5714`. Count only. Never `matched_rule`, `reason()`, the command, or argv — `auto_allow` patterns are user-authored command strings (`crates/execpolicy/src/command_safety.rs:35/309`) |
-| `command_palette_open` | `crates/tui/src/tui/ui/event_loop.rs:3941` and `crates/tui/src/tui/mouse_ui.rs:1346` |
+| `turns` | `run_event_loop` in `crates/tui/src/tui/ui/event_loop.rs`, immediately before it calls `execute_turn_end_observer_hook`. Never inside that hook: its first statement is `if !app.hooks.has_hooks_for_event(HookEvent::TurnEnd) { return Ok(()); }` (`crates/tui/src/tui/ui/observer_hooks.rs`), and the natural future optimization hoists that check to the call site, silently zeroing the counter for every user without hooks. |
+| `tool_calls` | `execute_tool_with_lock` in `crates/tui/src/core/engine/tool_execution.rs` — surface-agnostic, fires for exec and CLI too |
+| `fleet_dispatch` | `create_queued_run_with_descriptor` in `crates/tui/src/fleet/manager.rs` — the single funnel that `create_run` and `create_queued_run` both land in; counting at either caller would double-count a plain `fleet run`. |
+| `workflow_run` | bumped in `WorkflowTool::execute` (`crates/tui/src/tools/workflow/mod.rs`) only after `parse_workflow_action` returns an `Ok(WorkflowAction)`, never from `input["action"]`. The JSON Schema `enum` in `WorkflowTool::input_schema` is what is published *to the model* — a declaration, not a guard; the real parse also accepts `spawn\|wait\|list\|inspect\|stop\|abort`, and its reject arm (`Invalid workflow action '…'`) embeds the model string verbatim, so a rejected action is never counted. |
+| `subagent_spawn` | `apply_agent_spawned_status_and_observer` in `crates/tui/src/tui/ui/apply.rs` |
+| `mcp_server_connected` | bumped when a server snapshot's `.connected` is true, in `snapshot_from_config` (`crates/tui/src/mcp.rs`); never `name`, `command_or_url`, or `error` — server names are user-chosen and routinely internal infra |
+| `memory_search` | `tool_name == "memory_search"` (the tool registered in `crates/tui/src/tools/native_memory.rs`), counted at the same `execute_tool_with_lock` choke point |
+| `approval_modal_shown` | the `Event::ApprovalRequired` arm of `run_event_loop` (`crates/tui/src/tui/ui/event_loop.rs`; the event is defined in `crates/tui/src/core/events.rs`) |
+| `approval_auto_allowed` | `tool_ask_rule_decision_for_context` in `crates/tui/src/core/engine.rs`. Count only. Never `matched_rule`, `reason()`, the command, or argv — `auto_allow` patterns are user-authored command strings (`crates/execpolicy/src/command_safety.rs:35/309`) |
+| `command_palette_open` | the palette key path in `run_event_loop` (`crates/tui/src/tui/ui/event_loop.rs`) and `handle_context_menu_action` in `crates/tui/src/tui/mouse_ui.rs` |
 
 **`errors`** — closed field set. Every value is a **variant discriminant**, never `err.to_string()`:
 
@@ -304,7 +304,7 @@ The workhorse. Everything a session accumulated ships here, once.
 
 Why discriminants and nothing else: `ToolError::PathEscape`'s `Display` *is* an absolute path (`crates/tools/src/lib.rs:61`); `fim.rs:48-50`'s `Display` *is* a literal source fragment the model emitted; `secrets/src/lib.rs:50`'s `Display` carries the secret store's absolute path; every `LlmError` variant carries the raw provider HTTP body verbatim (`crates/tui/src/llm_client/mod.rs:327`), and a 400 from a content filter routinely echoes the prompt.
 
-**`turn_wall`** — a per-session histogram of counts, never per-turn events. `lt_5s`, `5_30s`, `30_120s`, `gte_120s`. Source `crates/tui/src/tui/ui/event_loop.rs:1857`, which already has `duration` in hand.
+**`turn_wall`** — a per-session histogram of counts, never per-turn events. `lt_5s`, `5_30s`, `30_120s`, `gte_120s`. Recorded by `observe_turn_secs` next to the `turns` bump in `run_event_loop`, which already has the turn duration in hand.
 
 ### Event: `panic`
 

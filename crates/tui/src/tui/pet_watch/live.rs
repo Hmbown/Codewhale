@@ -109,6 +109,9 @@ pub enum Command {
 pub enum Notice {
     Exported(PathBuf),
     Message(String),
+    /// The companion cannot be reached: the view thread stopped, or a frame
+    /// fetch failed and it is reconnecting. Only this marks the pet offline.
+    Unreachable(String),
 }
 pub struct Worker {
     pub tx: mpsc::SyncSender<Command>,
@@ -282,7 +285,7 @@ impl Worker {
             .name("pet-view".into())
             .spawn(move || {
                 if let Err(e) = run(rx, &output, &notices_tx, &settings, session) {
-                    let _ = notices_tx.try_send(Notice::Message(e.to_string()));
+                    let _ = notices_tx.try_send(Notice::Unreachable(e.to_string()));
                 }
             })?;
         Ok(Self {
@@ -422,9 +425,8 @@ fn run(
                     producer_seq = None;
                     if last_failure.elapsed() > Duration::from_secs(3) {
                         last_failure = Instant::now();
-                        let _ = notices.try_send(Notice::Message(
-                            "Shared pet reconnecting · unobserved".into(),
-                        ));
+                        let _ =
+                            notices.try_send(Notice::Unreachable("Shared pet reconnecting".into()));
                         if let Ok(next) = Client::connect() {
                             client = next;
                         }

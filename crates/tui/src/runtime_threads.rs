@@ -3743,6 +3743,10 @@ pub struct ThreadDetail {
     /// `tool_call.requested` event is already behind that cursor.
     #[serde(default)]
     pub pending_dynamic_tool_calls: Vec<DynamicToolCallParams>,
+    /// Live session approval grants on this thread (see
+    /// [`RuntimeApprovalGrant`]); each can be revoked by `grant_id`.
+    #[serde(default)]
+    pub approval_grants: Vec<RuntimeApprovalGrant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3762,6 +3766,30 @@ pub struct PendingApprovalRequest {
     /// matches `id` only, so this value settles nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Model-independent one-line summary of the gated call ("Search the web
+    /// for '…'"), with workspace-relative paths. Clients show it first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+/// A session approval grant: "allow for this conversation" on one call.
+///
+/// The grant covers later calls of the same tool and argument class (the
+/// approval grouping key) on this thread, for the life of this Runtime
+/// process or until the thread is archived or deleted. It never changes the
+/// thread's permission posture, and it can be revoked. Known limit: grants
+/// are in memory only, so a Runtime restart forgets them and the next
+/// matching call prompts again (fail closed).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeApprovalGrant {
+    /// Runtime-minted `grant_<32 hex>`; the revoke endpoint accepts only this.
+    pub grant_id: String,
+    pub tool_name: String,
+    /// The approval grouping key the grant matches (tool + argument class).
+    pub scope: String,
+    /// The summary of the call the person approved.
+    pub summary: String,
+    pub granted_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4421,6 +4449,7 @@ fn runtime_compaction_config(
 struct ActiveTurnState {
     turn_id: String,
     goal_id: Option<String>,
+    goal_progress: Option<crate::tools::goal::GoalSnapshot>,
     interrupt_requested: bool,
     compaction_id: Option<String>,
 }
@@ -4606,6 +4635,8 @@ pub struct RuntimeThreadManager {
     automations:
         Arc<parking_lot::Mutex<Option<crate::automation_manager::SharedAutomationManager>>>,
     pending_approvals: Arc<parking_lot::Mutex<HashMap<String, PendingApprovalEntry>>>,
+    /// Session approval grants per thread id.
+    approval_grants: Arc<parking_lot::Mutex<HashMap<String, Vec<RuntimeApprovalGrant>>>>,
     pending_user_inputs: Arc<parking_lot::Mutex<HashMap<(String, String), PendingUserInputEntry>>>,
     pending_dynamic_tools: Arc<parking_lot::Mutex<HashMap<String, PendingDynamicToolEntry>>>,
     recovery_receipts: Arc<parking_lot::Mutex<HashMap<String, Vec<RecoveredTurnReceipt>>>>,
@@ -5186,6 +5217,7 @@ impl RuntimeThreadManager {
             task_execution_lease: Arc::new(parking_lot::Mutex::new(None)),
             automations: Arc::new(parking_lot::Mutex::new(None)),
             pending_approvals: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            approval_grants: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_user_inputs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_dynamic_tools: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             recovery_receipts: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -5965,6 +5997,7 @@ impl RuntimeThreadManager {
                 // Stands in for the provider's raw call ID so tests can prove
                 // the correlator is visible and still not deliverable.
                 tool_call_id: Some(label.to_string()),
+                summary: None,
             },
         )
     }
@@ -6004,42 +6037,118 @@ impl RuntimeThreadManager {
         })
     }
 
-    fn remember_thread_auto_approve(&self, thread_id: &str, engine: &EngineHandle) {
-        let thread = {
-            let _thread_mutation = self.store.thread_mutation.lock();
-            let Ok(mut thread) = self.store.load_thread(thread_id) else {
-                return;
-            };
-            if !thread.auto_approve || thread.permission_posture.as_deref() != Some("full_access") {
-                thread.auto_approve = true;
-                thread.permission_posture = Some("full_access".to_string());
-                thread.updated_at = Utc::now();
-                if let Err(err) = self.store.save_thread(&thread) {
-                    tracing::warn!(
-                        "Failed to persist full-access posture for thread {}: {}",
-                        thread_id,
-                        err
-                    );
-                    return;
-                }
-            }
-            thread
-        };
+    /// Live session approval grants on `thread_id`, oldest first.
+    #[must_use]
+    pub fn approval_grants_for_thread(&self, thread_id: &str) -> Vec<RuntimeApprovalGrant> {
+        self.approval_grants
+            .lock()
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default()
+    }
 
-        let configured_sandbox_mode = self.read_config().sandbox_mode.clone();
-        let policy = RuntimePolicyProjection::from_persisted(
-            &thread.mode,
-            thread.permission_posture.as_deref(),
-            thread.auto_approve,
-        );
-        let _ = engine.try_send(Op::ChangeMode {
-            mode: policy.mode,
-            allow_shell: thread.allow_shell,
-            trust_mode: thread.trust_mode,
-            auto_approve: policy.auto_approve(),
-            approval_mode: policy.permission,
-            configured_sandbox_mode,
-        });
+    fn session_grant_for(&self, thread_id: &str, scope: &str) -> Option<RuntimeApprovalGrant> {
+        self.approval_grants
+            .lock()
+            .get(thread_id)?
+            .iter()
+            .find(|grant| grant.scope == scope)
+            .cloned()
+    }
+
+    /// Record "allow for this conversation" as a grant scoped to the tool and
+    /// its argument class (E1). The thread's permission posture is untouched:
+    /// promoting a one-call approval to Full Access is what this replaced.
+    ///
+    /// Returns `None` (nothing recorded) when the thread is archived or gone.
+    /// Archiving has no quiescence gate, so a prompt raised before archive can
+    /// be answered after it; recording that grant would outlive the archive
+    /// that was meant to end it. The approved call itself still runs.
+    async fn add_session_grant(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        tool_name: &str,
+        scope: &str,
+        summary: &str,
+    ) -> Option<RuntimeApprovalGrant> {
+        let grant = {
+            // Same order as update_thread's archive path (thread_mutation,
+            // then approval_grants), so archive and record cannot interleave.
+            let _thread_mutation = self.store.thread_mutation.lock();
+            let live = self
+                .store
+                .load_thread(thread_id)
+                .is_ok_and(|thread| !thread.archived);
+            if !live {
+                return None;
+            }
+            let mut grants = self.approval_grants.lock();
+            let thread_grants = grants.entry(thread_id.to_string()).or_default();
+            if let Some(existing) = thread_grants.iter().find(|grant| grant.scope == scope) {
+                return Some(existing.clone());
+            }
+            let grant = RuntimeApprovalGrant {
+                grant_id: format!("grant_{}", Uuid::new_v4().simple()),
+                tool_name: tool_name.to_string(),
+                scope: scope.to_string(),
+                summary: summary.to_string(),
+                granted_at: Utc::now(),
+            };
+            thread_grants.push(grant.clone());
+            grant
+        };
+        self.emit_event(
+            thread_id,
+            Some(turn_id),
+            None,
+            "approval.grant_added",
+            json!({ "grant": grant.clone() }),
+        )
+        .await
+        .ok();
+        Some(grant)
+    }
+
+    /// Remove every session grant on `thread_id` and return them. Archiving or
+    /// deleting a thread calls this, so a grant never outlives the
+    /// conversation it was given in.
+    fn take_approval_grants(&self, thread_id: &str) -> Vec<RuntimeApprovalGrant> {
+        self.approval_grants
+            .lock()
+            .remove(thread_id)
+            .unwrap_or_default()
+    }
+
+    /// Revoke one session grant. Returns `false` when the thread holds no
+    /// grant with that id. The next matching call prompts again.
+    pub async fn revoke_approval_grant(&self, thread_id: &str, grant_id: &str) -> Result<bool> {
+        let revoked = {
+            let mut grants = self.approval_grants.lock();
+            let Some(thread_grants) = grants.get_mut(thread_id) else {
+                return Ok(false);
+            };
+            let Some(index) = thread_grants
+                .iter()
+                .position(|grant| grant.grant_id == grant_id)
+            else {
+                return Ok(false);
+            };
+            let revoked = thread_grants.remove(index);
+            if thread_grants.is_empty() {
+                grants.remove(thread_id);
+            }
+            revoked
+        };
+        self.emit_event(
+            thread_id,
+            None,
+            None,
+            "approval.grant_revoked",
+            json!({ "grant": revoked }),
+        )
+        .await?;
+        Ok(true)
     }
 
     #[must_use]
@@ -6080,11 +6189,38 @@ impl RuntimeThreadManager {
         &self,
         thread_id: &str,
     ) -> Result<Option<codewhale_protocol::ThreadGoal>> {
-        let thread_id = thread_id.to_string();
+        let requested_id = thread_id.to_string();
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || store.load_goal(&thread_id))
+        let mut goal = tokio::task::spawn_blocking(move || store.load_goal(&requested_id))
             .await
-            .context("goal load task panicked")?
+            .context("goal load task panicked")??;
+        // Live usage is a projection only. Terminal settlement remains the
+        // single durable accrual, so polling cannot double-count spend.
+        let active = self.active.lock().await;
+        if let Some(goal) = goal.as_mut()
+            && let Some(turn) = active
+                .engines
+                .get(thread_id)
+                .and_then(|state| state.active_turn.as_ref())
+            && turn.goal_id.as_deref() == Some(goal.goal_id.as_str())
+            && let Some(progress) = turn.goal_progress.as_ref()
+            && progress.objective.as_deref() == Some(goal.objective.as_str())
+            && progress
+                .goal_id
+                .as_deref()
+                .is_none_or(|id| id == goal.goal_id)
+        {
+            goal.tokens_used = goal
+                .tokens_used
+                .max(i64::try_from(progress.tokens_used).unwrap_or(i64::MAX));
+            goal.time_used_seconds = goal
+                .time_used_seconds
+                .max(i64::try_from(progress.time_used_seconds).unwrap_or(i64::MAX));
+            goal.continuation_count = goal
+                .continuation_count
+                .max(i64::from(progress.continuation_count));
+        }
+        Ok(goal)
     }
 
     /// Persist (create or replace) the goal for a thread.
@@ -6144,6 +6280,10 @@ impl RuntimeThreadManager {
             if let Some(state) = active.engines.get(thread_id)
                 && state.active_turn.is_some()
             {
+                // A PUT during a running goal replaces its revision. Park the
+                // obsolete within-turn loop; settlement admits the new goal.
+                let current = self.store.load_goal(thread_id)?;
+                state.engine.sync_runtime_goal_control(current.as_ref())?;
                 return Ok(());
             }
         }
@@ -6158,26 +6298,15 @@ impl RuntimeThreadManager {
     /// Push a durable goal lifecycle transition into a cached engine so its
     /// prompt surface and tool gates follow the store. Engines are not
     /// loaded for this; a later load re-derives the state from the record.
-    pub async fn sync_engine_goal_status(
-        &self,
-        thread_id: &str,
-        status: crate::tools::goal::GoalStatus,
-        clear: bool,
-    ) {
-        let engine = {
-            let active = self.active.lock().await;
-            active
-                .engines
-                .get(thread_id)
-                .map(|state| state.engine.clone())
-        };
-        if let Some(engine) = engine {
-            let _ = engine.try_send(Op::SetGoalStatus {
-                status,
-                clear,
-                goal_id: None,
-            });
+    pub async fn sync_engine_goal_status(&self, thread_id: &str) -> Result<()> {
+        let active = self.active.lock().await;
+        if let Some(state) = active.engines.get(thread_id) {
+            // Read the latest store revision while admission is excluded. A
+            // delayed DELETE/complete response must never stop a newer goal.
+            let goal = self.store.load_goal(thread_id)?;
+            state.engine.sync_runtime_goal_control(goal.as_ref())?;
         }
+        Ok(())
     }
 
     /// Claim one host-driven goal turn with the standard durable machinery.
@@ -7470,7 +7599,10 @@ impl RuntimeThreadManager {
         // API-created jobs, and dropping the last handle kills them.
         active.shell_managers.remove(thread_id);
         drop(active);
-        self.store.remove_thread(thread_id)
+        self.store.remove_thread(thread_id)?;
+        // A deleted conversation keeps no session grants behind it.
+        self.take_approval_grants(thread_id);
+        Ok(())
     }
 
     pub async fn list_threads(
@@ -7983,7 +8115,7 @@ impl RuntimeThreadManager {
             None
         };
         let configured_sandbox_mode = self.read_config().sandbox_mode.clone();
-        let (thread, changes, evicted_engine, posture_engine) = {
+        let (thread, changes, evicted_engine, posture_engine, ended_grants) = {
             // Take the active guard first so a workspace mutation can check
             // and evict the cached engine atomically with the durable update.
             // Using the same order as start/compact avoids lock inversion.
@@ -8140,8 +8272,32 @@ impl RuntimeThreadManager {
             } else {
                 None
             };
-            (thread, changes, evicted_engine, posture_engine)
+            // Archiving ends the conversation's session grants: unarchiving
+            // later starts from a clean slate and the next call prompts.
+            let ended_grants = if changes.get("archived") == Some(&json!(true)) {
+                self.take_approval_grants(id)
+            } else {
+                Vec::new()
+            };
+            (
+                thread,
+                changes,
+                evicted_engine,
+                posture_engine,
+                ended_grants,
+            )
         };
+
+        for grant in ended_grants {
+            self.emit_event(
+                &thread.id,
+                None,
+                None,
+                "approval.grant_revoked",
+                json!({ "grant": grant }),
+            )
+            .await?;
+        }
 
         if let Some(engine) = evicted_engine {
             let _ = engine.send(Op::Shutdown).await;
@@ -8264,6 +8420,7 @@ impl RuntimeThreadManager {
         state.active_turn = turn_id.map(|turn_id| ActiveTurnState {
             turn_id: turn_id.to_string(),
             goal_id: None,
+            goal_progress: None,
             interrupt_requested: false,
             compaction_id: None,
         });
@@ -8362,6 +8519,7 @@ impl RuntimeThreadManager {
             pending_approvals,
             pending_user_inputs,
             pending_dynamic_tool_calls,
+            approval_grants: self.approval_grants_for_thread(id),
         })
     }
 
@@ -10552,6 +10710,7 @@ impl RuntimeThreadManager {
             state.active_turn = Some(ActiveTurnState {
                 goal_id: turn_goal.as_ref().map(|goal| goal.goal_id.clone()),
                 turn_id: turn_id.clone(),
+                goal_progress: None,
                 interrupt_requested: false,
                 compaction_id: None,
             });
@@ -10926,6 +11085,7 @@ impl RuntimeThreadManager {
             state.active_turn = Some(ActiveTurnState {
                 goal_id: None,
                 turn_id: turn_id.clone(),
+                goal_progress: None,
                 interrupt_requested: false,
                 compaction_id: Some(compaction_id),
             });
@@ -11430,6 +11590,18 @@ impl RuntimeThreadManager {
             }
             return Ok(engine);
         }
+    }
+
+    /// The thread's engine only when it is already live in this process.
+    /// Control routes that act on in-flight work (stopping an agent run) use
+    /// this: loading a cold engine cannot reach work that is not running here.
+    pub async fn loaded_engine(&self, thread_id: &str) -> Option<EngineHandle> {
+        self.active
+            .lock()
+            .await
+            .engines
+            .get(thread_id)
+            .map(|state| state.engine.clone())
     }
 
     /// Get the engine handle for a thread, loading it if necessary.
@@ -12140,11 +12312,19 @@ impl RuntimeThreadManager {
                         // re-emit provider tool_calls. Without it a restart
                         // replays empty id/name/arguments shells that strict
                         // OpenAI-compatible endpoints reject (#5823).
-                        metadata: Some(json!({
-                            "tool_use_id": id.clone(),
-                            "tool_name": name.clone(),
-                            "tool_input": input_str,
-                        })),
+                        metadata: Some({
+                            let mut meta = json!({
+                                "tool_use_id": id.clone(),
+                                "tool_name": name.clone(),
+                                "tool_input": input_str,
+                            });
+                            // Tool discovery is engine plumbing, not work the
+                            // user asked for: clients collapse it by default.
+                            if crate::core::engine::tool_catalog::is_tool_search_tool(&name) {
+                                meta["visibility"] = json!(INTERNAL_ITEM_VISIBILITY);
+                            }
+                            meta
+                        }),
                         artifact_refs: Vec::new(),
                         started_at: Some(Utc::now()),
                         ended_at: None,
@@ -12261,11 +12441,27 @@ impl RuntimeThreadManager {
                                         if let Some(started) =
                                             item.metadata.as_ref().and_then(Value::as_object)
                                         {
-                                            for key in ["tool_use_id", "tool_name", "tool_input"] {
+                                            for key in [
+                                                "tool_use_id",
+                                                "tool_name",
+                                                "tool_input",
+                                                "visibility",
+                                            ] {
                                                 if let Some(value) = started.get(key) {
                                                     obj.insert(key.to_string(), value.clone());
                                                 }
                                             }
+                                        }
+                                        // A first call to a deferred tool only
+                                        // loads its schema; the model retries.
+                                        // That hand-off is not a user-facing step.
+                                        if obj.get("deferred_tool_loaded").and_then(Value::as_bool)
+                                            == Some(true)
+                                        {
+                                            obj.insert(
+                                                "visibility".to_string(),
+                                                json!(INTERNAL_ITEM_VISIBILITY),
+                                            );
                                         }
                                         obj.insert("tool_result_for".to_string(), json!(id));
                                         obj.insert("is_error".to_string(), json!(!output.success));
@@ -12621,7 +12817,10 @@ impl RuntimeThreadManager {
                     id,
                     tool_name,
                     description,
+                    input,
+                    approval_grouping_key,
                     intent_summary,
+                    approval_force_prompt,
                     ..
                 } => {
                     let Some(authority) = self
@@ -12634,6 +12833,16 @@ impl RuntimeThreadManager {
                     let auto_approve = authority.auto_approve;
                     let trust_mode = authority.trust_mode;
                     let approval_mode = authority.approval_mode;
+                    let summary_workspace = self
+                        .store
+                        .load_thread(&thread_id)
+                        .ok()
+                        .map(|thread| thread.workspace);
+                    let summary = crate::tools::approval_summary::approval_summary(
+                        &tool_name,
+                        &input,
+                        summary_workspace.as_deref(),
+                    );
 
                     let pending_request = PendingApprovalRequest {
                         // Replaced by the minted ID at registration. The raw
@@ -12646,6 +12855,7 @@ impl RuntimeThreadManager {
                         description: description.clone(),
                         intent_summary: intent_summary.clone(),
                         tool_call_id: Some(id.clone()),
+                        summary: Some(summary.clone()),
                     };
 
                     if auto_approve {
@@ -12665,6 +12875,7 @@ impl RuntimeThreadManager {
                                 "approval_id": approval_id,
                                 "tool_call_id": id,
                                 "tool_name": tool_name,
+                                "summary": summary,
                                 "description": description,
                                 "intent_summary": intent_summary,
                             }),
@@ -12731,6 +12942,50 @@ impl RuntimeThreadManager {
                         continue;
                     }
 
+                    // A session grant for this tool and argument class
+                    // answers the prompt without a modal and without touching
+                    // posture (E1). A forced prompt is never pre-answered.
+                    if !approval_force_prompt
+                        && let Some(grant) =
+                            self.session_grant_for(&thread_id, &approval_grouping_key)
+                    {
+                        let approval_id = Self::mint_approval_id();
+                        self.emit_event(
+                            &thread_id,
+                            Some(&turn_id),
+                            None,
+                            "approval.required",
+                            json!({
+                                "id": approval_id,
+                                "approval_id": approval_id,
+                                "tool_call_id": id,
+                                "tool_name": tool_name,
+                                "summary": summary,
+                                "description": description,
+                                "intent_summary": intent_summary,
+                            }),
+                        )
+                        .await?;
+                        self.emit_event(
+                            &thread_id,
+                            Some(&turn_id),
+                            None,
+                            "approval.decided",
+                            json!({
+                                "approval_id": approval_id,
+                                "tool_call_id": id,
+                                "decision": "allow",
+                                "remember": false,
+                                "auto": true,
+                                "grant_id": grant.grant_id,
+                            }),
+                        )
+                        .await
+                        .ok();
+                        let _ = engine.approve_tool_call(id).await;
+                        continue;
+                    }
+
                     // Register before sequencing the event. A snapshot racing
                     // this branch therefore either contains the request or
                     // subscribes from an older cursor that will replay it.
@@ -12764,6 +13019,7 @@ impl RuntimeThreadManager {
                                 "approval_id": approval_id,
                                 "tool_call_id": id,
                                 "tool_name": tool_name,
+                                "summary": summary,
                                 "description": description,
                                 "intent_summary": intent_summary,
                             }),
@@ -12792,16 +13048,6 @@ impl RuntimeThreadManager {
                             .is_some_and(|turn| {
                                 turn.turn_id == turn_id && !turn.interrupt_requested
                             });
-                        if accepting
-                            && matches!(
-                                decision,
-                                Ok(Ok(ExternalApprovalDecision::Allow { remember: true }))
-                            )
-                        {
-                            // Keep Stop excluded until its competing permission
-                            // change has committed to the same active turn.
-                            self.remember_thread_auto_approve(&thread_id, &engine);
-                        }
                         !accepting
                     };
                     if cancelled {
@@ -12826,6 +13072,22 @@ impl RuntimeThreadManager {
                     }
                     match decision {
                         Ok(Ok(ExternalApprovalDecision::Allow { remember })) => {
+                            // "Allow for this conversation" records a grant
+                            // for this tool and argument class. It must not
+                            // change posture: a posture change mid-turn used
+                            // to fail the very call it approved (E1/E2).
+                            let grant = if remember {
+                                self.add_session_grant(
+                                    &thread_id,
+                                    &turn_id,
+                                    &tool_name,
+                                    &approval_grouping_key,
+                                    &summary,
+                                )
+                                .await
+                            } else {
+                                None
+                            };
                             self.emit_event(
                                 &thread_id,
                                 Some(&turn_id),
@@ -12836,6 +13098,7 @@ impl RuntimeThreadManager {
                                     "tool_call_id": id,
                                     "decision": "allow",
                                     "remember": remember,
+                                    "grant_id": grant.map(|grant| grant.grant_id),
                                 }),
                             )
                             .await
@@ -12980,6 +13243,14 @@ impl RuntimeThreadManager {
                     drop(projection);
                 }
                 EngineEvent::Status { message } => {
+                    // Model-facing hints (deferred-tool retry) already reach
+                    // the model in the tool result; they are not user items.
+                    // Scheduler/continuation rows keep a receipt tagged so
+                    // clients collapse them by default.
+                    let visibility = crate::core::events::status_visibility(&message);
+                    if visibility == crate::core::events::StatusVisibility::ModelOnly {
+                        continue;
+                    }
                     let item = TurnItemRecord {
                         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
                         id: format!("item_{}", &Uuid::new_v4().to_string()[..8]),
@@ -12988,7 +13259,8 @@ impl RuntimeThreadManager {
                         status: TurnItemLifecycleStatus::Completed,
                         summary: summarize_text(&message, SUMMARY_LIMIT),
                         detail: Some(message.clone()),
-                        metadata: None,
+                        metadata: (visibility == crate::core::events::StatusVisibility::Internal)
+                            .then(|| json!({ "visibility": visibility.as_str() })),
                         artifact_refs: Vec::new(),
                         started_at: Some(Utc::now()),
                         ended_at: Some(Utc::now()),
@@ -13177,6 +13449,21 @@ impl RuntimeThreadManager {
                         {
                             admitted_goal_id = Some(goal_id);
                         }
+                    }
+                    {
+                        let mut active = self.active.lock().await;
+                        if let Some(turn) = active
+                            .engines
+                            .get_mut(&thread_id)
+                            .and_then(|state| state.active_turn.as_mut())
+                            && turn.turn_id == turn_id
+                        {
+                            turn.goal_id.clone_from(&admitted_goal_id);
+                            turn.goal_progress = Some(snapshot.clone());
+                        }
+                    }
+                    if let Some(goal) = self.get_goal(&thread_id).await? {
+                        self.emit_goal_updated_event(&thread_id, goal).await?;
                     }
                     latest_goal_snapshot = Some(snapshot);
                 }
@@ -13935,6 +14222,11 @@ fn parse_mode_opt(mode: &str) -> Option<AppMode> {
 fn parse_mode(mode: &str) -> AppMode {
     parse_mode_opt(mode).unwrap_or(AppMode::Agent)
 }
+
+/// `metadata.visibility` value for runtime items that are engine plumbing
+/// (scheduler rows, tool discovery, deferred-schema hand-offs). Clients
+/// collapse these by default; the durable receipt is kept.
+pub const INTERNAL_ITEM_VISIBILITY: &str = "internal";
 
 fn tool_kind_for_name(name: &str) -> TurnItemKind {
     let lower = name.to_ascii_lowercase();

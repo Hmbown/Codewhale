@@ -404,6 +404,63 @@ class RuntimeContractBudgetTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(after, original)
 
+    def test_failure_prints_the_same_pr_receipt_command(self) -> None:
+        receipt = receipt_fixture()
+        budget = mod.budget_from_receipt(receipt)
+        set_path(receipt, ("skill_discovery", "second_delta", "directories_visited"), 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt_path, budget_path = write_documents(tmp, receipt, budget)
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                result = mod.main(
+                    ["--receipt", str(receipt_path), "--budget", str(budget_path)]
+                )
+        self.assertEqual(result, 1)
+        self.assertIn("--update --allow-increase", errors.getvalue())
+
+    def test_allow_increase_lands_growth_and_identity_change_keeping_history(self) -> None:
+        receipt = receipt_fixture()
+        budget = mod.budget_from_receipt(receipt)
+        budget["_comment"] = "history that must survive a rebase"
+        grown = ("skill_discovery", "second_delta", "directories_visited")
+        set_path(receipt, grown, 2)
+        active = receipt["tool_catalog"]["modes"]["act"]["active"]
+        active["tool_names"] = sorted(["File", "Hash"])
+        active["identity_sha256"] = mod.tool_identity_digest(active["tool_names"])
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt_path, budget_path = write_documents(tmp, receipt, budget)
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                refused = mod.main(
+                    ["--receipt", str(receipt_path), "--budget", str(budget_path)]
+                )
+            self.assertEqual(refused, 2)
+            self.assertIn("--update --allow-increase", errors.getvalue())
+            with redirect_stdout(io.StringIO()):
+                result = mod.main(
+                    [
+                        "--receipt",
+                        str(receipt_path),
+                        "--budget",
+                        str(budget_path),
+                        "--update",
+                        "--allow-increase",
+                    ]
+                )
+            updated = json.loads(budget_path.read_text(encoding="utf-8"))
+            with redirect_stdout(io.StringIO()):
+                recheck = mod.main(
+                    ["--receipt", str(receipt_path), "--budget", str(budget_path)]
+                )
+        self.assertEqual(result, 0)
+        self.assertEqual(recheck, 0)
+        self.assertEqual(mod.metric_value(updated, grown, "budget"), 2)
+        self.assertEqual(updated["_comment"], "history that must survive a rebase")
+
+    def test_allow_increase_requires_update(self) -> None:
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            mod.main(["--allow-increase"])
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

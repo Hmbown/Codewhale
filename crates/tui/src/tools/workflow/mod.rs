@@ -1106,7 +1106,7 @@ impl ToolSpec for WorkflowTool {
                 },
                 "fleet": {
                     "type": "string",
-                    "description": "Named Fleet from $CODEWHALE_HOME/fleets/ or workspace fleets/; qualified origin/name accepted. Exact Fleets freeze member identity, route, and reasoning. Runtime derives authority from role and live parent; per-task route/authority overrides are rejected."
+                    "description": "Named Fleet from $CODEWHALE_HOME/fleets/, <workspace>/.codewhale/fleets/, or checked-in <workspace>/fleets/; qualified origin/name accepted (codewhale_home, workspace, workspace_root). Exact Fleets freeze member identity, route, and reasoning. Runtime derives authority from role and live parent; per-task route/authority overrides are rejected."
                 },
                 "plan": plan_schema::structured_plan_schema(),
                 "args": {
@@ -1328,7 +1328,17 @@ async fn start_workflow(
     .min()
     .or((workflow_cfg.default_token_budget > 0).then_some(workflow_cfg.default_token_budget));
     let verify_on_complete = optional_bool(&input, "verify", false)?;
-    let fleet = workflow_fleet_binding(&input, context, runtime.api_config.as_deref())?;
+    let fleet = if let Some(name) = workflow_fleet_name(&input)? {
+        let workspace = context.workspace.clone();
+        let api_config = runtime.api_config.clone();
+        tokio::task::spawn_blocking(move || {
+            workflow_fleet_binding(&name, &workspace, api_config.as_deref())
+        })
+        .await
+        .map_err(|error| ToolError::execution_failed(format!("Fleet loading failed: {error}")))??
+    } else {
+        WorkflowFleetBinding::None
+    };
     let run_id = format!("workflow_{}", &Uuid::new_v4().to_string()[..8]);
     let gate_specs = source
         .spec
@@ -1694,16 +1704,14 @@ impl WorkflowFleetBinding {
     }
 }
 
+// Reads Fleet/profile files; the runtime caller must use spawn_blocking.
 fn workflow_fleet_binding(
-    input: &Value,
-    context: &ToolContext,
+    name: &str,
+    workspace: &std::path::Path,
     api_config: Option<&crate::config::Config>,
 ) -> Result<WorkflowFleetBinding, ToolError> {
-    let Some(name) = workflow_fleet_name(input)? else {
-        return Ok(WorkflowFleetBinding::None);
-    };
-    let roots = crate::fleet::exact::fleet_search_roots(&context.workspace);
-    let (document, id) = crate::fleet::exact::load_fleet_document(&name, &context.workspace)
+    let roots = crate::fleet::exact::fleet_search_roots(workspace);
+    let (document, id) = crate::fleet::exact::load_fleet_document(name, workspace, api_config)
         .map_err(|err| {
             ToolError::invalid_input(format!(
                 "Failed to load workflow Fleet '{name}' from {}: {err}",
@@ -1723,7 +1731,10 @@ fn workflow_fleet_binding(
                 .map(|(role, profile)| (role.as_str(), profile.as_str())),
         )
         .map_err(|err| ToolError::invalid_input(err.to_string()))?;
-        return Ok(WorkflowFleetBinding::Legacy { name, roles });
+        return Ok(WorkflowFleetBinding::Legacy {
+            name: name.to_owned(),
+            roles,
+        });
     }
 
     // Exact: freeze the definition now. Everything the run launches afterwards
@@ -3340,6 +3351,16 @@ fn leaf_task_options_expression(
     parallel: bool,
 ) -> Result<String, ToolError> {
     validate_leaf_runtime_contract(spec)?;
+    // Reject invalid plans before accepting a background run, using the same
+    // path policy as direct task() dispatch rather than a second validator.
+    let cwd = spec
+        .cwd
+        .as_deref()
+        .map(codewhale_workflow_js::normalize_task_cwd)
+        .transpose()
+        .map_err(|error| {
+            ToolError::invalid_input(format!("Workflow leaf '{}': {error}", spec.id))
+        })?;
     let worktree = leaf_wants_worktree(spec, parallel);
     let write_authority = match spec.mode {
         TaskMode::ReadOnly => "read_only",
@@ -3371,7 +3392,7 @@ fn leaf_task_options_expression(
         &spec.id,
         phase,
         leaf_allowed_tools(spec)?,
-        spec.cwd.as_deref(),
+        cwd.as_deref(),
     ))
 }
 
@@ -3497,22 +3518,11 @@ fn leaf_allowed_tools(spec: &LeafSpec) -> Result<Option<Vec<String>>, ToolError>
     if !spec.permissions.allowed_tools.is_empty() {
         return Ok(Some(spec.permissions.allowed_tools.clone()));
     }
-    if spec.mode != TaskMode::ReadOnly {
-        return Ok(None);
-    }
-    Ok(Some(
-        read_only_allowed_tools(spec.agent_type)
-            .iter()
-            .map(|tool| (*tool).to_string())
-            .collect(),
-    ))
-}
-
-fn read_only_allowed_tools(agent_type: AgentType) -> &'static [&'static str] {
-    match agent_type {
-        AgentType::Verifier => &["File"],
-        _ => &["File"],
-    }
+    // The child grant already intersects role, parent permissions and the
+    // emitted writeAuthority. A second File-only default hid bounded Git/CI
+    // inspection from scouts and Run from verifiers without adding safety.
+    // Explicit allowlists and deny_all_tools above remain exact restrictions.
+    Ok(None)
 }
 
 fn is_write_or_shell_tool(tool: &str) -> bool {
@@ -6890,10 +6900,20 @@ permissions = "read_only"
         assert_eq!(clean.write_authority.as_deref(), Some("read_only"));
         assert_eq!(clean.subagent_type, None);
         // A task allowlist can only narrow; it never removes Runtime denials.
+        // Asking for a tool the role denies is refused loudly (SHA-6734)
+        // instead of silently launching a child with nothing usable.
         let mut narrowed = exact_task_request("reviewer");
         narrowed.allowed_tools = Some(vec!["exec_shell".to_string()]);
+        let err = bind_exact_fleet_task_request(&operation, exact_session(), &mut narrowed)
+            .expect_err("a requested tool the Runtime denylist removes is refused");
+        let message = format!("{err:?}");
+        assert!(message.contains("would start with no tools"), "{message}");
+        assert!(message.contains("dropped [exec_shell]"), "{message}");
+        // A request the role allows still narrows the surface.
+        let mut narrowed = exact_task_request("reviewer");
+        narrowed.allowed_tools = Some(vec!["read_file".to_string()]);
         bind_exact_fleet_task_request(&operation, exact_session(), &mut narrowed)
-            .expect("allowlist narrows without overriding the Runtime denylist");
+            .expect("allowlist narrows within the role");
         assert_eq!(narrowed.write_authority.as_deref(), Some("read_only"));
         assert!(
             narrowed
@@ -7884,6 +7904,36 @@ export default workflow({
     }
 
     #[test]
+    fn read_only_workflow_leaves_use_the_runtime_grant_unless_explicitly_narrowed() {
+        for agent_type in ["explore", "review", "verifier", "general"] {
+            let mut leaf: LeafSpec = serde_json::from_value(json!({
+                "id": "inspect",
+                "prompt": "Inspect source and CI evidence",
+                "agent_type": agent_type,
+                "mode": "read_only"
+            }))
+            .expect("read-only leaf");
+            assert_eq!(leaf_allowed_tools(&leaf).unwrap(), None);
+            let source = leaf_task_options_expression(&leaf, None, false).unwrap();
+            assert!(source.contains("writeAuthority: \"read_only\""), "{source}");
+            assert!(!source.contains("allowedTools:"), "{source}");
+
+            leaf.permissions.deny_all_tools = true;
+            assert_eq!(leaf_allowed_tools(&leaf).unwrap(), Some(Vec::new()));
+            leaf.permissions.deny_all_tools = false;
+            leaf.permissions.allowed_tools = vec!["File".into()];
+            assert_eq!(
+                leaf_allowed_tools(&leaf).unwrap(),
+                Some(vec!["File".into()])
+            );
+            leaf.permissions.allowed_tools = vec!["bash".into()];
+            assert!(validate_leaf_runtime_contract(&leaf).is_ok());
+            leaf.permissions.allowed_tools = vec!["exec_shell".into()];
+            assert!(validate_leaf_runtime_contract(&leaf).is_err());
+        }
+    }
+
+    #[test]
     fn parallel_read_only_children_do_not_default_to_worktree() {
         let source = r#"
 export default workflow({
@@ -8184,6 +8234,77 @@ export default workflow({
             .expect_err("blank child cwd must be refused")
             .to_string();
         assert!(err.contains("cwd"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn structured_plan_child_cwd_rejected_before_start() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let runtime = SubAgentRuntime::new(
+            stub_client(),
+            "deepseek-v4-flash".to_string(),
+            ctx.clone(),
+            true,
+            None,
+            manager.clone(),
+        );
+        let tool = WorkflowTool::new(manager, runtime);
+        for cwd in [
+            "/absolute/repo",
+            "../sibling",
+            "repo/../sibling",
+            "//server/share",
+            r"C:\repo",
+            "repo\nchild",
+        ] {
+            let error = tool
+                .execute(
+                    json!({
+                        "action": "start",
+                        "plan": {
+                            "goal": "inspect a repo",
+                            "children": [{
+                                "id": "inspect",
+                                "prompt": "Read the README",
+                                "type": "explore",
+                                "cwd": cwd
+                            }]
+                        }
+                    }),
+                    &ctx,
+                )
+                .await
+                .expect_err("invalid cwd must fail the call, not create a background run");
+            let error = error.to_string();
+            assert!(
+                error.contains("inspect") && error.contains("cwd"),
+                "{cwd:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_plan_child_cwd_uses_dispatch_normalization() {
+        let source = workflow_source(
+            &json!({
+                "plan": {
+                    "goal": "inspect a repo",
+                    "children": [{
+                        "prompt": "Read the README",
+                        "type": "explore",
+                        "cwd": r" ./repos\a// "
+                    }]
+                }
+            }),
+            &ToolContext::new("."),
+        )
+        .expect("bounded cwd should normalize before launch");
+        assert!(
+            source.source.contains(r#"cwd: "repos/a""#),
+            "{}",
+            source.source
+        );
     }
 
     #[test]

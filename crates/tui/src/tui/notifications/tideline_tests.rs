@@ -121,8 +121,8 @@ fn notifications_ascii_safe_projects_marks() {
     let text = draw(80, 24, &inbox);
     assert!(text.contains("* approval"), "gold ◆ projects to *: {text}");
     assert!(
-        text.contains(". whale done"),
-        "read ○ projects to .: {text}"
+        text.contains("o whale done"),
+        "read ○ projects to o, distinct from the filled marker: {text}"
     );
     for ch in text.chars() {
         if ch != '\n' {

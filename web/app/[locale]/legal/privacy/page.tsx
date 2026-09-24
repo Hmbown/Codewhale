@@ -2,35 +2,30 @@ import Link from "next/link";
 import { UsagePreferenceControl } from "@/components/usage-counting";
 import { USAGE_COUNTING_COPY } from "@/lib/content/usage-counting";
 import { BUILD_FACTS } from "@/lib/facts";
-import { pickText } from "@/lib/i18n/dictionaries";
+import { fill, getLegalPrivacy, pickText } from "@/lib/i18n/dictionaries";
 import { buildPageMetadata } from "@/lib/page-meta";
 import { LEGAL_UPDATED, PRIVACY_SECTIONS } from "@/lib/legal-copy";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
+  const t = getLegalPrivacy(locale);
   return buildPageMetadata({
     path: "/legal/privacy",
     locale,
-    title: isZh ? "隐私政策 · Codewhale" : "Privacy policy · Codewhale",
-    description: isZh
-      ? "Shannon Labs 如何在你使用 Codewhale 时处理信息。"
-      : "How Shannon Labs handles information when you use Codewhale.",
+    title: t.metaTitle,
+    description: t.metaDescription,
   });
 }
 
 export default async function PrivacyPage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
+  const t = getLegalPrivacy(locale);
   return (
     <div className="portal-home">
       <article className="legal-doc">
-        <p className="legal-doc-kicker">{isZh ? "法律" : "Legal"}</p>
-        <h1>{isZh ? "隐私政策" : "Privacy policy"}</h1>
-        <p className="legal-doc-updated">
-          {isZh ? "生效并最近更新于" : "Effective and last updated"} {LEGAL_UPDATED}
-          {isZh ? "。以下为具有约束力的英文文本。" : "."}
-        </p>
+        <p className="legal-doc-kicker">{t.kicker}</p>
+        <h1>{t.title}</h1>
+        <p className="legal-doc-updated">{fill(t.updated, { date: LEGAL_UPDATED })}</p>
         <p>This policy explains how Shannon Labs handles information when you use Codewhale.</p>
         {PRIVACY_SECTIONS.map((section) => (
           <section key={section.title}>
@@ -43,8 +38,8 @@ export default async function PrivacyPage({ params }: { params: Promise<{ locale
           <UsagePreferenceControl locale={locale} appVersion={BUILD_FACTS.version ?? "0.0.0"} />
         </section>
         <p className="legal-doc-nav">
-          <Link href={`/${locale}/legal/terms`}>{isZh ? "服务条款" : "Terms of service"}</Link>
-          <Link href={`/${locale}`}>{isZh ? "返回首页" : "Back home"}</Link>
+          <Link href={`/${locale}/legal/terms`}>{t.termsLink}</Link>
+          <Link href={`/${locale}`}>{t.homeLink}</Link>
         </p>
       </article>
     </div>

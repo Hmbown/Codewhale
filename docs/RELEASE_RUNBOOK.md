@@ -161,7 +161,13 @@ gates. A mismatch fails before those gates start; it never silently tests a
 different head.
 
 `release-candidate.yml` also fails unless the selected ref resolves to the
-exact requested SHA. It invokes the same reusable artifact workflow as the
+exact requested SHA. It runs the same parity gate as the public release
+(`release-parity.yml`: fmt, check, clippy, workspace nextest, doctests,
+protocol and state parity), and `release.yml` refuses to start unless a green
+release-candidate run with a green Parity job exists for the exact tag SHA
+(`scripts/release/require-rc-receipt.sh`). Tag the SHA the RC validated; if
+the receipt check fails, run the RC on that SHA rather than moving the tag.
+It invokes the same reusable artifact workflow as the
 public release, building all seven targets (including Android arm64 and native
 Windows arm64), staging `codewhale` and `codew` (single binary), building the
 NSIS installer and nine platform archives, and validating the authoritative
@@ -467,9 +473,13 @@ maintainer approval:
 gh release delete vX.Y.Z --repo Hmbown/CodeWhale --yes --cleanup-tag
 git push origin :refs/tags/vX.Y.Z    # belt-and-suspenders
 git tag -d vX.Y.Z                    # local
-# 3. recut at the fixed HEAD (workspace version unchanged)
+# 3. validate the fixed HEAD first: release.yml refuses a tag without a
+#    green release-candidate receipt (Parity included) for its exact SHA
+gh workflow run release-candidate.yml --repo Hmbown/CodeWhale --ref main \
+  -f expected_sha="$(git rev-parse origin/main)"
+# 4. once that RC run is green, recut at the same HEAD (version unchanged)
 gh workflow run auto-tag.yml --repo Hmbown/CodeWhale --ref main
-# 4. release.yml rebuilds assets; rebuild + reinstall locally from the new tag
+# 5. release.yml rebuilds assets; rebuild + reinstall locally from the new tag
 ```
 
 This is the sanctioned path from "do not delete/move/recreate a release tag

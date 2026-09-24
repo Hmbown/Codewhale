@@ -76,9 +76,9 @@ stewardship.
 | Role          | Stance                                 | Writes? | Network? | Shell posture | Typical use                                  |
 |---------------|----------------------------------------|---------|----------|---------------|----------------------------------------------|
 | `general`     | flexible; do whatever the parent says  | yes     | yes      | yes           | the default; multi-step tasks                |
-| `explore`     | read-only; map the relevant code fast  | no      | yes      | read-only (net + bounded verify) | "find every call site of `Foo`; check the PR with gh" |
+| `explore`     | read-only; map the relevant code fast  | no      | yes      | bounded inspection | "find every call site of `Foo`; check the PR with gh" |
 | `planner`     | analyse and produce a strategy         | no      | yes      | read-only probes | "design the migration; don't execute"        |
-| `reviewer`    | read-and-grade with severity scores    | no      | yes      | read-only (net + bounded verify) | "audit this PR for bugs"                     |
+| `reviewer`    | read-and-grade with severity scores    | no      | yes      | bounded inspection | "audit this PR for bugs"                     |
 | `implement`   | land a specific change with min edit   | yes     | yes      | yes           | "rewrite `bar.rs::Foo::bar` to do X"         |
 | `test`        | run tests / validation, report outcome | no      | yes      | bounded verification (no writes) | "verify the diff with the bounded test checks; report PASS/FAIL" |
 | `advisor`     | short-lived, high-reasoning counsel     | no      | yes      | none          | "what are we missing in this design?"        |
@@ -212,6 +212,15 @@ before admission. Active overlapping shared claims fail before mutation; a
 real isolated worktree may proceed in parallel. A `custom` role requires
 explicit write-capable authority to claim writes; otherwise it starts
 read-only.
+
+Read-only is not file-only. A normally write-capable agent narrowed with
+`write_authority: "read_only"` keeps the existing classifier-bounded inspection
+shell when its parent permits it: Git history/status, search, and allowed `gh`
+log reads, not arbitrary commands or test programs. Workflow read-only steps
+likewise use the effective role's tools instead of imposing a second File-only
+list; a `test` role retains its bounded verification interface. Explicit tool
+allowlists, `deny_all_tools`, parent denials, network limits, and mutation checks
+still apply. A parent without shell access cannot delegate it.
 
 Optional fields:
 
@@ -659,6 +668,26 @@ the same model or exact provider/model pair, but cannot change the pin with
 manual role pin. A type-only start also selects a unique saved role pin when
 there is no manual override; ambiguous saved roles fail instead of choosing one.
 Durable Fleet runs retain their selected member's frozen route.
+
+A structured role pin may list approved replacement routes:
+
+```toml
+[subagents.roles.reviewer]
+model = "xai/grok-4.6"
+replacements = ["deepseek/deepseek-v4-pro"]
+```
+
+When the pinned route refuses the agent's **first** request (exhausted quota,
+rejected credentials or authorization, or an unavailable model), the agent
+retries that same request on the next listed route, keeping its role,
+permissions, tools, scope and budgets. Listing a route authorizes sending the
+agent's task to that provider, so each entry must name `provider/model`; at
+most three are allowed and each is tried once. The route receipt records the
+effective route, `route_source = "role.replacement"`, and a note with the
+original route, the reason and the attempt. Replacement never happens after
+the agent has run a tool, never for content-policy, context-length or
+invalid-request errors, never for Codewhale's own permission denials, and never
+for exact Fleet members or task-level `model` choices, which stay exact.
 
 Structured role pins accept `provider/model`, preserving the configured provider's
 exact identity and the complete model suffix. Unknown providers, empty pairs,

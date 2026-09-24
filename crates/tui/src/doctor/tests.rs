@@ -72,8 +72,8 @@ fn update_renderer_omits_untrusted_release_tags_and_errors() {
     let metadata = doctor_update_report("0.9.3", Ok::<String, ()>(release_sentinel.to_string()));
     let transport = doctor_update_report("0.9.3", Err(error_sentinel.to_string()));
     let rendered = [
-        doctor_update_report_lines(&metadata).join("\n"),
-        doctor_update_report_lines(&transport).join("\n"),
+        doctor_update_report_lines(&metadata, "codewhale update").join("\n"),
+        doctor_update_report_lines(&transport, "codewhale update").join("\n"),
     ]
     .join("\n");
 
@@ -88,11 +88,26 @@ fn update_renderer_omits_untrusted_release_tags_and_errors() {
 fn update_renderer_canonicalizes_safe_release_tags() {
     let report = doctor_update_report("0.9.3", Ok::<String, ()>(" v0.9.4 ".to_string()));
     assert_eq!(
-        doctor_update_report_lines(&report),
+        doctor_update_report_lines(&report, "codewhale update"),
         vec![
             "latest: v0.9.4".to_string(),
             "Update available. Run `codewhale update` to install.".to_string(),
         ]
+    );
+}
+
+#[test]
+fn update_renderer_names_the_package_manager_for_managed_installs() {
+    let report = doctor_update_report("0.9.3", Ok::<String, ()>("v0.9.4".to_string()));
+    let npm = codewhale_release::InstallMethod::Npm.update_command();
+    let lines = doctor_update_report_lines(&report, npm);
+    assert_eq!(
+        lines[1],
+        "Update available. Run `npm install -g codewhale@latest` to install."
+    );
+    assert!(
+        !lines.join("\n").contains("`codewhale update`"),
+        "an npm-owned binary must not be told to self-update: {lines:?}"
     );
 }
 

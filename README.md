@@ -43,8 +43,11 @@ For an existing direct install, run `codewhale update` (or `codewhale update --c
 to inspect it). The updater prints the executable path and keeps newer builds.
 
 
-The first run helps you connect a provider or configure Codewhale offline.
-Model replies require a connected hosted or local model. Codewhale also
+The first run opens straight to the composer; it does not walk you through
+setup. Model replies require a connected hosted or local model: until one is
+connected, the launch screen says "no model connected". Run `/provider` (or
+press F3) to add a hosted key or pick a local runtime. If Ollama is already
+running with a chat model, Codewhale switches to it on its own. Codewhale also
 supports npm and Cargo as secondary packaging routes, plus Docker, Nix, Scoop,
 Android/Termux, and an optional CNB mirror. Existing package-managed installs
 receive migration instructions. See [installation and PATH help](docs/INSTALL.md).
@@ -82,11 +85,10 @@ the agent and its tools:
   runs a task from a script or CI job.
 - **Local browser:** `codewhale web` opens the bundled
   [local web client](docs/WEB.md) for the same runtime.
-- **Codewhale desktop app (GPUI):** the native GPUI desktop app is the
-  product-client direction (decided 2026-09-14; the phase map lives in
-  `docs/TRANSITION.md` in the private `codehwhale-gpui` repo). The hosted web
-  app at app.codewhale.net sunsets in phases; the marketing site, sign-in,
-  billing, legal, and download pages stay on the web permanently.
+- **Codewhale desktop app (GPUI):** a native desktop app, developed in a
+  separate repository, is the direction for the signed-in product client.
+  The hosted web app at app.codewhale.net will be rebuilt to match it; the
+  marketing site, sign-in, billing, legal, and download pages stay on the web.
   Availability is listed on the [product page](https://codewhale.net/en/product).
 
 **Computer Use adds tools for observing and interacting with other applications.**
@@ -134,7 +136,7 @@ stack and [configuration](docs/CONFIGURATION.md) for local settings.
 - [Agent teams](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hooks](docs/HOOKS.md), and [configuration](docs/CONFIGURATION.md)
 - [Local web client](docs/WEB.md)
-- [All documentation](docs)
+- [All documentation](docs/README.md)
 - [Repository layout and contribution guide](CONTRIBUTING.md#project-structure)
 
 ## Join the community

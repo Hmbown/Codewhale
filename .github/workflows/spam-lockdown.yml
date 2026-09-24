@@ -45,18 +45,19 @@ jobs:
             const hit = patterns.find(p => p.test(blob));
             if (!hit) return;
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issue.number,
-              body: [
-                'This issue was auto-closed because the title or body matches',
-                'a spam pattern (paid promotion / unrelated link) and the author',
-                'account is less than 30 days old. If this is a real bug or',
-                'feature request, please reopen with a clearer description',
-                '(in English or 中文) of the project-relevant context.',
-              ].join(' '),
-            });
+            // Label and close; no comment (founder, 2026-09-22). The label
+            // description tells a false positive how to get the issue back.
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'spam',
+                color: 'b60205',
+                description: 'Auto-closed: spam pattern from a <30-day account. Real report? Reopen with project context',
+              });
+            } catch (error) {
+              if (error.status !== 422) throw error; // 422: label already exists
+            }
 
             await github.rest.issues.update({
               owner: context.repo.owner,
@@ -71,4 +72,4 @@ jobs:
               repo: context.repo.repo,
               issue_number: issue.number,
               labels: ['spam'],
-            }).catch(() => {});  // ignore if label doesn't exist yet
+            });

@@ -18,6 +18,8 @@ export const STREAM_EVENT_NAMES = [
   "approval.required",
   "approval.decided",
   "approval.timeout",
+  "approval.grant_added",
+  "approval.grant_revoked",
   "user_input.required",
   "user_input.answered",
   "user_input.canceled",

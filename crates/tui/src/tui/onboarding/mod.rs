@@ -146,11 +146,9 @@ fn action_hints(app: &App) -> Vec<ActionHint> {
             ActionHint::new("3/N", app.tr(MessageId::OnboardTrustActionQuit).to_string()),
         ],
         OnboardingState::Ready => vec![
+            // Only keys this screen handles: a `/rc` hint here could not be
+            // typed, because the Ready screen owns the keyboard.
             ActionHint::new("Enter", app.tr(MessageId::OnboardReadyStart).to_string()),
-            ActionHint::new(
-                "/rc",
-                app.tr(MessageId::CmdRemoteControlDescription).to_string(),
-            ),
             ActionHint::new("C", app.tr(MessageId::OnboardReadyCustomize).to_string()),
         ],
         OnboardingState::None => Vec::new(),
@@ -950,6 +948,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ready_screen_advertises_only_keys_it_handles() {
+        use crate::tui::views::action_footer_lines;
+
+        let mut app = test_app_with_locale(Locale::En);
+        app.onboarding = OnboardingState::Ready;
+        let rail = flattened(action_footer_lines(&action_hints(&app), 80));
+        assert!(rail.contains("Enter"), "{rail}");
+        assert!(rail.contains("change the look"), "{rail}");
+        assert!(
+            !rail.contains("/rc"),
+            "the Ready screen owns the keyboard, so /rc cannot be typed: {rail}"
+        );
     }
 
     #[test]

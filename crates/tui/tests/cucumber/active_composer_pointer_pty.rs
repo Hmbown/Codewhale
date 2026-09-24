@@ -344,11 +344,13 @@ fn assert_startup_contract(frame: &Frame, rows: u16, cols: u16, size: &str) {
 fn assert_live_shell_contract(frame: &Frame, cols: u16, size: &str) {
     let text = frame.text();
     // The bottom metrics row owns the model; repository state belongs to
-    // the launch header and git view. This sealed offline session uses the
-    // default model, which must remain visible even at 40 columns.
+    // the launch header and git view. This sealed offline session carries no
+    // key, so the route chip says the model is not connected instead of
+    // naming a default route that cannot answer (experience mark 8, U3). That
+    // chip must remain visible even at 40 columns.
     let metrics = frame.row(frame.rows().saturating_sub(1));
     assert!(
-        metrics.contains("deepseek-flash"),
+        metrics.contains("model not connected"),
         "{size}: live shell misses the model in the metrics line\n{}",
         frame.debug_dump()
     );

@@ -197,6 +197,14 @@ impl SteerPermit {
 }
 
 impl EngineHandle {
+    /// The engine's turn-phase heartbeat (#6184). Hosts read it to tell a
+    /// bounded model wait from a wedged turn without inferring liveness from
+    /// the stream-chunk timeout.
+    #[must_use]
+    pub(crate) fn turn_heartbeat(&self) -> &Arc<super::turn_heartbeat::TurnHeartbeat> {
+        &self.turn_heartbeat
+    }
+
     /// Called only while Runtime holds the idle turn admission claim. The
     /// following SendMessage refreshes the existing prompt/config projection.
     pub(crate) fn restore_runtime_goal(
@@ -214,6 +222,45 @@ impl EngineHandle {
                     &crate::tools::goal::GoalSnapshot::from_thread_goal(goal),
                 )
             });
+        }
+        Ok(())
+    }
+
+    /// Apply the host's latest durable goal control to the live continuation
+    /// gate. The mailbox drains only between turns, so it cannot carry stop
+    /// controls. A replacement parks the old goal until normal turn admission
+    /// restores the new revision; it never starts a second turn here.
+    pub(crate) fn sync_runtime_goal_control(
+        &self,
+        goal: Option<&codewhale_protocol::ThreadGoal>,
+    ) -> Result<()> {
+        let mut state = self
+            .goal_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("goal state lock poisoned"))?;
+        let current = state.snapshot();
+        let Some(goal) = goal else {
+            state.clear();
+            return Ok(());
+        };
+        if current.goal_id.as_deref() != Some(goal.goal_id.as_str()) {
+            if state.is_active() {
+                state.sync_from_host_status(
+                    current.objective.as_deref(),
+                    current.token_budget,
+                    crate::tools::goal::GoalStatus::Paused,
+                );
+            }
+        } else {
+            let (status, _) =
+                crate::tools::goal::thread_goal_status_projection(goal.status.clone());
+            if status != crate::tools::goal::GoalStatus::Active {
+                state.sync_from_host_status(
+                    current.objective.as_deref(),
+                    current.token_budget,
+                    status,
+                );
+            }
         }
         Ok(())
     }

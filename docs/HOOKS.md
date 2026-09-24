@@ -68,13 +68,13 @@ default_timeout_secs = 30      # see the timeout note below
 working_dir = "/path/to/dir"   # default: the session workspace
 
 [[hooks.hooks]]
-event = "tool_call_before"     # required; one of the 11 names below
+event = "tool_call_before"     # required; one of the 15 names below
 command = "~/.codewhale/hooks/gate.sh"  # required; `sh -c` on Unix, `cmd /C` on Windows
 name = "gate"                  # optional label for /hooks and log lines
 timeout_secs = 30              # optional, default 30
 background = false             # optional; foreground inside the hook worker
 continue_on_error = true       # optional, default true
-condition = { type = "tool_name", name = "exec_shell" }  # optional
+condition = { type = "tool_name", name = "bash" }  # optional
 ```
 
 `timeout_secs` note, stated as implemented: when `[hooks].default_timeout_secs`
@@ -173,7 +173,7 @@ configured instead (the backend owns its base environment, and your
 | Condition | Matches | Supported on |
 | --- | --- | --- |
 | `{ type = "always" }` | every invocation (also the default when omitted) | every event |
-| `{ type = "tool_name", name = "exec_shell" }` | exact tool name; `*` globs are supported, e.g. `mcp__*` | `tool_call_before`, `tool_call_after`, `shell_env`, `on_error` |
+| `{ type = "tool_name", name = "bash" }` | exact tool name; `*` globs are supported, e.g. `mcp__*`. The shell tool's spellings `bash`, `Bash`, and `exec_shell` are aliases: a condition naming any one matches all three | `tool_call_before`, `tool_call_after`, `shell_env`, `on_error` |
 | `{ type = "tool_category", category = "shell" }` | tool category | `tool_call_before`, `tool_call_after`, `shell_env`, `on_error` |
 | `{ type = "mode", mode = "plan" }` | the context's mode string, case-insensitive | every event **except** `shell_env` |
 | `{ type = "exit_code", code = 1 }` | the exit code the tool actually reported | `tool_call_after`, `on_error` |
@@ -184,7 +184,7 @@ Three rules keep conditions from lying:
 
 - **`exit_code` needs a real exit code.** It matches only when the event
   actually observed a process exit code — `tool_call_after`, or `on_error` for
-  a tool failure, in both cases for a process-backed tool such as `exec_shell`.
+  a tool failure, in both cases for a process-backed tool such as `bash`.
   A tool that reports no exit code never matches an `exit_code` condition; the
   condition is not satisfied by a default, a zero, or a success flag. The value
   is a 64-bit integer, so a Windows crash code such as `3221225477`

@@ -1,0 +1,197 @@
+/* ------------------------------------------------------------------ */
+/*  Motion — entrances, considered hovers, and one-shot settles        */
+/* ------------------------------------------------------------------ */
+/*
+ * Grammar: the page is complete and static; motion answers a person's action
+ * (a hover draws a rule, a press stamps a copy). The one authored ambient
+ * moment is the column breath above. Everything here animates transform
+ * and/or opacity only and is gated on `no-preference`, so reduced motion is
+ * the *absence* of motion rather than an override fighting it.
+ */
+/* The nav-link underline draw, extended to the other mono-voice links. Hover
+   draws the rule; the transition is the whole effect, so reduced motion keeps
+   the existing colour change and simply skips the draw. */
+.product-start-links a,
+.gs-step-link,
+.product-surfaces > .product-container > a,
+.product-community nav a {
+  position: relative;
+}
+
+.product-start-links a::after,
+.gs-step-link::after,
+.product-surfaces > .product-container > a::after,
+.product-community nav a::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -2px;
+  height: 1px;
+  background: currentColor;
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform var(--dur-state) var(--ease-spring);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .product-start-links a:hover::after,
+  .gs-step-link:hover::after,
+  .product-surfaces > .product-container > a:hover::after,
+  .product-community nav a:hover::after {
+    transform: scaleX(1);
+  }
+}
+
+/* The primary-button arrow leans into the direction it points. */
+.product-button > span[aria-hidden="true"] {
+  display: inline-block;
+  transition: transform var(--dur-state) var(--ease-spring);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .product-button:hover > span[aria-hidden="true"],
+  .product-button:focus-visible > span[aria-hidden="true"] {
+    transform: translateX(2px);
+  }
+}
+
+/* Copy-to-clipboard: the press is a stamp, the confirmation a jade seal —
+   the wire's merge verb colour, borrowed for one beat. The colour change is
+   unconditional (it is the confirmation); only the motion is gated. */
+.copy-btn[data-copied="true"] {
+  background: var(--jade);
+  color: var(--paper);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .copy-btn {
+    transition: background-color var(--dur-state) var(--ease-spring), color var(--dur-state) var(--ease-spring), transform var(--dur-state) var(--ease-spring);
+  }
+
+  .copy-btn:active {
+    transform: scale(0.95);
+  }
+
+  .copy-btn[data-copied="true"] {
+    animation: copy-settle var(--dur-spring) var(--ease-spring);
+  }
+}
+
+@keyframes copy-settle {
+  0% { transform: scale(1); }
+  35% { transform: scale(0.93); }
+  70% { transform: scale(1.04); }
+  100% { transform: scale(1); }
+}
+
+/* Mobile menu: the sheet drops a few points while its items settle in
+   sequence; exit is a short fade. The exit is driven by a delayed unmount in
+   components/mobile-menu.tsx — with reduced motion the menu mounts and
+   unmounts instantly, exactly as before. */
+@media (prefers-reduced-motion: no-preference) {
+  .mm-panel {
+    animation: mm-in var(--dur-spring) var(--ease-spring) both;
+  }
+
+  .mm-panel.mm-closing {
+    animation: mm-out 170ms var(--ease-exit) both;
+    pointer-events: none;
+  }
+
+  .mm-panel li,
+  .mm-panel nav > a {
+    animation: mm-rise var(--dur-spring) var(--ease-spring) both;
+  }
+
+  .mm-panel li:nth-child(1) { animation-delay: 34ms; }
+  .mm-panel li:nth-child(2) { animation-delay: 58ms; }
+  .mm-panel li:nth-child(3) { animation-delay: 82ms; }
+  .mm-panel li:nth-child(4) { animation-delay: 106ms; }
+  .mm-panel li:nth-child(5) { animation-delay: 130ms; }
+  .mm-panel li:nth-child(6) { animation-delay: 154ms; }
+  .mm-panel li:nth-child(7) { animation-delay: 178ms; }
+  .mm-panel li:nth-child(8) { animation-delay: 202ms; }
+  .mm-panel nav > a { animation-delay: 226ms; }
+}
+
+@keyframes mm-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes mm-out {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(-6px); }
+}
+
+@keyframes mm-rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ---------- decorative big CJK in margin ---------- */
+.margin-glyph {
+  font-family: var(--font-cjk);
+  font-weight: 700;
+  color: var(--ink);
+  opacity: 0.04;
+  font-size: 18rem;
+  line-height: 0.9;
+  pointer-events: none;
+  user-select: none;
+  position: absolute;
+}
+
+/* ---------- focus + selection ---------- */
+/* The one focus treatment on the site: a 2px primary ring. No component
+   restyles it; inputs keep the same ring rather than a glow. */
+::selection { background: var(--selection); }
+:focus-visible { outline: var(--gpui-focus-width) solid var(--ring); outline-offset: var(--gpui-focus-offset); }
+/* The dark stage keeps the light scheme's page but a sidebar-dark field;
+   there the light primary ring is ~2.8:1 (#245bc7 on #191a1c), under the 3:1
+   a focus indicator needs, so stage surfaces take the dark scheme's ring. */
+.ocean-column,
+.site-footer,
+.folio-shot,
+.portal-quickstart,
+.portal-community,
+.contribute-dev-loop,
+pre.code-block { --ring: var(--gpui-dark-primary); }
+
+/* ---------- link reset ---------- */
+a { color: inherit; text-decoration: none; }
+a.body-link {
+  color: var(--ink);
+  background-image: linear-gradient(var(--indigo), var(--indigo));
+  background-repeat: no-repeat;
+  background-position: 0 100%;
+  background-size: 100% 1px;
+  transition: background-size var(--dur-state) var(--ease-spring);
+}
+a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
+
+/* ---------- mobile-only adjustments ---------- */
+@media (max-width: 640px) {
+  /* Big CJK margin glyph already hidden via tailwind's `hidden lg:block`,
+     but re-assert that nothing hits the viewport edge. */
+  .margin-glyph { display: none; }
+
+  /* Ticker text gets cramped on phones — shrink + tighten gaps */
+  .ticker-track { gap: 1.5rem; padding-right: 1.5rem; }
+}
+
+@media (max-width: 900px) {
+  .site-nav-inner { gap: 1rem; }
+  .site-github-link { display: none; }
+  .site-footer-main { grid-template-columns: 1fr; gap: 2.5rem; }
+  .site-footer-meta { grid-template-columns: minmax(0, 1fr); gap: 0.7rem; }
+  .site-footer-meta > div { min-width: 0; flex-wrap: wrap; }
+}
+
+@media (max-width: 700px) {
+  .site-wordmark { font-size: 1.05rem; }
+}
+
+/* Anchor fallback; page-level scroll-mt utilities should be able to override it. */
+:where([id]) { scroll-margin-top: 5rem; }

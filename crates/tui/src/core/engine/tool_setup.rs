@@ -29,7 +29,20 @@ impl Engine {
         options.goal_state = Some(self.config.goal_state.clone());
         options.verify_tool_enabled = self.config.features.enabled(Feature::Verify);
         options.user_input_limits = self.config.user_input_limits;
+        options.request_plugin_install_enabled = self.request_plugin_install_allowed();
         options
+    }
+
+    /// `request_plugin_install` returns a TUI slash command and is a
+    /// proactive offer, so it exists only in the interactive TUI with
+    /// contextual tips on (0.10.1 plugin offering policy, rules 3 and 11).
+    /// Exec, ACP, and runtime-API hosts run with terminal chrome off. Applies
+    /// to every mode's surface and is inherited by child agents.
+    fn request_plugin_install_allowed(&self) -> bool {
+        self.config.terminal_chrome_enabled
+            && crate::settings::Settings::load_read_only()
+                .map(|settings| settings.contextual_tips)
+                .unwrap_or(true)
     }
 
     #[cfg(test)]
@@ -137,9 +150,11 @@ impl Engine {
         // headless entry points install the merged notification policy before
         // tool setup, including method=off, quiet/category, and attention.
         // The tool returns a truthful suppressed/delivered receipt.
-        builder = builder
-            .with_notify_tool()
-            .with_request_plugin_install_tool();
+        builder = builder.with_notify_tool();
+
+        if self.request_plugin_install_allowed() {
+            builder = builder.with_request_plugin_install_tool();
+        }
 
         // Register the `registry_sync` tool for fetching and caching
         // MCP Registry server metadata. Rides on `Feature::Mcp` — the same

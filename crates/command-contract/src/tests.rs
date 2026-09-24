@@ -1185,6 +1185,14 @@ impl CommandPluginContext for FakePlugin {
             outcome: PluginMutationOutcome::Installed,
         })
     }
+
+    fn suggestion_dismissals(&self) -> Result<PluginSuggestionDismissals, String> {
+        Ok(PluginSuggestionDismissals::default())
+    }
+
+    fn reset_suggestion_dismissals(&mut self, _name: Option<&str>) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
 }
 
 #[test]

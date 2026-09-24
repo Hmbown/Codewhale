@@ -105,6 +105,11 @@ pub struct TurnContext {
     /// Route facts resolved for this turn but not timestamped until the first
     /// provider request is actually dispatched.
     pub(crate) pending_route: Option<TurnRoute>,
+
+    /// The provider's answer when it rejected an emergency context-recovery
+    /// request (capability, auth, unreachable). The turn then fails on that
+    /// cause, not on the context budget the recovery was trying to fix.
+    pub(crate) context_recovery_rejection: Option<anyhow::Error>,
 }
 
 impl TurnContext {
@@ -141,6 +146,7 @@ impl TurnContext {
             messages_len_at_last_parent_prompt: None,
             compaction_refusal_notified: false,
             pending_route: None,
+            context_recovery_rejection: None,
         }
     }
 
@@ -666,7 +672,7 @@ fn snapshot_with_label(
         Ok(repo) => {
             clear_snapshots_disabled_status(workspace, session_id);
             let id = match repo.snapshot_with_session(label, session_id) {
-                Ok(id) => Some(id.0),
+                Ok(id) => Some(id.into_string()),
                 Err(e) => {
                     tracing::warn!(target: "snapshot", "snapshot '{label}' failed: {e}");
                     return None;

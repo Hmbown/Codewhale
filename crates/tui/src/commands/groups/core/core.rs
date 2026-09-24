@@ -246,6 +246,10 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     app.session.last_warmup_key = None;
     app.session.last_tool_catalog = None;
     app.session.last_base_url = None;
+    // A fresh conversation inherits neither this one's denials nor its
+    // "approve for session" grants (UX-8).
+    app.approval_session_denied.clear();
+    app.approval_session_approved.clear();
     true
 }
 
@@ -1630,7 +1634,7 @@ mod tests {
         assert_eq!(app.view_stack.top_kind(), Some(ModalKind::SubAgents));
         assert_eq!(
             app.status_message,
-            Some("Finding this session's sub-agents...".to_string())
+            Some("Finding this session's agents...".to_string())
         );
     }
 

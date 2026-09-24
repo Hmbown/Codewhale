@@ -49,9 +49,8 @@ docker run --rm -it \\
         <p className={`${t.bodyClassName} mt-3`}>{t.dockerToolboxNote}</p>
       </section>
 
-      <section id="source" className="hairline-t pt-8">
-        <p className="text-sm text-ink-mute">{t.sourceNote}</p>
-      </section>
+      {/* Maintainer pointer: kept out of the rendered copy (experience mark 5). */}
+      <div hidden data-source-note={t.sourceNote} />
     </section>
   );
 }

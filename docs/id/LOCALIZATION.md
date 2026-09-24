@@ -2,7 +2,7 @@
 
 Dokumen pelacakan kanonik untuk setiap bahasa yang didukung, sedang dibangun, direncanakan, atau ditunda oleh Codewhale.
 
-> **Catatan Cakupan (diperbarui 2026-07-29):** Matriks ini mencakup tiga permukaan utama — paket bahasa TUI (`crates/tui/locales/`), README terjemahan (root repositori), dan situs web (`web/`). Ketiganya rilis pada ritme yang berbeda, sehingga suatu bahasa bisa berstatus **shipped** di satu permukaan dan **planned** di permukaan lain.
+> **Catatan Cakupan (diperbarui 2026-07-29):** Matriks ini mencakup tiga permukaan utama — paket bahasa TUI (`crates/localization/locales/`), README terjemahan (root repositori), dan situs web (`web/`). Ketiganya rilis pada ritme yang berbeda, sehingga suatu bahasa bisa berstatus **shipped** di satu permukaan dan **planned** di permukaan lain.
 
 ---
 
@@ -19,7 +19,7 @@ Dokumen pelacakan kanonik untuk setiap bahasa yang didukung, sedang dibangun, di
 
 ## Paket Bahasa TUI
 
-Paket TUI di bawah `crates/tui/locales/` adalah permukaan terjemahan terbesar di repositori. `en.json` adalah acuan utama; sebuah paket dianggap **lengkap** (complete) jika memiliki paritas kunci persis dengannya, yang ditegakkan oleh `scripts/check-tui-locale-parity.py` (CI) dan pengujian paritas di `crates/tui/src/localization.rs`.
+Paket TUI di bawah `crates/localization/locales/` adalah permukaan terjemahan terbesar di repositori. `en.json` adalah acuan utama; sebuah paket dianggap **lengkap** (complete) jika memiliki paritas kunci persis dengannya, yang ditegakkan oleh `scripts/check-tui-locale-parity.py` (CI) dan pengujian paritas di `crates/tui/src/localization.rs`.
 
 | Bahasa | Berkas | Kunci vs `en.json` (1248) | Status | Catatan |
 |--------|------|--------------------------|--------|-------|
@@ -70,8 +70,8 @@ Paket TUI di bawah `crates/tui/locales/` adalah permukaan terjemahan terbesar di
 ## Cara Menambahkan Paket Bahasa Baru
 
 1. **Paket TUI**:
-   - Buat berkas `crates/tui/locales/<tag>.json` berisi seluruh kunci di `en.json`.
-   - Tambahkan varian `Locale` pada `crates/tui/src/localization.rs` dan daftarkan di `config_ui.rs`.
+   - Buat berkas `crates/localization/locales/<tag>.json` berisi seluruh kunci di `en.json`.
+   - Tambahkan varian `Locale` pada `crates/localization/src/lib.rs`, lalu ikuti langkah lengkap di `docs/LOCALIZATION.md` (bagian "How to add a locale") untuk match arm yang masih ditulis manual.
    - Jalankan `python3 scripts/check-tui-locale-parity.py` dan `cargo test -p codewhale-tui localization`.
 
 2. **README**:

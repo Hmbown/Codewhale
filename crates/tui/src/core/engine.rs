@@ -704,6 +704,8 @@ pub struct EngineHandle {
     /// be awaiting a provider while its bounded op mailbox is unable to drain,
     /// so cancellation cannot depend on processing a later mailbox entry.
     compaction_cancellation: Arc<StdMutex<CompactionCancellationState>>,
+    /// Read-only view of the engine's turn-phase heartbeat (#6184).
+    turn_heartbeat: Arc<turn_heartbeat::TurnHeartbeat>,
 }
 
 const MAX_PENDING_COMPACTION_CANCELLATIONS: usize = 64;
@@ -871,12 +873,6 @@ pub struct Engine {
     mcp_event_generation: u64,
     /// Workspace-scoped immutable plugin catalogue and authority receipts.
     plugin_registry: Arc<crate::plugins::PluginRegistry>,
-    /// Keeps the append-only `<recommended_plugins>` fragment once-per-
-    /// Engine-lifetime per plugin id, and suppresses plugins whose name a
-    /// catalogue skill already covers (#6274). The skill-name snapshot is
-    /// taken at construction from the same catalogue the system prompt
-    /// indexes (see the gate's known-limitations note).
-    recommended_plugin_gate: StdMutex<crate::plugins::recommend::RecommendedPluginGate>,
     api_provider: ApiProvider,
     /// Exact configured route key. Named custom providers share the `Custom`
     /// enum, so the enum alone cannot prove that the active client is current.
@@ -979,6 +975,10 @@ pub struct Engine {
     /// `None` until the first turn completes with the advisor enabled, then
     /// held for the session lifetime so state persists across turns.
     advisor_emission_guard: Option<Arc<tokio::sync::Mutex<crate::tools::subagent::EmissionGuard>>>,
+    /// Turn-phase heartbeat (#6184): where the active turn is and when it
+    /// last made progress. Shared with `EngineHandle` and supervised by the
+    /// stall watchdog spawned in `run`.
+    pub(crate) turn_heartbeat: Arc<turn_heartbeat::TurnHeartbeat>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1023,6 +1023,49 @@ impl LiveRuntimeAuthority {
             approval_mode,
             configured_sandbox_mode,
         }
+    }
+
+    /// Whether `self` grants less than `prior` along any axis: a stricter
+    /// approval posture, a lost shell/trust/auto-approve bit, a stricter
+    /// configured sandbox, or a mode switch that is not a step out of Plan.
+    ///
+    /// A call the user approved under `prior` stays approved under a posture
+    /// that is equal or broader; only a narrowing sends it back for a retry.
+    fn narrows(&self, prior: &Self) -> bool {
+        fn posture_rank(mode: ApprovalMode) -> u8 {
+            match mode {
+                ApprovalMode::Never => 0,
+                ApprovalMode::Suggest => 1,
+                ApprovalMode::Auto => 2,
+                ApprovalMode::Bypass => 3,
+            }
+        }
+        fn sandbox_rank(mode: Option<&str>) -> Option<u8> {
+            match mode {
+                Some("read-only") => Some(0),
+                Some("workspace-write") => Some(1),
+                Some("external-sandbox") => Some(2),
+                None => Some(3),
+                // An unknown value cannot be ordered; treat any move to or
+                // from it as a narrowing.
+                Some(_) => None,
+            }
+        }
+        let mode_narrowed = self.mode != prior.mode && prior.mode != AppMode::Plan;
+        let sandbox_narrowed = self.configured_sandbox_mode != prior.configured_sandbox_mode
+            && match (
+                sandbox_rank(self.configured_sandbox_mode.as_deref()),
+                sandbox_rank(prior.configured_sandbox_mode.as_deref()),
+            ) {
+                (Some(now), Some(before)) => now < before,
+                _ => true,
+            };
+        mode_narrowed
+            || sandbox_narrowed
+            || posture_rank(self.approval_mode) < posture_rank(prior.approval_mode)
+            || (prior.allow_shell && !self.allow_shell)
+            || (prior.trust_mode && !self.trust_mode)
+            || (prior.auto_approve && !self.auto_approve)
     }
 
     fn permission_snapshot(&self) -> RuntimePermissionAuthority {
@@ -1810,9 +1853,6 @@ impl Engine {
             mcp_boot_generation: None,
             mcp_event_generation: 0,
             plugin_registry,
-            recommended_plugin_gate: StdMutex::new(
-                crate::plugins::recommend::RecommendedPluginGate::default(),
-            ),
             api_provider,
             api_provider_identity,
             api_provider_id,
@@ -1851,6 +1891,7 @@ impl Engine {
             token_estimate_cache: TokenEstimateCache::new(),
             shared_paused: shared_paused.clone(),
             advisor_emission_guard: None,
+            turn_heartbeat: turn_heartbeat::TurnHeartbeat::new(),
         };
         let handle = EngineHandle {
             goal_state: engine.config.goal_state.clone(),
@@ -1866,6 +1907,7 @@ impl Engine {
             client_preflight_required: true,
             live_runtime_authority,
             compaction_cancellation,
+            turn_heartbeat: Arc::clone(&engine.turn_heartbeat),
         };
 
         (engine, handle)
@@ -2096,7 +2138,7 @@ impl Engine {
         auto_approve: bool,
         approval_mode: ApprovalMode,
         configured_sandbox_mode: Option<String>,
-    ) {
+    ) -> bool {
         let authority = TurnAuthority::from_effective_fields(
             mode,
             allow_shell,
@@ -2115,7 +2157,7 @@ impl Engine {
         self.api_config.sandbox_mode = configured_sandbox_mode;
         self.apply_runtime_mode_policy(&authority);
         if !changed {
-            return;
+            return false;
         }
         self.emit_session_updated().await;
         let _ = self
@@ -2126,12 +2168,18 @@ impl Engine {
                 // the bar's notice shedder cuts at clause joints and keeps the
                 // head — so the user read "Runtime policy changed to" with the
                 // policy itself gone, which is the one word the notice exists
-                // to carry.
-                "Policy: {} / {}",
+                // to carry. Product words only (§19): Permissions, then
+                // Plan / Work / Operate — not "Policy" or the ACT tag.
+                "Permissions: {} · {}",
                 effective_approval.permission_chip_label(),
-                mode.label(),
+                match mode {
+                    AppMode::Plan => "Plan",
+                    AppMode::Agent => "Work",
+                    AppMode::Operate => "Operate",
+                },
             )))
             .await;
+        true
     }
 
     fn take_pending_runtime_authority(&self) -> Option<LiveRuntimeAuthority> {
@@ -2154,7 +2202,7 @@ impl Engine {
             .clone()
     }
 
-    async fn apply_runtime_authority(&mut self, authority: LiveRuntimeAuthority) {
+    async fn apply_runtime_authority(&mut self, authority: LiveRuntimeAuthority) -> bool {
         self.apply_change_mode(
             authority.mode,
             authority.allow_shell,
@@ -2163,15 +2211,31 @@ impl Engine {
             authority.approval_mode,
             authority.configured_sandbox_mode,
         )
-        .await;
+        .await
     }
 
+    /// Apply the newest published authority, if any. Returns whether the
+    /// live posture actually changed: a republished identical posture (a
+    /// PATCH that only renamed the thread, a repeated mode pick) is not a
+    /// change and must not invalidate planned or approved calls.
     async fn apply_pending_runtime_authority(&mut self) -> bool {
         let Some(authority) = self.take_pending_runtime_authority() else {
             return false;
         };
-        self.apply_runtime_authority(authority).await;
-        true
+        self.apply_runtime_authority(authority).await
+    }
+
+    /// The posture this engine is enforcing right now, read from the live
+    /// session rather than the shared (possibly newer, unapplied) snapshot.
+    fn applied_runtime_authority(&self) -> LiveRuntimeAuthority {
+        LiveRuntimeAuthority {
+            mode: self.current_mode,
+            allow_shell: self.session.allow_shell,
+            trust_mode: self.session.trust_mode,
+            auto_approve: self.session.auto_approve,
+            approval_mode: self.session.approval_mode,
+            configured_sandbox_mode: self.api_config.sandbox_mode.clone(),
+        }
     }
 
     fn record_applied_runtime_authority(&self, authority: &TurnAuthority) {
@@ -2692,6 +2756,14 @@ impl Engine {
         // engine must wait for its host to claim and explicitly dispatch the
         // next turn so events cannot be attached to the wrong durable record.
         let host_managed_turns = self.host_managed_turns();
+        // #6184: supervise the turn heartbeat from outside the turn future,
+        // so a wedged await still produces a log line, a stall record and a
+        // status event. The watchdog exits once the event channel closes.
+        let stall_watchdog = turn_heartbeat::spawn_turn_stall_watchdog(
+            Arc::clone(&self.turn_heartbeat),
+            self.tx_event.clone(),
+        );
+        let _stall_watchdog_guard = turn_heartbeat::AbortOnDrop(stall_watchdog);
         if let Err(error) = self
             .start_mcp_session_boot(McpConnectRefresh::IfChanged)
             .await
@@ -2958,12 +3030,24 @@ impl Engine {
                     }
                     Op::CancelSubAgent { agent_id } => {
                         let active_session_id = self.session.id.clone();
-                        let result = {
-                            let mut manager = self.subagent_manager.write().await;
-                            match manager.cancel_agent_for_session(&active_session_id, &agent_id) {
-                                Ok(_) => Ok(agent_list_event(&manager, &active_session_id)),
-                                Err(err) => Err(err),
+                        let cancelled = self
+                            .subagent_manager
+                            .write()
+                            .await
+                            .cancel_agent_for_session(&active_session_id, &agent_id);
+                        let result = match cancelled {
+                            Ok(snapshot) => {
+                                // F4: cancelling keeps the work — inventory and
+                                // checkpoint what the child left, off the lock.
+                                crate::tools::subagent::preserve_cancelled_work(
+                                    &self.subagent_manager,
+                                    snapshot,
+                                )
+                                .await;
+                                let manager = self.subagent_manager.read().await;
+                                Ok(agent_list_event(&manager, &active_session_id))
                             }
+                            Err(err) => Err(err),
                         };
                         match result {
                             Ok(event) => {
@@ -3058,15 +3142,21 @@ impl Engine {
                             .await;
                     }
                     Op::SetCompaction { config } => {
-                        let enabled = config.enabled;
-                        self.config.compaction = config;
-                        let _ = self
-                            .tx_event
-                            .send(Event::status(format!(
-                                "Auto-compaction {}",
-                                if enabled { "enabled" } else { "disabled" }
-                            )))
-                            .await;
+                        // Hosts resend the compaction config on every route
+                        // or model sync. An unchanged config is not news; its
+                        // acknowledgement used to overwrite a real error in
+                        // the footer (U1).
+                        if self.config.compaction != config {
+                            let enabled = config.enabled;
+                            self.config.compaction = config;
+                            let _ = self
+                                .tx_event
+                                .send(Event::status(format!(
+                                    "Auto-compaction {}",
+                                    if enabled { "enabled" } else { "disabled" }
+                                )))
+                                .await;
+                        }
                     }
                     Op::SetStreamChunkTimeout { timeout_secs } => {
                         self.config.stream_chunk_timeout = Duration::from_secs(timeout_secs);
@@ -3180,8 +3270,11 @@ impl Engine {
                         }
                         let compaction_checkpoint =
                             extract_compaction_summary_prompt(system_prompt.clone());
+                        // The op owns the synced history: move each message
+                        // through the projection instead of cloning the whole
+                        // conversation and dropping the original (M3).
                         let restored_messages =
-                            crate::runtime_handoff::project_messages_for_restore(&messages);
+                            crate::runtime_handoff::project_owned_messages_for_restore(messages);
                         // Replace the checkpoint in place so turns after the
                         // compaction boundary keep their chronology.
                         let restored_messages = crate::compaction::restore_compaction_checkpoint(
@@ -3851,33 +3944,12 @@ impl Engine {
                 cache_control: None,
             }];
         }
-        let recommended_plugins = {
-            let mut recommended_plugin_gate = self
-                .recommended_plugin_gate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            crate::plugins::recommend::recommended_plugins_user_fragment(
-                &text,
-                self.plugin_registry.as_ref(),
-                &crate::plugins::recommend::load_marketplace_candidates(
-                    self.plugin_registry.state_path(),
-                ),
-                &mut recommended_plugin_gate,
-            )
-        };
         let expanded = crate::image_attach::expand_attachment_blocks(&text);
-        let mut content = Vec::with_capacity(3 + expanded.blocks.len());
+        let mut content = Vec::with_capacity(2 + expanded.blocks.len());
         content.push(ContentBlock::Text {
             text,
             cache_control: None,
         });
-        // Append-only on this turn. Never spliced into the pinned system prefix.
-        if let Some(fragment) = recommended_plugins {
-            content.push(ContentBlock::Text {
-                text: fragment,
-                cache_control: None,
-            });
-        }
         content.extend(expanded.blocks);
         if let Some(notice) = crate::image_attach::notice_block(&expanded.notices) {
             content.push(notice);
@@ -4332,7 +4404,7 @@ impl Engine {
         let snapshot = match self.config.goal_state.lock() {
             Ok(mut state) => {
                 if state.is_active()
-                    && let Err(err) = state.mark_blocked(message.clone())
+                    && let Err(err) = state.mark_runtime_blocked(message.clone())
                 {
                     tracing::warn!("failed to mark goal continuation blocked: {err}");
                     return;
@@ -4360,6 +4432,37 @@ impl Engine {
         self.emit_session_updated().await;
         let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
         let _ = self.tx_event.send(Event::status(message)).await;
+    }
+
+    /// Resume the shared goal when its only blocker was a runtime stop and it
+    /// is the objective this turn names; publish the change like any other
+    /// goal transition.
+    async fn resume_runtime_blocked_goal(&mut self, objective: Option<&str>) -> bool {
+        let snapshot = match self.config.goal_state.lock() {
+            Ok(mut state) => {
+                if normalized_goal_objective(state.objective())
+                    != normalized_goal_objective(objective)
+                    || !state.resume_after_runtime_block()
+                {
+                    return false;
+                }
+                state.snapshot()
+            }
+            Err(err) => {
+                tracing::warn!("goal state lock poisoned while resuming a goal: {err}");
+                return false;
+            }
+        };
+        self.config.goal_status = GoalStatus::Active;
+        self.emit_session_updated().await;
+        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+        let _ = self
+            .tx_event
+            .send(Event::status(
+                "Goal resumed: your message continues the work the earlier turn stopped",
+            ))
+            .await;
+        true
     }
 
     /// Pause a still-active goal with an inspectable reason and publish every
@@ -5018,6 +5121,21 @@ impl Engine {
             }
         }
 
+        // A person writing to a goal that only the runtime stopped (a failed
+        // or timed-out continuation) is continuing the work: resume it as a
+        // new revision instead of running a goalless turn against a stale
+        // blocker. Blockers the model or user reported stay until an explicit
+        // resume, and automated inputs never resume anything.
+        let goal_status = if provenance == UserInputProvenance::ExternalUser
+            && goal_status == GoalStatus::Blocked
+            && self
+                .resume_runtime_blocked_goal(goal_objective.as_deref())
+                .await
+        {
+            GoalStatus::Active
+        } else {
+            goal_status
+        };
         let input_policy = effective_input_policy(
             provenance,
             mode,
@@ -5474,6 +5592,9 @@ impl Engine {
         })
         .catch_unwind()
         .await;
+        // Every return path (including a caught panic) leaves the phase idle,
+        // so the stall watchdog never reports a turn that already ended.
+        self.turn_heartbeat.idle();
         let (mut status, error) = match turn_result {
             Ok(outcome) => outcome,
             Err(panic) => {
@@ -5846,6 +5967,10 @@ impl Engine {
             .await;
     }
 
+    /// The pressure estimate (`estimate_input_tokens_for_pressure`) over the
+    /// installed history: the number compaction receipts, the refusal trace
+    /// and the context-budget snapshot report, equal to what the gate and the
+    /// meter read. Not the 1.5x overflow guard.
     fn estimated_input_tokens(&mut self) -> usize {
         // Memoized on (session.messages_revision, system-prompt fingerprint).
         // The cache invalidates as soon as either input changes; until then
@@ -7739,6 +7864,7 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
         client_preflight_required: false,
         live_runtime_authority,
         compaction_cancellation,
+        turn_heartbeat: turn_heartbeat::TurnHeartbeat::new(),
     };
 
     MockEngineHandle {
@@ -8162,6 +8288,7 @@ mod tool_media;
 mod tool_preparation;
 mod tool_setup;
 pub(crate) mod turn_budget;
+pub(crate) mod turn_heartbeat;
 pub(crate) mod turn_loop;
 pub(crate) use dispatch::{
     FLEET_FINAL_REPORT_NOTICE, FLEET_NO_PROGRESS_STOP, FLEET_STRATEGY_SWITCH_NOTICE,

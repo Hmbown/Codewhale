@@ -3493,6 +3493,29 @@ mod tests {
 
     struct MockExecutor;
 
+    /// Poll until the task is claimed as `Running`, or fail at `timeout`.
+    ///
+    /// A worker claims the task and installs its cancel token under one state
+    /// lock, so observing `Running` means a cancel or shutdown now reaches a
+    /// live executor rather than a still-queued record.
+    async fn wait_for_running(
+        manager: &TaskManager,
+        task_id: &str,
+        timeout: Duration,
+    ) -> Result<TaskRecord> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let task = manager.get_task(task_id).await?;
+            if task.status == TaskStatus::Running {
+                return Ok(task);
+            }
+            if task.status.is_terminal() || std::time::Instant::now() >= deadline {
+                bail!("task {task_id} never started running: {task:?}");
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     fn provider_default_model_cases() -> Vec<(&'static str, Config, &'static str)> {
         let deepseek = Config {
             provider: Some("deepseek".to_string()),
@@ -4407,14 +4430,17 @@ mod tests {
     #[tokio::test]
     async fn cancel_running_task_marks_canceled() -> Result<()> {
         let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
-        let manager =
-            TaskManager::start_with_executor(test_config(root), Arc::new(MockExecutor)).await?;
+        let manager = TaskManager::start_with_executor(
+            test_config(root),
+            Arc::new(CooperativeIdleCancelExecutor),
+        )
+        .await?;
 
         let task = manager
             .add_task(NewTaskRequest::from_prompt("test cancellation"))
             .await?;
 
-        sleep(Duration::from_millis(10)).await;
+        wait_for_running(&manager, &task.id, Duration::from_secs(5)).await?;
         let cancellation = manager.cancel_task(&task.id).await?;
         assert_eq!(cancellation.disposition, TaskCancelDisposition::Requested);
         let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
@@ -5269,7 +5295,7 @@ mod tests {
         let task = manager
             .add_task(NewTaskRequest::from_prompt("stuck during shutdown"))
             .await?;
-        sleep(Duration::from_millis(5)).await;
+        wait_for_running(&manager, &task.id, Duration::from_secs(5)).await?;
         manager.shutdown();
         let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
         assert_eq!(finished.status, TaskStatus::Canceled);
@@ -5292,13 +5318,7 @@ mod tests {
             .add_task(NewTaskRequest::from_prompt("stuck during shutdown"))
             .await?;
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while manager.get_task(&task.id).await?.status != TaskStatus::Running {
-            if std::time::Instant::now() >= deadline {
-                bail!("task never started running");
-            }
-            sleep(Duration::from_millis(5)).await;
-        }
+        wait_for_running(&manager, &task.id, Duration::from_secs(5)).await?;
 
         manager.shutdown();
         let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
@@ -5359,18 +5379,7 @@ mod tests {
         let task = manager
             .add_task(NewTaskRequest::from_prompt("race complete after cancel"))
             .await?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let current = manager.get_task(&task.id).await?;
-            if current.status == TaskStatus::Running {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                bail!("task never started running");
-            }
-            sleep(Duration::from_millis(5)).await;
-        }
-        sleep(Duration::from_millis(5)).await;
+        wait_for_running(&manager, &task.id, Duration::from_secs(5)).await?;
         let cancellation = manager.cancel_task(&task.id).await?;
         assert_eq!(cancellation.disposition, TaskCancelDisposition::Requested);
         let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;

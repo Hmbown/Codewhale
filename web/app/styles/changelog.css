@@ -1,0 +1,138 @@
+/* ------------------------------------------------------------------ */
+/*  Changelog                                                          */
+/* ------------------------------------------------------------------ */
+.changelog-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-top: 1.75rem;
+}
+
+.changelog-facts > div {
+  padding: 1.1rem 1.25rem;
+  border: 1px solid var(--stage-line);
+  border-radius: var(--radius-control);
+  background: var(--paper-card);
+}
+
+.changelog-facts span {
+  display: block;
+  color: var(--ink-mute);
+  font-family: var(--font-body);
+  font-size: 0.75rem;
+}
+
+.changelog-facts > div { min-width: 0; }
+
+.changelog-facts strong {
+  display: block;
+  overflow-wrap: anywhere;
+  margin-top: 0.45rem;
+  color: var(--ink);
+  font-size: 1.05rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.changelog-facts a {
+  display: inline-block;
+  margin-top: 0.55rem;
+  color: var(--indigo);
+  font-size: 0.76rem;
+}
+
+.changelog-facts a:hover { text-decoration: underline; text-underline-offset: 0.2rem; }
+
+.changelog-facts [data-published="true"] strong { color: var(--jade); }
+.changelog-facts [data-candidate="unreleased"] strong { color: var(--ochre); }
+
+.changelog-release {
+  padding-block: 2.25rem;
+  border-top: 1px solid var(--hairline);
+}
+
+.changelog-release-head {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem 1.5rem;
+}
+
+.changelog-release-head h2 {
+  font-size: clamp(1.4rem, 2.6vw, 1.9rem);
+  font-variant-numeric: tabular-nums;
+}
+
+.changelog-release-head .dotline {
+  color: var(--ink-mute);
+}
+
+.changelog-release-head .dotline a { color: var(--indigo); }
+.changelog-release-head .dotline a:hover { text-decoration: underline; text-underline-offset: 0.2rem; }
+
+.changelog-unreleased-note {
+  max-width: 44rem;
+  margin-top: 0.6rem;
+  color: var(--ink-soft);
+  font-size: 0.86rem;
+  line-height: 1.6;
+}
+
+.changelog-sections {
+  display: grid;
+  gap: 1.35rem;
+  margin-top: 1.4rem;
+}
+
+.changelog-sections h3 {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--ink-mute);
+}
+
+.changelog-sections h3 a {
+  color: var(--ink-mute);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: none;
+}
+
+.changelog-sections h3 a:hover {
+  color: var(--indigo);
+  text-decoration: underline;
+  text-underline-offset: 0.2rem;
+}
+
+.changelog-sections ul {
+  margin-top: 0.55rem;
+  border-top: 1px solid var(--hairline);
+}
+
+.changelog-sections li {
+  min-width: 0;
+  padding: 0.6rem 0;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--ink-soft);
+  font-size: 0.86rem;
+  line-height: 1.6;
+  /* Release notes quote commands, env names, and URLs verbatim; a long
+     unbroken token must wrap inside the column, never widen the page. */
+  overflow-wrap: anywhere;
+}
+
+.changelog-sections li::before {
+  content: "·";
+  margin-right: 0.6rem;
+  color: var(--stage-dim);
+}
+
+@media (max-width: 640px) {
+  .changelog-facts { grid-template-columns: 1fr; }
+}

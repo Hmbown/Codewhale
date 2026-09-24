@@ -13,19 +13,19 @@ export const docsTroubleshooting: DocsTroubleshootingDict = {
   bodyClassName: "text-ink-soft leading-relaxed",
   overviewTitle: "Troubleshooting",
   overviewLead:
-    "Start with quick triage: confirm the binary and config (codewhale --version, ~/.codewhale/config.toml), enable verbose logs with RUST_LOG=deepseek_cli=debug when needed (RUST_LOG=deepseek_cli::client=debug for HTTP retries/reconnects), and capture the current state of ~/.codewhale/sessions and ~/.codewhale/tasks.",
+    "Start with quick triage: confirm the binary and config (codewhale --version, ~/.codewhale/config.toml), enable verbose logs with RUST_LOG=codewhale_tui=debug when needed (RUST_LOG=codewhale_tui::client=debug for HTTP retries/reconnects; logs land in ~/.codewhale/logs/), and capture the current state of ~/.codewhale/sessions and ~/.codewhale/tasks.",
   incidents: [
     [
       "Turn hangs or the stream stops",
-      "If a foreground shell command is still running, press Ctrl+B to move it to the background (the turn keeps running and the command becomes a background job under /jobs); use Esc or Ctrl+C to cancel the turn itself. Inspect deepseek_cli::client retry logs and endpoint connectivity, and after a restart confirm the previously in-flight turn shows as interrupted rather than running.",
+      "If a foreground shell command is still running, press Ctrl+B to move it to the background (the turn keeps running and the command becomes a background job under /jobs); use Esc or Ctrl+C to cancel the turn itself. Inspect codewhale_tui::client retry logs and endpoint connectivity, and after a restart confirm the previously in-flight turn shows as interrupted rather than running.",
     ],
     [
       "Network outage / offline behavior",
-      "New prompts queue while offline, persisted to ~/.codewhale/sessions/checkpoints/offline_queue.json. Inspect with /queue list, restore connectivity, then re-send queued entries (/queue edit <n> plus Enter, or the normal input flow); the queue file clears when the queue empties.",
+      "New prompts queue while offline, persisted per session to ~/.codewhale/sessions/checkpoints/<session-id>.offline_queue.json (a legacy global offline_queue.json is adopted once on upgrade). Inspect with /queue list, restore connectivity, then re-send queued entries (/queue edit <n> plus Enter, or the normal input flow); the queue file clears when the queue empties.",
     ],
     [
       "Crash recovery",
-      "The checkpoint lives at ~/.codewhale/sessions/checkpoints/latest.json; startup begins a fresh session unless --resume/--continue is supplied. Resume explicitly with codewhale --resume <id> or Ctrl+R in the TUI; if the checkpoint schema is newer than the binary supports, upgrade the binary or remove the stale checkpoint.",
+      "Each session checkpoints to ~/.codewhale/sessions/checkpoints/<session-id>.json (a legacy latest.json is still read but no longer written); startup begins a fresh session unless --resume/--continue is supplied. Resume explicitly with codewhale --resume <id> or Ctrl+R in the TUI; if the checkpoint schema is newer than the binary supports, upgrade the binary or remove the stale checkpoint.",
     ],
     [
       "Persistent state schema errors",

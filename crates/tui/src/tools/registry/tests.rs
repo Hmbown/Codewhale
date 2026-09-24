@@ -1578,6 +1578,33 @@ fn agent_runtime_surface_gates_verify_on_option() {
 }
 
 #[test]
+fn agent_runtime_surface_gates_request_plugin_install_on_option() {
+    use super::AgentToolSurfaceOptions;
+    use crate::worker_profile::ShellPolicy;
+
+    // Policy rule 11: hosts without the TUI (exec, runtime API) and sessions
+    // with contextual tips off get no plugin-offer tool in any mode.
+    let build_surface = |enabled: bool| {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let mut options = AgentToolSurfaceOptions::new(ShellPolicy::Full);
+        options.request_plugin_install_enabled = enabled;
+        ToolRegistryBuilder::new()
+            .with_agent_runtime_surface(
+                None,
+                "test-model".to_string(),
+                options,
+                crate::tools::todo::new_shared_todo_list(),
+                crate::tools::plan::new_shared_plan_state(),
+            )
+            .build(ctx)
+    };
+
+    assert!(build_surface(true).contains("request_plugin_install"));
+    assert!(!build_surface(false).contains("request_plugin_install"));
+}
+
+#[test]
 fn test_builder_with_agent_tools_policy_includes_finance() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path().to_path_buf());
@@ -2148,6 +2175,7 @@ fn registration_adapter_origins_are_bounded_and_exclude_execution_payloads() {
                     name: hostile.clone(),
                     description: Some(command.into()),
                     input_schema: json!({"description":schema_payload}),
+                    annotations: None,
                 },
                 pool: Arc::new(tokio::sync::Mutex::new(crate::mcp::McpPool::new(
                     crate::mcp::McpConfig::default(),

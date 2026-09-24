@@ -28,6 +28,9 @@ crates/*/assets/**/*.json text eol=lf
 crates/*/assets/**/*.md text eol=lf
 crates/*/locales/*.json text eol=lf
 workflows/*.js text eol=lf
+# Executable documentation: the Fleet tutorial's JSON fence is parsed by the
+# task-spec contract test, so its bytes must agree on Windows and Unix.
+docs/FLEET_WORKFLOW_TUTORIAL.md text eol=lf
 # The dsh bundle scene is include_str!() into the generated client.js and
 # hashed for stale detection; CRLF would change both across platforms.
 crates/tui/src/integrations/dsh/*.js text eol=lf

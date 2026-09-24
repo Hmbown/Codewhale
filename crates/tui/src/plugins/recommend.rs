@@ -3,10 +3,11 @@
 //! Ranks installed bundles and locally-added marketplace candidates. A
 //! suggestion is never an install, trust, enable, or network side effect.
 //!
-//! The proactive toast and the `<recommended_plugins>` fragment are driven
-//! by the declared-keyword matcher (`match_plugin_for_draft`), not by the
-//! score below: there is no host score gate on what the model sees. Scoring
-//! only ranks the user-invoked `/plugin suggest` list.
+//! The send-time toast is driven by the declared-keyword matcher
+//! (`match_plugin_for_draft`), not by the score below. Scoring only ranks the
+//! user-invoked `/plugin suggest` list. Nothing here writes to the model's
+//! request: the former `<recommended_plugins>` user-turn block is gone
+//! (0.10.1 plugin offering policy, rule 2).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -83,12 +84,8 @@ impl PluginTaskRecommendation {
     }
 }
 
-const RECOMMENDED_PLUGINS_INTRO: &str =
-    "Here is a list of plugins that are available but not installed.";
-const MAX_RECOMMENDED_PLUGINS: usize = 8;
-
-/// One matcher-driven candidate for the live composer CTA or the
-/// append-only `<recommended_plugins>` user fragment.
+/// One matcher-driven candidate for the send-time toast or a model-requested
+/// review.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginKeywordMatch {
     pub name: String,
@@ -142,11 +139,33 @@ pub fn load_marketplace_candidates(
 }
 
 /// Keyword candidates that can still be reviewed: installed-but-idle plugins
-/// and uninstalled catalog entries. Already-active plugins are omitted.
+/// and uninstalled catalog entries. Already-active plugins are omitted, and so
+/// are:
+///
+/// - bundled (`PluginScope::Builtin`) plugins, which are never advertised and
+///   appear passively in `/plugin list` and Extensions only (policy rule 5);
+/// - plugins that cannot run on this machine: an installed bundle whose
+///   `when` gate is not met, or a catalog entry whose `when.os` excludes the
+///   current OS (policy rule 7).
 #[must_use]
 pub fn idle_and_catalog_keyword_matches(
     registry: &PluginRegistry,
     marketplace: &[MarketplaceCandidate],
+) -> Vec<PluginKeywordMatch> {
+    idle_and_catalog_keyword_matches_for_os(registry, marketplace, std::env::consts::OS)
+}
+
+/// True when a catalog entry's `when.os` (if any) admits `os`. Binary gates
+/// are left to install review: the binary may arrive with the plugin.
+fn catalog_os_allows(when: Option<&super::manifest::PluginWhen>, os: &str) -> bool {
+    when.and_then(|when| when.os.as_ref())
+        .is_none_or(|os_list| os_list.iter().any(|entry| entry.eq_ignore_ascii_case(os)))
+}
+
+fn idle_and_catalog_keyword_matches_for_os(
+    registry: &PluginRegistry,
+    marketplace: &[MarketplaceCandidate],
+    os: &str,
 ) -> Vec<PluginKeywordMatch> {
     let installed = registry.list();
     let installed_names = installed
@@ -155,7 +174,10 @@ pub fn idle_and_catalog_keyword_matches(
         .collect::<BTreeSet<_>>();
     let mut out = Vec::new();
     for plugin in &installed {
-        if plugin.active() {
+        if plugin.active()
+            || plugin.scope == super::types::PluginScope::Builtin
+            || !plugin.applicable
+        {
             continue;
         }
         let next_step = if !plugin.trusted() {
@@ -181,14 +203,15 @@ pub fn idle_and_catalog_keyword_matches(
             continue;
         }
         // Only plugins are plugin suggestions (#6290 rework): skill entries
-        // are installable, but this pool feeds the composer toast and the
-        // `<recommended_plugins>` fragment, so a skill must not be dressed as
-        // one. This replaces #6274's name suppression, which existed only
+        // are installable, but this pool feeds the composer toast, so a skill
+        // must not be dressed as one. This replaces #6274's name suppression, which existed only
         // because the catalog mixed the two kinds.
         if candidate.kind != crate::plugins::marketplace::types::MarketplaceEntryKind::Plugin {
             continue;
         }
-        if installed_names.contains(&candidate.name.to_ascii_lowercase()) {
+        if installed_names.contains(&candidate.name.to_ascii_lowercase())
+            || !catalog_os_allows(candidate.when.as_ref(), os)
+        {
             continue;
         }
         let mut keywords = candidate.keywords.clone();
@@ -263,65 +286,6 @@ pub fn match_plugin_for_draft_among(
     let mut matched = candidates.get(idx)?.clone();
     matched.matched_term = Some(term);
     Some(matched)
-}
-
-/// Per-Engine gate for the append-only `<recommended_plugins>` fragment.
-///
-/// A plugin id is suggested at most once per Engine lifetime, and dismissals
-/// are honored through `Settings`.
-///
-/// Skill-name suppression (#6274) is gone with the #6290 rework: it existed
-/// only because skill entries were catalogued as plugins and then had to be
-/// suppressed by name — a snapshot-based check that missed mid-session
-/// changes and never applied to the composer toast. Entry kinds now keep
-/// skills out of the plugin pool entirely (see `MarketplaceEntryKind`).
-#[derive(Debug, Default)]
-pub struct RecommendedPluginGate {
-    shown: BTreeSet<String>,
-}
-
-impl RecommendedPluginGate {
-    /// True when this plugin may be suggested now: not already suggested in
-    /// this Engine's lifetime. First admission records the plugin id.
-    fn admits(&mut self, id: &str) -> bool {
-        self.shown.insert(id.to_string())
-    }
-}
-
-/// Append-only user-turn fragment. Never part of the pinned system prefix.
-/// Bounded, omitted when nothing matches.
-#[must_use]
-pub fn recommended_plugins_user_fragment(
-    draft: &str,
-    registry: &PluginRegistry,
-    marketplace: &[MarketplaceCandidate],
-    gate: &mut RecommendedPluginGate,
-) -> Option<String> {
-    // Called once when composing a user turn, never from the render loop.
-    // Read the shared preference so headless and long-lived Engines also
-    // honor dismissals recorded by a TUI after Engine startup.
-    let settings = crate::settings::Settings::load_read_only().unwrap_or_default();
-    let matched = match_plugin_for_draft(
-        draft,
-        registry,
-        marketplace,
-        &settings.dismissed_plugin_suggestions,
-    )?;
-    // Once per Engine lifetime per plugin id. Skill exclusion happens a
-    // layer down: skill-kind entries never enter the plugin pool (#6290).
-    if !gate.admits(&matched.id) {
-        return None;
-    }
-    let mut listed = vec![matched];
-    listed.truncate(MAX_RECOMMENDED_PLUGINS);
-    let body = listed
-        .iter()
-        .map(|plugin| format!("- {} ({})", plugin.name, plugin.id))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Some(format!(
-        "<recommended_plugins>\n{RECOMMENDED_PLUGINS_INTRO}\n\n{body}\n</recommended_plugins>"
-    ))
 }
 
 /// Resolve a model-requested plugin name against installed and catalog
@@ -660,63 +624,135 @@ mod tests {
         assert!(recs.is_empty(), "{recs:?}");
     }
 
+    /// Policy rule 5: a bundled plugin is never advertised, however well its
+    /// keywords match; it stays visible in `/plugin list` and Extensions.
     #[test]
-    fn recommended_plugins_fragment_present_for_matching_idle_plugin() {
+    fn builtin_plugins_are_never_suggested() {
+        let root = TempDir::new().unwrap();
+        let config = crate::plugins::discovery::DiscoveryConfig {
+            workspace: root.path().join("project"),
+            user_plugins_dir: root.path().join("user"),
+            workspace_plugins_dir: root.path().join("workspace"),
+            builtin_plugin_dirs: vec![root.path().join("builtin")],
+            state_path: root.path().join("state.json"),
+        };
+        let bundle = root.path().join("builtin/computer-use");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(
+            bundle.join("plugin.toml"),
+            "schema_version = 1\n[plugin]\nname = \"computer-use\"\nversion = \"1.0.0\"\nkeywords = [\"accessibility\", \"screenshot\", \"desktop control\"]\n",
+        )
+        .unwrap();
+        let registry = crate::plugins::discovery::discover_with_config(&config);
+        let plugin = registry.get("computer-use").expect("builtin discovered");
+        assert_eq!(plugin.scope, crate::plugins::types::PluginScope::Builtin);
+        assert!(!plugin.active(), "fixture must be idle to prove the skip");
+
+        let catalog = [marketplace_candidate(
+            "official",
+            "computer-use",
+            &["desktop control"],
+        )];
+        assert!(idle_and_catalog_keyword_matches(&registry, &catalog).is_empty());
+        for draft in [
+            "improve accessibility",
+            "take a screenshot",
+            "fix the accessibility of the login form",
+            "use desktop control to click the button",
+        ] {
+            assert_eq!(
+                match_plugin_for_draft(draft, &registry, &catalog, &BTreeSet::new()),
+                None,
+                "{draft}"
+            );
+        }
+        assert!(lookup_reviewable_plugin("computer-use", &registry, &catalog).is_none());
+    }
+
+    /// Policy rule 6: generic words never trigger an offer, even for a
+    /// non-bundled plugin that declares them.
+    #[test]
+    fn generic_words_do_not_suggest_an_installed_plugin() {
         let _lock = lock_test_env();
         let root = TempDir::new().unwrap();
         let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path().join("home"));
-        write_keyword_bundle(root.path(), "supabase", "Hosted Postgres", &["supabase"]);
+        write_keyword_bundle(
+            root.path(),
+            "chromewhale",
+            "Codewhale in your own Chrome",
+            &["chrome", "browser", "extension", "side-panel", "web"],
+        );
         let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
             .registry_for_workspace(root.path());
-
-        let fragment = recommended_plugins_user_fragment(
-            "add supabase auth to login",
-            &registry,
-            &[],
-            &mut RecommendedPluginGate::default(),
-        )
-        .expect("idle plugin should produce a fragment");
-        assert!(fragment.starts_with("<recommended_plugins>"));
-        assert!(fragment.contains("- supabase ("));
-        assert!(fragment.contains("</recommended_plugins>"));
-        assert!(
-            recommended_plugins_user_fragment(
-                "fix the failing test",
-                &registry,
-                &[],
-                &mut RecommendedPluginGate::default(),
-            )
-            .is_none()
+        let catalog = [marketplace_candidate(
+            "official",
+            "screen-tools",
+            &["accessibility", "screenshot", "automation"],
+        )];
+        for draft in [
+            "improve accessibility",
+            "take a screenshot",
+            "open chrome and check the web page",
+            "write a browser extension",
+            "add automation to the docs site",
+        ] {
+            assert_eq!(
+                match_plugin_for_draft(draft, &registry, &catalog, &BTreeSet::new()),
+                None,
+                "{draft}"
+            );
+        }
+        // Specific terms still work.
+        assert_eq!(
+            match_plugin_for_draft("open the side-panel", &registry, &catalog, &BTreeSet::new())
+                .map(|matched| matched.name),
+            Some("chromewhale".to_string())
         );
     }
 
+    /// Policy rule 7: only offer what can run here.
     #[test]
-    fn recommended_plugins_fragment_suggests_a_plugin_once_per_gate() {
+    fn plugins_for_another_os_are_not_suggested() {
         let _lock = lock_test_env();
         let root = TempDir::new().unwrap();
         let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path().join("home"));
-        write_keyword_bundle(root.path(), "supabase", "Hosted Postgres", &["supabase"]);
+        let registry = crate::plugins::PluginRegistry::empty(root.path());
+        let mut mac_only = marketplace_candidate("official", "mac-control", &["mac control"]);
+        mac_only.when = Some(crate::plugins::manifest::PluginWhen {
+            os: Some(vec!["macos".to_string()]),
+            binaries: None,
+        });
+        let catalog = std::slice::from_ref(&mac_only);
+        assert!(idle_and_catalog_keyword_matches_for_os(&registry, catalog, "linux").is_empty());
+        assert!(idle_and_catalog_keyword_matches_for_os(&registry, catalog, "windows").is_empty());
+        assert_eq!(
+            idle_and_catalog_keyword_matches_for_os(&registry, catalog, "macos").len(),
+            1,
+            "control: the same entry is offered on macOS"
+        );
+
+        // An installed bundle whose `when` gate fails here is not offered.
+        let bundle = root.path().join(".codewhale/plugins/elsewhere");
+        fs::create_dir_all(&bundle).unwrap();
+        let other_os = if cfg!(target_os = "windows") {
+            "linux"
+        } else {
+            "windows"
+        };
+        fs::write(
+            bundle.join("plugin.toml"),
+            format!(
+                "schema_version = 1\n[plugin]\nname = \"elsewhere\"\nversion = \"1.0.0\"\nkeywords = [\"elsewhere\"]\n[when]\nos = [\"{other_os}\"]\n"
+            ),
+        )
+        .unwrap();
         let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
             .registry_for_workspace(root.path());
-
-        let mut gate = RecommendedPluginGate::default();
-        let first = recommended_plugins_user_fragment(
-            "add supabase auth to login",
-            &registry,
-            &[],
-            &mut gate,
-        )
-        .expect("first matching turn suggests the plugin");
-        assert!(first.contains("- supabase ("));
-        assert!(
-            recommended_plugins_user_fragment(
-                "add supabase auth to the signup flow",
-                &registry,
-                &[],
-                &mut gate,
-            )
-            .is_none(),
-            "a plugin id is suggested at most once per Engine lifetime (#6274)"
+        let plugin = registry.get("elsewhere").expect("bundle discovered");
+        assert!(!plugin.applicable);
+        assert_eq!(
+            match_plugin_for_draft("run elsewhere", &registry, &[], &BTreeSet::new()),
+            None
         );
     }
 
@@ -735,29 +771,14 @@ mod tests {
             idle_and_catalog_keyword_matches(&registry, slice).is_empty(),
             "a skill entry must not be a plugin candidate"
         );
-        assert!(
-            recommended_plugins_user_fragment(
-                "run the test suite",
-                &registry,
-                slice,
-                &mut RecommendedPluginGate::default(),
-            )
-            .is_none(),
-            "a skill entry must not produce a <recommended_plugins> fragment"
-        );
 
-        // Control: the same entry as a plugin still matches, so the
+        // Control: the same entry as a plugin is a candidate, so the
         // exclusion is the kind and not a broken fixture.
         skill.kind = MarketplaceEntryKind::Plugin;
-        assert!(
-            recommended_plugins_user_fragment(
-                "run the test suite",
-                &registry,
-                std::slice::from_ref(&skill),
-                &mut RecommendedPluginGate::default(),
-            )
-            .is_some(),
-            "the same entry as a plugin still matches"
+        assert_eq!(
+            idle_and_catalog_keyword_matches(&registry, std::slice::from_ref(&skill)).len(),
+            1,
+            "the same entry as a plugin is a candidate"
         );
     }
 

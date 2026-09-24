@@ -162,7 +162,7 @@ fn pet_widget_keeps_unknown_distinct_from_sleep_and_keeps_its_label() {
     }
     .render(buf.area, &mut buf);
     let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
-    assert!(text.contains("other · drift · unobserved"));
+    assert!(text.contains("other · drift · resting"));
     let mut narrow = Buffer::empty(Rect::new(0, 0, 18, 6));
     let before = narrow.clone();
     pet_widget::PetWidget {

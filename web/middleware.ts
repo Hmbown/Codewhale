@@ -44,6 +44,31 @@ function canonicalHostRedirect(req: NextRequest): NextResponse | null {
   return NextResponse.redirect(url, 301);
 }
 
+/**
+ * Paths with no page of their own that should land on installation in one
+ * hop, bare or localized. `/download` and `/desktop` 404'd (M2) until a dark
+ * download hub exists (D11). `/pricing` went bare → `/en/pricing` →
+ * `/en/install` (UX-13); public pricing stays off (§0), so it keeps landing on
+ * install — `app/[locale]/pricing/page.tsx` still redirects as a backstop.
+ * Temporary (307) because each of these may become a real page later.
+ */
+const INSTALL_ALIASES = new Set(["download", "desktop", "pricing"]);
+
+function installAliasRedirect(req: NextRequest): NextResponse | null {
+  const segments = req.nextUrl.pathname.split("/").filter(Boolean);
+  const existing = pathLocale(req.nextUrl.pathname);
+  const rest = existing ? segments.slice(1) : segments;
+  if (rest.length !== 1 || !INSTALL_ALIASES.has(rest[0].toLowerCase())) return null;
+  const locale =
+    existing ??
+    detectLocaleFromHeaders(req.cookies.get(COOKIE)?.value, req.headers.get("accept-language"));
+  const url = req.nextUrl.clone();
+  url.pathname = `/${locale}/install`;
+  const res = NextResponse.redirect(url, 307);
+  res.cookies.set(COOKIE, locale, { path: "/", maxAge: 60 * 60 * 24 * 365 });
+  return res;
+}
+
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
@@ -77,6 +102,9 @@ export function middleware(req: NextRequest) {
     url.pathname = canonicalAuth;
     return applySecurityHeaders(NextResponse.redirect(url, 308));
   }
+
+  const installAlias = installAliasRedirect(req);
+  if (installAlias) return applySecurityHeaders(installAlias);
 
   // Check if locale is already in path (`pt-BR` is one segment).
   const existing = pathLocale(pathname);

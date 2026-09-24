@@ -268,7 +268,7 @@ fn read_bounded_resident_context(
 /// the unbounded sentinel used by the default agent loop.
 const MAX_SUBAGENT_STEPS: u32 = 2_000;
 /// Default wall-clock budget for one child run, including model and tool work.
-const DEFAULT_CHILD_WALL_TIME: Duration = Duration::from_secs(30 * 60);
+pub(crate) const DEFAULT_CHILD_WALL_TIME: Duration = Duration::from_secs(30 * 60);
 const MAX_CHILD_WALL_TIME: Duration = Duration::from_secs(24 * 60 * 60);
 /// Default wall-clock budget for a single sub-agent tool execution. The active
 /// value travels on `SubAgentRuntime::tool_timeout` so a long-but-legitimate
@@ -515,6 +515,8 @@ const SUBAGENT_SESSION_CLOSED_REASON: &str = "Interrupted: parent session closed
 #[cfg(test)]
 const SUBAGENT_MODEL_WAIT_REASON: &str = "waiting for model response";
 const SUBAGENT_QUEUED_LAUNCH_REASON: &str = "queued: waiting for a sub-agent launch slot";
+/// Result text of a parent/operator Stop, before any preservation receipt.
+const CANCELLED_BY_PARENT_RESULT: &str = "Cancelled by parent request.";
 /// Queued-reason variant used while the rate-limit governor has paused new
 /// sub-agent launches after sustained provider 429s.
 const SUBAGENT_QUEUED_RATE_LIMIT_REASON: &str = "queued: waiting for provider rate-limit recovery";
@@ -2276,15 +2278,47 @@ impl SubAgentTerminalDeliveryContext {
         }
 
         if let Some(event_tx) = self.event_tx.as_ref() {
-            let _ = event_tx.try_send(Event::AgentComplete {
-                owner_session_id: self.session_id.clone(),
-                id: result.agent_id.clone(),
-                result: completion.payload,
-                outcome: Some(result.status.clone()),
-                parent_run_id: result.parent_run_id.clone(),
-                spawn_depth: Some(result.spawn_depth),
-                continuable: Some(subagent_checkpoint_is_continuable(result)),
-                usage: result.usage.clone(),
+            send_terminal_event(
+                event_tx,
+                Event::AgentComplete {
+                    owner_session_id: self.session_id.clone(),
+                    id: result.agent_id.clone(),
+                    result: completion.payload,
+                    outcome: Some(result.status.clone()),
+                    parent_run_id: result.parent_run_id.clone(),
+                    spawn_depth: Some(result.spawn_depth),
+                    continuable: Some(subagent_checkpoint_is_continuable(result)),
+                    usage: result.usage.clone(),
+                },
+            );
+        }
+    }
+}
+
+/// Deliver a terminal sub-agent event the host must not lose (#6184 H2).
+///
+/// `try_send` dropped `AgentComplete` whenever the event channel was full,
+/// leaving a ghost Running row that silenced every stall watchdog. The
+/// terminal claim forbids awaiting here, so a full channel hands the event to
+/// a task that waits for capacity; only a closed channel (no host left)
+/// drops it. Progress events stay lossy by design. `AgentSpawned` also stays
+/// lossy: delivered late it could land after the completion and resurrect a
+/// Running row, while a lost one is recovered by the completion itself.
+pub(crate) fn send_terminal_event(event_tx: &mpsc::Sender<Event>, event: Event) {
+    let event = match event_tx.try_send(event) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
+        Err(mpsc::error::TrySendError::Full(event)) => event,
+    };
+    let tx = event_tx.clone();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                let _ = tx.send(event).await;
+            });
+        }
+        Err(_) => {
+            std::thread::spawn(move || {
+                let _ = tx.blocking_send(event);
             });
         }
     }
@@ -2595,6 +2629,12 @@ pub struct SubAgentRuntime {
     pub reasoning_effort: Option<String>,
     pub reasoning_effort_auto: bool,
     pub role_models: HashMap<String, SubagentModelOverride>,
+    /// Operator-approved `provider/model` routes this child may move to when
+    /// its role pin's first request is refused before any work. Set only by
+    /// a role pin that declares them (`[subagents.roles.<role>]
+    /// replacements`); every other route source, including exact Fleet
+    /// bindings and task-level models, keeps it empty and stays exact.
+    pub route_replacements: Vec<SubagentModelOverride>,
     pub context: ToolContext,
     pub allow_shell: bool,
     /// When true, Suggest-level file writes auto-accept for write-capable roles
@@ -2754,6 +2794,7 @@ impl SubAgentRuntime {
             reasoning_effort: None,
             reasoning_effort_auto: false,
             role_models: HashMap::new(),
+            route_replacements: Vec::new(),
             context,
             allow_shell,
             accept_edits: false,
@@ -3067,6 +3108,8 @@ impl SubAgentRuntime {
             reasoning_effort: self.reasoning_effort.clone(),
             reasoning_effort_auto: self.reasoning_effort_auto,
             role_models: self.role_models.clone(),
+            // A descendant earns replacement authority only from its own pin.
+            route_replacements: Vec::new(),
             context: child_context,
             allow_shell: self.allow_shell,
             accept_edits: self.accept_edits,
@@ -5465,6 +5508,29 @@ impl SubAgentManager {
         self.persist_state_debounced();
     }
 
+    /// Persist a pre-work route replacement in the worker's existing route
+    /// receipt: the effective provider/model, `role.replacement` as the
+    /// source, and a note naming the original route, reason and attempts.
+    fn record_route_replacement(
+        &mut self,
+        worker_id: &str,
+        provider_id: String,
+        model_id: String,
+        note: String,
+    ) {
+        if let Some(record) = self.worker_records.get_mut(worker_id) {
+            record.spec.model.clone_from(&model_id);
+            if let Some(route) = record.spec.child_route.as_mut() {
+                route.provider_id = provider_id;
+                route.model_id = model_id;
+                route.route_source = SpawnRouteSource::RoleReplacement.as_str().to_string();
+                route.fallback_note = Some(note);
+            }
+            record.updated_at_ms = epoch_millis_now();
+            self.persist_state_debounced();
+        }
+    }
+
     fn mark_worker_unreported_usage(&mut self, worker_id: &str) {
         if let Some(record) = self.worker_records.get_mut(worker_id) {
             record.has_unreported_usage = true;
@@ -5684,12 +5750,33 @@ impl SubAgentManager {
             self.snapshot_for_listing(agent)
         };
         terminal.status = SubAgentStatus::Cancelled;
-        terminal.result = Some("Cancelled by parent request.".to_string());
+        terminal.result = Some(CANCELLED_BY_PARENT_RESULT.to_string());
         terminal.needs_input = None;
         if !self.finish_terminal_result(&agent_id, terminal, true, true) {
             return self.get_result(&agent_id);
         }
         self.get_result(&agent_id)
+    }
+
+    /// Append the work-preservation receipt to a child this process just
+    /// cancelled (addendum F4). Returns the refreshed snapshot, or `None` when
+    /// the child is no longer a fresh Stop (already noted, or re-terminalized).
+    pub(crate) fn append_cancel_preservation_note(
+        &mut self,
+        agent_id: &str,
+        note: &str,
+    ) -> Option<SubAgentResult> {
+        let agent = self.agents.get_mut(agent_id)?;
+        if agent.status != SubAgentStatus::Cancelled
+            || agent.result.as_deref() != Some(CANCELLED_BY_PARENT_RESULT)
+        {
+            return None;
+        }
+        agent.result = Some(format!("{CANCELLED_BY_PARENT_RESULT} {note}"));
+        self.persist_state_best_effort();
+        self.agents
+            .get(agent_id)
+            .map(|agent| self.snapshot_for_listing(agent))
     }
 
     /// Terminalize a child that already left `Running` but whose worker record
@@ -10171,6 +10258,7 @@ async fn cancel_agent_from_input(
             manager.get_worker_record_for_session(&context.state_namespace, &snapshot.agent_id);
         (snapshot, worker_record)
     };
+    let snapshot = preserve_cancelled_work(&manager, snapshot).await;
     let projection =
         subagent_session_projection(&manager, snapshot, false, context, worker_record).await;
     let mut tool_result = ToolResult::json(&projection)
@@ -10800,14 +10888,16 @@ fn apply_spawn_write_authority(runtime: &mut SubAgentRuntime, request: &SpawnReq
     }
     // `read_only` must be an executable posture, not just metadata. Normally
     // write-capable identities also inherit Full shell, which could mutate the
-    // workspace without a scope-aware claim under Auto/Full Access. Clamp that
-    // shell surface completely; verifier keeps its deliberate test runner.
+    // workspace without a scope-aware claim under Auto/Full Access. Narrow it
+    // to the existing classifier-bounded inspection shell, not a file-only
+    // surface. A parent with no shell stays shell-less; verifier keeps its
+    // deliberate test runner. The grant and executor enforce the same boundary.
     runtime.worker_profile.permissions.write = false;
     if matches!(
         request.agent_type,
         FleetRole::Worker | FleetRole::Builder | FleetRole::Custom
     ) {
-        runtime.worker_profile.shell = ShellPolicy::None;
+        runtime.worker_profile.shell = runtime.worker_profile.shell.min_with(ShellPolicy::ReadOnly);
     }
 }
 
@@ -11367,6 +11457,34 @@ fn budget_partial_result(
     budget_partial_result_with_note(result, cause, &note)
 }
 
+/// Cancelling keeps the work (addendum F4, fleet-5). A Stop used to end a
+/// write-scoped child with only "Cancelled by parent request.", leaving the
+/// files it had changed unnamed and uncheckpointed. After a fresh
+/// Running -> Cancelled transition this runs the same inventory and
+/// isolated-worktree checkpoint a budget death gets, off the manager lock,
+/// and appends it to the child's result. Read-only children have no
+/// delivery baseline and are returned unchanged.
+pub(crate) async fn preserve_cancelled_work(
+    manager: &SharedSubAgentManager,
+    snapshot: SubAgentResult,
+) -> SubAgentResult {
+    if snapshot.status != SubAgentStatus::Cancelled
+        || snapshot.result.as_deref() != Some(CANCELLED_BY_PARENT_RESULT)
+    {
+        return snapshot;
+    }
+    let Some(note) =
+        budget_work_preservation_note(manager, &snapshot.agent_id, "cancelled by parent").await
+    else {
+        return snapshot;
+    };
+    manager
+        .write()
+        .await
+        .append_cancel_preservation_note(&snapshot.agent_id, &note)
+        .unwrap_or(snapshot)
+}
+
 /// Inventory the workspace changes a budget-killed worker left behind, for
 /// the preservation receipt in its terminal result (#5529). The spawn-time
 /// delivery baseline makes `changed_paths` name exactly what this worker
@@ -11374,12 +11492,11 @@ fn budget_partial_result(
 /// silent loss. Returns `None` when no write-scoped baseline exists (a
 /// read-only worker cannot have left file work) or git cannot answer.
 async fn budget_work_preservation_note(
-    runtime: &SubAgentRuntime,
+    manager: &SharedSubAgentManager,
     agent_id: &str,
     cause: &str,
 ) -> Option<String> {
-    let (evidence, workspace, isolated_worktree) = runtime
-        .manager
+    let (evidence, workspace, isolated_worktree) = manager
         .read()
         .await
         .worker_records
@@ -11580,7 +11697,7 @@ async fn run_subagent_task_inner(mut task: SubAgentTask) {
             None => {
                 match tokio::time::timeout_at(
                     deadline.into(),
-                    acquire_queued_launch_permit(&task, Arc::clone(gate)),
+                    acquire_queued_launch_permit(&task, Arc::clone(gate), deadline),
                 )
                 .await
                 {
@@ -11654,7 +11771,7 @@ async fn run_subagent_task_inner(mut task: SubAgentTask) {
         .is_some_and(|error| error.contains("wall-time budget exhausted"))
     {
         budget_work_preservation_note(
-            &task.runtime,
+            &task.runtime.manager,
             &agent_id,
             failure_error
                 .as_deref()
@@ -11718,24 +11835,69 @@ async fn run_subagent_task_inner(mut task: SubAgentTask) {
     }
 }
 
+/// Queued-row reason (addendum F5): why the child waits — a free slot, or the
+/// rate-limit governor's pause/throttle — and how much of its wall budget is
+/// left (as its end time). The wall clock starts at spawn and keeps running while queued (it is
+/// shared with the permit wait so saturation cannot stretch a child past its
+/// budget, #6277); the row says so instead of hiding it.
+fn queued_launch_reason(task: &SubAgentTask, deadline: Instant) -> String {
+    let now = Instant::now();
+    let governor_line = task
+        .runtime
+        .governor
+        .as_ref()
+        .and_then(|governor| governor.snapshot(now).status_line());
+    let base = match governor_line {
+        Some(line)
+            if task
+                .runtime
+                .governor
+                .as_ref()
+                .is_some_and(|governor| governor.is_paused(now)) =>
+        {
+            format!("{SUBAGENT_QUEUED_RATE_LIMIT_REASON} — {line}")
+        }
+        Some(line) => format!("{SUBAGENT_QUEUED_LAUNCH_REASON} — {line}"),
+        None => SUBAGENT_QUEUED_LAUNCH_REASON.to_string(),
+    };
+    format!(
+        "{base} {}",
+        queued_budget_note(
+            deadline.saturating_duration_since(now),
+            chrono::Local::now()
+        )
+    )
+}
+
+/// The wall-budget half of a queued reason. The row is republished only when
+/// the governor state changes, so a "N minutes left" count would freeze at its
+/// first value while the budget drained; the absolute end time stays true.
+fn queued_budget_note(remaining: Duration, now: chrono::DateTime<chrono::Local>) -> String {
+    let ends_at = chrono::Duration::from_std(remaining)
+        .ok()
+        .and_then(|remaining| now.checked_add_signed(remaining))
+        .unwrap_or(now);
+    format!(
+        "(wall budget ends at {}; it keeps running while queued)",
+        ends_at.format("%H:%M")
+    )
+}
+
+/// The part of a queued reason that changes with governor state, not time.
+fn queued_reason_cause(reason: &str) -> &str {
+    reason.split(" (").next().unwrap_or(reason)
+}
+
 async fn acquire_queued_launch_permit(
     task: &SubAgentTask,
     gate: Arc<governor::DynamicGate>,
+    deadline: Instant,
 ) -> Option<governor::DynamicGatePermit> {
     // When the governor has paused launches over sustained provider 429s,
     // surface the reason in the queued status instead of the generic
     // "waiting for a launch slot" message.
-    let paused_for_rate_limit = task
-        .runtime
-        .governor
-        .as_ref()
-        .is_some_and(|governor| governor.is_paused(Instant::now()));
-    let queued_reason = if paused_for_rate_limit {
-        SUBAGENT_QUEUED_RATE_LIMIT_REASON
-    } else {
-        SUBAGENT_QUEUED_LAUNCH_REASON
-    };
-    record_queued_launch_progress(task, queued_reason).await;
+    let mut queued_reason = queued_launch_reason(task, deadline);
+    record_queued_launch_progress(task, &queued_reason).await;
     // While queued, periodically probe the governor: if a rate-limit pause
     // outlives its window (the in-flight fleet finished before any success
     // could lift the pause), the probe resumes launches instead of leaving
@@ -11764,6 +11926,13 @@ async fn acquire_queued_launch_permit(
                 if let Some(governor) = task.runtime.governor.as_ref() {
                     governor.recover_if_window_drained(Instant::now());
                 }
+                // F5: re-publish when the governor state behind the queue
+                // changed (paused, throttled, recovered).
+                let reason = queued_launch_reason(task, deadline);
+                if queued_reason_cause(&reason) != queued_reason_cause(&queued_reason) {
+                    record_queued_launch_progress(task, &reason).await;
+                    queued_reason = reason;
+                }
                 // If the probe lifted a pause it raised the gate capacity,
                 // which grants queued waiters; the pinned `acquire_permit`
                 // below observes the grant on the next poll.
@@ -11775,7 +11944,7 @@ async fn acquire_queued_launch_permit(
     }
 }
 
-async fn record_queued_launch_progress(task: &SubAgentTask, queued_reason: &'static str) {
+async fn record_queued_launch_progress(task: &SubAgentTask, queued_reason: &str) {
     {
         let mut manager = task.runtime.manager.write().await;
         manager.touch(&task.agent_id);
@@ -12513,8 +12682,21 @@ fn retryable_subagent_provider_failure(
 }
 
 fn is_transient_subagent_provider_error(error: &anyhow::Error) -> bool {
-    if let Some(LlmError::RateLimited { .. }) = error.downcast_ref::<LlmError>() {
-        return true;
+    // Durable account, model, and policy refusals outrank message text: a
+    // quota error mentioning "429" is not a transient rate limit. Retain the
+    // transport fallback for generic/parse errors and relay HTTP 400s, which
+    // can carry an upstream timeout rather than an invalid request.
+    match error.downcast_ref::<LlmError>() {
+        Some(
+            LlmError::QuotaExhausted(_)
+            | LlmError::AuthenticationError(_)
+            | LlmError::AuthorizationError(_)
+            | LlmError::ModelError(_)
+            | LlmError::ContentPolicyError(_)
+            | LlmError::ContextLengthError(_),
+        ) => return false,
+        Some(error) if error.is_retryable() => return true,
+        _ => {}
     }
 
     let message = format!("{error:#}").to_ascii_lowercase();
@@ -13126,7 +13308,18 @@ async fn run_subagent(
     )
     .await;
 
-    loop {
+    // Route replacement (operator-approved, pre-work only). `runtime` keeps
+    // owning role, grants, tools, scope and budgets; only requests read the
+    // replacement route. It is staged, then installed at the loop head.
+    let mut route_override: Option<SubAgentRuntime> = None;
+    let mut staged_route_override: Option<SubAgentRuntime> = None;
+    let mut replacements_tried = 0usize;
+    let mut skipped_replacements: Vec<String> = Vec::new();
+
+    'subagent: loop {
+        if let Some(next) = staged_route_override.take() {
+            route_override = Some(next);
+        }
         match subagent_loop_boundary(work_max_steps, steps, runtime.cancel_token.is_cancelled()) {
             // Cancellation must win even after the final allowed tool step.
             // Otherwise a turn-end park at that seam is mislabeled as step
@@ -13247,9 +13440,10 @@ async fn run_subagent(
         // its own `work_update` calls returned, which are already in
         // `messages`. Nothing synthetic is appended per step.
         let mut request_messages = messages.clone();
-        let request_route = runtime
+        let route_runtime = route_override.as_ref().unwrap_or(runtime);
+        let request_route = route_runtime
             .client
-            .effective_route_envelope(&runtime.model, chrono::Utc::now());
+            .effective_route_envelope(&route_runtime.model, chrono::Utc::now());
         let image_input = runtime
             .api_config
             .as_deref()
@@ -13270,9 +13464,9 @@ async fn run_subagent(
             &request_route.model,
         );
         let request = MessageRequest {
-            model: runtime.model.clone(),
+            model: route_runtime.model.clone(),
             messages: request_messages,
-            max_tokens: runtime
+            max_tokens: route_runtime
                 .client
                 .effective_max_output_tokens(&request_route.model),
             system: Some(request_system.clone()),
@@ -13284,7 +13478,7 @@ async fn run_subagent(
             },
             metadata: None,
             thinking: None,
-            reasoning_effort: runtime.reasoning_effort.clone(),
+            reasoning_effort: route_runtime.reasoning_effort.clone(),
             stream: Some(false),
             temperature: None,
             top_p: None,
@@ -13358,7 +13552,7 @@ async fn run_subagent(
                 break;
             }
             api = request_subagent_model_response_with_retries(
-                runtime,
+                route_runtime,
                 &agent_id,
                 steps,
                 max_steps,
@@ -13385,6 +13579,83 @@ async fn run_subagent(
                                 // request died with zero completed work —
                                 // fail plainly, exactly as before.
                                 if steps <= 1 {
+                                    // Nothing of this run has executed yet,
+                                    // so an operator-approved route may take
+                                    // the same request; never after work.
+                                    if let Some(why) = route_replacement_reason(&err) {
+                                        while let Some(route) =
+                                            runtime.route_replacements.get(replacements_tried)
+                                        {
+                                            replacements_tried += 1;
+                                            let to = format!(
+                                                "{}/{}",
+                                                route.provider.as_deref().unwrap_or_default(),
+                                                route.model
+                                            );
+                                            match replacement_route_runtime(runtime, route) {
+                                                Ok(next) => {
+                                                    let from = format!(
+                                                        "{}/{}",
+                                                        route_runtime.client.api_provider().as_str(),
+                                                        route_runtime.model
+                                                    );
+                                                    let detail: String = route_runtime
+                                                        .client
+                                                        .redact_model_bound_text(&format!("{err}"))
+                                                        .chars()
+                                                        .take(160)
+                                                        .collect();
+                                                    let mut note = format!(
+                                                        "{from} refused the first request before any work ({why}: {detail}); moved to approved replacement {to} (attempt {replacements_tried} of {})",
+                                                        runtime.route_replacements.len()
+                                                    );
+                                                    if !skipped_replacements.is_empty() {
+                                                        note.push_str("; skipped ");
+                                                        note.push_str(&skipped_replacements.join("; "));
+                                                    }
+                                                    let note: String = note.chars().take(480).collect();
+                                                    let provider_id = next
+                                                        .api_config
+                                                        .as_ref()
+                                                        .map(|config| {
+                                                            config.provider_identity_for(
+                                                                next.client.api_provider(),
+                                                            )
+                                                        })
+                                                        .unwrap_or_else(|| {
+                                                            next.client.api_provider().as_str().to_string()
+                                                        });
+                                                    runtime.manager.write().await.record_route_replacement(
+                                                        &agent_id,
+                                                        provider_id,
+                                                        next.model.clone(),
+                                                        note.clone(),
+                                                    );
+                                                    record_agent_progress(
+                                                        runtime,
+                                                        &agent_id,
+                                                        AgentProgressEventMeta::new(
+                                                            AgentWorkerStatus::Running,
+                                                        )
+                                                        .with_step(0),
+                                                        format!("Route replaced: {note}"),
+                                                    );
+                                                    staged_route_override = Some(next);
+                                                    steps = 0;
+                                                    continue 'subagent;
+                                                }
+                                                Err(unavailable) => skipped_replacements.push(
+                                                    format!("{to} ({})", unavailable.chars().take(120).collect::<String>()),
+                                                ),
+                                            }
+                                        }
+                                        if !skipped_replacements.is_empty() {
+                                            return Err(err.context(format!(
+                                                "no approved replacement route could take the task: {}",
+                                                skipped_replacements.join("; ")
+                                            )));
+                                        }
+                                    }
                                     return Err(err);
                                 }
                                 (
@@ -13980,7 +14251,9 @@ async fn run_subagent(
         // describes what the model remembered; this names the on-disk changes
         // the worker actually left, so the parent can salvage them without
         // trusting the partial report.
-        if let Some(preservation) = budget_work_preservation_note(runtime, &agent_id, cause).await {
+        if let Some(preservation) =
+            budget_work_preservation_note(&runtime.manager, &agent_id, cause).await
+        {
             let note = handback_note.get_or_insert_with(String::new);
             if !note.is_empty() {
                 note.push(' ');
@@ -15229,6 +15502,9 @@ enum SpawnRouteSource {
     /// back to the session route loudly (receipt note names the pin and
     /// the reason) instead of failing (#5529 mode 2).
     SessionFallback,
+    /// The role pin's first request was refused before any work and the
+    /// child moved to an operator-approved replacement route.
+    RoleReplacement,
 }
 
 impl SpawnRouteSource {
@@ -15241,6 +15517,7 @@ impl SpawnRouteSource {
             Self::RoleDefault => "role.default",
             Self::RunModel => "run.model",
             Self::SessionFallback => "session.fallback",
+            Self::RoleReplacement => "role.replacement",
         }
     }
 }
@@ -15427,6 +15704,9 @@ async fn bind_spawn_model_route(
     // task-level pins stay exact — only saved-profile rot falls back.
     let mut member = member;
     let mut fallback_note = None;
+    // Replacement authority belongs to one role pin, never to a descendant
+    // that inherited this runtime or chose its route another way.
+    runtime.route_replacements.clear();
     match bind_profile_provider(runtime, member)? {
         MemberProviderBind::Bound => {}
         MemberProviderBind::Unavailable {
@@ -15478,6 +15758,7 @@ async fn bind_spawn_model_route(
             )?),
             source: SpawnRouteSource::RolePin,
         };
+        runtime.route_replacements = configured_route_replacements(runtime, request)?;
         manual_pin = Some(pin);
         selection
     } else if let Some(model) = bind_shortlisted_task_model(runtime, request)? {
@@ -16104,6 +16385,102 @@ fn configured_manual_spawn_model(
         return Ok(None);
     }
     Ok(Some(pin.clone()))
+}
+
+/// Upper bound on declared replacement routes: each is tried at most once, so
+/// this also bounds the extra first requests one refused pin can cost.
+const MAX_ROUTE_REPLACEMENTS: usize = 3;
+
+/// The replacement routes declared beside the role pin this spawn resolved.
+/// Misconfiguration fails loud at spawn, not at the failure it would cover.
+fn configured_route_replacements(
+    runtime: &SubAgentRuntime,
+    request: &SpawnRequest,
+) -> Result<Vec<SubagentModelOverride>, ToolError> {
+    let Some(config) = runtime.api_config.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let overrides = config.subagent_model_overrides();
+    let Some((key, _)) = configured_role_model_override(
+        &overrides,
+        request.assignment.role.as_deref(),
+        &request.agent_type,
+    ) else {
+        return Ok(Vec::new());
+    };
+    let replacements = config.subagent_route_replacements(&key);
+    if replacements.len() > MAX_ROUTE_REPLACEMENTS {
+        return Err(ToolError::invalid_input(format!(
+            "subagents.roles.{key}.replacements lists {} routes; at most {MAX_ROUTE_REPLACEMENTS} are allowed",
+            replacements.len()
+        )));
+    }
+    for route in &replacements {
+        let Some(provider) = route.provider.as_deref().filter(|p| !p.trim().is_empty()) else {
+            return Err(ToolError::invalid_input(format!(
+                "subagents.roles.{key}.replacements entries must name `provider/model`, so the provider that may receive the task is explicit; got {:?}",
+                route.model
+            )));
+        };
+        if route.model.trim().is_empty()
+            || route.model.trim().eq_ignore_ascii_case("auto")
+            || route.model.chars().any(char::is_control)
+        {
+            return Err(ToolError::invalid_input(format!(
+                "subagents.roles.{key}.replacements entry for {provider:?} must name one exact model"
+            )));
+        }
+        config
+            .resolve_provider_pin_identity(provider)
+            .map_err(ToolError::invalid_input)?;
+    }
+    Ok(replacements)
+}
+
+/// Why a first-request refusal may move a child to an approved replacement
+/// route, or `None` when it must not. Typed only: an arbitrary message that
+/// mentions credits is not quota evidence. Content-policy, context-length and
+/// invalid-request refusals would recur on any route (or would shop content
+/// to another provider), and Codewhale's own permission denials never reach
+/// this seam as provider errors.
+fn route_replacement_reason(error: &anyhow::Error) -> Option<&'static str> {
+    match error.downcast_ref::<LlmError>()? {
+        LlmError::QuotaExhausted(_) => Some("quota exhausted"),
+        LlmError::AuthenticationError(_) => Some("credentials rejected"),
+        LlmError::AuthorizationError(_) => Some("provider refused authorization"),
+        LlmError::ModelError(_) => Some("model unavailable"),
+        _ => None,
+    }
+}
+
+/// Bind `base` to one approved replacement route. Only the request route
+/// changes: role, grants, tool scope, budgets and workspace stay `base`'s.
+fn replacement_route_runtime(
+    base: &SubAgentRuntime,
+    route: &SubagentModelOverride,
+) -> Result<SubAgentRuntime, String> {
+    let mut next = base.clone();
+    let provider = route.provider.as_deref().unwrap_or_default();
+    match try_bind_spawn_provider(&mut next, provider).map_err(|error| error.to_string())? {
+        MemberProviderBind::Bound => {}
+        MemberProviderBind::Unavailable {
+            provider_id,
+            reason,
+        } => return Err(format!("{provider_id} unavailable: {reason}")),
+    }
+    let model = normalize_bound_subagent_model(&route.model, "replacement", &next.client)
+        .map_err(|error| error.to_string())?;
+    let model = ensure_subagent_model_for_provider(&next, &ModelRoute::Fixed(model.clone()), model)
+        .map_err(|error| error.to_string())?;
+    if let Some(rebound) = next
+        .client
+        .rebound_for_model_protocol(next.api_config.as_deref(), &model)
+        .map_err(|error| format!("{error:#}"))?
+    {
+        next.client = rebound;
+    }
+    next.model = model;
+    Ok(next)
 }
 
 /// One alias/default precedence for manual Config pins and legacy role defaults.
@@ -18577,18 +18954,18 @@ fn annotate_child_model_error(
             route_source_label(route),
         )
     };
+    let lower = err.to_ascii_lowercase();
     match crate::error_taxonomy::classify_error_message(err) {
-        crate::error_taxonomy::ErrorCategory::Authorization
-        | crate::error_taxonomy::ErrorCategory::State => hint(),
+        crate::error_taxonomy::ErrorCategory::Authorization => hint(),
+        crate::error_taxonomy::ErrorCategory::State if lower.contains("model") => hint(),
         _ => {
             // #3020 (#2653): Provider rejections like "Model Not Exist" or
             // "does not exist or you do not have access" often classify as
             // `Internal` rather than `Authorization`/`State`.  Catch these
             // patterns in the raw error text and annotate anyway.
-            let lower = err.to_ascii_lowercase();
             if lower.contains("model not exist")
                 || lower.contains("model_not_found")
-                || lower.contains("does not exist")
+                || lower.contains("model") && lower.contains("does not exist")
                 || lower.contains("no such model")
                 || lower.contains("invalid model")
             {

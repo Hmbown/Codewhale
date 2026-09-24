@@ -1870,6 +1870,21 @@ impl App {
         !self.input.trim().is_empty()
     }
 
+    /// Whether the *draft* is in a submittable state, for display only.
+    ///
+    /// Deliberately time-independent. [`Self::composer_enter_would_submit`]
+    /// additionally consults the paste-burst heuristic, whose suppression
+    /// window is re-extended on every fast keystroke -- correct for deciding
+    /// what a newline does mid-paste, wrong for a persistent affordance.
+    /// Driving the `[↵]` chip from it made the chip strobe `[↵]`/`[·]` for as
+    /// long as the user kept typing, because the window kept reopening
+    /// (#6397). Enter routing, mouse submit and hover registration stay on
+    /// the timing predicate.
+    #[must_use]
+    pub fn composer_draft_is_submittable(&self) -> bool {
+        !self.input.trim().is_empty()
+    }
+
     /// Public wrapper around [`Self::consolidate_large_input`] that no-ops
     /// when the current input fits inside the safety cap. Both the paste-
     /// insert path (visible-before-submit) and the submit-time safety net

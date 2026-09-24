@@ -300,7 +300,7 @@ fn adapter_projects_absent_restore_points_without_creating_a_repo() {
     let workspace = harness.temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     harness.app.workspace = workspace.clone();
-    let before = crate::snapshot::snapshot_git_dir(&workspace);
+    let before = crate::snapshot::snapshot_git_dir(&workspace).expect("snapshot path");
     assert!(!before.exists(), "precondition: no side repo yet");
 
     let projection = conversation_projection(&mut harness.app);
@@ -310,7 +310,9 @@ fn adapter_projects_absent_restore_points_without_creating_a_repo() {
         RestorePointProjection::None
     ));
     assert!(
-        !crate::snapshot::snapshot_git_dir(&workspace).exists(),
+        !crate::snapshot::snapshot_git_dir(&workspace)
+            .expect("snapshot path")
+            .exists(),
         "projection must never create the snapshot repo"
     );
 }
@@ -1271,14 +1273,16 @@ fn command_export_does_not_create_a_snapshot_repo_for_a_fresh_workspace() {
     std::fs::create_dir_all(&workspace).expect("workspace");
     let app = &mut harness.app;
     app.workspace = workspace.clone();
-    let before = crate::snapshot::snapshot_git_dir(&workspace);
+    let before = crate::snapshot::snapshot_git_dir(&workspace).expect("snapshot path");
     assert!(!before.exists(), "precondition: no side repo yet");
 
     let result = dispatch(app, Some("clipboard"));
     assert!(!result.is_error, "{:?}", result.message);
 
     assert!(
-        !crate::snapshot::snapshot_git_dir(&workspace).exists(),
+        !crate::snapshot::snapshot_git_dir(&workspace)
+            .expect("snapshot path")
+            .exists(),
         "export must never create the side repo"
     );
 }

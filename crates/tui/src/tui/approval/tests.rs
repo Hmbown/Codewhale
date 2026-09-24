@@ -265,7 +265,7 @@ fn test_approval_request_derives_impact_summary() {
         request
             .impacts
             .iter()
-            .any(|line| line.contains("Executes a Bash command"))
+            .any(|line| line.contains("Runs a shell command"))
     );
     assert!(
         request
@@ -296,7 +296,7 @@ fn mcp_impact_summary_preserves_full_target_for_underscored_names() {
         request
             .impacts
             .iter()
-            .any(|line| line == "MCP target: my_db_execute_sql")
+            .any(|line| line == "Connected app: my_db_execute_sql")
     );
     assert!(!request.impacts.iter().any(|line| line == "Server: my"));
 
@@ -304,7 +304,7 @@ fn mcp_impact_summary_preserves_full_target_for_underscored_names() {
     assert!(
         zh_impacts
             .iter()
-            .any(|line| line == "MCP 目标：my_db_execute_sql")
+            .any(|line| line == "已连接应用：my_db_execute_sql")
     );
     assert!(!zh_impacts.iter().any(|line| line == "服务器：my"));
 }
@@ -1800,8 +1800,8 @@ fn agent_tool_is_classified_and_renders_calm() {
     let view = ApprovalView::new(request);
     let lines = render_lines(&view, 100, 40);
     let joined = lines.join("\n");
-    assert!(joined.contains("APPROVAL"), "{joined}");
-    assert!(!joined.contains("DESTRUCTIVE"), "{joined}");
+    assert!(joined.contains("Starts an agent"), "{joined}");
+    assert!(!joined.contains("Can't be undone"), "{joined}");
     assert!(
         !joined.contains("not classified"),
         "agent must not render the unknown-tool warning:\n{joined}"
@@ -1832,7 +1832,12 @@ fn render_benign_includes_review_badge_and_selection_hint() {
     let view = ApprovalView::new(benign_request());
     let lines = render_lines(&view, 100, 40);
     let joined = lines.join("\n");
-    assert!(joined.contains("REVIEW"), "missing REVIEW badge:\n{joined}");
+    assert!(
+        joined.contains("Reads only"),
+        "missing effect badge:\n{joined}"
+    );
+    // The card leads with the plain summary, workspace-relative (E6).
+    assert!(joined.contains("Read src/main.rs"), "{joined}");
     assert_approval_key_badges_visible(&joined);
     // The selection prose moved into the per-option key badges; the footer
     // keeps only the escape-hatch hints.
@@ -1840,7 +1845,6 @@ fn render_benign_includes_review_badge_and_selection_hint() {
         joined.contains("Pg↑/↓ review"),
         "footer controls hint missing:\n{joined}"
     );
-    assert!(joined.contains("read_file"));
 }
 
 #[test]
@@ -1877,16 +1881,19 @@ fn approval_footer_hints_use_muted_contrast_tier() {
 
 #[test]
 fn render_elevated_write_is_calm_and_compact() {
-    // Ordinary state-touching work (a file write) renders as a calm
-    // APPROVAL ask: no DESTRUCTIVE badge, no policy dossier, no
-    // impact/category taxonomy — that detail stays one details chord away.
+    // Ordinary state-touching work (a file write) renders as a calm ask
+    // that names its effect: no "Can't be undone" badge, no policy dossier,
+    // no impact/category taxonomy — that detail stays one details chord away.
     let view = ApprovalView::new(destructive_request());
     let lines = render_lines(&view, 100, 40);
     let joined = lines.join("\n");
-    assert!(joined.contains("APPROVAL"), "missing calm badge:\n{joined}");
     assert!(
-        !joined.contains("DESTRUCTIVE"),
-        "routine write must not scream DESTRUCTIVE:\n{joined}"
+        joined.contains("Changes files"),
+        "missing effect badge:\n{joined}"
+    );
+    assert!(
+        !joined.contains("Can't be undone"),
+        "routine write must not claim it is irreversible:\n{joined}"
     );
     assert_approval_key_badges_visible(&joined);
     assert!(
@@ -1894,7 +1901,7 @@ fn render_elevated_write_is_calm_and_compact() {
         "footer controls hint missing:\n{joined}"
     );
     assert!(
-        !joined.contains("active approval policy"),
+        !joined.contains("Your permissions"),
         "policy prose is critical-only:\n{joined}"
     );
     assert!(
@@ -1905,7 +1912,7 @@ fn render_elevated_write_is_calm_and_compact() {
         !joined.contains("Type:"),
         "category taxonomy is critical-only:\n{joined}"
     );
-    assert!(joined.contains("write_file"));
+    assert!(joined.contains("Write src/main.rs"), "{joined}");
 }
 
 #[test]
@@ -1916,18 +1923,22 @@ fn render_critical_shows_warning_badge_and_policy_semantics() {
     let lines = render_lines(&view, 100, 40);
     let joined = lines.join("\n");
     assert!(
-        joined.contains("DESTRUCTIVE"),
-        "missing DESTRUCTIVE badge:\n{joined}"
+        joined.contains("Can't be undone"),
+        "missing irreversible badge:\n{joined}"
     );
     assert_approval_key_badges_visible(&joined);
     assert!(
-        joined.contains("active approval policy"),
-        "missing policy/review-rule semantics:\n{joined}"
+        joined.contains("Your permissions, a review rule"),
+        "missing permission/review-rule semantics:\n{joined}"
     );
     assert!(
-        joined.contains("Deny rejects only this tool call"),
-        "missing deny-vs-abort semantics:\n{joined}"
+        joined.contains("Don't allow skips only this step"),
+        "missing don't-allow-vs-stop semantics:\n{joined}"
     );
+    // Mark 4: no approval surface says Bash, MCP or abort.
+    for banned in ["Bash", "MCP", "abort", "Abort"] {
+        assert!(!joined.contains(banned), "{banned} on the card:\n{joined}");
+    }
     assert!(joined.contains("rm -rf"));
 }
 
@@ -1937,11 +1948,11 @@ fn render_elevated_zh_hans_is_calm_and_localized() {
     let lines = render_lines(&view, 100, 40);
     let joined = compact_rendered_text(&lines);
     assert!(
-        joined.contains("需要批准"),
-        "missing zh calm badge:\n{joined}"
+        joined.contains("修改文件"),
+        "missing zh effect badge:\n{joined}"
     );
     assert!(
-        !joined.contains("破坏性"),
+        !joined.contains("无法撤销"),
         "routine write must not use the destructive zh badge:\n{joined}"
     );
     assert!(
@@ -1989,7 +2000,7 @@ fn render_critical_zh_hans_localizes_security_copy() {
     let lines = render_lines(&view, 100, 40);
     let joined = compact_rendered_text(&lines);
     assert!(
-        joined.contains("破坏性"),
+        joined.contains("无法撤销"),
         "missing zh risk badge:\n{joined}"
     );
     assert!(

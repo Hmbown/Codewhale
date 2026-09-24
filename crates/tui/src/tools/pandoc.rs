@@ -70,7 +70,7 @@ impl ToolSpec for PandocConvertTool {
     }
 
     fn description(&self) -> &'static str {
-        "Convert a document between formats via pandoc. Reads `source_path` (any pandoc-supported input format — pandoc autodetects from extension), converts to `target_format`, and either writes the result to `output_path` (when provided) or returns the converted text inline. Supported targets: markdown, gfm, commonmark, html, rst, latex, docx, odt, epub, plain, asciidoc. Use this instead of shelling out to pandoc via `Bash` — no approval prompt for output_path-less reads, structured errors, and a curated format whitelist."
+        "Convert a document between formats via pandoc. Reads `source_path` (any pandoc-supported input format — pandoc autodetects from extension), converts to `target_format`, and either writes the result to `output_path` (when provided) or returns the converted text inline. Supported targets: markdown, gfm, commonmark, html, rst, latex, docx, odt, epub, plain, asciidoc. Use this instead of shelling out to pandoc via `bash` — no approval prompt for output_path-less reads, structured errors, and a curated format whitelist."
     }
 
     fn input_schema(&self) -> Value {

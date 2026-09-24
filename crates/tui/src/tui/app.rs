@@ -1770,11 +1770,11 @@ pub struct App {
     /// fast typing or IME commits could otherwise be mis-classified as a
     /// paste burst (#1322 follow-up).
     pub bracketed_paste_seen: bool,
-    /// The terminal is one we have verified delivers `Event::Paste`, so the
-    /// rapid-keystroke heuristic is skipped from the first keystroke instead
-    /// of waiting for `bracketed_paste_seen` to be proven by an actual
-    /// paste. Resolved once at startup from the environment — never read
-    /// ambiently, so tests and headless runs stay hermetic.
+    /// A non-Windows terminal on the verified `Event::Paste` allowlist may
+    /// skip the rapid-keystroke heuristic from the first keystroke. Windows
+    /// input requires `bracketed_paste_seen`: a terminal name or WT_SESSION
+    /// does not prove that the input backend delivers paste events (#6427).
+    /// Resolved once at startup, so tests and headless runs stay hermetic.
     pub bracketed_paste_trusted: bool,
     pub system_prompt: Option<SystemPrompt>,
     pub auto_compact: bool,
@@ -3024,10 +3024,10 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Mark the first-run follow-up as seen without inserting a transcript
-    /// message. The empty underwater launch surface owns setup guidance; a
-    /// synthetic history cell would hide that surface before the user sends
-    /// anything.
+    /// Show the one-time Fleet intro as a status line, the first time the
+    /// user opens `/fleet` or enters Operate — never as a first-run push.
+    /// It inserts no transcript message: a synthetic history cell would hide
+    /// the empty launch surface before the user sends anything.
     pub fn maybe_show_feature_intro(&mut self) {
         if self.onboarding != OnboardingState::None {
             return;

@@ -4210,6 +4210,8 @@ fn save_deepseek_key_uses_isolated_file_store_without_plaintext_config() -> Resu
             .any(|line| line.trim_start().starts_with("api_key ="))
     );
     assert!(config.contains("auth_mode = \"api_key\""));
+    // Saving a key leaves the model to the provider default.
+    assert!(!config.contains("default_text_model"), "{config}");
     assert_eq!(
         codewhale_secrets::Secrets::auto_detect().get("deepseek")?,
         Some("deepseek-test-credential".to_string())

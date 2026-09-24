@@ -49,6 +49,16 @@ impl SessionEntryKind {
             Self::Message { .. } | Self::User { .. } | Self::Assistant { .. }
         )
     }
+    /// `self.as_message() == Some(message)` without materializing the
+    /// projection. Every autosave compares the whole active branch with the
+    /// live transcript, so the common `Message` entry must not be deep-cloned
+    /// just to be compared.
+    pub fn projects_to(&self, message: &Message) -> bool {
+        match self {
+            Self::Message { message: own } => own == message,
+            other => other.as_message().as_ref() == Some(message),
+        }
+    }
     pub fn as_message(&self) -> Option<Message> {
         match self {
             Self::Message { message } => Some(message.clone()),
@@ -343,7 +353,7 @@ impl SessionJournal {
         let shared_prefix = active_path
             .iter()
             .zip(messages)
-            .take_while(|(entry, message)| entry.kind.as_message().as_ref() == Some(*message))
+            .take_while(|(entry, message)| entry.kind.projects_to(message))
             .count();
         self.leaf_id = shared_prefix
             .checked_sub(1)
@@ -685,5 +695,38 @@ mod tests {
         j.append(SessionEntryKind::User { text: "c".into() });
         let msgs2 = j.active_messages(false);
         assert_eq!(msgs2.len(), 2);
+    }
+
+    #[test]
+    fn projects_to_matches_as_message_equality_for_every_kind() {
+        let kinds = [
+            SessionEntryKind::Message {
+                message: msg("assistant", "hi"),
+            },
+            SessionEntryKind::User {
+                text: "hi".to_string(),
+            },
+            SessionEntryKind::Assistant {
+                text: "hi".to_string(),
+            },
+            SessionEntryKind::System {
+                content: "hi".to_string(),
+            },
+        ];
+        let probes = [
+            msg("assistant", "hi"),
+            msg("user", "hi"),
+            msg("system", "hi"),
+            msg("assistant", "other"),
+        ];
+        for kind in &kinds {
+            for probe in &probes {
+                assert_eq!(
+                    kind.projects_to(probe),
+                    kind.as_message().as_ref() == Some(probe),
+                    "{kind:?} vs {probe:?}"
+                );
+            }
+        }
     }
 }

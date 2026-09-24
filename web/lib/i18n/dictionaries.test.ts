@@ -19,6 +19,8 @@ import {
   EN_DOCS_SHELL,
   EN_DOCS_TROUBLESHOOTING,
   EN_HOME,
+  EN_LEGAL_PRIVACY,
+  EN_LEGAL_TERMS,
   fill,
   getChrome,
   getDocsGuide,
@@ -38,6 +40,8 @@ import {
   getDocsShell,
   getDocsTroubleshooting,
   getHome,
+  getLegalPrivacy,
+  getLegalTerms,
   pickText,
   splitToken,
   splitTokens,
@@ -270,6 +274,8 @@ describe("website dictionaries", () => {
       ["docs-auth", getDocsAuth, EN_DOCS_AUTH],
       ["docs-trust", getDocsTrust, EN_DOCS_TRUST],
       ["changelog", getChangelog, EN_CHANGELOG],
+      ["legal-terms", getLegalTerms, EN_LEGAL_TERMS],
+      ["legal-privacy", getLegalPrivacy, EN_LEGAL_PRIVACY],
     ] as const) {
       const enKeys = Object.keys(reference).sort();
       for (const locale of [...DICTIONARY_LOCALES, "fr", "und"]) {
@@ -601,6 +607,16 @@ describe("website dictionaries", () => {
       expect(byLine, `${locale} tickerBy`).toContain("{handle}");
       const parts = splitToken(byLine, "handle");
       expect(parts.length, `${locale} tickerBy split`).toBe(2);
+    }
+  });
+
+  it("carries {date} through both legal pages' effective-date line", () => {
+    // The date used to sit in the JSX between two translated fragments. Now
+    // it is a fill() token, so a translation that drops it would ship a legal
+    // page that no longer says when it took effect.
+    for (const locale of ["en", "zh"]) {
+      expect(getLegalTerms(locale).updated, `${locale} legal-terms`).toContain("{date}");
+      expect(getLegalPrivacy(locale).updated, `${locale} legal-privacy`).toContain("{date}");
     }
   });
 

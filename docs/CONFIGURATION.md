@@ -668,18 +668,27 @@ auto-select MiMo endpoints. Use
 `https://token-plan-cn.xiaomimimo.com/v1` for China-region accounts, or
 `https://token-plan-ams.xiaomimimo.com/v1` for Europe/Amsterdam accounts.
 
-### Auto Model Routing (`[auto.router]`)
+### Auto Model Routing (`[auto]`, `[auto.router]`)
 
-With `model = "auto"`, Codewhale routes each turn between a strong and a cheap
-model. The routing decision comes from a small classifier call, or from a local
-heuristic when no classifier route is available.
+With `model = "auto"`, each turn runs on your **declared default model** unless
+you have opted into something else. Auto never guesses a cheaper or stronger
+model from how a request is worded; the old keyword-and-length heuristic was
+removed (`auto_route_declared_fallback` in `crates/tui/src/model_routing.rs`).
+Two optional layers change that:
 
-**There is no default classifier.** With `[auto.router]` unset, Auto is local
-and free: it uses the heuristic and makes no classifier call, whatever keys you
-hold. Holding a DeepSeek key used to elect `deepseek-v4-flash` automatically;
-that was removed because it spent tokens on a route the user never chose and
-privileged one provider over the rest (`crates/tui/src/config.rs:2392-2402`).
-Electing a network classifier is now something you write down.
+- an `[auto.router]` classifier, which you write down, that picks a model per
+  turn; and
+- `[auto] cost_saving`, which prefers the active provider's fast sibling.
+
+With neither set, Auto is local and free: the turn uses the default model and
+no classifier call is made.
+
+**There is no default classifier.** With `[auto.router]` unset, no classifier
+call happens, whatever keys you hold. Holding a DeepSeek key used to elect
+`deepseek-v4-flash` automatically. That was removed because it spent tokens on
+a route the user never chose and privileged one provider over the rest
+(`AutoRouterConfig` in `crates/tui/src/config.rs`). Electing a network
+classifier is now something you write down.
 
 Point the classifier at any configured provider with `[auto.router]`:
 
@@ -688,13 +697,38 @@ Point the classifier at any configured provider with `[auto.router]`:
 provider = "zai"
 model = "glm-5-turbo"
 thinking = "off"        # optional; defaults to off
+timeout_secs = 4        # optional; default 4, 0 = default, capped at 300
 ```
 
-A classifier call happens only when `[auto.router]` is set *and* that provider
-has a key — `router_available = router_configured && has_api_key_for(...)`
-(`crates/tui/src/model_inventory.rs:206-218`). Either condition failing means
-the heuristic decides, not a failure. The turn's route receipt (`/status` →
-Auto) records which one it was.
+A classifier call happens only when `[auto.router]` names both `provider` and
+`model` *and* that provider has a key:
+`router_available = router_configured && has_api_key_for(...)` in
+`ModelInventory::from_config` (`crates/tui/src/model_inventory.rs`). If either
+condition fails, or the classifier call errors or times out, the local
+fallback decides: the default model, or the fast sibling under `cost_saving`.
+That is a fallback, not a failure. The turn's route receipt
+(`/status` → Auto) records which path was taken.
+
+Two `[auto]` keys shape routing (`AutoConfig` in `crates/tui/src/config.rs`):
+
+```toml
+[auto]
+cost_saving = false     # default false
+cross_provider = false  # default false
+```
+
+- **`cost_saving`** (default `false`). Without a classifier, Auto pins the
+  active provider's validated fast sibling instead of the default model. A
+  provider with no runnable fast sibling stays on the default. With a
+  classifier, the classifier is told to prefer the fast tier for routine or
+  ambiguous work and to pick the strong tier only for clearly agentic,
+  multi-step, architecture, security or debugging work. Cost-saving never
+  switches provider just to save money.
+- **`cross_provider`** (default `false`). Auto stays on the provider the session
+  is configured to use. The classifier is only shown that provider's models,
+  and the fallback never leaves it. Setting `cross_provider = true` lets the
+  classifier choose among every runnable provider. There is no interactive
+  toggle; it has to be set in config.
 
 To bootstrap MCP and skills directories at their resolved paths, run `codewhale setup`.
 To only scaffold MCP, run `codewhale mcp init`.
@@ -1819,7 +1853,7 @@ operations and four-state To-do list as plain text, running work first. It
 reads the same snapshots as the styled Work surface and owns no parallel
 progress state.
 
-Plan and Act are the everyday visible modes in the UI; Operate is an explicit
+Plan and Work are the everyday visible modes in the UI; Operate is an explicit
 preview entry while its Workflow control surface is still being built. Switch
 between them with `/mode`. For compatibility, older settings files with
 `default_mode = "normal"` still load as `agent`.

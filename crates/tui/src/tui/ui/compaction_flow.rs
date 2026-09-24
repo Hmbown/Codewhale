@@ -341,7 +341,14 @@ pub(crate) fn apply_compaction_completed(
 pub(crate) fn apply_compaction_failed(app: &mut App, id: &str, auto: bool, message: String) {
     if settle_compaction(app, id, auto) {
         add_compaction_receipt(app, &message);
-        set_explicit_compaction_status(app, message, StatusToastLevel::Error, true);
+        // A pass the user asked for keeps its sticky footer error. An
+        // automatic pass is the engine's own recovery: the transcript receipt
+        // records it, and when the turn then fails its error line is the
+        // headline. Echoing the same failure in the footer made one failure
+        // read as three (experience mark 2).
+        if !auto {
+            set_explicit_compaction_status(app, message, StatusToastLevel::Error, true);
+        }
     }
 }
 

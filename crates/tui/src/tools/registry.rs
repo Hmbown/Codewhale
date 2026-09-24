@@ -697,6 +697,10 @@ pub struct AgentToolSurfaceOptions {
     /// the surface options so model-spawned children inherit the parent's
     /// configured limits instead of silently falling back to the defaults.
     pub user_input_limits: super::user_input::UserInputLimits,
+    /// Register `request_plugin_install`. The engine turns this off outside
+    /// the interactive TUI and when contextual tips are off (0.10.1 plugin
+    /// offering policy, rules 3 and 11); children inherit the parent's value.
+    pub request_plugin_install_enabled: bool,
 }
 
 impl AgentToolSurfaceOptions {
@@ -712,6 +716,7 @@ impl AgentToolSurfaceOptions {
             goal_state: None,
             verify_tool_enabled: true,
             user_input_limits: super::user_input::UserInputLimits::default(),
+            request_plugin_install_enabled: true,
         }
     }
 }
@@ -1351,10 +1356,11 @@ impl ToolRegistryBuilder {
             builder = builder.with_vision_tools(vision_config, vision_client);
         }
 
-        builder
-            .with_notify_tool()
-            .with_request_plugin_install_tool()
-            .with_session_recall_tools()
+        builder = builder.with_notify_tool();
+        if options.request_plugin_install_enabled {
+            builder = builder.with_request_plugin_install_tool();
+        }
+        builder.with_session_recall_tools()
     }
 
     /// Include the full child-inherited Agent surface under resolved
@@ -1654,6 +1660,7 @@ pub(super) fn mcp_tool_adapter_for_test(name: &str) -> Arc<dyn ToolSpec> {
             name: name.to_string(),
             description: None,
             input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
         },
         pool: Arc::new(tokio::sync::Mutex::new(crate::mcp::McpPool::new(
             crate::mcp::McpConfig::default(),

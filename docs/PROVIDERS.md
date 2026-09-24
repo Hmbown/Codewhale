@@ -26,8 +26,12 @@ host is a `[providers.<name>]` table with a base URL, a model, and a key env
 and a key" path for exactly this. Offerings come from live `GET /v1/models`
 plus the Codewhale catalog rather than a compiled roster (#5350, #6289).
 
-Known-good hosts (documentation, not compiled rows — verify against the
-vendor's own docs before trusting any value here):
+Known-good hosts. These ship as bundled descriptor rows in
+`crates/config/assets/provider_descriptors.json` (compiled in by
+`crates/config/src/descriptors.rs`): each row says how to reach the host — wire,
+base URL, key env, aliases — while model ids stay live from `GET /v1/models`
+and the Codewhale catalog; the example model is only a bootstrap hint. Verify
+against the vendor's own docs before trusting any value here:
 
 | Host | Base URL | Example models | API key env |
 | --- | --- | --- | --- |
@@ -36,18 +40,24 @@ vendor's own docs before trusting any value here):
 | Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
 | Cerebras | `https://api.cerebras.ai/v1` | `llama-3.3-70b` | `CEREBRAS_API_KEY` |
 | Command Code | `https://api.commandcode.ai/provider/v1` | `deepseek/deepseek-v4-flash` | `COMMAND_CODE_API_KEY` |
-| AICraft | `https://aicraftapi.com/v1` | DeepSeek / Qwen / GLM / MiniMax / Doubao families | `AICRAFT_API_KEY` |
+| Alibaba Model Studio (DashScope) | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `qwen3.8-flash` | `DASHSCOPE_API_KEY` |
+| AICraft | `https://aicraftapi.com/v1` | `claude-4.6-sonnet`; DeepSeek / Claude / Gemini / Qwen / GLM / MiniMax / Doubao families | `AICRAFT_API_KEY` |
 
-AICraft advertises DeepSeek, Qwen, GLM, MiniMax and Doubao and lists no
-Anthropic models — pick a model from their roster, not from this table.
+AICraft's roster spans DeepSeek, Anthropic Claude, Google Gemini, Qwen, GLM,
+MiniMax and Doubao ids on its OpenAI-compatible endpoint. The authority is
+`GET https://aicraftapi.com/v1/models` with your key — pick a model from that
+list, not from this table.
 OpenCode Zen and OpenCode Go are first-class provider routes, configured like
-any other provider below; they are not part of this table. `/provider` `P`
-opens the template list; `S` still fills SenseNova; `T` probes `/models` and
-records reachability only (a 2xx is not model-ready).
+any other provider below; they are not part of this table. In `/provider`,
+type to filter the list (letters not bound to a row action); `Ctrl+T` probes the
+selected row's `/models` and records reachability only (a 2xx is not
+model-ready).
 
 Sources to keep in sync:
 
 - `crates/config/src/lib.rs` - shared provider IDs, defaults, env precedence.
+- `crates/config/assets/provider_descriptors.json` - bundled OpenAI-compatible
+  host descriptors (the known-good hosts table above).
 - `crates/tui/src/config.rs` - TUI provider IDs, provider capability metadata,
   and provider-specific env handling.
 - `crates/agent/src/lib.rs` - static `ModelRegistry` used by

@@ -1318,14 +1318,64 @@ where
         ..
     } = context;
     let mut has_tool_receipts = false;
+    // #6310: the engine turn loop's empty-stop budget, shared so both loops
+    // recover the same way. It is turn-scoped, like the engine's.
+    let mut empty_stop_retries: u32 = 0;
+    let mut empty_stop_nudge = false;
     for _round in 0..MAX_ACP_TOOL_ROUNDS {
-        let stream = open_stream(messages.clone())
-            .await
-            .map_err(|error| AgenticPromptError::new(error, &messages, has_tool_receipts))?;
-        let (outcome, tool_calls) =
-            drive_prompt_stream(stream, session_id, response_id_policy, reader, writer)
+        let (outcome, tool_calls) = loop {
+            let mut outbound = messages.clone();
+            // Request-scoped: the nudge rides this one request and is never
+            // committed to the session history.
+            let nudge = context.config.reasoning_only_reprompt_message();
+            if std::mem::take(&mut empty_stop_nudge) && !nudge.trim().is_empty() {
+                outbound.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: nudge.to_string(),
+                        cache_control: None,
+                    }],
+                });
+            }
+            let stream = open_stream(outbound)
                 .await
                 .map_err(|error| AgenticPromptError::new(error, &messages, has_tool_receipts))?;
+            let (outcome, tool_calls) =
+                drive_prompt_stream(stream, session_id, response_id_policy, reader, writer)
+                    .await
+                    .map_err(|error| {
+                        AgenticPromptError::new(error, &messages, has_tool_receipts)
+                    })?;
+            let answerless = matches!(&outcome, PromptOutcome::Completed(text) if text.trim().is_empty())
+                && tool_calls.is_empty();
+            if !answerless {
+                break (outcome, tool_calls);
+            }
+            // Nothing was streamed to the client for this response, so a
+            // retry is invisible to it until the budget is spent.
+            match crate::core::engine::turn_loop::plan_empty_stop_retry(empty_stop_retries) {
+                Some(retry) => {
+                    empty_stop_retries += 1;
+                    empty_stop_nudge = matches!(
+                        retry,
+                        crate::core::engine::turn_loop::EmptyStopRetry::Nudged
+                    );
+                    crate::logging::warn(format!(
+                        "ACP: model returned no answer or tool call (attempt {empty_stop_retries}/{}); re-requesting",
+                        crate::core::engine::turn_loop::EMPTY_STOP_MAX_RETRIES
+                    ));
+                }
+                None => {
+                    return Err(AgenticPromptError::new(
+                        anyhow!(
+                            "Model returned no answer or tool call (after {empty_stop_retries} retries)."
+                        ),
+                        &messages,
+                        has_tool_receipts,
+                    ));
+                }
+            }
+        };
 
         let text = match outcome {
             PromptOutcome::Cancelled => return Ok((PromptOutcome::Cancelled, messages)),
@@ -1675,13 +1725,45 @@ impl AcpServer {
         let mut modes = vec![
             json!({"id": "plan", "name": tr(locale, MessageId::AppModePlan), "description": tr(locale, MessageId::AppModePlanHint)}),
         ];
+        // #6310: the permission posture is server-owned (a client can never
+        // relax it), but it must be discoverable. Work under Full Access must
+        // not claim that edits ask for approval, and the posture is surfaced
+        // below as a read-only select that names how Full Access is enabled.
+        let posture = acp_approval_mode(&session.config);
+        let agent_hint = if posture == ApprovalMode::Bypass {
+            tr(locale, MessageId::HomeYoloModeTip)
+        } else {
+            tr(locale, MessageId::AppModeAgentHint)
+        };
         if acp_mode(&self.config) != AppMode::Plan {
-            modes.insert(0, json!({"id": "agent", "name": tr(locale, MessageId::AppModeAgent), "description": tr(locale, MessageId::AppModeAgentHint)}));
+            modes.insert(0, json!({"id": "agent", "name": tr(locale, MessageId::AppModeAgent), "description": agent_hint}));
         }
         let current_mode = if acp_mode(&session.config) == AppMode::Plan {
             "plan"
         } else {
             "agent"
+        };
+        let (posture_value, posture_name, posture_description) = match posture {
+            ApprovalMode::Bypass => (
+                "full-access",
+                MessageId::ConfigChoiceFullAccess,
+                MessageId::PermissionsPostureBypass,
+            ),
+            ApprovalMode::Auto => (
+                "auto-review",
+                MessageId::ConfigChoiceAutoReview,
+                MessageId::PermissionsPostureAuto,
+            ),
+            ApprovalMode::Never => (
+                "never",
+                MessageId::ConfigChoiceNever,
+                MessageId::PermissionsPostureNever,
+            ),
+            ApprovalMode::Suggest => (
+                "ask",
+                MessageId::ConfigChoiceAsk,
+                MessageId::PermissionsPostureAsk,
+            ),
         };
         json!({
             "sessionId": session_id,
@@ -1694,7 +1776,17 @@ impl AcpServer {
                 {"id": "mode", "name": tr(locale, MessageId::SettingSubjectMode), "category": "mode", "type": "select", "currentValue": current_mode,
                  "options": modes.iter().map(|mode| json!({"value": mode["id"], "name": mode["name"], "description": mode["description"]})).collect::<Vec<_>>()},
                 {"id": "model", "name": tr(locale, MessageId::SettingSubjectModel), "category": "model", "type": "select", "currentValue": session.model,
-                 "options": models.iter().map(|model| json!({"value": model, "name": model})).collect::<Vec<_>>()}
+                 "options": models.iter().map(|model| json!({"value": model, "name": model})).collect::<Vec<_>>()},
+                // Exactly one option: the posture the server was started
+                // with. Offering a looser value here would let a client relax
+                // the operator's floor.
+                {"id": "permission", "name": tr(locale, MessageId::SettingSubjectPermissions), "category": "_permission", "type": "select", "currentValue": posture_value,
+                 "options": [{"value": posture_value, "name": tr(locale, posture_name), "description": tr(locale, posture_description)}],
+                 "_meta": {"codewhale": {
+                     "readOnly": true,
+                     "fullAccess": posture == ApprovalMode::Bypass,
+                     "enableFullAccess": ACP_FULL_ACCESS_HINT,
+                 }}}
             ]
         })
     }
@@ -1751,6 +1843,8 @@ impl AcpServer {
                     self.client_supports_terminal,
                 ));
             }
+            // The only offered permission value is the current posture.
+            "permission" => {}
             _ => unreachable!("validated offered option"),
         }
         Ok(json!({"configOptions": self.session_configuration(session_id)["configOptions"]}))
@@ -2101,6 +2195,10 @@ fn build_acp_system_prompt(
         crate::prompts::PromptHost::Headless,
     )
 }
+
+/// How an operator starts an ACP server in Full Access. The posture is chosen
+/// when the server is launched, never by a client request (#6310).
+const ACP_FULL_ACCESS_HINT: &str = "Start the server with `codewhale --approval-policy full-access serve --acp`, or set approval_policy = \"full-access\" in config.toml. Full Access also turns off Codewhale's own sandbox unless sandbox_mode tightens it; Plan stays read-only.";
 
 fn acp_mode(config: &Config) -> AppMode {
     if config.sandbox_mode.as_deref() == Some("read-only") {
@@ -2785,7 +2883,7 @@ mod tests {
         assert!(
             loaded["configOptions"]
                 .as_array()
-                .is_some_and(|options| options.len() == 2)
+                .is_some_and(|options| options.len() == 3)
         );
         let session = server
             .sessions
@@ -2918,7 +3016,8 @@ mod tests {
         else {
             panic!("configuration response")
         };
-        assert_eq!(configured["configOptions"].as_array().unwrap().len(), 2);
+        assert_eq!(configured["configOptions"].as_array().unwrap().len(), 3);
+        assert_eq!(configured["configOptions"][2]["currentValue"], "ask");
         assert_eq!(configured["configOptions"][0]["currentValue"], "plan");
         assert_eq!(configured["configOptions"][1]["currentValue"], alternative);
         assert_eq!(
@@ -2995,6 +3094,71 @@ mod tests {
             "the shared authority must reject mutation: {outcome:?}"
         );
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn full_access_posture_is_discoverable_but_never_client_selectable() {
+        // #6310: the mode list alone gave an ACP client no way to see or
+        // learn about Full Access, and Work claimed edits ask for approval
+        // even under `--yolo`.
+        let workspace = tempfile::tempdir().unwrap();
+        let mut ask = AcpServer::new(
+            Config::default(),
+            "deepseek-v4-flash".into(),
+            workspace.path().into(),
+        );
+        let state = ask.new_session(json!({})).unwrap();
+        let id = state["sessionId"].as_str().unwrap().to_string();
+        let permission = &state["configOptions"][2];
+        assert_eq!(permission["id"], "permission");
+        assert_eq!(permission["currentValue"], "ask");
+        assert_eq!(permission["options"].as_array().unwrap().len(), 1);
+        assert_eq!(permission["_meta"]["codewhale"]["fullAccess"], false);
+        assert!(
+            permission["_meta"]["codewhale"]["enableFullAccess"]
+                .as_str()
+                .unwrap()
+                .contains("--approval-policy full-access"),
+            "the posture names how Full Access is enabled"
+        );
+        for value in ["full-access", "bypass"] {
+            let error = ask
+                .set_session_config(
+                    json!({"sessionId": id, "configId": "permission", "value": value}),
+                )
+                .unwrap_err();
+            assert_eq!(error.code, -32602, "a client cannot select {value}");
+        }
+        assert_eq!(
+            acp_approval_mode(&ask.sessions[&id].config),
+            ApprovalMode::Suggest
+        );
+        // Re-selecting the offered (current) value is a harmless no-op.
+        ask.set_session_config(json!({"sessionId": id, "configId": "permission", "value": "ask"}))
+            .unwrap();
+
+        // The hint's own spelling must actually reach Full Access.
+        let mut yolo = AcpServer::new(
+            Config {
+                approval_policy: Some("full-access".into()),
+                ..Config::default()
+            },
+            "deepseek-v4-flash".into(),
+            workspace.path().into(),
+        );
+        let state = yolo.new_session(json!({})).unwrap();
+        let permission = &state["configOptions"][2];
+        assert_eq!(permission["currentValue"], "full-access");
+        assert_eq!(permission["_meta"]["codewhale"]["fullAccess"], true);
+        let agent_hint = state["modes"]["availableModes"][0]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(
+            state["modes"]["availableModes"][0]["description"],
+            ask.session_configuration(&id)["modes"]["availableModes"][0]["description"],
+            "Work under Full Access must not reuse the ask-for-approval hint: {agent_hint}"
+        );
     }
 
     #[test]
@@ -4841,6 +5005,97 @@ mod tests {
             panic!("expected tool_result for b.txt");
         };
         assert!(b_content.contains("contents-of-b"));
+    }
+
+    fn empty_stop_stream() -> StreamEventBox {
+        ready_stream(vec![StreamEvent::MessageStop])
+    }
+
+    async fn run_empty_stop_acp_turn(
+        streams: Vec<StreamEventBox>,
+    ) -> (
+        std::result::Result<(PromptOutcome, Vec<Message>), AgenticPromptError>,
+        Vec<Vec<Message>>,
+    ) {
+        let (_dir, registry) = workspace_registry();
+        let scripted = ScriptedStreams::new(streams);
+        let requests = RefCell::new(Vec::new());
+        let mut reader = lines_from("");
+        let mut out = Vec::new();
+        let result = run_agentic_prompt_turn(
+            AcpTurnContext {
+                config: &Config::default(),
+                model: "test-model",
+                session_id: "sess_1",
+                tool_registry: &registry,
+                response_id_policy: JsonRpcResponseIdPolicy::Preserve,
+            },
+            vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "Answer me".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            &mut reader,
+            &mut out,
+            |msgs| {
+                requests.borrow_mut().push(msgs);
+                scripted.next()
+            },
+        )
+        .await;
+        (result, requests.into_inner())
+    }
+
+    /// #6310 through the ACP prompt loop: one answerless clean stop is
+    /// retried with the identical request and the turn completes.
+    #[tokio::test]
+    async fn agentic_turn_retries_an_empty_clean_stop_then_completes() {
+        let (result, requests) = run_empty_stop_acp_turn(vec![
+            empty_stop_stream(),
+            ready_stream(vec![text_delta("recovered"), StreamEvent::MessageStop]),
+        ])
+        .await;
+        let (outcome, messages) = result.expect("turn completes after one retry");
+        assert_eq!(outcome, PromptOutcome::Completed("recovered".to_string()));
+        assert_eq!(requests.len(), 2, "exactly one retry");
+        assert_eq!(requests[0], requests[1], "exact-prefix retry");
+        // user -> assistant(text); the empty response left nothing behind.
+        assert_eq!(messages.len(), 2);
+    }
+
+    /// #6310 through the ACP prompt loop: an answerless clean stop on every
+    /// attempt fails visibly after the shared budget; the second retry is
+    /// nudged and the nudge never joins the committed history.
+    #[tokio::test]
+    async fn agentic_turn_fails_visibly_when_every_stop_is_empty() {
+        let (result, requests) = run_empty_stop_acp_turn(vec![
+            empty_stop_stream(),
+            empty_stop_stream(),
+            empty_stop_stream(),
+        ])
+        .await;
+        let Err(error) = result else {
+            panic!("an always-empty model must fail the turn");
+        };
+        assert!(
+            error.to_string().contains("no answer or tool call")
+                && error.to_string().contains("after 2 retries"),
+            "{error}"
+        );
+        assert!(error.partial_messages.is_none());
+        assert_eq!(
+            requests.len(),
+            1 + crate::core::engine::turn_loop::EMPTY_STOP_MAX_RETRIES as usize
+        );
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests[2].len(), requests[0].len() + 1, "nudged retry");
+        let nudge = crate::config::DEFAULT_REASONING_ONLY_REPROMPT_MESSAGE;
+        assert!(matches!(
+            requests[2].last().map(|m| &m.content[0]),
+            Some(ContentBlock::Text { text, .. }) if text == nudge
+        ));
     }
 
     #[tokio::test]

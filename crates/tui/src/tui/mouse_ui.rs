@@ -325,12 +325,16 @@ fn handle_plugin_cta_mouse(app: &mut App, mouse: MouseEvent) -> Option<Vec<ViewE
         return None;
     }
     if mouse_hits_rect(mouse, app.viewport.last_plugin_cta_dismiss_area) {
+        // "Don't suggest again": the explicit, persisted dismissal.
         let _ = app.dismiss_plugin_cta();
         return Some(Vec::new());
     }
-    // Review button, or the rest of the CTA line, runs the existing review
-    // command. Never auto-installs: the slash command is the human path.
-    if let Some(command) = app.accept_plugin_cta_command() {
+    // Only the labelled button acts, and it opens `/plugin show <name>`;
+    // install, trust, and enable stay the person's own next command. A click
+    // elsewhere on the row is consumed and does nothing.
+    if mouse_hits_rect(mouse, app.viewport.last_plugin_cta_review_area)
+        && let Some(command) = app.accept_plugin_cta_command()
+    {
         return Some(apply_sidebar_row_action(
             app,
             crate::tui::app::SidebarRowAction::Command(command),

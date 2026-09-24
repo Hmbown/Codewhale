@@ -76,8 +76,10 @@ pub fn ascii_fallback(symbol: &str) -> Option<&'static str> {
         "▲" | "△" | "↑" => Some("^"),
         "◆" | "◇" | "♦" | "✦" | "◍" | "◉" | "★" | "☆" => Some("*"),
         "■" | "□" | "▪" | "▫" | "◼" | "◻" => Some("#"),
-        "●" | "○" | "∘" | "•" | "·" | "☐" => Some("."),
-        "◌" | "˚" | "°" | "◦" => Some("o"),
+        // Filled marks stay a dot; hollow ones become `o` so CURRENT and
+        // AVAILABLE stay distinguishable on ASCII terminals.
+        "●" | "∘" | "•" | "·" => Some("."),
+        "○" | "☐" | "◌" | "˚" | "°" | "◦" => Some("o"),
         "✓" | "✔" | "☑" => Some("Y"),
         "✕" | "×" | "⊘" | "✗" | "✘" | "☒" => Some("X"),
         "⏸" => Some("="),
@@ -121,6 +123,11 @@ mod tests {
             (SELECTION, ">"),
             ("▷", ">"),
             (CURRENT, "."),
+            (AVAILABLE, "o"),
+            (READY, "o"),
+            ("☐", "o"),
+            ("•", "."),
+            (NEUTRAL, "."),
             (USER, "|"),
             (DONE, "Y"),
             (FAILED, "X"),
@@ -142,6 +149,11 @@ mod tests {
         ] {
             assert_eq!(ascii_fallback(rich), Some(safe));
         }
+        assert_ne!(
+            ascii_fallback(CURRENT),
+            ascii_fallback(AVAILABLE),
+            "current and available must stay distinct in ASCII"
+        );
         assert_eq!(braille_ascii_fallback('\u{2801}'), Some("."));
         assert_eq!(braille_ascii_fallback('A'), None);
     }

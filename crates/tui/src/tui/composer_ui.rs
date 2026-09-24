@@ -37,10 +37,12 @@ pub(crate) fn next_escape_action(app: &App, slash_menu_open: bool) -> EscapeActi
         || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
     {
         EscapeAction::CancelRequest
+    } else if !app.input.is_empty() {
+        // A draft is the person's work: Esc clears it (recoverably) before it
+        // dismisses a plugin offer (0.10.1 plugin offering policy, rule 9).
+        EscapeAction::ClearInput
     } else if app.plugin_cta.phase.is_visible() {
         EscapeAction::DismissPluginCta
-    } else if !app.input.is_empty() {
-        EscapeAction::ClearInput
     } else {
         EscapeAction::Noop
     }

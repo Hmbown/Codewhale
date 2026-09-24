@@ -1710,7 +1710,7 @@ fn glibc_check_disabled() -> bool {
 }
 
 fn preflight_downloaded_binary(asset_name: &str, bytes: &[u8]) -> Result<()> {
-    // GNU libc preflight is Linux-only (#4241). Rust treats `target_os = "android"`
+    // glibc preflight is Linux-only (#4241). Rust treats `target_os = "android"`
     // as distinct from `"linux"`, so Termux/Android builds skip this check entirely
     // — Android uses Bionic libc, not glibc.
     if !cfg!(target_os = "linux") || glibc_check_disabled() {
@@ -1767,22 +1767,19 @@ fn glibc_compatibility_message(
             "this system has glibc {}, which is too old for that asset.",
             host.display()
         ),
-        None => "this system does not appear to provide GNU libc.".to_string(),
+        None => "this system does not appear to provide glibc.".to_string(),
     };
     format!(
         "\
 Prebuilt Codewhale asset `{asset_name}` requires GLIBC_{required}, but {host_line}
 
-Official Linux release binaries are GNU libc builds. Ubuntu 22.04 ships glibc
-2.35, so it cannot run a binary that was built against Ubuntu 24.04/glibc 2.39.
-
-Install from source on this host instead:
+Official Codewhale Linux release assets (x64 and arm64) are static musl builds
+with no glibc dependency, so this binary is not an official release asset. Check
+the download source, or install from source on this host instead:
 
   cargo install codewhale-cli --locked
 
-Release engineering follow-up: build Linux GNU assets against an older glibc
-baseline, or add a musl/static Linux asset. Set CODEWHALE_SKIP_GLIBC_CHECK=1 to
-bypass this preflight at your own risk.",
+Set CODEWHALE_SKIP_GLIBC_CHECK=1 to bypass this preflight at your own risk.",
         required = required.display(),
     )
 }
@@ -3001,7 +2998,8 @@ mod tests {
         assert!(message.contains("requires GLIBC_2.39"));
         assert!(message.contains("this system has glibc 2.35"));
         assert!(message.contains("cargo install codewhale-cli --locked"));
-        assert!(message.contains("build Linux GNU assets against an older glibc"));
+        assert!(message.contains("(x64 and arm64) are static musl builds"));
+        assert!(!message.contains("GNU "), "no stale GNU-build claim");
     }
 
     #[test]

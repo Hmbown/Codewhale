@@ -276,19 +276,19 @@
     "metaDescription": "常见问题的快速分诊：挂起的回合、离线队列、崩溃恢复、schema 错误、MCP 故障与 Docker 说明。",
     "bodyClassName": "text-ink-soft leading-[1.9] tracking-wide",
     "overviewTitle": "排障",
-    "overviewLead": "先快速分诊：确认二进制与配置（codewhale --version、~/.codewhale/config.toml），需要更详细日志时用 RUST_LOG=deepseek_cli=debug 启动（HTTP 重试/重连用 RUST_LOG=deepseek_cli::client=debug），并看一眼 ~/.codewhale/sessions 与 ~/.codewhale/tasks 的当前状态。",
+    "overviewLead": "先快速分诊：确认二进制与配置（codewhale --version、~/.codewhale/config.toml），需要更详细日志时用 RUST_LOG=codewhale_tui=debug 启动（HTTP 重试/重连用 RUST_LOG=codewhale_tui::client=debug；日志写入 ~/.codewhale/logs/），并看一眼 ~/.codewhale/sessions 与 ~/.codewhale/tasks 的当前状态。",
     "incidents": [
       [
         "回合挂起或流停止",
-        "前台 shell 命令还在跑时按 Ctrl+B 把它移到后台（回合继续，命令变成 /jobs 下的后台任务）；想取消回合本身用 Esc 或 Ctrl+C。检查 deepseek_cli::client 的重试日志和端点连通性，重启后确认此前在途的回合被标记为中断，而不是停在运行态。"
+        "前台 shell 命令还在跑时按 Ctrl+B 把它移到后台（回合继续，命令变成 /jobs 下的后台任务）；想取消回合本身用 Esc 或 Ctrl+C。检查 codewhale_tui::client 的重试日志和端点连通性，重启后确认此前在途的回合被标记为中断，而不是停在运行态。"
       ],
       [
         "网络中断 / 离线行为",
-        "离线时新提示词会排队，队列持久化在 ~/.codewhale/sessions/checkpoints/offline_queue.json。用 /queue list 查看，恢复连接后重新发送（/queue edit <n> 加回车，或走正常输入流程），队列清空后文件随之清除。"
+        "离线时新提示词会排队，队列按会话持久化在 ~/.codewhale/sessions/checkpoints/<session-id>.offline_queue.json（旧的全局 offline_queue.json 会在升级时被接管一次）。用 /queue list 查看，恢复连接后重新发送（/queue edit <n> 加回车，或走正常输入流程），队列清空后文件随之清除。"
       ],
       [
         "崩溃恢复",
-        "检查点保存在 ~/.codewhale/sessions/checkpoints/latest.json；除非传入 --resume/--continue，启动会开新会话。用 codewhale --resume <id> 或 TUI 里的 Ctrl+R 显式恢复；若检查点 schema 比二进制新，升级二进制或移除过期检查点。"
+        "每个会话的检查点保存在 ~/.codewhale/sessions/checkpoints/<session-id>.json（旧的 latest.json 仍会读取，但不再写入）；除非传入 --resume/--continue，启动会开新会话。用 codewhale --resume <id> 或 TUI 里的 Ctrl+R 显式恢复；若检查点 schema 比二进制新，升级二进制或移除过期检查点。"
       ],
       [
         "持久状态 schema 错误",
@@ -313,9 +313,9 @@
     "auditLead": "在 TUI 里运行 {auditCommand} 可以查看哪些文档化的键能在当前会话修改、哪些能持久化、哪些只能改文件或需要重启——改动前以它输出的“Command / reason”列为准。",
     "overlayTitle": "项目级覆盖",
     "overlayLead": "当工作区包含常规文件 <workspace>/.codewhale/config.toml 时，其中声明的安全取值会合并到全局配置之上（旧版 <workspace>/.deepseek/config.toml 在新路径缺失时仍会读取；符号链接的项目配置会被拒绝）。这让仓库可以建议模型或收紧本地安全姿态，而不动用户的全局配置。单次启动可用 --no-project-config 跳过覆盖。",
-    "overlayLimits": "覆盖层有意保持狭窄：支持 model、reasoning_effort、approval_policy 与 sandbox_mode（只能收紧）、notes_path、max_subagents（夹紧到 1..=20）、allow_shell（false 生效，true 被忽略）。凭据、端点、提供商选择、MCP 配置、hooks、skills 和 instructions = [...] 始终属于用户全局配置——仓库里的 config.toml 声明 api_key、base_url 或 provider 会被忽略，克隆的仓库无法借此选择任意本地文件进入提示词。",
+    "overlayLimits": "覆盖层有意保持狭窄：支持 model、reasoning_effort、approval_policy 与 sandbox_mode（只能收紧）、notes_path、max_subagents（夹紧到 1..=128）、allow_shell（false 生效，true 被忽略）。凭据、端点、提供商选择、MCP 配置、hooks、skills 和 instructions = [...] 始终属于用户全局配置——仓库里的 config.toml 声明 api_key、base_url 或 provider 会被忽略，克隆的仓库无法借此选择任意本地文件进入提示词。",
     "credentialsTitle": "凭据查找",
-    "credentialsLead": "在显式 {apiKey} 之后，凭据按 config → keyring → env 的顺序解析。{authStatus} 可以查看当前提供商的配置文件、系统 keyring 后端、环境变量、生效来源和末四位标签，而不会打印密钥本身。托管、OpenAI 兼容、自托管或 Anthropic 原生路由用 {providerConfig} 或 {providerFlag} 选择；完整注册表见模型与提供商页和 docs/PROVIDERS.md。",
+    "credentialsLead": "当前提供商的 API 密钥按以下顺序解析，先命中者生效：路由自身的认证约定（OAuth 路由使用已授权的令牌；auth_mode = \"none\" 不发送密钥），然后是显式 {apiKey}，然后是配置文件中的 api_key，然后是 api_key_env 绑定，然后是 codewhale auth set 写入的密钥存储（默认是 ~/.codewhale/secrets/ 下的文件；仅当 CODEWHALE_SECRET_BACKEND=system 时才使用系统 keyring），最后是提供商自己的环境变量（只会发送到该提供商的官方端点）。{authStatus} 可以查看当前提供商的配置文件、密钥存储后端、环境变量、生效来源和末四位标签，而不会打印密钥本身。托管、OpenAI 兼容、自托管或 Anthropic 原生路由用 {providerConfig} 或 {providerFlag} 选择；完整注册表见模型与提供商页和 docs/PROVIDERS.md。",
     "legacyTitle": "旧版 .deepseek/ 路径",
     "legacyLead": "Codewhale 由 DeepSeek-TUI 更名而来。为了不破坏既有安装，运行时从新的 ~/.codewhale/ 位置读取状态，但在只有旧目录存在时回退到 ~/.deepseek/，并且始终写入 ~/.codewhale/——读取带回退、写入新位置。状态目录解析集中在 crates/config/src/lib.rs 的 resolve_state_dir / ensure_state_dir 中，每一处旧路径引用都有审计过的保留决定。",
     "sourceNote": "来源文档：docs/CONFIGURATION.md, docs/LEGACY_PATHS.md · 更新时请同步修改 docs-map.ts。"
@@ -391,19 +391,19 @@
         "用于只读调查与规划。Codewhale 可以检查工作区，但不能执行 Shell 命令或修改文件。"
       ],
       [
-        "Act",
+        "Work",
         "用于常规交互式编码。Codewhale 可以检查、编辑并使用工具；Shell 是否可用以及何时请求批准，取决于当前配置和权限姿态。"
       ],
       [
         "Operate",
-        "用于从同一个输入区协调多项任务。父回合可以直接检查、编辑并使用 Shell 或 MCP 工具，其权限姿态、沙箱和安全规则与 Act 相同。独立、并行、后台或长时间工作会优先交给 fleet worker，但并非所有可执行步骤都必须委派。只有需要有序阶段、门禁或确定性汇总时才需要 Workflow。"
+        "用于从同一个输入区协调多项任务。父回合可以直接检查、编辑并使用 Shell 或 MCP 工具，其权限姿态、沙箱和安全规则与 Work 相同。独立、并行、后台或长时间工作会优先交给 fleet worker，但并非所有可执行步骤都必须委派。只有需要有序阶段、门禁或确定性汇总时才需要 Workflow。"
       ]
     ],
     "switchingTitle": "切换模式",
-    "switchingLead": "输入区空闲时，按 {tab} 循环 Plan → Act → Operate。补全菜单打开时，Tab 接受补全；回合运行时，它可以把当前草稿排入下一个跟进消息。",
+    "switchingLead": "输入区空闲时，按 {tab} 循环 Plan → Work → Operate。补全菜单打开时，Tab 接受补全；回合运行时，它可以把当前草稿排入下一个跟进消息。",
     "switchingCommandLead": "运行 /mode 打开模式选择器，或使用以下命令直接切换：",
     "permissionsTitle": "权限姿态",
-    "permissionsLead": "Plan 始终为只读。在 Act 或 Operate 中且输入区空闲时，按 {shiftTab} 循环 Ask → Auto-Review → Full Access。运行 {configCommand} 可查看或编辑当前会话权限；项目或托管策略可能会锁定或收紧它。",
+    "permissionsLead": "Plan 始终为只读。在 Work 或 Operate 中且输入区空闲时，按 {shiftTab} 循环 Ask → Auto-Review → Full Access。运行 {configCommand} 可查看或编辑当前会话权限；项目或托管策略可能会锁定或收紧它。",
     "postures": [
       [
         "Ask",
@@ -411,7 +411,7 @@
       ],
       [
         "Auto-Review",
-        "自动评估工具风险，只在确实需要你决定时询问。"
+        "完全自主：从不停下来询问你。可证明安全的调用直接运行，发布类操作和破坏性的后台操作会被拦截，其余调用交给一次性模型审查；高风险调用和未决的拦截会被拒绝，而不是转成提示。"
       ],
       [
         "Full Access",
@@ -796,8 +796,10 @@
     "reload": "重新加载页面",
     "homeLink": "返回首页",
     "docsIndexLink": "打开文档目录",
-    "notFoundTitle": "这个地址没有页面",
-    "notFoundBody": "链接可能已过期，或页面已迁移。文档目录列出了当前所有页面。",
+    "notFoundTitle": "谁还没打过错字呢。",
+    "notFoundBody": "这个页面还不存在。\n这款游戏也一样。",
+    "notFoundHomeLink": "返回基地",
+    "notFoundPosterAlt": "虚构游戏《Codwhale: Modern Whalefare》的海报，一只身穿战术装备的蓝鲸。",
     "unavailableTitle": "实时记录尚未加载",
     "unavailableBody": "数据源没有响应上一次刷新，或者此页面自构建以来尚未刷新。这里不会用编造的内容填充。",
     "offlineTitle": "你已离线",

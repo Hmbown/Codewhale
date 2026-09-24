@@ -100,6 +100,32 @@ test("replay re-enters the pipeline, stops at the first refusal, and never recor
   assert.equal((await tool("trajectory", { action: "status" })).recording, false);
 });
 
+test("E4: entered text is redacted, the file is 0600 in a 0700 dir, and redacted steps never replay", async () => {
+  const started = await tool("trajectory", { action: "start" });
+  assert.equal(started.recording, true);
+  // set_value without a target refuses before any backend is touched, but the
+  // attempt — with its secret — is still part of the record.
+  const refused = await tool("set_value", { value: "hunter2-secret" });
+  assert.equal(refused.error?.code, "bad_args");
+  await tool("wait", { seconds: 0.01 });
+  const stopped = await tool("trajectory", { action: "stop" });
+  const text = fs.readFileSync(stopped.file, "utf8");
+  assert.ok(!text.includes("hunter2"), "the secret never reaches disk");
+  const call = text.trim().split("\n").map(JSON.parse).find((l) => l.tool === "set_value");
+  assert.equal(call.args.value, "[redacted]");
+  assert.equal(call.redacted, true);
+  assert.equal(call.replayable, false);
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(stopped.file).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.dirname(stopped.file)).mode & 0o777, 0o700);
+  }
+  const dry = await tool("trajectory", { action: "replay", id: path.basename(stopped.file), dry_run: true });
+  assert.deepEqual(dry.not_replayable, [0]);
+  const replay = await tool("trajectory", { action: "replay", id: path.basename(stopped.file) });
+  assert.equal(replay.replayed, 1);
+  assert.deepEqual(replay.results, [{ tool: "set_value", ok: false, code: "not_replayable" }]);
+});
+
 test("replay refuses escaping ids; the kill switch gates replay but not status", async () => {
   const bad = await tool("trajectory", { action: "replay", id: "../escape.jsonl" });
   assert.equal(bad.error?.code, "bad_args");

@@ -636,6 +636,49 @@ pub(super) fn context_overflow_exhausted_message(
     )
 }
 
+/// The single error line for a request that cannot fit the route and has
+/// too little earlier conversation to summarize (experience mark 2). It names the real
+/// cause and one next step instead of blaming a compaction that never had
+/// anything to work with.
+pub(super) fn context_does_not_fit_message(
+    interactive: bool,
+    local_ollama: bool,
+    model: &str,
+    estimated_input: usize,
+    input_budget: usize,
+    prefix_tokens: usize,
+) -> String {
+    let pick = |what: &str| {
+        if interactive {
+            format!("Pick {what}: /model.")
+        } else {
+            format!("Choose {what}.")
+        }
+    };
+    if local_ollama && crate::local_ollama::looks_like_non_chat_tag(model) {
+        return format!("{model} can't chat. {}", pick("a chat model"));
+    }
+    let larger = if local_ollama {
+        "a larger model, or raise num_ctx"
+    } else {
+        "a larger model"
+    };
+    if prefix_tokens >= input_budget {
+        format!(
+            "{model}'s context window (~{input_budget} tokens usable) is smaller than \
+             Codewhale's working instructions (~{prefix_tokens} tokens). {}",
+            pick(larger)
+        )
+    } else {
+        format!(
+            "This message (~{estimated_input} tokens with Codewhale's instructions) does not \
+             fit {model}'s window (~{input_budget} tokens usable), and there is not enough \
+             earlier conversation to summarize. Shorten it, or {}",
+            pick(larger).to_lowercase()
+        )
+    }
+}
+
 pub(super) fn is_image_input_rejection_message(message: &str) -> bool {
     let lower = message.to_lowercase();
     let image_signal = lower.contains("image_url")

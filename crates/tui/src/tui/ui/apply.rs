@@ -710,6 +710,8 @@ pub(crate) async fn apply_mode_update(
     app.report_mode_selection(mode, outcome);
     if mode == AppMode::Operate {
         present_operate_board(app, config).await;
+        // First contact with the fleet, not first launch, owns its intro.
+        app.maybe_show_feature_intro();
     }
     if outcome.changed_live_state() {
         sync_mode_update(app, engine_handle).await;
@@ -2200,6 +2202,8 @@ pub(crate) async fn apply_command_result(
                             app, config,
                         ));
                 }
+                // `/fleet` is where the one-time Fleet intro belongs.
+                app.maybe_show_feature_intro();
             }
             AppAction::OpenFleetSetup => {
                 open_fleet_setup_target(app, config, None);
@@ -3844,6 +3848,7 @@ pub(crate) fn apply_loaded_session_with_goal(
         std::time::Duration::from_secs(session.metadata.cumulative_turn_secs);
     app.current_session_id = Some(session.metadata.id.clone());
     app.current_session_metadata = Some(session.metadata.clone());
+    reset_approval_scope_for_new_conversation(app);
     if let Some(binding) = recovered_binding {
         if let Some(metadata) = app.current_session_metadata.as_mut() {
             metadata.runtime_store = Some(binding);

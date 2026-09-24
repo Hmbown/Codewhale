@@ -88,6 +88,8 @@ base prompt". Two more corollaries earned here:
   "for the record" notes. The one exception is closing or superseding a human
   contributor's PR or issue: one sentence saying why, with the link. The PR and
   issue review workflows are disabled; re-enable one only by founder decision.
+- **Write `close`/`fix`/`resolve #N` only when you mean it.** GitHub closes the
+  issue on merge even inside "does not close #N"; use `Refs #N` otherwise.
 
 ## Landing other people's work
 

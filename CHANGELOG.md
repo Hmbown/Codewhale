@@ -7,6 +7,140 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The website's not-found page now uses the Codwhale poster and typo joke,
+with English/Chinese recovery links to home and docs
+([#6419](https://github.com/Hmbown/Codewhale/issues/6419),
+[#6420](https://github.com/Hmbown/Codewhale/pull/6420)).
+
+Planned for Codewhale v0.10.1: a reliability and first-run release. Turns that
+stall now say so, approvals keep what you approved, plugin suggestions are
+quieter, and Fleet runs can be checked before they spend anything.
+
+### Fixed
+
+- A turn that stops producing output now reports itself: the turn loop records
+  its phase and last progress, and an overdue phase surfaces instead of
+  hanging silently until the stream idle timeout. A delegated agent's final result is
+  never dropped when the host is busy, so a finished child no longer leaves a
+  ghost Running row behind ([#6184](https://github.com/Hmbown/Codewhale/issues/6184)).
+- Git commands run by tools never stop to ask for a password, passphrase or
+  host-key confirmation inside the terminal, and `git_fetch` has a timeout
+  ([#6184](https://github.com/Hmbown/Codewhale/issues/6184)).
+- A provider response that ends cleanly with no text and no tool call is
+  retried before the turn fails, and the failure names how many retries ran
+  ([#6310](https://github.com/Hmbown/Codewhale/issues/6310)).
+- The context meter, the point where Codewhale makes room, preflight,
+  `/context` and turn receipts show one pressure number instead of disagreeing
+  ([#6407](https://github.com/Hmbown/Codewhale/pull/6407)).
+- Continuing a conversation that is already open no longer adds a second
+  thread, and a fork keeps its own session file, so autosave on one side no
+  longer leaves the other unloadable
+  ([#6406](https://github.com/Hmbown/Codewhale/pull/6406), thanks @gaord).
+- Upgrading Codewhale no longer turns off the built-in Computer Use. Each build
+  writes the built-in bundle to its own directory, so an upgrade used to present
+  it as never reviewed and disabled. Now the review and enablement carry to the
+  new build when its capabilities are unchanged. Changed capabilities show
+  `capabilities-changed` and wait for review, and a revoked trust never carries
+  ([#6303](https://github.com/Hmbown/Codewhale/issues/6303)).
+- "Allow for this conversation" records a grant for that tool and argument
+  class instead of switching the whole thread to Full Access, so the call you
+  just approved is no longer failed by a Permissions change. An approval
+  also survives a Permissions change that only widens what is allowed, grants
+  end when a thread is archived or deleted, and `web.run` open grants are
+  scoped by host. Full Access covers MCP tools that declare themselves destructive in
+  every host, including `codewhale exec`
+  ([#3866](https://github.com/Hmbown/Codewhale/issues/3866)).
+- `web.run` retries a refused page once with a browser user agent, and one
+  site's failure no longer fails the whole call or drops its search results.
+- Hooks treat `bash`, `Bash` and `exec_shell` as one tool in `tool_name`
+  conditions, so the documented example fires.
+- macOS no longer reports Codewhale's ordinary heap as GPU (IOAccelerator)
+  memory.
+- Code highlighting uses less memory, and long transcripts, the pager and the
+  session picker do less work on the event loop; session previews load in the
+  background ([#6014](https://github.com/Hmbown/Codewhale/issues/6014)).
+- The composer's send cue follows the draft, not a paste in progress
+  ([#6397](https://github.com/Hmbown/Codewhale/issues/6397)).
+- Voice status is localized, ASCII-mode markers are distinct, and the cursor
+  honours `NO_COLOR` ([#5846](https://github.com/Hmbown/Codewhale/issues/5846)).
+- `/cache`, `/stash`, `/config`, session prune, `metrics --since` and the
+  `lane start`/`lane stop --json` flags handle their edge cases.
+
+### Experience
+
+- Typing a first message with no model connected leaves a line in the
+  transcript that says the message was not sent and opens the provider picker.
+- First run picks a chat-capable Ollama model instead of the alphabetically
+  first tag, and says plainly when no model is available yet.
+- `codewhale doctor` leads and ends with one verdict and the next step, and
+  gives the update command for how you actually installed Codewhale.
+  Command-line usage and errors say `codewhale`.
+- The approval card leads with a plain summary of the action, such as
+  "Run `cargo test`", and shows workspace-relative paths. The footer labels
+  its values.
+- `/status` warns when the session's pinned model is no longer in its
+  provider's live model list
+  ([#6035](https://github.com/Hmbown/Codewhale/issues/6035)).
+- Error messages give one true sentence and one next step. The TUI's English
+  copy says agent, Fleet, Permissions and Work consistently, help lists one
+  summary per row, provider rows without a key say "needs key", `/setup` says
+  what it sets up, and the pet tank rests when it is offline.
+- ACP clients can see the Permissions setting the server started with,
+  including Full Access and how to turn it on, but cannot select it
+  ([#6310](https://github.com/Hmbown/Codewhale/issues/6310)).
+- `GET /v1/commands` tells clients each command's argument shape, so they do
+  not re-derive composer behaviour from the usage string
+  ([#6230](https://github.com/Hmbown/Codewhale/issues/6230)).
+
+### Fleet and agents
+
+- `codewhale fleet run <spec> --check` runs every validation a real run would
+  and stops there: nothing is created, launched or spent.
+- A queued agent says why it is waiting, for example when launches are
+  throttled after provider rate limits, and when its time budget ends
+  ([#6277](https://github.com/Hmbown/Codewhale/issues/6277)).
+- Stopping an agent that writes files keeps and names the work it had
+  changed, as a budget stop already did
+  ([#5529](https://github.com/Hmbown/Codewhale/issues/5529)).
+- `workflow(fleet:)` runs Fleets saved from the Fleet UI, and finds
+  workspace Fleets under `.codewhale/fleets`.
+- The runtime API can stop a delegated agent run from the desktop.
+
+### Plugins
+
+- Codewhale no longer appends plugin recommendations to your messages to the
+  model. Suggestions appear in one place, follow one switch and one budget,
+  and never advertise built-in plugins, generic words or plugins for another
+  operating system.
+- `/plugin dismissals` lists the plugins suggestions skip, and
+  `/plugin dismissals reset [<name>]` brings them back.
+- Tools from reviewed plugins that declare themselves read-only no longer ask
+  for approval on every call.
+- The bundled Computer Use plugin is 0.11.3, synced from upstream `0f54bf6`
+  ([#6303](https://github.com/Hmbown/Codewhale/issues/6303)).
+  `app_script` refuses shell escapes. Clicks on irreversible actions such as
+  pay, send or delete need confirmation. Consent decisions cannot ride inside
+  `run_actions` or trajectory replay, and trajectories redact secure fields.
+  Also new: a shared-computer control lease that pauses agent input while a
+  person drives, and a browser attach mode for a shared Chromium. The vendored
+  README no longer claims delegated agents share the Computer Use session; they
+  never receive its tools.
+- The bundled first-party catalog pins marketplace revision
+  `93b0e0e4e441384533ca586b59890c0d5942bc0a`. It lists Computer Use 0.11.3 and
+  the same five plugins as before. Chromewhale is not in the bundled catalog
+  yet.
+
+### CI
+
+- Fork pull requests stay under the macOS runner limit and the Actions cache
+  stays under its cap.
+- Release candidates and releases share one parity gate, and a release tag
+  without a release-candidate receipt is refused.
+- Budget ratchets block same-repository pull requests unless the pull request
+  updates the budget with a receipt.
+- A CodeQL advanced-setup workflow is ready for when the repository switches
+  from default setup.
+
 ## [0.10.0] - 2026-09-22
 
 Codewhale v0.10.0 brings a redesigned terminal workbench, clearer settings, and

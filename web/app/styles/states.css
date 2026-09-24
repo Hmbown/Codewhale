@@ -1,0 +1,192 @@
+/* ------------------------------------------------------------------ */
+/*  Shared surface states — empty / loading / error (surface-state.tsx) */
+/* ------------------------------------------------------------------ */
+/*
+ * One plate for every data-bearing page's non-data moments. The mark on the
+ * left carries the state in colour AND the copy carries it in words, so no
+ * state is conveyed by colour alone: mute for empty, action blue for loading,
+ * coral for error — the status-bar grammar the product already speaks.
+ */
+.state-block {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+  padding: clamp(1.5rem, 4vw, 2.25rem) clamp(1.25rem, 3vw, 1.75rem);
+  border: 1px solid var(--stage-line);
+  border-radius: var(--radius-control);
+  background: var(--paper-card);
+  color: var(--ink);
+}
+
+.state-block-compact {
+  padding: 1rem 1.15rem;
+  gap: 0.8rem;
+}
+
+.state-mark {
+  width: 0.6rem;
+  height: 0.6rem;
+  margin-top: 0.42rem;
+  border-radius: var(--radius-pill);
+  background: var(--ink-mute);
+  flex: none;
+}
+
+.state-block-loading .state-mark { background: var(--indigo); }
+.state-block-error .state-mark { background: var(--ocean-coral); }
+.state-block-error { border-color: color-mix(in srgb, var(--ocean-coral) 45%, var(--stage-line)); }
+
+.state-copy { min-width: 0; }
+
+.state-title {
+  color: var(--ink);
+  font-size: 0.98rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.state-body {
+  max-width: 44rem;
+  margin-top: 0.4rem;
+  color: var(--ink-soft);
+  font-size: 0.86rem;
+  line-height: 1.65;
+}
+
+.state-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+
+.state-retry[aria-busy="true"] { opacity: 0.7; cursor: progress; }
+
+/* Skeleton lines: neutral bars, never fake words. The shimmer is opt-in
+   under no-preference; reduced motion sees still bars. */
+.state-skeleton {
+  display: grid;
+  gap: 0.55rem;
+  margin-top: 0.85rem;
+}
+
+.state-skeleton > span {
+  display: block;
+  height: 0.7rem;
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--ink-mute) 22%, transparent);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .state-skeleton > span {
+    background: linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--ink-mute) 18%, transparent) 0%,
+      color-mix(in srgb, var(--ink-mute) 34%, transparent) 50%,
+      color-mix(in srgb, var(--ink-mute) 18%, transparent) 100%
+    );
+    background-size: 200% 100%;
+    animation: state-shimmer 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes state-shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+
+/* Route-level boundaries (loading.tsx / error.tsx / not-found.tsx) sit in
+   the site container with the page rhythm so a boundary never looks like a
+   different site. */
+.route-state {
+  width: var(--container);
+  margin-inline: auto;
+  padding-block: clamp(3rem, 6vw, 4.75rem);
+  max-width: 52rem;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Connection banner — offline / reconnecting / degraded / restored    */
+/* ------------------------------------------------------------------ */
+.connection-banner {
+  position: sticky;
+  top: 0;
+  z-index: 35;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 0.9rem;
+  align-items: center;
+  width: var(--container);
+  margin: 0.75rem auto 0;
+  padding: 0.7rem 1rem;
+  border: 1px solid var(--stage-line);
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--paper-card) 92%, transparent);
+  backdrop-filter: blur(8px);
+  color: var(--ink);
+}
+
+.connection-mark {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: var(--radius-pill);
+  background: var(--ink-mute);
+}
+
+.connection-banner-offline { border-color: color-mix(in srgb, var(--ocean-coral) 50%, var(--stage-line)); }
+.connection-banner-offline .connection-mark { background: var(--ocean-coral); }
+.connection-banner-reconnecting .connection-mark { background: var(--indigo); }
+.connection-banner-degraded .connection-mark { background: var(--ochre); }
+.connection-banner-restored { border-color: color-mix(in srgb, var(--jade) 50%, var(--stage-line)); }
+.connection-banner-restored .connection-mark { background: var(--jade); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .connection-banner-reconnecting .connection-mark {
+    animation: connection-pulse 1.2s ease-in-out infinite;
+  }
+  .connection-banner {
+    animation: mm-in var(--dur-spring) var(--ease-spring) both;
+  }
+}
+
+@keyframes connection-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.connection-copy { min-width: 0; }
+.connection-title { font-size: 0.86rem; font-weight: 600; }
+.connection-body { margin-top: 0.15rem; color: var(--ink-soft); font-size: 0.78rem; line-height: 1.5; }
+.connection-checked { color: var(--ink-mute); font-family: var(--font-mono); font-size: 0.75rem; }
+
+.connection-actions { display: flex; gap: 0.5rem; }
+
+.connection-button {
+  display: inline-flex;
+  min-height: 2.25rem;
+  align-items: center;
+  padding: 0.35rem 0.75rem;
+  border: 1px solid var(--stage-line);
+  border-radius: var(--radius-control);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  transition: border-color var(--dur-state) var(--ease-spring), background-color var(--dur-state) var(--ease-spring), color var(--dur-state) var(--ease-spring);
+}
+
+.connection-button:hover { border-color: var(--indigo); color: var(--indigo); }
+.connection-button-primary { border-color: var(--indigo); background: var(--indigo); color: var(--paper); }
+.connection-button-primary:hover { background: var(--indigo-deep); border-color: var(--indigo-deep); color: var(--paper); }
+.connection-button:disabled { opacity: 0.55; cursor: not-allowed; }
+.connection-button[aria-busy="true"] { cursor: progress; }
+
+@media (max-width: 560px) {
+  .connection-banner {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .connection-actions {
+    grid-column: 2;
+  }
+}

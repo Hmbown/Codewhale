@@ -143,12 +143,6 @@ export default async function ConstitutionPage({ params }: { params: Promise<{ l
             {isZh ? "安装 →" : "Install →"}
           </Link>
           <Link
-            href={p("/docs/constitution")}
-            className="px-5 py-3 hairline-t hairline-b hairline-l hairline-r font-mono text-sm uppercase tracking-wider hover:bg-paper-deep transition-colors"
-          >
-            {isZh ? "参考细节：文档 →" : "Reference detail: docs →"}
-          </Link>
-          <Link
             href="https://github.com/Hmbown/CodeWhale/blob/main/docs/CONFIGURATION.md#constitution-project-instructions-and-repo-authority"
             className="px-5 py-3 font-mono text-sm uppercase tracking-wider text-ink-mute hover:text-indigo transition-colors"
           >

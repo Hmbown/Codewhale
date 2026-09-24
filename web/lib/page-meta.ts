@@ -63,6 +63,9 @@ const OG_LOCALE: Record<string, string> = {
  * @param locale      Locale of the page being rendered (a routed locale).
  * @param title       Localized page <title> (full string; no template is applied).
  * @param description Localized meta description, same locale as `title`.
+ * @param robots      Optional robots directives, e.g. `{ index: false, follow: true }`
+ *                    for draft, auth, or flag-gated pages that must stay out of
+ *                    search indexes. Omitted → no robots field (site default).
  *
  * Usage in a page or layout:
  * ```ts
@@ -83,11 +86,13 @@ export function buildPageMetadata({
   locale,
   title,
   description,
+  robots,
 }: {
   path: string;
   locale: string;
   title: string;
   description: string;
+  robots?: Metadata["robots"];
 }): Metadata {
   // "/" → "" so the homepage canonical is /en, not /en/.
   const suffix = path === "/" ? "" : path.replace(/\/+$/, "");
@@ -106,6 +111,7 @@ export function buildPageMetadata({
     metadataBase: new URL(SITE_URL),
     title,
     description,
+    ...(robots === undefined ? {} : { robots }),
     alternates: {
       canonical,
       languages,

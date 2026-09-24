@@ -1,0 +1,107 @@
+name: Release parity
+
+# The one parity gate. release-candidate.yml and release.yml both call this,
+# so the SHA an RC validates has passed exactly the gate that publish runs.
+# Before this was shared, the RC skipped parity: RC 35707500620 was green on
+# 3e8bf29946, Release 35728585975 then failed parity on that SHA, and v0.10.0
+# was re-pointed to 1be1a703b, which docs/RELEASE_RUNBOOK.md forbids.
+#
+# Checks out the caller's GITHUB_SHA. Callers must verify that SHA first.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  parity:
+    name: Workspace parity
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    steps:
+      # Every caller's resolve job already proved GITHUB_SHA equals the
+      # candidate or tag commit. Do not interpolate a SHA into checkout or
+      # cache keys —
+      # CodeQL treats a *sha* ref as an untrusted checkout on workflow_dispatch
+      # (default-branch cache write).
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-18
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        id: sccache
+        continue-on-error: true
+      - name: Enable sccache
+        if: steps.sccache.outcome == 'success'
+        shell: bash
+        run: |
+          {
+            echo "SCCACHE_GHA_ENABLED=true"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1"
+          } >> "${GITHUB_ENV}"
+      - name: Install Linux system dependencies
+        run: |
+          for i in 1 2 3 4 5; do
+            sudo apt-get update && break
+            echo "apt-get update failed (attempt $i); retrying in 15s"
+            sleep 15
+          done
+          sudo apt-get install -y libdbus-1-dev pkg-config
+      # Restore after the trusted lockfile is on disk. Key is OS + arch +
+      # explicit stable toolchain + rust-cache's Cargo.lock / rust-toolchain
+      # hash. Never interpolate github.event, github.ref, github.sha, or inputs.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+          prefix-key: v1-${{ runner.os }}-${{ runner.arch }}-stable
+      - uses: taiki-e/install-action@e88e69ecdb9658bd172693dcdc2c84e7f0ab6a11 # nextest
+        with:
+          tool: nextest
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Compile check
+        run: cargo check --workspace --all-targets --locked
+      - name: OHOS dependency graph
+        run: ./scripts/release/check-ohos-deps.sh
+      - name: Clippy
+        run: |
+          cargo clippy --workspace --all-targets --all-features --locked -- \
+            -D warnings \
+            -A clippy::uninlined_format_args \
+            -A clippy::too_many_arguments \
+            -A clippy::unnecessary_map_or \
+            -A clippy::collapsible_if \
+            -A clippy::assertions_on_constants
+      - name: Workspace tests
+        # Same test binaries as `cargo test`, run by cargo-nextest: one process
+        # per test. This gate used libtest, where every test shares one process,
+        # so a test that mutates process-global state leaks into its neighbours.
+        # It failed on five such tests — deterministically, and on a different
+        # set on different machines — while CI's nextest lanes were green on the
+        # same source, and every one of them passes in isolation. Match the lane
+        # that gates every merge; doctests are the next step, because nextest
+        # does not run them.
+        run: sh scripts/with-hermetic-test-home.sh cargo nextest run --workspace --all-features --locked --profile ci
+        env:
+          # Match the CI test lane: test threads get the same stack the product
+          # gives itself (main.rs CODEWHALE_MAIN_STACK_BYTES). See the note in
+          # ci.yml's "Run tests" step. Without it this gate runs the deep
+          # engine/runtime futures on a stack that never ships.
+          RUST_MIN_STACK: '16777216'
+      - name: Workspace doctests
+        run: sh scripts/with-hermetic-test-home.sh cargo test --workspace --all-features --locked --doc
+        env:
+          RUST_MIN_STACK: '16777216'
+      - name: Protocol schema parity
+        run: sh scripts/with-hermetic-test-home.sh cargo test -p codewhale-protocol --test parity_protocol --locked
+      - name: State persistence parity
+        run: sh scripts/with-hermetic-test-home.sh cargo test -p codewhale-state --test parity_state --locked
+      - name: Lockfile drift guard
+        run: git diff --exit-code -- Cargo.lock

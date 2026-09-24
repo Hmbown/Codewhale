@@ -86,8 +86,8 @@ use crate::task_manager::{
     NewTaskRequest, SharedTaskManager, TaskManager, TaskManagerConfig, TaskRecord, TaskSummary,
 };
 use crate::tools::subagent::{
-    AgentWorkerRecord, SharedSubAgentManager, load_persisted_agent_worker_records,
-    new_shared_subagent_manager_with_timeout,
+    AgentWorkerRecord, AgentWorkerStatus, SharedSubAgentManager, SubAgentStatus,
+    load_persisted_agent_worker_records, new_shared_subagent_manager_with_timeout,
 };
 #[cfg(test)]
 pub(super) use codewhale_models::{ContentBlock, Message};
@@ -98,6 +98,7 @@ use codewhale_protocol::fleet::{
 };
 
 mod auth;
+mod computer_display;
 mod context;
 mod diagnostics;
 mod git;
@@ -216,6 +217,9 @@ pub struct RuntimeApiState {
     /// per-thread managers; this one serves the file view and is built lazily
     /// so a server without LSP use never spawns a language server.
     lsp_manager: Arc<std::sync::OnceLock<Arc<crate::lsp::LspManager>>>,
+    /// The computer this Engine runs on: display socket, human control
+    /// lease, device client tokens and `computer.*` events (§3.3).
+    computer: computer_display::ComputerState,
     #[cfg(test)]
     compat_stream_test_hook: Option<tokio::sync::mpsc::UnboundedSender<CompatStreamTestPoint>>,
 }
@@ -1024,6 +1028,7 @@ pub async fn run_http_server(
         fleet_codewhale_binary: configured_codewhale_binary(),
         mcp_pool: Arc::new(Mutex::new(None)),
         lsp_manager: Arc::new(std::sync::OnceLock::new()),
+        computer: computer_display::ComputerState::from_env(),
         #[cfg(test)]
         compat_stream_test_hook: None,
     };
@@ -1200,6 +1205,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/workspace/instructions", get(workspace_instructions))
         .route("/v1/agent-runs", get(list_agent_runs))
         .route("/v1/agent-runs/{run_id}", get(get_agent_run))
+        .route("/v1/agent-runs/{run_id}/cancel", post(cancel_agent_run))
         .route("/v1/fleet/profiles", get(list_fleet_profiles))
         .route(
             "/v1/fleet/runs",
@@ -1384,6 +1390,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{approval_id}", post(decide_approval))
         .route(
+            "/v1/threads/{id}/approval-grants/{grant_id}",
+            delete(revoke_approval_grant),
+        )
+        .route(
             "/v1/user-input/{thread_id}/{input_id}",
             post(submit_user_input),
         )
@@ -1563,6 +1573,12 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/mobile", get(mobile_page))
         .route("/mobile/", get(mobile_page))
         .route("/v1/runtime/info", get(runtime_info))
+        // Authenticates per handler: the display WS also takes a single-use
+        // ticket, and client-token minting is master-token only.
+        .merge(computer_display::router(
+            state.computer.clone(),
+            state.runtime_token.clone(),
+        ))
         .merge(api_routes)
         .layer(cors_layer(&state.cors_origins))
         .with_state(state)
@@ -2060,16 +2076,152 @@ async fn get_agent_run(
     })?;
     let run = runs
         .into_iter()
-        .find(|record| {
-            let effective_run_id = if record.spec.run_id.is_empty() {
-                record.spec.worker_id.as_str()
-            } else {
-                record.spec.run_id.as_str()
-            };
-            effective_run_id == run_id || record.spec.worker_id == run_id
-        })
+        .find(|record| agent_run_matches(record, &run_id))
         .ok_or_else(|| ApiError::not_found(format!("agent run '{run_id}' not found")))?;
     Ok(Json(run))
+}
+
+/// A run is addressed by its run id, or by its worker id for records that
+/// predate run ids.
+fn agent_run_matches(record: &AgentWorkerRecord, run_id: &str) -> bool {
+    let effective_run_id = if record.spec.run_id.is_empty() {
+        record.spec.worker_id.as_str()
+    } else {
+        record.spec.run_id.as_str()
+    };
+    effective_run_id == run_id || record.spec.worker_id == run_id
+}
+
+/// How long a stop request waits for the owning engine to record the
+/// terminal receipt before answering `202 Accepted` with the live record.
+const AGENT_RUN_CANCEL_SETTLE: Duration = Duration::from_secs(3);
+
+/// `POST /v1/agent-runs/{run_id}/cancel`: stop a delegated agent run and
+/// answer with its receipt (addendum F2).
+///
+/// The stop goes through the same session-scoped path as the TUI's `X` and
+/// the `agent/cancel` tool, so descendants stop with it and a write-scoped
+/// child's work is inventoried rather than dropped. The answer is:
+/// - `200` with the terminal record once the run is stopped (or was already
+///   finished — stopping is idempotent);
+/// - `202` with the current record when the owning engine accepted the stop
+///   but has not recorded the terminal receipt yet;
+/// - `404` for an unknown run;
+/// - `409` when the run belongs to a session this runtime does not host, so
+///   nothing here can reach it.
+async fn cancel_agent_run(
+    State(state): State<RuntimeApiState>,
+    Path(run_id): Path<String>,
+) -> Result<(StatusCode, Json<AgentWorkerRecord>), ApiError> {
+    // Runs this runtime is executing itself (Fleet-launched children) stop
+    // in place. Only a running child in this process qualifies for mutation;
+    // a terminal receipt can be returned without mutating or consulting disk.
+    // Other persisted runs still go through their owning session below.
+    let owned = {
+        let manager = state.sub_agent_manager.read().await;
+        manager
+            .list_worker_records()
+            .into_iter()
+            .find(|record| agent_run_matches(record, &run_id))
+            .filter(|record| {
+                manager
+                    .get_result(&record.spec.worker_id)
+                    .is_ok_and(|agent| {
+                        agent.status == SubAgentStatus::Running || record.status.is_terminal()
+                    })
+            })
+    };
+    if let Some(record) = owned {
+        // Persistence is asynchronous. A repeated stop must answer from the
+        // owning manager's terminal receipt, not race the disk projection and
+        // incorrectly report a run we just stopped as missing or still live.
+        if record.status.is_terminal() {
+            return Ok((StatusCode::OK, Json(record)));
+        }
+        let agent_id = record.spec.worker_id.clone();
+        let cancelled = {
+            let mut manager = state.sub_agent_manager.write().await;
+            if record.owner_session_id.is_empty() {
+                manager.cancel_agent(&agent_id)
+            } else {
+                manager.cancel_agent_for_session(&record.owner_session_id, &agent_id)
+            }
+        }
+        .map_err(|err| {
+            ApiError::conflict(format!("agent run '{run_id}' could not be stopped: {err}"))
+        })?;
+        crate::tools::subagent::preserve_cancelled_work(&state.sub_agent_manager, cancelled).await;
+        let manager = state.sub_agent_manager.read().await;
+        let record = manager
+            .list_worker_records()
+            .into_iter()
+            .find(|record| record.spec.worker_id == agent_id)
+            .unwrap_or(record);
+        let status = if record.status.is_terminal() {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        };
+        return Ok((status, Json(record)));
+    }
+
+    let find_persisted = |workspace: &FsPath| -> Result<Option<AgentWorkerRecord>, ApiError> {
+        load_persisted_agent_worker_records(workspace)
+            .map(|runs| {
+                runs.into_iter()
+                    .find(|record| agent_run_matches(record, &run_id))
+            })
+            .map_err(|err| {
+                ApiError::internal(format!("Failed to load persisted agent run records: {err}"))
+            })
+    };
+    let record = find_persisted(&state.workspace)?
+        .ok_or_else(|| ApiError::not_found(format!("agent run '{run_id}' not found")))?;
+
+    // A runtime thread's session id is its thread id: its live engine owns
+    // the child and stops it through the session-scoped cancel path. The
+    // on-disk projection cannot tell a live child from an orphan (loading it
+    // marks every in-flight record interrupted), so a hosted thread is always
+    // asked, and only its own write settles the answer.
+    let engine = if record.owner_session_id.is_empty() {
+        None
+    } else {
+        state
+            .runtime_threads
+            .loaded_engine(&record.owner_session_id)
+            .await
+    };
+    let Some(engine) = engine else {
+        if record.status.is_terminal() {
+            return Ok((StatusCode::OK, Json(record)));
+        }
+        return Err(ApiError::conflict(format!(
+            "agent run '{run_id}' belongs to a session this runtime is not hosting; stop it from that session"
+        )));
+    };
+    engine
+        .send(crate::core::ops::Op::CancelSubAgent {
+            agent_id: record.spec.worker_id.clone(),
+        })
+        .await
+        .map_err(|err| ApiError::internal(format!("Failed to reach the run's engine: {err}")))?;
+
+    let settled = |current: &AgentWorkerRecord| {
+        current.status.is_terminal()
+            && (current.status != AgentWorkerStatus::Interrupted
+                || current.latest_message != record.latest_message)
+    };
+    let deadline = tokio::time::Instant::now() + AGENT_RUN_CANCEL_SETTLE;
+    loop {
+        let current = find_persisted(&state.workspace)?.unwrap_or_else(|| record.clone());
+        if settled(&current) {
+            return Ok((StatusCode::OK, Json(current)));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok((StatusCode::ACCEPTED, Json(current)));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn list_fleet_profiles(
@@ -3199,6 +3351,18 @@ struct CommandCatalogEntry {
     /// Literal verbs declared by the usage line (`/goal <block|complete|…>`).
     subcommands: Vec<String>,
     takes_arguments: bool,
+    /// Composer argument shape, computed the way the TUI composer computes
+    /// it so clients do not re-derive it from the usage string.
+    /// Usage mentions any argument, required or optional.
+    requires_argument: bool,
+    /// Usage has a `<required>` argument outside every `[optional]` group.
+    requires_required_argument: bool,
+    /// Accepting the command leaves a trailing space for its arguments.
+    composer_wants_trailing_space: bool,
+    /// The palette runs the command on selection instead of pasting it.
+    palette_runs_directly: bool,
+    /// Listed when the slash menu opens with no filter text.
+    show_in_empty_discovery: bool,
     /// `builtin` is registered code; `user` expands a stored template.
     kind: &'static str,
     /// `host` runs locally and never reaches the model; `prompt` expands into
@@ -3255,6 +3419,11 @@ fn command_catalog(
             takes_arguments: crate::commands::user_registry::usage_describes_arguments(
                 info.name, info.usage,
             ),
+            requires_argument: info.requires_argument(),
+            requires_required_argument: info.requires_required_argument(),
+            composer_wants_trailing_space: info.composer_wants_trailing_space(),
+            palette_runs_directly: info.palette_runs_directly(),
+            show_in_empty_discovery: info.show_in_empty_discovery(),
             kind: "builtin",
             binding: "host",
             discovery: Some(match info.discovery() {
@@ -3268,13 +3437,20 @@ fn command_catalog(
         });
     }
     for command in user_commands.iter() {
+        let takes_arguments = command.takes_arguments();
         commands.push(CommandCatalogEntry {
             name: command.name.clone(),
             aliases: command.aliases.clone(),
             summary: command.description.clone(),
             usage: command.display_usage().map(str::to_string),
             subcommands: Vec::new(),
-            takes_arguments: command.takes_arguments(),
+            takes_arguments,
+            // A template may run bare, so its arguments are never required.
+            requires_argument: takes_arguments,
+            requires_required_argument: false,
+            composer_wants_trailing_space: takes_arguments,
+            palette_runs_directly: !takes_arguments,
+            show_in_empty_discovery: !command.hidden,
             kind: "user",
             binding: "prompt",
             discovery: None,
@@ -3939,6 +4115,27 @@ async fn decide_approval(
         decision: req.decision,
         delivered,
     }))
+}
+
+/// `DELETE /v1/threads/{id}/approval-grants/{grant_id}` — revoke one
+/// "allow for this conversation" grant. The next matching call prompts again.
+async fn revoke_approval_grant(
+    State(state): State<RuntimeApiState>,
+    Path((thread_id, grant_id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let revoked = state
+        .runtime_threads
+        .revoke_approval_grant(&thread_id, &grant_id)
+        .await
+        .map_err(map_thread_err)?;
+    if !revoked {
+        return Err(ApiError::not_found(format!(
+            "no approval grant with id '{grant_id}' on thread '{thread_id}'"
+        )));
+    }
+    Ok(Json(
+        json!({ "ok": true, "grant_id": grant_id, "revoked": true }),
+    ))
 }
 
 async fn submit_user_input(
@@ -5128,6 +5325,12 @@ async fn check_operate_auto_merge(
     State(state): State<RuntimeApiState>,
     Json(req): Json<OperateAutoMergeCheckRequest>,
 ) -> Result<Json<OperateAutoMergeCheckView>, ApiError> {
+    crate::operate::validate_auto_merge_request(&crate::operate::AutoMergeRequest {
+        repo: &req.repo,
+        pr: &req.pr,
+        role: &req.agent,
+    })
+    .map_err(ApiError::bad_request)?;
     let checker = crate::operate::discover_auto_merge_checker(&state.workspace);
     let repo = req.repo.clone();
     let pr = req.pr.clone();
@@ -5585,7 +5788,7 @@ async fn revert_thread_file(
 }
 
 fn snapshot_id_is_well_formed(id: &str) -> bool {
-    matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
+    crate::snapshot::SnapshotId::is_well_formed(id)
 }
 
 fn expected_hash_is_well_formed(hash: &str) -> bool {
@@ -6091,8 +6294,9 @@ async fn delete_thread_goal(
     let _ = state.runtime_threads.emit_goal_cleared_event(&id).await;
     state
         .runtime_threads
-        .sync_engine_goal_status(&id, crate::tools::goal::GoalStatus::Active, true)
-        .await;
+        .sync_engine_goal_status(&id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -6139,8 +6343,9 @@ async fn complete_thread_goal(
         .await;
     state
         .runtime_threads
-        .sync_engine_goal_status(&id, crate::tools::goal::GoalStatus::Complete, false)
-        .await;
+        .sync_engine_goal_status(&id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(updated))
 }
 
@@ -6188,8 +6393,9 @@ async fn block_thread_goal(
         .await;
     state
         .runtime_threads
-        .sync_engine_goal_status(&id, crate::tools::goal::GoalStatus::Blocked, false)
-        .await;
+        .sync_engine_goal_status(&id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(updated))
 }
 
@@ -7189,7 +7395,8 @@ async fn restore_snapshot(
 fn restore_snapshot_for_workspace(workspace: &FsPath, id: &str) -> Result<(), ApiError> {
     let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace)
         .map_err(|e| ApiError::internal(format!("Snapshot repo init failed: {e}")))?;
-    let snapshot_id = crate::snapshot::SnapshotId(id.to_string());
+    let snapshot_id = crate::snapshot::SnapshotId::parse(id)
+        .map_err(|e| ApiError::bad_request(format!("Invalid snapshot id: {e}")))?;
     repo.restore(&snapshot_id)
         .map_err(|e| ApiError::internal(format!("Snapshot restore failed: {e}")))
 }
@@ -9906,6 +10113,7 @@ base_url = "http://127.0.0.1:9/v1"
             fleet_codewhale_binary: "unused-test-binary".to_string(),
             mcp_pool: Arc::new(Mutex::new(None)),
             lsp_manager: Arc::new(std::sync::OnceLock::new()),
+            computer: computer_display::ComputerState::from_env(),
             compat_stream_test_hook: None,
         };
         let router = build_router(state.clone());

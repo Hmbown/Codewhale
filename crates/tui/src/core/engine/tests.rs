@@ -2599,6 +2599,92 @@ async fn initial_goal_failure_projects_blocked_state() {
     run_task.await.expect("engine task");
 }
 
+/// A goal the runtime stopped (its turn failed) resumes when the person
+/// writes again; the host still reports Blocked because it only learns of
+/// the resume from this turn's GoalUpdated.
+#[tokio::test]
+async fn user_message_resumes_a_goal_only_the_runtime_blocked() {
+    let objective = "resume after a runtime stop";
+    let model = std::sync::Arc::new(FailingGoalModelClient {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        message: "turn deadline elapsed".to_string(),
+    });
+    let config = goal_custom_route_config();
+    let client: crate::core::model_client::SharedModelClient = model.clone();
+    let (engine, handle) = Engine::new_with_model_client(
+        EngineConfig {
+            model: "local-model".to_string(),
+            snapshots_enabled: false,
+            terminal_chrome_enabled: false,
+            ..EngineConfig::default()
+        },
+        &config,
+        client,
+    );
+    let goal_state = engine.config.goal_state.clone();
+    let run_task = tokio::spawn(engine.run());
+    let settle = || async {
+        tokio::time::timeout(model_turn_event_timeout(), handle.get_session_snapshot())
+            .await
+            .expect("turn did not settle")
+            .expect("session snapshot")
+    };
+
+    handle
+        .send(active_goal_message_op(&config, "start", objective, None))
+        .await
+        .expect("send goal turn");
+    settle().await;
+    let blocked = goal_state.lock().expect("goal lock").snapshot();
+    assert_eq!(blocked.status, "blocked");
+
+    let Op::SendMessage(mut spec) = active_goal_message_op(&config, "continue", objective, None)
+    else {
+        unreachable!()
+    };
+    spec.goal_status = crate::tools::goal::GoalStatus::Blocked;
+    handle
+        .send(Op::SendMessage(spec))
+        .await
+        .expect("send continue");
+    settle().await;
+    assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let resumed = goal_state.lock().expect("goal lock").snapshot();
+    assert_ne!(
+        resumed.goal_id, blocked.goal_id,
+        "the continue turn ran as a resumed goal revision"
+    );
+
+    // A blocker the model reported is a judgement: the next message is an
+    // ordinary turn and the goal stays blocked on that report.
+    goal_state
+        .lock()
+        .expect("goal lock")
+        .mark_blocked("needs the staging credentials".to_string())
+        .unwrap();
+    let reported = goal_state.lock().expect("goal lock").snapshot();
+    let Op::SendMessage(mut spec) = active_goal_message_op(&config, "continue", objective, None)
+    else {
+        unreachable!()
+    };
+    spec.goal_status = crate::tools::goal::GoalStatus::Blocked;
+    handle
+        .send(Op::SendMessage(spec))
+        .await
+        .expect("send ordinary turn");
+    settle().await;
+    let after = goal_state.lock().expect("goal lock").snapshot();
+    assert_eq!(after.status, "blocked");
+    assert_eq!(after.goal_id, reported.goal_id);
+    assert_eq!(
+        after.blocker.as_deref(),
+        Some("needs the staging credentials")
+    );
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+}
+
 #[tokio::test]
 async fn initial_goal_interruption_keeps_goal_active() {
     let objective = "keep goal active after interrupted turn";
@@ -6791,8 +6877,12 @@ async fn tool_result_followed_by_terminal_empty_assistant_fails_turn() {
         canned::message_delta("stop", None),
         canned::message_stop(),
     ];
+    // #6310: an answerless clean stop is retried (exact prefix, then nudged)
+    // before the turn fails, so the fixture stays empty for every attempt.
     let mock = std::sync::Arc::new(MockLlmClient::new(vec![
         canned::tool_call_turn("call-read", "read_file", r#"{"path":"README.md"}"#),
+        empty_terminal_turn.clone(),
+        empty_terminal_turn.clone(),
         empty_terminal_turn,
     ]));
     let client: crate::core::model_client::SharedModelClient = mock.clone();
@@ -6810,11 +6900,17 @@ async fn tool_result_followed_by_terminal_empty_assistant_fails_turn() {
 
     let (status, error) = engine.run_turn(&mut turn, surface, None, None).await;
     assert_eq!(status, TurnOutcomeStatus::Failed);
-    assert_eq!(mock.call_count(), 2, "tool step then empty provider step");
+    assert_eq!(
+        mock.call_count(),
+        4,
+        "tool step, empty provider step, then exactly two bounded retries"
+    );
+    assert_eq!(turn.stop_diagnostics.empty_stop_retries, 2);
     assert!(
         error
             .as_deref()
-            .is_some_and(|message| message.contains("terminal stop reason `stop`")),
+            .is_some_and(|message| message.contains("terminal stop reason `stop`")
+                && message.contains("after 2 retries")),
         "terminal empty response must produce a precise failure: {error:?}"
     );
 
@@ -6841,6 +6937,139 @@ async fn tool_result_followed_by_terminal_empty_assistant_fails_turn() {
             .iter()
             .all(|message| { message.role != Role::Assistant || !message.content.is_empty() }),
         "the engine must not fabricate an empty assistant message"
+    );
+}
+
+fn empty_clean_stop_turn() -> Vec<StreamEvent> {
+    use crate::llm_client::mock::canned;
+    vec![
+        canned::message_start("mock_empty_clean_stop"),
+        canned::message_delta("stop", None),
+        canned::message_stop(),
+    ]
+}
+
+async fn run_empty_stop_fixture(
+    turns: Vec<Vec<StreamEvent>>,
+) -> (
+    std::sync::Arc<crate::llm_client::mock::MockLlmClient>,
+    Engine,
+    crate::core::turn::TurnContext,
+    TurnOutcomeStatus,
+    Option<String>,
+) {
+    let workspace = tempdir().expect("tempdir");
+    let mock = std::sync::Arc::new(crate::llm_client::mock::MockLlmClient::new(turns));
+    let client: crate::core::model_client::SharedModelClient = mock.clone();
+    let (mut engine, _handle) = Engine::new_with_model_client(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+        client,
+    );
+    let registry = crate::tools::ToolRegistry::new(crate::tools::ToolContext::new(
+        workspace.path().to_path_buf(),
+    ));
+    let surface = test_tool_surface(&engine, registry, None, AppMode::Agent);
+    let mut turn = crate::core::turn::TurnContext::new(4);
+    let (status, error) = engine.run_turn(&mut turn, surface, None, None).await;
+    (mock, engine, turn, status, error)
+}
+
+/// #6310: one clean `stop` with no text, reasoning or tool call is retried
+/// with the identical request and the turn completes on the real answer.
+#[tokio::test]
+async fn empty_clean_stop_is_retried_once_and_the_turn_completes() {
+    use crate::llm_client::mock::canned;
+
+    let (mock, engine, turn, status, error) = run_empty_stop_fixture(vec![
+        empty_clean_stop_turn(),
+        canned::simple_text_turn("the recovered answer"),
+    ])
+    .await;
+
+    assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+    assert_eq!(mock.call_count(), 2, "exactly one retry");
+    assert_eq!(turn.stop_diagnostics.empty_stop_retries, 1);
+    let requests = mock.captured_requests();
+    assert_eq!(
+        requests[0].messages.len(),
+        requests[1].messages.len(),
+        "the first retry is an exact-prefix re-request"
+    );
+    let transcript =
+        serde_json::to_string(&engine.session.messages.iter().collect::<Vec<_>>()).unwrap();
+    assert_eq!(transcript.matches("the recovered answer").count(), 1);
+    assert!(
+        engine
+            .session
+            .messages
+            .iter()
+            .all(|message| message.role != Role::Assistant || !message.content.is_empty()),
+        "the empty response must not be persisted"
+    );
+}
+
+/// #6310: the second retry carries the request-scoped nudge, which never
+/// joins the session; the retry after that budget is not attempted.
+#[tokio::test]
+async fn empty_clean_stop_second_retry_is_nudged_and_never_persisted() {
+    use crate::llm_client::mock::canned;
+
+    let (mock, engine, turn, status, error) = run_empty_stop_fixture(vec![
+        empty_clean_stop_turn(),
+        empty_clean_stop_turn(),
+        canned::simple_text_turn("answer after nudge"),
+    ])
+    .await;
+
+    assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+    assert_eq!(mock.call_count(), 3);
+    assert_eq!(turn.stop_diagnostics.empty_stop_retries, 2);
+    let requests = mock.captured_requests();
+    let nudge = crate::config::DEFAULT_REASONING_ONLY_REPROMPT_MESSAGE;
+    let carries_nudge = |request: &codewhale_models::MessageRequest| {
+        serde_json::to_string(&request.messages)
+            .unwrap()
+            .contains(nudge)
+    };
+    assert!(!carries_nudge(&requests[0]));
+    assert!(!carries_nudge(&requests[1]), "first retry is exact-prefix");
+    assert!(carries_nudge(&requests[2]), "second retry is nudged");
+    assert_eq!(requests[2].messages.len(), requests[0].messages.len() + 1);
+    assert!(
+        !serde_json::to_string(&engine.session.messages.iter().collect::<Vec<_>>())
+            .unwrap()
+            .contains(nudge),
+        "the nudge is request-scoped and never written to the session"
+    );
+}
+
+/// #6310: an empty response on every attempt fails visibly once the budget
+/// is spent, with the retries recorded in stop diagnostics.
+#[tokio::test]
+async fn empty_clean_stop_every_time_fails_after_the_retry_budget() {
+    let (mock, _engine, turn, status, error) = run_empty_stop_fixture(vec![
+        empty_clean_stop_turn(),
+        empty_clean_stop_turn(),
+        empty_clean_stop_turn(),
+    ])
+    .await;
+
+    assert_eq!(status, TurnOutcomeStatus::Failed);
+    assert_eq!(
+        mock.call_count(),
+        1 + crate::core::engine::turn_loop::EMPTY_STOP_MAX_RETRIES as usize
+    );
+    assert_eq!(
+        turn.stop_diagnostics.empty_stop_retries,
+        crate::core::engine::turn_loop::EMPTY_STOP_MAX_RETRIES
+    );
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|message| message.contains("terminal stop reason `stop`")
+                && message.contains("after 2 retries")),
+        "{error:?}"
     );
 }
 
@@ -11930,6 +12159,139 @@ fn deferred_apply_patch_first_use_hydrates_schema_without_execution() {
     );
 }
 
+/// E3: the first call to a deferred tool hydrates its schema and tells the
+/// model to retry. That hint is model-facing; it reaches the model in the
+/// tool result and must not surface as a user status line.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn deferred_tool_first_use_does_not_emit_a_retry_status() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = lock_test_env();
+    let workspace = tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+    let tool_call_sse = concat!(
+        "data: {\"id\":\"chatcmpl-e3\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"call_e3_map\",\"type\":\"function\",\"function\":{\"name\":\"project_map\",",
+        "\"arguments\":\"{}\"}}",
+        "]},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-e3\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let done_sse = concat!(
+        "data: {\"id\":\"chatcmpl-e3-done\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-e3-done\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("call_e3_map"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(done_sse),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(tool_call_sse),
+        )
+        .expect(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let api_config = Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(server.uri()),
+        ..Config::default()
+    };
+    let (engine, handle) = Engine::new(
+        EngineConfig {
+            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            workspace: workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            terminal_chrome_enabled: false,
+            ..EngineConfig::default()
+        },
+        &api_config,
+    );
+    let run_task = tokio::spawn(engine.run());
+    handle
+        .send(Op::SendMessage(TurnSpec {
+            max_output_tokens: None,
+            content: "Map this project".to_string(),
+            images: Vec::new(),
+            mode: AppMode::Agent,
+            route: resolved_route_for_test(&api_config, crate::config::DEFAULT_TEXT_MODEL),
+            compaction: Box::new(CompactionConfig::default()),
+            initial_routed_usage: Box::default(),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: true,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: ApprovalMode::Suggest,
+            translation_enabled: false,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        }))
+        .await
+        .expect("send model turn");
+
+    let mut hydration_result = None;
+    let mut statuses = Vec::new();
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+        .await
+        .expect("timed out waiting for turn event")
+    {
+        match event {
+            Event::Status { message, .. } => statuses.push(message),
+            Event::ToolCallComplete { name, result, .. } if name == "project_map" => {
+                hydration_result = Some(result);
+            }
+            Event::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    drop(rx);
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+
+    let hydration = hydration_result
+        .expect("the deferred call completes")
+        .expect("hydration result");
+    assert!(
+        hydration.content.contains("was deferred"),
+        "the model still gets the retry hint: {}",
+        hydration.content
+    );
+    assert!(
+        statuses
+            .iter()
+            .all(|status| !status.contains("Loaded deferred tool")),
+        "{statuses:?}"
+    );
+}
+
 #[test]
 fn model_tool_catalog_defers_non_core_native_tools_in_act_mode() {
     let always_load = HashSet::new();
@@ -12747,6 +13109,219 @@ async fn operate_model_shell_uses_normal_approval_and_workspace_sandbox() {
     let written = std::fs::read_to_string(workspace.path().join("operate-mode-approved.txt"))
         .expect("workspace-scoped shell output");
     assert_eq!(written.trim_end(), "operate-approved");
+}
+
+/// Drives one model turn whose single `Bash` call needs approval, publishes
+/// `change_to` (as a runtime PATCH does) while the approval is pending, then
+/// approves. Returns the call's result and whether the file was written.
+async fn posture_change_during_approval_wait(
+    change_to: (AppMode, ApprovalMode, bool),
+) -> (Result<crate::tools::spec::ToolResult, ToolError>, bool) {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let workspace = tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+    let tool_call_sse = concat!(
+        "data: {\"id\":\"chatcmpl-e2\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"call_e2_shell\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",",
+        "\"arguments\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"echo approved > e2-approved.txt\\\"}\"}}",
+        "]},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-e2\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let done_sse = concat!(
+        "data: {\"id\":\"chatcmpl-e2-done\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-e2-done\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("call_e2_shell"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(done_sse),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(tool_call_sse),
+        )
+        .expect(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let api_config = Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(server.uri()),
+        ..Config::default()
+    };
+    let (engine, handle) = Engine::new(
+        EngineConfig {
+            model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+            workspace: workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            terminal_chrome_enabled: false,
+            ..EngineConfig::default()
+        },
+        &api_config,
+    );
+    let run_task = tokio::spawn(engine.run());
+    handle
+        .send(Op::SendMessage(TurnSpec {
+            max_output_tokens: None,
+            content: "Record the approval fixture in the workspace".to_string(),
+            images: Vec::new(),
+            mode: AppMode::Agent,
+            route: resolved_route_for_test(&api_config, crate::config::DEFAULT_TEXT_MODEL),
+            compaction: Box::new(CompactionConfig::default()),
+            initial_routed_usage: Box::default(),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: true,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: ApprovalMode::Suggest,
+            translation_enabled: false,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        }))
+        .await
+        .expect("send model turn");
+
+    let (mode, approval_mode, auto_approve) = change_to;
+    let mut shell_result = None;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+        .await
+        .expect("timed out waiting for turn event")
+    {
+        match event {
+            Event::ApprovalRequired { id, .. } => {
+                // The PATCH lands while the approval card is open.
+                handle
+                    .try_send(Op::ChangeMode {
+                        mode,
+                        allow_shell: true,
+                        trust_mode: false,
+                        auto_approve,
+                        approval_mode,
+                        configured_sandbox_mode: None,
+                    })
+                    .expect("publish posture change");
+                handle.approve_tool_call(id).await.expect("approve shell");
+            }
+            Event::ToolCallComplete { name, result, .. } if name == "Bash" => {
+                shell_result = Some(result);
+            }
+            Event::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    drop(rx);
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+    let written = workspace.path().join("e2-approved.txt").exists();
+    (shell_result.expect("the approved call completes"), written)
+}
+
+#[test]
+fn live_runtime_authority_narrows_only_when_a_grant_is_withdrawn() {
+    let at = |mode, approval_mode, sandbox: Option<&str>| {
+        LiveRuntimeAuthority::from_fields(
+            mode,
+            true,
+            false,
+            approval_mode == ApprovalMode::Bypass,
+            approval_mode,
+            sandbox.map(str::to_string),
+        )
+    };
+    let ask = at(AppMode::Agent, ApprovalMode::Suggest, None);
+    assert!(!ask.narrows(&ask));
+    assert!(!at(AppMode::Agent, ApprovalMode::Auto, None).narrows(&ask));
+    assert!(!at(AppMode::Agent, ApprovalMode::Bypass, None).narrows(&ask));
+    assert!(!ask.narrows(&at(AppMode::Plan, ApprovalMode::Suggest, None)));
+    assert!(at(AppMode::Plan, ApprovalMode::Suggest, None).narrows(&ask));
+    assert!(at(AppMode::Operate, ApprovalMode::Suggest, None).narrows(&ask));
+    assert!(ask.narrows(&at(AppMode::Agent, ApprovalMode::Bypass, None)));
+    assert!(at(AppMode::Agent, ApprovalMode::Never, None).narrows(&ask));
+    assert!(at(AppMode::Agent, ApprovalMode::Suggest, Some("read-only")).narrows(&ask));
+    assert!(
+        !at(
+            AppMode::Agent,
+            ApprovalMode::Suggest,
+            Some("workspace-write")
+        )
+        .narrows(&at(
+            AppMode::Agent,
+            ApprovalMode::Suggest,
+            Some("read-only")
+        ))
+    );
+    assert!(at(AppMode::Agent, ApprovalMode::Suggest, Some("custom")).narrows(&ask));
+    let mut no_shell = ask.clone();
+    no_shell.allow_shell = false;
+    assert!(no_shell.narrows(&ask));
+}
+
+/// E2: approving a call must never invalidate the call it approves. A posture
+/// PATCH that is equal or broader (Ask -> Auto-Review, Ask -> Full Access)
+/// while the approval card is open leaves the approved call running.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn broader_posture_patch_during_approval_wait_keeps_the_approved_call() {
+    let _lock = lock_test_env();
+    for change_to in [
+        (AppMode::Agent, ApprovalMode::Auto, false),
+        (AppMode::Agent, ApprovalMode::Bypass, true),
+        (AppMode::Agent, ApprovalMode::Suggest, false),
+    ] {
+        let (result, written) = posture_change_during_approval_wait(change_to).await;
+        let result = result.unwrap_or_else(|err| panic!("{change_to:?}: {err}"));
+        assert!(result.success, "{change_to:?}: {result:?}");
+        assert!(written, "{change_to:?}: the approved shell ran");
+    }
+}
+
+/// E2 counterpart: a narrowing PATCH (Work -> Plan, Ask -> Never) still sends
+/// the approved call back to the model instead of running it under a grant
+/// the user has since withdrawn.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn narrower_posture_patch_during_approval_wait_fails_the_call() {
+    let _lock = lock_test_env();
+    for change_to in [
+        (AppMode::Plan, ApprovalMode::Suggest, false),
+        (AppMode::Agent, ApprovalMode::Never, false),
+    ] {
+        let (result, written) = posture_change_during_approval_wait(change_to).await;
+        let err = result.expect_err("narrowed posture fails the call");
+        assert!(
+            err.to_string()
+                .contains("posture changed before this tool call executed"),
+            "{change_to:?}: {err}"
+        );
+        assert!(!written, "{change_to:?}: the shell must not run");
+    }
 }
 
 #[tokio::test]
@@ -15229,6 +15804,46 @@ async fn change_mode_refreshes_session_prompt_and_updates_session() {
     );
 }
 
+/// A posture change announces itself in product words (§19): Permissions,
+/// then Plan / Work / Operate. A republished identical posture says nothing.
+#[tokio::test]
+async fn posture_change_status_uses_permissions_and_work() {
+    let tmp = tempdir().expect("tempdir");
+    let config = EngineConfig {
+        workspace: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let (mut engine, handle) = Engine::new(config, &Config::default());
+    let publish = |handle: &EngineHandle| {
+        handle
+            .try_send(Op::ChangeMode {
+                mode: AppMode::Agent,
+                allow_shell: true,
+                trust_mode: false,
+                auto_approve: true,
+                approval_mode: ApprovalMode::Bypass,
+                configured_sandbox_mode: None,
+            })
+            .expect("publish live runtime authority");
+    };
+    publish(&handle);
+    assert!(engine.apply_pending_runtime_authority().await);
+    publish(&handle);
+    assert!(!engine.apply_pending_runtime_authority().await);
+
+    let mut statuses = Vec::new();
+    let mut rx = handle.rx_event.write().await;
+    while let Ok(event) = rx.try_recv() {
+        if let Event::Status { message } = event {
+            statuses.push(message);
+        }
+    }
+    assert_eq!(
+        statuses,
+        vec!["Permissions: Full Access · Work".to_string()]
+    );
+}
+
 #[tokio::test]
 async fn live_runtime_authority_applies_latest_posture_and_sandbox_before_tools() {
     use crate::sandbox::SandboxPolicy;
@@ -15734,7 +16349,7 @@ async fn compaction_completed_reports_complete_post_input_tokens() {
     ))));
 
     let messages_only =
-        crate::compaction::estimate_input_tokens_conservative(&engine.session.messages, None);
+        crate::compaction::estimate_input_tokens_for_pressure(&engine.session.messages, None);
     let expected = engine.estimated_input_tokens();
     assert!(expected > messages_only);
 
@@ -15869,6 +16484,57 @@ async fn same_turn_fork_carries_the_updated_todo() {
         block.starts_with(stable_block.as_deref().expect("stable").trim()),
         "the stable capture must stay a byte-identical prefix: {block}"
     );
+}
+
+/// U1: hosts resend the compaction config on every model or route sync. An
+/// unchanged config must not produce a status line, which used to overwrite
+/// a real error (the missing-key notice) in the footer.
+#[tokio::test]
+async fn unchanged_compaction_config_is_acknowledged_silently() {
+    let tmp = tempdir().expect("tempdir");
+    let (engine, handle) = Engine::new(
+        EngineConfig {
+            workspace: tmp.path().to_path_buf(),
+            ..Default::default()
+        },
+        &Config::default(),
+    );
+    let current = engine.config.compaction.clone();
+    let run = tokio::spawn(engine.run());
+    handle
+        .send(Op::SetCompaction {
+            config: current.clone(),
+        })
+        .await
+        .expect("send unchanged config");
+    let mut changed = current;
+    changed.enabled = !changed.enabled;
+    let expected = if changed.enabled {
+        "Auto-compaction enabled"
+    } else {
+        "Auto-compaction disabled"
+    };
+    handle
+        .send(Op::SetCompaction { config: changed })
+        .await
+        .expect("send changed config");
+
+    let mut rx = handle.rx_event.write().await;
+    let first_status = loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("status after a real change")
+            .expect("event");
+        if let Event::Status { message } = event {
+            break message;
+        }
+    };
+    assert_eq!(
+        first_status, expected,
+        "the unchanged config produced no status; only the real change did"
+    );
+    drop(rx);
+    run.abort();
 }
 
 #[tokio::test]
@@ -22366,6 +23032,7 @@ fn engine_handle_try_send_does_not_block_when_op_channel_is_full() {
             ),
         ))),
         compaction_cancellation: Arc::new(StdMutex::new(CompactionCancellationState::default())),
+        turn_heartbeat: turn_heartbeat::TurnHeartbeat::new(),
     };
 
     // Fill the op channel with one message (capacity = 1).
@@ -23590,7 +24257,7 @@ async fn background_completion_after_a_turn_is_delivered_once_on_the_next_turn()
     assert!(text.contains("stdout-end"), "{text}");
     assert!(text.contains(evidence_ref), "{text}");
     assert!(
-        text.contains("the full output is retained and can be reviewed in the tool details view"),
+        text.contains("call retrieve_tool_result") && !text.contains("tool details view"),
         "{text}"
     );
     assert!(

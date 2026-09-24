@@ -970,6 +970,14 @@ impl ProviderDashboardRow {
             // machine spelling ("key:configured", "key:not-set").
             ProviderListView::Configured => self.readiness.label().to_string(),
             ProviderListView::Catalog => {
+                // A row you cannot use yet says what it needs, once. The
+                // bundled-model count beside it only repeated itself down a
+                // fifty-row list; the Details pane still carries it.
+                match self.readiness {
+                    ResolvedProviderReadiness::MissingKey => return "needs key".to_string(),
+                    ResolvedProviderReadiness::MissingLogin => return "needs sign-in".to_string(),
+                    _ => {}
+                }
                 let catalog = self.catalog_label();
                 if catalog.is_empty() {
                     self.readiness.label().to_string()

@@ -31,7 +31,7 @@ Fleet 状态存储在工作区下的 `.codewhale/fleet.jsonl`。worker 日志与
 
 当前交互会话的子代理是**另一组**对象，现在它们有自己的名字：
 
-- `/fleet workers`（或 `/subagents`，或 `n`）显示附着在当前 TUI 会话上的子代理。它不读取持久 ledger。
+- `/fleet workers`（或 `/subagents`，或在 `/fleet` roster 中按 Tab / `w`）显示附着在当前 TUI 会话上的子代理。它不读取持久 ledger。
 - `/fleet list|status|interrupt|resume` 与 `codewhale fleet list|status|interrupt|resume` 作用于持久 ledger。
 - `codewhale fleet restart <worker-id>` 仅限 CLI：它重新获取任务的 lease，然后驱动 manager 循环直至完成。`/fleet restart` 不会默默做一个更小的动作——它会报告 `surface_not_supported` 并指名 CLI 命令。
 

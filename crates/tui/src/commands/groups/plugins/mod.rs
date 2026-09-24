@@ -65,7 +65,7 @@ impl CommandGroup for PluginsCommands {
 pub(in crate::commands) const PLUGINS_INFO: CommandInfo = CommandInfo {
     name: "plugin",
     aliases: &["plugins", "extensions"],
-    usage: "/plugin [list|show|suggest|validate|export|install|import|update|uninstall|trust|enable|disable|revoke|reload|tools|marketplace]",
+    usage: "/plugin [list|show|suggest|validate|export|install|import|update|uninstall|trust|enable|disable|revoke|reload|tools|marketplace|dismissals]",
     description_key: "cmd_plugin_description",
 };
 
@@ -184,6 +184,10 @@ pub(super) fn plugins(
         ["disable", selector] => mutate_bundle(presentation, plugin, selector, Mutation::Disable),
         ["revoke", selector] => mutate_bundle(presentation, plugin, selector, Mutation::Revoke),
         ["reload"] => reload(presentation, plugin),
+        ["dismissals"] => list_dismissals(plugin),
+        ["dismissals", "reset"] => reset_dismissals(plugin, None),
+        ["dismissals", "reset", name] => reset_dismissals(plugin, Some(name)),
+        ["dismissals", ..] => CommandResult::error("Usage: /plugin dismissals [reset [<name>]]"),
         ["tools"] => legacy_tools(presentation, plugin, None),
         ["tools", name] => legacy_tools(presentation, plugin, Some(name)),
         [selector] => {
@@ -196,6 +200,57 @@ pub(super) fn plugins(
             }
         }
         _ => CommandResult::error(translate(presentation, "cmd_plugin_bundle_usage")),
+    }
+}
+
+/// `/plugin dismissals`: which plugins suggestions skip, and for how long
+/// (plugin policy rule 9: dismissal is reversible).
+fn list_dismissals(plugin: &dyn CommandPluginContext) -> CommandResult {
+    let dismissals = match plugin.suggestion_dismissals() {
+        Ok(dismissals) => dismissals,
+        Err(error) => return CommandResult::error(error),
+    };
+    if dismissals.persisted.is_empty() && dismissals.session.is_empty() {
+        return CommandResult::message("No plugins are hidden from suggestions.".to_string());
+    }
+    let mut output = String::from("Plugins hidden from suggestions:\n");
+    if !dismissals.persisted.is_empty() {
+        output.push_str("  Don't suggest again (kept across sessions):\n");
+        for name in &dismissals.persisted {
+            let _ = writeln!(output, "    {}", escape_review_text(name));
+        }
+    }
+    if !dismissals.session.is_empty() {
+        output.push_str("  This session only:\n");
+        for name in &dismissals.session {
+            let _ = writeln!(output, "    {}", escape_review_text(name));
+        }
+    }
+    output.push_str(
+        "\nReset with /plugin dismissals reset [<name>]. Manual /plugin commands work either way.",
+    );
+    CommandResult::message(output)
+}
+
+/// `/plugin dismissals reset [<name>]`: let suggestions offer a plugin again.
+fn reset_dismissals(plugin: &mut dyn CommandPluginContext, name: Option<&str>) -> CommandResult {
+    match plugin.reset_suggestion_dismissals(name) {
+        Ok(cleared) if cleared.is_empty() => CommandResult::message(match name {
+            Some(name) => format!(
+                "`{}` was not hidden from suggestions.",
+                escape_review_text(name)
+            ),
+            None => "No plugins were hidden from suggestions.".to_string(),
+        }),
+        Ok(cleared) => CommandResult::message(format!(
+            "Suggestions may offer {} again.",
+            cleared
+                .iter()
+                .map(|name| escape_review_text(name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        Err(error) => CommandResult::error(error),
     }
 }
 

@@ -42,7 +42,7 @@ function LoginForm({ locale, error }: { locale: string; error: boolean }) {
             autoFocus
             autoComplete="off"
             spellCheck={false}
-            className="w-full px-3 py-2 hairline-t hairline-b hairline-l hairline-r bg-paper font-mono text-sm focus:outline-none focus:border-indigo"
+            className="w-full px-3 py-2 hairline-t hairline-b hairline-l hairline-r bg-paper font-mono text-sm focus:border-indigo"
           />
         </label>
         <button

@@ -1,5 +1,7 @@
 // Process execution helper: spawn, timeout, text capture. Zero dependencies.
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -166,11 +168,26 @@ export class ExecError extends Error {
   }
 }
 
-/** True when the executable exists on PATH (or opts.fullPath exists). */
+/**
+ * True when the executable exists on PATH. Resolved in-process against PATH
+ * (and PATHEXT on Windows) instead of spawning `which`/`where`: a cold
+ * `where.exe` on a loaded Windows runner exceeded the old 5s probe budget and
+ * reported a present tool as missing (tag CI for v0.11.2/v0.11.3).
+ */
 export async function have(cmd) {
-  const probe = process.platform === "win32" ? "where" : "which";
-  const r = await run(probe, [cmd], { timeoutMs: 5000 });
-  return r.code === 0 && r.stdout.trim().length > 0;
+  if (typeof cmd !== "string" || !cmd) return false;
+  const win = process.platform === "win32";
+  const exts = win ? ["", ...String(process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)] : [""];
+  const executable = (file) => {
+    try {
+      if (!fs.statSync(file).isFile()) return false;
+      if (!win) fs.accessSync(file, fs.constants.X_OK);
+      return true;
+    } catch { return false; }
+  };
+  if (cmd.includes("/") || (win && cmd.includes("\\"))) return exts.some((ext) => executable(cmd + ext));
+  const dirs = String(process.env.PATH ?? process.env.Path ?? "").split(path.delimiter).filter(Boolean);
+  return dirs.some((dir) => exts.some((ext) => executable(path.join(dir, cmd + ext))));
 }
 
 export function trim(s, n = 400) {

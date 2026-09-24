@@ -42,8 +42,11 @@ const OPTIONAL_FILES = [
   "docs-computers.ts",
   "docs-auth.ts",
   "docs-trust.ts",
+  "docs-work.ts",
   "states.ts",
   "changelog.ts",
+  "legal-terms.ts",
+  "legal-privacy.ts",
   "computer-use.ts",
 ];
 

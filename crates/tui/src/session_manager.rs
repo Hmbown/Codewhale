@@ -2889,8 +2889,15 @@ impl SessionManager {
         max_age: std::time::Duration,
         keep: Option<&str>,
     ) -> std::io::Result<usize> {
-        let cutoff = Utc::now()
-            - chrono::Duration::from_std(max_age).unwrap_or(chrono::Duration::days(365 * 10));
+        // A max_age too large to represent (or to subtract from now) means
+        // nothing can be old enough to prune — keep everything instead of
+        // panicking on DateTime underflow or inventing a fallback horizon.
+        let Some(cutoff) = chrono::Duration::from_std(max_age)
+            .ok()
+            .and_then(|age| Utc::now().checked_sub_signed(age))
+        else {
+            return Ok(0);
+        };
         let sessions = self.list_sessions()?;
         let mut pruned = 0usize;
         for session in sessions {
@@ -7608,6 +7615,26 @@ mod tests {
         assert_eq!(pruned, 0);
         // Both files still on disk.
         assert_eq!(manager.list_sessions().expect("list").len(), 2);
+    }
+
+    #[test]
+    fn prune_sessions_older_than_huge_max_age_keeps_everything() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        write_session_with_updated_at(&manager, "old", Utc::now() - chrono::Duration::days(3650));
+        write_session_with_updated_at(&manager, "new", Utc::now());
+        // Both overflow paths: from_std rejects u64::MAX seconds, and a
+        // representable-but-enormous age underflows the DateTime subtraction.
+        for max_age in [
+            std::time::Duration::MAX,
+            std::time::Duration::from_secs(i64::MAX as u64 / 1_000),
+        ] {
+            let pruned = manager
+                .prune_sessions_older_than(max_age)
+                .expect("huge max_age must not error or panic");
+            assert_eq!(pruned, 0, "{max_age:?}");
+            assert_eq!(manager.list_sessions().expect("list").len(), 2);
+        }
     }
 
     #[test]

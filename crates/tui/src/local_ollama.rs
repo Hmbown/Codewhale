@@ -17,19 +17,114 @@ use crate::config::{ApiProvider, Config, DEFAULT_OLLAMA_BASE_URL};
 
 const TAGS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Upper bound on `/api/show` lookups per probe. A developer box can hold
+/// dozens of tags; ranking needs only the plausible chat candidates.
+const SHOW_PROBE_LIMIT: usize = 8;
+
 /// Result of a successful local Ollama tags/models probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LiveLocalOllamaCatalog {
     pub(crate) endpoint_v1: String,
     pub(crate) tags: Vec<String>,
+    /// The tag adoption may switch to: a model that can hold a conversation.
+    /// `None` when every live tag is an embedding/reranker model — adopting
+    /// one of those would make every first message fail.
+    pub(crate) chat_tag: Option<String>,
 }
 
 impl LiveLocalOllamaCatalog {
-    /// Prefer the alphabetically first live tag (matches route_runtime's
-    /// Ollama default when tags have no `default_for_provider` flag).
+    /// The chat-capable tag to adopt, if the catalog has one.
     pub(crate) fn preferred_tag(&self) -> Option<&str> {
-        self.tags.first().map(String::as_str)
+        self.chat_tag.as_deref()
     }
+}
+
+/// What `/api/show` reports about one tag. Both fields are optional because
+/// older daemons omit `capabilities` and some architectures omit a context
+/// length; a missing fact is unknown, never a "no".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OllamaTagProfile {
+    pub(crate) capabilities: Option<Vec<String>>,
+    pub(crate) context_length: Option<u64>,
+}
+
+impl OllamaTagProfile {
+    fn has_capability(&self, name: &str) -> Option<bool> {
+        self.capabilities
+            .as_ref()
+            .map(|caps| caps.iter().any(|cap| cap.eq_ignore_ascii_case(name)))
+    }
+}
+
+/// Name heuristic for tags that cannot chat: embedding and reranking models.
+/// Used only when the daemon did not report capabilities.
+pub(crate) fn looks_like_non_chat_tag(tag: &str) -> bool {
+    let lower = tag.to_ascii_lowercase();
+    ["embed", "bge", "rerank", "minilm"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn looks_like_coder_tag(tag: &str) -> bool {
+    let lower = tag.to_ascii_lowercase();
+    lower.contains("coder") || lower.contains("code")
+}
+
+/// Pick the tag adoption should switch to.
+///
+/// A tag is a chat candidate when `/api/show` lists `completion`, or — when
+/// the daemon reported no capabilities — when its name is not an embedding or
+/// reranker. Among candidates: coder or tool-capable models first, then the
+/// largest reported context, then alphabetical order for stability.
+pub(crate) fn choose_chat_tag(
+    tags: &[String],
+    profiles: &std::collections::HashMap<String, OllamaTagProfile>,
+) -> Option<String> {
+    let unknown = OllamaTagProfile::default();
+    tags.iter()
+        .filter_map(|tag| {
+            let profile = profiles.get(tag).unwrap_or(&unknown);
+            let chat = match profile.has_capability("completion") {
+                Some(known) => known,
+                None => !looks_like_non_chat_tag(tag),
+            };
+            if !chat {
+                return None;
+            }
+            let preferred =
+                looks_like_coder_tag(tag) || profile.has_capability("tools").unwrap_or(false);
+            Some((
+                preferred,
+                profile.context_length.unwrap_or(0),
+                std::cmp::Reverse(tag.as_str()),
+                tag,
+            ))
+        })
+        .max_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)))
+        .map(|(_, _, _, tag)| tag.clone())
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaShowResponse {
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+    #[serde(default)]
+    model_info: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Parse `POST /api/show` JSON into the facts adoption ranks on.
+pub(crate) fn parse_ollama_show_response(payload: &str) -> anyhow::Result<OllamaTagProfile> {
+    let parsed: OllamaShowResponse = serde_json::from_str(payload)
+        .map_err(|err| anyhow::anyhow!("Failed to parse Ollama /api/show JSON: {err}"))?;
+    let context_length = parsed.model_info.as_ref().and_then(|info| {
+        info.iter()
+            .filter(|(key, _)| key.ends_with(".context_length"))
+            .find_map(|(_, value)| value.as_u64())
+    });
+    Ok(OllamaTagProfile {
+        capabilities: parsed.capabilities,
+        context_length,
+    })
 }
 
 /// True when this session should adopt a live local catalog into chrome.
@@ -139,18 +234,66 @@ fn record_ollama_tags_into_lake(endpoint_v1: &str, tags: &[String]) {
     );
 }
 
-async fn fetch_text(url: &str) -> anyhow::Result<String> {
+fn probe_client() -> anyhow::Result<reqwest::Client> {
     // The first-run probe can run before any provider client has installed
     // the rustls crypto provider; the shared builder installs it (the bare
     // `reqwest::Client::builder()` panics under `rustls-no-provider`).
-    let client = crate::tls::reqwest_client_builder()
+    Ok(crate::tls::reqwest_client_builder()
         .timeout(TAGS_PROBE_TIMEOUT)
-        .build()?;
-    let response = client.get(url).send().await?;
+        .build()?)
+}
+
+async fn fetch_text(url: &str) -> anyhow::Result<String> {
+    let response = probe_client()?.get(url).send().await?;
     if !response.status().is_success() {
         anyhow::bail!("HTTP {}", response.status());
     }
     Ok(response.text().await?)
+}
+
+async fn fetch_tag_profile(origin: &str, tag: &str) -> anyhow::Result<OllamaTagProfile> {
+    let response = probe_client()?
+        .post(format!("{origin}/api/show"))
+        .json(&serde_json::json!({ "model": tag }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("HTTP {}", response.status());
+    }
+    parse_ollama_show_response(&response.text().await?)
+}
+
+/// Ask `/api/show` about the plausible chat tags. Failures leave a tag
+/// unprofiled, so the name heuristic decides for it.
+async fn fetch_tag_profiles(
+    origin: &str,
+    tags: &[String],
+) -> std::collections::HashMap<String, OllamaTagProfile> {
+    let candidates: Vec<&String> = tags
+        .iter()
+        .filter(|tag| !looks_like_non_chat_tag(tag))
+        .take(SHOW_PROBE_LIMIT)
+        .collect();
+    let lookups = candidates
+        .iter()
+        .map(|tag| fetch_tag_profile(origin, tag.as_str()));
+    let results = futures_util::future::join_all(lookups).await;
+    candidates
+        .into_iter()
+        .zip(results)
+        .filter_map(|(tag, result)| match result {
+            Ok(profile) => Some((tag.clone(), profile)),
+            Err(err) => {
+                tracing::debug!(
+                    target: "local_ollama",
+                    error = %err,
+                    tag = %tag,
+                    "POST /api/show probe failed"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// Probe local Ollama for a live catalog. Prefers native `/api/tags`, falls
@@ -202,7 +345,13 @@ pub(crate) async fn probe_live_local_ollama_catalog(
     };
 
     record_ollama_tags_into_lake(&endpoint_v1, &tags);
-    Some(LiveLocalOllamaCatalog { endpoint_v1, tags })
+    let profiles = fetch_tag_profiles(&origin, &tags).await;
+    let chat_tag = choose_chat_tag(&tags, &profiles);
+    Some(LiveLocalOllamaCatalog {
+        endpoint_v1,
+        tags,
+        chat_tag,
+    })
 }
 
 /// Env opt-out for harnesses that must not see the developer's machine.
@@ -246,6 +395,7 @@ pub(crate) fn spawn_local_ollama_adoption_probe(
 mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, lock_test_env};
+    use std::collections::HashMap;
 
     #[test]
     fn parse_ollama_tags_response_reads_name_field() {
@@ -277,15 +427,107 @@ mod tests {
         );
     }
 
-    #[test]
-    fn preferred_tag_is_alphabetically_first_after_sort() {
-        let mut tags = vec!["zeta:tag".into(), "alpha:tag".into()];
+    fn tags(names: &[&str]) -> Vec<String> {
+        let mut tags: Vec<String> = names.iter().map(|name| (*name).to_string()).collect();
         tags.sort();
+        tags
+    }
+
+    #[test]
+    fn chat_tag_never_picks_an_embedding_model() {
+        // The installed-0.10.0 re-run adopted `nomic-embed-text:latest`
+        // because it sorted first; with no /api/show facts the name decides.
+        let tags = tags(&["qwen2.5-coder:7b", "qwen3:4b", "nomic-embed-text:latest"]);
+        let chosen = choose_chat_tag(&tags, &HashMap::new());
+        assert_eq!(chosen.as_deref(), Some("qwen2.5-coder:7b"));
+    }
+
+    #[test]
+    fn embed_only_catalog_adopts_nothing() {
+        let tags = tags(&[
+            "nomic-embed-text:latest",
+            "bge-m3:latest",
+            "all-minilm:l6-v2",
+            "qllama/bge-reranker-v2-m3:latest",
+        ]);
+        assert_eq!(choose_chat_tag(&tags, &HashMap::new()), None);
         let catalog = LiveLocalOllamaCatalog {
             endpoint_v1: "http://localhost:11434/v1".into(),
+            chat_tag: choose_chat_tag(&tags, &HashMap::new()),
             tags,
         };
-        assert_eq!(catalog.preferred_tag(), Some("alpha:tag"));
+        assert_eq!(catalog.preferred_tag(), None);
+    }
+
+    #[test]
+    fn reported_capabilities_outrank_the_name_heuristic() {
+        let tags = tags(&["alpha:1b", "mystery:latest", "zeta:8b"]);
+        let mut profiles = HashMap::new();
+        // An embedding model with an innocent name is excluded by its facts.
+        profiles.insert(
+            "alpha:1b".to_string(),
+            OllamaTagProfile {
+                capabilities: Some(vec!["embedding".into()]),
+                context_length: Some(8_192),
+            },
+        );
+        // Tool support is preferred over a larger context without it.
+        profiles.insert(
+            "mystery:latest".to_string(),
+            OllamaTagProfile {
+                capabilities: Some(vec!["completion".into(), "tools".into()]),
+                context_length: Some(32_768),
+            },
+        );
+        profiles.insert(
+            "zeta:8b".to_string(),
+            OllamaTagProfile {
+                capabilities: Some(vec!["completion".into()]),
+                context_length: Some(131_072),
+            },
+        );
+        assert_eq!(
+            choose_chat_tag(&tags, &profiles).as_deref(),
+            Some("mystery:latest")
+        );
+    }
+
+    #[test]
+    fn larger_context_then_name_breaks_ties_among_equals() {
+        let tags = tags(&["b-model:7b", "a-model:7b", "c-model:7b"]);
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "c-model:7b".to_string(),
+            OllamaTagProfile {
+                capabilities: Some(vec!["completion".into()]),
+                context_length: Some(65_536),
+            },
+        );
+        assert_eq!(
+            choose_chat_tag(&tags, &profiles).as_deref(),
+            Some("c-model:7b")
+        );
+        assert_eq!(
+            choose_chat_tag(&tags, &HashMap::new()).as_deref(),
+            Some("a-model:7b"),
+            "without facts the first chat tag wins, as before"
+        );
+    }
+
+    #[test]
+    fn parse_ollama_show_response_reads_capabilities_and_context() {
+        let body = r#"{
+            "capabilities": ["completion", "tools"],
+            "model_info": {"general.architecture": "qwen2", "qwen2.context_length": 32768}
+        }"#;
+        let profile = parse_ollama_show_response(body).expect("parse");
+        assert_eq!(
+            profile.capabilities,
+            Some(vec!["completion".to_string(), "tools".to_string()])
+        );
+        assert_eq!(profile.context_length, Some(32_768));
+        let legacy = parse_ollama_show_response(r#"{"modelfile":""}"#).expect("parse");
+        assert_eq!(legacy, OllamaTagProfile::default());
     }
 
     #[tokio::test]

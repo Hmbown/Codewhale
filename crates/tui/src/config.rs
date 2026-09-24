@@ -2492,6 +2492,24 @@ pub struct SubagentsConfig {
 #[serde(deny_unknown_fields)]
 pub struct SubagentRoleConfig {
     pub model: String,
+    /// Operator-approved `provider/model` routes, tried in order only when
+    /// this pin's first request is refused before the agent has done any
+    /// work (exhausted quota, rejected credentials or authorization, or an
+    /// unavailable model). Listing a route authorizes sending the agent's
+    /// task to that provider. Empty keeps the pin exact.
+    #[serde(default)]
+    pub replacements: Vec<String>,
+}
+
+fn parse_subagent_role_pin(value: &str) -> SubagentModelOverride {
+    let value = value.trim();
+    match value.split_once('/') {
+        Some((provider, model)) => SubagentModelOverride {
+            provider: Some(provider.trim().to_string()),
+            model: model.trim().to_string(),
+        },
+        None => value.into(),
+    }
 }
 
 /// One role override carried through Config, Engine, and child admission.
@@ -8162,19 +8180,41 @@ impl Config {
             for (key, pin) in entries {
                 // Keep blank explicit pins so admission rejects them rather
                 // than silently inheriting a different route.
-                let value = pin.model.trim();
-                let pin = match value.split_once('/') {
-                    Some((provider, model)) => SubagentModelOverride {
-                        provider: Some(provider.trim().to_string()),
-                        model: model.trim().to_string(),
-                    },
-                    None => value.into(),
-                };
-                overrides.insert(canonical(key), pin);
+                overrides.insert(canonical(key), parse_subagent_role_pin(&pin.model));
             }
         }
 
         overrides
+    }
+
+    /// The operator-approved replacement routes declared beside the role pin
+    /// that [`Self::subagent_model_overrides`] resolved under `key`. A
+    /// canonical role key wins over a legacy alias, matching pin precedence.
+    pub fn subagent_route_replacements(&self, key: &str) -> Vec<SubagentModelOverride> {
+        let Some(roles) = self.subagents.as_ref().and_then(|cfg| cfg.roles.as_ref()) else {
+            return Vec::new();
+        };
+        let canonical = |raw: &str| {
+            let raw = raw.trim().to_ascii_lowercase();
+            if raw == "default" {
+                raw
+            } else {
+                crate::fleet::role::migrate_legacy_role_token(&raw)
+                    .unwrap_or(&raw)
+                    .to_string()
+            }
+        };
+        roles
+            .iter()
+            .filter(|(raw, _)| canonical(raw) == key)
+            .max_by_key(|(raw, _)| (canonical(raw) == raw.trim().to_ascii_lowercase(), *raw))
+            .map(|(_, pin)| {
+                pin.replacements
+                    .iter()
+                    .map(|route| parse_subagent_role_pin(route))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Parsed `[fleet]` table, or defaults when the table is absent
@@ -12040,13 +12080,8 @@ fn save_root_api_key_metadata_without_plaintext(
     ensure_parent_dir(config_path)?;
     crate::config_persistence::mutate_config_document(config_path, |doc| {
         crate::config_persistence::set_document_value(doc, &["auth_mode"], "api_key")?;
-        if !doc.contains_key("default_text_model") {
-            crate::config_persistence::set_document_value(
-                doc,
-                &["default_text_model"],
-                DEFAULT_TEXT_MODEL,
-            )?;
-        }
+        // Saving a key never pins a model (see
+        // `codewhale_config::credentials::prepare_provider_api_key_metadata`).
         if !doc.contains_key("reasoning_effort") {
             crate::config_persistence::set_document_value(doc, &["reasoning_effort"], "max")?;
         }
@@ -12097,8 +12132,8 @@ auth_mode = "api_key"
 # Set https://api.deepseek.com to opt out of beta features.
 # base_url = "https://api.deepseek.com/beta"
 
-# Default model
-default_text_model = "{DEFAULT_TEXT_MODEL}"
+# Default model (unset follows the provider default)
+# default_text_model = "{DEFAULT_TEXT_MODEL}"
 
 # Thinking mode (DeepSeek V4 reasoning effort):
 # "off" | "low" | "medium" | "high" | "max"

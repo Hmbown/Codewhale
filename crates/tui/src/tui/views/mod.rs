@@ -1126,6 +1126,9 @@ pub enum ViewEvent {
 #[derive(Debug, Clone)]
 pub enum ViewAction {
     None,
+    /// The view's own state changed with no event to report (a background
+    /// load landed): the host must repaint, nothing else.
+    Redraw,
     Close,
     Emit(ViewEvent),
     EmitAndClose(ViewEvent),
@@ -1187,6 +1190,14 @@ pub struct ViewStack {
     /// Theme snapshot for the texture pass, set alongside the mode each
     /// frame. `None` (e.g. tests that never opt in) disables the texture.
     focus_texture_theme: Option<codewhale_palette::UiTheme>,
+}
+
+/// What one [`ViewStack::tick`] produced: events to handle, and whether the
+/// frame must be repainted.
+#[derive(Debug, Default)]
+pub struct ViewTick {
+    pub events: Vec<ViewEvent>,
+    pub redraw: bool,
 }
 
 impl ViewStack {
@@ -1331,19 +1342,31 @@ impl ViewStack {
         self.apply_action(action)
     }
 
-    pub fn tick(&mut self) -> Vec<ViewEvent> {
+    /// Advance the top view's timers. The host repaints when `redraw` is
+    /// set — a view whose state changed on its own (a background preview
+    /// landing) returns [`ViewAction::Redraw`], and any emitted event also
+    /// implies a repaint. Without this, tick-driven changes stay invisible
+    /// until the next key press.
+    pub fn tick(&mut self) -> ViewTick {
         let action = self
             .views
             .last_mut()
             .map(|view| view.tick())
             .unwrap_or(ViewAction::None);
-        self.apply_action(action)
+        let view_redraw = matches!(action, ViewAction::Redraw);
+        let events = self.apply_action(action);
+        ViewTick {
+            redraw: view_redraw || !events.is_empty(),
+            events,
+        }
     }
 
     fn apply_action(&mut self, action: ViewAction) -> Vec<ViewEvent> {
         let mut events = Vec::new();
         match action {
-            ViewAction::None => {}
+            // Key and mouse paths already repaint after dispatch; `tick`
+            // reads `Redraw` before calling here.
+            ViewAction::None | ViewAction::Redraw => {}
             ViewAction::Close => {
                 if let Some(view) = self.views.pop() {
                     tracing::debug!(target: "codewhale_tui::view_stack", action = "close", kind = ?view.kind(), depth = self.views.len(), "view closed via action");
@@ -6644,7 +6667,7 @@ mod tests {
         empty.render(area, &mut empty_buf);
         let empty_text = buffer_text(&empty_buf, area);
         assert!(
-            empty_text.contains("No current-session fleet workers."),
+            empty_text.contains("No agents in this session."),
             "{empty_text}"
         );
         assert!(
@@ -6660,11 +6683,11 @@ mod tests {
         english.render(area, &mut english_buf);
         let english_text = buffer_text(&english_buf, area);
         assert!(
-            english_text.contains("Current-session fleet workers"),
+            english_text.contains("Agents in this session"),
             "{english_text}"
         );
         assert!(
-            english_text.contains("Sub-agent roles are current-session fleet worker roles."),
+            english_text.contains("Roles shown are this session's agent roles."),
             "{english_text}"
         );
 
@@ -6699,7 +6722,7 @@ mod tests {
             "{zh_hans_text}"
         );
         assert!(
-            !zh_hans_text.contains("Current-session fleet workers"),
+            !zh_hans_text.contains("Agents in this session"),
             "{zh_hans_text}"
         );
     }
@@ -6738,7 +6761,7 @@ mod tests {
         english.render(area, &mut english_buf);
         let english_text = buffer_text(&english_buf, area);
         for expected in [
-            "Current-session fleet workers",
+            "Agents in this session",
             "Running: 1",
             "Completed: 0",
             "Interrupted: 1",
@@ -6749,17 +6772,17 @@ mod tests {
             "running",
             "reason: manual review",
             "role: release",
-            "posture: network=on · shell=read-only · write=on",
+            "access: network=on · shell=read-only · write=on",
             "git: branch feature/localize @ fleet-workers",
             "objective: verify localized row",
             "result: all checks passed",
-            "live worker status · role · objective · model · elapsed",
+            "live agent status · role · objective · model · elapsed",
             "close",
             "select",
             "focus",
             "stop",
             "refresh",
-            "roster/setup",
+            "fleet/setup",
         ] {
             assert!(
                 english_text.contains(expected),
@@ -6908,8 +6931,10 @@ mod tests {
                     .collect();
                 let text = rows.join("\n");
 
+                // The card heading is the plain summary of the call (E6,
+                // mark 4), not the raw tool name.
                 assert!(
-                    text.contains("Do you want to proceed?") && text.contains("read_file"),
+                    text.contains("Do you want to proceed?") && text.contains("Read src/main.rs"),
                     "{mode:?} {w}x{h}: approval prompt must survive the texture"
                 );
                 // Zero sentinel bleed INSIDE the focused band: the backdrop
@@ -8031,7 +8056,7 @@ api_key_env = "ACME_API_KEY"
             .expect("sub-agent depth row");
         assert_eq!(depth.scope, ConfigScope::Saved);
         assert!(!depth.editable);
-        assert_eq!(config_label_for_key(&depth.key), "sub-agent depth");
+        assert_eq!(config_label_for_key(&depth.key), "agent depth");
 
         // Workflow keeps its own name and its `/workflow` wording.
         let workflow = view

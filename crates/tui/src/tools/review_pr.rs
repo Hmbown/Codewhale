@@ -463,12 +463,13 @@ fn run_command(workspace: &Path, program: Program, args: &[String]) -> Result<St
         Program::Gh => Gh::command().context("PR review requires GitHub CLI on PATH")?,
         Program::Git => Git::review_command(workspace)?,
     };
+    // `gh` shells out to git; give it the same no-prompt environment.
+    crate::dependencies::apply_git_noninteractive_env(&mut command);
     command
         .args(args)
         .current_dir(workspace)
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
         .env("GH_PROMPT_DISABLED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

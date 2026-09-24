@@ -1,0 +1,74 @@
+/* The supplied game poster is the 404 joke, kept whole at every width. */
+.page {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: clamp(2rem, 6vw, 5.5rem);
+  width: var(--container);
+  max-width: 70rem;
+  min-height: calc(100svh - 4.25rem);
+  margin-inline: auto;
+  padding-block: clamp(2rem, 5vw, 4rem);
+}
+
+.title {
+  max-width: 11ch;
+  font-size: clamp(2.5rem, 4.8vw, 4.25rem);
+  font-weight: 600;
+  line-height: 1.06;
+  letter-spacing: -0.03em;
+  text-wrap: balance;
+}
+
+.code {
+  display: block;
+  margin-bottom: 0.3em;
+  color: var(--ink-soft);
+}
+
+.body {
+  margin-top: 1.5rem;
+  color: var(--ink-soft);
+  font-size: 1.125rem;
+  line-height: 1.65;
+  white-space: pre-line;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem 1.25rem;
+  margin-top: 1.75rem;
+}
+
+.docs {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+  color: var(--ink-soft);
+  font-size: 0.875rem;
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
+.docs:hover { color: var(--ink); }
+
+.poster {
+  display: block;
+  width: 100%;
+  max-width: 30rem;
+  height: auto;
+  justify-self: end;
+  border-radius: var(--radius-control);
+}
+
+@media (max-width: 760px) {
+  .page {
+    grid-template-columns: minmax(0, 1fr);
+    min-height: auto;
+  }
+
+  .title { max-width: 15ch; }
+  .poster { justify-self: center; }
+}

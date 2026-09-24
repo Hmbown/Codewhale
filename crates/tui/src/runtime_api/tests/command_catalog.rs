@@ -22,6 +22,14 @@ fn command_catalog_serves_builtins_with_host_binding() {
     assert!(model.usage.is_some());
     assert!(model.takes_arguments);
 
+    // Composer shape comes from the same predicates the TUI composer uses:
+    // `/profile <name>` cannot run bare.
+    let profile = entry(&commands, "profile");
+    assert!(profile.requires_argument);
+    assert!(profile.requires_required_argument);
+    assert!(profile.composer_wants_trailing_space);
+    assert!(!profile.palette_runs_directly);
+
     // Unlisted builtins run but are not advertised — hidden, not absent.
     assert!(entry(&commands, "lane").hidden);
 
@@ -117,6 +125,17 @@ async fn get_v1_commands_serves_the_catalog_over_http() -> Result<()> {
         .find(|command| command["name"] == "model" && command["kind"] == "user")
         .expect("user model row");
     assert_eq!(user_model["binding"], "prompt");
+    // A template without `$ARGUMENTS` runs bare from the palette.
+    assert_eq!(user_model["requires_required_argument"], false);
+    assert_eq!(user_model["palette_runs_directly"], true);
+    assert_eq!(user_model["show_in_empty_discovery"], true);
+
+    let profile = commands
+        .iter()
+        .find(|command| command["name"] == "profile" && command["kind"] == "builtin")
+        .expect("builtin profile row");
+    assert_eq!(profile["requires_required_argument"], true);
+    assert_eq!(profile["palette_runs_directly"], false);
 
     handle.abort();
     Ok(())

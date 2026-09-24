@@ -347,15 +347,21 @@ pub trait ExternalTool {
         Some(cmd)
     }
 
+    /// The error a caller sees when the tool is not installed. It names the
+    /// binary the user would install (`git`, `python3`), never the Rust type
+    /// path (`codewhale_tui::dependencies::Git`).
+    fn not_found_error() -> std::io::Error {
+        let name = Self::candidates().first().copied().unwrap_or("tool");
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{name} not found on PATH"),
+        )
+    }
+
     /// Convenience: run the tool with arguments in a working directory
     /// and return the captured output.
     fn output(args: &[&str], cwd: &std::path::Path) -> std::io::Result<std::process::Output> {
-        let mut cmd = Self::command().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("{} not found on PATH", std::any::type_name::<Self>()),
-            )
-        })?;
+        let mut cmd = Self::command().ok_or_else(Self::not_found_error)?;
         cmd.args(args).current_dir(cwd).output()
     }
 
@@ -363,12 +369,7 @@ pub trait ExternalTool {
     /// exit status (discards stdout/stderr).
     #[cfg_attr(not(test), expect(dead_code))]
     fn status(args: &[&str], cwd: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
-        let mut cmd = Self::command().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("{} not found on PATH", std::any::type_name::<Self>()),
-            )
-        })?;
+        let mut cmd = Self::command().ok_or_else(Self::not_found_error)?;
         cmd.args(args).current_dir(cwd).status()
     }
 
@@ -397,6 +398,27 @@ pub trait ExternalTool {
 /// Git version control.
 pub struct Git;
 
+/// Keep a git child from ever waiting on a human.
+///
+/// Git and ssh read credentials, passphrases and host-key confirmations from
+/// `/dev/tty` directly — `stdin(null)` does not stop them — so inside the
+/// raw-mode TUI or an HTTP request a prompt is an invisible, indefinite hang.
+/// `GIT_TERMINAL_PROMPT=0` makes git fail instead of asking for a username or
+/// password; BatchMode ssh fails instead of asking for a passphrase or an
+/// unknown host key; an empty `GIT_PAGER` keeps output from ever being paged.
+/// A user who pinned their own ssh transport (`GIT_SSH_COMMAND` or `GIT_SSH`)
+/// keeps it untouched.
+///
+/// This is the single definition site; [`Git::command`] and
+/// [`Git::tokio_command`] apply it to every product git spawn. Call it
+/// directly only for a non-git program that may shell out to git (`gh`).
+pub(crate) fn apply_git_noninteractive_env(cmd: &mut Command) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0").env("GIT_PAGER", "");
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
+        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+}
+
 impl Git {
     /// Construct a read-only review command with content conversion disabled.
     /// Review callers also pass `--no-ext-diff` and `--no-textconv` for diffs.
@@ -422,9 +444,7 @@ impl Git {
                     if cfg!(windows) { "NUL" } else { "/dev/null" },
                 )
                 .env("GIT_NO_LAZY_FETCH", "1")
-                .env("GIT_NO_REPLACE_OBJECTS", "1")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .env("GIT_PAGER", "");
+                .env("GIT_NO_REPLACE_OBJECTS", "1");
             Ok(command)
         };
         let output = base()?
@@ -513,7 +533,14 @@ impl ExternalTool for Git {
             cmd.arg(arg);
         }
         cmd.env("GIT_OPTIONAL_LOCKS", "0");
+        apply_git_noninteractive_env(&mut cmd);
         Some(cmd)
+    }
+
+    /// Same environment as [`Git::command`]: the trait default would build a
+    /// bare command and silently drop the lock and prompt guards.
+    fn tokio_command() -> Option<tokio::process::Command> {
+        Self::command().map(tokio::process::Command::from)
     }
 
     fn resolve() -> Option<String> {
@@ -816,6 +843,29 @@ mod tests {
     }
 
     #[test]
+    fn missing_tool_error_names_the_binary_not_the_rust_type() {
+        struct Missing;
+        impl ExternalTool for Missing {
+            fn candidates() -> &'static [&'static str] {
+                &["codewhale-imaginary-tool", "fallback-name"]
+            }
+            fn resolve() -> Option<String> {
+                None
+            }
+        }
+
+        let error = Missing::output(&["--version"], std::path::Path::new("."))
+            .expect_err("an unresolvable tool must not spawn");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            error.to_string(),
+            "codewhale-imaginary-tool not found on PATH"
+        );
+        assert!(!error.to_string().contains("::"), "{error}");
+        assert_eq!(Git::not_found_error().to_string(), "git not found on PATH");
+    }
+
+    #[test]
     fn cargo_candidates_is_cargo_only() {
         assert_eq!(Cargo::candidates(), &["cargo"]);
     }
@@ -931,6 +981,38 @@ mod tests {
             .and_then(|(_, value)| value)
             .expect("GIT_OPTIONAL_LOCKS must be set on every git command");
         assert_eq!(value, std::ffi::OsStr::new("0"));
+    }
+
+    /// No git spawn may prompt on `/dev/tty` (0.10.1 item 3): a credential,
+    /// passphrase or host-key prompt inside the raw-mode TUI is a silent hang.
+    #[test]
+    fn git_commands_are_non_interactive() {
+        if !Git::available() {
+            return;
+        }
+        let std_cmd = Git::command().expect("git resolves when available");
+        let tokio_cmd = Git::tokio_command().expect("git resolves when available");
+        for envs in [
+            std_cmd.get_envs().collect::<Vec<_>>(),
+            tokio_cmd.as_std().get_envs().collect::<Vec<_>>(),
+        ] {
+            let get = |name: &str| {
+                envs.iter()
+                    .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                    .and_then(|(_, value)| *value)
+            };
+            assert_eq!(get("GIT_TERMINAL_PROMPT"), Some(std::ffi::OsStr::new("0")));
+            assert_eq!(get("GIT_PAGER"), Some(std::ffi::OsStr::new("")));
+            assert_eq!(get("GIT_OPTIONAL_LOCKS"), Some(std::ffi::OsStr::new("0")));
+            if std::env::var_os("GIT_SSH_COMMAND").is_none()
+                && std::env::var_os("GIT_SSH").is_none()
+            {
+                assert_eq!(
+                    get("GIT_SSH_COMMAND"),
+                    Some(std::ffi::OsStr::new("ssh -o BatchMode=yes"))
+                );
+            }
+        }
     }
 
     /// The suppression is deliberately scoped to git. Other external tools

@@ -44,11 +44,11 @@ fn search_text_stays_in_modal_and_out_of_composer() {
     for (open, title, prefix, query, escapes) in [
         (keys::key::f1(), "Help —", "Filter: ", "queue", 1),
         (keys::key::f1(), "Help —", "Filter: ", "Queue", 1),
-        (keys::key::f2(), "Config", "Search: ", "quiet", 2),
-        (keys::key::f2(), "Config", "Search: ", "effort", 2),
-        (keys::key::f2(), "Config", "Search: ", "json", 2),
-        (keys::key::f2(), "Config", "Search: ", "key", 2),
-        (keys::key::f2(), "Config", "Search: ", " 队列é", 2),
+        (keys::key::f2(), "Settings", "Search: ", "quiet", 2),
+        (keys::key::f2(), "Settings", "Search: ", "effort", 2),
+        (keys::key::f2(), "Settings", "Search: ", "json", 2),
+        (keys::key::f2(), "Settings", "Search: ", "key", 2),
+        (keys::key::f2(), "Settings", "Search: ", " 队列é", 2),
         (keys::key::ctrl('k'), "Command —", "Filter: ", "json", 1),
         (keys::key::ctrl('k'), "Command —", "Filter: ", "key", 1),
     ] {

@@ -1,8 +1,9 @@
 //! Session resume picker view for the TUI.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -44,6 +45,54 @@ fn section_block(title: &str) -> Block<'static> {
         .padding(Padding::uniform(1))
 }
 
+/// Previews kept in memory. Each entry is a whole rendered transcript, so the
+/// cache is bounded: scrolling a long list must not retain every session.
+const PREVIEW_CACHE_CAPACITY: usize = 16;
+
+/// Small least-recently-used cache of rendered previews keyed by session id.
+#[derive(Default)]
+struct PreviewCache {
+    /// Oldest first; a hit moves its entry to the back.
+    entries: VecDeque<(String, Vec<String>)>,
+}
+
+impl PreviewCache {
+    fn get(&mut self, id: &str) -> Option<&Vec<String>> {
+        let index = self.entries.iter().position(|(key, _)| key == id)?;
+        let entry = self.entries.remove(index)?;
+        self.entries.push_back(entry);
+        self.entries.back().map(|(_, lines)| lines)
+    }
+
+    fn insert(&mut self, id: String, lines: Vec<String>) {
+        self.entries.retain(|(key, _)| *key != id);
+        self.entries.push_back((id, lines));
+        while self.entries.len() > PREVIEW_CACHE_CAPACITY {
+            self.entries.pop_front();
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Outcome of reading one session from disk for the preview pane.
+struct PreviewLoad {
+    lines: Vec<String>,
+    /// Only a successful load is cached; a failure is retried on reselect.
+    cacheable: bool,
+}
+
+/// A preview load running off the event loop. The result is only applied if
+/// it still matches the selection that requested it.
+struct PendingPreview {
+    session_id: String,
+    generation: u64,
+    cell: Arc<Mutex<Option<PreviewLoad>>>,
+}
+
 pub struct SessionPickerView {
     /// Every session loaded from disk. The picker filters from this set.
     sessions: Vec<SessionMetadata>,
@@ -57,8 +106,12 @@ pub struct SessionPickerView {
     search_input: String,
     search_mode: bool,
     sort_mode: SessionSortMode,
-    preview_cache: HashMap<String, Vec<String>>,
+    preview_cache: PreviewCache,
     current_preview: Vec<String>,
+    /// Bumped on every preview refresh; a background load tagged with an
+    /// older generation is stale and dropped.
+    preview_generation: u64,
+    pending_preview: Option<PendingPreview>,
     confirm_delete: bool,
     rename_mode: bool,
     rename_input: String,
@@ -134,8 +187,10 @@ impl SessionPickerView {
             search_input: String::new(),
             search_mode: false,
             sort_mode: SessionSortMode::Recent,
-            preview_cache: HashMap::new(),
+            preview_cache: PreviewCache::default(),
             current_preview: Vec::new(),
+            preview_generation: 0,
+            pending_preview: None,
             confirm_delete: false,
             rename_mode: false,
             rename_input: String::new(),
@@ -595,49 +650,139 @@ impl SessionPickerView {
     }
 
     fn refresh_preview(&mut self) {
+        // Any load still in flight belongs to the previous selection.
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        self.pending_preview = None;
+
         let Some(session) = self.selected_session() else {
             self.current_preview = vec![tr(self.locale, MessageId::SessionsNoResults).into_owned()];
             self.scroll_history_to_latest();
             return;
         };
+        let session_id = session.id.clone();
 
-        if let Some(lines) = self.preview_cache.get(&session.id) {
+        if let Some(lines) = self.preview_cache.get(&session_id) {
             self.current_preview = lines.clone();
             self.scroll_history_to_latest();
             return;
         }
 
-        let manager = match SessionManager::default_location() {
-            Ok(manager) => manager,
-            Err(_) => {
-                self.current_preview =
-                    vec![tr(self.locale, MessageId::SessionsDirectoryFailed).into_owned()];
-                self.scroll_history_to_latest();
-                return;
-            }
-        };
+        // Reading and parsing a saved session is blocking disk I/O that grows
+        // with the transcript; arrowing through the list must not stall the
+        // event loop on it. Outside a runtime (unit tests, headless callers)
+        // there is no loop to stall, so load inline.
+        if tokio::runtime::Handle::try_current().is_err() {
+            let load = load_preview(&session_id, self.locale);
+            self.apply_preview_load(session_id, load);
+            return;
+        }
 
-        let saved = match manager.load_session(&session.id) {
-            Ok(saved) => saved,
-            Err(_) => {
-                self.current_preview =
-                    vec![tr(self.locale, MessageId::SessionsPreviewFailed).into_owned()];
-                self.scroll_history_to_latest();
-                return;
-            }
-        };
+        if let Some(session) = self.selected_session() {
+            self.current_preview = loading_preview_lines(session, self.locale);
+        }
+        self.scroll_history_to_latest();
 
-        let preview = build_preview_lines(&saved, self.locale);
-        self.preview_cache
-            .insert(session.id.clone(), preview.clone());
-        self.current_preview = preview;
+        let cell = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&cell);
+        let locale = self.locale;
+        let id = session_id.clone();
+        crate::utils::spawn_blocking_supervised("session-picker-preview", move || {
+            let load = load_preview(&id, locale);
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(load);
+            }
+        });
+        self.pending_preview = Some(PendingPreview {
+            session_id,
+            generation: self.preview_generation,
+            cell,
+        });
+    }
+
+    /// Apply a background preview load if it has landed and still belongs to
+    /// the current selection. Called from `tick`; returns whether the visible
+    /// preview changed, so the host knows to repaint.
+    fn poll_preview(&mut self) -> bool {
+        let Some(pending) = self.pending_preview.as_ref() else {
+            return false;
+        };
+        let landed = pending.cell.lock().ok().and_then(|mut guard| guard.take());
+        let Some(load) = landed else {
+            return false;
+        };
+        let Some(pending) = self.pending_preview.take() else {
+            return false;
+        };
+        let still_selected = self
+            .selected_session()
+            .is_some_and(|session| session.id == pending.session_id);
+        if pending.generation != self.preview_generation || !still_selected {
+            // Stale: keep a good result for later, never show it now.
+            if load.cacheable {
+                self.preview_cache.insert(pending.session_id, load.lines);
+            }
+            return false;
+        }
+        self.apply_preview_load(pending.session_id, load);
+        true
+    }
+
+    fn apply_preview_load(&mut self, session_id: String, load: PreviewLoad) {
+        if load.cacheable {
+            self.preview_cache.insert(session_id, load.lines.clone());
+        }
+        self.current_preview = load.lines;
         self.scroll_history_to_latest();
     }
+}
+
+/// Read one saved session and render its preview. Blocking; runs on the
+/// blocking pool when a runtime is available.
+fn load_preview(session_id: &str, locale: Locale) -> PreviewLoad {
+    let manager = match SessionManager::default_location() {
+        Ok(manager) => manager,
+        Err(_) => {
+            return PreviewLoad {
+                lines: vec![tr(locale, MessageId::SessionsDirectoryFailed).into_owned()],
+                cacheable: false,
+            };
+        }
+    };
+    match manager.load_session(session_id) {
+        Ok(saved) => PreviewLoad {
+            lines: build_preview_lines(&saved, locale),
+            cacheable: true,
+        },
+        Err(_) => PreviewLoad {
+            lines: vec![tr(locale, MessageId::SessionsPreviewFailed).into_owned()],
+            cacheable: false,
+        },
+    }
+}
+
+/// What the preview pane shows while the transcript loads: the header facts
+/// the list row already knows, then an ellipsis where the transcript goes.
+/// Built from existing localized strings so no locale falls back to English.
+fn loading_preview_lines(session: &SessionMetadata, locale: Locale) -> Vec<String> {
+    vec![
+        tr(locale, MessageId::SessionsPreviewId).replace("{id}", &session.id),
+        tr(locale, MessageId::SessionsPreviewTitle).replace("{title}", &session.title),
+        String::new(),
+        "\u{2026}".to_string(),
+    ]
 }
 
 impl ModalView for SessionPickerView {
     fn kind(&self) -> ModalKind {
         ModalKind::SessionPicker
+    }
+
+    fn tick(&mut self) -> ViewAction {
+        if self.poll_preview() {
+            ViewAction::Redraw
+        } else {
+            ViewAction::None
+        }
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -1468,8 +1613,10 @@ mod tests {
             search_input: String::new(),
             search_mode: false,
             sort_mode: SessionSortMode::Recent,
-            preview_cache: HashMap::new(),
+            preview_cache: PreviewCache::default(),
             current_preview: Vec::new(),
+            preview_generation: 0,
+            pending_preview: None,
             confirm_delete: false,
             rename_mode: false,
             rename_input: String::new(),
@@ -2405,8 +2552,10 @@ mod tests {
             search_input: String::new(),
             search_mode: false,
             sort_mode: SessionSortMode::Recent,
-            preview_cache: HashMap::new(),
+            preview_cache: PreviewCache::default(),
             current_preview: Vec::new(),
+            preview_generation: 0,
+            pending_preview: None,
             confirm_delete: false,
             rename_mode: false,
             rename_input: String::new(),
@@ -2492,5 +2641,145 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Drive `tick` until the background preview load has been applied.
+    fn wait_for_preview(view: &mut SessionPickerView) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while view.pending_preview.is_some() {
+            view.tick();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "preview load never landed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn select_id(view: &mut SessionPickerView, id: &str) {
+        view.selected = view
+            .filtered
+            .iter()
+            .position(|session| session.id == id)
+            .expect("session listed");
+    }
+
+    #[test]
+    fn preview_cache_is_a_bounded_lru() {
+        let mut cache = PreviewCache::default();
+        for idx in 0..PREVIEW_CACHE_CAPACITY {
+            cache.insert(format!("s{idx}"), vec![format!("line {idx}")]);
+        }
+        // Touch the oldest so it survives the next eviction.
+        assert!(cache.get("s0").is_some());
+        cache.insert("new".to_string(), vec!["new".to_string()]);
+        assert_eq!(cache.len(), PREVIEW_CACHE_CAPACITY);
+        assert!(cache.get("s0").is_some(), "recently used entry survives");
+        assert!(cache.get("s1").is_none(), "least recently used is evicted");
+        for idx in 0..40 {
+            cache.insert(format!("more{idx}"), Vec::new());
+        }
+        assert_eq!(cache.len(), PREVIEW_CACHE_CAPACITY);
+    }
+
+    /// Selecting a session must not read and parse its transcript on the
+    /// event loop: inside a runtime the pane shows a loading placeholder at
+    /// once, and the transcript arrives through `tick`. A load that finishes
+    /// after the selection moved on is never shown.
+    #[tokio::test]
+    async fn preview_loads_off_the_event_loop_and_drops_stale_results() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let manager = SessionManager::default_location().expect("session manager");
+        let mut first = saved_session_with_messages(vec![text_message("user", "alpha body")]);
+        first.metadata.id = "session-alpha".to_string();
+        let mut second = saved_session_with_messages(vec![text_message("user", "beta body")]);
+        second.metadata.id = "session-beta".to_string();
+        manager.save_session(&first).expect("save first");
+        manager.save_session(&second).expect("save second");
+        let mut view = picker_with(vec![first.metadata.clone(), second.metadata.clone()], None);
+
+        select_id(&mut view, "session-alpha");
+        view.refresh_preview();
+        assert!(
+            view.pending_preview.is_some(),
+            "load must run in the background"
+        );
+        assert!(
+            view.current_preview.iter().any(|line| line == "\u{2026}")
+                && view
+                    .current_preview
+                    .iter()
+                    .any(|line| line.contains("session-alpha")),
+            "placeholder names the session and marks the pending body: {:?}",
+            view.current_preview
+        );
+        let alpha_generation = view.preview_generation;
+
+        // Move on before alpha lands: alpha's result must never be shown.
+        select_id(&mut view, "session-beta");
+        view.refresh_preview();
+        assert_ne!(view.preview_generation, alpha_generation);
+        wait_for_preview(&mut view);
+        let shown = view.current_preview.join("\n");
+        assert!(shown.contains("beta body"), "{shown}");
+        assert!(!shown.contains("alpha body"), "{shown}");
+
+        // Returning to alpha loads it again, and a second visit is cached.
+        select_id(&mut view, "session-alpha");
+        view.refresh_preview();
+        wait_for_preview(&mut view);
+        assert!(view.current_preview.join("\n").contains("alpha body"));
+        select_id(&mut view, "session-beta");
+        view.refresh_preview();
+        assert!(
+            view.pending_preview.is_none(),
+            "a cached preview is shown without another load"
+        );
+        assert!(view.current_preview.join("\n").contains("beta body"));
+    }
+
+    /// A preview that lands in the background must repaint the frame on its
+    /// own; otherwise the placeholder stays up until the next key press.
+    #[tokio::test]
+    async fn landed_preview_requests_a_redraw_through_the_view_stack() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let manager = SessionManager::default_location().expect("session manager");
+        let mut saved = saved_session_with_messages(vec![text_message("user", "gamma body")]);
+        saved.metadata.id = "session-gamma".to_string();
+        manager.save_session(&saved).expect("save session");
+        let mut view = picker_with(vec![saved.metadata.clone()], None);
+        select_id(&mut view, "session-gamma");
+        view.refresh_preview();
+        assert!(
+            view.pending_preview.is_some(),
+            "load runs in the background"
+        );
+
+        let mut stack = crate::tui::views::ViewStack::new();
+        stack.push(view);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut redraws = 0;
+        loop {
+            let tick = stack.tick();
+            assert!(tick.events.is_empty(), "a preview load emits no event");
+            if tick.redraw {
+                redraws += 1;
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "preview load never requested a redraw"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(redraws, 1);
+        assert!(
+            !stack.tick().redraw,
+            "an idle tick after the preview landed must not keep repainting"
+        );
     }
 }

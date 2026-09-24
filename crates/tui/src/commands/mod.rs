@@ -405,7 +405,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
     previous[b_chars.len()]
 }
 
-fn best_suggestion_score<'a>(
+pub(crate) fn best_suggestion_score<'a>(
     query: &str,
     candidates: impl IntoIterator<Item = &'a str>,
 ) -> Option<(u8, usize)> {

@@ -107,6 +107,20 @@ impl PluginBootSummary {
     }
 }
 
+/// Warm render-path caches (syntax highlighting) off the UI thread, once per
+/// process. Only the live TUI reads [`SessionBootSurface::from_app`], so
+/// headless and one-shot paths never pay for the load.
+fn spawn_render_prewarm_once() {
+    static PREWARM: std::sync::Once = std::sync::Once::new();
+    PREWARM.call_once(|| {
+        // Best effort: if the thread cannot start, the first code block
+        // loads the sets lazily exactly as before.
+        let _ = std::thread::Builder::new()
+            .name("cw-syntax-prewarm".to_string())
+            .spawn(crate::tui::markdown_render::prewarm_syntax_highlighting);
+    });
+}
+
 fn plugin_trust_needs_setup(status: PluginTrustStatus) -> bool {
     matches!(
         status,
@@ -147,6 +161,7 @@ pub struct SessionBootSurface {
 impl SessionBootSurface {
     #[must_use]
     pub fn from_app(app: &App) -> Self {
+        spawn_render_prewarm_once();
         Self::from_parts(
             app.mcp_snapshot.as_ref(),
             app.mcp_initializing,

@@ -140,7 +140,10 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
     // header all still name the route.
     if shows(StatusItem::Model) {
         let (_, model) = app.effective_route_identity_display();
-        if model.is_empty() {
+        // A keyless first run carries a default model id but nothing can
+        // answer it: the chip says "not connected", matching the launch
+        // card's no-model line (U3), instead of naming a route that fails.
+        if model.is_empty() || app.onboarding_needs_api_key {
             segments.push(InfoSegment::new(
                 InfoSegmentId::Model,
                 app.tr(MessageId::StartupDefaultSubjectModel).as_ref(),
@@ -151,13 +154,12 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
             // The context reading and the metrics claim the rest of the row;
             // the route sheds its own qualifiers first.
             let budget = crate::tui::phase_strip::info_route_budget(width);
-            let fields = crate::tui::phase_strip::route_identity_fields(app, tier, budget)
-                .unwrap_or_else(|| {
-                    vec![crate::tui::phase_strip::RouteIdentityField {
-                        kind: crate::tui::phase_strip::RouteFieldKind::Model,
-                        text: model,
-                    }]
-                });
+            let fields = info_route_fields(app, tier, budget).unwrap_or_else(|| {
+                vec![crate::tui::phase_strip::RouteIdentityField {
+                    kind: crate::tui::phase_strip::RouteFieldKind::Model,
+                    text: model,
+                }]
+            });
             segments.push(InfoSegment::new(
                 InfoSegmentId::Model,
                 "",
@@ -340,6 +342,20 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
     segments
 }
 
+/// Route fields the info line paints, or `None` when it paints the
+/// "not connected" chip instead. `info_segments` and the hitbox split both
+/// read this, so a click can never land on a route the row did not draw.
+fn info_route_fields(
+    app: &App,
+    tier: crate::tui::underwater::ShellTier,
+    budget: usize,
+) -> Option<Vec<crate::tui::phase_strip::RouteIdentityField>> {
+    if app.onboarding_needs_api_key {
+        return None;
+    }
+    crate::tui::phase_strip::route_identity_fields(app, tier, budget)
+}
+
 /// The info line's controls that actually painted in this frame.
 ///
 /// The route target intentionally contains no copied route metadata. The
@@ -482,7 +498,7 @@ fn render_info_row(
         .map(|hitbox| hitbox.area);
     // Same pure call `info_segments` made, with the same budget owner, so the
     // split lines up with the text that was just measured.
-    let route_fields = crate::tui::phase_strip::route_identity_fields(
+    let route_fields = info_route_fields(
         app,
         crate::tui::underwater::ShellTier::for_chrome_width(area.width),
         crate::tui::phase_strip::info_route_budget(area.width),
@@ -2189,7 +2205,12 @@ pub(crate) fn context_usage_snapshot_for_window(app: &App, max: u32) -> Option<(
         .last_prompt_tokens
         .map(i64::from)
         .map(|tokens| tokens.max(0));
-    let estimated = estimated_context_tokens(app).map(|tokens| tokens.max(0));
+    // Lift to the provider-billed prompt exactly as the auto-compaction gate,
+    // the context inspector and the `/context` headline do (#5577): a provider
+    // billing above the local estimate must not leave the footer under-showing
+    // the pressure those surfaces report.
+    let billed = app.last_billed_input_tokens.map_or(0, i64::from);
+    let estimated = estimated_context_tokens(app).map(|tokens| tokens.max(0).max(billed));
 
     // Always prefer the estimated current-context size (computed from
     // `app.api_messages`) when we have it. Reported `last_prompt_tokens`
@@ -2303,6 +2324,7 @@ mod tests {
     fn infoline_route_segment_registers_interaction_target() {
         let mut app =
             crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        app.onboarding_needs_api_key = false;
         let mut terminal =
             Terminal::new(TestBackend::new(160, 1)).expect("info-line test terminal should build");
 
@@ -2360,6 +2382,49 @@ mod tests {
         }
     }
 
+    /// U3: a keyless first run keeps a default model id, but nothing can
+    /// answer it. The route chip says "not connected" instead of naming that
+    /// route, and it is not a route control until a model is connected.
+    #[test]
+    fn keyless_launch_route_chip_says_not_connected() {
+        let mut app =
+            crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        app.ui_locale = codewhale_localization::Locale::En;
+        app.onboarding_needs_api_key = true;
+        let (_, model) = app.effective_route_identity_display();
+        assert!(!model.is_empty(), "the fixture carries a default model id");
+        let mut terminal =
+            Terminal::new(TestBackend::new(160, 1)).expect("info-line test terminal should build");
+        let mut hitboxes = super::InfoLineInteractionHitboxes::default();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                hitboxes = render_info_row(frame, &mut app, area, false);
+            })
+            .expect("info line should render");
+        let row: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect();
+        assert!(row.contains("not connected"), "{row:?}");
+        assert!(!row.contains(&model), "a dead route is not named: {row:?}");
+        assert!(hitboxes.route.is_none(), "no provider control: {row:?}");
+
+        // Once a key lands the same row names the route again.
+        app.onboarding_needs_api_key = false;
+        let segments = super::info_segments(&app, 160);
+        assert!(
+            segments.iter().any(
+                |segment| segment.id == crate::tui::infoline::InfoSegmentId::Model
+                    && segment.value.contains(&model)
+            ),
+            "{segments:?}"
+        );
+    }
+
     /// "Where did the github info go?" — the workspace segment names the
     /// repository when `origin` resolves to a forge slug, and only falls back
     /// to the folder basename when it does not. The basename rides along as
@@ -2409,6 +2474,9 @@ mod tests {
         use codewhale_models::{ContentBlock, Message};
         let mut app =
             crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        // A keyless test config would paint "not connected" (U3); these
+        // readings are about a connected route.
+        app.onboarding_needs_api_key = false;
         app.api_messages = std::sync::Arc::new(vec![Message {
             role: codewhale_models::Role::User,
             content: vec![ContentBlock::Text {
@@ -2475,7 +2543,7 @@ mod tests {
             for width in [40u16, 80, 160] {
                 let row = metrics_row(&app, width);
                 assert!(
-                    row.contains(&format!("ctx {pct}%")),
+                    row.contains(&format!("context {pct}%")),
                     "{pct}% at {width} columns: {row:?}"
                 );
             }
@@ -2509,7 +2577,7 @@ mod tests {
 
         let mut app = app_with_context_percent(10);
         assert!(
-            metrics_row(&app, 160).contains("ctx 10%"),
+            metrics_row(&app, 160).contains("context 10%"),
             "the reading starts on the row"
         );
 
@@ -2537,7 +2605,7 @@ mod tests {
         app.status_items = items;
         let row = metrics_row(&app, 160);
         assert!(
-            !row.contains("ctx "),
+            !row.contains("context "),
             "the toggle must take it off: {row:?}"
         );
         assert!(
@@ -2593,7 +2661,8 @@ mod tests {
         assert!(
             fields
                 .iter()
-                .any(|field| field.kind == RouteFieldKind::Effort && field.text == label),
+                .any(|field| field.kind == RouteFieldKind::Effort
+                    && field.text == format!("thinking: {label}")),
             "{fields:?}"
         );
     }
@@ -2689,7 +2758,10 @@ mod tests {
             row.contains("saved coverage unavailable"),
             "an unclassified route preserves the reason: {row:?}"
         );
-        assert!(row.contains("ctx 10%"), "and nothing else moves: {row:?}");
+        assert!(
+            row.contains("context 10%"),
+            "and nothing else moves: {row:?}"
+        );
 
         // A real price on an otherwise unclassified route still prints.
         app.session.cost_coverage_unknown_legacy = false;

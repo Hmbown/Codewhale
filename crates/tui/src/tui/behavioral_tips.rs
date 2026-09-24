@@ -138,6 +138,8 @@ impl App {
                     StatusToastKind::BehavioralTip(_) | StatusToastKind::PluginSuggestion
                 )
             });
+            // One switch governs every plugin offer, the review row included.
+            self.plugin_cta.phase = crate::tui::plugin_suggestions::PluginCtaPhase::Hidden;
         }
         self.needs_redraw = true;
     }

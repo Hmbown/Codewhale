@@ -523,9 +523,25 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
     };
     match value {
         Some(v) => CommandResult::message(format!("{key} = {v}")),
-        None => CommandResult::error(format!(
-            "Unknown setting '{key}'. See `/help config` for available settings."
-        )),
+        None => CommandResult::error(unknown_setting_message(&key)),
+    }
+}
+
+/// Error for `/config <key>` when `key` is not a known setting: name the
+/// closest real key when there is one, and point at the full list.
+fn unknown_setting_message(key: &str) -> String {
+    let nearest = Settings::available_settings()
+        .into_iter()
+        .filter_map(|(candidate, _)| {
+            crate::commands::best_suggestion_score(key, [candidate]).map(|score| (score, candidate))
+        })
+        .min_by_key(|(score, _)| *score)
+        .map(|(_, candidate)| candidate);
+    match nearest {
+        Some(candidate) => format!(
+            "Unknown setting '{key}'. Did you mean `/config {candidate}`? Run `/settings text` to list every setting."
+        ),
+        None => format!("Unknown setting '{key}'. Run `/settings text` to list every setting."),
     }
 }
 
@@ -3538,6 +3554,25 @@ mod tests {
 
         let rejected = crate::commands::execute("/inline sideways", &mut app);
         assert!(rejected.is_error, "/inline takes no argument");
+    }
+
+    #[test]
+    fn config_unknown_setting_suggests_nearest_key() {
+        let mut app = create_test_app();
+        let result = config_command(&mut app, Some("auto_compcat"));
+        assert!(result.is_error);
+        let text = result.message.as_deref().unwrap_or_default();
+        assert!(
+            text.contains("Did you mean `/config auto_compact`?"),
+            "{text}"
+        );
+        assert!(text.contains("/settings text"), "{text}");
+
+        let result = config_command(&mut app, Some("zzqqxxyy"));
+        assert!(result.is_error);
+        let text = result.message.as_deref().unwrap_or_default();
+        assert!(!text.contains("Did you mean"), "{text}");
+        assert!(text.contains("/settings text"), "{text}");
     }
 
     #[test]

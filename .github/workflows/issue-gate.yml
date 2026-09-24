@@ -12,7 +12,10 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     steps:
-      - name: Welcome new external issue reporters
+      # Labels only, never comments (founder, 2026-09-22): the intake note used
+      # to thank other bots, and a comment is noise a label does not make.
+      # Maintainers still see who needs triage; `/lgtmi` still skips it.
+      - name: Label new external issues for triage
         uses: actions/github-script@v9
         with:
           script: |
@@ -21,8 +24,27 @@ jobs:
             const repo = context.repo.repo;
             const privileged = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 
+            async function label(name, color, description) {
+              try {
+                await github.rest.issues.createLabel({ owner, repo, name, color, description });
+              } catch (error) {
+                if (error.status !== 422) throw error; // 422: label already exists
+              }
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: issue.number,
+                labels: [name],
+              });
+            }
+
             if (privileged.has(issue.author_association)) return;
-            if (issue.user.login === 'github-actions[bot]') return;
+            // `user.type` is set by GitHub for app and bot accounts and cannot
+            // be spoofed by a login that merely ends in "[bot]".
+            if (issue.user.type === 'Bot') {
+              await label('bot-authored', 'ededed', 'Opened by a bot or app account');
+              return;
+            }
 
             function parseAllowlist(content) {
               return new Set(
@@ -60,25 +82,8 @@ jobs:
               return;
             }
 
-            const marker = '<!-- codewhale-issue-intake -->';
-            const { data: comments } = await github.rest.issues.listComments({
-              owner,
-              repo,
-              issue_number: issue.number,
-              per_page: 100,
-            });
-            if (comments.some(comment => (comment.body || '').includes(marker))) return;
-
-            await github.rest.issues.createComment({
-              owner,
-              repo,
-              issue_number: issue.number,
-              body: [
-                marker,
-                `Thanks @${issue.user.login} for the report.`,
-                '',
-                'This issue is staying open for maintainer triage. CodeWhale gets better because people bring us real edge cases from real machines, providers, regions, and workflows.',
-                '',
-                'If you can add a reproduction, logs, version output, screenshots, or the provider/model involved, that makes it much easier for us to verify and harvest the fix. Maintainers may comment `/lgtmi` to mark recurring issue reporters as approved so this intake note is skipped next time.',
-              ].join('\n'),
-            });
+            await label(
+              'needs-triage',
+              'fbca04',
+              'New external report awaiting maintainer triage; repro, logs and version output help'
+            );

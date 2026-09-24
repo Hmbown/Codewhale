@@ -83,6 +83,11 @@ pub(super) fn runtime_request_is_authorized(req: &Request, state: &RuntimeApiSta
     if request_has_header_runtime_token(req, expected) {
         return true;
     }
+    // Device client tokens (`POST /v1/auth/client-tokens`, <= 1 h, revocable)
+    // carry the same `/v1` authority as the master token, except minting.
+    if request_bearer(req).is_some_and(|token| state.computer.client_principal(token).is_some()) {
+        return true;
+    }
     if state.web.as_ref().is_some_and(|web| {
         web.matches_session_cookie(
             req.headers()
@@ -96,6 +101,18 @@ pub(super) fn runtime_request_is_authorized(req: &Request, state: &RuntimeApiSta
         .mobile
         .as_ref()
         .is_some_and(|mobile| mobile_session_request_is_authorized(req, state, mobile))
+}
+
+fn request_bearer(req: &Request) -> Option<&str> {
+    req.headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| raw.strip_prefix("Bearer "))
+        .or_else(|| {
+            req.headers()
+                .get("x-codewhale-runtime-token")
+                .and_then(|value| value.to_str().ok())
+        })
 }
 
 pub(super) fn request_has_header_runtime_token(req: &Request, expected: &str) -> bool {

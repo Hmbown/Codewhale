@@ -1,5 +1,5 @@
                                                                                                                         
-   Config  ──────────────────────────────────────────────────────────────────────────────────────────────────────────── 
+   Settings  ────────────────────────────────────────────────────────────────────────────────────────────────────────── 
                                                                                                                         
    Appearance   Models & providers   Work   Tools & MCP   Trust   Motion   Advanced                                     
    Search: type to filter  (17/71)                                                                                      
@@ -11,7 +11,7 @@
                     │ Model reasoning in chat            Off            [ ]   │startup   terminal                       
                     │ Thinking Default Expanded          Off            [ ]   │source    settings.toml                  
                     │ Thinking Preview Lines             2              ✎     │scope     SAVED                          
-                    │ Reasoning background highlight     On             [x]   │apply     applies on save                
+                    │ Thinking background highlight      On             [x]   │apply     applies on save                
                     │ Help Expand Groups                 Off            [ ]   │kind      choice                         
                     │ Contextual tips                    On             [x]   │available not observed this session      
                     │ Pin Last Prompt                    On             [x]   │                                         
@@ -26,7 +26,7 @@
                     │                                                         │                                         
                     │                                                         │                                         
   system | terminal | shoreline | shoreline-light | underwater | underwater-retro | dark | light | grayscale |…         
-  Preview:  ask   agent                                                                                                 
+  Preview:  ● ask   agent                                                                                               
   type=filter, Up/Down=select, Enter=edit, Esc=close                                                                    
  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 
                                                                                                                         

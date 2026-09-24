@@ -121,10 +121,16 @@ fn list_files(dir: &FsPath, cap: usize) -> Vec<FileEntry> {
 /// loading the whole file. Symlinks are never followed.
 fn read_named_window(dir: &FsPath, name: &str, query: FileReadQuery) -> Result<Value, ApiError> {
     let path = dir.join(name);
-    let metadata = std::fs::symlink_metadata(&path).map_err(|error| match error.kind() {
+    // Open first without following a final symlink, then take metadata from
+    // the handle, so the checked file is the file that is read.
+    let mut file = open_no_follow(&path).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => ApiError::not_found("file not found"),
-        _ => ApiError::internal(format!("file access failed: {error}")),
+        _ if is_symlink_refusal(&error) => ApiError::forbidden("not a regular file"),
+        _ => ApiError::internal(format!("file open failed: {error}")),
     })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ApiError::internal(format!("file access failed: {error}")))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(ApiError::forbidden("not a regular file"));
     }
@@ -145,8 +151,6 @@ fn read_named_window(dir: &FsPath, name: &str, query: FileReadQuery) -> Result<V
         (None, Some(tail)) => size.saturating_sub(tail.min(size)),
         (None, None) => 0,
     };
-    let mut file = File::open(&path)
-        .map_err(|error| ApiError::internal(format!("file open failed: {error}")))?;
     file.seek(SeekFrom::Start(offset))
         .map_err(|error| ApiError::internal(format!("file seek failed: {error}")))?;
     let mut window = Vec::with_capacity(limit.min(64 * 1024));
@@ -165,6 +169,39 @@ fn read_named_window(dir: &FsPath, name: &str, query: FileReadQuery) -> Result<V
         "encoding": encoding,
         "content": content,
     }))
+}
+
+/// Open `path` read-only without following a symlink in its final component.
+/// `O_NONBLOCK` keeps a FIFO planted under the name from hanging the open;
+/// the regular-file check on the handle rejects it afterwards.
+fn open_no_follow(path: &FsPath) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+/// `O_NOFOLLOW` on a symlink fails with `ELOOP` (and `EMLINK` on some BSDs).
+fn is_symlink_refusal(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(code) if code == libc::ELOOP || code == libc::EMLINK)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,17 +228,22 @@ fn log_sources() -> Vec<(PathBuf, Vec<PathBuf>)> {
     sources
 }
 
-/// Panic dumps prefer `<home>/.codewhale/crashes` and fall back to the legacy
-/// `.deepseek` directory — mirror the writer's preference order and merge
-/// every directory that exists.
+/// Read the selected profile's crash store. Default profiles also retain
+/// access to legacy dumps; explicit profiles never expose ambient diagnostics.
 fn crash_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = crate::config::effective_home_dir() {
-        for base in [".codewhale", ".deepseek"] {
-            let dir = home.join(base).join("crashes");
-            if dir.is_dir() && !dirs.contains(&dir) {
-                dirs.push(dir);
-            }
+    if let Ok(home) = codewhale_config::codewhale_home() {
+        let dir = home.join("crashes");
+        if dir.is_dir() {
+            dirs.push(dir);
+        }
+    }
+    if !codewhale_config::codewhale_home_is_explicit()
+        && let Ok(home) = codewhale_config::legacy_deepseek_home()
+    {
+        let dir = home.join("crashes");
+        if dir.is_dir() && !dirs.contains(&dir) {
+            dirs.push(dir);
         }
     }
     dirs
@@ -354,4 +396,79 @@ pub(super) async fn process_info(State(_state): State<RuntimeApiState>) -> Json<
         "executable": executable,
         "rss_bytes": rss,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use axum::http::StatusCode;
+
+    #[test]
+    fn explicit_profile_never_lists_ambient_crashes() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().expect("temp");
+        let _home = EnvVarGuard::set("HOME", tmp.path());
+        for base in [".codewhale", ".deepseek"] {
+            std::fs::create_dir_all(tmp.path().join(base).join("crashes"))
+                .expect("ambient fixture");
+        }
+        let profile = tmp.path().join("selected");
+        let _profile = EnvVarGuard::set("CODEWHALE_HOME", &profile);
+        assert!(crash_dirs().is_empty(), "no fallback for a fresh profile");
+        let selected = profile.join("crashes");
+        std::fs::create_dir_all(&selected).expect("selected fixture");
+        assert_eq!(crash_dirs(), vec![selected]);
+    }
+
+    #[test]
+    fn invalid_profile_does_not_fall_back_to_ambient_crashes() {
+        let _lock = crate::test_support::lock_test_env();
+        let _profile = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", "relative-profile");
+        assert!(crash_dirs().is_empty());
+    }
+
+    fn whole_file() -> FileReadQuery {
+        FileReadQuery {
+            offset: None,
+            limit: None,
+            tail: None,
+        }
+    }
+
+    #[test]
+    fn named_window_reads_a_regular_file() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        std::fs::write(dir.path().join("a.log"), b"hello").expect("write");
+        let body = read_named_window(dir.path(), "a.log", whole_file()).expect("read");
+        assert_eq!(body["bytes"], 5);
+        assert_eq!(body["size"], 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_window_refuses_a_symlink_at_open() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let outside = tempfile::TempDir::new().expect("temp");
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, b"do not serve").expect("write");
+        std::os::unix::fs::symlink(&secret, dir.path().join("a.log")).expect("symlink");
+        let error = read_named_window(dir.path(), "a.log", whole_file())
+            .expect_err("symlink must be refused");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_window_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let fifo = dir.path().join("a.log");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("cstr");
+        // SAFETY: `c_path` is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let error =
+            read_named_window(dir.path(), "a.log", whole_file()).expect_err("fifo must be refused");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
 }

@@ -806,11 +806,82 @@ pub(super) fn mcp_tool_is_read_only(name: &str) -> bool {
     )
 }
 
-pub(super) fn mcp_tool_approval_description(name: &str) -> String {
-    if mcp_tool_is_read_only(name) {
-        format!("Read-only MCP tool '{name}'")
-    } else {
-        format!("MCP tool '{name}' may have side effects")
+pub(super) fn mcp_tool_approval_description(name: &str, input: &serde_json::Value) -> String {
+    use crate::tools::approval_cache::{ComputerUseUserGate, computer_use_user_gate};
+
+    // K1/K2: a Computer Use consent or script card names exactly what the
+    // person is granting. Generic "may have side effects" text is how a
+    // model-issued consent used to read as routine.
+    match computer_use_user_gate(name, input) {
+        Some(ComputerUseUserGate::Consent {
+            action,
+            app,
+            bundle_id,
+            scope,
+            remember,
+            confirm,
+        }) => {
+            if confirm {
+                // The plugin paused on an action that cannot be taken back
+                // and handed the model a token; approving this card is the
+                // person's confirmation of that one action.
+                return "Computer Use confirmation requested by the model: allow the irreversible action (pay, buy, send, transfer or delete) the plugin just paused on. Approve only if you asked for exactly that action.".to_string();
+            }
+            let target = match scope {
+                "foreground" => {
+                    "shared-desktop foreground control (take the pointer and focus)".to_string()
+                }
+                _ => {
+                    let app = app.as_deref().unwrap_or("<unnamed app>");
+                    match bundle_id.as_deref() {
+                        Some(bundle) => format!("app '{app}' (bundle id {bundle})"),
+                        None => format!("app '{app}' (bundle id not given)"),
+                    }
+                }
+            };
+            let lifetime = if action == "revoke" {
+                "clears session and persisted decisions, including a saved deny"
+            } else if remember {
+                "persisted until revoked"
+            } else {
+                "this session"
+            };
+            let verb = if action == "revoke" {
+                "revoke recorded decisions for"
+            } else {
+                "allow"
+            };
+            return format!(
+                "Computer Use consent requested by the model: {verb} {target}; scope: {scope}; {lifetime}. Approve only if you want this."
+            );
+        }
+        Some(ComputerUseUserGate::AppScript {
+            language,
+            script_sha256,
+            first_line,
+            line_count,
+        }) => {
+            let shown = if line_count > 1 {
+                format!("first of {line_count} lines")
+            } else {
+                "1 line".to_string()
+            };
+            return format!(
+                "Computer Use app_script: run this exact {language} script outside the sandbox (sha256 {}, {shown}): {first_line}",
+                &script_sha256[..16]
+            );
+        }
+        None => {}
+    }
+    match crate::mcp::mcp_tool_approval_hint(name) {
+        _ if mcp_tool_is_read_only(name) => format!("Read-only MCP tool '{name}'"),
+        Some(crate::mcp::McpToolApprovalHint::TrustedReadOnly) => {
+            format!("Read-only MCP tool '{name}' (declared by a reviewed plugin)")
+        }
+        Some(crate::mcp::McpToolApprovalHint::Destructive) => {
+            format!("MCP tool '{name}' is marked destructive by its server")
+        }
+        None => format!("MCP tool '{name}' may have side effects"),
     }
 }
 

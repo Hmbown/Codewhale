@@ -18,15 +18,12 @@ jobs:
         with:
           days-before-stale: 14
           days-before-close: 7
-          stale-issue-message: >
-            This issue has been inactive for 14 days while waiting on
-            additional information. It will close automatically in 7 days
-            unless someone responds. If you still need help, drop a
-            comment with the requested details and a maintainer can
-            reopen.
-          close-issue-message: >
-            Closing for inactivity. Feel free to comment to reopen if
-            you can share the requested information.
+          # No stale or close messages (founder, 2026-09-22). An empty message
+          # makes actions/stale label and close without commenting (it checks
+          # `staleIssueMessage.length === 0` at the pinned SHA). The `stale`
+          # label is the signal; any reply removes it before the close.
+          stale-issue-message: ''
+          close-issue-message: ''
           stale-issue-label: 'stale'
           only-labels: 'needs-info'
           exempt-issue-labels: 'pinned,keep-open,release-blocker,security'

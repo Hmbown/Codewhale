@@ -502,7 +502,15 @@ fn build_entries(
             .iter()
             .copied()
             .filter(|alias| registry.get(alias).is_none())
+            .filter(|alias| alias_is_listed_for(locale, alias))
             .collect::<Vec<_>>();
+        // Every alias stays findable by typing it, listed or not.
+        let alias_terms = command
+            .aliases
+            .iter()
+            .map(|alias| format!("/{alias}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let description = if visible_aliases.is_empty() {
             localized.to_string()
         } else {
@@ -517,10 +525,11 @@ fn build_entries(
             )
         };
         let haystack = format!(
-            "{} {} {}",
+            "{} {} {} {}",
             label.to_ascii_lowercase(),
             description.to_ascii_lowercase(),
-            command.usage.to_ascii_lowercase()
+            command.usage.to_ascii_lowercase(),
+            alias_terms.to_lowercase()
         );
         entries.push(HelpEntry {
             section: HelpSection::Command,
@@ -617,6 +626,57 @@ fn build_entries(
     }
 
     entries
+}
+
+/// Romanized Chinese (pinyin) command aliases. They dispatch in every locale,
+/// but only the Chinese packs list them: an English reader sees `/clear`, not
+/// `/clear (aliases: /qingping)`.
+const ROMANIZED_ALIASES: &[&str] = &[
+    "bangzhu",
+    "chongmingming",
+    "chongshi",
+    "daili",
+    "dangan",
+    "daochu",
+    "digui",
+    "fujian",
+    "gaiming",
+    "gouzi",
+    "jiazai",
+    "jihua",
+    "jineng",
+    "jinengliebiao",
+    "lianjie",
+    "maodian",
+    "moxing",
+    "moxingliebiao",
+    "qingchu",
+    "qingping",
+    "shencha",
+    "shouye",
+    "tuichu",
+    "xinren",
+    "xitong",
+    "yasuo",
+    "yuyin",
+    "yuyincontrol",
+    "yuyinsend",
+    "zhinengti",
+    "zhuye",
+    "zidong",
+    "zuoye",
+];
+
+/// Whether `/help` lists `alias` beside its command for `locale`. Chinese
+/// aliases (Han script or pinyin) are listed only in the Chinese packs.
+fn alias_is_listed_for(locale: Locale, alias: &str) -> bool {
+    if matches!(locale, Locale::ZhHans | Locale::ZhHant) {
+        return true;
+    }
+    let han = alias
+        .chars()
+        .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch));
+    !han && !ROMANIZED_ALIASES.contains(&alias)
 }
 
 /// The usage line worth printing beside a row, or `None` when it only

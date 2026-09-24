@@ -29,6 +29,28 @@ ambiguous roots, links, oversized archives, and changed plugin identities are
 rejected. The install receipt preserves the source, including its selector,
 so `/plugin update` retains the same bundle selector and reviewed revision.
 
+## Built-in Computer Use across upgrades
+
+Computer Use also ships inside the binary as a built-in bundle. Each build
+writes its own copy under `$CODEWHALE_HOME/builtin-plugins`, so an upgrade
+presents it as a new bundle. Your review carries over when the capability
+hash is unchanged: a bundle you trusted and enabled stays trusted and enabled
+on the new build. When the capabilities changed, it shows
+`capabilities-changed` and stays off until you review it again with
+`/plugin show computer-use` and `/plugin trust computer-use`. If you revoked
+trust after your most recent review, nothing carries and the new build waits
+for a fresh review; once you review a build again, later upgrades carry that
+review. User and workspace plugins never carry trust: changed bytes
+always need review.
+
+## Chromewhale
+
+Chromewhale (Codewhale in your own Chrome) is in the marketplace repository
+but not in the catalog bundled with Core yet. It will be listed as a developer
+preview, loaded unpacked, once its inclusion checks pass on the published
+marketplace revision. Until then it is not offered in Extensions or
+`/plugin marketplace list`.
+
 ## Keeping the repositories current
 
 | Content | Authoritative source | Copies to check |
@@ -71,6 +93,17 @@ revision. A later marketplace change requires refreshing the Core snapshot and
 rebuilding; an existing pinned install does not silently follow `main`. Push the
 reviewed marketplace revision before publishing a Core release that references it. Hosted CI must be green for the
 actual published revisions; local checks do not prove a public URL works.
+
+Core's Computer Use copy (`crates/tui/plugins/computer-use`) is a runtime and
+tests subset of the upstream repository. Copy the upstream files Core already
+carries, plus any new runtime module the server imports and its tests, from the
+reviewed upstream commit. Keep the three deliberate Core variants
+(`package.json`, `README.md`, `tests/manifest.test.mjs`) and bump their version
+to match. Record the commit in `crates/tui/plugins/computer-use.upstream-sha`.
+Add each new runtime file to `COMPUTER_USE_FILES` in
+`crates/tui/src/plugins/builtin.rs`. The
+`computer_use_embed_list_matches_the_vendored_runtime_tree` test fails when
+the two disagree. Then run `npm test` in the vendored directory.
 
 Skill wording changes also need behavioral evaluation before claiming better
 outcomes. See [Skill evaluation](SKILL_EVALUATION.md).

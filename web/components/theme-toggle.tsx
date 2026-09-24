@@ -1,33 +1,48 @@
 "use client";
 
 /**
- * <ThemeToggle> — a compact Auto / Light / Dark control for the date strip.
+ * <ThemeToggle> — a compact System / Light / Dark control in the site nav,
+ * shown on every page.
  *
- * The site ships the Tideline dark field everywhere; the toggle only renders
- * on docs routes, where it switches the docs sheet between the dark default
- * and the opt-in Blue Stage light sheet — the same preset pair the TUI
- * offers. Showing it off the docs routes would be a control that appears to
- * do nothing.
+ * The whole site follows the OS appearance by default, the way the GPUI
+ * client follows its `set_theme` light/dark pair: with no `data-theme` on
+ * <html>, the stylesheet's `prefers-color-scheme` rules pick the scheme and
+ * track OS changes live. "light" and "dark" pin the scheme through
+ * `data-theme`; "system" removes the pin.
  *
- * "auto" removes the attribute and follows the site default (dark); "light"
- * and "dark" force the choice via `data-theme` on <html>. The choice persists
- * to localStorage and is re-applied before paint by the inline script in the
- * locale layout, so there is no theme flash on reload.
+ * One storage contract, shared with the web app: the `cw-theme` key holds
+ * `system | light | dark`. A stored `auto` (this toggle's former name for
+ * system) reads as `system`. localStorage is per-origin, so the choice made
+ * here does not carry to another Codewhale host. The inline boot script in
+ * the locale layout applies a stored pin before paint, so there is no theme
+ * flash on reload.
  */
 
 import { useEffect, useState } from "react";
-import { usePathname } from "next/navigation";
 import { fill } from "@/lib/i18n/dictionaries";
-import { isDocsPath } from "@/lib/i18n/path";
 
-type Mode = "auto" | "light" | "dark";
-const ORDER: Mode[] = ["auto", "light", "dark"];
+type Mode = "system" | "light" | "dark";
+const ORDER: Mode[] = ["system", "light", "dark"];
 const KEY = "cw-theme";
+
+function load(): Mode {
+  try {
+    const stored = localStorage.getItem(KEY);
+    return stored === "light" || stored === "dark" ? stored : "system";
+  } catch {
+    return "system";
+  }
+}
 
 function apply(mode: Mode) {
   const el = document.documentElement;
-  if (mode === "auto") el.removeAttribute("data-theme");
+  if (mode === "system") el.removeAttribute("data-theme");
   else el.setAttribute("data-theme", mode);
+  try {
+    localStorage.setItem(KEY, mode);
+  } catch {
+    /* private mode / storage disabled — the choice applies until reload */
+  }
 }
 
 export function ThemeToggle({
@@ -37,55 +52,48 @@ export function ThemeToggle({
   ariaTemplate,
   titleLabel,
 }: {
+  /** Label for the "system" mode (follow the OS). */
   autoLabel: string;
   lightLabel: string;
   darkLabel: string;
-  /** "Docs theme: {mode} (click to cycle)" — interpolated with fill(). */
+  /** "Theme: {mode} (click to cycle)" — interpolated with fill(). */
   ariaTemplate: string;
   titleLabel: string;
 }) {
-  const pathname = usePathname();
-  const [mode, setMode] = useState<Mode>("auto");
+  const [mode, setMode] = useState<Mode>("system");
   const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
     setMounted(true);
-    const stored = (typeof localStorage !== "undefined" && localStorage.getItem(KEY)) as Mode | null;
-    if (stored && ORDER.includes(stored)) setMode(stored);
+    setMode(load());
   }, []);
-
-  if (!isDocsPath(pathname)) return null;
 
   const cycle = () => {
     const next = ORDER[(ORDER.indexOf(mode) + 1) % ORDER.length];
     setMode(next);
-    try {
-      localStorage.setItem(KEY, next);
-    } catch {
-      /* private mode / storage disabled — the choice just won't persist */
-    }
     apply(next);
   };
 
   const labels: Record<Mode, string> = {
-    auto: autoLabel,
+    system: autoLabel,
     light: lightLabel,
     dark: darkLabel,
   };
-  const glyph: Record<Mode, string> = { auto: "◐", light: "☀", dark: "☾" };
+  const glyph: Record<Mode, string> = { system: "◐", light: "☀", dark: "☾" };
+  const shown = mounted ? mode : "system";
 
   return (
     <button
       type="button"
       onClick={cycle}
       className="inline-flex items-center gap-1.5 px-1.5 py-0.5 hairline-l hairline-r hairline-t hairline-b hover:text-indigo transition-colors"
-      aria-label={fill(ariaTemplate, { mode: labels[mode] })}
+      aria-label={fill(ariaTemplate, { mode: labels[shown] })}
       title={titleLabel}
       suppressHydrationWarning
     >
-      <span aria-hidden>{mounted ? glyph[mode] : glyph.auto}</span>
+      <span aria-hidden>{glyph[shown]}</span>
       <span className="hidden 2xl:inline" suppressHydrationWarning>
-        {mounted ? labels[mode] : labels.auto}
+        {labels[shown]}
       </span>
     </button>
   );

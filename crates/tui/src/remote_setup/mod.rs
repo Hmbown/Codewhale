@@ -2,8 +2,9 @@
 //!
 //! Generate-only MVP: the wizard collects a cloud target, a chat bridge, and a
 //! model provider, then renders a deploy bundle (env files, systemd units,
-//! RUNBOOK) to `--out`. The `--apply` cloud-CLI auto-provision path is stubbed
-//! ("not yet implemented") — nothing is ever executed.
+//! RUNBOOK) to `--out`. Cloud auto-provisioning is not implemented: the
+//! hidden `--apply` flag fails with a non-zero exit before anything is
+//! prompted, written, or executed.
 //!
 //! Design mirrors the table-driven provider registry in
 //! `crates/config/src/lib.rs`: the wizard iterates [`registry::CLOUD_TARGETS`],
@@ -40,8 +41,14 @@ pub struct RemoteSetupArgs {
     /// Emit the bundle, do not provision (default).
     #[arg(long, default_value_t = false)]
     pub generate_only: bool,
-    /// Run the cloud CLI to auto-provision (MVP: not yet implemented).
-    #[arg(long, default_value_t = false, conflicts_with = "generate_only")]
+    /// Reserved for cloud auto-provisioning, which is not implemented.
+    /// Hidden from `--help`; passing it makes `remote-setup` fail.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "generate_only",
+        hide = true
+    )]
     pub apply: bool,
     /// Skip the final confirmation gate (CI / non-interactive).
     #[arg(long, default_value_t = false)]
@@ -53,6 +60,10 @@ pub struct RemoteSetupArgs {
 
 /// Entry point invoked by the TUI command dispatcher.
 pub fn run_remote_setup(args: RemoteSetupArgs) -> Result<()> {
+    if args.apply {
+        bail!("{APPLY_NOT_IMPLEMENTED}");
+    }
+
     print_header();
 
     let cloud = resolve_cloud(&args)?;
@@ -100,7 +111,6 @@ pub fn run_remote_setup(args: RemoteSetupArgs) -> Result<()> {
         PathBuf::from("codewhale-deploy").join(format!("{}-{}", cloud.slug, bridge.slug))
     });
 
-    // Always render the bundle, even when --apply is requested.
     let written = write_bundle(&inputs, &out_dir)?;
     println!();
     println!("Generated bundle in {}:", out_dir.display());
@@ -112,20 +122,20 @@ pub fn run_remote_setup(args: RemoteSetupArgs) -> Result<()> {
         println!("  - {name}");
     }
 
-    if args.apply {
-        // MVP: the auto-provision path is intentionally not implemented yet.
-        println!();
-        println!("auto-provision not yet implemented; bundle generated, follow RUNBOOK.md");
-    } else {
-        println!();
-        println!(
-            "Next: open {}/RUNBOOK.md and follow the steps.",
-            out_dir.display()
-        );
-    }
+    println!();
+    println!(
+        "Next: open {}/RUNBOOK.md and follow the steps.",
+        out_dir.display()
+    );
 
     Ok(())
 }
+
+/// Error for `--apply`: provisioning is not implemented, so the command must
+/// fail rather than exit 0 as though something was provisioned.
+const APPLY_NOT_IMPLEMENTED: &str = "remote-setup --apply is not implemented: Codewhale does \
+not provision cloud resources. Run `codewhale remote-setup` without --apply to generate the \
+deploy bundle, then follow its RUNBOOK.md.";
 
 fn print_header() {
     use codewhale_palette as palette;
@@ -336,5 +346,24 @@ mod tests {
         assert_eq!(resolve_cloud(&args).unwrap().slug, "digitalocean");
         assert_eq!(resolve_bridge(&args).unwrap().slug, "telegram");
         assert_eq!(resolve_provider(&args).unwrap().slug, "deepseek");
+    }
+
+    #[test]
+    fn apply_fails_before_writing_a_bundle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tmp.path().join("bundle");
+        let args = RemoteSetupArgs {
+            cloud: Some("digitalocean".to_string()),
+            bridge: Some("telegram".to_string()),
+            provider: Some("deepseek".to_string()),
+            out: Some(out.clone()),
+            apply: true,
+            yes: true,
+            non_interactive: true,
+            ..Default::default()
+        };
+        let err = run_remote_setup(args).unwrap_err().to_string();
+        assert!(err.contains("--apply is not implemented"), "{err}");
+        assert!(!out.exists(), "--apply must not render a bundle");
     }
 }

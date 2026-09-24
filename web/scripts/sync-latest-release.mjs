@@ -1,14 +1,21 @@
 #!/usr/bin/env node
 // Refresh the checked-in "latest published release" fact from the real GitHub
-// release. The fact is mirrored in two places and BOTH must move together:
+// release. The fact is mirrored in three places and ALL must move together:
 //
 //   web/data/latest-published-release.json   (read by derive-facts.mjs)
 //   docs/public-surface-facts.json           (latestPublishedRelease, which
 //                                             names the file above as its
 //                                             `sources`)
+//   docs/cloud-facts/stable.json             (release.latest / release_url,
+//                                             compared by check-cloud-facts)
 //
-// web/lib/public-surface-contract.test.ts asserts the two agree, so updating
-// only the first turns a stale marketing fact into a red Lint & Type Check.
+// web/lib/public-surface-contract.test.ts asserts the first two agree and
+// check-cloud-facts.mjs asserts the third, so updating only one turns a stale
+// marketing fact into a red Lint & Type Check. web/lib/facts.generated.ts is
+// derived from the first file; regenerate it with derive-facts.mjs afterwards.
+//
+// release.yml's `sync-release-record` job runs this after every publish and
+// proposes the result to main as a bot PR, so nobody hand-commits the record.
 //
 // Facts must be derivable from the repo with no network (derive-facts.mjs reads
 // this file, it does not call GitHub), so the file is checked in. Nothing wrote
@@ -20,7 +27,11 @@
 //   node web/scripts/sync-latest-release.mjs --check  # exit 1 if stale
 //
 // --check is the CI form: it makes drift a failing gate at PR time instead of a
-// surprise after a production deploy.
+// surprise after a production deploy. It only warns while the record is exactly
+// one release behind a release published under 24h ago: that is the window in
+// which release.yml's sync-release-record PR is waiting to merge, and neither a
+// PR author nor an unrelated push to main can fix it. Past 24h, or more than one
+// release behind, it fails again.
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -30,6 +41,8 @@ const REPO = "Hmbown/CodeWhale";
 const here = dirname(fileURLToPath(import.meta.url));
 const target = resolve(here, "..", "data", "latest-published-release.json");
 const mirror = resolve(here, "..", "..", "docs", "public-surface-facts.json");
+const cloudFacts = resolve(here, "..", "..", "docs", "cloud-facts", "stable.json");
+const GRACE_MS = 24 * 60 * 60 * 1000;
 const checkOnly = process.argv.includes("--check");
 
 const headers = {
@@ -68,11 +81,33 @@ const readJson = (path) => {
 const current = readJson(target);
 const matrix = readJson(mirror);
 const currentMirror = matrix?.latestPublishedRelease ?? null;
+const cloud = readJson(cloudFacts);
 
 const isCurrent = (fact) =>
   Boolean(fact) && fact.tag === next.tag && fact.publishedAt === next.publishedAt;
+const cloudIsCurrent = (facts) =>
+  Boolean(facts?.release) && facts.release.latest === next.version && facts.release.release_url === next.url;
 
-if (isCurrent(current) && isCurrent(currentMirror)) {
+// True when `recordedTag` is the published (non-draft, non-prerelease) release
+// immediately before `next`, and `next` is younger than GRACE_MS. Any lookup
+// failure answers false, so the check stays strict when in doubt.
+async function isFreshlyOneBehind(recordedTag) {
+  const age = Date.now() - Date.parse(next.publishedAt);
+  if (!recordedTag || !(age >= 0 && age < GRACE_MS)) return false;
+  try {
+    const res = await fetch(`https://api.github.com/repos/${REPO}/releases?per_page=20`, { headers });
+    if (!res.ok) return false;
+    const tags = (await res.json())
+      .filter((r) => !r.draft && !r.prerelease && Number.isFinite(Date.parse(r.published_at)))
+      .sort((a, b) => Date.parse(b.published_at) - Date.parse(a.published_at))
+      .map((r) => String(r.tag_name));
+    return tags[0] === next.tag && tags[1] === recordedTag;
+  } catch {
+    return false;
+  }
+}
+
+if (isCurrent(current) && isCurrent(currentMirror) && (checkOnly || cloudIsCurrent(cloud))) {
   console.log(`[sync-latest-release] already current at ${next.tag}`);
   process.exit(0);
 }
@@ -88,7 +123,18 @@ if (checkOnly) {
       `[sync-latest-release] stale: docs/public-surface-facts.json says ${currentMirror?.tag ?? "(missing)"}, GitHub says ${next.tag}`,
     );
   }
-  console.error("Run: npm --prefix web run sync:latest-release && npm --prefix web run build");
+  const recorded = current?.tag;
+  if ((current?.tag ?? null) === (currentMirror?.tag ?? null) && (await isFreshlyOneBehind(recorded))) {
+    console.warn(
+      `[sync-latest-release] warning only: ${next.tag} was published under 24h ago and release.yml's ` +
+        "sync-release-record job proposes the record as a PR. Merge that; this change does not need to.",
+    );
+    if (process.env.GITHUB_ACTIONS) {
+      console.log(`::warning title=Release record catching up::${recorded} -> ${next.tag} is pending from release.yml`);
+    }
+    process.exit(0);
+  }
+  console.error("Run: npm --prefix web run sync:latest-release && node web/scripts/derive-facts.mjs");
   process.exit(1);
 }
 
@@ -104,4 +150,14 @@ if (!matrix) {
 matrix.latestPublishedRelease = { ...currentMirror, ...next };
 writeFileSync(mirror, `${JSON.stringify(matrix, null, 2)}\n`);
 
-console.log(`[sync-latest-release] wrote ${next.tag} (${next.publishedAt}) to both facts`);
+// stable.json is the unsigned cloud-facts authoring source; only the two
+// release pointers move here. yanked/min_supported/notice stay human calls.
+if (!cloud?.release) {
+  console.error(`[sync-latest-release] could not read release in ${cloudFacts}; it is now stale.`);
+  process.exit(1);
+}
+cloud.release.latest = next.version;
+cloud.release.release_url = next.url;
+writeFileSync(cloudFacts, `${JSON.stringify(cloud, null, 2)}\n`);
+
+console.log(`[sync-latest-release] wrote ${next.tag} (${next.publishedAt}) to all three facts`);

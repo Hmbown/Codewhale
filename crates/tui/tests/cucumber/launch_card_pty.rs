@@ -176,7 +176,7 @@ fn local_slash_navigation_does_not_create_rewindable_user_turns() {
     let (_workspace, mut tui) = start_with_titles(24, 80, false, &[]);
     // The first command leaves home; the others use the active-session path.
     for (command, title) in [
-        ("/settings", "Config"),
+        ("/settings", "Settings"),
         ("/skills", "Extensions"),
         ("/mcp", "Extensions"),
     ] {
@@ -206,11 +206,22 @@ fn local_slash_navigation_does_not_create_rewindable_user_turns() {
 }
 
 #[test]
-fn raw_slash_input_reenables_its_submit_cue_without_another_key() {
+fn raw_slash_input_keeps_a_steady_submit_cue_and_runs_on_enter_without_another_key() {
+    // #6397: the `[↵]` chip follows the draft, not the paste-burst window, so
+    // it is already lit while a raw (non-bracketed) burst's Enter-suppression
+    // window is still open. It is therefore not a signal that Enter will
+    // submit; wait out the window (120ms) with a quiet PTY before pressing
+    // Enter, which must then run the command with no other key.
     let (_workspace, mut tui) = start_with_titles(24, 80, false, &[]);
     tui.send("/mcp").unwrap();
     wait(&mut tui, "enter:run");
     wait(&mut tui, "[↵]");
+    tui.wait_for_idle(Duration::from_millis(300), WAIT).unwrap();
+    assert!(
+        tui.frame().contains("[↵]") && !tui.frame().contains("[·]"),
+        "submit cue did not stay steady: {}",
+        tui.diagnostics()
+    );
     tui.send(keys::key::enter()).unwrap();
     wait(&mut tui, "Extensions");
     tui.shutdown();
@@ -317,7 +328,7 @@ fn workbench_settings_visual_evidence() {
         ("/provider", "Provider", "providers"),
         ("/fleet", "Coordinator", "fleet"),
         ("/plugin", "Extensions", "plugins"),
-        ("/config", "Config", "settings"),
+        ("/config", "Settings", "settings"),
         ("/statusline", "Status", "statusline"),
     ] {
         for (rows, cols) in SIZES {
@@ -532,8 +543,12 @@ fn fleet_roles_open_the_shared_model_picker_and_escape_returns_to_the_same_role(
         wait(&mut tui, "Model · Coordinator");
         wait(&mut tui, "Current session");
         capture(&mut tui, "fleet-coordinator-model");
-        tui.send(keys::key::esc()).unwrap();
-        wait(&mut tui, "saved teams");
+        // The roster footer ("saved teams") can stay visible behind the
+        // picker at wide sizes, so it does not prove Esc landed. Wait for the
+        // picker itself to close and the screen to settle before the next
+        // key: a key sent inside the Esc disambiguation window is read as
+        // Alt+key and the role never changes.
+        close_picker(&mut tui, "Model · Coordinator");
         tui.send(keys::key::down()).unwrap();
         tui.send(keys::key::enter()).unwrap();
         wait(&mut tui, "Model · manager");
@@ -545,8 +560,7 @@ fn fleet_roles_open_the_shared_model_picker_and_escape_returns_to_the_same_role(
         tui.wait_for(|frame| !frame.contains("search-proof"), WAIT)
             .unwrap();
         tui.wait_for_idle(Duration::from_millis(200), WAIT).unwrap();
-        tui.send(keys::key::esc()).unwrap();
-        wait(&mut tui, "saved teams");
+        close_picker(&mut tui, "Model · manager");
         tui.send(keys::key::enter()).unwrap();
         wait(&mut tui, "Model · manager");
         // Following Coordinator is a selectable local choice even without credentials.
@@ -555,6 +569,20 @@ fn fleet_roles_open_the_shared_model_picker_and_escape_returns_to_the_same_role(
         capture(&mut tui, "fleet-role-destination");
         tui.shutdown();
     }
+}
+
+/// Esc out of a Fleet model picker and wait until the roster is back and
+/// quiet, so the next key is never folded into the Esc sequence.
+fn close_picker(tui: &mut Harness, title: &str) {
+    tui.send(keys::key::esc()).unwrap();
+    if let Err(error) = tui.wait_for(|frame| !frame.contains(title), WAIT) {
+        panic!(
+            "waiting for {title:?} to close: {error}\n{}",
+            tui.diagnostics()
+        );
+    }
+    wait(tui, "saved teams");
+    tui.wait_for_idle(Duration::from_millis(200), WAIT).unwrap();
 }
 
 #[test]

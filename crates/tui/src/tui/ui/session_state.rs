@@ -157,11 +157,117 @@ pub(crate) fn restore_matching_offline_queue_state(
     true
 }
 
+/// A Running sub-agent older than every child's wall budget cannot still be
+/// doing bounded work: its terminal event was lost or its task is wedged
+/// (#6184 H2). The default child wall budget plus generous grace.
+pub(crate) const SUBAGENT_SUSPECT_AFTER: Duration =
+    crate::tools::subagent::DEFAULT_CHILD_WALL_TIME.saturating_add(Duration::from_secs(5 * 60));
+
+/// Running sub-agents that are past their bound: shown as suspect, and never a
+/// veto on turn recovery. A prior-session row still marked Running cannot be
+/// live in this process at all.
+pub(crate) fn suspect_running_agents(app: &App, now: Instant) -> Vec<String> {
+    app.subagent_cache
+        .iter()
+        .filter(|agent| matches!(agent.status, SubAgentStatus::Running))
+        .filter(|agent| match agent.started_at {
+            Some(started) => now.saturating_duration_since(started) > SUBAGENT_SUSPECT_AFTER,
+            None => agent.from_prior_session,
+        })
+        .map(|agent| agent.agent_id.clone())
+        .collect()
+}
+
+/// Running sub-agents that still legitimately hold the turn open.
+pub(crate) fn live_running_agent_count(app: &App, now: Instant) -> usize {
+    let suspects = suspect_running_agents(app, now);
+    let mut ids: std::collections::HashSet<&str> =
+        app.agent_progress.keys().map(String::as_str).collect();
+    for agent in app
+        .subagent_cache
+        .iter()
+        .filter(|agent| matches!(agent.status, SubAgentStatus::Running))
+    {
+        ids.insert(agent.agent_id.as_str());
+    }
+    ids.retain(|id| !suspects.iter().any(|suspect| suspect == id));
+    ids.len()
+}
+
+/// Queued follow-ups the stalled turn is holding back, as a sentence suffix.
+fn held_queue_note(app: &App) -> String {
+    match app.queued_messages.len() {
+        0 => String::new(),
+        1 => " 1 queued message is held until the turn ends.".to_string(),
+        n => format!(" {n} queued messages are held until the turn ends."),
+    }
+}
+
+/// Log, record under `crashes/`, and name a stall the UI watchdog saw.
+fn record_ui_stall(app: &App, phase: &str, since_progress: Duration, bound: Duration) {
+    let suspects = suspect_running_agents(app, Instant::now());
+    let detail = (!suspects.is_empty()).then(|| {
+        format!(
+            "sub-agent(s) past their bound, treated as suspect: {}",
+            suspects.join(", ")
+        )
+    });
+    crate::core::engine::turn_heartbeat::report_stall(
+        &crate::core::engine::turn_heartbeat::StallReport {
+            source: "ui",
+            phase: phase.to_string(),
+            detail,
+            turn_id: app.runtime_turn_id.clone(),
+            provider_request: app
+                .active_turn
+                .as_ref()
+                .and_then(|turn| turn.route.as_ref())
+                .map(|route| format!("{} / {}", route.provider_identity, route.model)),
+            since_progress,
+            bound: Some(bound),
+        },
+    );
+}
+
+/// The UI watchdog, supervised by the engine heartbeat (#6184). Suspect
+/// sub-agents no longer veto recovery, and an engine-reported stall is shown
+/// with the phase it stalled in.
+pub(crate) fn reconcile_turn_liveness_supervised(
+    app: &mut App,
+    now: Instant,
+    heartbeat: &crate::core::engine::turn_heartbeat::HeartbeatSnapshot,
+) -> bool {
+    if (app.is_loading || matches!(app.runtime_turn_status.as_deref(), Some("in_progress")))
+        && let Some(stall) = heartbeat.stall.as_ref()
+    {
+        // Coalesced by text while visible, so one toast per stall episode.
+        let text = format!("{}{}", stall.status_line(), held_queue_note(app));
+        app.push_status_toast(text, StatusToastLevel::Error, None);
+    }
+    let has_live_agents = live_running_agent_count(app, now) > 0;
+    reconcile_turn_liveness_with(app, now, has_live_agents, Some(heartbeat))
+}
+
+/// Unsupervised form (no engine heartbeat), kept for focused tests.
+#[cfg(test)]
 pub(crate) fn reconcile_turn_liveness(
     app: &mut App,
     now: Instant,
     has_running_agents: bool,
 ) -> bool {
+    reconcile_turn_liveness_with(app, now, has_running_agents, None)
+}
+
+pub(crate) fn reconcile_turn_liveness_with(
+    app: &mut App,
+    now: Instant,
+    has_running_agents: bool,
+    heartbeat: Option<&crate::core::engine::turn_heartbeat::HeartbeatSnapshot>,
+) -> bool {
+    // The engine is inside a wait it bounds itself and has not reported as
+    // overdue (a quiet model, a live stream). Its watchdog owns that bound;
+    // the UI does not second-guess it with a timer of its own.
+    let engine_owns_wait = heartbeat.is_some_and(|snapshot| snapshot.engine_owns_live_wait());
     if app.is_loading
         && app.runtime_turn_status.is_none()
         && !has_running_agents
@@ -171,6 +277,14 @@ pub(crate) fn reconcile_turn_liveness(
             now.saturating_duration_since(started) > DISPATCH_WATCHDOG_TIMEOUT
         })
     {
+        if let Some(started) = app.dispatch_started_at {
+            record_ui_stall(
+                app,
+                "while dispatching the message to the engine",
+                now.saturating_duration_since(started),
+                DISPATCH_WATCHDOG_TIMEOUT,
+            );
+        }
         // #2739: the user's prompt was already appended to api_messages
         // before dispatch, but the turn never reached `in_progress`. Persist
         // it before clearing turn state so `--continue` keeps the prompt
@@ -222,15 +336,18 @@ pub(crate) fn reconcile_turn_liveness(
     if app.is_loading
         && matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
         && !has_running_agents
+        && !engine_owns_wait
         && !app.is_compacting
         && !active_turn_has_running_tool(app)
-        && app
-            .turn_last_activity_at
-            .or(app.turn_started_at)
-            .is_some_and(|last_activity| {
-                now.saturating_duration_since(last_activity) > turn_stall_watchdog_timeout(app)
-            })
+        && let Some(last_activity) = app.turn_last_activity_at.or(app.turn_started_at)
+        && now.saturating_duration_since(last_activity) > turn_stall_watchdog_timeout(app)
     {
+        record_ui_stall(
+            app,
+            "waiting for the turn's completion signal",
+            now.saturating_duration_since(last_activity),
+            turn_stall_watchdog_timeout(app),
+        );
         recover_stalled_runtime_turn(
             app,
             "Turn stalled — no completion signal received. Please try again.",
@@ -245,13 +362,15 @@ pub(crate) fn reconcile_turn_liveness(
         && !app.is_compacting
         && !app.is_purging
         && active_turn_has_running_tool(app)
-        && app
-            .turn_last_activity_at
-            .or(app.turn_started_at)
-            .is_some_and(|last_activity| {
-                now.saturating_duration_since(last_activity) > TOOL_HANG_WATCHDOG_TIMEOUT
-            })
+        && let Some(last_activity) = app.turn_last_activity_at.or(app.turn_started_at)
+        && now.saturating_duration_since(last_activity) > TOOL_HANG_WATCHDOG_TIMEOUT
     {
+        record_ui_stall(
+            app,
+            "while a tool ran with no progress",
+            now.saturating_duration_since(last_activity),
+            TOOL_HANG_WATCHDOG_TIMEOUT,
+        );
         recover_stalled_runtime_turn(
             app,
             "Tool stalled with no progress for 10m — recovered; the command may still be running in the background. Use exec_shell_cancel or retry.",
@@ -357,6 +476,24 @@ pub(crate) fn recover_stalled_runtime_turn(app: &mut App, message: &str, level: 
     app.suppress_stream_events_until_turn_complete = false;
     // Per-turn scroll lock — clear so the next turn auto-scrolls.
     app.user_scrolled_during_stream = false;
+    // #6184: queued follow-ups drain only on a TurnComplete this recovered
+    // turn will never send. Hand the latest one back to the composer so one
+    // Enter resends it (the rest drain after that turn), and say so.
+    let held = app.queued_messages.len();
+    let message = if held > 0 && app.pop_last_queued_into_draft() {
+        let rest = held - 1;
+        let tail = if rest == 0 {
+            String::new()
+        } else {
+            format!(" {rest} more queued message(s) send after it.")
+        };
+        format!(
+            "{message} Your queued message is back in the composer — press Enter to resend it.{tail}"
+        )
+    } else {
+        format!("{message}{}", held_queue_note(app))
+    };
+    let message = message.as_str();
     app.push_status_toast(message, level, None);
     // Lifecycle outbox (`[lifecycle_outbox]`): the first scriptable stall
     // signal. Until now a wedged turn was only visible as this toast; with
@@ -779,6 +916,16 @@ pub(crate) fn keep_failed_immediate_submit_echo(
     );
     // Composer stays empty — HistoryCell::User already holds the turn.
     let _ = message;
+    // U1: a keyless first message must leave a visible, durable recovery,
+    // not only a footer status the next config acknowledgement can replace.
+    // Say what happened once in the transcript and open the provider picker,
+    // as a rejected environment key already does.
+    app.add_message(HistoryCell::System {
+        content: "No model connected, so this message was not sent. Choose a provider, then send it again."
+            .to_string(),
+    });
+    app.onboarding_needs_api_key = true;
+    app.onboarding = OnboardingState::Provider;
     let status = format!("Message not sent ({error})");
     app.status_message = Some(status.clone());
     app.set_sticky_status(
@@ -1304,6 +1451,38 @@ mod launch_resume_tests {
             status.contains("Resume failed"),
             "the status says why: {status}"
         );
+    }
+
+    /// U1: a keyless first message leaves one durable transcript line, opens
+    /// the provider picker, and a later routine acknowledgement ("Auto-
+    /// compaction enabled") does not wipe the error from the footer.
+    #[test]
+    fn keyless_submit_leaves_a_durable_recovery_that_config_acks_cannot_erase() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            crate::test_support::test_tui_options(dir.path()),
+            &Config::default(),
+        );
+        let cells_before = app.history.len();
+        keep_failed_immediate_submit_echo(
+            &mut app,
+            crate::tui::app::QueuedMessage::new("hello".to_string(), None),
+            "DeepSeek API key not found",
+        );
+        assert_eq!(app.history.len(), cells_before + 1);
+        assert!(matches!(
+            app.history.last(),
+            Some(HistoryCell::System { content }) if content.starts_with("No model connected")
+        ));
+        assert_eq!(app.onboarding, OnboardingState::Provider);
+        assert!(app.onboarding_needs_api_key);
+
+        app.status_message = Some("Auto-compaction enabled".to_string());
+        let shown = app
+            .active_status_toast(crate::tui::underwater::ShellPhase::Idle)
+            .expect("footer notice");
+        assert_eq!(shown.level, StatusToastLevel::Error);
+        assert!(shown.text.contains("Message not sent"), "{}", shown.text);
     }
 
     /// The prominent new-session entry begins a fresh session in place.

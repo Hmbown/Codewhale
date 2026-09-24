@@ -1,8 +1,9 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { resolveWhale } from "./whale-tokens";
+import { siteCss } from "./site-css";
 
-const CSS = readFileSync(new URL("../app/globals.css", import.meta.url), "utf8");
+const CSS = siteCss();
 
 function selectorBlock(selector: string): string {
   const match = CSS.match(new RegExp(`(?:^|\n)${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`, "s"));
@@ -39,20 +40,55 @@ function contrastRatio(foreground: string, background: string): number {
   return (lighter + 0.05) / (darker + 0.05);
 }
 
+const PINNED_DARK = '.ocean-column,\n.site-footer,\n:root[data-theme="dark"]';
+
+/** Every custom property declared in the OS-dark block (inside the media query). */
+function osDarkVars(): Record<string, string> {
+  const media = CSS.match(/@media \(prefers-color-scheme: dark\)\s*\{\s*:root:not\(\[data-theme="light"\]\)\s*\{([^}]*)\}/);
+  if (!media) throw new Error("Missing OS-dark block");
+  return Object.fromEntries([...media[1].matchAll(/--([\w-]+):\s*([^;]+);/g)].map((m) => [m[1], m[2].trim()]));
+}
+
+function allVars(selector: string): Record<string, string> {
+  return Object.fromEntries(
+    [...selectorBlock(selector).matchAll(/--([\w-]+):\s*([^;]+);/g)].map((m) => [m[1], m[2].trim()]),
+  );
+}
+
+describe("site-wide theme contract", () => {
+  it("follows the OS by default and repeats the pinned dark scheme exactly", () => {
+    // No region-scoped dark sheet: the docs portal follows the root theme.
+    expect(CSS).not.toMatch(/html\[data-theme="dark"\] \.docs-(portal|theme)/);
+    expect(selectorBlock(":root")).toMatch(/color-scheme:\s*light/);
+    expect(osDarkVars()).toEqual(allVars(PINNED_DARK));
+    expect(selectorBlock(PINNED_DARK)).toMatch(/color-scheme:\s*dark/);
+  });
+
+  it("re-inks the navy nav wordmark under both dark selectors", () => {
+    // wordmark.svg is fixed #142352 ink (~1.2:1 on the dark charcoal).
+    expect(CSS).toMatch(/:root:not\(\[data-theme="light"\]\) \.paper-wordmark-logo\s*\{\s*filter:/);
+    expect(CSS).toMatch(/:root\[data-theme="dark"\] \.paper-wordmark-logo\s*\{\s*filter:/);
+  });
+
+  it("shows the toggle on every page with one system|light|dark storage contract", () => {
+    const toggle = readFileSync(new URL("../components/theme-toggle.tsx", import.meta.url), "utf8");
+    expect(toggle).not.toMatch(/isDocsPath|return null/);
+    expect(toggle).toMatch(/"system" \| "light" \| "dark"/);
+    expect(toggle).toContain('const KEY = "cw-theme"');
+    const layout = readFileSync(new URL("../app/[locale]/layout.tsx", import.meta.url), "utf8");
+    // The boot script pins only an explicit light/dark; anything else (system,
+    // a legacy "auto", nothing) is left to prefers-color-scheme.
+    expect(layout).toContain("localStorage.getItem('cw-theme');if(t==='light'||t==='dark')");
+  });
+});
+
 describe("docs theme contrast contract", () => {
-  // Tidal Folio: paper is the site default (the bare `.docs-theme` block
-  // inherits the paper tokens from `:root`), and the whale's dark stage is
-  // the opt-in override, set through the shared below-the-waterline rule
-  // plus the docs-specific inks. Both are checked.
-  const belowWaterline = () =>
-    selectorVars('.ocean-column,\n.site-footer,\nhtml[data-theme="dark"] .docs-portal');
+  // The docs sheet follows the site theme. Light is the bare :root; dark is
+  // :root overlaid with the pinned dark block (which the OS-dark block
+  // repeats). Both are checked.
   const themes = () => [
-    { ...selectorVars(":root"), ...selectorVars(".docs-theme") },
-    {
-      ...selectorVars(":root"),
-      ...belowWaterline(),
-      ...selectorVars('html[data-theme="dark"] .docs-theme'),
-    },
+    selectorVars(":root"),
+    { ...selectorVars(":root"), ...selectorVars(PINNED_DARK) },
   ];
 
   it("keeps current and hover sidebar text at WCAG AA contrast", () => {

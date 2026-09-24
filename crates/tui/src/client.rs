@@ -5156,6 +5156,14 @@ mod provider_native_search;
 mod responses;
 mod role_placement;
 mod stream_entry;
+
+/// Longest a request may take to open its stream and deliver the first body
+/// byte before the client itself times out (#6184): the header wait plus the
+/// first-byte bound. The engine heartbeat uses it as its awaiting-model bound.
+#[must_use]
+pub(crate) fn stream_first_response_bound(idle: Duration) -> Duration {
+    stream_entry::stream_open_timeout().saturating_add(stream_entry::first_byte_timeout(idle))
+}
 mod wire;
 
 // Retain the crate-visible accounting helpers at the existing client seam.
@@ -13875,15 +13883,15 @@ mod tests {
             .expect("custom route should resolve");
 
         // Provide the key the route's auth path will read.
-        // SAFETY: single-threaded unit test mutating a uniquely-named var.
-        unsafe {
-            std::env::set_var("EXAMPLE_API_KEY_FROM_CANDIDATE_TEST", "sk-custom");
-        }
-        let client = CodewhaleClient::from_candidate(&route.config, &route.candidate)
-            .expect("client should construct from custom candidate");
-        unsafe {
-            std::env::remove_var("EXAMPLE_API_KEY_FROM_CANDIDATE_TEST");
-        }
+        let client = {
+            let _env = crate::test_support::lock_test_env();
+            let _key = crate::test_support::EnvVarGuard::set(
+                "EXAMPLE_API_KEY_FROM_CANDIDATE_TEST",
+                "sk-custom",
+            );
+            CodewhaleClient::from_candidate(&route.config, &route.candidate)
+                .expect("client should construct from custom candidate")
+        };
 
         assert_eq!(client.base_url, "https://api.example.com/v1");
         assert_eq!(client.default_model, "custom-model-v1");

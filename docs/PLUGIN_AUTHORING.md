@@ -240,18 +240,43 @@ python3 scripts/convert-plugin.py --format dsh \
   --bundle ./node_modules/@demo/tools-dsh --name migrated-dsh --output ./migrated-dsh
 ```
 
-The converter reads the package's `cordis.patch.yml`, applies its `insert` and
-keyed-override operations over an empty profile (matching `applyEntryPatches`),
-and converts each resulting row. Rows it cannot represent — runtime plugins,
-`dsh.client` UI code, `!!js` expressions outside the documented idioms,
-conditional `disabled` flags — are listed in `CONVERSION.md` rather than
-silently dropped. The `!!js` idioms it does lower: `process.execPath` (becomes
-`node`), `process.env.NAME` and `process.env.NAME || 'literal'` (resolved
-against this machine), and `` `${process.env.NAME}...` `` templates. An `args`
-entry that resolves to a host file is snapshotted: its containing directory is
-copied into `mcp/<server>` and the resolution is recorded in the receipt. Rows
-of `@deepseek-ai/dsh-skill-filesystem` contribute their `customSkillDirs`
-children as skills when those directories live inside the package.
+`dsh.bundle.patch` may name one patch file or an ordered list of files. The
+converter reads only contained, non-linked package files (at most 64 files and
+1 MiB of patch data combined), then applies `insert` and keyed overrides over
+one empty profile. As in upstream `applyEntryPatches`, an override replaces a
+whole field: `config` is **not** deep-merged. This is not a complete profile
+resolver: other bundles, user overlays and deployment configuration are absent.
+
+Disabled groups propagate their state to descendants. Disabled MCP declarations
+stay disabled. Disabled skills are omitted with an explicit receipt because the
+native skill format has no disabled state; `--skill` is an explicit selection,
+not an automatic recovery of an omitted skill. A conditional/non-boolean
+`disabled` value on a group or portable row refuses the conversion rather than
+assuming it is enabled. Unsupported entry policy/dependency fields, including
+`inject`, `intercept` and `isolate`, also refuse conversion on those rows or their
+groups. Preserve their activation and authority rules in a manual port.
+
+Foreign runtime plugins and `dsh.client` UI code are not executed or translated.
+Other unrepresentable components are reported in `CONVERSION.md` and structured
+`CONVERSION.json`, with source package/version, manifest and ordered-layer SHA-256
+hashes, converter version, per-row outcomes and required manual ports. Unapplied
+patch operations also appear in the structured manual-port list, with their source
+layer and one-based operation index; they are not treated as successful overlays.
+Intentionally omitted disabled skills are reported separately, not as manual ports.
+A partial output is an authoring draft, not an equivalent DSH runtime: review every
+skipped component, patch operation and dependency before installing anything.
+
+The only lowered `!!js` expressions are `process.execPath` (becomes `node`) and
+simple quoted/template literals without escapes or interpolation. Environment
+expressions—including fallbacks—are never resolved against this machine.
+Unrepresentable fields are reported without copying their values. For packaged
+Node MCP, a relative entry may resolve inside the selected package and declared
+relative working directory. External source roots require an explicit
+`--stdio-root SERVER=DIRECTORY` and a reviewed relative entry; host paths are
+never inferred or copied from expressions. Rows of
+`@deepseek-ai/dsh-skill-filesystem` contribute their literal `customSkillDirs`
+children only when those directories live inside the package. Default user and
+project skill roots, watchers and foreign service dependencies are not imported.
 
 ### Local Node MCP servers
 
@@ -337,7 +362,7 @@ YAML aliases/tags, `__jsExpr`, and unsupported skill runtime fields (including
 `user-invocable: false`) require a manual port. Conversion does not reproduce
 another client's runtime or bypass Codewhale's credential and sandbox rules.
 
-Read the generated `CONVERSION.md`, `plugin.json`, `mcp.json` when present, and
+Read the generated `CONVERSION.md`, `CONVERSION.json` for bundles, `plugin.json`, `mcp.json` when present, and
 all selected skill and MCP source files. Then use `/plugin install ./migrated-opencode` (or the
 DSH output path), `/plugin validate <name>`, and the same hash-bound trust and
 enable flow above. Conversion alone proves neither connectivity nor runtime
@@ -346,7 +371,12 @@ compatibility; the output is not installed, trusted, or enabled.
 Source audit, 2026-09-08: OpenCode's [v1 MCP documentation](https://github.com/anomalyco/opencode/blob/d6855b6b47a8433462ac6aeeba882ccf734cb7f1/packages/web/src/content/docs/mcp-servers.mdx)
 and [v2 MCP schema](https://github.com/anomalyco/opencode/blob/d6855b6b47a8433462ac6aeeba882ccf734cb7f1/packages/core/src/config/mcp.ts)
 at `d6855b6b47`, and DSH's [MCP client reference](https://github.com/deepseek-ai/deepseek-harness/blob/c389f96bf3a9b6807cb71ed6bdad5849be0df6d8/packages/mcp/mcp-client/README.md)
-at `c389f96bf3`. Upstream supports more than this deliberately bounded converter.
+at `c389f96bf3`. Bundle patch semantics were rechecked against DSH
+[`00102833df`](https://github.com/deepseek-ai/deepseek-harness/tree/00102833dfaee1da9f48a3a8eae9d34005a75218)
+(`0.1.7-alpha.2`); `scripts/fixtures/dsh-web-app` retains its real five-file package
+as parser-only test data, not as an importable native plugin. CI runs the offline
+converter corpus with Python/PyYAML and synthetic Node fixtures. Upstream supports
+more than this deliberately bounded converter.
 
 ## Community context
 

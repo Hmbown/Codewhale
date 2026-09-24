@@ -38,7 +38,9 @@ Actions:
 
 Expected behavior:
 - New prompts are queued while offline mode is active
-- Queue state persists to `~/.codewhale/sessions/checkpoints/offline_queue.json`
+- Queue state persists per session to
+  `~/.codewhale/sessions/checkpoints/<session-id>.offline_queue.json`; a legacy
+  global `offline_queue.json` is adopted once on upgrade
 
 Checks:
 1. Open queue in TUI: `/queue list`
@@ -52,14 +54,16 @@ Actions:
 ## Incident: Crash Recovery Needed
 
 Expected behavior:
-- Checkpoint stored at `~/.codewhale/sessions/checkpoints/latest.json`
+- Each session checkpoints to `~/.codewhale/sessions/checkpoints/<session-id>.json`;
+  a legacy `latest.json` is still read for recovery but is no longer written
 - Startup begins a fresh session unless `--resume`/`--continue` is supplied
 
 Actions:
 1. Resume prior work explicitly via `codewhale --resume <id>` (alias
    `codewhale resume <id>`; `codewhale --continue` recovers the newest
    interrupted checkpoint for the workspace) or `Ctrl+R` in TUI
-2. If checkpoint inspection is needed, inspect `latest.json` for schema mismatch/details
+2. If checkpoint inspection is needed, inspect `checkpoints/<session-id>.json` (or a leftover legacy
+   `latest.json`) for schema mismatch/details
 3. If schema is newer than binary supports, upgrade binary or remove stale checkpoint
 
 ## Incident: Persistent State Schema Errors

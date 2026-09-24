@@ -24,6 +24,9 @@ const ELEMENTS = [
   { index: 6, path: [0], windowIndex: -2, role: "AXMenu", actions: [] },
   { index: 7, path: [0, 0], windowIndex: -2, role: "AXMenuItem", label: "Choose", actions: ["AXPress"] },
   { index: 8, path: [0, 2], windowIndex: 0, role: "AXTextField", value: "Fixture text", focused: true, enabled: true, actions: ["AXConfirm"], position: { x: 10, y: 60 }, size: { w: 150, h: 25 } },
+  // Suites that need more controls append them (FAKE_BACKEND_EXTRA_ELEMENTS,
+  // a JSON array) so the shared indices above never shift.
+  ...JSON.parse(process.env.FAKE_BACKEND_EXTRA_ELEMENTS || "[]"),
 ];
 
 function tmpPng(prefix) {
@@ -93,6 +96,8 @@ export function create() {
     async key(args) { record("key", args); return { action_sent: true, key: args.text ?? "return" }; },
     async focus(args) { record("focus", args); return { action_sent: true, focused: true, strategy: "a11y" }; },
     async get_value(args) { record("get_value", args); return { value: "Fixture text", strategy: "a11y" }; },
+    async invoke_menu(args) { record("invoke_menu", args); return { action_sent: true, strategy: "a11y" }; },
+    async app_script(args) { record("app_script", args); return { result: "fake", language: args.language ?? "applescript" }; },
   };
 }
 

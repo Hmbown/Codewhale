@@ -11,6 +11,7 @@ use tempfile::{Builder as TempDirBuilder, tempdir};
 
 mod launch_receipt;
 mod roster_routes;
+mod route_replacement;
 
 fn built_in_whale_name_that_cannot_be_generated_for(agent_id: &str) -> &'static str {
     WHALE_NICKNAMES
@@ -625,8 +626,87 @@ fn declared_read_only_write_roles_derive_without_mutating_shell() {
             false,
         );
         assert!(!profile.permissions.write, "{request:?}");
-        assert_eq!(profile.shell, ShellPolicy::None, "{request:?}");
+        assert_eq!(profile.shell, ShellPolicy::ReadOnly, "{request:?}");
+
+        runtime.worker_profile.shell = ShellPolicy::None;
+        apply_spawn_write_authority(&mut runtime, &request);
+        assert_eq!(runtime.worker_profile.shell, ShellPolicy::None);
     }
+}
+
+#[tokio::test]
+async fn explicit_read_only_general_can_inspect_git_but_cannot_mutate() {
+    let tmp = tempdir().expect("tempdir");
+    init_claim_repo(tmp.path());
+    let workspace = tmp.path().canonicalize().expect("workspace");
+    let request = parse_spawn_request(&json!({
+        "prompt": "inspect CI evidence",
+        "write_authority": "read_only",
+        "allowed_tools": ["read", "bash"]
+    }))
+    .expect("read-only request");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(workspace.clone());
+    runtime.context.auto_approve = true;
+    apply_spawn_write_authority(&mut runtime, &request);
+    runtime.worker_profile = worker_profile_for_spawn(
+        &runtime,
+        &request.agent_type,
+        &AgentWorkerToolProfile::Inherited,
+        "deepseek-v4-pro",
+        None,
+        false,
+    );
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        request.agent_type,
+        Some(vec!["read".into(), "bash".into()]),
+        crate::tools::todo::new_shared_todo_list(),
+        crate::tools::plan::new_shared_plan_state(),
+    );
+    assert!(registry.unavailable_allowed_tools().is_empty());
+    assert_ne!(
+        registry.grant.files,
+        crate::worker_profile::FileGrant::Write
+    );
+    for command in ["pwd", "git status --short", "git log --oneline -1"] {
+        let output = registry
+            .execute("inspection", "bash", json!({"command": command}))
+            .await
+            .unwrap_or_else(|error| panic!("{command}: {error}"));
+        if command != "git status --short" {
+            assert!(!output.trim().is_empty());
+        }
+    }
+    for command in [
+        "gh run view 123 --repo owner/repo --log-failed",
+        "rg -n TODO src",
+    ] {
+        let input = json!({"command": command});
+        assert!(
+            registry.posture_permits_tool("bash", Some(&input)),
+            "{command}"
+        );
+        assert!(
+            registry.envelope_refusal("bash", &input).is_none(),
+            "{command}"
+        );
+    }
+    for command in [
+        "touch forbidden.txt",
+        "git checkout -b forbidden",
+        "npm test",
+    ] {
+        assert!(
+            registry
+                .execute("inspection", "bash", json!({"command": command}))
+                .await
+                .is_err(),
+            "inspection is not arbitrary execution: {command}"
+        );
+    }
+    assert!(!workspace.join("forbidden.txt").exists());
 }
 
 #[test]
@@ -2634,6 +2714,14 @@ async fn provider_success_without_usage_records_one_route_aware_gap_and_no_zero_
     assert_eq!(worker.usage.cost_microusd, None);
     assert_eq!(worker.usage_source_fingerprints, [fingerprint].into());
 }
+
+/// A server-side delay no test outlives: the request is accepted and counted
+/// but never answered, so a step timeout can never lose a race to the reply.
+const NEVER_ANSWERS: Duration = Duration::from_secs(3600);
+
+/// Upper bound for waits on real loopback I/O. Hitting it means the child hung;
+/// the assertions themselves never depend on how fast the runner is.
+const HANG_GUARD: Duration = Duration::from_secs(30);
 
 /// Like [`delayed_chat_client`] but delays *every* attempt, so the per-step
 /// API timeout fires on the first call and on every retry — the shape needed
@@ -6583,6 +6671,61 @@ async fn agent_tool_cancel_stops_running_child() {
     );
 }
 
+/// #6184 H2: a full host event channel used to drop `AgentComplete`, leaving
+/// a ghost Running row. Fill the channel, finish a child, and the terminal
+/// event must still arrive once the host drains.
+#[tokio::test]
+async fn full_event_channel_still_delivers_agent_complete() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 2);
+    let agent_id = "agent_full_channel".to_string();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        agent_id.clone(),
+        FleetRole::Worker,
+        "finish while the host is backed up".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        manager.current_session_boot_id.clone(),
+    );
+    agent.task_handle = Some(tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }));
+
+    let (event_tx, mut event_rx) = mpsc::channel(1);
+    event_tx
+        .try_send(Event::status("host is busy"))
+        .expect("fill the only slot");
+    let mut runtime = runtime_with_depth(1, None);
+    runtime.event_tx = Some(event_tx);
+    agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
+    manager.agents.insert(agent_id.clone(), agent);
+    manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+
+    let result = manager.cancel_agent(&agent_id).expect("stop");
+    assert_eq!(result.status, SubAgentStatus::Cancelled);
+    assert_ne!(
+        manager.get_result(&agent_id).expect("roster row").status,
+        SubAgentStatus::Running,
+        "the roster leaves Running"
+    );
+
+    let filler = event_rx.recv().await.expect("filler event");
+    assert!(matches!(filler, Event::Status { .. }));
+    let delivered = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+        .await
+        .expect("terminal event is not dropped")
+        .expect("channel open");
+    assert!(matches!(
+        &delivered,
+        Event::AgentComplete { id, outcome: Some(SubAgentStatus::Cancelled), .. } if id == &agent_id
+    ));
+}
+
 #[tokio::test]
 async fn model_wait_cancel_fans_in_once_and_preserves_checkpoint() {
     use tokio_util::sync::CancellationToken;
@@ -9358,14 +9501,18 @@ async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parkin
         manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
     }
 
-    // Every attempt outlasts the 50ms step timeout, so the timeout-retry
-    // budget (SUBAGENT_API_TIMEOUT_MAX_RETRIES) is driven to exhaustion
-    // before the step interrupts. The backoff base is shrunk to 1ms so the
-    // test does not wait out the production backoff sequence.
-    let (client, calls) =
-        always_delayed_chat_client(Duration::from_millis(150), "resumed answer").await;
+    // Every attempt outlasts the step timeout, so the timeout-retry budget
+    // (SUBAGENT_API_TIMEOUT_MAX_RETRIES) is driven to exhaustion before the
+    // step interrupts. The backoff base is shrunk to 1ms so the test does not
+    // wait out the production backoff sequence.
+    //
+    // Determinism (fleet-6): the server never answers within the test, so the
+    // step timeout always wins; a 150ms reply used to race a 50ms timeout on a
+    // loaded runner. The 250ms step timeout is the window each attempt has to
+    // reach the loopback server and be counted.
+    let (client, calls) = always_delayed_chat_client(NEVER_ANSWERS, "resumed answer").await;
     let mut runtime = stub_runtime()
-        .with_step_api_timeout(Duration::from_millis(50))
+        .with_step_api_timeout(Duration::from_millis(250))
         .with_api_timeout_retry_base_backoff(Duration::from_millis(1));
     runtime.client = client;
     runtime.manager = Arc::clone(&manager);
@@ -9392,7 +9539,7 @@ async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parkin
     };
     let task_handle = tokio::spawn(run_subagent_task(task));
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             if calls.load(Ordering::SeqCst) >= 1 {
                 break;
@@ -9403,7 +9550,7 @@ async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parkin
     .await
     .expect("first timed-out API attempt should reach the test server");
 
-    let interrupted_envelope = tokio::time::timeout(Duration::from_secs(5), async {
+    let interrupted_envelope = tokio::time::timeout(HANG_GUARD, async {
         loop {
             for env in mailbox_rx.drain() {
                 if let MailboxMessage::Interrupted {
@@ -9426,7 +9573,7 @@ async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parkin
         interrupted_envelope.1
     );
 
-    tokio::time::timeout(Duration::from_secs(5), task_handle)
+    tokio::time::timeout(HANG_GUARD, task_handle)
         .await
         .expect("sub-agent task must not park waiting for checkpoint input")
         .expect("sub-agent task should finish");
@@ -9533,13 +9680,14 @@ async fn subagent_retries_api_timeout_before_succeeding() {
         manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
     }
 
-    // Only the first attempt outlasts the 50ms step timeout; the retry
-    // answers immediately, so a single timed-out attempt must be retried
-    // exactly once and then complete.
-    let (client, calls, _bodies) =
-        delayed_chat_client(Duration::from_millis(150), "recovered answer").await;
+    // Only the first attempt outlasts the step timeout; the retry answers
+    // immediately, so a single timed-out attempt must be retried exactly once
+    // and then complete. The first reply never arrives within the test, so it
+    // cannot race the timeout (fleet-6); 500ms is the window the immediate
+    // retry has to answer on a loaded runner.
+    let (client, calls, _bodies) = delayed_chat_client(NEVER_ANSWERS, "recovered answer").await;
     let mut runtime = stub_runtime()
-        .with_step_api_timeout(Duration::from_millis(50))
+        .with_step_api_timeout(Duration::from_millis(500))
         .with_api_timeout_retry_base_backoff(Duration::from_millis(1));
     runtime.client = client;
     runtime.manager = Arc::clone(&manager);
@@ -9562,13 +9710,10 @@ async fn subagent_retries_api_timeout_before_succeeding() {
         _foreground_child_registration: None,
     };
 
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::spawn(run_subagent_task(task)),
-    )
-    .await
-    .expect("sub-agent task should finish")
-    .expect("sub-agent join should succeed");
+    tokio::time::timeout(HANG_GUARD, tokio::spawn(run_subagent_task(task)))
+        .await
+        .expect("sub-agent task should finish")
+        .expect("sub-agent join should succeed");
 
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -9656,6 +9801,60 @@ fn transient_provider_classifier_matches_structured_rate_limit() {
     .context("Responses API request failed");
 
     assert!(is_transient_subagent_provider_error(&err));
+}
+
+#[test]
+fn transient_provider_classifier_respects_durable_typed_errors() {
+    // The provider body and outer context both contain the old transient
+    // heuristics. Neither may override a durable HTTP-boundary classification.
+    let misleading = "429 rate limited: stream request temporarily unavailable";
+    let mut errors = vec![
+        LlmError::from_http_response(401, misleading),
+        LlmError::AuthorizationError(misleading.to_string()),
+        LlmError::ModelError(misleading.to_string()),
+        LlmError::ContentPolicyError(misleading.to_string()),
+        LlmError::ContextLengthError(misleading.to_string()),
+    ];
+    for status in [400, 402, 429] {
+        let quota = LlmError::from_http_response(
+            status,
+            r#"{"error":{"type":"insufficient_quota","message":"429: insufficient quota for stream request"}}"#,
+        );
+        assert!(matches!(quota, LlmError::QuotaExhausted(_)));
+        errors.push(quota);
+    }
+    for error in errors {
+        assert!(!error.is_retryable(), "fixture must be a durable refusal");
+        let error = anyhow::Error::new(error).context("stream request failed: 503");
+        assert!(
+            !is_transient_subagent_provider_error(&error),
+            "typed refusal must not become transient: {error:#}"
+        );
+        assert!(retryable_subagent_provider_failure(&error, 1).is_none());
+    }
+}
+
+#[test]
+fn transient_provider_classifier_uses_typed_retryability_without_keywords() {
+    for error in [
+        LlmError::ServerError {
+            status: 500,
+            message: "upstream failed".to_string(),
+        },
+        LlmError::NetworkError("socket closed".to_string()),
+        LlmError::Timeout(Duration::from_secs(1)),
+    ] {
+        let error = anyhow::Error::new(error);
+        assert!(is_transient_subagent_provider_error(&error));
+        assert!(retryable_subagent_provider_failure(&error, 1).is_some());
+    }
+    let error = anyhow::Error::new(LlmError::RateLimited {
+        message: "slow down".to_string(),
+        retry_after: Some(Duration::from_secs(7)),
+    });
+    let retry = retryable_subagent_provider_failure(&error, 1).expect("transient rate limit");
+    assert_eq!(retry.delay, Duration::from_secs(7));
+    assert_eq!(retry.checkpoint_reason, "api_rate_limited");
 }
 
 #[tokio::test]
@@ -11897,6 +12096,25 @@ fn annotate_child_model_error_adds_actionable_hint() {
         openai_style.contains("child-agent model config"),
         "OpenAI-style rejection gets the hint: {openai_style}"
     );
+}
+
+#[test]
+fn child_runtime_capability_errors_are_not_misreported_as_model_access_errors() {
+    for error in [
+        "Sub-agent requested unavailable tools: bash",
+        "Requested source file does not exist",
+        "The worktree path is unavailable",
+    ] {
+        assert_eq!(
+            annotate_child_model_error(
+                error,
+                "deepseek-flash",
+                crate::config::ApiProvider::Deepseek,
+                &ModelRoute::Inherit,
+            ),
+            error,
+        );
+    }
 }
 
 #[test]
@@ -14429,6 +14647,7 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
         reasoning_effort: None,
         reasoning_effort_auto: false,
         role_models: std::collections::HashMap::new(),
+        route_replacements: Vec::new(),
         context,
         allow_shell: true,
         accept_edits: false,
@@ -15546,6 +15765,11 @@ async fn run_subagent_task_claims_before_delivery_and_then_finalizes() {
 
     let (completion_tx, mut completion_rx) = mpsc::channel::<SubAgentCompletion>(16);
     let mut runtime = runtime_with_depth(1, Some(completion_tx));
+    // Answer the child's single model call from a loopback stub instead of the
+    // stub client's real provider URL: the old network round-trip (DNS, TLS,
+    // a 401) is what made the post-release wait flaky (fleet-6).
+    let (client, _calls, _bodies) = delayed_chat_client(Duration::ZERO, "done").await;
+    runtime.client = client;
     runtime.manager = Arc::clone(&manager);
     agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
     manager.write().await.agents.insert(agent_id.clone(), agent);
@@ -15580,14 +15804,16 @@ async fn run_subagent_task_claims_before_delivery_and_then_finalizes() {
     );
     drop(manager_lock);
 
-    let completion = tokio::time::timeout(Duration::from_secs(1), completion_rx.recv())
+    // Hang guard only: the completion is ordered after the claim, not timed.
+    let completion = tokio::time::timeout(Duration::from_secs(30), completion_rx.recv())
         .await
         .expect("completion should follow the successful terminal claim");
     let completion = completion.expect("completion channel should remain open");
     assert_eq!(completion.agent_id, agent_id);
 
-    task_handle
+    tokio::time::timeout(Duration::from_secs(30), task_handle)
         .await
+        .expect("run_subagent_task should not hang after lock release")
         .expect("run_subagent_task should complete after lock release");
 
     let snapshot = manager
@@ -16698,21 +16924,14 @@ fn gpt55_faster_route_stays_on_gpt55_with_low_reasoning() {
     // because the Codex adapter has no true "off" on the wire.
     //
     // The Codex client validates OAuth credentials at construction time, so we
-    // stub the access-token env var for the duration of this test (save/restore
-    // to avoid leaking into parallel tests).
-    let prev_token = std::env::var_os("OPENAI_CODEX_ACCESS_TOKEN");
-    // Safety: this test does not run concurrently with other tests that read
-    // OPENAI_CODEX_ACCESS_TOKEN, and we restore the original value below.
-    unsafe {
-        std::env::set_var("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-    }
-    let mut codex = stub_runtime_for_provider("openai-codex");
-    unsafe {
-        match prev_token {
-            Some(prev) => std::env::set_var("OPENAI_CODEX_ACCESS_TOKEN", prev),
-            None => std::env::remove_var("OPENAI_CODEX_ACCESS_TOKEN"),
-        }
-    }
+    // stub the access-token env var while the client is built, under the
+    // process-wide env lock.
+    let mut codex = {
+        let _env = crate::test_support::lock_test_env();
+        let _token =
+            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
+        stub_runtime_for_provider("openai-codex")
+    };
     codex.model = "gpt-5.5".to_string();
     let route = fallback_subagent_assignment_route(
         &codex,
@@ -20524,7 +20743,11 @@ const READ_ONLY_CHILD_ENVELOPE_BYTE_CEILING: usize = 89_000;
 // Re-measured when `load_skill` joined the eager catalog: +244B for its
 // name, description and schema, against the `## Skills` index the prefix
 // already carries and a `change:tool_surface` re-pin per skill use avoided.
-const PARENT_SURFACE_BYTE_CEILING: usize = 88_642;
+// Re-measured 2026-09-22 at 88,715B on Linux (88,702B on macOS), +73B: the
+// base prompt's progress-narration rule (E4, 5cf9db3d6) and the workflow
+// Fleet origin list (26cfaf8de), net of the read/bash wording trims
+// (105ad9d3e).
+const PARENT_SURFACE_BYTE_CEILING: usize = 88_715;
 
 #[tokio::test]
 async fn read_only_child_envelope_stays_within_measured_ceiling() {
@@ -23474,4 +23697,27 @@ fn missing_precomputed_evidence_falls_back_to_inline_capture() {
         .get_worker_record("agent_inline")
         .expect("worker record");
     assert!(record.delivery_evidence.changed_paths(tmp.path()).is_some());
+}
+
+/// F5: a queued row is republished only when the governor state changes, so
+/// its budget half must name the end time, not a countdown that freezes.
+#[test]
+fn queued_budget_note_names_the_end_time_and_keeps_the_cause_stable() {
+    use chrono::TimeZone as _;
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 9, 22, 14, 2, 0)
+        .single()
+        .expect("local time");
+    let note = queued_budget_note(Duration::from_secs(30 * 60), now);
+    assert_eq!(
+        note,
+        "(wall budget ends at 14:32; it keeps running while queued)"
+    );
+    let later = queued_budget_note(
+        Duration::from_secs(10 * 60),
+        now + chrono::Duration::minutes(20),
+    );
+    assert_eq!(note, later, "same deadline, same text: no stale countdown");
+    let reason = format!("{SUBAGENT_QUEUED_LAUNCH_REASON} {note}");
+    assert_eq!(queued_reason_cause(&reason), SUBAGENT_QUEUED_LAUNCH_REASON);
 }

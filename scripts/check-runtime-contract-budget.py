@@ -9,6 +9,13 @@ Usage:
     python3 scripts/check-runtime-contract-budget.py
     python3 scripts/check-runtime-contract-budget.py --receipt receipt.json
     python3 scripts/check-runtime-contract-budget.py --update
+    python3 scripts/check-runtime-contract-budget.py --update --allow-increase
+
+``--update`` alone only locks in decreases and refuses growth. A PR whose
+change intentionally grows the contract, or changes a structural identity,
+runs ``--update --allow-increase`` to rewrite the budget from its own
+measurement so the fix lands in the same PR instead of turning main red after
+merge. Existing ``_``-prefixed history notes are preserved either way.
 """
 
 from __future__ import annotations
@@ -422,14 +429,27 @@ def run_measurement() -> dict[str, Any]:
     return receipt
 
 
-def update_command(receipt_path: Path | None, budget_path: Path) -> str:
+def update_command(
+    receipt_path: Path | None, budget_path: Path, *, allow_increase: bool = False
+) -> str:
     parts = ["python3", "scripts/check-runtime-contract-budget.py"]
     if receipt_path is not None:
         parts.extend(["--receipt", str(receipt_path)])
     if budget_path != BUDGET_PATH:
         parts.extend(["--budget", str(budget_path)])
     parts.append("--update")
+    if allow_increase:
+        parts.append("--allow-increase")
     return shlex.join(parts)
+
+
+def rebased_budget(receipt: dict[str, Any], previous: dict[str, Any]) -> dict[str, Any]:
+    """Budget from ``receipt`` that keeps ``previous``'s ``_`` history notes."""
+    budget = budget_from_receipt(receipt)
+    for key, value in previous.items():
+        if key.startswith("_"):
+            budget[key] = copy.deepcopy(value)
+    return budget
 
 
 FRAGMENT_MODULE = REPO_ROOT / "crates" / "core" / "src" / "fragments.rs"
@@ -634,7 +654,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="tighten all ceilings to the current receipt; refuses increases",
     )
+    parser.add_argument(
+        "--allow-increase",
+        action="store_true",
+        help=(
+            "with --update, also accept increases and identity changes: rewrite "
+            "the budget from the receipt so the change lands in the same PR"
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.allow_increase and not args.update:
+        parser.error("--allow-increase requires --update")
+    grow_command = update_command(args.receipt, args.budget, allow_increase=True)
 
     try:
         check_fragment_caps()
@@ -648,9 +679,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.receipt is not None
             else run_measurement()
         )
+        if args.allow_increase:
+            validate_receipt(receipt)
+            validate_budget(budget)
+            write_budget_atomic(args.budget, rebased_budget(receipt, budget))
+            print(
+                f"[runtime-contract-budget] wrote {args.budget} from the current "
+                f"measurement ({len(METRICS)} metrics, {len(IDENTITIES)} identities). "
+                "Record why it grew in the budget's _comment or the PR description."
+            )
+            return 0
         increases, decreases = compare(receipt, budget)
     except RuntimeContractError as error:
         print(f"[runtime-contract-budget] ERROR: {error}", file=sys.stderr)
+        if str(error).startswith("identity changed"):
+            print(
+                "If the identity change is intended, land the new budget in this PR:\n"
+                f"  {grow_command}",
+                file=sys.stderr,
+            )
+        return 2
+    except OSError as error:
+        print(
+            f"[runtime-contract-budget] ERROR: failed to update budget: {error}",
+            file=sys.stderr,
+        )
         return 2
 
     if increases:
@@ -661,15 +714,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
         print(
-            "\nReduce the model-facing surface or make any higher ceiling an explicit "
-            "maintainer decision in scripts/runtime-contract-budget.json.",
+            "\nReduce the model-facing surface, or if the growth is intended land "
+            f"the higher ceiling in this PR:\n  {grow_command}",
             file=sys.stderr,
         )
         return 1
 
     if args.update:
         try:
-            write_budget_atomic(args.budget, budget_from_receipt(receipt))
+            write_budget_atomic(args.budget, rebased_budget(receipt, budget))
         except OSError as error:
             print(
                 f"[runtime-contract-budget] ERROR: failed to update budget: {error}",

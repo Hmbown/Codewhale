@@ -53,7 +53,7 @@ test('real handler/backend/native resolver never redirects an explicit app refer
   const guarded=spawnSync(binary,[JSON.stringify({tool:'inspect_pointer_guard',args:{lock_dir:dir}})],{encoding:'utf8'});
   assert.equal(guarded.status,0,guarded.stderr);
   const guard=JSON.parse(guarded.stdout);
-  assert.match(guard.refusal,/foreground changed to Other/);
+  assert.match(guard.refusal,/real_pointer_refused/,'the HID pointer route is gone, not merely foreground-guarded');
   assert.equal(guard.posts,0,'a stale foreground binding cannot post a global mouse gesture');
   assert.equal(guard.activations,0,'a pointer gesture cannot reclaim the user foreground');
   process.env.CU_TARGETING_NATIVE='1';

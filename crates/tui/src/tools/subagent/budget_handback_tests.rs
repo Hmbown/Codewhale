@@ -600,6 +600,69 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
+/// Addendum F4 (fleet-5): cancelling keeps the work. A Stop on a
+/// write-scoped child appends the same preservation receipt a budget death
+/// gets, exactly once, and leaves a read-only child's result alone.
+#[tokio::test]
+async fn cancel_appends_work_preservation_note_once() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "user.name", "Budget test"]);
+    git(root, &["config", "user.email", "budget@example.invalid"]);
+    fs::write(root.join("src.rs"), "baseline\n").unwrap();
+    git(root, &["add", "--", "src.rs"]);
+    git(root, &["commit", "--quiet", "-m", "baseline"]);
+
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(root.to_path_buf(), 2)));
+    for (agent_id, write) in [("cancel-writer", true), ("cancel-scout", false)] {
+        let mut spec = make_worker_spec(agent_id, root.to_path_buf());
+        spec.runtime_profile.permissions.write = write;
+        let mut guard = manager.write().await;
+        guard.register_worker(spec);
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let mut agent = SubAgent::new(
+            agent_id.to_string(),
+            FleetRole::Worker,
+            "work that gets stopped".to_string(),
+            SubAgentAssignment {
+                objective: "edit".to_string(),
+                role: Some("worker".to_string()),
+            },
+            "deepseek-v4-flash".to_string(),
+            None,
+            None,
+            input_tx,
+            root.to_path_buf(),
+            guard.current_session_boot_id.clone(),
+        );
+        agent.task_handle = Some(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }));
+        guard.agents.insert(agent_id.to_string(), agent);
+    }
+    fs::create_dir_all(root.join("scratch")).unwrap();
+    fs::write(root.join("scratch/half-done.rs"), "wip\n").unwrap();
+
+    let stopped = manager.write().await.cancel_agent("cancel-writer").unwrap();
+    let preserved = preserve_cancelled_work(&manager, stopped).await;
+    let text = preserved.result.as_deref().unwrap_or_default();
+    assert!(text.starts_with(CANCELLED_BY_PARENT_RESULT), "{text}");
+    assert!(text.contains("scratch/half-done.rs"), "{text}");
+    let stored = manager.read().await.get_result("cancel-writer").unwrap();
+    assert_eq!(stored.result, preserved.result, "the receipt is persisted");
+
+    // A repeated Stop does not stack a second receipt.
+    let again = manager.write().await.cancel_agent("cancel-writer").unwrap();
+    let again = preserve_cancelled_work(&manager, again).await;
+    assert_eq!(again.result, preserved.result);
+
+    // A read-only child has no baseline: its result stays the plain Stop.
+    let scout = manager.write().await.cancel_agent("cancel-scout").unwrap();
+    let scout = preserve_cancelled_work(&manager, scout).await;
+    assert_eq!(scout.result.as_deref(), Some(CANCELLED_BY_PARENT_RESULT));
+}
+
 /// #5529: a budget death must name the work the worker left on disk. The
 /// spawn-time delivery baseline is what makes the inventory attributable to
 /// this worker rather than the parent's own dirty files.
@@ -626,9 +689,10 @@ async fn run_death_preservation_note_names_surviving_workspace_changes() {
     let mut runtime = stub_runtime();
     runtime.manager = Arc::clone(&manager);
 
-    let note = budget_work_preservation_note(&runtime, "preserve-worker", "wall_time_budget")
-        .await
-        .expect("write-scoped worker has a baseline");
+    let note =
+        budget_work_preservation_note(&runtime.manager, "preserve-worker", "wall_time_budget")
+            .await
+            .expect("write-scoped worker has a baseline");
     assert!(
         note.contains("scratch/leftover.rs"),
         "note should name the surviving path: {note}"
@@ -641,7 +705,7 @@ async fn run_death_preservation_note_names_surviving_workspace_changes() {
     scout_spec.runtime_profile.permissions.write = false;
     manager.write().await.register_worker(scout_spec);
     assert!(
-        budget_work_preservation_note(&runtime, "scout-worker", "wall_time_budget")
+        budget_work_preservation_note(&runtime.manager, "scout-worker", "wall_time_budget")
             .await
             .is_none()
     );
@@ -664,7 +728,7 @@ async fn run_death_preservation_note_names_surviving_workspace_changes() {
     git(clean_path, &["commit", "--quiet", "-m", "baseline"]);
     clean_spec.workspace = clean_path.to_path_buf();
     manager.write().await.register_worker(clean_spec);
-    let note = budget_work_preservation_note(&runtime, "clean-worker", "wall_time_budget")
+    let note = budget_work_preservation_note(&runtime.manager, "clean-worker", "wall_time_budget")
         .await
         .expect("baseline exists");
     assert!(note.contains("No workspace changes"), "{note}");
@@ -724,9 +788,10 @@ async fn budget_death_checkpoint_commits_uncommitted_work_on_isolated_worktree()
 
     let mut runtime = stub_runtime();
     runtime.manager = Arc::clone(&manager);
-    let note = budget_work_preservation_note(&runtime, "checkpoint-worker", "wall_time_budget")
-        .await
-        .expect("note");
+    let note =
+        budget_work_preservation_note(&runtime.manager, "checkpoint-worker", "wall_time_budget")
+            .await
+            .expect("note");
     assert!(
         note.contains("checkpointed in commit"),
         "note should name the salvage commit: {note}"
@@ -763,7 +828,7 @@ async fn budget_death_checkpoint_skips_shared_checkout() {
 
     let mut runtime = stub_runtime();
     runtime.manager = Arc::clone(&manager);
-    let note = budget_work_preservation_note(&runtime, "shared-worker", "wall_time_budget")
+    let note = budget_work_preservation_note(&runtime.manager, "shared-worker", "wall_time_budget")
         .await
         .expect("note");
     assert!(!note.contains("checkpointed in commit"), "{note}");
@@ -813,7 +878,7 @@ async fn budget_death_checkpoint_reports_worker_committed_tree() {
 
     let mut runtime = stub_runtime();
     runtime.manager = Arc::clone(&manager);
-    let note = budget_work_preservation_note(&runtime, "tidy-worker", "wall_time_budget")
+    let note = budget_work_preservation_note(&runtime.manager, "tidy-worker", "wall_time_budget")
         .await
         .expect("note");
     assert!(note.contains("committed before death"), "{note}");

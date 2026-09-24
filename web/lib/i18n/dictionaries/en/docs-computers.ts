@@ -55,7 +55,7 @@ export const docsComputers: DocsComputersDict = {
   ],
   membershipTitle: "Who can dispatch",
   membershipLead:
-    "Managed Agent surfaces authenticate to the same Codewhale membership — the {login} account session. Membership gates cloud agents, not local dispatch: `codewhale dispatch` with Daytona and forge credentials needs no account. Provider brands stay internal, and installing or running the local runtime needs no account at all.",
+    "Managed Agent surfaces authenticate to the same Codewhale membership — the {login} account session. Membership gates cloud agents, not local dispatch: `codewhale dispatch` with Daytona and forge credentials needs no account. Managed cloud agents do not name the infrastructure behind them; local dispatch names Daytona only because you bring your own Daytona key. Installing or running the local runtime needs no account at all.",
   leftoverTitle: "Not built yet",
   leftover: [
     ["Live watch", "A log tail of a running sandbox."],

@@ -24,6 +24,7 @@ import {
   secondaryNavLinks as buildSecondaryNavLinks,
 } from "./i18n/links";
 import { SITE_URL } from "./page-meta";
+import { siteCss } from "./site-css";
 
 const webRoot = new URL("../", import.meta.url);
 const repoRoot = new URL("../../", import.meta.url);
@@ -38,7 +39,7 @@ const navLinks = webText("components/nav-links.tsx");
 const mobileMenu = webText("components/mobile-menu.tsx");
 const footer = webText("components/footer.tsx");
 const localeLayout = webText("app/[locale]/layout.tsx");
-const css = webText("app/globals.css");
+const css = siteCss();
 
 describe("docs-map registration", () => {
   it("registers the guide and vocabulary topics as first-party pages", () => {
@@ -92,7 +93,7 @@ describe("sitemap and hreflang preservation", () => {
   it("keeps sitemap and hreflang output aligned with real translation coverage", () => {
     // 18 home locales + 10 guide locales + (en, zh) for every other route
     // (including /product, /plugins, and /changelog, whose bodies ship en/zh only).
-    expect(sitemapEntries).toHaveLength(100);
+    expect(sitemapEntries).toHaveLength(98);
     expect(sitemapEntries.some(entry => entry.url.endsWith("/pricing"))).toBe(false);
     for (const path of ["/product", "/plugins", "/computer-use", "/signin", "/signup", "/legal/terms", "/legal/privacy"]) {
       expect(
@@ -178,10 +179,10 @@ describe("navigation parity and accessibility", () => {
     expect(mobileMenu).toContain('if (e.key !== "Tab") return');
     expect(mobileMenu).toContain('window.matchMedia("(min-width: 1280px)")');
     expect(mobileMenu).toContain("if (event.matches) closeImmediately()");
-    // Locale and docs-route handlers are shared so a regional tag cannot
-    // nest (`/ja/pt-BR/...`) or hide the theme control on `/pt-BR/docs`.
+    // Locale handlers are shared so a regional tag cannot nest
+    // (`/ja/pt-BR/...`); the theme control is site-wide, never route-gated.
     expect(webText("components/locale-switcher.tsx")).toContain("replacePathLocale(pathname, code)");
-    expect(webText("components/theme-toggle.tsx")).toContain("isDocsPath(pathname)");
+    expect(webText("components/theme-toggle.tsx")).not.toContain("isDocsPath");
     expect(webText("middleware.ts")).toContain("pathLocale(pathname)");
   });
 

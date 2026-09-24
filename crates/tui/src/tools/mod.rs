@@ -10,6 +10,7 @@
 
 pub mod apply_patch;
 pub mod approval_cache;
+pub mod approval_summary;
 pub mod arg_repair;
 pub mod automation;
 pub mod canonical_action;

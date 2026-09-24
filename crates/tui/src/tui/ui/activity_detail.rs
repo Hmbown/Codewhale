@@ -1517,8 +1517,9 @@ fn command_looks_like_verifier(command: &str) -> bool {
 
 /// Section 7 — approvals / denials.
 ///
-/// The approval allow/deny sets are session-scoped (not per-turn), so the
-/// counts are labelled `(session)` to avoid implying turn precision.
+/// "Approve for session" grants last the conversation; a Deny lasts only
+/// the user turn it answered (cleared on `TurnStarted`), so each count names
+/// its own scope.
 fn turn_approvals_lines(app: &App) -> Vec<String> {
     let mut lines = Vec::new();
     let approved = app.approval_session_approved.len();
@@ -1527,7 +1528,7 @@ fn turn_approvals_lines(app: &App) -> Vec<String> {
         lines.push(format!("Approved (session): {approved}"));
     }
     if denied > 0 {
-        lines.push(format!("Denied (session): {denied}"));
+        lines.push(format!("Denied (this turn): {denied}"));
     }
     lines
 }

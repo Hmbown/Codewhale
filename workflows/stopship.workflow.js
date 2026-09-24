@@ -78,6 +78,7 @@ export default workflow({
               "agent_type": "explore",
               "role": "explore",
               "mode": "read_only",
+              "permissions": { "allowed_tools": ["File"] },
               "file_scope": [
                 "fleets/stopship.toml",
                 "crates/cli/src/lib.rs",

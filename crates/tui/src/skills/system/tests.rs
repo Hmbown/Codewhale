@@ -48,9 +48,10 @@ fn bundled_integration_skills_use_current_codewhale_commands_and_paths() {
     assert!(SKILL_CREATOR_BODY.contains("<workspace>/.codewhale/skills"));
     assert!(SKILL_CREATOR_BODY.contains("~/.codewhale/skills"));
     assert!(SKILL_INSTALLER_BODY.contains("~/.codewhale/skills"));
-    // Bundled skills must name live tools. `read_file` is retired and cannot
-    // dispatch (crates/tui/src/tools/registry.rs:2067).
-    assert!(PDF_BODY.contains("built-in `File` tool (`action: \"read\"`)"));
+    // Bundled skills must name model-visible tools. `read_file` is retired and
+    // `File`/`Bash` are hidden compatibility names absent from new catalogs.
+    assert!(PDF_BODY.contains("through `bash`"));
+    assert!(HELP_BODY.contains("the `read` tool"));
     for (name, body) in [
         ("pdf", PDF_BODY),
         ("help", HELP_BODY),
@@ -60,6 +61,10 @@ fn bundled_integration_skills_use_current_codewhale_commands_and_paths() {
         assert!(
             !body.contains("read_file") && !body.contains("exec_shell"),
             "{name} must not teach a retired tool name"
+        );
+        assert!(
+            !body.contains("`File`") && !body.contains("`Bash`"),
+            "{name} must not teach the hidden File/Bash tools"
         );
     }
 }
@@ -697,5 +702,34 @@ fn generation_14_refreshes_known_bodies_and_preserves_customizations_and_deletio
         fs::write(marker_file(&tmp), "13").unwrap();
         install_system_skills(tmp.path()).unwrap();
         assert!(!skill_file(&tmp, name).exists(), "{name} must stay deleted");
+    }
+}
+
+#[test]
+fn generation_15_refreshes_help_and_pdf_from_generation_14() {
+    for name in ["help", "pdf"] {
+        let old = SUPERSEDED_BODIES
+            .iter()
+            .find(|(entry, _)| *entry == name)
+            .map(|(_, body)| *body)
+            .expect("generation-14 body retained");
+        assert!(
+            old.contains("`File`"),
+            "{name} retained body is the old one"
+        );
+        let skill = BUNDLED_SKILLS
+            .iter()
+            .find(|skill| skill.name == name)
+            .unwrap();
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(skill_dir(&tmp, name)).unwrap();
+        fs::write(skill_file(&tmp, name), old).unwrap();
+        fs::write(marker_file(&tmp), "14").unwrap();
+        install_system_skills(tmp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(skill_file(&tmp, name)).unwrap(),
+            skill.body,
+            "{name}"
+        );
     }
 }

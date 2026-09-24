@@ -267,7 +267,7 @@ function installFailureHint(error) {
     "    CODEWHALE_RELEASE_BASE_URL=https://<mirror>/<release-asset-directory>/",
     "  or CODEWHALE_USE_CNB_MIRROR=1 on Linux x64.",
     "  The directory must contain codewhale-artifacts-sha256.txt and the platform binaries.",
-    "  See docs/INSTALL.md#npm-binary-download-times-out.",
+    "  See https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md#npm-binary-download-times-out",
   ].join("\n");
 }
 

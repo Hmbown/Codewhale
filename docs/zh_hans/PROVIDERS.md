@@ -6,11 +6,12 @@
 
 DeepSeek 仍是默认提供商，但 `ProviderKind::ALL` 中的每个条目都是一等公民、可选的提供商路由。`ALL` 是目录/选择器表面——每个厂商一个身份。双线协议方言种类（`*Anthropic`，例如 `deepseek-anthropic`）和 Model Studio 套餐变体保留在枚举中用于 serde 和 `provider_for_kind`，但刻意**不**作为目录行：套餐是主提供商配置（`crates/config/src/provider_kind.rs:221-226`）上的 `mode`/`base_url`，方言则是 `wire = openai|anthropic`。托管路由、通用 OpenAI 兼容端点、OpenAI Codex/ChatGPT 路由、原生 Anthropic 以及本地运行时，都在所选提供商/模型/base URL 上运行同一个终端 harness。
 
-经普通 Chat Completions 访问的主机是普通的具名 provider（`[providers.<name>]` 表：base URL、模型、密钥环境变量），而不是 `ProviderKind`；`/provider` 与 `/setup` 保留「粘贴 Base URL 和密钥」路径。英文版中的「已知可用主机」表列出 SenseNova、Baseten、Groq、Cerebras、Command Code 与 AICraft 的 URL 和密钥变量，仅供参考，请以各厂商文档为准。OpenCode Zen 与 OpenCode Go 是下方的一等路由。`T` 探测 `/models` 只记录可达性（2xx 并不代表模型可用）。
+经普通 Chat Completions 访问的主机是普通的具名 provider（`[providers.<name>]` 表：base URL、模型、密钥环境变量），而不是 `ProviderKind`；`/provider` 与 `/setup` 保留「粘贴 Base URL 和密钥」路径。英文版中的「已知可用主机」表列出 SenseNova、Baseten、Groq、Cerebras、Command Code、阿里云百炼（DashScope）与 AICraft 的 URL 和密钥变量；这些主机作为内置描述符行随附于 `crates/config/assets/provider_descriptors.json`（仅描述如何连接主机，模型 ID 以实时 `GET /v1/models` 与 Codewhale 目录为准），仅供参考，请以各厂商文档为准。AICraft 的模型列表涵盖 DeepSeek、Anthropic Claude、Google Gemini、Qwen、GLM、MiniMax 与 Doubao（例如 `claude-4.6-sonnet`），以带密钥请求 `GET https://aicraftapi.com/v1/models` 的结果为准。OpenCode Zen 与 OpenCode Go 是下方的一等路由。在 `/provider` 中直接输入即可筛选列表（已绑定行操作的字母除外）；`Ctrl+T` 探测所选行的 `/models`，只记录可达性（2xx 并不代表模型可用）。
 
 需要保持同步的来源：
 
 - `crates/config/src/lib.rs` —— 共享的提供商 ID、默认值、环境变量优先级。
+- `crates/config/assets/provider_descriptors.json` —— 内置的 OpenAI 兼容主机描述符（即上文的已知可用主机表）。
 - `crates/tui/src/config.rs` —— TUI 提供商 ID、提供商能力元数据以及提供商特定的环境变量处理。
 - `crates/agent/src/lib.rs` —— `codewhale model list` 和 `codewhale model resolve` 使用的静态 `ModelRegistry`。
 - `config.example.toml` 和 `docs/CONFIGURATION.md` —— 面向用户的配置示例和环境变量参考。

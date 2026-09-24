@@ -2,13 +2,14 @@
 //!
 //! OSC 12 changes the terminal cursor color and OSC 112 restores the terminal
 //! default. The guard is deliberately conservative: an explicit supported
-//! terminal marker is required, while `TERM=dumb` and reduced-motion policy
-//! suppress the decorative escape entirely.
+//! terminal marker is required, while `TERM=dumb`, `NO_COLOR` (monochrome
+//! color depth), and reduced-motion policy suppress the decorative escape
+//! entirely.
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use codewhale_palette::WHALE_ACTION_RGB;
+use codewhale_palette::{ColorDepth, WHALE_ACTION_RGB};
 use ratatui::style::Color;
 
 const OSC12_RESET: &[u8] = b"\x1b]112\x07";
@@ -77,11 +78,13 @@ fn environment_allows_cursor_accent() -> bool {
     let reduced_motion = std::env::var("NO_ANIMATIONS")
         .ok()
         .is_some_and(|value| env_truthy(&value));
+    let no_color = ColorDepth::detect() == ColorDepth::Monochrome;
     cursor_accent_supported(
         Some(&term_program),
         Some(&term),
         Some(&color_term),
         reduced_motion,
+        no_color,
     )
 }
 
@@ -90,8 +93,9 @@ fn cursor_accent_supported(
     term: Option<&str>,
     color_term: Option<&str>,
     reduced_motion: bool,
+    no_color: bool,
 ) -> bool {
-    if reduced_motion || term == Some("dumb") {
+    if reduced_motion || no_color || term == Some("dumb") {
         return false;
     }
 
@@ -130,18 +134,21 @@ mod tests {
             Some("Ghostty"),
             Some("xterm-256color"),
             Some("truecolor"),
+            false,
             false
         ));
         assert!(cursor_accent_supported(
             Some("kitty"),
             Some("xterm-kitty"),
             Some("truecolor"),
+            false,
             false
         ));
         assert!(!cursor_accent_supported(
             Some("unknown-terminal"),
             Some("xterm-256color"),
             Some("truecolor"),
+            false,
             false
         ));
     }
@@ -152,12 +159,32 @@ mod tests {
             Some("Ghostty"),
             Some("dumb"),
             Some("truecolor"),
+            false,
             false
         ));
         assert!(!cursor_accent_supported(
             Some("Ghostty"),
             Some("xterm-256color"),
             Some("truecolor"),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn no_color_suppresses_the_accent_on_supported_terminals() {
+        assert!(!cursor_accent_supported(
+            Some("Ghostty"),
+            Some("xterm-256color"),
+            Some("truecolor"),
+            false,
+            true
+        ));
+        assert!(!cursor_accent_supported(
+            Some("kitty"),
+            Some("xterm-kitty"),
+            None,
+            false,
             true
         ));
     }

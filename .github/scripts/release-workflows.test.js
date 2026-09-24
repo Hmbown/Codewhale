@@ -35,6 +35,7 @@ const nightly = read(".github/workflows/nightly.yml");
 const candidate = read(".github/workflows/release-candidate.yml");
 const artifacts = read(".github/workflows/release-artifacts.yml");
 const release = read(".github/workflows/release.yml");
+const parityWorkflow = read(".github/workflows/release-parity.yml");
 const republish = read(".github/workflows/release-republish.yml");
 const releaseDockerfile = read("packaging/docker/Dockerfile.release");
 const cnb = read(".cnb.yml");
@@ -83,15 +84,22 @@ const npmSmokeCases = [
   ["main Ubuntu", "push", true, "ubuntu-latest", true, true, false, false, true],
   ["main macOS", "push", true, "macos-latest", true, true, true, false, false],
   ["main Windows", "push", true, "windows-latest", true, true, true, false, false],
+  ["main cache failure", "push", true, "macos-latest", true, false, true, false, false],
   ["light main", "push", false, "ubuntu-latest", true, true, false, false, false],
   ["schedule", "schedule", true, "ubuntu-latest", true, true, false, false, false],
 ];
+// The sccache GitHub Actions backend is main-only, mirroring rust-cache's
+// save-if: pull requests never install or enable it (cache bloat, PLAN D).
+const sccacheInstallStep = "mozilla-actions/sccache-action@v0.0.11";
 for (const [label, event, heavy, os, trusted, cache, execute, linuxDeps, cnb] of npmSmokeCases) {
+  const ref = event === "pull_request" ? "refs/pull/1/merge" : "refs/heads/main";
+  const onMain = ref === "refs/heads/main";
+  const installed = execute && onMain;
   const context = {
     needs: { changes: { outputs: { heavy: String(heavy), trusted: String(trusted) } } },
-    github: { event_name: event },
+    github: { event_name: event, ref },
     matrix: { os },
-    steps: { sccache: { outcome: cache ? "success" : "failure" } },
+    steps: { sccache: { outcome: installed ? (cache ? "success" : "failure") : "skipped" } },
   };
   const jobGuard = npmSmokeJob.match(/^    if: (.+)$/m)?.[1];
   assert.ok(jobGuard, "the wrapper job must retain its event guard");
@@ -104,7 +112,8 @@ for (const [label, event, heavy, os, trusted, cache, execute, linuxDeps, cnb] of
     if (name === "Skip npm wrapper smoke for light change") expected = !heavy;
     else if (name === "Install Linux system dependencies") expected = linuxDeps;
     else if (name === "Linux smoke location") expected = cnb;
-    else if (name === "Enable sccache" || name === "sccache stats") expected = execute && cache;
+    else if (name === sccacheInstallStep) expected = installed;
+    else if (name === "Enable sccache" || name === "sccache stats") expected = installed && cache;
     assert.equal(
       Boolean(jobEnabled && vm.runInNewContext(guard, context)),
       expected,
@@ -366,8 +375,22 @@ for (const block of rustCacheBlocks) {
   assert.doesNotMatch(block, /github\.(event|ref|sha)|inputs\./);
 }
 
-const parity = release.match(/\n  parity:\n([\s\S]*?)\n  artifacts:\n/);
-assert.ok(parity, "public release must retain a parity job");
+// One parity gate, called by the release candidate and the public release,
+// and the release refuses a tag without a green RC receipt for its exact SHA.
+const parity = parityWorkflow.match(/\n  parity:\n([\s\S]*)$/);
+assert.ok(parity, "release-parity.yml must define the parity job");
+assert.match(parityWorkflow, /^on:\n  workflow_call:\n/m, "parity must be a reusable workflow");
+for (const [name, source] of [["release.yml", release], ["release-candidate.yml", candidate]]) {
+  const caller = source.match(/\n  parity:\n([\s\S]*?)\n\n/);
+  assert.ok(caller, `${name} must run the parity job`);
+  assert.match(caller[1], /name: Parity\n/, `${name}: the RC receipt check matches the "Parity" job name`);
+  assert.match(caller[1], /uses: \.\/\.github\/workflows\/release-parity\.yml/, `${name} must call the shared parity gate`);
+}
+assert.match(
+  namedStep(release, "Require a green release-candidate receipt for this exact SHA"),
+  /require-rc-receipt\.sh "\$\{GITHUB_REPOSITORY\}" "\$\{SHA\}"/,
+);
+assert.match(release, /^  resolve:\n(?:.*\n)*?      actions: read\n/m, "resolve needs actions: read for the RC receipt");
 assert.doesNotMatch(
   parity[1],
   /ref: \$\{\{ needs\.resolve\.outputs\.sha \}\}/,
@@ -500,11 +523,17 @@ assert.doesNotMatch(
 
 // Cover every test invocation, including named parity and narrow crate gates.
 // These launchers protect production dependencies as well as cfg(test) code.
-// `release` is 4 rather than 3: parity runs the workspace under nextest for the
-// same one-process-per-test isolation CI's lanes use, and keeps a separate
-// doctest invocation because nextest does not run doctests.
+// `release parity` is 4 rather than 3: parity runs the workspace under nextest
+// for the same one-process-per-test isolation CI's lanes use, and keeps a
+// separate doctest invocation because nextest does not run doctests. release.yml
+// itself runs none: its parity job calls release-parity.yml.
 let hermeticInvocations = 0;
-for (const [label, workflow, expected] of [["CI", ci, 5], ["release", release, 4], ["CNB", cnb, 3]]) {
+for (const [label, workflow, expected] of [
+  ["CI", ci, 5],
+  ["release", release, 0],
+  ["release parity", parityWorkflow, 4],
+  ["CNB", cnb, 3],
+]) {
   const commands = workflow.split("\n").filter((line) =>
     !line.trimStart().startsWith("#") && /\bcargo (?:test|nextest run)\b/.test(line),
   );
@@ -659,6 +688,7 @@ for (const [name, source] of [
   ["release-candidate.yml", candidate],
   ["release-artifacts.yml", artifacts],
   ["release.yml", release],
+  ["release-parity.yml", parityWorkflow],
   ["release-republish.yml", republish],
   ["ci.yml", ci],
   ["nightly.yml", nightly],
@@ -701,7 +731,7 @@ assert.equal(jobTimeout(nightly, "build"), 90);
 assert.equal(jobTimeout(release, "resolve"), 10);
 // The v0.9.12 tag push finished every parity step and was then cancelled at
 // 20 minutes inside rust-cache's post-run save; 45 keeps that margin.
-assert.equal(jobTimeout(release, "parity"), 45);
+assert.equal(jobTimeout(parityWorkflow, "parity"), 45);
 
 console.log(
   "Workflow contracts OK: 6-target/12-asset single-runtime nightly and exact-head 7-target/34-asset release candidate.",

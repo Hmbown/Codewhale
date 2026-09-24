@@ -1,0 +1,373 @@
+/* ---------- nav link ---------- */
+.site-nav {
+  position: sticky;
+  z-index: 30;
+  top: 0;
+  border-bottom: 1px solid var(--hairline);
+  background: rgb(var(--c-paper) / 0.94);
+  backdrop-filter: blur(10px);
+}
+
+.site-nav-inner {
+  display: flex;
+  width: var(--container);
+  min-height: 4.25rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  margin-inline: auto;
+}
+
+.site-wordmark {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 0.7rem;
+  color: var(--ink);
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+.paper-nav-inner {
+  min-height: 3.85rem;
+  padding-block: 0.55rem;
+}
+
+.paper-wordmark {
+  flex: 0 1 auto;
+  gap: 0.75rem;
+  max-width: 15rem;
+  min-width: 8.75rem;
+  overflow: hidden;
+}
+
+.paper-wordmark-text {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  line-height: 1.1;
+  min-width: 0;
+}
+
+.paper-wordmark-mark {
+  display: block;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+}
+
+/* The traced wordmark is ~7.1:1; when the compact nav clamps its width the
+   glyphs scale down inside the box instead of squashing. */
+.paper-wordmark-logo {
+  display: block;
+  flex: 0 1 auto;
+  width: auto;
+  min-width: 0;
+  max-width: 100%;
+  height: 20px;
+  object-fit: contain;
+  object-position: left center;
+}
+
+/* The traced wordmark is navy ink (#142352), which disappears on the dark
+   scheme's charcoal. Under dark (OS or pinned) it is re-inked to the light
+   stage foreground; the footer already uses the reversed cut. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .paper-wordmark-logo {
+    filter: brightness(0) invert(0.93);
+  }
+}
+:root[data-theme="dark"] .paper-wordmark-logo {
+  filter: brightness(0) invert(0.93);
+}
+
+.paper-star-badge {
+  font-family: var(--font-body);
+  font-size: 0.75rem;
+}
+
+.paper-install-cta {
+  align-items: center;
+  min-height: 2.25rem;
+  padding: 0.35rem 0.85rem;
+  background: var(--indigo);
+  color: var(--paper);
+  font-family: var(--font-body);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  border-radius: var(--radius-control);
+  transition: background-color var(--dur-state) var(--ease-spring);
+}
+
+.paper-install-cta:hover {
+  background: var(--indigo-deep);
+  color: var(--paper);
+}
+
+.paper-auth {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.paper-auth-signin,
+.paper-auth-register {
+  align-items: center;
+  min-height: 2.25rem;
+  padding: 0.35rem 0.75rem;
+  font-family: var(--font-body);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  transition: background-color var(--dur-state) var(--ease-spring), color var(--dur-state) var(--ease-spring), border-color var(--dur-state) var(--ease-spring);
+}
+
+.paper-auth-signin,
+.paper-auth-register {
+  color: var(--ink);
+}
+
+.paper-auth-signin:hover,
+.paper-auth-register:hover {
+  color: var(--indigo);
+}
+
+.site-nav-actions {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.site-nav-actions > * { flex-shrink: 0; }
+
+/* Native <select> sizes to the selected option (Safari) or the longest
+   option (Chrome). Unbounded, "Bahasa Indonesia (sebagian)" / "Deutsch
+   (teilweise)" push the compact controls past overflow-x: clip. */
+.site-nav-actions select {
+  width: 6.75rem;
+  max-width: 6.75rem;
+  min-width: 0;
+}
+
+.site-github-link {
+  display: inline-flex;
+  min-height: 2.25rem;
+  align-items: center;
+  padding: 0.35rem 0.75rem;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-control);
+  font-family: var(--font-body);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.site-github-link:hover { border-color: var(--ink); }
+
+.brand-mark { width: 1rem; height: 1rem; display: block; }
+
+.paper-star-badge .brand-mark { margin-right: 0.3rem; }
+
+.nav-link {
+  font-family: var(--font-body);
+  font-size: 0.78rem;
+  letter-spacing: 0;
+  color: var(--ink);
+  position: relative;
+  padding: 0.25rem 0;
+}
+.nav-link::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: -2px;
+  height: 2px;
+  background: var(--indigo);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform var(--dur-state) var(--ease-spring);
+}
+.nav-link:hover::after, .nav-link[aria-current="page"]::after { transform: scaleX(1); }
+
+/* ---------- footer ---------- */
+.site-footer {
+  position: relative;
+  background: var(--ocean-deep);
+  color: var(--stage-soft);
+}
+
+/* The waterline before the seabed. Every page that is still on paper when
+   it reaches the footer descends here; the homepage is already under water
+   by then, so its column hides the band and the seabed simply continues. */
+.site-footer-waterline {
+  position: relative;
+  height: clamp(9rem, 18vw, 15rem);
+  overflow: hidden;
+  background: var(--paper);
+}
+.site-footer-waterline > svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+main:has(.ocean-column) + .site-footer .site-footer-waterline { display: none; }
+.site-footer-main { border-top: 1px solid rgb(var(--c-stage-soft) / 0.13); }
+main:has(.ocean-column) + .site-footer .site-footer-main { border-top-color: transparent; }
+
+.site-footer-main,
+.site-footer-meta {
+  width: var(--container);
+  margin-inline: auto;
+}
+
+.site-footer-main {
+  display: grid;
+  grid-template-columns: minmax(16rem, 1.25fr) minmax(18rem, 0.75fr);
+  gap: 4rem;
+  padding-block: 2.8rem;
+}
+
+.site-wordmark-footer { color: var(--stage-text); }
+.site-wordmark-footer img { display: block; width: auto; height: 18px; }
+.site-footer-brand p { max-width: 30rem; margin-top: 0.8rem; color: rgb(var(--c-stage-soft) / 0.62); font-size: 0.86rem; line-height: 1.6; }
+
+.site-footer-links {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2rem;
+}
+
+.site-footer-links > div { display: flex; flex-direction: column; gap: 0.55rem; }
+.site-footer-links span { margin-bottom: 0.25rem; color: var(--ocean-current); font-family: var(--font-body); font-size: 0.75rem; }
+.site-footer-links a { color: rgb(var(--c-stage-soft) / 0.76); font-size: 0.82rem; }
+.site-footer-links a:hover { color: var(--stage-text); }
+
+.site-footer-meta {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 1.5rem;
+  align-items: center;
+  padding-block: 1rem;
+  border-top: 1px solid rgb(var(--c-stage-soft) / 0.13);
+  color: rgb(var(--c-stage-soft) / 0.5);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+
+.site-footer-meta a:hover { color: var(--ocean-current); }
+.site-footer-meta > div { display: flex; gap: 1rem; }
+.site-footer-meta > p { min-width: 0; max-width: 70ch; overflow-wrap: anywhere; }
+
+/* ---------- ticker ---------- */
+.ticker-viewport {
+  position: relative;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.ticker-track {
+  display: inline-flex;
+  gap: 3rem;
+  white-space: nowrap;
+  animation: ticker 80s linear infinite;
+  padding-right: 3rem;
+}
+@keyframes ticker {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+
+/* One wire entry: verb, number or tag, title, by-line, age. Baseline-aligned
+   so the mono verb sits on the same line as the title it qualifies. */
+.ticker-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+/* The verb carries the state. Merges are the headline case, so they get the
+   one warm-neutral ink on the sheet; releases take ochre; anything closed
+   recedes to mute. Everything else is the action blue. */
+.ticker-verb {
+  color: var(--indigo);
+  font-size: 0.75rem;
+}
+
+.ticker-verb[data-event="merged"] { color: var(--jade); }
+.ticker-verb[data-event="published"] { color: var(--ochre); }
+.ticker-verb[data-event="closed"] { color: var(--ink-mute); }
+
+.ticker-num,
+.ticker-tag,
+.ticker-by,
+.ticker-age {
+  color: var(--ink-mute);
+}
+
+.ticker-title {
+  color: var(--ink);
+  max-width: 24rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The contributor's handle is the point of the line, not a footnote. */
+.ticker-handle {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.ticker-first {
+  padding: 0 0.35rem;
+  border: 1px solid var(--ochre);
+  color: var(--ochre);
+  font-size: 0.75rem;
+}
+
+.ticker-sep { color: var(--paper-line-soft); }
+
+@media (prefers-reduced-motion: reduce) {
+  .ticker-track { animation: none; }
+  /* A frozen track would clip every entry past the fold with no way to reach
+     them. Stopping the motion must not also remove the content. */
+  .ticker-viewport { overflow-x: auto; }
+}
+
+/* ---------- ambient ---------- */
+/*
+ * One effect, OPT-IN under `no-preference` rather than opted out under
+ * `reduce`. A `reduce` override can be defeated by specificity; a gate cannot.
+ * Reduced motion freezes the field — it never removes it, so the column's
+ * gradient and the whale below are unconditional and only the movement is not.
+ * The whale mark itself is always the still pose.
+ *
+ * The TUI's ambient life — fish, jellyfish, bubbles, the whale cameo — stays
+ * out of scope. This page quotes the product's restraint doctrine in its own
+ * copy. The standing loops on the whole site are three — ticker, caret, and
+ * this one. Entrances are transitions, and the one-shot settles live in the
+ * Motion section below under the same no-preference gate.
+ */
+
+/* M1 — the column breath. Opacity only, on a 90s cycle: the TUI's authored
+   0.018–0.055 phase bias expressed as the same fraction of a mix. Opacity is
+   the one property that cannot cause layout work on an element four bands
+   tall. No position change, no hue shift, no filter. */
+@keyframes cw-breath {
+  0%, 100% { opacity: 0; }
+  50% { opacity: 0.045; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .ocean-column::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background: var(--stage-ambient);
+    opacity: 0;
+    animation: cw-breath 90s ease-in-out infinite;
+  }
+}

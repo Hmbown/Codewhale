@@ -6788,6 +6788,7 @@ fn enforce_lru_capacity_does_not_loop_when_all_threads_are_active() {
         ActiveThreadState {
             engine: harness_a.handle,
             active_turn: Some(ActiveTurnState {
+                goal_progress: None,
                 goal_id: None,
                 turn_id: "turn_a".to_string(),
                 interrupt_requested: false,
@@ -6808,6 +6809,7 @@ fn enforce_lru_capacity_does_not_loop_when_all_threads_are_active() {
         ActiveThreadState {
             engine: harness_b.handle,
             active_turn: Some(ActiveTurnState {
+                goal_progress: None,
                 goal_id: None,
                 turn_id: "turn_b".to_string(),
                 interrupt_requested: false,
@@ -8916,6 +8918,7 @@ async fn workspace_restore_guard_rejects_overlapping_active_turns() -> Result<()
         let mut active = manager.active.lock().await;
         let state = active.engines.get_mut(&thread.id).expect("mock engine");
         state.active_turn = Some(ActiveTurnState {
+            goal_progress: None,
             goal_id: None,
             turn_id: "turn_live".to_string(),
             interrupt_requested: false,
@@ -8985,6 +8988,7 @@ async fn update_thread_workspace_rejects_active_turn() -> Result<()> {
         let mut active = manager.active.lock().await;
         let state = active.engines.get_mut(&thread.id).expect("mock engine");
         state.active_turn = Some(ActiveTurnState {
+            goal_progress: None,
             goal_id: None,
             turn_id: "turn_live".to_string(),
             interrupt_requested: false,
@@ -10333,6 +10337,103 @@ async fn model_created_goal_never_overwrites_concurrent_explicit_goal() -> Resul
         goal.tokens_used, 0,
         "settlement must not accrue the no-goal turn onto the explicit revision"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_goal_progress_is_revision_fenced_and_settled_once() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut goal = active_test_goal(&thread.id, "goal_live");
+    goal.tokens_used = 100;
+    manager.store.save_goal(&goal)?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    manager.activate_thread_goal(&thread.id).await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage(_))
+    ));
+    let mut progress = crate::tools::goal::GoalSnapshot::from_thread_goal(&goal);
+    progress.tokens_used = 120;
+    progress.continuation_count = 1;
+    harness
+        .tx_event
+        .send(EngineEvent::GoalUpdated { snapshot: progress })
+        .await?;
+    tokio::time::timeout(TURN_SETTLEMENT_DEADLOCK_TIMEOUT, async {
+        loop {
+            if manager
+                .get_goal(&thread.id)
+                .await?
+                .is_some_and(|goal| goal.tokens_used == 120)
+                && manager.events_since(&thread.id, None)?.iter().any(|event| {
+                    event.event == "thread_goal_updated"
+                        && event.payload["goal"]["tokens_used"] == 120
+                })
+            {
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        manager.store.load_goal(&thread.id)?.unwrap().tokens_used,
+        100
+    );
+    assert!(
+        manager
+            .events_since(&thread.id, None)?
+            .iter()
+            .any(|event| event.event == "thread_goal_updated"
+                && event.payload["goal"]["tokens_used"] == 120)
+    );
+    let replacement = active_test_goal(&thread.id, "goal_new");
+    manager.store.save_goal(&replacement)?;
+    assert_eq!(manager.get_goal(&thread.id).await?.unwrap().tokens_used, 0);
+    manager.remove_goal(&thread.id).await?;
+    assert!(manager.get_goal(&thread.id).await?.is_none());
+    manager.store.save_goal(&goal)?;
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 10,
+                ..Usage::default()
+            },
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: Some(vec![]),
+            base_url: None,
+        })
+        .await?;
+    wait_for_terminal_turn_count(&manager, &thread.id, 1, TURN_SETTLEMENT_DEADLOCK_TIMEOUT).await?;
+    tokio::time::timeout(TURN_SETTLEMENT_DEADLOCK_TIMEOUT, async {
+        loop {
+            if manager.store.load_goal(&thread.id)?.unwrap().tokens_used == 120 {
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        manager.get_goal(&thread.id).await?.unwrap().tokens_used,
+        120
+    );
+
+    // A previous turn's projection must never leak onto a replacement with
+    // the same objective or recreate a deleted goal.
+    let replacement = active_test_goal(&thread.id, "goal_new");
+    manager.store.save_goal(&replacement)?;
+    assert_eq!(manager.get_goal(&thread.id).await?.unwrap().tokens_used, 0);
+    manager.remove_goal(&thread.id).await?;
+    assert!(manager.get_goal(&thread.id).await?.is_none());
     Ok(())
 }
 
@@ -13943,23 +14044,19 @@ async fn deliver_external_approval_for_unknown_id_returns_false() {
     assert_eq!(manager.pending_approvals_count(), 0);
 }
 
+/// E1/E2 regression: "allow for this conversation" on one call is a grant for
+/// that tool and argument class. It never changes the thread's posture (which
+/// used to flip to Full Access and publish a mid-turn posture change that
+/// failed the approved call), it answers the queued same-class call without a
+/// prompt, it cancels nothing, a different class still prompts, and it can be
+/// revoked.
 #[tokio::test]
-async fn approval_required_remember_flips_thread_auto_approve() -> Result<()> {
+async fn approval_remember_grants_tool_class_without_changing_posture() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
     let thread = manager
-        .create_thread(CreateThreadRequest {
-            model: None,
-            workspace: None,
-            mode: None,
-            allow_shell: None,
-            trust_mode: None,
-            auto_approve: None,
-            archived: false,
-            system_prompt: None,
-            task_id: None,
-            ..Default::default()
-        })
+        .create_thread(CreateThreadRequest::default())
         .await?;
+    let posture_before = manager.store.load_thread(&thread.id)?.permission_posture;
     assert!(!manager.store.load_thread(&thread.id)?.auto_approve);
 
     let mut harness = install_mock_engine(&manager, &thread.id).await;
@@ -13967,13 +14064,7 @@ async fn approval_required_remember_flips_thread_auto_approve() -> Result<()> {
         .start_turn(
             &thread.id,
             StartTurnRequest {
-                prompt: "needs approval".to_string(),
-                input_summary: None,
-                model: None,
-                mode: None,
-                allow_shell: None,
-                trust_mode: None,
-                auto_approve: None,
+                prompt: "compare espresso machines".to_string(),
                 ..Default::default()
             },
         )
@@ -13983,53 +14074,245 @@ async fn approval_required_remember_flips_thread_auto_approve() -> Result<()> {
         Some(Op::SendMessage(TurnSpec { .. }))
     ));
 
+    let search = |id: &str, q: &str| {
+        let input = json!({ "search_query": [{ "q": q }] });
+        EngineEvent::ApprovalRequired {
+            approval_key: crate::tools::approval_cache::build_approval_key("web.run", &input).0,
+            approval_grouping_key: crate::tools::approval_cache::build_approval_grouping_key(
+                "web.run", &input,
+            )
+            .0,
+            id: id.to_string(),
+            tool_name: "web.run".to_string(),
+            description: "Browse the web".to_string(),
+            input,
+            intent_summary: None,
+            approval_force_prompt: false,
+        }
+    };
+    // Three gated calls queued behind one prompt: two searches, one write.
+    harness
+        .tx_event
+        .send(search("call_search_1", "espresso"))
+        .await?;
+    harness
+        .tx_event
+        .send(search("call_search_2", "grinders"))
+        .await?;
     harness
         .tx_event
         .send(EngineEvent::ApprovalRequired {
-            approval_key: "key3".to_string(),
-            approval_grouping_key: "key3".to_string(),
-            id: "tool_remember".to_string(),
-            tool_name: "exec_command".to_string(),
-            description: "remember=true".to_string(),
-            input: serde_json::json!({}),
+            approval_key: "write-key".to_string(),
+            approval_grouping_key: "write-group".to_string(),
+            id: "call_write".to_string(),
+            tool_name: "write_file".to_string(),
+            description: "write".to_string(),
+            input: json!({ "path": thread.workspace.join("espresso.md") }),
             intent_summary: None,
             approval_force_prompt: false,
         })
         .await?;
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline && manager.pending_approvals_count() == 0 {
-        sleep(Duration::from_millis(20)).await;
-    }
-    let approval_id = await_approval_identity(&manager, &thread.id, "tool_remember").await?;
+    let approval_id = await_approval_identity(&manager, &thread.id, "call_search_1").await?;
+    let pending = manager
+        .get_thread_detail(&thread.id)
+        .await?
+        .pending_approvals;
+    assert_eq!(
+        pending[0].summary.as_deref(),
+        Some("Search the web for 'espresso'"),
+        "the approval carries a model-independent summary (E6)"
+    );
     assert!(manager.deliver_external_approval(
         &approval_id,
         ExternalApprovalDecision::Allow { remember: true },
     ));
-    let _ = harness.recv_approval_event().await;
-
-    assert!(
-        manager.store.load_thread(&thread.id)?.auto_approve,
-        "remember=true should flip thread auto_approve"
+    assert_eq!(
+        harness.recv_approval_event().await,
+        Some(MockApprovalEvent::Approved {
+            id: "call_search_1".to_string()
+        })
     );
+    // The queued same-class search is answered by the grant, not cancelled.
+    assert_eq!(
+        harness.recv_approval_event().await,
+        Some(MockApprovalEvent::Approved {
+            id: "call_search_2".to_string()
+        })
+    );
+    // A different tool still asks.
+    let write_approval = await_approval_identity(&manager, &thread.id, "call_write").await?;
+    let detail = manager.get_thread_detail(&thread.id).await?;
+    assert_eq!(detail.pending_approvals.len(), 1);
+    assert_eq!(
+        detail.pending_approvals[0].summary.as_deref(),
+        Some("Write espresso.md"),
+        "paths are workspace-relative"
+    );
+
+    // Posture is untouched everywhere: record, live engine, mailbox.
+    let record = manager.store.load_thread(&thread.id)?;
+    assert!(
+        !record.auto_approve,
+        "a session grant must not enable auto-approve"
+    );
+    assert_eq!(record.permission_posture, posture_before);
     assert_eq!(
         manager.active_turn_flags(&thread.id, &turn.id).await,
-        Some((true, false)),
-        "remember=true should update the active turn used by subsequent approvals"
+        Some((false, false))
+    );
+    assert!(
+        harness.rx_op.try_recv().is_err(),
+        "approving must not queue a posture change"
     );
 
+    // The grant is named on the event stream and in the snapshot.
+    assert_eq!(detail.approval_grants.len(), 1);
+    let grant = detail.approval_grants[0].clone();
+    assert_eq!(grant.tool_name, "web.run");
+    assert_eq!(grant.summary, "Search the web for 'espresso'");
+    let events = manager.events_since(&thread.id, None)?;
+    assert!(events.iter().any(|event| {
+        event.event == "approval.grant_added"
+            && event.payload["grant"]["grant_id"] == grant.grant_id
+    }));
+    assert!(events.iter().any(|event| {
+        event.event == "approval.decided"
+            && event.payload["tool_call_id"] == "call_search_2"
+            && event.payload["grant_id"] == grant.grant_id
+    }));
+
+    assert!(manager.deliver_external_approval(
+        &write_approval,
+        ExternalApprovalDecision::Deny { remember: false },
+    ));
+    let _ = harness.recv_approval_event().await;
+
+    // Revoked, the next search prompts again.
+    assert!(
+        manager
+            .revoke_approval_grant(&thread.id, &grant.grant_id)
+            .await?
+    );
+    assert!(
+        !manager
+            .revoke_approval_grant(&thread.id, &grant.grant_id)
+            .await?
+    );
     harness
         .tx_event
-        .send(EngineEvent::TurnComplete {
-            usage: Usage::default(),
-            parent_route_usage: Usage::default(),
-            routed_usage_dropped_records: 0,
-            status: TurnOutcomeStatus::Completed,
-            error: None,
-            tool_catalog: None,
-            base_url: None,
-        })
+        .send(search("call_search_3", "tampers"))
         .await?;
+    await_approval_identity(&manager, &thread.id, "call_search_3").await?;
+    assert!(
+        manager
+            .get_thread_detail(&thread.id)
+            .await?
+            .approval_grants
+            .is_empty()
+    );
+
+    manager.interrupt_turn(&thread.id, &turn.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn archiving_or_deleting_a_thread_ends_its_session_grants() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let archived = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let kept = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let grant = manager
+        .add_session_grant(
+            &archived.id,
+            "turn_1",
+            "web.run",
+            "web:web.run:search_query",
+            "Search the web for 'espresso'",
+        )
+        .await
+        .expect("a live thread records the grant");
+    manager
+        .add_session_grant(
+            &kept.id,
+            "turn_1",
+            "web.run",
+            "web:web.run:search_query",
+            "s",
+        )
+        .await
+        .expect("a live thread records the grant");
+
+    // A title edit leaves grants alone.
+    manager
+        .update_thread(
+            &archived.id,
+            UpdateThreadRequest {
+                title: Some("renamed".to_string()),
+                ..UpdateThreadRequest::default()
+            },
+        )
+        .await?;
+    assert_eq!(manager.approval_grants_for_thread(&archived.id).len(), 1);
+
+    manager
+        .update_thread(
+            &archived.id,
+            UpdateThreadRequest {
+                archived: Some(true),
+                ..UpdateThreadRequest::default()
+            },
+        )
+        .await?;
+    assert!(manager.approval_grants_for_thread(&archived.id).is_empty());
+    assert!(
+        manager
+            .session_grant_for(&archived.id, "web:web.run:search_query")
+            .is_none(),
+        "the next matching call on an archived thread prompts again"
+    );
+    let events = manager.events_since(&archived.id, None)?;
+    assert!(events.iter().any(|event| {
+        event.event == "approval.grant_revoked"
+            && event.payload["grant"]["grant_id"] == grant.grant_id
+    }));
+    // Archiving has no quiescence gate: a prompt raised before the archive
+    // can be answered "allow for this conversation" after it. That answer
+    // must not plant a grant that survives the archive.
+    assert!(
+        manager
+            .add_session_grant(
+                &archived.id,
+                "turn_1",
+                "web.run",
+                "web:web.run:search_query",
+                "late remember",
+            )
+            .await
+            .is_none(),
+        "an archived thread records no new grant"
+    );
+    assert!(manager.approval_grants.lock().get(&archived.id).is_none());
+    // Unarchiving does not bring the grant back.
+    manager
+        .update_thread(
+            &archived.id,
+            UpdateThreadRequest {
+                archived: Some(false),
+                ..UpdateThreadRequest::default()
+            },
+        )
+        .await?;
+    assert!(manager.approval_grants_for_thread(&archived.id).is_empty());
+    // Another thread's grants are untouched.
+    assert_eq!(manager.approval_grants_for_thread(&kept.id).len(), 1);
+
+    // Deleting a thread drops its grants with it.
+    manager.discard_empty_thread(&kept.id).await?;
+    assert!(manager.approval_grants.lock().get(&kept.id).is_none());
     Ok(())
 }
 
@@ -17216,6 +17499,7 @@ async fn shell_opt_in_is_idle_only_and_preserves_ask() -> Result<()> {
         .get_mut(&thread.id)
         .unwrap()
         .active_turn = Some(ActiveTurnState {
+        goal_progress: None,
         goal_id: None,
         turn_id: "turn_shell_guard".into(),
         interrupt_requested: false,
@@ -17279,6 +17563,7 @@ async fn shell_opt_in_is_idle_only_and_preserves_ask() -> Result<()> {
         .get_mut(&thread.id)
         .unwrap()
         .active_turn = Some(ActiveTurnState {
+        goal_progress: None,
         goal_id: None,
         turn_id: "turn_revoke".into(),
         interrupt_requested: false,
@@ -17481,6 +17766,133 @@ async fn flush_recovery_receipts_drains_every_listed_thread() -> Result<()> {
         "the flush must settle every listed thread; still queued: {remaining:?}"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn engine_plumbing_items_are_tagged_internal_and_retry_hints_are_dropped() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "plumbing visibility fixture".to_string(),
+                ..StartTurnRequest::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
+    harness
+        .tx_event
+        .send(EngineEvent::TurnStarted {
+            turn_id: "engine_plumbing_visibility".to_string(),
+            created_at: Utc::now(),
+            route: None,
+        })
+        .await?;
+    for status in [
+        "Executing tools sequentially (writes, approvals, or non-parallel tools detected)",
+        "Loaded deferred tool 'load_skill'. Retry the call with its visible schema.",
+        "Reconnecting…",
+    ] {
+        harness.tx_event.send(EngineEvent::status(status)).await?;
+    }
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallStarted {
+            id: "tool-search-1".to_string(),
+            name: "tool_search".to_string(),
+            input: json!({"query": "skill"}),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallComplete {
+            id: "tool-search-1".to_string(),
+            name: "tool_search".to_string(),
+            result: Ok(crate::tools::spec::ToolResult::success("found load_skill")),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallStarted {
+            id: "hydrate-1".to_string(),
+            name: "load_skill".to_string(),
+            input: json!({}),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallComplete {
+            id: "hydrate-1".to_string(),
+            name: "load_skill".to_string(),
+            result: Ok(
+                crate::tools::spec::ToolResult::success("schema loaded").with_metadata(json!({
+                    "deferred_tool_loaded": true,
+                    "executed": false,
+                })),
+            ),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    wait_for_terminal_turn(&manager, &turn.id).await?;
+
+    let items = manager.store.list_items_for_turn(&turn.id)?;
+    let visibility = |item: &TurnItemRecord| {
+        item.metadata
+            .as_ref()
+            .and_then(|meta| meta.get("visibility"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let statuses = items
+        .iter()
+        .filter(|item| item.kind == TurnItemKind::Status)
+        .map(|item| (item.summary.clone(), visibility(item)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        vec![
+            (
+                "Executing tools sequentially (writes, approvals, or non-parallel tools detected)"
+                    .to_string(),
+                Some("internal".to_string()),
+            ),
+            ("Reconnecting…".to_string(), None),
+        ],
+        "the model-facing retry hint must not become a user item"
+    );
+    for tool in ["tool_search", "load_skill"] {
+        let item = items
+            .iter()
+            .find(|item| {
+                item.metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("tool_name"))
+                    .and_then(Value::as_str)
+                    == Some(tool)
+            })
+            .unwrap_or_else(|| panic!("{tool} item persisted"));
+        assert_eq!(visibility(item).as_deref(), Some("internal"), "{tool}");
+    }
     Ok(())
 }
 

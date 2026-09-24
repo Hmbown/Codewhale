@@ -58,7 +58,14 @@ pub(crate) fn route_identity_fields(
     // rather than `high→effective unavailable` (#5950): a placeholder that
     // can never resolve is noise, not a reading. First-party routes keep
     // their tier, `auto: tier` and `req→eff` labels.
-    let effort = app.provable_reasoning_effort_label().unwrap_or_default();
+    // Labeled, so a bare "max" never sits on the row unexplained (mark 8).
+    let effort = app
+        .provable_reasoning_effort_label()
+        .map(|level| {
+            app.tr(MessageId::InfoLineThinking)
+                .replace("{level}", &level)
+        })
+        .unwrap_or_default();
     if model.is_empty() {
         return None;
     }
@@ -213,7 +220,17 @@ fn fit_notice(text: &str, budget: usize) -> Option<String> {
         return Some(fitted);
     }
     let first = sentences.first().copied().unwrap_or(text);
-    join_while_fitting(&notice_clauses(first, &CLAUSE_MARKS), budget)
+    let clauses = notice_clauses(first, &CLAUSE_MARKS);
+    let fitted = join_while_fitting(&clauses, budget)?;
+    // A one-word label whose value was shed is not a notice, it is a false
+    // one: `Thinking: high → max · model qwen` cut to `Thinking` sat in an
+    // idle footer reading as if a turn were thinking (experience mark 8).
+    // A phrase before the colon (`Auto-denied exec_shell`) still stands.
+    let bare_label = clauses
+        .first()
+        .is_some_and(|label| label.ends_with([':', '：']))
+        && !fitted.contains(char::is_whitespace);
+    (!bare_label).then_some(fitted)
 }
 
 /// Map the boot surface's typed severity through the same semantic palette as
@@ -374,6 +391,26 @@ mod tests {
             Some("Anonymous usage counts are on.")
         );
         assert_eq!(fit_notice("   ", 40), None);
+    }
+
+    /// Experience mark 8: a `/model` thinking change on a narrow rail used to
+    /// shed to a bare `Thinking`, which read as a live indicator with nothing
+    /// running. A label whose value cannot fit says nothing instead.
+    #[test]
+    fn a_label_never_sheds_to_a_bare_word_that_reads_as_activity() {
+        let notice = "Thinking: high → max · model deepseek-v4-flash";
+        assert_eq!(fit_notice(notice, 40), None);
+        assert_eq!(
+            fit_notice("思考：高 → 最高 · 模型 deepseek-v4-flash", 12),
+            None
+        );
+        // Room for the whole reading keeps it whole.
+        assert_eq!(fit_notice(notice, 60).as_deref(), Some(notice));
+        // A phrase before the colon is still a notice on its own.
+        assert_eq!(
+            fit_notice("Auto-denied exec_shell: denied earlier this turn", 30).as_deref(),
+            Some("Auto-denied exec_shell")
+        );
     }
 
     /// The failure this caught: a one-sentence warning longer than the row
@@ -542,9 +579,11 @@ mod tests {
 // direction 2026-09-02): the first row under the composer, in Claude Code's
 // grammar —
 //
-//    full access (Shift+Tab)   work (Tab)   2 agents, 1 task   Esc to interrupt      rc connected
+//    ● full access  Shift+Tab to change   work (Tab)   2 agents, 1 task   Esc to interrupt      rc connected
 //
-// permission chip first (never sheds, #5796), the mode, the turn clock, the
+// permission chip first (never sheds, #5796), marked `●` so the current
+// permission reads without color (experience mark 8) and followed by what
+// its key does, then the mode, the turn clock, the
 // live counts, the session clock, then the one hint that applies right now;
 // the remote-control state or a live notice pinned right. No cost: the
 // roster owns per-agent elapsed and the metrics line owns the price. The
@@ -574,8 +613,9 @@ pub struct TidelineFooter<'a> {
     /// Permission chip (`ask` / `auto` / `full access`, plus the filesystem
     /// scope notice when it deviates) in its Permission ink. Never sheds.
     pub permission_chip: (&'a str, codewhale_palette::ChromeInk),
-    /// The chord that cycles the permission posture, when the binding is
-    /// live for the current focus (`Shift+Tab`).
+    /// What the permission key does, when the binding is live for the
+    /// current focus and not yet learned (`Shift+Tab to change`). Painted
+    /// after the chip in hint ink.
     pub permission_key: Option<&'a str>,
     /// Mode chip (`work` / `plan` / `operate`) in its Policy ink.
     pub mode_chip: Option<(&'a str, codewhale_palette::ChromeInk)>,
@@ -755,6 +795,9 @@ fn tput(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
 /// (bold) or a hint.
 struct PostureItem {
     text: String,
+    /// The taught key painted after `text` in hint ink (`  Shift+Tab to
+    /// change`, ` (Tab)`), separator included. Sheds before the chip does.
+    key: Option<String>,
     ink: ChromeInk,
     bold: bool,
     /// Painted after `, ` rather than ` · `: the counts are one group.
@@ -784,16 +827,22 @@ struct PostureItem {
 /// The hint and counts still outrank it (#5914). Above them the
 /// context-cap warning, which is not a hint but the reason the next turn
 /// will not start at all.
+///
+/// The permission key ("Shift+Tab to change", mark 8) is a reminder of a
+/// binding, not live state, and is the widest optional item on the row, so
+/// it sheds right after the clocks: a live hint ("Enter again to send
+/// now") or the agent count must never be dropped to keep it. The
+/// permission chip itself, marked `●`, never sheds.
 const SHED_TURN_CLOCK: u8 = 1;
 const SHED_SESSION_CLOCK: u8 = 2;
-const SHED_HINT: u8 = 3;
-const SHED_COUNTS: u8 = 4;
-const SHED_CAP_WARNING: u8 = 5;
-const SHED_MODE_KEY: u8 = 6;
-const SHED_MODE: u8 = 7;
-const SHED_PERMISSION_KEY: u8 = 8;
+const SHED_PERMISSION_KEY: u8 = 3;
+const SHED_HINT: u8 = 4;
+const SHED_COUNTS: u8 = 5;
+const SHED_CAP_WARNING: u8 = 6;
+const SHED_MODE_KEY: u8 = 7;
+const SHED_MODE: u8 = 8;
 /// The most-shed rung: everything gone but the permission chip.
-const MAX_SHED: u8 = SHED_PERMISSION_KEY;
+const MAX_SHED: u8 = SHED_MODE;
 /// Where a compact posture bar (`tui.posture_bar = "compact"`, #5950)
 /// starts on the ladder: the clocks, the hint and the counts are gone
 /// before width is consulted; the cap warning, the mode chip and the
@@ -801,17 +850,20 @@ const MAX_SHED: u8 = SHED_PERMISSION_KEY;
 const COMPACT_SHED: u8 = SHED_COUNTS;
 
 fn posture_items(footer: &TidelineFooter<'_>, shed: u8) -> Vec<PostureItem> {
-    let chip = |text: &str, key: Option<&str>| -> String {
-        match key {
-            Some(key) => format!("{text} ({key})"),
-            None => text.to_string(),
-        }
-    };
+    // Experience mark 8: the current permission is marked, not only
+    // colored, so a monochrome terminal still tells it apart from the mode
+    // chip beside it; its key says what it does rather than sitting in
+    // parentheses like one more option.
     let mut items = vec![PostureItem {
-        text: chip(
-            &footer.sym(footer.permission_chip.0),
-            footer.permission_key.filter(|_| shed < SHED_PERMISSION_KEY),
+        text: format!(
+            "{} {}",
+            footer.sym(crate::tui::glyphs::CURRENT),
+            footer.sym(footer.permission_chip.0)
         ),
+        key: footer
+            .permission_key
+            .filter(|_| shed < SHED_PERMISSION_KEY)
+            .map(|key| format!("  {}", footer.sym(key))),
         ink: footer.permission_chip.1,
         bold: true,
         joined: false,
@@ -819,10 +871,11 @@ fn posture_items(footer: &TidelineFooter<'_>, shed: u8) -> Vec<PostureItem> {
     }];
     if let Some((mode, ink)) = footer.mode_chip.filter(|_| shed < SHED_MODE) {
         items.push(PostureItem {
-            text: chip(
-                &footer.sym(mode),
-                footer.mode_key.filter(|_| shed < SHED_MODE_KEY),
-            ),
+            text: footer.sym(mode),
+            key: footer
+                .mode_key
+                .filter(|_| shed < SHED_MODE_KEY)
+                .map(|key| format!(" ({key})")),
             ink,
             bold: false,
             joined: false,
@@ -842,6 +895,7 @@ fn posture_items(footer: &TidelineFooter<'_>, shed: u8) -> Vec<PostureItem> {
     if let Some((clock, ink)) = footer.turn_clock.filter(|_| shed < turn_shed) {
         items.push(PostureItem {
             text: footer.sym(clock),
+            key: None,
             ink,
             bold: false,
             joined: false,
@@ -850,8 +904,16 @@ fn posture_items(footer: &TidelineFooter<'_>, shed: u8) -> Vec<PostureItem> {
     }
     if shed < SHED_COUNTS {
         for (index, (count, ink)) in footer.counts.iter().enumerate() {
+            // The idle dock affordance carries its chord as `(Ctrl+])`; keep
+            // the word legible while the chord recedes into hint ink.
+            let count = footer.sym(count);
+            let (text, key) = match count.strip_suffix(" (Ctrl+])") {
+                Some(label) => (label.to_string(), Some(" (Ctrl+])".to_string())),
+                None => (count, None),
+            };
             items.push(PostureItem {
-                text: footer.sym(count),
+                text,
+                key,
                 ink: *ink,
                 bold: false,
                 joined: index > 0,
@@ -862,6 +924,7 @@ fn posture_items(footer: &TidelineFooter<'_>, shed: u8) -> Vec<PostureItem> {
     if let Some((clock, ink)) = footer.session_clock.filter(|_| shed < SHED_SESSION_CLOCK) {
         items.push(PostureItem {
             text: footer.sym(clock),
+            key: None,
             ink,
             bold: false,
             joined: false,
@@ -881,6 +944,7 @@ fn posture_items(footer: &TidelineFooter<'_>, shed: u8) -> Vec<PostureItem> {
     {
         items.push(PostureItem {
             text,
+            key: None,
             ink,
             bold: false,
             joined: false,
@@ -900,8 +964,14 @@ fn separator_before(item: &PostureItem) -> &'static str {
     }
 }
 
+impl PostureItem {
+    fn width(&self) -> usize {
+        self.text.width() + self.key.as_deref().map_or(0, UnicodeWidthStr::width)
+    }
+}
+
 fn left_run_width(items: &[PostureItem]) -> usize {
-    items.iter().map(|item| item.text.width()).sum::<usize>()
+    items.iter().map(PostureItem::width).sum::<usize>()
         + items
             .iter()
             .skip(1)
@@ -978,41 +1048,34 @@ pub fn render_tideline_footer(
         if item.bold {
             style = style.add_modifier(Modifier::BOLD);
         }
+        // Keep the state legible while its taught keyboard hint recedes:
+        // the chip keeps its semantic ink, the key paints in hint ink.
         let text = clip(x, &item.text);
-        // Keep the state legible while its taught keyboard hint recedes.
-        // Only known shortcut suffixes qualify; parenthetical scope/warnings
-        // retain their semantic ink.
-        let key_start = [footer.permission_key, footer.mode_key, Some("Ctrl+]")]
-            .into_iter()
-            .flatten()
-            .find_map(|key| {
-                let suffix = format!(" ({key})");
-                item.text
-                    .ends_with(&suffix)
-                    .then(|| item.text.len() - suffix.len())
-            });
-        if let Some(start) = key_start.filter(|start| *start < text.len()) {
-            let (label, key) = text.split_at(start);
-            tput(buf, x as u16, area.y, label, style);
+        tput(buf, x as u16, area.y, &text, style);
+        let key_x = x + item.text.width();
+        let key = item
+            .key
+            .as_deref()
+            .map(|key| clip(key_x, key))
+            .unwrap_or_default();
+        if !key.is_empty() {
             tput(
                 buf,
-                (x + label.width()) as u16,
+                key_x as u16,
                 area.y,
-                key,
+                &key,
                 tchrome(theme, ChromeInk::MetadataHint),
             );
-        } else {
-            tput(buf, x as u16, area.y, &text, style);
         }
         if let Some(count_index) = item.count_index
             && !text.is_empty()
         {
             count_rects.push((
                 count_index,
-                Rect::new(x as u16, area.y, text.width() as u16, 1),
+                Rect::new(x as u16, area.y, (text.width() + key.width()) as u16, 1),
             ));
         }
-        x += item.text.width();
+        x += item.width();
     }
 
     if let Some((text, ink)) = right
@@ -1028,7 +1091,9 @@ pub fn render_tideline_footer(
 /// to [`TidelineFooter`] for painting.
 pub(crate) struct TidelineFooterFacts {
     pub permission_chip: (String, codewhale_palette::ChromeInk),
-    pub permission_key: Option<&'static str>,
+    /// `Shift+Tab to change`, localized, while the binding is live and not
+    /// yet learned.
+    pub permission_key: Option<String>,
     pub mode_chip: Option<(String, codewhale_palette::ChromeInk)>,
     pub mode_key: Option<&'static str>,
     pub turn_clock: ClockReading,
@@ -1056,7 +1121,7 @@ impl TidelineFooterFacts {
             theme,
             (self.permission_chip.0.as_str(), self.permission_chip.1),
         )
-        .permission_key(self.permission_key)
+        .permission_key(self.permission_key.as_deref())
         .mode_chip(borrow(&self.mode_chip))
         .mode_key(self.mode_key)
         .turn_clock(borrow(&self.turn_clock))
@@ -1350,12 +1415,16 @@ pub(crate) fn tideline_footer_from_app(app: &mut App, width: u16) -> TidelineFoo
     let (counts, count_actions) = live_counts(app, tier);
     TidelineFooterFacts {
         permission_chip,
-        permission_key: live_chord(ShellBindingId::PermissionCycle).filter(|_| {
-            !crate::tui::footer_hints::retired(
-                &app.footer_hint_uses,
-                crate::tui::footer_hints::PERMISSION_CYCLE,
-            )
-        }),
+        permission_key: live_chord(ShellBindingId::PermissionCycle)
+            .filter(|_| {
+                !crate::tui::footer_hints::retired(
+                    &app.footer_hint_uses,
+                    crate::tui::footer_hints::PERMISSION_CYCLE,
+                )
+            })
+            .map(|chord| {
+                tr(app.ui_locale, MessageId::FooterPermissionKeyHint).replace("{key}", chord)
+            }),
         mode_chip,
         mode_key: live_chord(ShellBindingId::ModeCycle).filter(|_| {
             !crate::tui::footer_hints::retired(
