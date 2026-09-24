@@ -3187,18 +3187,21 @@
       if (sec < 60) return sec + ' 秒';
       return Math.floor(sec / 60) + ' 分 ' + (sec % 60) + ' 秒';
     }
-    /* ── 两个钟：本轮（「处理中 · 已用 N」）＋ 这个对话累计（官方那个「已运行 N」）─────
+    /* ── 这个对话「真干了多久」的累计读数（官方那个「已运行 N」）──────────────
      * 【官方语义（照 `tui/tui/phase_strip.rs:1100` 的 `working_clock()`，别自己发明）】
-     *   · turn 读数 = `{阶段词} {时长}` —— 答「正在干什么、多久了」；
      *   · session 读数 = `App::cumulative_turn_duration`（**已完成轮次时长之和**）＋当前这一轮；
      *     注释原文 *"It is model work, not wall clock since launch — an idle TUI does not
      *     claim to have been working"* ⇒ **不是「挂着多久」，是这个对话真干了多久**；
-     *   · 门槛 `CLOCK_SESSION_FLOOR_SECS = 60`（不足 1 分钟不显示）·
-     *     与 turn 读数相同时也不显示（会话第一轮，`#6041`）· 空闲时用暗色（钟停了）。
+     *   · 门槛 `CLOCK_SESSION_FLOOR_SECS = 60`（不足 1 分钟不显示）· 空闲时用暗色（钟停了）。
      *   · 文案照官方语言包 `locales/zh-Hans.json:1229` —— 「已运行{duration}」。
      * 【数据从哪来】`GET /v1/threads/{id}` 的 turns（每轮 `duration_ms`）＝已完成轮次之和；
-     *   正在跑的那一轮用本地秒表补（就是原来那个「已用 N 秒」的钟）。
-     * 【为什么合并】§12 M15：我们**已有**这个 tick，做这条时要合并，别摆出两个钟。
+     *   正在跑的那一轮用本地秒表补（`startedAt`，由 `#interrupt-turn` 的显隐驱动）。
+     * 【为什么只有这一个读数】§12 M15 的告诫是「做这条要合并，别摆出两个钟」—— 当时确实把
+     *   「⏱ 处理中 · 已用 N 秒」（本轮）与「已运行」（累计）并进了同一个元素。
+     *   ⚠️ **2026-09-24 老板拍：去掉「处理中 · 已用 N 秒」那一段** —— 因为干活时
+     *   `#asbudy-live` 已经在**同一行**报了「工作中 2s」（相位词 ＋ 本轮时长），两段说同一件事。
+     *   去掉之后，官方那条「与 turn 读数相同就不显示」的去重（`#6041`）**也就不需要了**：
+     *   它当年是为了不让同一行出现两个一样的数，而现在这一行只有累计这一个数。
      */
     var doneMs = 0;        // 已完成轮次之和（毫秒）
     var doneFor = '';      // doneMs 读的是哪个会话
@@ -3233,14 +3236,10 @@
       var el = ensureEl();
       if (!el) return;
       if (MODEL_THREAD !== seenFor) { seenFor = MODEL_THREAD; if (MODEL_THREAD !== doneFor) loadDone(); }
-      var parts = [];
-      var turnSec = startedAt ? Math.round((Date.now() - startedAt) / 1000) : 0;
-      if (startedAt) parts.push('⏱ 处理中 · 已用 ' + fmt(turnSec));
       var w = workedSec();
-      // 官方两条门槛：不足 60 秒不显示；与 turn 读数相同（第一轮）也不显示
-      if (w >= 60 && !(startedAt && w === turnSec)) parts.push('已运行 ' + fmt(w));
-      el.textContent = parts.join('　·　');
-      el.hidden = parts.length === 0;
+      // 只留累计这一个读数（本轮的「处理中 · 已用 N 秒」2026-09-24 老板拍去掉 —— 见上面那段注释）
+      el.textContent = w >= 60 ? ('已运行 ' + fmt(w)) : '';
+      el.hidden = w < 60;                       // 官方门槛：不足 1 分钟不显示
       // 空闲时暗一点（官方：钟停了；颜色降一档，但不隐藏）
       el.style.opacity = startedAt ? '' : '.7';
     }
