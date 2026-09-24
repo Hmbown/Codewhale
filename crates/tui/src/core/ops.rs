@@ -20,6 +20,15 @@ pub const USER_SHELL_TOOL_ID_PREFIX: &str = "user_shell_";
 /// Returned by `Op::GetSessionSnapshot` via a oneshot channel.
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
+    /// The live conversation id this engine session is running under.
+    ///
+    /// It is the id every workspace snapshot this conversation takes
+    /// (`tool:` / `pre-turn:`) is tagged with, so a save of the conversation
+    /// has to persist it as the session document's own id: a document minted
+    /// under a different id leaves the thread bound to a session that owns no
+    /// snapshots, and `/undo` and the file-revert endpoint both select by that
+    /// binding (see `patch_undo_workspace_files`).
+    pub session_id: String,
     pub messages: Vec<Message>,
     pub total_tokens: u64,
     pub model: String,

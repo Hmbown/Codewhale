@@ -3269,6 +3269,7 @@ impl Engine {
                         let total_tokens = self.session.total_usage.input_tokens
                             + self.session.total_usage.output_tokens;
                         let snapshot = SessionSnapshot {
+                            session_id: self.session.id.clone(),
                             messages: self.session.messages.to_vec(),
                             total_tokens,
                             model: self.session.model.clone(),
