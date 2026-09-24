@@ -17483,3 +17483,30 @@ async fn flush_recovery_receipts_drains_every_listed_thread() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn saved_history_boundary_refuses_until_every_kept_prompt_is_seen() {
+    let user = |text: &str| Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+    };
+    let kept = vec!["first".to_string(), "second".to_string()];
+
+    // The kept prompts in order, then the undone turn's prompt: cut there.
+    let messages = vec![user("first"), user("second"), user("undo me")];
+    assert_eq!(saved_history_boundary(&messages, &kept, "undo me"), Some(2));
+
+    // "second" never appears: matching "undo me" early would drop a kept turn.
+    let drifted = vec![user("first"), user("undo me"), user("second")];
+    assert_eq!(saved_history_boundary(&drifted, &kept, "undo me"), None);
+
+    // A repeated prompt stays aligned with the records.
+    let repeated = vec![user("same"), user("same")];
+    assert_eq!(
+        saved_history_boundary(&repeated, &["same".to_string()], "same"),
+        Some(1)
+    );
+}

@@ -832,9 +832,13 @@ fn saved_history_boundary(
         };
         match expected {
             Some(next) if next == &text => expected = kept.next(),
-            // The first user text that is not part of the kept prefix is where
-            // the undone turn begins — and it has to be that turn's own prompt.
-            _ => return (text == target_prompt).then_some(index),
+            // A kept prompt is still unaccounted for, so this transcript has
+            // drifted from the records; even the undone turn's prompt here
+            // would cut away a turn the backtrack must keep.
+            Some(_) => return None,
+            // The first user text after the whole kept prefix is where the
+            // undone turn begins — and it has to be that turn's own prompt.
+            None => return (text == target_prompt).then_some(index),
         }
     }
     None
