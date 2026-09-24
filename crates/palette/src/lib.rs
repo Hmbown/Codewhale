@@ -8,6 +8,10 @@
 //!    values mapped to UI roles (surface, text, accent, status, mode).
 //! 3. **Backward-compatible aliases** (`DEEPSEEK_*`) — legacy names that
 //!    delegate to the current Whale palette constants.
+//!
+//! Throwaway probe (2026-09-24): this one-line comment exists only to give a
+//! `pull_request` a heavy Rust change, so the Ubuntu test matrix actually runs
+//! instead of skipping. Do not merge; see `docs/PLAN-CI-QUALITY-GATE.md`.
 
 mod adapt;
 mod contrast;
