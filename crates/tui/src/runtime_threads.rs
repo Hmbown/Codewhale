@@ -772,27 +772,88 @@ fn session_messages_sha256(messages: &[Message]) -> Result<String> {
         .collect())
 }
 
-/// Compare only fields represented by legacy seeding. A match identifies a
-/// prefix boundary; the saved messages themselves retain every raw block.
+/// The prompt text a user-role message contributes to a history comparison,
+/// or `None` when it carries none.
+///
+/// Tool results are user-role messages with no text. The per-turn
+/// `<turn_meta>` preamble is rebuilt from runtime facts when a turn is
+/// installed and never recorded on the turn's items, so it is not part of the
+/// conversation a reconstruction can identify — both sides of every comparison
+/// drop it, and `extract_user_prompt` is the repository's one rule for what a
+/// user's prompt is once that envelope is removed (it trims the block's edges
+/// too, and applies the same way on both sides).
+fn projected_user_text(message: &Message) -> Option<String> {
+    if message.role.as_str() != "user" {
+        return None;
+    }
+    let text = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
+            _ => None,
+        })
+        .map(crate::session_manager::extract_user_prompt)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn projected_user_texts(messages: &[Message]) -> Vec<String> {
+    messages.iter().filter_map(projected_user_text).collect()
+}
+
+/// The message index in a saved transcript where the undone turn begins.
+///
+/// A backtrack may only keep the messages that belong to the turns before the
+/// undone one, and the transcript alone cannot say where that is: it is the
+/// model-visible history, carrying the per-turn `<turn_meta>` preamble and tool
+/// results as the route's compaction left them, while the turn records keep the
+/// prompt and the raw output. The prompts *are* recorded verbatim, and a turn
+/// begins with its user message, so walking the transcript's user text
+/// messages — the kept turns' prompts in order, then the undone turn's —
+/// locates the boundary exactly.
+///
+/// `None` refuses: the caller must not cut a history it cannot account for, and
+/// a transcript that drifted from the records (edited, purged, or belonging to
+/// another conversation) fails the prompt sequence rather than matching by
+/// coincidence.
+fn saved_history_boundary(
+    messages: &[Message],
+    kept_prompts: &[String],
+    target_prompt: &str,
+) -> Option<usize> {
+    let mut kept = kept_prompts.iter();
+    let mut expected = kept.next();
+    for (index, message) in messages.iter().enumerate() {
+        let Some(text) = projected_user_text(message) else {
+            continue;
+        };
+        match expected {
+            Some(next) if next == &text => expected = kept.next(),
+            // The first user text that is not part of the kept prefix is where
+            // the undone turn begins — and it has to be that turn's own prompt.
+            _ => return (text == target_prompt).then_some(index),
+        }
+    }
+    None
+}
+
+/// The conversation identity two histories are compared by: user prompts (their
+/// `<turn_meta>` envelope removed), assistant text, thinking and tool calls,
+/// and tool results.
+///
+/// Everything a turn record cannot reproduce stays out — that preamble, image
+/// blocks, and the bytes the route's compaction left in a tool result — so a
+/// match identifies a prefix boundary rather than a byte-for-byte replay. The
+/// saved messages themselves retain every raw block.
 fn session_recovery_projection(messages: &[Message]) -> Vec<Value> {
     let mut projection = Vec::new();
     for message in messages {
         let role = message.role.as_str();
-        if role == "user" {
-            let text = message
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
-                        Some(text.as_str())
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !text.is_empty() {
-                projection.push(json!(["user", text]));
-            }
+        if let Some(text) = projected_user_text(message) {
+            projection.push(json!(["user", text]));
         }
         for block in &message.content {
             match block {
@@ -8645,12 +8706,43 @@ impl RuntimeThreadManager {
             let retained_messages = if covered <= target_turn_idx {
                 messages.len()
             } else {
-                let expected = session_recovery_projection(
-                    &self.reconstruct_messages_from_turns(&source_turns[..target_turn_idx])?,
-                );
-                (0..=messages.len())
-                    .find(|count| session_recovery_projection(&messages[..*count]) == expected)
+                let kept_messages =
+                    self.reconstruct_messages_from_turns(&source_turns[..target_turn_idx])?;
+                let kept_projection = session_recovery_projection(&kept_messages);
+                // An exact projection match is the strongest proof: message for
+                // message, this prefix *is* the kept history. It holds for a
+                // transcript the records reproduce, and is tried first so those
+                // shapes keep their exact boundary.
+                if let Some(count) = (0..=messages.len()).find(|count| {
+                    session_recovery_projection(&messages[..*count]) == kept_projection
+                }) {
+                    count
+                } else {
+                    // It cannot hold for a real conversation: the model-visible
+                    // transcript carries the per-turn `<turn_meta>` preamble and
+                    // tool results as the route's compaction left them, neither
+                    // of which the records keep. The prompt is recorded
+                    // verbatim, so it still names the message the undone turn
+                    // begins at — see `saved_history_boundary`.
+                    let target_prompt = projected_user_texts(
+                        &self.reconstruct_messages_from_turns(
+                            &source_turns[target_turn_idx..=target_turn_idx],
+                        )?,
+                    )
+                    .into_iter()
+                    .next()
+                    .with_context(|| {
+                        format!(
+                            "Turn {target_turn_id} records no user prompt to align the saved history with; the source thread was preserved"
+                        )
+                    })?;
+                    saved_history_boundary(
+                        &messages,
+                        &projected_user_texts(&kept_messages),
+                        &target_prompt,
+                    )
                     .context("Cannot identify an exact saved-history boundary for this backtrack; the source thread was preserved")?
+                }
             };
             forked.saved_session_checkpoint = Some(SavedSessionCheckpoint {
                 covered_turn_id: kept_turns
