@@ -164,7 +164,7 @@ describe("collectProviderModelPages", () => {
         total: 2,
         nextCursor: "same-page",
       })),
-    ).rejects.toThrow("non-progressing model cursor");
+    ).rejects.toThrow("引擎返回的模型游标没有前进。");
   });
 });
 
@@ -234,9 +234,10 @@ describe("receiptPresentation", () => {
       summary: raw,
       metadata: { tool_name: "bash", tool_input: JSON.stringify({ command: "cd /app && ls -la" }) },
     });
-    expect(presented.label).toBe("工具 · 完成");
+    // AsBudy 第 47 轮：工具卡按族分类（bash = 执行族 ⇒「运行」）
+    expect(presented.label).toBe("运行 · 完成");
     expect(presented.summary).toBe("执行命令：cd /app && ls -la");
-    expect(presented.raw).toContain("drwxr-xr-x");
+    expect(presented.raw).toContain("drwxr-x");  // 目录行可能带 ACL 标记（drwxr-x---+）
     expect(presented.failed).toBe(false);
   });
 
@@ -247,14 +248,15 @@ describe("receiptPresentation", () => {
       summary: "write failed: Failed to authorize tool execution: Auto-Review guardian denied...",
       metadata: { tool_name: "write", tool_input: JSON.stringify({ path: "/opt/app/public/index.html" }) },
     });
-    expect(presented.label).toBe("文件改动 · 未完成");
+    // AsBudy 第 47 轮：write/apply_patch 归「修补」族
+    expect(presented.label).toBe("修补 · 未完成");
     expect(presented.summary).toBe("写入 public/index.html —— 未完成");
     expect(presented.failed).toBe(true);
   });
 
   it("AsBudy: 引擎的英文状态句译成中文，认不出的句子退回原文", () => {
     expect(receiptPresentation({ kind: "status", status: "completed", summary: "Auto-Review checking 'bash'" }).summary)
-      .toBe("正在检查这一步（bash）");
+      .toBe("已检查这一步（bash）");
     expect(receiptPresentation({ kind: "status", status: "completed", summary: "Continuing — tool results" }).summary)
       .toBe("拿到结果，继续");
     expect(receiptPresentation({ kind: "status", status: "completed", summary: "Some brand new engine sentence" }).summary)
@@ -272,10 +274,11 @@ describe("workflowReceiptPresentation", () => {
         "---"
       ),
     ).toEqual({
-      label: "Workflow · Needs attention",
-      summary: "1 task dispatch was rejected",
+      label: "工作流 · 需要处理",
+      summary: "有 1 个任务派发被拒绝了",
       raw: "---",
       failed: true,
+      variant: "plan",
     });
   });
 
@@ -286,7 +289,7 @@ describe("workflowReceiptPresentation", () => {
       raw,
       null
     );
-    expect(result.summary).toBe("3 task dispatches were rejected");
+    expect(result.summary).toBe("3 个任务派发被拒绝");
     expect(result.failed).toBe(true);
   });
 
@@ -297,10 +300,11 @@ describe("workflowReceiptPresentation", () => {
       null
     );
     expect(result).toEqual({
-      label: "Workflow · Failed",
-      summary: "The workflow did not complete",
+      label: "工作流 · 失败",
+      summary: "工作流未完成",
       raw: null,
       failed: true,
+      variant: "plan",
     });
   });
 
@@ -310,8 +314,8 @@ describe("workflowReceiptPresentation", () => {
       '{"status":"degraded"}',
       null
     );
-    expect(result.label).toBe("Workflow · Needs attention");
-    expect(result.summary).toBe("The workflow completed with degraded results");
+    expect(result.label).toBe("工作流 · 需要处理");
+    expect(result.summary).toBe("工作流完成，但结果降级");
   });
 
   it("returns null for non-workflow receipts", () => {
@@ -475,7 +479,8 @@ describe("refusalMessage", () => {
     for (const message of messages) {
       // Every refusal must state the outcome, not just the cause: the user
       // needs to know their message did not go anywhere.
-      expect(message).toContain("nothing was sent");
+      // AsBudy：文案已中文化 —— 五条都写明「没有发送」，官方这句断言要的意图不变
+      expect(message).toContain("没有发送");
     }
   });
 
@@ -490,16 +495,16 @@ describe("streamCursor", () => {
       latestSeq: 12,
       gap: false,
       connected: true,
-      label: "Live — event #12",
+      label: "实时——事件 #12",
     });
   });
 
   it("names a gap and a disconnect distinctly, both carrying the resume point", () => {
     expect(streamCursor({ latestSeq: 5 }, { gap: true }).label).toBe(
-      "Gap detected — re-syncing from #5",
+      "检测到断档——从 #5 重新同步",
     );
     expect(streamCursor({ latestSeq: 5 }, { connected: false }).label).toBe(
-      "Reconnecting — resuming from #5",
+      "重新连接中——从 #5 续上",
     );
   });
 

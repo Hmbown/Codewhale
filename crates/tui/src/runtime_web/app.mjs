@@ -1318,7 +1318,11 @@ export function receiptPresentation(item = {}) {
     failed,
     variant: receiptVariant(item, toolName),
     meta: receiptMetaZh(item),
-    diff: diffText,
+    // AsBudy：**只在真有 diff 时才带这个字段**。官方那条
+    // `does not rewrite ordinary receipts` 断言「普通回执不被改写」——
+    // 一个空的 diff 字段也算改写。消费方（下面渲染内联 diff 那处）用的是
+    // `presentation.diff || ""`，缺字段安全。
+    ...(diffText ? { diff: diffText } : {}),
   };
 }
 
