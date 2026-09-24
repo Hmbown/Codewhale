@@ -4993,29 +4993,54 @@ impl RuntimeThreadManager {
             );
             engine_compaction.runtime_cost_owner = active_turn_id;
             let route_config = route.config;
-            let _ = engine
-                .send(Op::SetCompaction {
-                    config: engine_compaction,
-                })
-                .await;
-            let _ = engine
-                .send(Op::SetStreamChunkTimeout {
-                    timeout_secs: stream_chunk_timeout_secs,
-                })
-                .await;
-            let _ = engine
-                .send(Op::SetSubagentRuntimeConfig {
-                    enabled: route_config.subagents_enabled_for_provider(provider),
-                    max_subagents: route_config
-                        .max_subagents_for_provider(provider)
-                        .clamp(1, crate::config::MAX_SUBAGENTS),
-                    launch_concurrency: route_config.launch_concurrency_for_provider(provider),
-                    max_spawn_depth: route_config.subagent_max_spawn_depth_for_provider(provider),
-                    api_timeout_secs: route_config.subagent_api_timeout_secs_for_provider(provider),
-                    heartbeat_timeout_secs: route_config
-                        .subagent_heartbeat_timeout_secs_for_provider(provider),
-                })
-                .await;
+            // ── AsBudy 2026-09-24：这三处从**阻塞** `send(..).await` 改成 `try_send` ─────────
+            // 依据是**官方自己的规矩**（不是我发明的）：`tui/ui/apply.rs:1951` 对同一批 op 写着
+            //   `// #6150: the input path never awaits a full op channel.` —— 那边用的就是 try_send
+            //   （失败还提示 "Engine busy — setting not applied; try again"）；
+            //   `compaction_flow.rs:32` 的 `SetCompaction` 同样。
+            // 阻塞在这儿的代价被放大：本函数全程持 `config_admission.write()` 与 `engine_load`
+            //   （见函数开头那两个下划线绑定）⇒ **任一个**引擎信箱满（容量 32，`core/engine.rs:90`）
+            //   就会让 reload **永久挂起**、写锁不放 ⇒ 该账号下所有新 turn 排队等读锁
+            //   ⇒ 客户看到的是「引擎不再处理对话」。
+            //   2026-09-22 实测：reload 240 秒不回、CPU 15% 持续、88 条连接挂着；
+            //   根因（那条线程的信箱当初为何会堵）仍未定性 —— 所以这里只拆掉「一堵就全线卡死」这一环。
+            // 丢一次不影响正确性：这三个都是「为下一轮准备」的刷新类 op
+            //   （本函数下面那句日志自己写着 "provider route will apply on the next turn"）。
+            if let Err(err) = engine.try_send(Op::SetCompaction {
+                config: engine_compaction,
+            }) {
+                tracing::warn!(
+                    thread_id = %thread_id,
+                    error = %err,
+                    "reload: op 信箱满或已关闭，跳过 SetCompaction（下一轮会重新装，不影响正确性）"
+                );
+            }
+            if let Err(err) = engine.try_send(Op::SetStreamChunkTimeout {
+                timeout_secs: stream_chunk_timeout_secs,
+            }) {
+                tracing::warn!(
+                    thread_id = %thread_id,
+                    error = %err,
+                    "reload: op 信箱满或已关闭，跳过 SetStreamChunkTimeout"
+                );
+            }
+            if let Err(err) = engine.try_send(Op::SetSubagentRuntimeConfig {
+                enabled: route_config.subagents_enabled_for_provider(provider),
+                max_subagents: route_config
+                    .max_subagents_for_provider(provider)
+                    .clamp(1, crate::config::MAX_SUBAGENTS),
+                launch_concurrency: route_config.launch_concurrency_for_provider(provider),
+                max_spawn_depth: route_config.subagent_max_spawn_depth_for_provider(provider),
+                api_timeout_secs: route_config.subagent_api_timeout_secs_for_provider(provider),
+                heartbeat_timeout_secs: route_config
+                    .subagent_heartbeat_timeout_secs_for_provider(provider),
+            }) {
+                tracing::warn!(
+                    thread_id = %thread_id,
+                    error = %err,
+                    "reload: op 信箱满或已关闭，跳过 SetSubagentRuntimeConfig"
+                );
+            }
             tracing::info!(
                 thread_id = %thread_id,
                 "Reloaded runtime controls; provider route will apply on the next turn"
