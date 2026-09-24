@@ -32,25 +32,20 @@ const REVIEWER_TIMEOUT: Duration = Duration::from_secs(90);
 /// Truncating tool input could hide the unsafe part, so oversized reviews deny.
 const MAX_REVIEW_CONTEXT_BYTES: usize = 64 * 1024;
 
-/// Unusable-answer reasons that a second attempt cannot improve on. Kept as
-/// constants so the retry gate and the failure sites cannot drift apart.
-const TIMEOUT_REASON: &str = "the reviewer timed out";
-const CONTEXT_LIMIT_REASON: &str = "the exact review context exceeded the guardian limit";
-
-/// Output budget for one guardian answer.
+/// ── AsBudy 2026-09-18（2026-09-24 复核保留）──────────────────────────────
+/// 守卫（Auto-Review 的审批员）的**输出预算**。官方原值 `384`。
 ///
-/// The guardian answers with one small JSON object and runs with thinking
-/// disabled, so a few dozen tokens usually suffice. The budget stays generous
-/// because this is a *safety* verdict: an answer clipped at the limit parses
-/// as nothing and fails closed, turning a call the model never judged into a
-/// denial. Measured 2026-09-18 — with the previous 384-token budget a
-/// reasoning model spent the entire allowance on hidden thinking
-/// (`finish_reason = length`, empty content) on roughly a quarter of
-/// real-world holds, and every one of those became a false denial.
+/// 生产实测（2026-09-18）：推理型模型会把整整 384 个 token 花在**隐藏思考**上
+/// （`finish_reason = length`、`content` 为空），于是约**四分之一**的真实 hold
+/// 变成误拒 —— 客户看到的是「明明安全的操作被拒」。
+/// 依据是官方自己的注释：被截断的判定 *"parses as nothing and fails closed"*
+/// ⇒ **预算不够 = 拒绝**。所以这个值必须给够，它不是一个可以省的额度。
 const REVIEWER_MAX_TOKENS: u32 = 1024;
-/// Second-attempt budget after an unusable answer. Only the budget changes:
-/// the policy, the call under review, and the decision rule stay exact.
-const REVIEWER_RETRY_MAX_TOKENS: u32 = 2048;
+
+/// 同一实测带出来的第二处：把守卫的**隐藏思考关掉**（官方原来是 `None`）。
+/// 判定就是一个小 JSON 对象，隐藏思考只会先吃掉输出预算、再把答案截断。
+/// `off` 是客户端层给各服务商文档化的档位拼写；没有文档这组开关的服务商不受影响。
+const REVIEWER_REASONING_EFFORT: &str = "off";
 
 /// The reviewer's answer, with failure modes separated from explicit denials.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,40 +123,24 @@ impl ReviewerResult {
 /// Ask the model guardian for one decision. `context_text` carries the
 /// deterministic hold and the call under review; the system prompt is fixed.
 ///
-/// An unusable answer (clipped output, unparseable reply, transport failure)
-/// is retried once with a larger output budget: the guardian never actually
-/// decided, and a fail-closed denial would read as a decision it did make.
-/// Failures that would repeat identically — a timeout, or a context over the
-/// guardian limit — are not retried.
+/// ── AsBudy 2026-09-24：**刻意不重试** ──
+/// 曾经试过「回答不可用就换更大预算重试一次」，但它违背官方把这条契约钉死的两处测试：
+/// `core::engine::tests::auto_review_guardian_parse_and_transport_failures_deny_closed`
+/// （断言「失败必须配**一条**结果」）与
+/// `tools::subagent::tests::…semantic_failures_still_record_provider_usage`
+/// （断言「一次 provider 成功的守卫调用只记**一次**账」；CI 实测用量 9 → 18）。
+/// 语义上也不该重试：守卫是**安全判定**，拿不到判定就 fail closed，而「多试几次直到它放行」
+/// 正是要避免的模式。真正要修的是**为什么答案会不可用** —— 见上面两条常量（预算 + 关思考）。
 pub(crate) async fn consult_reviewer(
     client: &dyn ModelClient,
     context_text: &str,
     cancel_token: &CancellationToken,
 ) -> ReviewerResult {
-    let first =
-        consult_reviewer_once(client, context_text, cancel_token, REVIEWER_MAX_TOKENS).await;
-    if !worth_retrying(&first) {
-        return first;
-    }
-    let retry = consult_reviewer_once(
-        client,
-        context_text,
-        cancel_token,
-        REVIEWER_RETRY_MAX_TOKENS,
-    )
-    .await;
-    ReviewerResult::finish(retry.outcome, merge_usage(first.usage, retry.usage))
-}
-
-/// One guardian attempt at the given output budget.
-async fn consult_reviewer_once(
-    client: &dyn ModelClient,
-    context_text: &str,
-    cancel_token: &CancellationToken,
-    max_tokens: u32,
-) -> ReviewerResult {
     if context_text.len() > MAX_REVIEW_CONTEXT_BYTES {
-        return ReviewerResult::unavailable(CONTEXT_LIMIT_REASON, None);
+        return ReviewerResult::unavailable(
+            "the exact review context exceeded the guardian limit",
+            None,
+        );
     }
     let request = MessageRequest {
         model: client.model().to_string(),
@@ -172,19 +151,13 @@ async fn consult_reviewer_once(
                 cache_control: None,
             }],
         }],
-        max_tokens,
+        max_tokens: REVIEWER_MAX_TOKENS,
         system: Some(SystemPrompt::Text(DEFAULT_GUARDIAN_POLICY.to_string())),
         tools: None,
         tool_choice: None,
         metadata: None,
         thinking: None,
-        // Disable reasoning for the guardian. The verdict is one small JSON
-        // object; hidden thinking would spend the output budget first and
-        // clip the answer. `off` is the tier spelling the client layer
-        // documents per provider (providers that do not document these
-        // controls are left untouched), and the same tier the translation
-        // path uses for its own small decisions.
-        reasoning_effort: Some("off".to_string()),
+        reasoning_effort: Some(REVIEWER_REASONING_EFFORT.to_string()),
         stream: Some(false),
         temperature: Some(0.0),
         top_p: None,
@@ -200,7 +173,7 @@ async fn consult_reviewer_once(
         response = tokio::time::timeout(REVIEWER_TIMEOUT, client.create_message_uncached(request)) => response,
     };
     let response = match response {
-        Err(_) => return ReviewerResult::unavailable(TIMEOUT_REASON, None),
+        Err(_) => return ReviewerResult::unavailable("the reviewer timed out", None),
         // Provider errors can include response bodies or credential-shaped
         // details. The guardian needs only the fail-closed outcome.
         Ok(Err(_)) => return ReviewerResult::unavailable("the reviewer request failed", None),
@@ -208,58 +181,6 @@ async fn consult_reviewer_once(
     };
     let outcome = verdict_from_response(&response);
     ReviewerResult::finish(outcome, Some(response.usage))
-}
-
-/// Whether a second attempt could plausibly decide differently.
-///
-/// Only answer-level failures qualify: a clipped or unparseable reply never
-/// reached a verdict, and a larger budget can produce one. A timeout already
-/// spent the full deadline, and an oversized context cannot shrink, so both
-/// would repeat identically.
-fn worth_retrying(result: &ReviewerResult) -> bool {
-    matches!(
-        &result.outcome,
-        ReviewerOutcome::Unavailable { reason }
-            if reason.as_str() != TIMEOUT_REASON && reason.as_str() != CONTEXT_LIMIT_REASON
-    )
-}
-
-/// Sum both attempts' usage: a retry is real spend, not a correction.
-fn merge_usage(first: Option<Usage>, second: Option<Usage>) -> Option<Usage> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(Usage {
-            input_tokens: first.input_tokens.saturating_add(second.input_tokens),
-            output_tokens: first.output_tokens.saturating_add(second.output_tokens),
-            prompt_cache_hit_tokens: sum_optional(
-                first.prompt_cache_hit_tokens,
-                second.prompt_cache_hit_tokens,
-            ),
-            prompt_cache_miss_tokens: sum_optional(
-                first.prompt_cache_miss_tokens,
-                second.prompt_cache_miss_tokens,
-            ),
-            prompt_cache_write_tokens: sum_optional(
-                first.prompt_cache_write_tokens,
-                second.prompt_cache_write_tokens,
-            ),
-            reasoning_tokens: sum_optional(first.reasoning_tokens, second.reasoning_tokens),
-            reasoning_replay_tokens: sum_optional(
-                first.reasoning_replay_tokens,
-                second.reasoning_replay_tokens,
-            ),
-            server_tool_use: second.server_tool_use.or(first.server_tool_use),
-        }),
-        (Some(only), None) | (None, Some(only)) => Some(only),
-        (None, None) => None,
-    }
-}
-
-fn sum_optional(first: Option<u32>, second: Option<u32>) -> Option<u32> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(first.saturating_add(second)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
 }
 
 fn verdict_from_response(response: &MessageResponse) -> ReviewerOutcome {
@@ -401,11 +322,14 @@ mod tests {
         let request = mock.last_request().expect("reviewer request");
         assert_eq!(request.tools, None, "guardian requests never expose tools");
         assert_eq!(
-            request.reasoning_effort.as_deref(),
-            Some("off"),
-            "the guardian must not spend its output budget on hidden thinking"
+            request.max_tokens, REVIEWER_MAX_TOKENS,
+            "AsBudy: 守卫预算必须给够 —— 384 会把判定截断成拒绝（见常量上的实测）"
         );
-        assert_eq!(request.max_tokens, REVIEWER_MAX_TOKENS);
+        assert_eq!(
+            request.reasoning_effort.as_deref(),
+            Some(REVIEWER_REASONING_EFFORT),
+            "AsBudy: 守卫不许把输出预算花在隐藏思考上"
+        );
         let SystemPrompt::Text(system) = request.system.expect("guardian policy") else {
             panic!("guardian system prompt must be text");
         };
@@ -429,11 +353,6 @@ mod tests {
                 reason: "destination is not authorized".to_string()
             }
         );
-        assert_eq!(
-            deny.call_count(),
-            1,
-            "an explicit denial is a decision, not an unusable answer"
-        );
         assert!(matches!(
             verdict_from_response(&response(
                 r#"{"risk_level":"high","decision":"allow","reason":"the request mentions it"}"#,
@@ -445,38 +364,15 @@ mod tests {
             }
         ));
 
-        // An unusable first answer is retried with a larger budget instead of
-        // denying a call the guardian never actually judged. Both attempts'
-        // usage is kept — a retry is real spend.
         let malformed = MockLlmClient::new(Vec::new());
         malformed.push_message_response(response("allow it", Usage::default()));
-        malformed.push_message_response(response(
-            r#"{"risk_level":"low","decision":"allow","reason":"bounded and authorized"}"#,
-            Usage {
-                input_tokens: 11,
-                output_tokens: 5,
-                ..Usage::default()
-            },
-        ));
         let malformed_result =
             consult_reviewer(&malformed, "context", &CancellationToken::new()).await;
-        assert_eq!(
+        assert!(matches!(
             malformed_result.outcome,
-            ReviewerOutcome::Allow {
-                risk: ReviewerRiskLevel::Low,
-                reason: "bounded and authorized".to_string()
-            }
-        );
-        assert_eq!(malformed.call_count(), 2);
-        assert_eq!(malformed_result.usage.unwrap().output_tokens, 5);
-        let retry_requests = malformed.captured_requests();
-        assert_eq!(retry_requests.len(), 2);
-        assert_eq!(retry_requests[0].max_tokens, REVIEWER_MAX_TOKENS);
-        assert_eq!(
-            retry_requests[1].max_tokens, REVIEWER_RETRY_MAX_TOKENS,
-            "the second attempt gets the larger budget"
-        );
-        assert_eq!(retry_requests[1].reasoning_effort.as_deref(), Some("off"));
+            ReviewerOutcome::Unavailable { .. }
+        ));
+        assert!(malformed_result.usage.is_some());
 
         let incomplete = MockLlmClient::new(Vec::new());
         let mut incomplete_response = response(
@@ -485,34 +381,14 @@ mod tests {
         );
         incomplete_response.stop_reason = Some("max_tokens".to_string());
         incomplete.push_message_response(incomplete_response);
-        incomplete.push_message_response(response(
-            r#"{"risk_level":"medium","decision":"allow","reason":"bounded workspace edit"}"#,
-            Usage::default(),
-        ));
-        let incomplete_result =
-            consult_reviewer(&incomplete, "context", &CancellationToken::new()).await;
         assert_eq!(
-            incomplete_result.outcome,
-            ReviewerOutcome::Allow {
-                risk: ReviewerRiskLevel::Medium,
-                reason: "bounded workspace edit".to_string()
-            },
-            "a clipped answer must not become a fail-closed denial"
+            consult_reviewer(&incomplete, "context", &CancellationToken::new())
+                .await
+                .outcome,
+            ReviewerOutcome::Unavailable {
+                reason: "the reviewer answer was incomplete".to_string()
+            }
         );
-        assert_eq!(incomplete.call_count(), 2);
-
-        // A guardian that stays unusable on both attempts still fails closed:
-        // the retry softens the clipping failure, it does not open the gate.
-        let hopeless = MockLlmClient::new(Vec::new());
-        hopeless.push_message_response(response("not json", Usage::default()));
-        hopeless.push_message_response(response("still not json", Usage::default()));
-        let hopeless_result =
-            consult_reviewer(&hopeless, "context", &CancellationToken::new()).await;
-        assert!(matches!(
-            hopeless_result.outcome,
-            ReviewerOutcome::Unavailable { .. }
-        ));
-        assert_eq!(hopeless.call_count(), 2);
     }
 
     #[tokio::test]
