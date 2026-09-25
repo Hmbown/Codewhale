@@ -89,7 +89,7 @@ mimalloc = { version = "0.1", default-features = false }
 # remake — no C compiler, no build script on that path. `rusty_alloc-api` is
 # the crate's documented surface; it pulls the `rusty_alloc` core transitively
 # at the same version.
-rusty_alloc-api = "1.1.6"
+rusty_alloc-api = "2.2.0"
 
 # The everyday `--release` gate (AGENTS.md pre-push build): optimized but
 # fast to produce. Shipping artifacts use `--profile dist` below — fat LTO on

@@ -4813,19 +4813,20 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rusty_alloc"
-version = "1.1.6"
+version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c93620fee9935a120a50df2086fe48fa072f7d391f129a5e04bf20ea9b83097d"
+checksum = "d1de3138e043fcecdee8196590798868ca1c8837a82eb039a32ffce3d02ba463"
 dependencies = [
  "libc",
+ "portable-atomic",
  "windows-sys 0.60.2",
 ]
 
 [[package]]
 name = "rusty_alloc-api"
-version = "1.1.6"
+version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05ce52d7f72842a590e4588013d70ea02d27edbf6b6af9bc193f6e1ac173845a"
+checksum = "3a0409c8229b02630c938d0479c71e91112291b08beba87df7a454252d8c81ad"
 dependencies = [
  "rusty_alloc",
 ]
