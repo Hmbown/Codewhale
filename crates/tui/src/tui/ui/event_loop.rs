@@ -4002,16 +4002,16 @@ pub(crate) async fn run_event_loop(
                         // can see who decided and why, without a modal. It is
                         // held until the tool card completes so it lands
                         // under that card rather than inside a running run.
-                        let audit = serde_json::json!({
-                            "session_id": app.current_session_id,
-                            "agent_id": agent_id,
-                            "tool_id": tool_id,
-                            "tool_name": tool_name,
-                            "gate": gate.as_str(),
-                            "decision": decision.as_str(),
-                            "risk": risk,
-                            "reason": codewhale_secrets::redact::redact_secrets(&reason),
-                        });
+                        let mut audit = crate::tui::gate_receipts::tool_gate_audit_record(
+                            agent_id.as_deref(),
+                            &tool_id,
+                            &tool_name,
+                            gate,
+                            decision,
+                            risk.as_deref(),
+                            &reason,
+                        );
+                        audit["session_id"] = serde_json::json!(app.current_session_id);
                         tokio::task::spawn_blocking(move || {
                             log_sensitive_event("tool.gate.decision", audit);
                         });

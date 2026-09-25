@@ -901,29 +901,66 @@ mod tests {
         }
     }
 
+    /// Every closed outcome is persisted with the decider the handle was given,
+    /// so a receipt's "approved by you" is a person and nothing else.
     #[tokio::test]
     async fn keyless_engine_persists_every_closed_approval_outcome() {
         enum Decision {
             Approve,
+            ApproveBy(ApprovalDecider),
             Deny,
+            DenyBy(ApprovalDecider),
             Timeout,
             Cancel,
             Retry,
         }
         let cases = [
-            (Decision::Approve, ApprovalOutcome::ApprovedOnce),
-            (Decision::Deny, ApprovalOutcome::Denied),
-            (Decision::Timeout, ApprovalOutcome::Timeout),
-            (Decision::Cancel, ApprovalOutcome::Cancelled),
+            (
+                Decision::Approve,
+                ApprovalOutcome::ApprovedOnce,
+                Some(ApprovalDecider::User),
+            ),
+            (
+                Decision::ApproveBy(ApprovalDecider::Posture),
+                ApprovalOutcome::ApprovedOnce,
+                Some(ApprovalDecider::Posture),
+            ),
+            (
+                Decision::ApproveBy(ApprovalDecider::SessionRule),
+                ApprovalOutcome::ApprovedOnce,
+                Some(ApprovalDecider::SessionRule),
+            ),
+            (
+                Decision::Deny,
+                ApprovalOutcome::Denied,
+                Some(ApprovalDecider::User),
+            ),
+            (
+                Decision::DenyBy(ApprovalDecider::Posture),
+                ApprovalOutcome::Denied,
+                Some(ApprovalDecider::Posture),
+            ),
+            (
+                Decision::DenyBy(ApprovalDecider::Host),
+                ApprovalOutcome::Denied,
+                Some(ApprovalDecider::Host),
+            ),
+            (Decision::Timeout, ApprovalOutcome::Timeout, None),
+            (
+                Decision::Cancel,
+                ApprovalOutcome::Cancelled,
+                Some(ApprovalDecider::Host),
+            ),
             (
                 Decision::Retry,
                 ApprovalOutcome::RetryWithPolicy {
                     policy: SandboxPolicy::DangerFullAccess,
                 },
+                Some(ApprovalDecider::User),
             ),
         ];
 
-        for (index, (decision, expected)) in cases.into_iter().enumerate() {
+        for (index, (decision, expected, expected_by)) in cases.into_iter().enumerate() {
             let tmp = tempfile::tempdir().expect("tempdir");
             let (mut engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
             let store = crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions"));
@@ -948,7 +985,15 @@ mod tests {
             assert!(matches!(emitted, Event::ApprovalRequired { .. }));
             match decision {
                 Decision::Approve => handle.approve_tool_call(&tool_id).await.expect("approve"),
+                Decision::ApproveBy(by) => handle
+                    .approve_tool_call_by(&tool_id, by)
+                    .await
+                    .expect("approve by"),
                 Decision::Deny => handle.deny_tool_call(&tool_id).await.expect("deny"),
+                Decision::DenyBy(by) => handle
+                    .deny_tool_call_by(&tool_id, by)
+                    .await
+                    .expect("deny by"),
                 Decision::Timeout => handle
                     .deny_tool_call_timed_out(&tool_id)
                     .await
@@ -980,6 +1025,7 @@ mod tests {
             let replay = store.replay(&session_id).expect("replay approvals");
             assert_eq!(replay.completed.len(), 1);
             assert_eq!(replay.completed[0].outcome, expected);
+            assert_eq!(replay.completed[0].decided_by, expected_by, "case {index}");
             assert!(replay.unmatched_asks.is_empty());
         }
     }
@@ -1015,6 +1061,7 @@ mod tests {
         let replay = store.replay(&session_id).expect("replay approvals");
         assert_eq!(replay.completed.len(), 1);
         assert_eq!(replay.completed[0].outcome, ApprovalOutcome::Unavailable);
+        assert_eq!(replay.completed[0].decided_by, Some(ApprovalDecider::Host));
     }
 
     #[tokio::test]

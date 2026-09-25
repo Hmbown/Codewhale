@@ -127,8 +127,10 @@ pub struct ReceiptTotals {
     pub approvals: ApprovalTotals,
     /// File changes, commands, code runs, web and MCP calls, and agents that
     /// ran with no approval on record: the posture, an allow rule, or a
-    /// remembered grant let them run without a prompt. Zero, with a
-    /// `not_recorded` note, for a session older than its approval log.
+    /// remembered grant let them run without a prompt. A call Codewhale
+    /// refused before it started, or one the record does not show starting,
+    /// is not counted. Zero, with a `not_recorded` note, for a session older
+    /// than its approval log.
     pub ran_without_asking: usize,
     /// Actions that ran and failed, plus failed turns.
     pub failures: usize,
@@ -143,15 +145,24 @@ pub struct ApprovalTotals {
     pub approved: usize,
     pub denied: usize,
     pub timed_out: usize,
-    /// Cancelled, or resolved by the host because nobody could be asked.
+    /// Cancelled, or resolved by Codewhale because nobody could be asked
+    /// (the turn had ended or stopped). Never a person's no.
     pub not_answered: usize,
     pub pending: usize,
-    pub by_you: usize,
-    pub by_session_rule: usize,
-    pub by_posture: usize,
-    /// Approved or denied, but the record predates Codewhale keeping who
-    /// decided (or a sub-agent's request, which does not carry it yet).
-    pub decider_not_recorded: usize,
+    /// Who gave each approval counted in `approved`.
+    pub approved_by: DeciderCounts,
+    /// Who gave each denial counted in `denied`.
+    pub denied_by: DeciderCounts,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct DeciderCounts {
+    pub you: usize,
+    pub session_rule: usize,
+    pub posture: usize,
+    /// The record predates Codewhale keeping who decided, or came from a
+    /// sub-agent's request, which does not carry it yet.
+    pub not_recorded: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -261,12 +272,16 @@ pub struct NestedCall {
 #[serde(rename_all = "snake_case")]
 pub enum ActionStatus {
     Ok,
+    /// Ran and failed.
     Failed,
-    /// Held at approval: denied, timed out, or never answered.
+    /// Did not run: held at approval (denied, timed out, never answered), or
+    /// refused by Codewhale before it started (a policy or Auto-Review block,
+    /// invalid input, a tool that is not available).
     NotRun,
     Interrupted,
     Running,
-    /// No result is in the record.
+    /// The record does not show whether it ran: there is no result, or a
+    /// command returned an error with no exit code or shell status.
     Unknown,
 }
 
@@ -363,9 +378,15 @@ pub(crate) fn session_receipt(
         }
     };
     if let Some(turn) = turn {
-        let known = steps.iter().any(|step| step.turn.as_deref() == Some(turn));
-        if !known && turn.parse::<usize>().is_err() {
-            anyhow::bail!("turn '{turn}' is not a turn number in this session");
+        let count = turn_postures.len();
+        if !turn
+            .parse::<usize>()
+            .is_ok_and(|number| (1..=count).contains(&number))
+        {
+            anyhow::bail!(
+                "turn '{turn}' is not a turn in this session; it has {}",
+                plural(count, "turn", "turns")
+            );
         }
     }
     notes.insert(
@@ -733,6 +754,12 @@ fn approvals_from_replay(replay: &ApprovalReplay) -> Vec<ApprovalStep> {
     for completed in &replay.completed {
         let (decision, implied) = match &completed.outcome {
             ApprovalOutcome::ApprovedOnce => (ApprovalDecisionLabel::Approved, None),
+            // The Runtime answers "deny" for a request it could not put in
+            // front of anyone (no active turn, the turn stopped, the channel
+            // closed). That is nobody answering, not a no.
+            ApprovalOutcome::Denied if completed.decided_by == Some(ApprovalDecider::Host) => {
+                (ApprovalDecisionLabel::Unavailable, None)
+            }
             ApprovalOutcome::Denied => (ApprovalDecisionLabel::Denied, None),
             ApprovalOutcome::Timeout => (ApprovalDecisionLabel::TimedOut, None),
             ApprovalOutcome::Cancelled => (
@@ -1066,35 +1093,115 @@ fn mutation_files(facts: Option<&Value>) -> Option<Vec<FileTouch>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// One line of a unified diff or patch, read in context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffLine<'a> {
+    /// A `--- old` / `+++ new` file header pair, as their raw paths.
+    Header {
+        old: &'a str,
+        new: &'a str,
+    },
+    /// `diff --git …`: a new file section starts.
+    FileStart,
+    Added,
+    Removed,
+    Other(&'a str),
+}
+
+/// Classify a diff's lines. `--- ` and `+++ ` are file headers only as an
+/// adjacent pair outside a hunk: inside one they are a removed `-- …` or
+/// added `++ …` line (a SQL or Lua comment), and a hunk's `@@ -a,b +c,d @@`
+/// counts say where it ends.
+fn diff_lines(text: &str) -> Vec<DiffLine<'_>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::with_capacity(lines.len());
+    let (mut old_left, mut new_left) = (0u64, 0u64);
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        index += 1;
+        // Never hunk content, which always starts with ` `, `+`, or `-`.
+        if line.starts_with("diff --git ") {
+            (old_left, new_left) = (0, 0);
+            out.push(DiffLine::FileStart);
+            continue;
+        }
+        let in_hunk = old_left > 0 || new_left > 0;
+        if !in_hunk {
+            if let (Some(old), Some(new)) = (
+                line.strip_prefix("--- "),
+                lines.get(index).and_then(|next| next.strip_prefix("+++ ")),
+            ) {
+                out.push(DiffLine::Header { old, new });
+                index += 1;
+                continue;
+            }
+            if line.starts_with("@@") {
+                if let Some((old, new)) = hunk_counts(line) {
+                    (old_left, new_left) = (old, new);
+                }
+                out.push(DiffLine::Other(line));
+                continue;
+            }
+        }
+        out.push(match line.as_bytes().first() {
+            Some(b'+') => {
+                new_left = new_left.saturating_sub(1);
+                DiffLine::Added
+            }
+            Some(b'-') => {
+                old_left = old_left.saturating_sub(1);
+                DiffLine::Removed
+            }
+            // A blank line is a context line whose leading space was trimmed.
+            Some(b' ') | None => {
+                old_left = old_left.saturating_sub(1);
+                new_left = new_left.saturating_sub(1);
+                DiffLine::Other(line)
+            }
+            _ => DiffLine::Other(line),
+        });
+    }
+    out
+}
+
+/// `(old, new)` line counts from `@@ -a[,b] +c[,d] @@`; a missing count is 1.
+fn hunk_counts(line: &str) -> Option<(u64, u64)> {
+    let mut ranges = line.strip_prefix("@@ ")?.split_whitespace();
+    let count = |range: &str, sign: char| -> Option<u64> {
+        let range = range.strip_prefix(sign)?;
+        match range.split_once(',') {
+            Some((_, count)) => count.parse().ok(),
+            None => range.parse::<u64>().ok().map(|_| 1),
+        }
+    };
+    Some((count(ranges.next()?, '-')?, count(ranges.next()?, '+')?))
+}
+
 /// Per-file `(+, -)` from a unified diff, keyed by the `+++ b/<path>` (or
 /// `--- a/<path>` for deletions) header.
 fn diff_counts_by_path(diff: &str) -> HashMap<String, (u64, u64)> {
     let mut counts: HashMap<String, (u64, u64)> = HashMap::new();
     let mut current: Option<String> = None;
-    let mut pending_old: Option<String> = None;
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("--- ") {
-            pending_old = header_path(rest);
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            current = header_path(rest).or_else(|| pending_old.take());
-            if let Some(path) = &current {
-                counts.entry(path.clone()).or_default();
+    for line in diff_lines(diff) {
+        match line {
+            DiffLine::Header { old, new } => {
+                current = header_path(new).or_else(|| header_path(old));
+                if let Some(path) = &current {
+                    counts.entry(path.clone()).or_default();
+                }
             }
-            continue;
-        }
-        if line.starts_with("diff --git ") {
-            current = None;
-            pending_old = None;
-            continue;
-        }
-        let Some(path) = &current else { continue };
-        let entry = counts.entry(path.clone()).or_default();
-        if line.starts_with('+') {
-            entry.0 += 1;
-        } else if line.starts_with('-') {
-            entry.1 += 1;
+            DiffLine::FileStart => current = None,
+            DiffLine::Added | DiffLine::Removed => {
+                let Some(path) = &current else { continue };
+                let entry = counts.entry(path.clone()).or_default();
+                if line == DiffLine::Added {
+                    entry.0 += 1;
+                } else {
+                    entry.1 += 1;
+                }
+            }
+            DiffLine::Other(_) => {}
         }
     }
     counts
@@ -1219,50 +1326,33 @@ fn line_count(text: &str) -> u64 {
 /// File:` envelopes or unified-diff headers.
 fn patch_files(patch: &str, fallback_path: Option<&str>) -> Vec<FileTouch> {
     let mut files: Vec<FileTouch> = Vec::new();
-    let mut pending_old: Option<String> = None;
-    for line in patch.lines() {
-        let envelope = [
-            ("*** Add File: ", FileChangeKind::Created),
-            ("*** Update File: ", FileChangeKind::Edited),
-            ("*** Delete File: ", FileChangeKind::Deleted),
-        ]
-        .into_iter()
-        .find_map(|(prefix, change)| line.strip_prefix(prefix).map(|path| (path, change)));
-        if let Some((path, change)) = envelope {
-            files.push(FileTouch {
-                path: path.trim().to_string(),
-                change,
-                lines_added: Some(0),
-                lines_removed: Some(0),
-            });
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("--- ") {
-            pending_old = header_path(rest);
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            let new_path = header_path(rest);
-            let (path, change) = match (new_path, pending_old.take()) {
-                (Some(path), Some(_)) => (path, FileChangeKind::Edited),
-                (Some(path), None) => (path, FileChangeKind::Created),
-                (None, Some(old)) => (old, FileChangeKind::Deleted),
-                (None, None) => continue,
-            };
-            files.push(FileTouch {
-                path,
-                change,
-                lines_added: Some(0),
-                lines_removed: Some(0),
-            });
-            continue;
-        }
-        if line.starts_with("***") || line.starts_with("@@") {
-            continue;
-        }
+    for line in diff_lines(patch) {
+        let (added, removed) = match line {
+            DiffLine::Header { old, new } => {
+                let (path, change) = match (header_path(new), header_path(old)) {
+                    (Some(path), Some(_)) => (path, FileChangeKind::Edited),
+                    (Some(path), None) => (path, FileChangeKind::Created),
+                    (None, Some(old)) => (old, FileChangeKind::Deleted),
+                    (None, None) => continue,
+                };
+                files.push(FileTouch {
+                    path,
+                    change,
+                    lines_added: Some(0),
+                    lines_removed: Some(0),
+                });
+                continue;
+            }
+            DiffLine::FileStart => continue,
+            DiffLine::Added => (1, 0),
+            DiffLine::Removed => (0, 1),
+            DiffLine::Other(line) => {
+                envelope_file(line, &mut files);
+                continue;
+            }
+        };
         if files.is_empty()
             && let Some(path) = fallback_path
-            && (line.starts_with('+') || line.starts_with('-'))
         {
             files.push(FileTouch {
                 path: path.to_string(),
@@ -1271,17 +1361,32 @@ fn patch_files(patch: &str, fallback_path: Option<&str>) -> Vec<FileTouch> {
                 lines_removed: Some(0),
             });
         }
-        let Some(file) = files.last_mut() else {
-            continue;
-        };
-        if line.starts_with('+') {
-            *file.lines_added.get_or_insert(0) += 1;
-        } else if line.starts_with('-') {
-            *file.lines_removed.get_or_insert(0) += 1;
+        if let Some(file) = files.last_mut() {
+            *file.lines_added.get_or_insert(0) += added;
+            *file.lines_removed.get_or_insert(0) += removed;
         }
     }
     files.truncate(MAX_FILES_PER_ACTION);
     files
+}
+
+/// A `*** Add/Update/Delete File: <path>` envelope line starts a file.
+fn envelope_file(line: &str, files: &mut Vec<FileTouch>) {
+    let envelope = [
+        ("*** Add File: ", FileChangeKind::Created),
+        ("*** Update File: ", FileChangeKind::Edited),
+        ("*** Delete File: ", FileChangeKind::Deleted),
+    ]
+    .into_iter()
+    .find_map(|(prefix, change)| line.strip_prefix(prefix).map(|path| (path, change)));
+    if let Some((path, change)) = envelope {
+        files.push(FileTouch {
+            path: path.trim().to_string(),
+            change,
+            lines_added: Some(0),
+            lines_removed: Some(0),
+        });
+    }
 }
 
 fn command_text(tool: &str, semantic: &str, input: &Value) -> String {
@@ -1321,8 +1426,13 @@ fn command_text(tool: &str, semantic: &str, input: &Value) -> String {
             _ => tool.to_string(),
         },
     };
-    let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    bounded(&redact(&flat), MAX_COMMAND_CHARS)
+    // Redact the text as written: the redactor finds a private-key block by
+    // its lines, which flattening would join into one.
+    let flat = redact(&raw)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    bounded(&flat, MAX_COMMAND_CHARS)
 }
 
 /// The engine's own closing status line for a failed shell call, e.g.
@@ -1331,6 +1441,92 @@ fn command_text(tool: &str, semantic: &str, input: &Value) -> String {
 fn closing_exit_code(output: Option<&str>) -> Option<i64> {
     let last = output?.trim_end().lines().last()?.trim();
     last.strip_prefix("Command exited with code ")?.parse().ok()
+}
+
+/// What a failed call's own result shows about whether it started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureEvidence {
+    /// An exit code, or a status line the shell writes only after a process
+    /// ran.
+    Ran,
+    /// Codewhale refused the call before it started.
+    Refused,
+    /// Neither.
+    Unclear,
+}
+
+/// Lines the shell tools write only after a process ran
+/// (`tools/shell.rs`: `contract_bash_error_status` and the `exec_shell`
+/// result).
+const SHELL_RAN_LINES: [&str; 5] = [
+    "Command exited with code ",
+    "Command failed (",
+    "Command timed out",
+    "Command canceled",
+    "Command aborted",
+];
+
+/// Whether a failed call's result shows it started. The record keeps no
+/// "blocked" flag, so two fixed shapes the engine writes are read, never
+/// model prose:
+///
+/// - a call refused before it runs gets its error as the result. A terminal
+///   session saves `Error: ` plus `dispatch::format_tool_error_with_schema`;
+///   a Runtime thread saves the `ToolError`'s own text. `exec_shell`'s policy
+///   and safety blocks start with `BLOCKED:`.
+/// - a process that ran leaves an exit code or one of [`SHELL_RAN_LINES`].
+fn failure_evidence(step: &ToolStep) -> FailureEvidence {
+    let structured = structured_output(step);
+    let facts = step.metadata.as_ref().or(structured.as_ref());
+    if number(facts, &["exit_code", "return_code"]).is_some() {
+        return FailureEvidence::Ran;
+    }
+    let Some(output) = step.output.as_deref() else {
+        return FailureEvidence::Unclear;
+    };
+    let lines = || output.lines().map(str::trim);
+    if lines().any(|line| {
+        SHELL_RAN_LINES
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+    }) {
+        return FailureEvidence::Ran;
+    }
+    if lines().any(|line| line.contains("\"side_effect_status\":\"not_started\"")) {
+        return FailureEvidence::Refused;
+    }
+    let Some(first) = lines().find(|line| !line.is_empty() && !line.starts_with("[approval]"))
+    else {
+        return FailureEvidence::Unclear;
+    };
+    let first = first.strip_prefix("Error: ").unwrap_or(first);
+    const REFUSED_PREFIXES: [&str; 7] = [
+        "BLOCKED:",
+        "Invalid input for tool '",
+        "Path escapes workspace:",
+        // `ToolError` text, as a Runtime thread saves it.
+        "Failed to authorize tool execution:",
+        "Failed to validate input:",
+        "Failed to locate tool:",
+        "Failed to resolve path '",
+    ];
+    const REFUSED_MARKERS: [&str; 4] = [
+        "' was denied: ",
+        "' denied by user",
+        "' is not available",
+        "' is missing required field ",
+    ];
+    let refused = REFUSED_PREFIXES
+        .iter()
+        .any(|prefix| first.starts_with(prefix))
+        || (first.starts_with("Tool '")
+            && REFUSED_MARKERS.iter().any(|marker| first.contains(marker)))
+        || first.contains("is not available in Plan mode");
+    if refused {
+        FailureEvidence::Refused
+    } else {
+        FailureEvidence::Unclear
+    }
 }
 
 fn nested_calls(facts: Option<&Value>) -> Vec<NestedCall> {
@@ -1389,6 +1585,7 @@ fn first_error_line(output: Option<&str>) -> Option<String> {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with("[approval]"))?;
+    let line = line.strip_prefix("Error: ").unwrap_or(line);
     Some(bounded(&redact(line), MAX_ERROR_CHARS))
 }
 
@@ -1448,17 +1645,24 @@ fn assemble(
             continue;
         }
         let classified = classify(step, &mut notes);
-        let status = match (approval, step.outcome) {
-            (Some(fact), _)
-                if !fact.decision.ran() && fact.decision != ApprovalDecisionLabel::Pending =>
-            {
-                ActionStatus::NotRun
-            }
-            (_, StepOutcome::Ok) => ActionStatus::Ok,
-            (_, StepOutcome::Failed) => ActionStatus::Failed,
-            (_, StepOutcome::Interrupted) => ActionStatus::Interrupted,
-            (_, StepOutcome::Running) => ActionStatus::Running,
-            (_, StepOutcome::Unknown) => ActionStatus::Unknown,
+        let is_command = matches!(classified, Classified::Listed(ActionKind::Command { .. }));
+        let held_at_approval = approval.is_some_and(|fact| {
+            !fact.decision.ran() && fact.decision != ApprovalDecisionLabel::Pending
+        });
+        let status = match step.outcome {
+            _ if held_at_approval => ActionStatus::NotRun,
+            StepOutcome::Ok => ActionStatus::Ok,
+            // A failed result is not proof the call ran: Codewhale answers a
+            // call it blocks before running with an error result too.
+            StepOutcome::Failed => match failure_evidence(step) {
+                FailureEvidence::Ran => ActionStatus::Failed,
+                FailureEvidence::Refused => ActionStatus::NotRun,
+                FailureEvidence::Unclear if is_command => ActionStatus::Unknown,
+                FailureEvidence::Unclear => ActionStatus::Failed,
+            },
+            StepOutcome::Interrupted => ActionStatus::Interrupted,
+            StepOutcome::Running => ActionStatus::Running,
+            StepOutcome::Unknown => ActionStatus::Unknown,
         };
         let what = match classified {
             Classified::Listed(what) => what,
@@ -1504,9 +1708,15 @@ fn assemble(
             status,
             duration_ms,
             approval,
-            error: (status == ActionStatus::Failed)
-                .then(|| first_error_line(step.output.as_deref()))
-                .flatten(),
+            // A refusal's reason is the fact worth keeping; a held call's
+            // approval already says why it did not run.
+            error: match status {
+                ActionStatus::Failed | ActionStatus::Unknown => true,
+                ActionStatus::NotRun => !held_at_approval,
+                _ => false,
+            }
+            .then(|| first_error_line(step.output.as_deref()))
+            .flatten(),
         });
     }
 
@@ -1582,10 +1792,21 @@ fn assemble(
             postures.push(posture);
         }
     }
-    if totals.approvals.decider_not_recorded > 0 {
+    let decider_not_recorded =
+        totals.approvals.approved_by.not_recorded + totals.approvals.denied_by.not_recorded;
+    if decider_not_recorded > 0 {
         notes.insert(format!(
-            "Who approved: {} approval(s) predate Codewhale recording the decider, or came from a sub-agent, so they show the decision without who made it.",
-            totals.approvals.decider_not_recorded
+            "Who decided: {} decision(s) predate Codewhale recording the decider, or came from a sub-agent, so they show the decision without who made it.",
+            decider_not_recorded
+        ));
+    }
+    let unclear = actions
+        .iter()
+        .filter(|action| action.status == ActionStatus::Unknown)
+        .count();
+    if unclear > 0 {
+        notes.insert(format!(
+            "Whether it ran: {unclear} call(s) have no result, or returned an error with no exit code, so the record does not show that they started. They are listed but not counted as run."
         ));
     }
     notes.insert(
@@ -1611,6 +1832,8 @@ impl ReceiptAction {
     /// A change, command, code run, web or MCP call, or agent that ran with
     /// no approval on record.
     fn ran_without_asking(&self) -> bool {
+        // `Unknown` and `NotRun` are left out: the record does not show the
+        // call started.
         self.approval.is_none()
             && matches!(
                 self.status,
@@ -1636,7 +1859,7 @@ fn tally(actions: &[ReceiptAction], totals: &mut ReceiptTotals) {
     let mut created: BTreeSet<&str> = BTreeSet::new();
     let mut deleted: BTreeSet<&str> = BTreeSet::new();
     for action in actions {
-        let ran = action.status != ActionStatus::NotRun;
+        let ran = !matches!(action.status, ActionStatus::NotRun | ActionStatus::Unknown);
         if action.status == ActionStatus::Failed {
             totals.failures += 1;
         }
@@ -1693,19 +1916,21 @@ fn tally(actions: &[ReceiptAction], totals: &mut ReceiptTotals) {
                 }
                 ApprovalDecisionLabel::Pending => approvals.pending += 1,
             }
-            let decided = matches!(
-                fact.decision,
-                ApprovalDecisionLabel::Approved
-                    | ApprovalDecisionLabel::ApprovedWithPolicy
-                    | ApprovalDecisionLabel::Denied
-            );
+            let by = match fact.decision {
+                ApprovalDecisionLabel::Approved | ApprovalDecisionLabel::ApprovedWithPolicy => {
+                    &mut approvals.approved_by
+                }
+                ApprovalDecisionLabel::Denied => &mut approvals.denied_by,
+                _ => continue,
+            };
             match fact.decided_by {
-                Some(ApprovalDecider::User) => approvals.by_you += 1,
-                Some(ApprovalDecider::SessionRule) => approvals.by_session_rule += 1,
-                Some(ApprovalDecider::Posture) => approvals.by_posture += 1,
-                Some(ApprovalDecider::Host) => {}
-                None if decided => approvals.decider_not_recorded += 1,
-                None => {}
+                Some(ApprovalDecider::User) => by.you += 1,
+                Some(ApprovalDecider::SessionRule) => by.session_rule += 1,
+                Some(ApprovalDecider::Posture) => by.posture += 1,
+                // Codewhale never approves, and its denials are read as not
+                // answered (`approvals_from_replay`), so this is only a
+                // record that says neither.
+                Some(ApprovalDecider::Host) | None => by.not_recorded += 1,
             }
         }
     }
@@ -1719,7 +1944,8 @@ fn tally(actions: &[ReceiptAction], totals: &mut ReceiptTotals) {
 // ---------------------------------------------------------------------------
 
 /// One line of totals, verbs first: `Changed 4 files · ran 7 commands · 2
-/// approvals by you · 9 ran without asking under Full Access`.
+/// approved by you · 9 ran without asking under Full Access · 1 denied by
+/// you`.
 #[must_use]
 pub fn totals_line(receipt: &Receipt) -> String {
     let totals = &receipt.totals;
@@ -1766,19 +1992,19 @@ pub fn totals_line(receipt: &Receipt) -> String {
         ));
     }
     let approvals = &totals.approvals;
-    for (count, label) in [
-        (approvals.by_you, "by you"),
-        (approvals.by_session_rule, "by session rule"),
-        (approvals.by_posture, "by posture"),
-        (approvals.decider_not_recorded, "decider not recorded"),
-    ] {
-        if count > 0 {
-            parts.push(format!(
-                "{} {label}",
-                plural(count, "approval", "approvals")
-            ));
-        }
-    }
+    let by_decider = |verb: &str, by: &DeciderCounts| -> Vec<String> {
+        [
+            (by.you, "by you"),
+            (by.session_rule, "by session rule"),
+            (by.posture, "by posture"),
+            (by.not_recorded, "(decider not recorded)"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, who)| format!("{count} {verb} {who}"))
+        .collect()
+    };
+    parts.extend(by_decider("approved", &approvals.approved_by));
     if totals.ran_without_asking > 0 {
         let mut part = format!("{} ran without asking", totals.ran_without_asking);
         if !receipt.postures.is_empty() {
@@ -1786,11 +2012,12 @@ pub fn totals_line(receipt: &Receipt) -> String {
         }
         parts.push(part);
     }
-    if approvals.denied > 0 {
-        parts.push(format!("{} denied", approvals.denied));
-    }
+    parts.extend(by_decider("denied", &approvals.denied_by));
     if approvals.timed_out > 0 {
         parts.push(format!("{} timed out", approvals.timed_out));
+    }
+    if approvals.not_answered > 0 {
+        parts.push(format!("{} not answered", approvals.not_answered));
     }
     if approvals.pending > 0 {
         parts.push(format!("{} waiting", approvals.pending));
@@ -1875,14 +2102,39 @@ fn file_phrase(file: &FileTouch) -> String {
     format!("{verb} {}{counts}", file.path)
 }
 
+/// Inline code that survives backticks in the text: the fence is one
+/// backtick longer than the longest run inside it.
+fn code_span(text: &str) -> String {
+    let longest = text.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest + 1);
+    let pad = if text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{text}{pad}{fence}")
+}
+
+/// What the action did (or would have done), past tense and verb first.
+/// Every phrase starts with one of [`PHRASE_VERBS`], so a call that did not
+/// run can say so in the same words.
 fn action_phrase(action: &ReceiptAction) -> String {
     match &action.what {
         ActionKind::FileChange { files } => match files.as_slice() {
             [file] => file_phrase(file),
-            files => format!(
+            files if action.status == ActionStatus::Ok => format!(
                 "changed {} files: {}",
                 files.len(),
                 files.iter().map(file_phrase).collect::<Vec<_>>().join(", ")
+            ),
+            files => format!(
+                "changed {} files: {}",
+                files.len(),
+                files
+                    .iter()
+                    .map(|file| file.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         },
         ActionKind::Command {
@@ -1890,7 +2142,7 @@ fn action_phrase(action: &ReceiptAction) -> String {
             cwd,
             exit_code,
         } => {
-            let mut text = format!("ran `{command}`");
+            let mut text = format!("ran {}", code_span(command));
             if let Some(cwd) = cwd {
                 text.push_str(&format!(" in {cwd}"));
             }
@@ -1923,7 +2175,7 @@ fn action_phrase(action: &ReceiptAction) -> String {
             ("search", _, None) => "searched the web".to_string(),
             ("fetch", Some(host), _) => format!("fetched {host}"),
             ("git_fetch", Some(remote), _) => format!("fetched git remote {remote}"),
-            (other, Some(host), _) => format!("{} on {host}", other.replace('_', " ")),
+            (other, Some(host), _) => format!("called {host}: {}", other.replace('_', " ")),
             (other, None, _) => format!("made a web request ({other})"),
         },
         ActionKind::Mcp { server, .. } => {
@@ -1957,9 +2209,37 @@ fn action_phrase(action: &ReceiptAction) -> String {
             }
         }
         ActionKind::Approval => format!("asked to use {}", action.tool),
-        ActionKind::Tool => action.tool.clone(),
+        ActionKind::Tool => format!("called {}", action.tool),
         ActionKind::TurnFailed => "turn failed".to_string(),
     }
+}
+
+/// The past-tense verbs [`action_phrase`] starts with, and their base form.
+const PHRASE_VERBS: [(&str, &str); 11] = [
+    ("ran ", "run "),
+    ("edited ", "edit "),
+    ("created ", "create "),
+    ("deleted ", "delete "),
+    ("wrote ", "write "),
+    ("changed ", "change "),
+    ("searched ", "search "),
+    ("fetched ", "fetch "),
+    ("called ", "call "),
+    ("started ", "start "),
+    ("made ", "make "),
+];
+
+/// `ran `x`` becomes `did not run `x`` (lead `did not`) or `tried to run
+/// `x`` (lead `tried to`).
+fn with_base_verb(lead: &str, phrase: &str) -> String {
+    PHRASE_VERBS
+        .iter()
+        .find_map(|(past, base)| {
+            phrase
+                .strip_prefix(past)
+                .map(|rest| format!("{lead} {base}{rest}"))
+        })
+        .unwrap_or_else(|| format!("{lead} run: {phrase}"))
 }
 
 fn duration_label(ms: u64) -> String {
@@ -1977,8 +2257,13 @@ fn duration_label(ms: u64) -> String {
 pub fn action_line(action: &ReceiptAction) -> String {
     let mut line = action_phrase(action);
     match action.status {
+        // An approval line already reads as a request, not a run.
+        ActionStatus::NotRun if action.what == ActionKind::Approval => {}
         ActionStatus::NotRun => {
-            line = format!("did not run: {line}");
+            line = with_base_verb("did not", &line);
+            if let Some(error) = &action.error {
+                line.push_str(&format!(" — refused: {error}"));
+            }
         }
         ActionStatus::Failed => {
             line.push_str(" — failed");
@@ -1990,7 +2275,13 @@ pub fn action_line(action: &ReceiptAction) -> String {
         ActionStatus::Running if action.what != ActionKind::Approval => {
             line.push_str(" — still running")
         }
-        ActionStatus::Unknown => line.push_str(" — no result recorded"),
+        ActionStatus::Unknown => {
+            line = with_base_verb("tried to", &line);
+            match &action.error {
+                Some(error) => line.push_str(&format!(" — error, no exit code: {error}")),
+                None => line.push_str(" — no result recorded"),
+            }
+        }
         _ => {}
     }
     if let Some(ms) = action.duration_ms
@@ -2074,6 +2365,18 @@ pub fn render_markdown(receipt: &Receipt) -> String {
 #[must_use]
 pub fn render_json(receipt: &Receipt) -> String {
     serde_json::to_string_pretty(receipt).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// [`render_json`] inside a fenced code block, for a surface that renders
+/// Markdown (the terminal's note cell): the fence keeps `$`, `*`, and `_` in
+/// commands from being read as math or emphasis, and it is longer than any
+/// backtick run a command holds, so the JSON copies out whole.
+#[must_use]
+pub fn render_json_block(receipt: &Receipt) -> String {
+    let json = render_json(receipt);
+    let longest = json.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    format!("{fence}json\n{json}\n{fence}")
 }
 
 #[cfg(test)]

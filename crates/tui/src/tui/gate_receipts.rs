@@ -56,6 +56,30 @@ pub fn tool_gate_receipt(
     )
 }
 
+/// The `tool.gate.decision` record `audit.log` keeps for the same decision.
+/// The reason goes through the secret redactor: a reviewer's rationale can
+/// quote the command it judged. The caller adds `session_id`.
+#[must_use]
+pub fn tool_gate_audit_record(
+    agent_id: Option<&str>,
+    tool_id: &str,
+    tool_name: &str,
+    gate: ToolGate,
+    decision: ToolGateVerdict,
+    risk: Option<&str>,
+    reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "agent_id": agent_id,
+        "tool_id": tool_id,
+        "tool_name": tool_name,
+        "gate": gate.as_str(),
+        "decision": decision.as_str(),
+        "risk": risk,
+        "reason": codewhale_secrets::redact::redact_secrets(reason),
+    })
+}
+
 /// The receipt for a safety-floor hold that Auto-Review denied without
 /// pausing (the posture never opens a prompt).
 #[must_use]
@@ -88,6 +112,37 @@ fn bounded_tool_name(tool_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gate_audit_record_names_the_gate_and_redacts_the_reason() {
+        let record = tool_gate_audit_record(
+            None,
+            "call-1",
+            "bash",
+            ToolGate::AutoReviewDeterministic,
+            ToolGateVerdict::Denied,
+            None,
+            "blocked `curl -H 'Authorization: Bearer sk-live-abcdefghijklmnopqrstuv' x`",
+        );
+        assert_eq!(record["gate"], "auto_review_deterministic");
+        assert_eq!(record["decision"], "denied");
+        assert_eq!(record["tool_id"], "call-1");
+        let reason = record["reason"].as_str().expect("reason");
+        assert!(
+            !reason.contains("sk-live-abcdefghijklmnopqrstuv"),
+            "{reason}"
+        );
+
+        // Written where every other audit event goes.
+        let home = tempfile::tempdir().expect("tempdir");
+        crate::audit::log_sensitive_event_in(home.path(), "tool.gate.decision", record);
+        let log = std::fs::read_to_string(home.path().join("audit.log")).expect("audit.log");
+        assert!(log.contains("\"event\":\"tool.gate.decision\""), "{log}");
+        assert!(
+            log.contains("\"gate\":\"auto_review_deterministic\""),
+            "{log}"
+        );
+    }
 
     #[test]
     fn guardian_allow_names_tool_risk_and_reason() {

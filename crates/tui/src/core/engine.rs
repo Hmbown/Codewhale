@@ -7812,15 +7812,26 @@ pub(crate) enum MockApprovalEvent {
 #[cfg(test)]
 impl MockEngineHandle {
     pub(crate) async fn recv_approval_event(&mut self) -> Option<MockApprovalEvent> {
-        match self.rx_approval.recv().await? {
-            ApprovalDecision::Approved { id, .. } => Some(MockApprovalEvent::Approved { id }),
-            ApprovalDecision::Denied { id, .. } => Some(MockApprovalEvent::Denied { id }),
-            ApprovalDecision::TimedOut { id } => Some(MockApprovalEvent::TimedOut { id }),
-            ApprovalDecision::Unavailable { id } => Some(MockApprovalEvent::Unavailable { id }),
-            ApprovalDecision::RetryWithPolicy { id, policy, .. } => {
-                Some(MockApprovalEvent::RetryWithPolicy { id, policy })
+        self.recv_approval_decision().await.map(|(event, _)| event)
+    }
+
+    /// The next decision and who the host said made it (`None` for a
+    /// timeout or an unavailable request, which name their own cause).
+    pub(crate) async fn recv_approval_decision(
+        &mut self,
+    ) -> Option<(
+        MockApprovalEvent,
+        Option<crate::approval_log::ApprovalDecider>,
+    )> {
+        Some(match self.rx_approval.recv().await? {
+            ApprovalDecision::Approved { id, by } => (MockApprovalEvent::Approved { id }, Some(by)),
+            ApprovalDecision::Denied { id, by } => (MockApprovalEvent::Denied { id }, Some(by)),
+            ApprovalDecision::TimedOut { id } => (MockApprovalEvent::TimedOut { id }, None),
+            ApprovalDecision::Unavailable { id } => (MockApprovalEvent::Unavailable { id }, None),
+            ApprovalDecision::RetryWithPolicy { id, policy, by } => {
+                (MockApprovalEvent::RetryWithPolicy { id, policy }, Some(by))
             }
-        }
+        })
     }
 
     pub(crate) async fn recv_user_input_submission(

@@ -6,7 +6,9 @@
 //! the terminal and the saved record cannot tell two stories.
 
 use crate::commands::CommandResult;
-use crate::receipts::{ReceiptSource, SourceKind, render_json, render_markdown, session_receipt};
+use crate::receipts::{
+    ReceiptSource, SourceKind, render_json_block, render_markdown, session_receipt,
+};
 use crate::tui::app::App;
 
 pub fn receipts(app: &mut App, arg: Option<&str>) -> CommandResult {
@@ -49,7 +51,7 @@ pub fn receipts(app: &mut App, arg: Option<&str>) -> CommandResult {
         updated_at: None,
     };
     match session_receipt(source, &app.api_messages, &approvals, turn) {
-        Ok(receipt) if json => CommandResult::message(render_json(&receipt)),
+        Ok(receipt) if json => CommandResult::message(render_json_block(&receipt)),
         Ok(receipt) => CommandResult::message(render_markdown(&receipt).trim_end().to_string()),
         Err(error) => CommandResult::error(error.to_string()),
     }

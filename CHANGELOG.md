@@ -29,7 +29,9 @@ quieter, and Fleet runs can be checked before they spend anything.
   did, one line per action: files changed with line counts, commands with exit
   codes, web and MCP calls, agents, approvals and who gave them, and failures.
   They also count what ran without asking and name the posture each turn ran
-  under, read from the turn's own record. All three read the records Codewhale
+  under, read from the turn's own record. A call Codewhale blocked before it
+  started is listed as not run, with the reason, and is not counted as run.
+  All three read the records Codewhale
   already keeps and say what those records do not hold
   ([docs/RECEIPTS.md](docs/RECEIPTS.md)). `audit.log` is not that record: it
   logs security events, and it logs an approval only when one is requested,
