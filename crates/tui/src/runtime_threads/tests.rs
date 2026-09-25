@@ -18102,6 +18102,7 @@ fn saved_history_boundary_refuses_until_every_kept_prompt_is_seen() {
         saved_history_boundary(&repeated, &["same".to_string()], "same"),
         Some(1)
     );
+}
 
 /// #6522 review: `/resume`, `/load` and launch warm the canonical sessions
 /// root on a blocking thread, so the confinement predicate that follows on
