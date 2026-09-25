@@ -1237,35 +1237,13 @@ fn open_fetch_options(timeout_ms: u64) -> FetchOptions {
     )
 }
 
+/// A 401/403 earns one browser-agent retry inside [`fetch_readable`].
 async fn fetch_page(
     url: &str,
     timeout_ms: u64,
     context: &ToolContext,
 ) -> Result<WebPage, ToolError> {
-    with_browser_fallback(open_fetch_options(timeout_ms), |options| async move {
-        fetch_page_with(url, &options, context).await
-    })
-    .await
-}
-
-/// Many sites refuse non-browser agents outright. One retry as a browser is
-/// the fetch fallback; a second refusal is final.
-async fn with_browser_fallback<F, Fut>(
-    options: FetchOptions,
-    fetch: F,
-) -> Result<WebPage, ToolError>
-where
-    F: Fn(FetchOptions) -> Fut,
-    Fut: std::future::Future<Output = Result<WebPage, ToolError>>,
-{
-    match fetch(options.clone()).await {
-        Err(ToolError::ExecutionFailed { message })
-            if matches!(http_status_of(&message), Some(401 | 403)) =>
-        {
-            fetch(options.with_browser_user_agent()).await
-        }
-        other => other,
-    }
+    fetch_page_with(url, &open_fetch_options(timeout_ms), context).await
 }
 
 async fn fetch_page_with(
@@ -1293,25 +1271,18 @@ async fn fetch_page_with_initial_pin(
     context: &ToolContext,
     initial_pin: Option<DnsPin>,
 ) -> Result<WebPage, ToolError> {
-    let initial_pin = initial_pin.flatten();
-    with_browser_fallback(open_fetch_options(timeout_ms), |options| {
-        let initial_pin = initial_pin.clone();
-        async move {
-            let readable = fetch_readable_with_initial_pin(
-                url,
-                &options,
-                context,
-                "web_run",
-                initial_pin,
-                |payload: super::web::fetch::FetchedPayload| {
-                    Box::pin(async move { document_from_fetched(&payload, context).await })
-                },
-            )
-            .await?;
-            page_from_document(readable.payload, readable.document, context)
-        }
-    })
-    .await
+    let readable = fetch_readable_with_initial_pin(
+        url,
+        &open_fetch_options(timeout_ms),
+        context,
+        "web_run",
+        initial_pin.flatten(),
+        |payload: super::web::fetch::FetchedPayload| {
+            Box::pin(async move { document_from_fetched(&payload, context).await })
+        },
+    )
+    .await?;
+    page_from_document(readable.payload, readable.document, context)
 }
 
 /// Reject non-2xx responses, then extract one readable document.
@@ -1992,11 +1963,9 @@ mod tests {
         assert_eq!(search["results"][0]["domain"], "docs.example.com");
         assert_eq!(search["receipt"]["backend"], "searxng");
         assert_eq!(search["receipt"]["honored"]["domains"], true);
-        assert!(
-            search["warning"]
-                .as_str()
-                .expect("visible degraded warning")
-                .contains("recency")
+        assert_eq!(
+            search["receipt"]["honored"]["recency"], true,
+            "SearXNG forwards recency as time_range"
         );
     }
 

@@ -971,7 +971,7 @@ pub(crate) async fn apply_model_picker_choice(
         let provider_identity = app.provider_identity_for_persistence().to_string();
         app.provider_models
             .insert(provider_identity.clone(), resolved_model.clone());
-        app.enable_provider_model(&provider_identity, &resolved_model);
+        app.note_route_used(&provider_identity, &resolved_model);
         app.clear_model_scoped_telemetry();
     }
     let preference_changed = if model_is_auto && !preserve_auto_effort {
@@ -1364,6 +1364,7 @@ pub(crate) async fn apply_command_result(
                             return Ok(false);
                         }
                     };
+                crate::runtime_threads::prepare_canonical_sessions_root().await;
                 let respawn = match apply_loaded_session_config_snapshot(
                     app,
                     config,
@@ -1717,6 +1718,15 @@ pub(crate) async fn apply_command_result(
                 {
                     app.status_message = Some(format!("Could not cancel {agent_id}"));
                 }
+            }
+            AppAction::RouterSetup { request } => {
+                crate::tui::views::router_setup::handle_router_request(
+                    app,
+                    config,
+                    task_manager,
+                    request,
+                )
+                .await;
             }
             AppAction::FetchBalance => {
                 let provider = app.api_provider;

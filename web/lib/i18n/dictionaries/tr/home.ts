@@ -16,6 +16,7 @@ export const home: HomeDict = {
   heroIntro:
     "{brand}, yazılım geliştirebilen, dosyaların üzerinde çalışabilen ve tekrarlanan görevleri yeniden kullanılabilir iş akışlarına dönüştürebilen ajanlar sunar. Onlara ne yapmak istediğini anlat ve işe uygun barındırılan veya yerel modelleri seç; çalışırken sağlayıcı değiştirmekte özgürsün.",
   getCodewhale: "Codewhale'i edin",
+  heroInstallAria: "Kurulum komutu",
   exploreProduct: "Ürünü keşfet",
   shotPreview: "Terminal önizlemesi",
   shotBuild: "v{version} geliştirme derlemesi",

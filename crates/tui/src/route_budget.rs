@@ -254,7 +254,17 @@ pub(crate) fn effective_max_output_tokens_for_route(
     // With a known route window and no published output limit, reserve a
     // conservative part of that window. The model-only fallback reserved 64K even
     // for a configured 32K Ollama route, leaving just 1K for input (#5820).
+    // The same squeeze hit the capability *fallback* window: an unknown local
+    // Ollama tag resolves to an 8K window with no route limits, the model-only
+    // 64K request clamped to 6K, and the input budget collapsed to 1K — every
+    // turn tripped emergency compaction before its first request (#6540). So a
+    // model-only request larger than half of whatever window is in force also
+    // yields to the window-relative reservation.
     // Explicit requests and documented ceilings retain their existing rules.
+    let model_only_cap = effective_max_output_tokens(model);
+    let window_known = route_limits
+        .and_then(|limits| limits.context_tokens)
+        .is_some_and(|tokens| (1..=u64::from(u32::MAX)).contains(&tokens));
     let requested_cap = if explicit_max_output_tokens_override().is_none()
         && codewhale_models::max_output_tokens_for_model(model).is_none()
         && route_cap.is_none()
@@ -262,13 +272,11 @@ pub(crate) fn effective_max_output_tokens_for_route(
             compatibility_source,
             OutputCeilingSource::RouteDeclaredUnknown | OutputCeilingSource::Uncatalogued(_)
         )
-        && route_limits
-            .and_then(|limits| limits.context_tokens)
-            .is_some_and(|tokens| (1..=u64::from(u32::MAX)).contains(&tokens))
+        && (window_known || model_only_cap > window / 2)
     {
         (window / 4).clamp(1, UNCATALOGUED_COMPAT_MAX_OUTPUT_TOKENS)
     } else {
-        effective_max_output_tokens(model)
+        model_only_cap
     };
     // Unknown means unknown only where a route *declares* it: membership ids
     // such as the `kimi-for-coding` family, and operator-owned self-hosted
@@ -474,6 +482,44 @@ mod tests {
                 })
             ),
             4_096
+        );
+    }
+
+    /// #6540: the runtime store's 15 failed compactions were all emergency
+    /// passes on an unknown local Ollama tag (`qwen3:4b`) with no route
+    /// limits: the capability fallback window (8K) minus a 6K output
+    /// reservation left a ~1K input budget, so every first request of a turn
+    /// tripped preflight recovery. The fallback window must keep the same
+    /// input room a configured window of that size gets.
+    #[test]
+    fn provider_regression_6540_fallback_window_keeps_room_for_input() {
+        let _lock = crate::test_support::lock_test_env();
+        let _canonical = crate::test_support::EnvVarGuard::remove("CODEWHALE_MAX_OUTPUT_TOKENS");
+        let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_MAX_OUTPUT_TOKENS");
+        let model = "qwen3:4b";
+        assert!(codewhale_models::max_output_tokens_for_model(model).is_none());
+        let window = route_context_window_tokens(ApiProvider::Ollama, model, None);
+        assert_eq!(
+            window, 8_192,
+            "unknown local tags keep the conservative window"
+        );
+
+        let wire_cap = effective_max_output_tokens_for_route(ApiProvider::Ollama, model, None);
+        assert_eq!(wire_cap, 2_048);
+        let budget = route_context_budget(ApiProvider::Ollama, model, None, 0).unwrap();
+        assert_eq!(budget.output_cap_tokens, u64::from(wire_cap));
+        assert_eq!(budget.input_budget_ceiling, 8_192 - 2_048 - 1_024);
+        // The recorded first-request estimates (~1.9K–3.9K) now fit.
+        assert!(budget.input_budget_ceiling > 3_900, "{budget:?}");
+
+        // Same answer as the explicitly configured 8K window (#5820).
+        let configured = Some(RouteLimits {
+            context_tokens: Some(8_192),
+            ..RouteLimits::default()
+        });
+        assert_eq!(
+            effective_max_output_tokens_for_route(ApiProvider::Ollama, model, configured),
+            wire_cap
         );
     }
 

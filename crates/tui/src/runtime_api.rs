@@ -408,6 +408,25 @@ struct SkillsResponse {
 #[derive(Debug, Serialize)]
 struct AgentRunsResponse {
     runs: Vec<AgentWorkerRecord>,
+    /// Live launch-governor state for agents this runtime launches (Fleet
+    /// runs), so a client can say why a queued run waits (addendum F5).
+    governor: AgentRunsGovernor,
+}
+
+/// The rate-limit governor behind agent launches, as of this response.
+#[derive(Debug, Serialize)]
+struct AgentRunsGovernor {
+    /// Launch slots currently granted, after any rate-limit shrink.
+    launch_slots: usize,
+    /// Configured launch concurrency.
+    max_launch_slots: usize,
+    /// New launches are held entirely after sustained provider rate limits.
+    paused: bool,
+    /// Provider rate limits seen inside the governor's sliding window.
+    recent_rate_limits: usize,
+    /// One human line while launches are held back; absent at full speed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2068,7 +2087,22 @@ async fn list_agent_runs(
     let runs = load_persisted_agent_worker_records(&state.workspace).map_err(|err| {
         ApiError::internal(format!("Failed to load persisted agent run records: {err}"))
     })?;
-    Ok(Json(AgentRunsResponse { runs }))
+    let snapshot = state
+        .sub_agent_manager
+        .read()
+        .await
+        .rate_limit_governor()
+        .snapshot(std::time::Instant::now());
+    Ok(Json(AgentRunsResponse {
+        runs,
+        governor: AgentRunsGovernor {
+            launch_slots: snapshot.launch_capacity,
+            max_launch_slots: snapshot.max_capacity,
+            paused: snapshot.paused,
+            recent_rate_limits: snapshot.window_limited,
+            status: snapshot.status_line(),
+        },
+    }))
 }
 
 async fn get_agent_run(

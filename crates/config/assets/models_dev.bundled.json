@@ -2757,6 +2757,39 @@
         "XAI_API_KEY"
       ],
       "models": {
+        "grok-4.7": {
+          "id": "grok-4.7",
+          "name": "Grok 4.7",
+          "family": "grok",
+          "attachment": true,
+          "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh"
+              ],
+              "default": "high"
+            }
+          ],
+          "tool_call": true,
+          "structured_output": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 500000
+          }
+        },
         "grok-4.6": {
           "id": "grok-4.6",
           "name": "Grok 4.6",

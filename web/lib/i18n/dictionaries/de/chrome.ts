@@ -25,19 +25,9 @@ export const chrome: ChromeDict = {
   navCommunity: "Community",
   navContribute: "Mitwirken",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
-
   navProduct: "Produkt",
   navModels: "Modelle",
   navPlugins: "Plugins",
-  navProductSecondary: "Product",
-  navModelsSecondary: "Models",
-  navPluginsSecondary: "Plugins",
 
   skipToContent: "Zum Hauptinhalt springen",
 
@@ -47,17 +37,12 @@ export const chrome: ChromeDict = {
   installCta: "Installieren →",
 
   authSignIn: "Anmelden",
-  authRegister: "Registrieren",
-  authGroupAria: "Konto",
 
   wordmarkSeal: "深",
   wordmarkTag: "jedes Modell, auf deiner Maschine",
 
   issueLabel: "Ausgabe vom {date}",
   dateLocale: "de-DE",
-
-  starsAria: "GitHub-Sterne",
-  githubFallback: "GitHub",
 
   tickerLiveLabel: "Echtzeit",
   tickerLiveTag: "LIVE",
@@ -78,8 +63,8 @@ export const chrome: ChromeDict = {
   themeAuto: "auto",
   themeLight: "hell",
   themeDark: "dunkel",
-  themeAria: "Dokumentations-Design: {mode} (Klick zum Wechseln)",
-  themeTitle: "Dokumentations-Design · auto / hell / dunkel",
+  themeAria: "Design: {mode} (Klick zum Wechseln)",
+  themeTitle: "Design · auto / hell / dunkel",
 
   footerTagline:
     "Erstelle, was du möchtest, und automatisiere alltägliche Arbeit mit den Modellen deiner Wahl.",

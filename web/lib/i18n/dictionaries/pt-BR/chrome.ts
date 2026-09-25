@@ -14,22 +14,11 @@ export const chrome: ChromeDict = {
   navCommunity: "Comunidade",
   navContribute: "Contribuir",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
-
   navProduct: "Produto",
   navModels: "Modelos",
   navPlugins: "Plugins",
-  navProductSecondary: "Product",
-  navModelsSecondary: "Models",
-  navPluginsSecondary: "Plugins",
 
   skipToContent: "Pular para o conteúdo principal",
-
 
   navPrimaryAria: "Navegação principal",
   navHomeAria: "Início do Codewhale",
@@ -37,17 +26,12 @@ export const chrome: ChromeDict = {
   installCta: "Instalar →",
 
   authSignIn: "Entrar",
-  authRegister: "Criar conta",
-  authGroupAria: "Conta",
 
   wordmarkSeal: "深",
   wordmarkTag: "qualquer modelo, na sua máquina",
 
   issueLabel: "Edição {date}",
   dateLocale: "pt-BR",
-
-  starsAria: "Estrelas no GitHub",
-  githubFallback: "GitHub",
 
   tickerLiveLabel: "Ao vivo",
   tickerLiveTag: "LIVE",
@@ -68,8 +52,8 @@ export const chrome: ChromeDict = {
   themeAuto: "auto",
   themeLight: "claro",
   themeDark: "escuro",
-  themeAria: "Tema da documentação: {mode} (clique para alternar)",
-  themeTitle: "Tema da documentação · auto / claro / escuro",
+  themeAria: "Tema: {mode} (clique para alternar)",
+  themeTitle: "Tema · auto / claro / escuro",
 
   footerTagline:
     "Crie o que quiser e automatize o trabalho do dia a dia com os modelos que você escolher.",

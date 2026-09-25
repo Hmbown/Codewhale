@@ -969,6 +969,25 @@ fn encode_within_budget(
     Err(over_budget_error(path, budget, smallest))
 }
 
+/// Fit `image` to `max_edge` and encode it within `budget` on the same ladder
+/// `read_media` delivers with. Attach-time ingest (`image_attach`) shares it,
+/// so a pasted Retina screenshot is normalized exactly like a tool read.
+pub(crate) fn fit_and_encode(
+    image: &DynamicImage,
+    max_edge: u32,
+    budget: usize,
+    path: &std::path::Path,
+) -> Result<(Vec<u8>, &'static str), ToolError> {
+    let (width, height) = image.dimensions();
+    let fitted = if width.max(height) > max_edge {
+        image.resize(max_edge, max_edge, FilterType::Lanczos3)
+    } else {
+        image.clone()
+    };
+    let outcome = encode_within_budget(&fitted, classify_image(&fitted), budget, path)?;
+    Ok((outcome.bytes, outcome.mime))
+}
+
 /// Fail-closed error naming the exact conversion recipe to retry with.
 fn over_budget_error(
     path: &std::path::Path,

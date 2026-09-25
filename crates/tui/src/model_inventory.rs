@@ -6,8 +6,10 @@
 
 use serde::Serialize;
 
+use crate::client::system_one::DecisionRouterRoute;
 use crate::config::{
-    ApiProvider, Config, has_api_key_for, normalize_model_name_for_provider, provider_capability,
+    ApiProvider, AutoRouterKind, Config, has_api_key_for, normalize_model_name_for_provider,
+    provider_capability,
 };
 use crate::provider_lake::models_for_provider;
 
@@ -50,6 +52,45 @@ pub(crate) struct ModelRouteCandidate {
     pub(crate) tags: Vec<&'static str>,
 }
 
+/// Why a declared `[auto.router]` cannot run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AutoRouterSetupIssue {
+    /// `kind` is neither `"chat"` nor `"decision"`.
+    UnknownKind,
+    /// `kind = "decision"` names a provider that serves no decision API.
+    UnsupportedDecisionProvider,
+    /// `provider` or `model` is missing (or the chat provider is unknown).
+    Incomplete,
+    /// The route is complete but its credential is missing.
+    MissingKey,
+}
+
+impl AutoRouterSetupIssue {
+    #[must_use]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::UnknownKind => "unknown [auto.router] kind (expected \"chat\" or \"decision\")",
+            Self::UnsupportedDecisionProvider => {
+                "decision routers are served by OpenRouter or TypeSafe"
+            }
+            Self::Incomplete => "[auto.router] needs a known provider and a model",
+            Self::MissingKey => "no API key for the router route",
+        }
+    }
+}
+
+/// Probability or confidence (0..=1) as basis points, so receipts and the
+/// inventory stay `Eq` and never re-render a float.
+#[must_use]
+pub(crate) fn probability_bp(value: f64) -> u16 {
+    if !value.is_finite() {
+        return 0;
+    }
+    // Bounded to 0..=10000 before the cast.
+    (value.clamp(0.0, 1.0) * 10_000.0).round() as u16
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ModelInventory {
     pub(crate) active_provider: ApiProvider,
@@ -64,6 +105,19 @@ pub(crate) struct ModelInventory {
     /// holding a provider key never elects a network classifier by itself.
     pub(crate) router_configured: bool,
     pub(crate) router_available: bool,
+    /// `[auto.router] kind` (#6525); an unknown kind leaves the router
+    /// unconfigured and sets [`Self::router_setup_issue`].
+    pub(crate) router_kind: AutoRouterKind,
+    /// Endpoint for a decision router (`None` for chat routers).
+    pub(crate) router_decision_route: Option<DecisionRouterRoute>,
+    /// Decision-router endpoint override (TypeSafe only).
+    pub(crate) router_base_url: Option<String>,
+    /// Decision-router confidence floor in basis points (0..=10000).
+    pub(crate) router_min_confidence_bp: u16,
+    /// Why a declared `[auto.router]` cannot run. `None` when no router is
+    /// declared or the router is available. A declared-but-unusable router is
+    /// shown as failing, never silently ignored.
+    pub(crate) router_setup_issue: Option<AutoRouterSetupIssue>,
     /// `[auto] cross_provider = true` opt-in (#4411). When false (the
     /// default), Auto routing — classifier payload included — is confined to
     /// `active_provider`. The full candidate list still carries every
@@ -239,45 +293,107 @@ impl ModelInventory {
         // every Auto turn, spending a user's tokens on a route they never asked
         // for and privileging one provider. With no explicit `[auto.router]`,
         // legacy Auto is now local/free (heuristic-only).
-        let explicit_router = config
-            .auto
-            .as_ref()
-            .and_then(|auto| auto.router.as_ref())
-            .and_then(|router| {
-                let provider = router.provider.as_deref().and_then(ApiProvider::parse)?;
-                let model = router
-                    .model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())?;
-                Some((
-                    provider,
-                    model.to_string(),
-                    router
-                        .thinking
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|t| !t.is_empty())
-                        .map(str::to_string),
-                ))
-            });
+        let router_table = config.auto.as_ref().and_then(|auto| auto.router.as_ref());
+        // Any populated key declares a router: a table holding only
+        // `timeout_secs` or `base_url` is a malformed router to diagnose, not
+        // an absent one to skip silently.
+        let router_declared = router_table.is_some_and(|router| {
+            router.provider.is_some()
+                || router.model.is_some()
+                || router.kind.is_some()
+                || router.thinking.is_some()
+                || router.timeout_secs.is_some()
+                || router.min_confidence.is_some()
+                || router.base_url.is_some()
+        });
+        let router_kind = AutoRouterKind::parse(router_table.and_then(|r| r.kind.as_deref()));
+        let router_model_setting = router_table
+            .and_then(|router| router.model.as_deref())
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
+        let router_provider_setting = router_table
+            .and_then(|router| router.provider.as_deref())
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty());
+        let mut router_setup_issue = None;
+        let mut router_decision_route = None;
+        let explicit_router = match router_kind {
+            None => {
+                router_setup_issue = Some(AutoRouterSetupIssue::UnknownKind);
+                None
+            }
+            Some(AutoRouterKind::Chat) => router_provider_setting
+                .and_then(ApiProvider::parse)
+                .zip(router_model_setting)
+                .map(|(provider, model)| {
+                    (
+                        provider,
+                        model.to_string(),
+                        router_table
+                            .and_then(|router| router.thinking.as_deref())
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_string),
+                    )
+                }),
+            Some(AutoRouterKind::Decision) => {
+                match router_provider_setting.map(DecisionRouterRoute::parse) {
+                    Some(None) => {
+                        router_setup_issue =
+                            Some(AutoRouterSetupIssue::UnsupportedDecisionProvider);
+                        None
+                    }
+                    Some(Some(route)) => router_model_setting.map(|model| {
+                        router_decision_route = Some(route);
+                        // A decision model has no reasoning knob, so the
+                        // configured `thinking` is ignored. TypeSafe is not a
+                        // chat provider; `router_provider` is only a label
+                        // there, and `router_decision_route` is authoritative.
+                        (ApiProvider::Openrouter, model.to_string(), None)
+                    }),
+                    None => None,
+                }
+            }
+        };
         let router_configured = explicit_router.is_some();
         let (router_provider, router_model, router_thinking) = explicit_router
             // Kept only as an inert display/default label for the router fields;
             // `router_available` below is what gates any classifier call.
             .unwrap_or_else(|| (ApiProvider::Deepseek, "deepseek-v4-flash".to_string(), None));
+        let router_available = router_configured
+            && match router_decision_route {
+                Some(route) => route.has_key(config),
+                None => has_api_key_for(config, router_provider),
+            };
+        if router_declared && router_setup_issue.is_none() && !router_available {
+            router_setup_issue = Some(if router_configured {
+                AutoRouterSetupIssue::MissingKey
+            } else {
+                AutoRouterSetupIssue::Incomplete
+            });
+        }
 
         let cross_provider_auto = config.auto_cross_provider();
         let router_timeout_secs = config.auto_router_timeout_secs();
+        let router_min_confidence_bp = probability_bp(config.auto_router_min_confidence());
 
         Self {
             active_provider,
             router_provider,
             router_configured,
-            router_available: router_configured && has_api_key_for(config, router_provider),
+            router_available,
             router_model,
             router_thinking,
             router_timeout_secs,
+            router_kind: router_kind.unwrap_or(AutoRouterKind::Chat),
+            router_decision_route,
+            router_base_url: router_table
+                .and_then(|router| router.base_url.as_deref())
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(str::to_string),
+            router_min_confidence_bp,
+            router_setup_issue,
             cross_provider_auto,
             candidates,
         }
@@ -773,6 +889,7 @@ mod tests {
                     model: Some("local-router".to_string()),
                     thinking: None,
                     timeout_secs: Some(15),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -788,6 +905,7 @@ mod tests {
                     model: Some("local-router".to_string()),
                     thinking: None,
                     timeout_secs: Some(9_999),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -806,6 +924,7 @@ mod tests {
                     model: Some("local-router".to_string()),
                     thinking: None,
                     timeout_secs: Some(0),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -860,6 +979,7 @@ mod tests {
                     model: Some("glm-5-turbo".to_string()),
                     thinking: Some("low".to_string()),
                     timeout_secs: None,
+                    ..Default::default()
                 }),
             }),
             ..Default::default()
@@ -908,6 +1028,7 @@ mod tests {
                     model: Some("glm-5-turbo".to_string()),
                     thinking: None,
                     timeout_secs: None,
+                    ..Default::default()
                 }),
                 cross_provider: None,
             }),
@@ -983,6 +1104,11 @@ mod tests {
             router_timeout_secs: 4,
             router_configured: false,
             router_available: false,
+            router_kind: AutoRouterKind::Chat,
+            router_decision_route: None,
+            router_base_url: None,
+            router_min_confidence_bp: 5_000,
+            router_setup_issue: None,
             cross_provider_auto: false,
             candidates: vec![ModelRouteCandidate {
                 provider: ApiProvider::Openai,
@@ -1147,6 +1273,7 @@ mod tests {
                     model: Some("deepseek-v4-flash".to_string()),
                     thinking: None,
                     timeout_secs: None,
+                    ..Default::default()
                 }),
             }),
             ..zai.clone()
@@ -1281,5 +1408,155 @@ mod tests {
         );
         crate::provider_catalog_live::reset_cache_for_test();
         crate::provider_lake::clear_live_snapshot();
+    }
+}
+
+#[cfg(test)]
+mod decision_router_inventory_tests {
+    use super::*;
+
+    fn with_router(router: crate::config::AutoRouterConfig, openrouter_key: bool) -> Config {
+        Config {
+            provider: Some("deepseek".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                openrouter: crate::config::ProviderConfig {
+                    api_key: openrouter_key.then(|| "or-test-key".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            auto: Some(crate::config::AutoConfig {
+                cost_saving: None,
+                cross_provider: None,
+                router: Some(router),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn decision(provider: &str) -> crate::config::AutoRouterConfig {
+        crate::config::AutoRouterConfig {
+            kind: Some("decision".to_string()),
+            provider: Some(provider.to_string()),
+            model: Some("typesafe/jev-1.13".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Tuple fields drop in order: restore the environment, then unlock.
+    fn hermetic() -> (
+        crate::test_support::EnvVarGuard,
+        crate::test_support::EnvVarGuard,
+        crate::test_support::TestEnvLock,
+    ) {
+        let lock = crate::test_support::lock_test_env();
+        (
+            crate::test_support::EnvVarGuard::remove("OPENROUTER_API_KEY"),
+            crate::test_support::EnvVarGuard::remove("TYPESAFE_API_KEY"),
+            lock,
+        )
+    }
+
+    #[test]
+    fn decision_router_on_openrouter_needs_the_openrouter_key() {
+        let _env = hermetic();
+        let with_key = ModelInventory::from_config(&with_router(decision("openrouter"), true));
+        assert!(with_key.router_configured);
+        assert!(with_key.router_available);
+        assert_eq!(with_key.router_kind, AutoRouterKind::Decision);
+        assert_eq!(
+            with_key.router_decision_route,
+            Some(DecisionRouterRoute::Openrouter)
+        );
+        assert_eq!(
+            with_key.router_thinking, None,
+            "decision models ignore thinking"
+        );
+        assert_eq!(with_key.router_min_confidence_bp, 5_000);
+        assert_eq!(with_key.router_setup_issue, None);
+
+        let without_key = ModelInventory::from_config(&with_router(decision("openrouter"), false));
+        assert!(without_key.router_configured);
+        assert!(!without_key.router_available);
+        assert_eq!(
+            without_key.router_setup_issue,
+            Some(AutoRouterSetupIssue::MissingKey)
+        );
+    }
+
+    #[test]
+    fn unknown_kind_or_unsupported_decision_provider_is_not_configured() {
+        let _env = hermetic();
+        let bogus = crate::config::AutoRouterConfig {
+            kind: Some("bogus".to_string()),
+            ..decision("openrouter")
+        };
+        let inventory = ModelInventory::from_config(&with_router(bogus, true));
+        assert!(!inventory.router_configured);
+        assert!(!inventory.router_available);
+        assert_eq!(
+            inventory.router_setup_issue,
+            Some(AutoRouterSetupIssue::UnknownKind)
+        );
+
+        let zai = ModelInventory::from_config(&with_router(decision("zai"), true));
+        assert!(!zai.router_configured);
+        assert_eq!(
+            zai.router_setup_issue,
+            Some(AutoRouterSetupIssue::UnsupportedDecisionProvider)
+        );
+    }
+
+    #[test]
+    fn a_router_table_with_only_tuning_keys_is_declared_and_incomplete() {
+        let _env = hermetic();
+        let tuning_only = [
+            crate::config::AutoRouterConfig {
+                timeout_secs: Some(3),
+                ..Default::default()
+            },
+            crate::config::AutoRouterConfig {
+                min_confidence: Some(0.6),
+                ..Default::default()
+            },
+            crate::config::AutoRouterConfig {
+                thinking: Some("off".to_string()),
+                ..Default::default()
+            },
+            crate::config::AutoRouterConfig {
+                base_url: Some("https://api.typesafe.ai/v1".to_string()),
+                ..Default::default()
+            },
+        ];
+        for router in tuning_only {
+            let inventory = ModelInventory::from_config(&with_router(router.clone(), true));
+            assert!(!inventory.router_available, "{router:?}");
+            assert_eq!(
+                inventory.router_setup_issue,
+                Some(AutoRouterSetupIssue::Incomplete),
+                "{router:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn min_confidence_is_clamped() {
+        let _env = hermetic();
+        for (configured, expected) in [
+            (Some(2.0), 10_000),
+            (Some(-1.0), 0),
+            (Some(0.35), 3_500),
+            (None, 5_000),
+        ] {
+            let router = crate::config::AutoRouterConfig {
+                min_confidence: configured,
+                ..decision("openrouter")
+            };
+            assert_eq!(
+                ModelInventory::from_config(&with_router(router, true)).router_min_confidence_bp,
+                expected,
+                "{configured:?}"
+            );
+        }
     }
 }

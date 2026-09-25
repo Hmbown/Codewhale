@@ -16,6 +16,7 @@ export const home: HomeDict = {
   heroIntro:
     "{brand} menyediakan agen yang dapat membangun perangkat lunak, mengelola berkas Anda, dan mengubah tugas berulang menjadi alur kerja yang dapat digunakan kembali. Sampaikan apa yang ingin Anda capai dan pilih model yang dihosting atau dijalankan secara lokal sesuai kebutuhan tugas, dengan kebebasan untuk berganti penyedia selama bekerja.",
   getCodewhale: "Dapatkan Codewhale",
+  heroInstallAria: "Perintah instalasi",
   exploreProduct: "Jelajahi produk",
   shotPreview: "Pratinjau terminal",
   shotBuild: "build pengembangan v{version}",

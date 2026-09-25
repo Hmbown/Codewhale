@@ -13,6 +13,7 @@ import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { FACTS } from "./facts.generated";
 import { SNIPPETS, VERIFY } from "./install-binary-snippets";
+import { INSTALL_GUIDE } from "./install-guide.generated";
 import { getChrome, getHome } from "./i18n/dictionaries";
 import { footerProjectLinks } from "./i18n/links";
 import { TERMINAL_SCREENSHOT } from "./media-manifest";
@@ -264,7 +265,8 @@ describe("public surface contracts", () => {
     expect(installDoc).toContain("One Cargo package is required");
     expect(installDoc).toContain("`codewhale-cli` installs the `codewhale` command");
     expect(installDoc).toContain("Cargo does\nnot create that alias");
-    expect(installPage).toContain("# Install the compiled runtime as codewhale");
+    expect(installPage).toContain("INSTALL_GUIDE.chunks");
+    expect(INSTALL_GUIDE.chunks.some((chunk) => chunk.kind === "code" && chunk.text.includes("cargo install --path crates/cli --locked"))).toBe(true);
     expect(installPage).not.toContain("codewhale-tui");
     expect(npmReadme).toContain("installs `codewhale` plus the `codew` convenience name");
     expect(npmReadme).not.toContain("codewhale-tui");

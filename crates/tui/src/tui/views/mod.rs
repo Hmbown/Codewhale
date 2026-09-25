@@ -38,6 +38,7 @@ pub mod fleet_roster;
 pub mod fleet_setup;
 pub mod mode_picker;
 pub mod route_save_prompt;
+pub(crate) mod router_setup;
 pub mod skills_manager;
 pub mod status_picker;
 pub mod workflows_manager;
@@ -85,6 +86,8 @@ pub enum ModalKind {
     /// "Resume this session?" over the launch card. Resuming replaces the
     /// whole session context, so it asks first.
     LaunchResumeConfirm,
+    /// Router setup (`/router`, `/model router`): presets for `[auto.router]`.
+    RouterSetup,
 }
 
 /// Clear and paint a modal popup with an opaque surface.
@@ -5641,6 +5644,21 @@ pub struct SubAgentsView {
     /// the parked roster instead of stacking a second one. Direct entry
     /// (`/fleet workers`, the Work dock) leaves it false, so `Esc` closes.
     back_to_fleet_roster: bool,
+    /// Agent whose Stop is armed (addendum F4). Stopping an agent that can
+    /// change files takes two presses of `X` (or `X` then `Enter`); `Esc`
+    /// or moving the selection disarms it.
+    armed_stop: Option<String>,
+}
+
+/// Whether stopping this agent can strand file work, so `X` asks twice: it
+/// is still running and may write files (write permission or a full shell).
+/// Rows without a permission snapshot (live progress rows) stop on one press.
+fn subagent_stop_needs_confirm(agent: &SubAgentResult) -> bool {
+    agent.status == SubAgentStatus::Running
+        && agent
+            .runtime_permissions
+            .as_ref()
+            .is_some_and(|permissions| permissions.write || permissions.shell == "full")
 }
 
 /// Build the agent rows shown by `/subagents`.
@@ -5798,6 +5816,7 @@ impl SubAgentsView {
             locale: Locale::En,
             opened_at: std::time::Instant::now(),
             back_to_fleet_roster: false,
+            armed_stop: None,
         }
     }
 
@@ -5808,6 +5827,26 @@ impl SubAgentsView {
         view.motion = app.motion_policy().mode();
         view.locale = app.ui_locale;
         view
+    }
+
+    fn selected_agent(&self) -> Option<&SubAgentResult> {
+        let id = self.ordered_agent_ids().get(self.selected).cloned()?;
+        self.agents.iter().find(|agent| agent.agent_id == id)
+    }
+
+    /// `X`: stop the selected agent. One that can change files arms first and
+    /// stops on the second press, so a stray key cannot end a writer.
+    fn press_stop(&mut self) -> ViewAction {
+        let Some(agent) = self.selected_agent() else {
+            return ViewAction::None;
+        };
+        let agent_id = agent.agent_id.clone();
+        if subagent_stop_needs_confirm(agent) && self.armed_stop.as_deref() != Some(&agent_id) {
+            self.armed_stop = Some(agent_id);
+            return ViewAction::None;
+        }
+        self.armed_stop = None;
+        ViewAction::Emit(ViewEvent::SidebarAgentCancel { agent_id })
     }
 
     /// Mark this view as pushed on top of the Fleet roster (#5954), so the
@@ -5907,6 +5946,20 @@ impl ModalView for SubAgentsView {
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         use crossterm::event::KeyCode;
 
+        // An armed Stop (F4) owns Esc and Enter: Esc disarms without closing,
+        // Enter confirms — the same two-step the Work inspector's Stop uses.
+        if self.armed_stop.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.armed_stop = None;
+                    return ViewAction::None;
+                }
+                KeyCode::Enter => return self.press_stop(),
+                KeyCode::Char('x') | KeyCode::Char('X') => {}
+                _ => self.armed_stop = None,
+            }
+        }
+
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => ViewAction::Close,
             // Enter opens the selected agent's transcript — the same primary
@@ -5919,14 +5972,10 @@ impl ModalView for SubAgentsView {
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 ViewAction::Emit(ViewEvent::SubAgentsRefresh)
             }
-            // Manage: stop the selected worker. Terminal workers ignore the
-            // key; the cancel receipt names what happened either way.
-            KeyCode::Char('x') | KeyCode::Char('X') => {
-                match self.ordered_agent_ids().get(self.selected).cloned() {
-                    Some(agent_id) => ViewAction::Emit(ViewEvent::SidebarAgentCancel { agent_id }),
-                    None => ViewAction::None,
-                }
-            }
+            // Manage: stop the selected agent. Terminal agents ignore the
+            // key; the cancel receipt names what happened either way. A
+            // running agent that can change files asks twice (F4).
+            KeyCode::Char('x') | KeyCode::Char('X') => self.press_stop(),
             // The roster is the same destination either way: pop back to the
             // parked one when there is one (#5954) — re-running `/fleet`
             // would stack a duplicate roster and lose its cursor.
@@ -6010,6 +6059,15 @@ impl ModalView for SubAgentsView {
                     .position(|candidate| candidate == &id)
             })
             .unwrap_or_else(|| self.selected.min(last));
+        // An armed Stop only survives while its agent is still selected and
+        // still needs the confirm (it may have finished meanwhile).
+        let still_armed = self.armed_stop.as_deref().is_some_and(|armed| {
+            self.selected_agent()
+                .is_some_and(|agent| agent.agent_id == armed && subagent_stop_needs_confirm(agent))
+        });
+        if !still_armed {
+            self.armed_stop = None;
+        }
         true
     }
 
@@ -6162,7 +6220,14 @@ impl ModalView for SubAgentsView {
                 ActionHint::new("Esc", self.esc_hint_label()),
                 ActionHint::new("↑/↓", tr(self.locale, MessageId::CtxInspActionSelect)),
                 ActionHint::new("Enter", tr(self.locale, MessageId::ExtensionsActionFocus)),
-                ActionHint::new("X", tr(self.locale, MessageId::SidebarStopControl)),
+                if self.armed_stop.is_some() {
+                    ActionHint::new(
+                        "X/Enter",
+                        tr(self.locale, MessageId::WorkSurfaceStopConfirmHint),
+                    )
+                } else {
+                    ActionHint::new("X", tr(self.locale, MessageId::SidebarStopControl))
+                },
                 ActionHint::new("R", tr(self.locale, MessageId::SubagentsActionRefresh)),
                 ActionHint::new("F", tr(self.locale, MessageId::SubagentsActionRosterSetup)),
             ],
@@ -7257,6 +7322,100 @@ mod tests {
             started_at: None,
             from_prior_session: false,
         }
+    }
+
+    fn writer_agent(id: &str) -> SubAgentResult {
+        let mut agent = manager_agent(id, SubAgentStatus::Running);
+        agent.runtime_permissions = Some(codewhale_protocol::fleet::FleetEffectivePermissions {
+            write: true,
+            network: false,
+            shell: "read_only".to_string(),
+            tool_scope: "inherit".to_string(),
+            tools: Vec::new(),
+            background: false,
+            max_spawn_depth: 0,
+            profile_id: None,
+            profile_origin: None,
+            source: "test".to_string(),
+        });
+        agent
+    }
+
+    fn press(view: &mut SubAgentsView, code: KeyCode) -> ViewAction {
+        view.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn is_stop_of(action: &ViewAction, id: &str) -> bool {
+        matches!(
+            action,
+            ViewAction::Emit(ViewEvent::SidebarAgentCancel { agent_id }) if agent_id == id
+        )
+    }
+
+    #[test]
+    fn stopping_a_writing_agent_takes_two_presses_and_esc_disarms() {
+        let mut view = SubAgentsView::new(vec![writer_agent("w")]);
+
+        // First X arms; nothing is stopped yet and the footer asks to confirm.
+        assert!(matches!(
+            press(&mut view, KeyCode::Char('x')),
+            ViewAction::None
+        ));
+        let area = Rect::new(0, 0, 100, 20);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+        assert!(buffer_text(&buf, area).contains("X/Enter"));
+
+        // Esc disarms without closing the register.
+        assert!(matches!(press(&mut view, KeyCode::Esc), ViewAction::None));
+        assert!(view.armed_stop.is_none());
+
+        // X, X stops; X then Enter stops too.
+        assert!(matches!(
+            press(&mut view, KeyCode::Char('X')),
+            ViewAction::None
+        ));
+        assert!(is_stop_of(&press(&mut view, KeyCode::Char('X')), "w"));
+        assert!(matches!(
+            press(&mut view, KeyCode::Char('x')),
+            ViewAction::None
+        ));
+        assert!(is_stop_of(&press(&mut view, KeyCode::Enter), "w"));
+        assert!(view.armed_stop.is_none());
+    }
+
+    #[test]
+    fn stopping_a_read_only_or_moved_selection_does_not_need_the_armed_press() {
+        // A read-only running agent (no write, no full shell) stops at once.
+        let mut read_only = writer_agent("r");
+        if let Some(permissions) = read_only.runtime_permissions.as_mut() {
+            permissions.write = false;
+        }
+        let mut view = SubAgentsView::new(vec![read_only]);
+        assert!(is_stop_of(&press(&mut view, KeyCode::Char('x')), "r"));
+
+        // Moving the selection disarms: the next X on the other writer arms
+        // afresh instead of stopping it.
+        let mut view = SubAgentsView::new(vec![writer_agent("a"), writer_agent("b")]);
+        assert!(matches!(
+            press(&mut view, KeyCode::Char('x')),
+            ViewAction::None
+        ));
+        press(&mut view, KeyCode::Down);
+        assert!(view.armed_stop.is_none());
+        assert!(matches!(
+            press(&mut view, KeyCode::Char('x')),
+            ViewAction::None
+        ));
+        assert!(is_stop_of(&press(&mut view, KeyCode::Char('x')), "b"));
+
+        // An armed agent that finishes before the confirm is disarmed.
+        let mut view = SubAgentsView::new(vec![writer_agent("w")]);
+        press(&mut view, KeyCode::Char('x'));
+        let mut done = writer_agent("w");
+        done.status = SubAgentStatus::Completed;
+        view.update_subagents(&[done]);
+        assert!(view.armed_stop.is_none());
     }
 
     #[test]

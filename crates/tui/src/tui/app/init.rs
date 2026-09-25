@@ -366,11 +366,10 @@ impl App {
         }
         provider_models.insert(provider_identity.clone(), model.clone());
         let auto_model = model.trim().eq_ignore_ascii_case("auto");
-        let mut enabled_provider_models = settings.enabled_models.clone().unwrap_or_default();
-        for (saved_provider, saved_model) in &provider_models {
-            push_enabled_provider_model(&mut enabled_provider_models, saved_provider, saved_model);
-        }
-        push_enabled_provider_model(&mut enabled_provider_models, &provider_identity, &model);
+        // `settings.toml [enabled_models]` is no longer read (#6533): the
+        // picker ranks by use, which this index derives from saved sessions.
+        let route_usage = crate::model_relevance::SharedRouteUsage::default();
+        crate::model_relevance::spawn_build(route_usage.clone());
         let active_context_window_override = config.context_window_for_provider_config(provider);
         let active_model_context_windows = config.model_context_windows_for(provider).cloned();
         let configured_route_base_url = effective_auth_config.active_route_base_url();
@@ -817,7 +816,7 @@ impl App {
             plugin_cta: crate::tui::plugin_suggestions::PluginCtaState::from_settings(&settings),
             model,
             provider_models,
-            enabled_provider_models,
+            route_usage,
             configured_models: config.custom_models.clone().unwrap_or_default(),
             pinned_models: settings.pinned_models.clone(),
             auto_model,

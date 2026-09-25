@@ -1224,6 +1224,9 @@
         {
           "id": "grok-4.6",
           "default": true
+        },
+        {
+          "id": "grok-4.7"
         }
       ],
       "transport": "chat-completions"

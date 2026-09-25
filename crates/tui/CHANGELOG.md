@@ -16,6 +16,15 @@ Planned for Codewhale v0.10.1: a reliability and first-run release. Turns that
 stall now say so, approvals keep what you approved, plugin suggestions are
 quieter, and Fleet runs can be checked before they spend anything.
 
+### Added
+
+- Official model routing: `/router` (also `/model router`) sets up the Auto
+  router with presets: Jev (TypeSafe's decision model, via OpenRouter or a
+  TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes
+  one test call before it saves, `/status` shows the router's choice, cost and
+  latency, and a failing router is shown as failing
+  ([#6525](https://github.com/Hmbown/Codewhale/issues/6525)).
+
 ### Fixed
 
 - A turn that stops producing output now reports itself: the turn loop records

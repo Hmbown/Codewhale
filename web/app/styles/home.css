@@ -80,6 +80,46 @@
   line-height: 1.6;
 }
 
+/* The hero install: a segmented choice over the shared copy block. The
+   selected segment takes the neutral selected fill, not the accent: the one
+   primary action on the plate stays the Get Codewhale button. */
+.hero-install {
+  max-width: 34rem;
+  margin-top: 1.6rem;
+}
+
+.hero-install-switch {
+  display: inline-flex;
+  gap: 2px;
+  margin-bottom: 0.5rem;
+  padding: 2px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-control);
+  background: var(--paper-card);
+}
+
+.hero-install-switch button {
+  min-height: 2rem;
+  padding: 0.25rem 0.75rem;
+  color: var(--ink-soft);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  border-radius: var(--radius-control);
+  transition: background-color var(--dur-state) var(--ease-spring), color var(--dur-state) var(--ease-spring);
+}
+
+.hero-install-switch button:hover { background: var(--hover); color: var(--ink); }
+.hero-install-switch button[aria-pressed="true"] { background: var(--selected); color: var(--ink); }
+
+/* The hero column is narrow; the command wraps rather than scrolling under
+   the Copy button. Copy still writes the exact one-line command. */
+.hero-install pre.code-block {
+  margin: 0;
+  padding-right: 5rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .folio-actions {
   display: flex;
   flex-wrap: wrap;
@@ -885,12 +925,6 @@ pre.gs-step-commands {
 
   .site-nav-actions {
     min-width: 0;
-    gap: 0.35rem;
-  }
-
-  .site-nav-actions select {
-    width: 6.75rem;
-    min-width: 0;
   }
 
   .paper-wordmark {
@@ -902,10 +936,6 @@ pre.gs-step-commands {
     font-size: clamp(2.3rem, 11vw, 3.2rem);
     word-break: normal;
     overflow-wrap: break-word;
-  }
-
-  .paper-install-cta {
-    display: none;
   }
 
   .folio-actions {

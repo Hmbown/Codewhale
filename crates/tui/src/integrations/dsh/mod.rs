@@ -55,6 +55,9 @@ pub(crate) const CLI_COMMAND: &str = "codewhale integrations dsh";
 /// Codewhale-owned files for this integration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DshPaths {
+    /// The Codewhale home these paths live under; the integration's audit
+    /// events are written to its `audit.log` (#6534).
+    pub(crate) codewhale_home: PathBuf,
     pub(crate) root: PathBuf,
     pub(crate) overlay: PathBuf,
     pub(crate) receipt: PathBuf,
@@ -74,6 +77,7 @@ impl DshPaths {
             skin_preview: root.join(SKIN_PREVIEW_FILE),
             bundle_dir: root.join(bundle::BUNDLE_DIR),
             root,
+            codewhale_home: codewhale_home.to_path_buf(),
         }
     }
 
@@ -519,7 +523,8 @@ pub(crate) fn apply_plan(
     });
     doc.current = Some(record.clone());
     doc.save(&paths.receipt)?;
-    crate::audit::log_sensitive_event(
+    crate::audit::log_sensitive_event_in(
+        &paths.codewhale_home,
         &format!("integration.dsh.{}", event.as_str()),
         serde_json::json!({
             "overlay_path": paths.overlay.display().to_string(),
@@ -562,7 +567,8 @@ pub(crate) fn set_disabled(paths: &DshPaths, disabled: bool) -> Result<DshConnec
     });
     doc.current = Some(record.clone());
     doc.save(&paths.receipt)?;
-    crate::audit::log_sensitive_event(
+    crate::audit::log_sensitive_event_in(
+        &paths.codewhale_home,
         &format!("integration.dsh.{}", event.as_str()),
         serde_json::json!({ "overlay_path": paths.overlay.display().to_string() }),
     );
@@ -610,7 +616,8 @@ pub(crate) fn remove(paths: &DshPaths) -> Result<Vec<PathBuf>> {
         )),
     });
     doc.save(&paths.receipt)?;
-    crate::audit::log_sensitive_event(
+    crate::audit::log_sensitive_event_in(
+        &paths.codewhale_home,
         "integration.dsh.remove",
         serde_json::json!({ "removed": removed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>() }),
     );
@@ -862,7 +869,8 @@ pub(crate) fn install_bundle(
     });
     doc.current = Some(record);
     doc.save(&paths.receipt)?;
-    crate::audit::log_sensitive_event(
+    crate::audit::log_sensitive_event_in(
+        &paths.codewhale_home,
         "integration.dsh.install_bundle",
         serde_json::json!({
             "profile_dir": bundle_record.profile_dir.display().to_string(),
@@ -914,7 +922,8 @@ pub(crate) fn remove_bundle(
     });
     doc.current = Some(record);
     doc.save(&paths.receipt)?;
-    crate::audit::log_sensitive_event(
+    crate::audit::log_sensitive_event_in(
+        &paths.codewhale_home,
         "integration.dsh.remove_bundle",
         serde_json::json!({ "removed": removed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>() }),
     );

@@ -4,6 +4,7 @@ import { useRouter, usePathname } from "next/navigation";
 import { ALL_LOCALES } from "@/lib/i18n/config";
 import { fill, getChrome } from "@/lib/i18n/dictionaries";
 import { replacePathLocale } from "@/lib/i18n/path";
+import { Icon } from "./icon";
 
 /** Labels for the dropdown. Keyed by locale code, displayed in native script. */
 const LOCALE_LABELS: Record<string, string> = {};
@@ -34,29 +35,36 @@ export function LocaleSwitcher({ current }: { current: string }) {
     if (!other) return null;
     return (
       <button
+        type="button"
         onClick={() => switchLocale(other.code)}
-        className="font-mono text-[0.72rem] uppercase text-ink-mute hover:text-indigo transition-colors px-2 py-1"
+        className="nav-icon-button"
         aria-label={fill(chrome.switcherSwitchTo, { label: other.label })}
+        title={other.label}
       >
-        {other.label}
+        <Icon name="globe" className="nav-icon" />
       </button>
     );
   }
 
-  // 3+ routed locales: show a dropdown. Partial packs carry a visible
-  // badge so the incomplete scope is honest at the point of selection.
+  // 3+ routed locales: a globe icon over a native <select>, which keeps the
+  // platform picker, keyboard and screen-reader behavior. The select is
+  // transparent and covers the icon, so the whole icon is the hit target.
+  // Partial packs carry a visible badge in the list so the incomplete scope
+  // is honest at the point of selection.
   return (
-    <select
-      value={current}
-      onChange={(e) => switchLocale(e.target.value)}
-      className="font-mono text-[0.72rem] uppercase text-ink-mute bg-transparent hairline-t hairline-b hairline-l hairline-r px-2 py-1 cursor-pointer hover:text-indigo transition-colors"
-      aria-label={chrome.switcherLabel}
-    >
-      {ROUTED.map((l) => (
-        <option key={l.code} value={l.code}>
-          {l.status === "partial" ? `${l.label} ${chrome.partialBadge}` : l.label}
-        </option>
-      ))}
-    </select>
+    <span className="nav-icon-button nav-locale">
+      <Icon name="globe" className="nav-icon" />
+      <select
+        value={current}
+        onChange={(e) => switchLocale(e.target.value)}
+        aria-label={chrome.switcherLabel}
+      >
+        {ROUTED.map((l) => (
+          <option key={l.code} value={l.code}>
+            {l.status === "partial" ? `${l.label} ${chrome.partialBadge}` : l.label}
+          </option>
+        ))}
+      </select>
+    </span>
   );
 }

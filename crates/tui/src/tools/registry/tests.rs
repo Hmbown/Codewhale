@@ -2290,3 +2290,21 @@ fn fleet_readonly_reviewer_wire_catalog_carries_no_null_schema_fields() {
         );
     }
 }
+
+#[test]
+fn read_media_is_not_offered_to_a_text_only_route() {
+    use codewhale_config::route::CapabilityState;
+    let tmp = tempdir().unwrap();
+    for (state, offered) in [
+        (CapabilityState::Unsupported, false),
+        (CapabilityState::Unknown, true),
+        (CapabilityState::Supported, true),
+    ] {
+        let mut context = ToolContext::new(tmp.path());
+        context.route_capabilities.image_input = state;
+        let registry = ToolRegistryBuilder::new()
+            .with_read_media_tool()
+            .build(context);
+        assert_eq!(registry.get("read_media").is_some(), offered, "{state:?}");
+    }
+}

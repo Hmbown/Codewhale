@@ -2823,6 +2823,14 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
         .json()
         .await?;
     assert_eq!(runs["runs"][0]["spec"]["run_id"], "run_receipt");
+    // F5: the payload carries the launch governor; a calm fleet has no line.
+    assert_eq!(runs["governor"]["paused"], false);
+    assert_eq!(runs["governor"]["recent_rate_limits"], 0);
+    assert_eq!(
+        runs["governor"]["launch_slots"],
+        runs["governor"]["max_launch_slots"]
+    );
+    assert!(runs["governor"].get("status").is_none());
     assert_eq!(runs["runs"][0]["follow_up"]["tool"], "handle_read");
     assert_eq!(
         runs["runs"][0]["verification"]["status"],
@@ -16387,7 +16395,7 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
         json!({"prompt":"look", "images":[{"mime":"image/png", "dataBase64":"garbage"}]}),
         json!({"prompt":"", "images":[good.clone()]}),
         json!({"prompt":"look", "model":"auto", "images":[good.clone()]}),
-        json!({"prompt":"look", "model":"deepseek-v4-flash", "images":[good.clone()]}),
+        json!({"prompt":"look", "model":"deepseek-v4-pro", "images":[good.clone()]}),
         json!({"prompt":"look", "images":[{"mime":"image/png", "dataBase64":good.data_base64, "path":"/private/host-only"}]}),
     ] {
         let response = client.post(&url).json(&body).send().await?;
@@ -16502,7 +16510,7 @@ async fn runtime_image_stream_rejection_does_not_leave_empty_threads() -> Result
         json!({"prompt":"look", "images":[{"mime":"image/png","dataBase64":"garbage"}]}),
         json!({"prompt":"", "images":[good.clone()]}),
         json!({"prompt":"look", "model":"auto", "images":[good.clone()]}),
-        json!({"prompt":"look", "model":"deepseek-v4-flash", "images":[good]}),
+        json!({"prompt":"look", "model":"deepseek-v4-pro", "images":[good]}),
         json!({"prompt":"look", "images":[runtime_image_fixture_bytes(4 * 1024 * 1024 + 1)]}),
     ] {
         let response = client

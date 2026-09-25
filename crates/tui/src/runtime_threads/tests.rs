@@ -16744,7 +16744,7 @@ mod runtime_image_inputs {
         let good = runtime_image_fixture(17);
         for (prompt, model, image) in [
             ("look", "auto", good.clone()),
-            ("look", "deepseek-v4-flash", good.clone()),
+            ("look", "deepseek-v4-pro", good.clone()),
             ("look", "unknown-image-fixture", good.clone()),
             ("", "deepseek-v4-flash-vision-exp", good.clone()),
             (
@@ -17198,7 +17198,7 @@ mod runtime_image_inputs {
             };
             assert!(manager.start_turn(&fork.id, request.clone()).await.is_err());
             let mut unsupported = request.clone();
-            unsupported.model = Some("deepseek-v4-flash".into());
+            unsupported.model = Some("deepseek-v4-pro".into());
             assert!(
                 manager
                     .start_turn_from_stored_images(&fork.id, unsupported)
@@ -18102,4 +18102,27 @@ fn saved_history_boundary_refuses_until_every_kept_prompt_is_seen() {
         saved_history_boundary(&repeated, &["same".to_string()], "same"),
         Some(1)
     );
+
+/// #6522 review: `/resume`, `/load` and launch warm the canonical sessions
+/// root on a blocking thread, so the confinement predicate that follows on
+/// the UI runtime is served from the cache instead of resolving a path.
+#[cfg(unix)]
+#[tokio::test]
+async fn canonical_sessions_root_is_resolved_off_the_ui_runtime_and_cached() -> Result<()> {
+    let _env = crate::test_support::lock_test_env();
+    let root = tempfile::tempdir()?;
+    let real_home = root.path().join("real-home");
+    std::fs::create_dir_all(&real_home)?;
+    let home = root.path().join("linked-home");
+    std::os::unix::fs::symlink(&real_home, &home)?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home);
+    let sessions = codewhale_config::resolve_state_dir("sessions")?;
+    std::fs::create_dir_all(&sessions)?;
+
+    assert_eq!(cached_canonical_sessions_root(&sessions), None);
+    prepare_canonical_sessions_root().await;
+    let cached = cached_canonical_sessions_root(&sessions).expect("warmed");
+    assert_eq!(cached, sessions.canonicalize()?);
+    assert_ne!(cached, sessions, "the fixture spells the root two ways");
+    Ok(())
 }

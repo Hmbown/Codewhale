@@ -153,8 +153,8 @@ export function Ticker({ items, labels }: { items: FeedItem[]; labels: TickerLab
       <div className="site-container flex items-stretch">
         <div className="border-r border-paper-edge text-ink px-4 py-2 flex items-center shrink-0 gap-2">
           <span className="w-1.5 h-1.5 bg-indigo rounded-full inline-block animate-pulse" />
-          <span className="font-cjk text-sm font-semibold tracking-wider">{labels.liveLabel}</span>
-          <span className="font-mono text-[0.55rem] uppercase tracking-widest text-ink-mute ml-1 self-end mb-0.5">
+          <span className="font-cjk text-sm font-semibold">{labels.liveLabel}</span>
+          <span className="text-xs text-ink-mute ml-1 self-end mb-0.5">
             {labels.liveTag}
           </span>
         </div>

@@ -265,6 +265,13 @@ pub fn exit() -> CommandResult {
 /// picker (Pro/Flash + thinking effort) per #39 — gives users a discoverable
 /// way to flip both knobs without memorising the docs.
 pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
+    // `/model router …` is `/router …` (#6525): one Router setup view.
+    if let Some(name) = model_name.map(str::trim) {
+        let (head, rest) = name.split_once(char::is_whitespace).unwrap_or((name, ""));
+        if head.eq_ignore_ascii_case("router") {
+            return super::router::router_command(Some(rest));
+        }
+    }
     if model_name.is_some_and(|name| name.eq_ignore_ascii_case("save-default")) {
         // Explicit persistence of the pending session route as the startup
         // default — only an explicit command can write settings after an
@@ -412,7 +419,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
         let provider_identity = app.provider_identity_for_persistence().to_string();
         app.provider_models
             .insert(provider_identity.clone(), model_id.clone());
-        app.enable_provider_model(&provider_identity, &model_id);
+        app.note_route_used(&provider_identity, &model_id);
         // Route changes are temporary by default: nothing is written here.
         // The route-save prompt offers the explicit persistence choices.
         app.note_session_route_change(&provider_identity, &model_id);

@@ -26,6 +26,7 @@ describe("page metadata", () => {
     ["ru", "/faq", "FAQ · Codewhale", "en_US", "en"],
     ["uk", "/faq", "FAQ · Codewhale", "en_US", "en"],
     ["pt-BR", "/install", "Install · Codewhale", "en_US", "en"],
+    ["zh", "/install", "安装 · Codewhale", "en_US", "en"],
     ["ja", "/", "Codewhale", "ja_JP", "ja"],
   ])(
     "builds canonical, hreflang, Open Graph, and Twitter fields for %s%s",
@@ -83,6 +84,7 @@ describe("page metadata", () => {
         `${SITE_URL}/en/docs/guide`,
       ],
       ["/docs", "ja", ["en", "zh"], `${SITE_URL}/en/docs`],
+      ["/install", "zh", ["en"], `${SITE_URL}/en/install`],
     ] as const) {
       const metadata = buildPageMetadata({
         path,

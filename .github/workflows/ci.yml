@@ -593,6 +593,35 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         run: echo "Linux clippy/test gates run on CNB for mirrored fix/*, rebrand/*, work/v*, and main branches."
 
+  msrv:
+    # The workspace must build on its minimum supported toolchain. A lint
+    # expectation that newer rustc fulfils can be unfulfilled on 1.89 and
+    # fail the build there while stable stays green (#6543).
+    name: MSRV check (1.89)
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89"
+      - name: Install Linux system dependencies
+        run: |
+          for i in 1 2 3 4 5; do
+            sudo apt-get update && break
+            echo "apt-get update failed (attempt $i); retrying in 15s"
+            sleep 15
+          done
+          sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo +1.89 check
+        run: cargo +1.89 check --workspace --locked
+
   workflow-rlm-cache:
     name: Workflow RLM cache
     needs: changes
@@ -670,6 +699,14 @@ jobs:
         # on community.chocolatey.org's availability instead of on the tree.
         # NSIS must still install for the regression below to run; this only
         # survives a transient outage.
+        #
+        # A feed failure also makes `choco install` exit 0 without installing
+        # anything ("Chocolatey installed 0/0 packages" after a V2 feed 504),
+        # so an attempt only counts when `makensis.exe` exists where the installer
+        # regression looks for it (Program Files; choco does not put it on PATH).
+        # Without that check the retry reported success on an unprovisioned
+        # runner and the regression below failed as an unattributable exit
+        # code instead of this step naming the outage (2026-09-24).
         run: |
           $ErrorActionPreference = 'Continue'
           $delays = @(0, 20, 45)
@@ -679,11 +716,12 @@ jobs:
               Start-Sleep -Seconds $delays[$attempt]
             }
             choco install nsis -y --no-progress
-            if ($LASTEXITCODE -eq 0) {
+            $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($LASTEXITCODE -eq 0 -and $makensis) {
               Write-Host "NSIS installed on attempt $($attempt + 1)"
               exit 0
             }
-            Write-Host "::warning::choco install nsis failed (exit $LASTEXITCODE)"
+            Write-Host "::warning::NSIS is still unavailable after attempt $($attempt + 1) (choco exit $LASTEXITCODE)"
           }
           Write-Host "::error::NSIS could not be provisioned from Chocolatey after $($delays.Count) attempts"
           exit 1
@@ -721,6 +759,40 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+      - name: Hold this machine's build lock (self-hosted)
+        # The self-hosted Mac is also a developer machine: local agents build
+        # through scripts/dev-cargo.sh, which holds this lock, and two Cargo
+        # builds at once exhaust its memory. Opt-in: the runner's `.env` names
+        # the same file as CODEWHALE_BUILD_LOCK_FILE. The holder is a
+        # background process; the runner kills orphans when the job ends, so a
+        # cancelled or crashed job cannot leave the lock held.
+        # (`env.*` in `if:` cannot see the runner's `.env`, so the opt-in is
+        # checked in the script.)
+        if: needs.changes.outputs.heavy == 'true' && runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          if [ -z "${CODEWHALE_BUILD_LOCK_FILE:-}" ]; then
+            echo "CODEWHALE_BUILD_LOCK_FILE is not set on this runner; building without the machine lock."
+            exit 0
+          fi
+          hold="$RUNNER_TEMP/cw-build-lock.hold"
+          ready="$RUNNER_TEMP/cw-build-lock.ready"
+          log="$RUNNER_TEMP/cw-build-lock.log"
+          touch "$hold"
+          rm -f "$ready"
+          # The single quotes are deliberate: the inner sh expands $1/$2.
+          # shellcheck disable=SC2016
+          nohup python3 scripts/build-lock.py "$CODEWHALE_BUILD_LOCK_FILE" -- \
+            sh -c 'touch "$1"; while [ -e "$2" ]; do sleep 2; done' _ "$ready" "$hold" \
+            >"$log" 2>&1 &
+          shown=0
+          until [ -e "$ready" ]; do
+            if [ "$shown" -eq 0 ] && [ -s "$log" ]; then cat "$log"; shown=1; fi
+            sleep 2
+          done
+          cat "$log"
+          # Scripts inside this job already run under the lock.
+          echo "CODEWHALE_BUILD_LOCK_HELD=1" >> "$GITHUB_ENV"
       - name: Run tests
         # Same test binaries as `cargo test`, run by cargo-nextest: one
         # process per test, all runner cores busy, slow tests named instead
@@ -789,6 +861,10 @@ jobs:
       - name: Linux test location (CNB)
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && github.event_name != 'workflow_dispatch' && github.event_name != 'pull_request'
         run: echo "Linux workspace tests run on CNB for non-PR release/main pushes; pull requests run directly on Ubuntu."
+      - name: Release this machine's build lock (self-hosted)
+        if: always() && runner.environment == 'self-hosted'
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/cw-build-lock.hold"
 
   macos-budget:
     # Fork PRs build cold on a GitHub-hosted Mac, and the RSS budget and the

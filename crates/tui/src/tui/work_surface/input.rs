@@ -170,9 +170,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
 
     let action = match key.code {
         KeyCode::Esc => {
-            if app.work_surface.opened.is_some() {
+            if super::interaction::opened_detail_on_screen(app) {
                 close_opened(app);
             } else {
+                // A stale owner (the row's command opened no view) must not
+                // swallow the Esc the close control advertises.
+                app.work_surface.opened = None;
                 super::interaction::dismiss_dock(app);
             }
             return Some(None);

@@ -1,7 +1,7 @@
 //! Lightweight audit logging for sensitive operations.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -14,7 +14,18 @@ use crate::utils::{flush_and_sync, open_append};
 /// This helper is best-effort by design: callers should not fail critical flows
 /// if audit persistence fails.
 pub fn log_sensitive_event(event: &str, details: Value) {
-    if let Err(err) = append_event(event, details) {
+    let result = default_audit_path().and_then(|path| append_event(&path, event, details));
+    if let Err(err) = result {
+        crate::logging::warn(format!("audit log write failed: {err}"));
+    }
+}
+
+/// Append an audit event to `<codewhale_home>/audit.log` for a caller that
+/// already owns an explicit Codewhale home (for example the DSH integration's
+/// `DshPaths`), so its audit record lands beside the rest of its state rather
+/// than in whatever home the process environment names (#6534).
+pub fn log_sensitive_event_in(codewhale_home: &Path, event: &str, details: Value) {
+    if let Err(err) = append_event(&codewhale_home.join("audit.log"), event, details) {
         crate::logging::warn(format!("audit log write failed: {err}"));
     }
 }
@@ -48,8 +59,8 @@ fn rotate_if_oversized(path: &std::path::Path) {
     let _ = fs::rename(path, std::path::Path::new(&rolled));
 }
 
-fn append_event(event: &str, details: Value) -> anyhow::Result<()> {
-    let path = default_audit_path()?;
+fn append_event(path: &Path, event: &str, details: Value) -> anyhow::Result<()> {
+    let path = path.to_path_buf();
     let parent = path.parent().map(|p| p.to_path_buf());
     if let Some(ref parent) = parent {
         fs::create_dir_all(parent)?;
@@ -71,6 +82,15 @@ fn append_event(event: &str, details: Value) -> anyhow::Result<()> {
 }
 
 fn default_audit_path() -> anyhow::Result<PathBuf> {
+    // A test process without an explicit CODEWHALE_HOME must never append to
+    // the developer's real ~/.codewhale/audit.log (#6534); it gets a
+    // per-process scratch log instead.
+    #[cfg(test)]
+    if !codewhale_config::codewhale_home_is_explicit() {
+        return Ok(std::env::temp_dir()
+            .join(format!("codewhale-test-audit-{}", std::process::id()))
+            .join("audit.log"));
+    }
     Ok(codewhale_config::codewhale_home()?.join("audit.log"))
 }
 
@@ -85,6 +105,29 @@ pub fn audit_log_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{AUDIT_LOG_ROTATE_BYTES, rotate_if_oversized};
+
+    /// #6534 guard: with no explicit CODEWHALE_HOME, a test process resolves
+    /// the audit log outside the real user home, so no test can append to it.
+    #[test]
+    fn test_process_never_resolves_the_real_home_audit_log() {
+        let _lock = crate::test_support::lock_test_env();
+        let _home = crate::test_support::EnvVarGuard::remove("CODEWHALE_HOME");
+        let path = super::audit_log_path().expect("audit path");
+        let real = codewhale_paths::user_home()
+            .expect("user home")
+            .join(".codewhale")
+            .join("audit.log");
+        assert_ne!(path, real);
+        assert!(path.starts_with(std::env::temp_dir()), "{}", path.display());
+    }
+
+    #[test]
+    fn an_explicit_home_receives_its_own_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        super::log_sensitive_event_in(dir.path(), "test.event", serde_json::json!({"k": 1}));
+        let log = std::fs::read_to_string(dir.path().join("audit.log")).expect("audit.log");
+        assert!(log.contains("\"event\":\"test.event\""), "{log}");
+    }
 
     #[test]
     fn a_small_log_is_left_alone() {

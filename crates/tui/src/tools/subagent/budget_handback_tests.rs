@@ -81,6 +81,8 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
                             "tool_calls": [{"id": "must-not-write", "type": "function", "function": {
                                 "name": "write_file", "arguments": "{\"path\":\"report.md\",\"content\":\"must not execute\"}"
                             }}]}, "finish_reason": "tool_calls"})
+                    } else if mode == "truncated" {
+                        json!({"index": 0, "message": {"role": "assistant", "content": "TRUNCATED_REPORT: README evid"}, "finish_reason": "length"})
                     } else {
                         json!({"index": 0, "message": {"role": "assistant", "content":
                             "PARTIAL_REPORT: README evidence identifies missing checksum validation. No report file was produced. Next: implement and verify the checksum check."}, "finish_reason": "stop"})
@@ -271,6 +273,42 @@ async fn budget_handback_turn_consolidates_tool_only_work_and_checks_declared_de
     assert!(completion.payload.contains("budget_exhausted"));
     assert!(completion.payload.contains("deliverable_missing"));
     assert!(fixture.completions.try_recv().is_err());
+}
+
+/// #6536 — the provider truncates the hand-back report. The deterministic
+/// digest recorded before that turn stays the deliverable: in the result
+/// text `agent result` / `agent wait` return, and as a private file.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn budget_handback_truncated_report_leaves_the_digest_as_the_deliverable() {
+    let _retry = crate::retry_status::test_guard();
+    crate::retry_status::clear_rate_limit();
+    let mut fixture = fixture("truncated", 15, 1).await;
+    let result = fixture.finish().await;
+    assert_eq!(fixture.requests.lock().unwrap().len(), 2);
+    assert_eq!(result.status, SubAgentStatus::BudgetExhausted);
+    let text = result.result.as_deref().unwrap();
+    assert!(
+        text.contains("RECORDED_FINDING"),
+        "digest is the result: {text}"
+    );
+    assert!(!text.contains("TRUNCATED_REPORT"), "{text}");
+    assert!(text.contains("did not finish"), "{text}");
+    assert!(text.contains("this child's deliverable"), "{text}");
+
+    let state_root = fixture.manager.read().await.state_root.clone();
+    let artifact = checked_subagent_state_path(
+        &state_root,
+        &Path::new(".codewhale/state/subagent-results").join(format!(
+            "{}.md",
+            crate::hashing::sha256_hex(b"report-worker")
+        )),
+    )
+    .unwrap();
+    let saved = fs::read_to_string(&artifact).expect("digest artifact written");
+    assert!(saved.contains("RECORDED_FINDING"), "{saved}");
+    assert!(!saved.contains("TRUNCATED_REPORT"), "{saved}");
+    assert!(text.contains(&artifact.display().to_string()), "{text}");
 }
 
 #[tokio::test]
@@ -661,6 +699,91 @@ async fn cancel_appends_work_preservation_note_once() {
     let scout = manager.write().await.cancel_agent("cancel-scout").unwrap();
     let scout = preserve_cancelled_work(&manager, scout).await;
     assert_eq!(scout.result.as_deref(), Some(CANCELLED_BY_PARENT_RESULT));
+}
+
+/// F4: a Stop cascades to descendants, and each write-scoped descendant
+/// stopped with the parent gets its own receipt; a read-only one does not.
+#[tokio::test]
+async fn cancel_receipts_each_writing_descendant_stopped_with_its_parent() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "user.name", "Budget test"]);
+    git(root, &["config", "user.email", "budget@example.invalid"]);
+    fs::write(root.join("src.rs"), "baseline\n").unwrap();
+    git(root, &["add", "--", "src.rs"]);
+    git(root, &["commit", "--quiet", "-m", "baseline"]);
+
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(root.to_path_buf(), 4)));
+    for (agent_id, write, parent) in [
+        ("tree-parent", true, None),
+        ("tree-writer", true, Some("tree-parent")),
+        ("tree-scout", false, Some("tree-parent")),
+        ("tree-stranger", true, None),
+    ] {
+        let mut spec = make_worker_spec(agent_id, root.to_path_buf());
+        spec.runtime_profile.permissions.write = write;
+        spec.parent_run_id = parent.map(str::to_string);
+        let mut guard = manager.write().await;
+        guard.register_worker(spec);
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let mut agent = SubAgent::new(
+            agent_id.to_string(),
+            FleetRole::Worker,
+            "work that gets stopped".to_string(),
+            SubAgentAssignment {
+                objective: "edit".to_string(),
+                role: Some("worker".to_string()),
+            },
+            "deepseek-v4-flash".to_string(),
+            None,
+            None,
+            input_tx,
+            root.to_path_buf(),
+            guard.current_session_boot_id.clone(),
+        );
+        agent.task_handle = Some(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }));
+        guard.agents.insert(agent_id.to_string(), agent);
+    }
+    fs::create_dir_all(root.join("scratch")).unwrap();
+    fs::write(root.join("scratch/half-done.rs"), "wip\n").unwrap();
+
+    // The cascade order of `cancel_agent_for_session`: descendants, then the
+    // target. The unrelated writer is stopped too but is not a descendant.
+    let parent = {
+        let mut guard = manager.write().await;
+        for id in ["tree-writer", "tree-scout", "tree-stranger"] {
+            guard.cancel_agent(id).unwrap();
+        }
+        guard.cancel_agent("tree-parent").unwrap()
+    };
+    let parent = preserve_cancelled_work(&manager, parent).await;
+    assert!(
+        parent
+            .result
+            .as_deref()
+            .is_some_and(|text| text.contains("scratch/half-done.rs")),
+        "{:?}",
+        parent.result
+    );
+
+    let guard = manager.read().await;
+    let writer = guard.get_result("tree-writer").unwrap();
+    let writer_text = writer.result.as_deref().unwrap_or_default();
+    assert!(
+        writer_text.starts_with(CANCELLED_BY_PARENT_RESULT),
+        "{writer_text}"
+    );
+    assert!(
+        writer_text.contains("scratch/half-done.rs"),
+        "{writer_text}"
+    );
+    let scout = guard.get_result("tree-scout").unwrap();
+    assert_eq!(scout.result.as_deref(), Some(CANCELLED_BY_PARENT_RESULT));
+    let stranger = guard.get_result("tree-stranger").unwrap();
+    assert_eq!(stranger.result.as_deref(), Some(CANCELLED_BY_PARENT_RESULT));
 }
 
 /// #5529: a budget death must name the work the worker left on disk. The

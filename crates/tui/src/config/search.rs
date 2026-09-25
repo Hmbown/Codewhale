@@ -206,4 +206,10 @@ pub struct SearchConfig {
     /// disk write.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Whether the active route's provider-native search runs ahead of the
+    /// search provider. Unset: native search leads only when no provider is
+    /// configured, so a pinned provider always wins; see
+    /// [`crate::config::Config::search_native`].
+    #[serde(default)]
+    pub native: Option<bool>,
 }

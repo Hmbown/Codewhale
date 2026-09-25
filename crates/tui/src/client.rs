@@ -760,6 +760,13 @@ fn configured_model_bound_secret_values(config: &Config, active_api_key: &str) -
         }
     }
 
+    // The decision router's TypeSafe key is no chat provider's key; its env
+    // form must still never reach a model. (`for_decision_route` adds the key
+    // from every source to its own client.)
+    if let Ok(value) = std::env::var(system_one::TYPESAFE_API_KEY_ENV) {
+        push_model_bound_secret(&mut values, Some(&value));
+    }
+
     push_file_backed_model_bound_secrets(&mut values);
 
     // Replace longer values first in case one credential happens to contain
@@ -5156,6 +5163,7 @@ mod provider_native_search;
 mod responses;
 mod role_placement;
 mod stream_entry;
+pub(crate) mod system_one;
 
 /// Longest a request may take to open its stream and deliver the first body
 /// byte before the client itself times out (#6184): the header wait plus the
@@ -5966,6 +5974,104 @@ mod tests {
         let path = requests[0].url.path().to_string();
         let body = serde_json::from_slice(&requests[0].body).expect("captured request JSON");
         (path, body)
+    }
+
+    /// #6540: the compaction summary is the parent turn plus one trailing
+    /// user instruction. Rendered through the production wire builders, its
+    /// prompt must be byte-for-byte the parent's prompt followed by that one
+    /// item, with the same model, system/instructions, tools and reasoning
+    /// controls — otherwise the provider cache misses the whole history.
+    #[test]
+    fn compaction_summary_request_extends_the_parent_turn_prompt_bytes() {
+        fn text(role: Role, text: &str) -> Message {
+            Message {
+                role,
+                content: vec![ContentBlock::Text {
+                    text: text.to_string(),
+                    cache_control: None,
+                }],
+            }
+        }
+        fn assert_extends(label: &str, parent: &Value, summary: &Value) {
+            let parent_items = parent.as_array().expect("parent prompt items");
+            let summary_items = summary.as_array().expect("summary prompt items");
+            assert_eq!(summary_items.len(), parent_items.len() + 1, "{label}");
+            let parent_bytes = serde_json::to_string(parent).expect("serialize parent");
+            let summary_bytes = serde_json::to_string(summary).expect("serialize summary");
+            let open_prefix = parent_bytes.strip_suffix(']').expect("JSON array");
+            assert!(
+                summary_bytes.starts_with(open_prefix),
+                "{label}: summary prompt diverges from the parent prefix"
+            );
+        }
+
+        let model = "deepseek-v4-pro";
+        let history = vec![
+            text(Role::User, "fix the failing session_store test"),
+            text(Role::Assistant, "Reading the test first."),
+            text(Role::User, "keep the branch name"),
+        ];
+        let system = SystemPrompt::Text("pinned system prompt".to_string());
+        let tools = vec![test_tool("read"), test_tool("bash")];
+        let effort = "high";
+        let parent = codewhale_core::request::prepare_primary_turn_request(
+            codewhale_core::request::PrimaryTurnRequest {
+                model: model.to_string(),
+                messages: history.clone(),
+                max_tokens: 64_000,
+                system: Some(system.clone()),
+                tools: Some(tools.clone()),
+                tool_choice: Some(json!({"type": "auto"})),
+                reasoning_effort: Some(effort.to_string()),
+            },
+        );
+        let config = crate::compaction::CompactionConfig {
+            model: model.to_string(),
+            ..Default::default()
+        };
+        let mut summary_history = history;
+        summary_history.push(text(Role::User, "write the handoff summary"));
+        let summary = crate::compaction::compaction_summary_request(
+            summary_history,
+            &config,
+            Some(&system),
+            Some(&tools),
+            Some(effort),
+            8_192,
+        );
+
+        // Chat Completions: system and history share one `messages` array.
+        let client = deepseek_request_boundary_client(
+            "https://api.deepseek.com/v1",
+            "http://127.0.0.1:9".into(),
+        );
+        let parent_body = client
+            .prepare_outbound_request(parent.clone(), true)
+            .expect("parent prepares")
+            .body;
+        let summary_body = client
+            .prepare_outbound_request(summary.clone(), false)
+            .expect("summary prepares")
+            .body;
+        assert_extends("chat", &parent_body["messages"], &summary_body["messages"]);
+        for key in ["model", "tools", "reasoning_effort", "thinking"] {
+            assert_eq!(parent_body.get(key), summary_body.get(key), "chat {key}");
+        }
+
+        // Responses (the Codex route where the 0% hit was recorded).
+        let parent_body =
+            responses::build_responses_body_for_provider(&parent, ApiProvider::OpenaiCodex);
+        let summary_body =
+            responses::build_responses_body_for_provider(&summary, ApiProvider::OpenaiCodex);
+        assert_extends("responses", &parent_body["input"], &summary_body["input"]);
+        for key in ["model", "instructions", "tools", "reasoning", "include"] {
+            assert_eq!(
+                parent_body.get(key),
+                summary_body.get(key),
+                "responses {key}"
+            );
+        }
+        assert!(parent_body.get("reasoning").is_some());
     }
 
     #[tokio::test]

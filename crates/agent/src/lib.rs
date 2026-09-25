@@ -1356,6 +1356,15 @@ impl Default for ModelRegistry {
                 supports_tools: true,
                 supports_reasoning: true,
             },
+            // https://docs.x.ai/docs/models/grok-4.7: function calling and
+            // reasoning (low/medium/high/xhigh, cannot be disabled).
+            ModelInfo {
+                id: "grok-4.7".to_string(),
+                provider: ProviderKind::Xai,
+                aliases: vec![],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
             ModelInfo {
                 id: "grok-4.5".to_string(),
                 provider: ProviderKind::Xai,

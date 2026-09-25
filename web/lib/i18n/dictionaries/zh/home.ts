@@ -16,6 +16,7 @@ export const home: HomeDict = {
   heroIntro:
     "{brand} 是一个开源智能体，能够读取文件、编辑代码、运行命令并检查结果。在终端或本地浏览器中使用它，连接你选择的云端或本地模型。工具和权限由你决定；对话与工具执行结果保存在会话中。",
   getCodewhale: "获取 Codewhale",
+  heroInstallAria: "安装命令",
   exploreProduct: "了解产品",
   shotPreview: "终端预览",
   shotBuild: "v{version} 开发版本",

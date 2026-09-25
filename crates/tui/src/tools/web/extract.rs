@@ -49,8 +49,9 @@ enum MediaFamily {
 }
 
 static TITLE_RE: OnceLock<Regex> = OnceLock::new();
-static FALLBACK_RE: OnceLock<Vec<Regex>> = OnceLock::new();
+static FALLBACK_RE: OnceLock<[Regex; 3]> = OnceLock::new();
 static PAGE_CHROME_RE: OnceLock<Regex> = OnceLock::new();
+static PAGE_HEADER_RE: OnceLock<Regex> = OnceLock::new();
 static TAG_RE: OnceLock<Regex> = OnceLock::new();
 static WHITESPACE_RE: OnceLock<Regex> = OnceLock::new();
 
@@ -276,41 +277,72 @@ fn resolve_relative_http_href(base_url: &reqwest::Url, href: &str) -> Option<Str
     base_url.join(href).ok().map(Into::into)
 }
 
+/// Pick the readable region of a page with bounded regexes.
+///
+/// Order: every `<article>` (listing, news and forum pages carry one per
+/// card), then `<main>`, then `<body>`. Page chrome is removed from the chosen
+/// region; a `<header>` is chrome only at body level, because inside an
+/// article or `<main>` it carries the title and byline. Forms are unwrapped,
+/// not dropped: ASP.NET-style pages wrap the whole body in one `<form>`, so
+/// only the controls themselves are stripped.
+///
+/// Known limits: the lazy regexes do not balance nested same-name elements
+/// (an `<article>` inside an `<article>` ends at the inner close tag), and no
+/// JavaScript runs, so a client-rendered shell still yields nothing.
 fn fallback_main_html(html: &str) -> Option<String> {
+    let [article, main, body] = FALLBACK_RE.get_or_init(|| {
+        ["article", "main", "body"].map(|tag| {
+            Regex::new(&format!(r"(?is)<{tag}(?:\s[^>]*)?>(.*?)</{tag}\s*>"))
+                .expect("fallback element regex")
+        })
+    });
+    let articles = article
+        .captures_iter(html)
+        .filter_map(|capture| capture.get(1))
+        .map(|content| strip_page_chrome(content.as_str(), false))
+        .filter(|content| !html_to_plain_text(content).is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if meaningful_html(&articles) {
+        return Some(articles);
+    }
+    [(main, false), (body, true)]
+        .into_iter()
+        .find_map(|(re, strip_header)| {
+            let content = re.captures(html)?.get(1)?;
+            let cleaned = strip_page_chrome(content.as_str(), strip_header);
+            meaningful_html(&cleaned).then_some(cleaned)
+        })
+}
+
+fn strip_page_chrome(html: &str, strip_header: bool) -> String {
     let page_chrome = PAGE_CHROME_RE.get_or_init(|| {
         Regex::new(concat!(
             r"(?is)(?:<script(?:\s[^>]*)?>.*?</script\s*>",
             r"|<style(?:\s[^>]*)?>.*?</style\s*>",
             r"|<noscript(?:\s[^>]*)?>.*?</noscript\s*>",
             r"|<nav(?:\s[^>]*)?>.*?</nav\s*>",
-            r"|<header(?:\s[^>]*)?>.*?</header\s*>",
             r"|<footer(?:\s[^>]*)?>.*?</footer\s*>",
             r"|<aside(?:\s[^>]*)?>.*?</aside\s*>",
-            r"|<form(?:\s[^>]*)?>.*?</form\s*>)",
+            // Form controls, and the form tags themselves (unwrapped).
+            r"|<select(?:\s[^>]*)?>.*?</select\s*>",
+            r"|<textarea(?:\s[^>]*)?>.*?</textarea\s*>",
+            r"|<button(?:\s[^>]*)?>.*?</button\s*>",
+            r"|<input(?:\s[^>]*)?>",
+            r"|</?form(?:\s[^>]*)?>)",
         ))
         .expect("page chrome regex")
     });
-    for re in FALLBACK_RE.get_or_init(|| {
-        ["article", "main", "body"]
-            .into_iter()
-            .map(|tag| {
-                Regex::new(&format!(r"(?is)<{tag}(?:\s[^>]*)?>(.*?)</{tag}\s*>"))
-                    .expect("fallback element regex")
-            })
-            .collect()
-    }) {
-        let Some(capture) = re.captures(html) else {
-            continue;
-        };
-        let Some(content) = capture.get(1) else {
-            continue;
-        };
-        let without_chrome = page_chrome.replace_all(content.as_str(), "");
-        if meaningful_html(&without_chrome) {
-            return Some(without_chrome.into_owned());
-        }
+    let cleaned = page_chrome.replace_all(html, "");
+    if !strip_header {
+        return cleaned.into_owned();
     }
-    None
+    PAGE_HEADER_RE
+        .get_or_init(|| {
+            Regex::new(r"(?is)<header(?:\s[^>]*)?>.*?</header\s*>").expect("page header regex")
+        })
+        .replace_all(&cleaned, "")
+        .into_owned()
 }
 
 fn meaningful_html(html: &str) -> bool {
@@ -1199,5 +1231,117 @@ mod tests {
         .expect("sniff svg");
         assert_eq!(document.kind, DocumentKind::Media);
         assert_eq!(document.media_extension, Some("svg"));
+    }
+
+    async fn extract_html_fixture(url: &str, html: &str) -> ExtractedDocument {
+        extract_document(url, Some("text/html"), html.as_bytes(), None)
+            .await
+            .expect("fixture must extract readable text")
+    }
+
+    #[tokio::test]
+    async fn listing_page_keeps_every_article() {
+        let html = r#"<html><body><nav>Home Blog About</nav><main>
+            <article><h2>First post</h2><p>Alpha story body with plenty of words to read here.</p></article>
+            <article><h2>Second post</h2><p>Bravo story body with plenty of words to read here.</p></article>
+            <article><h2>Third post</h2><p>Charlie story body with plenty of words to read here.</p></article>
+            </main></body></html>"#;
+        let document = extract_html_fixture("https://blog.example/", html).await;
+        for needle in [
+            "First post",
+            "Alpha story",
+            "Second post",
+            "Bravo story",
+            "Third post",
+            "Charlie story",
+        ] {
+            assert!(
+                document.markdown.contains(needle),
+                "{needle} missing: {}",
+                document.markdown
+            );
+        }
+        assert!(!document.markdown.contains("Home Blog About"));
+    }
+
+    #[tokio::test]
+    async fn article_header_keeps_title_and_byline() {
+        let html = r#"<html><body><header>Site logo Sign in Subscribe</header>
+            <article><header><h1>Whales sing in dialects</h1><p class="byline">By Ada Lovelace</p></header>
+            <p>Researchers recorded humpback song across three oceans and found regional variation.</p>
+            </article></body></html>"#;
+        let document = extract_html_fixture("https://news.example/whales", html).await;
+        assert!(
+            document.markdown.contains("Whales sing in dialects"),
+            "{}",
+            document.markdown
+        );
+        assert!(
+            document.markdown.contains("By Ada Lovelace"),
+            "{}",
+            document.markdown
+        );
+        assert!(document.markdown.contains("regional variation"));
+        assert!(!document.markdown.contains("Sign in Subscribe"));
+    }
+
+    #[tokio::test]
+    async fn page_wrapped_in_a_form_is_not_mistaken_for_a_javascript_shell() {
+        let html = r#"<html><body><form method="post" action="./Default.aspx" id="form1">
+            <input type="hidden" name="__VIEWSTATE" value="dDwtMTA4MzE0MjEwNTs7Pg==" />
+            <div class="content"><h1>Quarterly report</h1>
+            <p>Revenue grew in every region this quarter, led by the northern division.</p></div>
+            <select name="year"><option>2025</option><option>2026</option></select>
+            <button type="submit">Go</button>
+            </form></body></html>"#;
+        let document = extract_html_fixture("https://legacy.example/Default.aspx", html).await;
+        assert!(
+            document.markdown.contains("Quarterly report"),
+            "{}",
+            document.markdown
+        );
+        assert!(document.markdown.contains("northern division"));
+        assert!(!document.markdown.contains("VIEWSTATE"));
+        assert!(
+            !document.markdown.contains("2026"),
+            "form controls are stripped"
+        );
+    }
+
+    #[tokio::test]
+    async fn arxiv_abstract_page_extracts_title_and_abstract() {
+        // Trimmed from the shape of https://arxiv.org/abs/1706.03762 (2026-09).
+        let html = r##"<!DOCTYPE html><html lang="en"><head><title>[1706.03762] Attention Is All You Need</title>
+            <script>window.MathJax = {};</script></head>
+            <body ><div class="flex-wrap-footer"><a href="#content" class="ds-skip-link">Skip to main content</a>
+            <header class="ds-site-header"><a href="https://arxiv.org/">archive home</a>
+            <button type="button" id="ds-nav-toggle">Open menu</button>
+            <nav class="ds-site-header-nav"><a href="https://arxiv.org/search">Search</a><a href="https://arxiv.org/login">Log in</a></nav>
+            </header>
+            <div class="arxiv-search-overlay" hidden><form method="GET" action="https://arxiv.org/search">
+            <label for="q">Search arXiv</label><input type="text" name="query" id="q"></form></div>
+            <main><div id="content"><!-- rdf:RDF <rdf:Description dc:title="Attention Is All You Need" /> -->
+            <div id="abs-outer"><div class="leftcolumn"><div class="subheader"><h1>Computer Science &gt; Computation and Language</h1></div>
+            <div id="abs"><div class="dateline">[Submitted on 12 Jun 2017 (<a href="/abs/1706.03762v1">v1</a>)]</div>
+            <h1 class="title mathjax"><span class="descriptor">Title:</span>Attention Is All You Need</h1>
+            <div class="authors"><span class="descriptor">Authors:</span><a href="/a/vaswani_a_1">Ashish Vaswani</a></div>
+            <blockquote class="abstract mathjax"><span class="descriptor">Abstract:</span>The dominant sequence transduction models are based on complex recurrent or convolutional neural networks.</blockquote>
+            <script type="text/javascript" language="javascript">mathjaxToggle();</script>
+            </div></div></div></div></main>
+            <footer><a href="https://info.arxiv.org/help/contact.html">Contact</a></footer></div></body></html>"##;
+        let document = extract_html_fixture("https://arxiv.org/abs/1706.03762", html).await;
+        assert!(
+            document.markdown.contains("Attention Is All You Need"),
+            "{}",
+            document.markdown
+        );
+        assert!(
+            document.markdown.contains("dominant sequence transduction"),
+            "{}",
+            document.markdown
+        );
+        assert!(document.markdown.contains("Ashish Vaswani"));
+        assert!(!document.markdown.contains("mathjaxToggle"));
+        assert!(!document.markdown.contains("Log in"));
     }
 }

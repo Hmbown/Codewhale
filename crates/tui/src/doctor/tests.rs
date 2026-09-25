@@ -202,6 +202,7 @@ async fn search_probe_counts_any_http_response_as_transport_only() {
             provider: Some(crate::config::SearchProvider::DuckDuckGo),
             base_url: Some(server.uri()),
             api_key: None,
+            native: None,
         }),
         ..Default::default()
     };
@@ -256,6 +257,7 @@ async fn search_probe_does_not_follow_redirects() {
             provider: Some(crate::config::SearchProvider::Searxng),
             base_url: Some(server.uri()),
             api_key: None,
+            native: None,
         }),
         ..Default::default()
     };
@@ -282,6 +284,7 @@ async fn search_probe_respects_network_policy_without_contacting_the_authority()
             provider: Some(crate::config::SearchProvider::Searxng),
             base_url: Some("https://search.example/private?token=secret".to_string()),
             api_key: None,
+            native: None,
         }),
         network: Some(crate::config::NetworkPolicyToml {
             default: "allow".to_string(),

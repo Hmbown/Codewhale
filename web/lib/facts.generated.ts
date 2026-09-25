@@ -37,7 +37,7 @@ export interface RepoFacts {
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-09-22T18:25:10.895Z",
+  "generatedAt": "2026-09-24T07:58:50.292Z",
   "sourceRevision": null,
   "sourceCommittedAt": null,
   "version": "0.10.0",
@@ -326,6 +326,14 @@ export const FACTS: RepoFacts = {
     }
   ],
   "models": [
+    {
+      "id": "grok-4.7",
+      "provider": "xAI",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-09-23"
+    },
     {
       "id": "step-3.5-flash",
       "provider": "StepFun",

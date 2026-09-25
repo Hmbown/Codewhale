@@ -3,18 +3,20 @@
 //! The CLI, TUI, runtime threads, subagents, and command handlers all need
 //! this behavior, so it intentionally lives outside the command tree.
 
-use std::time::Duration;
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::client::CodewhaleClient;
-use crate::config::{ApiProvider, Config, normalize_model_name_for_provider};
+use crate::client::system_one::{DecisionRouterRoute, SystemOneAnswer, SystemOneResponse};
+use crate::config::{ApiProvider, AutoRouterKind, Config, normalize_model_name_for_provider};
 use crate::cost_status::{
     EffectiveRouteEnvelope, EffectiveRouteUsage, RuntimeUsageDropRecord, RuntimeUsageRecord,
 };
 use crate::llm_client::LlmClient;
-use crate::model_inventory::ModelInventory;
+use crate::model_inventory::{ModelInventory, probability_bp};
 use crate::reasoning_preference::ReasoningEffort;
 use codewhale_models::Role;
 use codewhale_models::{ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt};
@@ -309,6 +311,12 @@ pub(crate) enum AutoRouteDataPath {
         provider: ApiProvider,
         model: String,
     },
+    /// A System One decision model (#6525). Additive: older binaries cannot
+    /// read a session that persisted this variant.
+    Decision {
+        route: DecisionRouterRoute,
+        model: String,
+    },
 }
 
 impl AutoRouteDataPath {
@@ -319,6 +327,10 @@ impl AutoRouteDataPath {
             Self::Classifier { provider, model } => format!(
                 "latest request + bounded recent context -> {} / {model}",
                 provider.display_name()
+            ),
+            Self::Decision { route, model } => format!(
+                "latest request + bounded recent context -> {} / {model} (decision model)",
+                route.display_name()
             ),
         }
     }
@@ -353,6 +365,8 @@ pub(crate) enum AutoRouteHeuristicReason {
     /// The configured default model: no classifier was available and no
     /// content signal was consulted.
     DeclaredDefault,
+    /// A decision router answered below `[auto.router] min_confidence`.
+    LowConfidence,
 }
 
 impl AutoRouteHeuristicReason {
@@ -367,6 +381,7 @@ impl AutoRouteHeuristicReason {
             Self::NoFastSibling => "no runnable fast sibling",
             Self::NoRunnableCandidate => "no runnable inventory candidate",
             Self::DeclaredDefault => "configured default (no classifier)",
+            Self::LowConfidence => "decision confidence below threshold",
         }
     }
 }
@@ -415,6 +430,75 @@ pub(crate) struct AutoRouteReceipt {
     pub(crate) scope: AutoRouteScope,
     pub(crate) data_path: AutoRouteDataPath,
     pub(crate) reason: AutoRouteReason,
+    /// Decision-model evidence (#6525); absent for chat routers and for
+    /// sessions saved before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) decision: Option<AutoRouteDecisionEvidence>,
+    /// Why a configured router did not produce this route. Set by both router
+    /// kinds, so a configured-but-failing router is shown as failing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) router_failure: Option<AutoRouterFailure>,
+}
+
+/// What a decision model answered and what it cost. Probabilities are basis
+/// points (0..=10000) so the receipt stays `Eq` and never re-renders floats.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AutoRouteDecisionEvidence {
+    /// The tier the decision model chose (`fast` | `strong`).
+    pub(crate) choice: String,
+    pub(crate) probabilities_bp: BTreeMap<String, u16>,
+    pub(crate) confidence_bp: u16,
+    pub(crate) min_confidence_bp: u16,
+    /// `[auto] cost_saving` kept the fast tier because the strong tier's
+    /// probability was below the cost-saving floor.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) cost_saving_kept_fast: bool,
+    /// The reasoning effort the decision applied, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) thinking: Option<String>,
+    /// `usage.cost` exactly as the provider reported it (USD decimal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_reported_cost_usd: Option<String>,
+    pub(crate) latency_ms: u64,
+    /// The dated model snapshot the provider echoed, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) response_model: Option<String>,
+}
+
+/// Non-secret failure class for a configured router. Provider error bodies
+/// never enter this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub(crate) enum AutoRouterFailure {
+    /// Declared but unusable: missing key, unknown kind, or client setup.
+    NotRunnable,
+    Timeout,
+    Http {
+        status: u16,
+    },
+    QuotaExhausted,
+    /// The provider rejected the request (model, size, or policy).
+    Rejected,
+    Transport,
+    /// The response could not be decoded or failed validation.
+    InvalidAnswer,
+}
+
+impl AutoRouterFailure {
+    #[must_use]
+    pub(crate) fn label(self) -> String {
+        match self {
+            Self::NotRunnable => {
+                "not runnable (check the router key and [auto.router])".to_string()
+            }
+            Self::Timeout => "timed out".to_string(),
+            Self::Http { status } => format!("HTTP {status}"),
+            Self::QuotaExhausted => "provider quota or credits exhausted".to_string(),
+            Self::Rejected => "request rejected by the provider".to_string(),
+            Self::Transport => "network error".to_string(),
+            Self::InvalidAnswer => "invalid answer".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,6 +625,27 @@ struct InventoryAutoRouteAttempt {
     routed_usage: Vec<RuntimeUsageRecord>,
     routed_usage_drop_records: Vec<RuntimeUsageDropRecord>,
     routed_usage_dropped_records: u64,
+    /// Decision-model evidence, when a decision router answered.
+    decision: Option<AutoRouteDecisionEvidence>,
+    /// Why the router produced no usable recommendation.
+    failure: Option<AutoRouterFailure>,
+    /// Overrides the fallback reason when the router answered but its answer
+    /// was not acted on (low confidence).
+    fallback_reason: Option<AutoRouteHeuristicReason>,
+}
+
+impl InventoryAutoRouteAttempt {
+    fn failed(failure: AutoRouterFailure) -> Self {
+        Self {
+            recommendation: None,
+            routed_usage: Vec::new(),
+            routed_usage_drop_records: Vec::new(),
+            routed_usage_dropped_records: 0,
+            decision: None,
+            failure: Some(failure),
+            fallback_reason: None,
+        }
+    }
 }
 
 pub(crate) async fn resolve_auto_route_with_inventory(
@@ -592,20 +697,22 @@ pub(crate) async fn resolve_auto_route_with_inventory_for_session_and_cache_poli
 ) -> Result<AutoRouteSelection> {
     let inventory = ModelInventory::from_config(config);
     if !inventory.router_available {
-        // Fall back to declared-default auto routing when the flash router
-        // is unavailable (e.g. non-DeepSeek providers like wanjie-ark).
+        // Declared-default auto routing when no router is available. A router
+        // that was declared but cannot run is marked failing on the receipt.
+        return Ok(normalize_auto_route_selection_for_config(
+            config,
+            auto_route_without_router(config, &inventory),
+        ));
+    }
+
+    if cfg!(test) {
         return Ok(normalize_auto_route_selection_for_config(
             config,
             auto_route_declared_fallback(config, &inventory),
         ));
     }
 
-    let fallback = auto_route_declared_fallback(config, &inventory);
-    if cfg!(test) {
-        return Ok(normalize_auto_route_selection_for_config(config, fallback));
-    }
-
-    let selection = match auto_route_inventory_recommendation(
+    let selection = auto_route_via_router(
         config,
         &inventory,
         latest_request,
@@ -615,15 +722,139 @@ pub(crate) async fn resolve_auto_route_with_inventory_for_session_and_cache_poli
         selected_thinking_mode,
         allow_response_cache,
     )
-    .await
+    .await;
+    Ok(normalize_auto_route_selection_for_config(config, selection))
+}
+
+/// The local fallback when the router is not available, marking a declared
+/// but unusable router as failing rather than silently ignoring it.
+fn auto_route_without_router(config: &Config, inventory: &ModelInventory) -> AutoRouteSelection {
+    let mut selection = auto_route_declared_fallback(config, inventory);
+    if inventory.router_setup_issue.is_some()
+        && let Some(receipt) = selection.receipt.as_mut()
     {
-        Ok(attempt) => auto_route_from_classifier_attempt(fallback, &inventory, attempt),
+        receipt.router_failure = Some(AutoRouterFailure::NotRunnable);
+    }
+    selection
+}
+
+/// Ask the configured router (either kind) for this turn's route. Callers
+/// have already checked `inventory.router_available`. The `cfg!(test)`
+/// short-circuit lives in the caller, so tests exercise this directly.
+#[allow(clippy::too_many_arguments)]
+async fn auto_route_via_router(
+    config: &Config,
+    inventory: &ModelInventory,
+    latest_request: &str,
+    recent_context: &str,
+    session_mode: &str,
+    selected_model_mode: &str,
+    selected_thinking_mode: &str,
+    allow_response_cache: bool,
+) -> AutoRouteSelection {
+    let fallback = auto_route_declared_fallback(config, inventory);
+    let attempt = match inventory.router_kind {
+        AutoRouterKind::Decision => {
+            // Options are tiers, not model ids: without a runnable strong/fast
+            // pair there is nothing to decide, so no request and no spend.
+            let Some(pair) = runnable_active_pair(inventory) else {
+                let mut selection = fallback;
+                if let Some(receipt) = selection.receipt.as_mut() {
+                    receipt.reason =
+                        AutoRouteReason::LocalFallback(AutoRouteHeuristicReason::NoFastSibling);
+                }
+                return selection;
+            };
+            auto_route_decision_recommendation(
+                config,
+                inventory,
+                &pair,
+                latest_request,
+                recent_context,
+                session_mode,
+                selected_thinking_mode,
+            )
+            .await
+        }
+        AutoRouterKind::Chat => {
+            auto_route_inventory_recommendation(
+                config,
+                inventory,
+                latest_request,
+                recent_context,
+                session_mode,
+                selected_model_mode,
+                selected_thinking_mode,
+                allow_response_cache,
+            )
+            .await
+        }
+    };
+    match attempt {
+        Ok(attempt) => auto_route_from_classifier_attempt(fallback, inventory, attempt),
         // Client construction/preparation failed before a provider request was
         // admitted. There is no provider usage to invent and no dropped
         // response receipt to claim.
-        Err(_) => auto_route_classifier_fallback(fallback, &inventory),
-    };
-    Ok(normalize_auto_route_selection_for_config(config, selection))
+        Err(_) => {
+            let mut selection = auto_route_classifier_fallback(fallback, inventory);
+            if let Some(receipt) = selection.receipt.as_mut() {
+                receipt.router_failure = Some(AutoRouterFailure::NotRunnable);
+            }
+            selection
+        }
+    }
+}
+
+/// Fixed synthetic request used by `/router` preset test calls.
+pub(crate) const ROUTER_TEST_REQUEST: &str = "Rename the variable foo to bar in src/lib.rs";
+
+/// One `/router` preset test call (#6525): exactly the per-turn routing path,
+/// run once against a fixed synthetic request, with its wall-clock latency.
+/// Returns `Err` with a non-secret reason whenever no request was sent, so
+/// the setup view never reports a test that did not happen.
+pub(crate) async fn test_auto_router(
+    config: &Config,
+) -> std::result::Result<(AutoRouteSelection, u64), String> {
+    let inventory = ModelInventory::from_config(config);
+    if !inventory.router_available {
+        return Err(inventory
+            .router_setup_issue
+            .map_or("router is not configured", |issue| issue.label())
+            .to_string());
+    }
+    // A decision router with no runnable strong/fast pair has nothing to
+    // decide and sends nothing (see `auto_route_via_router`).
+    if inventory.router_kind == AutoRouterKind::Decision
+        && runnable_active_pair(&inventory).is_none()
+    {
+        return Err(AutoRouteHeuristicReason::NoFastSibling.label().to_string());
+    }
+    let started = Instant::now();
+    let selection = auto_route_via_router(
+        config,
+        &inventory,
+        ROUTER_TEST_REQUEST,
+        "",
+        "agent",
+        "auto",
+        "auto",
+        false,
+    )
+    .await;
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // `NotRunnable` is set only when the client could not be built or the
+    // request failed preflight: nothing reached the network.
+    if let Some(failure @ AutoRouterFailure::NotRunnable) = selection
+        .receipt
+        .as_ref()
+        .and_then(|receipt| receipt.router_failure)
+    {
+        return Err(failure.label());
+    }
+    Ok((
+        normalize_auto_route_selection_for_config(config, selection),
+        latency_ms,
+    ))
 }
 
 pub(crate) fn resolve_explicit_route_with_inventory(
@@ -797,13 +1028,11 @@ fn auto_route_from_classifier(
     inventory: &ModelInventory,
     recommendation: InventoryAutoRouteRecommendation,
 ) -> AutoRouteSelection {
-    let data_path = AutoRouteDataPath::Classifier {
-        provider: inventory.router_provider,
-        model: inventory.router_model.to_string(),
-    };
+    let data_path = router_data_path(inventory);
     // Report the scope the classifier actually had, not the widest one it
-    // could ever have (#4411).
-    let scope = if inventory.cross_provider_auto {
+    // could ever have (#4411). A decision router only ever chooses a tier of
+    // the active provider.
+    let scope = if inventory.cross_provider_auto && inventory.router_decision_route.is_none() {
         AutoRouteScope::RunnableProviders
     } else {
         AutoRouteScope::ActiveProvider
@@ -837,11 +1066,23 @@ fn auto_route_from_classifier_attempt(
         routed_usage,
         routed_usage_drop_records,
         routed_usage_dropped_records,
+        decision,
+        failure,
+        fallback_reason,
     } = attempt;
     let mut selection = recommendation.map_or_else(
         || auto_route_classifier_fallback(fallback, inventory),
         |recommendation| auto_route_from_classifier(inventory, recommendation),
     );
+    if let Some(receipt) = selection.receipt.as_mut() {
+        if let (Some(reason), AutoRouteReason::ClassifierFallback(_)) =
+            (fallback_reason, receipt.reason)
+        {
+            receipt.reason = AutoRouteReason::ClassifierFallback(reason);
+        }
+        receipt.decision = decision;
+        receipt.router_failure = failure;
+    }
     selection.routed_usage = routed_usage;
     selection.routed_usage_drop_records = routed_usage_drop_records;
     selection.routed_usage_dropped_records = routed_usage_dropped_records;
@@ -858,13 +1099,24 @@ fn auto_route_classifier_fallback(
             | AutoRouteReason::ClassifierFallback(reason) => reason,
             AutoRouteReason::ClassifierRecommendation => AutoRouteHeuristicReason::DeclaredDefault,
         };
-        receipt.data_path = AutoRouteDataPath::Classifier {
-            provider: inventory.router_provider,
-            model: inventory.router_model.to_string(),
-        };
+        receipt.data_path = router_data_path(inventory);
         receipt.reason = AutoRouteReason::ClassifierFallback(fallback_reason);
     }
     fallback
+}
+
+/// The non-secret data path of the configured router.
+fn router_data_path(inventory: &ModelInventory) -> AutoRouteDataPath {
+    match inventory.router_decision_route {
+        Some(route) => AutoRouteDataPath::Decision {
+            route,
+            model: inventory.router_model.to_string(),
+        },
+        None => AutoRouteDataPath::Classifier {
+            provider: inventory.router_provider,
+            model: inventory.router_model.to_string(),
+        },
+    }
 }
 
 fn auto_route_receipt(
@@ -897,6 +1149,8 @@ fn auto_route_receipt(
         scope,
         data_path,
         reason,
+        decision: None,
+        router_failure: None,
     }
 }
 
@@ -1024,10 +1278,15 @@ fn auto_route_attempt_from_response(
             })
             .flatten();
     InventoryAutoRouteAttempt {
+        failure: recommendation
+            .is_none()
+            .then_some(AutoRouterFailure::InvalidAnswer),
         recommendation,
         routed_usage,
         routed_usage_drop_records: Vec::new(),
         routed_usage_dropped_records: 0,
+        decision: None,
+        fallback_reason: None,
     }
 }
 
@@ -1058,16 +1317,16 @@ fn auto_route_attempt_from_provider_response(
 
 fn auto_route_attempt_with_dropped_response(
     request_route: EffectiveRouteEnvelope,
+    failure: AutoRouterFailure,
 ) -> InventoryAutoRouteAttempt {
     let request_route = request_route.sanitized_for_persistence();
     InventoryAutoRouteAttempt {
-        recommendation: None,
-        routed_usage: Vec::new(),
         routed_usage_drop_records: vec![RuntimeUsageDropRecord {
             source_id: auto_route_usage_source_id(&request_route, "transport-error"),
             route: request_route,
         }],
         routed_usage_dropped_records: 1,
+        ..InventoryAutoRouteAttempt::failed(failure)
     }
 }
 
@@ -1157,19 +1416,21 @@ async fn auto_route_inventory_recommendation(
         // The request crossed Codewhale's dispatch boundary, but no exact
         // provider usage came back. Preserve the fallback while explicitly
         // failing cost coverage closed.
-        Ok(Err(_)) => return Ok(auto_route_attempt_with_dropped_response(request_route)),
+        Ok(Err(error)) => {
+            return Ok(auto_route_attempt_with_dropped_response(
+                request_route,
+                crate::client::system_one::router_failure_from_error(&error),
+            ));
+        }
         // The local deadline cancels the future and can fire while the request
         // is still waiting on an application/provider permit. With no response
         // evidence we must not invent a provider call or a missing-usage
         // receipt. Transport errors returned by the client remain the
         // conservative explicit-dropped path above.
         Err(_) => {
-            return Ok(InventoryAutoRouteAttempt {
-                recommendation: None,
-                routed_usage: Vec::new(),
-                routed_usage_drop_records: Vec::new(),
-                routed_usage_dropped_records: 0,
-            });
+            return Ok(InventoryAutoRouteAttempt::failed(
+                AutoRouterFailure::Timeout,
+            ));
         }
     };
     Ok(auto_route_attempt_from_provider_response(
@@ -1177,6 +1438,306 @@ async fn auto_route_inventory_recommendation(
         &response,
         inventory,
     ))
+}
+
+/// The active provider's runnable strong/fast pair, when both tiers can run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveTierPair {
+    provider: ApiProvider,
+    strong: String,
+    fast: String,
+}
+
+fn runnable_active_pair(inventory: &ModelInventory) -> Option<ActiveTierPair> {
+    let active = inventory.active_default()?;
+    let candidates = provider_router_candidates(active.provider, &active.model);
+    let runnable = |model: &str| {
+        inventory
+            .candidate(active.provider, model)
+            .filter(|candidate| candidate.readiness.can_attempt())
+            .map(|candidate| candidate.model.clone())
+    };
+    Some(ActiveTierPair {
+        provider: active.provider,
+        strong: runnable(&candidates.big)?,
+        fast: runnable(candidates.cheap.as_deref()?)?,
+    })
+}
+
+// The decision model reads its criteria literally, so this wording is a
+// product surface: changing it changes routing. Pinned by a snapshot test.
+pub(crate) const DECISION_TIER_INSTRUCTIONS: &str =
+    "Which model tier should handle the latest request in this coding-agent session?";
+pub(crate) const DECISION_FAST_WHAT: &str = "A fast, cheaper model. Right for questions, explanations, lookups, small single-file edits, formatting, and routine follow-ups.";
+pub(crate) const DECISION_FAST_NOT_FOR: &str = "Multi-step agentic work, debugging across files, architecture or design, security review, release work.";
+pub(crate) const DECISION_STRONG_WHAT: &str = "The strongest model. Right for multi-step agentic coding, multi-file changes, debugging, architecture or design, security review, release work, or anything the fast tier would likely get wrong.";
+pub(crate) const DECISION_STRONG_NOT_FOR: &str = "Trivial questions or one-line edits.";
+pub(crate) const DECISION_THINKING_INSTRUCTIONS: &str =
+    "How much reasoning should the chosen model spend on the latest request?";
+pub(crate) const DECISION_THINKING_OFF: &str =
+    "A trivial answer with no tools and no reasoning needed.";
+pub(crate) const DECISION_THINKING_HIGH: &str =
+    "Ordinary reasoning: a normal coding or explanation task.";
+pub(crate) const DECISION_THINKING_MAX: &str =
+    "Agentic, multi-file, debugging, architecture, security, release, or uncertain work.";
+
+const DECISION_TIER_OPTIONS: [&str; 2] = ["fast", "strong"];
+const DECISION_THINKING_OPTIONS: [&str; 3] = ["off", "high", "max"];
+/// Under `[auto] cost_saving`, a `strong` decision needs at least this
+/// probability (basis points) or the turn stays on the fast tier.
+pub(crate) const COST_SAVING_STRONG_MIN_BP: u16 = 7_500;
+
+/// The System One request: one `tier` choice and one `thinking` choice over
+/// the same redacted, bounded state.
+fn decision_request_body(
+    client: &CodewhaleClient,
+    model: &str,
+    latest_request: &str,
+    recent_context: &str,
+    session_mode: &str,
+    selected_thinking_mode: &str,
+) -> serde_json::Value {
+    let recent_context = if recent_context.trim().is_empty() {
+        "No prior context."
+    } else {
+        recent_context
+    };
+    serde_json::json!({
+        "model": model,
+        "state": {
+            "session_mode": client.redact_model_bound_text(session_mode),
+            "selected_thinking_mode": client.redact_model_bound_text(selected_thinking_mode),
+            "recent_context": client.redact_model_bound_text(recent_context),
+            "latest_request": client
+                .redact_model_bound_text(&truncate_for_auto_router(latest_request, 4_000)),
+        },
+        "questions": {
+            "tier": {
+                "type": "choice",
+                "instructions": DECISION_TIER_INSTRUCTIONS,
+                "criteria": {
+                    "fast": { "what": DECISION_FAST_WHAT, "not_for": DECISION_FAST_NOT_FOR },
+                    "strong": { "what": DECISION_STRONG_WHAT, "not_for": DECISION_STRONG_NOT_FOR },
+                },
+            },
+            "thinking": {
+                "type": "choice",
+                "instructions": DECISION_THINKING_INSTRUCTIONS,
+                "criteria": {
+                    "off": DECISION_THINKING_OFF,
+                    "high": DECISION_THINKING_HIGH,
+                    "max": DECISION_THINKING_MAX,
+                },
+            },
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn auto_route_decision_recommendation(
+    config: &Config,
+    inventory: &ModelInventory,
+    pair: &ActiveTierPair,
+    latest_request: &str,
+    recent_context: &str,
+    session_mode: &str,
+    selected_thinking_mode: &str,
+) -> Result<InventoryAutoRouteAttempt> {
+    let route = inventory
+        .router_decision_route
+        .ok_or_else(|| anyhow::anyhow!("decision router has no route"))?;
+    let client =
+        CodewhaleClient::for_decision_route(config, route, inventory.router_base_url.as_deref())?;
+    let body = decision_request_body(
+        &client,
+        &inventory.router_model,
+        latest_request,
+        recent_context,
+        session_mode,
+        selected_thinking_mode,
+    );
+    // OpenRouter spend enters the session through the ordinary routed-usage
+    // path. TypeSafe is not a chat provider, so its spend is shown on the
+    // receipt only (see `client::system_one`).
+    let request_route = (route == DecisionRouterRoute::Openrouter)
+        .then(|| client.effective_route_envelope(&inventory.router_model, chrono::Utc::now()));
+    let started = Instant::now();
+    let dispatched = std::sync::atomic::AtomicBool::new(false);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(inventory.router_timeout_secs),
+        client.system_one_decide(&body, &dispatched),
+    )
+    .await;
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    Ok(match outcome {
+        // A deadline that fired after the request was handed to the transport
+        // may still be billed: record the coverage gap. One that fired while
+        // waiting on a permit sent nothing and invents no receipt.
+        Err(_) => match request_route {
+            Some(route) if dispatched.load(std::sync::atomic::Ordering::Acquire) => {
+                auto_route_attempt_with_dropped_response(route, AutoRouterFailure::Timeout)
+            }
+            _ => InventoryAutoRouteAttempt::failed(AutoRouterFailure::Timeout),
+        },
+        Ok(Err(failure)) => match request_route {
+            Some(route) => auto_route_attempt_with_dropped_response(route, failure),
+            None => InventoryAutoRouteAttempt::failed(failure),
+        },
+        Ok(Ok(response)) => decision_attempt_from_response(
+            config.auto_cost_saving(),
+            inventory,
+            pair,
+            request_route,
+            &response,
+            latency_ms,
+        ),
+    })
+}
+
+/// A validated `choice` answer.
+struct ValidChoice {
+    choice: String,
+    probabilities_bp: BTreeMap<String, u16>,
+    confidence_bp: u16,
+}
+
+/// Validate one `choice` answer against the offered options. Any violation
+/// rejects the whole answer; nothing is repaired.
+fn validated_choice(answer: Option<&SystemOneAnswer>, options: &[&str]) -> Option<ValidChoice> {
+    let answer = answer?;
+    if answer.kind != "choice" {
+        return None;
+    }
+    let choice = answer.choice.as_deref()?;
+    if !options.contains(&choice) || answer.probabilities.len() != options.len() {
+        return None;
+    }
+    let mut sum = 0.0;
+    let mut probabilities_bp = BTreeMap::new();
+    for option in options {
+        let value = (*answer.probabilities.get(*option)?)?;
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return None;
+        }
+        sum += value;
+        probabilities_bp.insert((*option).to_string(), probability_bp(value));
+    }
+    if (sum - 1.0).abs() > 0.02 {
+        return None;
+    }
+    let confidence = answer.confidence?;
+    if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+        return None;
+    }
+    Some(ValidChoice {
+        choice: choice.to_string(),
+        probabilities_bp,
+        confidence_bp: probability_bp(confidence),
+    })
+}
+
+/// Turn a decoded System One response into a routing attempt. All policy is
+/// here, in code: the decision model does no arithmetic.
+fn decision_attempt_from_response(
+    cost_saving: bool,
+    inventory: &ModelInventory,
+    pair: &ActiveTierPair,
+    request_route: Option<EffectiveRouteEnvelope>,
+    response: &SystemOneResponse,
+    latency_ms: u64,
+) -> InventoryAutoRouteAttempt {
+    let mut attempt = InventoryAutoRouteAttempt {
+        recommendation: None,
+        routed_usage: Vec::new(),
+        routed_usage_drop_records: Vec::new(),
+        routed_usage_dropped_records: 0,
+        decision: None,
+        failure: None,
+        fallback_reason: None,
+    };
+    if let Some(request_route) = request_route {
+        let usage = codewhale_models::Usage {
+            input_tokens: response
+                .usage
+                .as_ref()
+                .map_or(0, |usage| usage.input_tokens),
+            output_tokens: response
+                .usage
+                .as_ref()
+                .map_or(0, |usage| usage.output_tokens),
+            ..Default::default()
+        };
+        let response_id = response.id.as_deref().unwrap_or("systemone");
+        if auto_route_usage_has_reported_data(&usage) {
+            attempt.routed_usage.push(RuntimeUsageRecord {
+                source_id: auto_route_usage_source_id(&request_route, response_id),
+                usage: EffectiveRouteUsage {
+                    route: request_route.sanitized_for_persistence(),
+                    usage,
+                },
+            });
+        } else {
+            let drop_route = request_route.sanitized_for_persistence();
+            attempt
+                .routed_usage_drop_records
+                .push(RuntimeUsageDropRecord {
+                    source_id: auto_route_usage_source_id(
+                        &drop_route,
+                        &format!("missing-usage:{response_id}"),
+                    ),
+                    route: drop_route,
+                });
+            attempt.routed_usage_dropped_records = 1;
+        }
+    }
+
+    let Some(tier) = validated_choice(response.answers.get("tier"), &DECISION_TIER_OPTIONS) else {
+        attempt.failure = Some(AutoRouterFailure::InvalidAnswer);
+        return attempt;
+    };
+    let min_confidence_bp = inventory.router_min_confidence_bp;
+    // An invalid or unsure `thinking` answer drops only the effort.
+    let thinking = validated_choice(response.answers.get("thinking"), &DECISION_THINKING_OPTIONS)
+        .filter(|thinking| thinking.confidence_bp >= min_confidence_bp)
+        .map(|thinking| thinking.choice);
+    let strong_bp = tier.probabilities_bp.get("strong").copied().unwrap_or(0);
+    let cost_saving_kept_fast =
+        cost_saving && tier.choice == "strong" && strong_bp < COST_SAVING_STRONG_MIN_BP;
+    let acted = tier.confidence_bp >= min_confidence_bp;
+    attempt.decision = Some(AutoRouteDecisionEvidence {
+        choice: tier.choice.clone(),
+        probabilities_bp: tier.probabilities_bp,
+        confidence_bp: tier.confidence_bp,
+        min_confidence_bp,
+        cost_saving_kept_fast: acted && cost_saving_kept_fast,
+        thinking: thinking.clone().filter(|_| acted),
+        provider_reported_cost_usd: response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.reported_cost()),
+        latency_ms,
+        response_model: response
+            .model
+            .as_deref()
+            .map(|model| model.chars().take(128).collect()),
+    });
+    if !acted {
+        attempt.fallback_reason = Some(AutoRouteHeuristicReason::LowConfidence);
+        return attempt;
+    }
+    let model = if tier.choice == "strong" && !cost_saving_kept_fast {
+        pair.strong.clone()
+    } else {
+        pair.fast.clone()
+    };
+    attempt.recommendation = Some(InventoryAutoRouteRecommendation {
+        provider: pair.provider,
+        model,
+        reasoning_effort: thinking
+            .as_deref()
+            .and_then(parse_auto_route_reasoning_effort),
+    });
+    attempt
 }
 
 fn inventory_auto_router_system_prompt(inventory: &ModelInventory, cost_saving: bool) -> String {
@@ -1202,19 +1763,12 @@ security, tool-heavy, or uncertain work.\n\nInventory JSON:\n{}",
     ));
 
     if cost_saving {
-        let active_pair = inventory.active_default().and_then(|active| {
-            let candidates = provider_router_candidates(active.provider, &active.model);
-            let fast = candidates.cheap.as_deref()?;
-            (inventory
-                .candidate(active.provider, &candidates.big)
-                .is_some_and(|candidate| candidate.readiness.can_attempt())
-                && inventory
-                    .candidate(active.provider, fast)
-                    .is_some_and(|candidate| candidate.readiness.can_attempt()))
-            .then_some((active.provider, candidates.big, fast.to_string()))
-        });
-
-        if let Some((provider, strong, fast)) = active_pair {
+        if let Some(ActiveTierPair {
+            provider,
+            strong,
+            fast,
+        }) = runnable_active_pair(inventory)
+        {
             prompt.push_str(&format!(
                 "\n\nCost-saving mode is ON. For the active provider `{}`, `{fast}` is the fast tier \
 and `{strong}` is the strong tier. Prefer `{fast}` for ambiguous, routine, or single-step work. \
@@ -1439,6 +1993,7 @@ mod tests {
                     model: Some(model.to_string()),
                     thinking: Some("off".to_string()),
                     timeout_secs: None,
+                    ..Default::default()
                 }),
             }),
             ..Default::default()
@@ -1551,6 +2106,7 @@ mod tests {
 
         let transport = auto_route_attempt_with_dropped_response(
             client.effective_route_envelope(model, second_at + chrono::Duration::nanoseconds(3)),
+            AutoRouterFailure::Transport,
         );
         assert_eq!(transport.routed_usage_dropped_records, 1);
         assert_eq!(transport.routed_usage_drop_records.len(), 1);
@@ -2605,5 +3161,550 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.auto_cost_saving());
+    }
+}
+
+#[cfg(test)]
+mod decision_router_tests {
+    //! `[auto.router] kind = "decision"` (#6525) against wiremock. The
+    //! resolver's `cfg!(test)` short-circuit stays; these call the router path
+    //! (`auto_route_via_router`) and its pure policy directly.
+
+    use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    const MARKER: &str = "PROVIDER-BODY-MARKER-must-not-leak";
+
+    /// Fields drop in declaration order: restore the environment before the
+    /// lock is released, or another test observes our overrides.
+    struct Env {
+        _guards: Vec<crate::test_support::EnvVarGuard>,
+        _home: tempfile::TempDir,
+        _lock: crate::test_support::TestEnvLock,
+    }
+
+    fn hermetic_env() -> Env {
+        let lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("test home");
+        let guards = vec![
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path()),
+            crate::test_support::EnvVarGuard::remove("OPENROUTER_API_KEY"),
+            crate::test_support::EnvVarGuard::remove("TYPESAFE_API_KEY"),
+        ];
+        Env {
+            _guards: guards,
+            _home: home,
+            _lock: lock,
+        }
+    }
+
+    /// Active DeepSeek (pro/flash pair runnable) with an OpenRouter decision
+    /// router pointed at `openrouter_base`.
+    fn decision_config(openrouter_base: &str, cost_saving: bool, timeout_secs: u64) -> Config {
+        Config {
+            provider: Some("deepseek".to_string()),
+            default_text_model: Some("deepseek-v4-pro".to_string()),
+            providers: Some(crate::config::ProvidersConfig {
+                deepseek: crate::config::ProviderConfig {
+                    api_key: Some("ds-test-key".to_string()),
+                    ..Default::default()
+                },
+                openrouter: crate::config::ProviderConfig {
+                    api_key: Some("or-test-key".to_string()),
+                    base_url: Some(openrouter_base.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            auto: Some(crate::config::AutoConfig {
+                cost_saving: Some(cost_saving),
+                cross_provider: None,
+                router: Some(crate::config::AutoRouterConfig {
+                    kind: Some("decision".to_string()),
+                    provider: Some("openrouter".to_string()),
+                    model: Some("typesafe/jev-1.13".to_string()),
+                    timeout_secs: Some(timeout_secs),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        }
+    }
+
+    const TYPESAFE_TEST_KEY: &str = "tsbarekey0123456789";
+
+    fn answer_body(strong: f64, confidence: f64) -> serde_json::Value {
+        serde_json::json!({
+            "id": "gen-dec-1",
+            "model": "typesafe/jev-1.13-20260917",
+            "provider": "TypeSafe",
+            "answers": {
+                "tier": {
+                    "type": "choice",
+                    "choice": if strong >= 0.5 { "strong" } else { "fast" },
+                    "probabilities": { "fast": 1.0 - strong, "strong": strong },
+                    "confidence": confidence,
+                },
+                "thinking": {
+                    "type": "choice",
+                    "choice": "max",
+                    "probabilities": { "off": 0.02, "high": 0.21, "max": 0.77 },
+                    "confidence": 0.66,
+                },
+            },
+            "usage": { "cost": 0.000019992, "input_tokens": 476, "output_tokens": 70 },
+        })
+    }
+
+    async fn route(config: &Config, latest: &str, context: &str) -> AutoRouteSelection {
+        let inventory = ModelInventory::from_config(config);
+        assert!(
+            inventory.router_available,
+            "decision router must be available"
+        );
+        auto_route_via_router(
+            config, &inventory, latest, context, "agent", "auto", "auto", false,
+        )
+        .await
+    }
+
+    fn receipt(selection: &AutoRouteSelection) -> &AutoRouteReceipt {
+        selection.receipt.as_ref().expect("auto receipt")
+    }
+
+    #[tokio::test]
+    async fn decision_request_has_pinned_shape_and_redacted_state() {
+        let _env = hermetic_env();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(header("authorization", "Bearer or-test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer_body(0.82, 0.64)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = decision_config(&server.uri(), false, 2);
+        // A configured credential that a tool result echoed back.
+        let secret = "cw-router-secret-should-never-leave-process";
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .deepseek
+            .api_key = Some(secret.to_string());
+        let selection = route(
+            &config,
+            "Refactor the parser across files",
+            &format!("assistant: [tool result] token={secret}"),
+        )
+        .await;
+        assert_eq!(selection.model, "deepseek-v4-pro");
+
+        let requests: Vec<Request> = server.received_requests().await.expect("recorded");
+        assert_eq!(requests.len(), 1);
+        let raw = String::from_utf8(requests[0].body.clone()).expect("utf8 body");
+        assert!(
+            !raw.contains(secret),
+            "secret leaked into the decision state"
+        );
+        let body: serde_json::Value = serde_json::from_str(&raw).expect("json body");
+        assert_eq!(body["model"], "typesafe/jev-1.13");
+        let state_keys: Vec<&str> = body["state"]
+            .as_object()
+            .expect("state object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            state_keys,
+            [
+                "session_mode",
+                "selected_thinking_mode",
+                "recent_context",
+                "latest_request"
+            ]
+        );
+        // The criteria are a product surface: pin the exact wording.
+        assert_eq!(
+            body["questions"],
+            serde_json::json!({
+                "tier": {
+                    "type": "choice",
+                    "instructions": "Which model tier should handle the latest request in this coding-agent session?",
+                    "criteria": {
+                        "fast": {
+                            "what": "A fast, cheaper model. Right for questions, explanations, lookups, small single-file edits, formatting, and routine follow-ups.",
+                            "not_for": "Multi-step agentic work, debugging across files, architecture or design, security review, release work."
+                        },
+                        "strong": {
+                            "what": "The strongest model. Right for multi-step agentic coding, multi-file changes, debugging, architecture or design, security review, release work, or anything the fast tier would likely get wrong.",
+                            "not_for": "Trivial questions or one-line edits."
+                        }
+                    }
+                },
+                "thinking": {
+                    "type": "choice",
+                    "instructions": "How much reasoning should the chosen model spend on the latest request?",
+                    "criteria": {
+                        "off": "A trivial answer with no tools and no reasoning needed.",
+                        "high": "Ordinary reasoning: a normal coding or explanation task.",
+                        "max": "Agentic, multi-file, debugging, architecture, security, release, or uncertain work."
+                    }
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn confident_strong_decision_routes_strong_with_evidence_and_usage() {
+        let _env = hermetic_env();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer_body(0.82, 0.64)))
+            .mount(&server)
+            .await;
+        let config = decision_config(&server.uri(), false, 2);
+        let selection = route(&config, "Debug the release pipeline", "").await;
+
+        assert_eq!(selection.provider, ApiProvider::Deepseek);
+        assert_eq!(selection.model, "deepseek-v4-pro");
+        assert_eq!(selection.source, AutoRouteSource::FlashRouter);
+        assert_eq!(selection.reasoning_effort, Some(ReasoningEffort::Max));
+        let receipt = receipt(&selection);
+        assert_eq!(receipt.reason, AutoRouteReason::ClassifierRecommendation);
+        assert_eq!(receipt.tier, AutoRouteTier::Strong);
+        assert_eq!(receipt.scope, AutoRouteScope::ActiveProvider);
+        assert_eq!(
+            receipt.data_path,
+            AutoRouteDataPath::Decision {
+                route: DecisionRouterRoute::Openrouter,
+                model: "typesafe/jev-1.13".to_string(),
+            }
+        );
+        assert_eq!(receipt.router_failure, None);
+        let decision = receipt.decision.as_ref().expect("decision evidence");
+        assert_eq!(decision.choice, "strong");
+        assert_eq!(
+            decision.probabilities_bp,
+            BTreeMap::from([("fast".to_string(), 1800), ("strong".to_string(), 8200)])
+        );
+        assert_eq!(decision.confidence_bp, 6400);
+        assert_eq!(decision.min_confidence_bp, 5000);
+        assert_eq!(decision.thinking.as_deref(), Some("max"));
+        assert_eq!(
+            decision.provider_reported_cost_usd.as_deref(),
+            Some("0.000019992")
+        );
+        assert_eq!(
+            decision.response_model.as_deref(),
+            Some("typesafe/jev-1.13-20260917")
+        );
+        assert_eq!(selection.routed_usage.len(), 1);
+        assert_eq!(selection.routed_usage[0].usage.usage.input_tokens, 476);
+        assert_eq!(selection.routed_usage[0].usage.usage.output_tokens, 70);
+        assert!(
+            selection.routed_usage[0]
+                .source_id
+                .starts_with("auto-router:")
+        );
+    }
+
+    #[tokio::test]
+    async fn low_confidence_takes_the_declared_fallback_and_keeps_usage() {
+        let _env = hermetic_env();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer_body(0.35, 0.3)))
+            .mount(&server)
+            .await;
+        let config = decision_config(&server.uri(), false, 2);
+        let selection = route(&config, "What does this function do?", "").await;
+
+        assert_eq!(selection.model, "deepseek-v4-pro", "declared default");
+        assert_eq!(selection.source, AutoRouteSource::Heuristic);
+        let receipt = receipt(&selection);
+        assert_eq!(
+            receipt.reason,
+            AutoRouteReason::ClassifierFallback(AutoRouteHeuristicReason::LowConfidence)
+        );
+        assert_eq!(receipt.router_failure, None);
+        let decision = receipt.decision.as_ref().expect("evidence is kept");
+        assert_eq!(decision.choice, "fast");
+        assert_eq!(decision.confidence_bp, 3000);
+        assert_eq!(
+            decision.thinking, None,
+            "an unacted decision applies no effort"
+        );
+        assert_eq!(selection.routed_usage.len(), 1, "usage is still recorded");
+    }
+
+    #[tokio::test]
+    async fn http_errors_fail_the_router_loudly_without_leaking_bodies() {
+        for status in [401_u16, 402, 429, 500] {
+            let _env = hermetic_env();
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/systemone"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_string(format!(r#"{{"error":{{"message":"{MARKER}"}}}}"#)),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let config = decision_config(&server.uri(), false, 2);
+            let selection = route(&config, "Explain the diff", "").await;
+
+            assert_eq!(selection.model, "deepseek-v4-pro", "status {status}");
+            let receipt = receipt(&selection);
+            assert!(
+                matches!(receipt.reason, AutoRouteReason::ClassifierFallback(_)),
+                "status {status}"
+            );
+            assert_eq!(
+                receipt.router_failure,
+                Some(AutoRouterFailure::Http { status }),
+                "status {status}"
+            );
+            let json = serde_json::to_string(receipt).expect("receipt json");
+            assert!(!json.contains(MARKER), "status {status}: body leaked");
+            assert!(!receipt.router_failure.unwrap().label().contains(MARKER));
+            assert!(selection.routed_usage.is_empty());
+            assert_eq!(selection.routed_usage_dropped_records, 1, "status {status}");
+            assert_eq!(selection.routed_usage_drop_records.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatched_timeout_falls_back_and_marks_usage_missing() {
+        let _env = hermetic_env();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(answer_body(0.9, 0.8))
+                    .set_delay(Duration::from_millis(1_600)),
+            )
+            .mount(&server)
+            .await;
+        let config = decision_config(&server.uri(), false, 1);
+        let selection = route(&config, "Explain the diff", "").await;
+
+        let receipt = receipt(&selection);
+        assert_eq!(receipt.router_failure, Some(AutoRouterFailure::Timeout));
+        assert!(matches!(
+            receipt.reason,
+            AutoRouteReason::ClassifierFallback(_)
+        ));
+        assert!(selection.routed_usage.is_empty());
+        // The POST was sent before the deadline: coverage must fail closed.
+        assert_eq!(selection.routed_usage_drop_records.len(), 1);
+        assert_eq!(selection.routed_usage_dropped_records, 1);
+    }
+
+    #[tokio::test]
+    async fn no_fast_strong_pair_means_no_request() {
+        let _env = hermetic_env();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer_body(0.9, 0.8)))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut config = decision_config(&server.uri(), false, 2);
+        // A single-tier active provider: nothing for the decision to choose.
+        config.provider = Some("openrouter".to_string());
+        config.default_text_model = Some("synthetic/single-tier-model".to_string());
+        let selection = route(&config, "Refactor everything", "").await;
+
+        let receipt = receipt(&selection);
+        assert_eq!(
+            receipt.reason,
+            AutoRouteReason::LocalFallback(AutoRouteHeuristicReason::NoFastSibling)
+        );
+        assert_eq!(receipt.data_path, AutoRouteDataPath::LocalHeuristic);
+        assert!(selection.routed_usage.is_empty());
+
+        // The setup test must say no call was made, not report a result.
+        let reason = test_auto_router(&config)
+            .await
+            .expect_err("no test call without a strong/fast pair");
+        assert_eq!(reason, AutoRouteHeuristicReason::NoFastSibling.label());
+    }
+
+    #[tokio::test]
+    async fn typesafe_direct_uses_its_own_endpoint_and_key() {
+        let _env = hermetic_env();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(header(
+                "authorization",
+                format!("Bearer {TYPESAFE_TEST_KEY}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer_body(0.2, 0.6)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = decision_config("https://openrouter.invalid/api/v1", false, 2);
+        let providers = config.providers.as_mut().expect("providers");
+        providers.openrouter.api_key = None;
+        // From the environment: not part of any `[providers.*]` table, so
+        // only the TypeSafe-specific redaction covers it.
+        let _key = crate::test_support::EnvVarGuard::set("TYPESAFE_API_KEY", TYPESAFE_TEST_KEY);
+        let router = config
+            .auto
+            .as_mut()
+            .and_then(|auto| auto.router.as_mut())
+            .expect("router");
+        router.provider = Some("typesafe".to_string());
+        router.model = Some("jev-latest".to_string());
+        router.base_url = Some(format!("{}/v1", server.uri()));
+
+        // The TypeSafe key is no chat provider's key; a bare echo of it in
+        // context must still be redacted from the decision body.
+        let selection = route(
+            &config,
+            "Rename a variable",
+            &format!("assistant: [tool result] {TYPESAFE_TEST_KEY}"),
+        )
+        .await;
+        let requests: Vec<Request> = server.received_requests().await.expect("recorded");
+        let raw = String::from_utf8(requests[0].body.clone()).expect("utf8 body");
+        assert!(!raw.contains(TYPESAFE_TEST_KEY), "TypeSafe key leaked");
+
+        assert_eq!(selection.model, "deepseek-v4-flash");
+        let receipt = receipt(&selection);
+        assert_eq!(receipt.reason, AutoRouteReason::ClassifierRecommendation);
+        assert_eq!(
+            receipt.data_path,
+            AutoRouteDataPath::Decision {
+                route: DecisionRouterRoute::Typesafe,
+                model: "jev-latest".to_string(),
+            }
+        );
+        assert!(receipt.decision.is_some());
+        // TypeSafe is not a chat provider: spend stays on the receipt only.
+        assert!(selection.routed_usage.is_empty());
+        assert!(selection.routed_usage_drop_records.is_empty());
+    }
+
+    #[test]
+    fn declared_router_without_a_key_is_shown_as_failing() {
+        let _env = hermetic_env();
+        let mut config = decision_config("https://openrouter.invalid/api/v1", false, 2);
+        config
+            .providers
+            .as_mut()
+            .expect("providers")
+            .openrouter
+            .api_key = None;
+        let inventory = ModelInventory::from_config(&config);
+        assert!(!inventory.router_available);
+        let selection = auto_route_without_router(&config, &inventory);
+        assert_eq!(
+            receipt(&selection).router_failure,
+            Some(AutoRouterFailure::NotRunnable)
+        );
+    }
+
+    fn parsed(json: serde_json::Value) -> SystemOneResponse {
+        serde_json::from_str(&json.to_string()).expect("system one response")
+    }
+
+    fn pair() -> ActiveTierPair {
+        ActiveTierPair {
+            provider: ApiProvider::Deepseek,
+            strong: "deepseek-v4-pro".to_string(),
+            fast: "deepseek-v4-flash".to_string(),
+        }
+    }
+
+    fn policy(cost_saving: bool, response: &SystemOneResponse) -> InventoryAutoRouteAttempt {
+        let _env = hermetic_env();
+        let config = decision_config("https://openrouter.invalid/api/v1", cost_saving, 2);
+        let inventory = ModelInventory::from_config(&config);
+        decision_attempt_from_response(cost_saving, &inventory, &pair(), None, response, 120)
+    }
+
+    #[test]
+    fn cost_saving_needs_a_clear_strong_probability() {
+        let unsure = policy(true, &parsed(answer_body(0.70, 0.9)));
+        let recommendation = unsure.recommendation.expect("acted");
+        assert_eq!(recommendation.model, "deepseek-v4-flash");
+        assert!(unsure.decision.expect("evidence").cost_saving_kept_fast);
+
+        let clear = policy(true, &parsed(answer_body(0.80, 0.9)));
+        assert_eq!(
+            clear.recommendation.expect("acted").model,
+            "deepseek-v4-pro"
+        );
+        assert!(!clear.decision.expect("evidence").cost_saving_kept_fast);
+
+        let balanced = policy(false, &parsed(answer_body(0.70, 0.9)));
+        assert_eq!(
+            balanced.recommendation.expect("acted").model,
+            "deepseek-v4-pro"
+        );
+    }
+
+    #[test]
+    fn invalid_answers_are_rejected_not_repaired() {
+        let mut outside = answer_body(0.8, 0.6);
+        outside["answers"]["tier"]["choice"] = "medium".into();
+        let mut bad_sum = answer_body(0.8, 0.6);
+        bad_sum["answers"]["tier"]["probabilities"]["fast"] = 0.5.into();
+        let mut missing = answer_body(0.8, 0.6);
+        missing["answers"]
+            .as_object_mut()
+            .expect("answers")
+            .remove("tier");
+        let mut null_probability = answer_body(0.8, 0.6);
+        null_probability["answers"]["tier"]["probabilities"]["fast"] = serde_json::Value::Null;
+        let mut bad_confidence = answer_body(0.8, 0.6);
+        bad_confidence["answers"]["tier"]["confidence"] = 1.5.into();
+        for body in [outside, bad_sum, missing, null_probability, bad_confidence] {
+            let attempt = policy(false, &parsed(body.clone()));
+            assert_eq!(attempt.recommendation, None, "{body}");
+            assert_eq!(
+                attempt.failure,
+                Some(AutoRouterFailure::InvalidAnswer),
+                "{body}"
+            );
+        }
+
+        // An invalid `thinking` answer drops only the effort.
+        let mut bad_thinking = answer_body(0.8, 0.6);
+        bad_thinking["answers"]["thinking"]["choice"] = "ultra".into();
+        let attempt = policy(false, &parsed(bad_thinking));
+        let recommendation = attempt.recommendation.expect("tier still acted on");
+        assert_eq!(recommendation.model, "deepseek-v4-pro");
+        assert_eq!(recommendation.reasoning_effort, None);
+    }
+
+    #[test]
+    fn camel_case_usage_and_verbatim_cost_parse() {
+        let response = parsed(serde_json::json!({
+            "answers": {},
+            "usage": { "inputTokens": 381, "outputTokens": 62, "cost": 0.000016002 },
+        }));
+        let usage = response.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 381);
+        assert_eq!(usage.output_tokens, 62);
+        assert_eq!(usage.reported_cost().as_deref(), Some("0.000016002"));
+    }
+
+    #[test]
+    fn receipts_saved_before_decision_routing_still_load() {
+        let json = r#"{"tier":"fast","pair":{"strong":"deepseek-v4-pro","fast":"deepseek-v4-flash"},"scope":"active_provider","data_path":{"classifier":{"provider":"deepseek","model":"deepseek-v4-flash"}},"reason":"classifier_recommendation"}"#;
+        let receipt: AutoRouteReceipt = serde_json::from_str(json).expect("legacy receipt");
+        assert_eq!(receipt.decision, None);
+        assert_eq!(receipt.router_failure, None);
+        // And the new fields stay off the wire when empty.
+        assert_eq!(serde_json::to_string(&receipt).expect("json"), json);
     }
 }

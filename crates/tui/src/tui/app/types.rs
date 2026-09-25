@@ -675,6 +675,11 @@ pub enum AppAction {
         content: String,
         command: String,
     },
+    /// Router setup (`/router`, `/model router`, #6525): open the view, test a
+    /// preset with one routing call, or save one to `[auto.router]`.
+    RouterSetup {
+        request: crate::tui::views::router_setup::RouterRequest,
+    },
     /// Live remaining-credit lookup for prepaid providers (`/balance`).
     FetchBalance,
     FetchModels,

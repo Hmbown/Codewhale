@@ -694,6 +694,62 @@ fn adoptable_empty_store_reports_nothing_to_abandon() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #6418: the binding a live host records is its store's canonical root,
+/// while the configured sessions root is spelled lexically. When those differ
+/// (a Windows verbatim prefix or short name, a symlinked home on Unix), the
+/// hand-built bindings above still pass but every *recorded* binding read as
+/// unconfined, so an empty, unheld store could never be adopted in-session.
+#[test]
+fn recorded_binding_is_confined_under_a_non_canonical_home() -> anyhow::Result<()> {
+    let _environment = crate::test_support::lock_test_env();
+    let root = tempfile::tempdir()?;
+    let real_home = root.path().join("real-home");
+    std::fs::create_dir_all(&real_home)?;
+    #[cfg(unix)]
+    let home = {
+        let linked = root.path().join("linked-home");
+        std::os::unix::fs::symlink(&real_home, &linked)?;
+        linked
+    };
+    // Windows needs no fixture: canonical paths there carry `\\?\`.
+    #[cfg(not(unix))]
+    let home = real_home.clone();
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home);
+    let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+
+    let runtime = RuntimeThreadManager::open(
+        fixture_config(),
+        home.clone(),
+        RuntimeThreadManagerConfig::for_session(home.join("tasks"), "previous"),
+    )?;
+    let binding = runtime.session_store_binding();
+    drop(runtime);
+
+    #[cfg(unix)]
+    assert!(
+        !binding.data_dir.starts_with(&home),
+        "fixture must record a binding spelled differently from the home"
+    );
+    assert!(
+        !binding.is_missing_session_store()?,
+        "the recorded store exists"
+    );
+    assert!(
+        binding.is_adoptable_empty_store()?,
+        "a recorded, empty, unheld store is confined and adoptable"
+    );
+
+    // Confinement still refuses a store outside the sessions root.
+    let outside = crate::runtime_threads::RuntimeStoreBinding {
+        data_dir: root.path().join("elsewhere/previous/runtime"),
+        execution_scope: binding.execution_scope.clone(),
+    };
+    std::fs::create_dir_all(&outside.data_dir)?;
+    assert!(!outside.is_adoptable_empty_store()?);
+    Ok(())
+}
+
 /// #6207: the race that reverted the first fix — a live foreign TaskManager
 /// holds the store while its disk state is still empty, so emptiness alone
 /// cannot tell abandonment from a holder that has not flushed yet. The

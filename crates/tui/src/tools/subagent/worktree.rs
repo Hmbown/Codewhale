@@ -55,19 +55,21 @@ fn validate_existing_child_cwd(
     } else {
         parent_workspace.join(requested_cwd)
     };
-    let canonical = resolved.canonicalize().map_err(|e| {
-        ToolError::invalid_input(format!(
-            "Invalid cwd '{}': {e} (path may not exist yet — use worktree=true to let Codewhale create an isolated checkout)",
-            requested_cwd.display()
-        ))
-    })?;
     let workspace_canonical = parent_workspace
         .canonicalize()
         .unwrap_or_else(|_| parent_workspace.to_path_buf());
+    let canonical = resolved.canonicalize().map_err(|e| {
+        ToolError::invalid_input(format!(
+            "Invalid cwd '{}': {e}. Allowed cwd: an existing directory under {} (relative paths resolve against it), or omit cwd to use it. The path may not exist yet — use worktree=true to let Codewhale create an isolated checkout.",
+            requested_cwd.display(),
+            workspace_canonical.display()
+        ))
+    })?;
     if !canonical.starts_with(&workspace_canonical) {
         return Err(ToolError::invalid_input(format!(
-            "cwd must be inside the parent workspace: {} is not under {}",
+            "cwd must be inside the parent workspace: {} is not under {}. Allowed cwd: {} or a directory beneath it (relative paths resolve against it); omit cwd to run the child there.",
             canonical.display(),
+            workspace_canonical.display(),
             workspace_canonical.display()
         )));
     }
@@ -342,4 +344,37 @@ fn run_git_checked(workspace: &Path, args: &[String], action: &str) -> Result<St
     Err(ToolError::execution_failed(format!(
         "Failed to {action}: {detail}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cwd_errors_name_the_allowed_root() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let root = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+
+        let err = validate_existing_child_cwd(workspace.path(), outside.path())
+            .expect_err("outside cwd refused")
+            .to_string();
+        assert!(err.contains("Allowed cwd"), "{err}");
+        assert!(err.contains(&root.display().to_string()), "{err}");
+
+        let err = validate_existing_child_cwd(workspace.path(), Path::new("missing/dir"))
+            .expect_err("missing cwd refused")
+            .to_string();
+        assert!(err.contains("Allowed cwd"), "{err}");
+        assert!(err.contains(&root.display().to_string()), "{err}");
+
+        std::fs::create_dir(workspace.path().join("sub")).expect("sub");
+        assert_eq!(
+            validate_existing_child_cwd(workspace.path(), Path::new("sub")).expect("inside"),
+            root.join("sub")
+        );
+    }
 }

@@ -332,10 +332,19 @@ codewhale_dev_cache_exec_cargo() {
   case ${CODEWHALE_DEV_CACHE_MODE:-} in
     isolated-build-dir|force-isolated)
       if [ -n "${CARGO_BUILD_BUILD_DIR:-}" ]; then
-        exec cargo --config "build.build-dir = \"${CARGO_BUILD_BUILD_DIR}\"" "$@"
+        set -- --config "build.build-dir = \"${CARGO_BUILD_BUILD_DIR}\"" "$@"
       fi
       ;;
   esac
+  # One Cargo build per machine: separate target dirs do not make concurrent
+  # builds safe on a memory-constrained host (scripts/build-lock.py).
+  _cw_lock_script=${repo_root:-.}/scripts/build-lock.py
+  if ! codewhale_dev_cache_falsey "${CODEWHALE_BUILD_LOCK:-1}" \
+    && [ -z "${CODEWHALE_BUILD_LOCK_HELD:-}" ] \
+    && [ -f "$_cw_lock_script" ] \
+    && command -v python3 >/dev/null 2>&1; then
+    exec python3 "$_cw_lock_script" "${CODEWHALE_BUILD_LOCK_FILE:-$(codewhale_dev_cache_root)/build.lock}" -- cargo "$@"
+  fi
   exec cargo "$@"
 }
 

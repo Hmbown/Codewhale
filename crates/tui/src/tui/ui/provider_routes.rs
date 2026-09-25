@@ -722,8 +722,8 @@ pub(crate) async fn switch_provider(
     if model_override.is_some() {
         app.provider_models
             .insert(target_identity.clone(), new_model.clone());
-        app.enable_provider_model(&target_identity, &new_model);
     }
+    app.note_route_used(&target_identity, &new_model);
     app.update_model_compaction_budget();
     if cache_scope_changed {
         app.clear_model_scoped_telemetry();

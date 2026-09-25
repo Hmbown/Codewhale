@@ -1,39 +1,16 @@
+/**
+ * The two one-line installs, shared by the install page and the homepage
+ * hero. Code-owned shell, never translated.
+ */
+export const INSTALL_COMMANDS = {
+  shell: "curl -fsSL https://codewhale.net/install.sh | sh",
+  npm: "npm install -g codewhale",
+} as const;
+
 export const INSTALL_COPY = {
   metaTitle: { en: "Install · Codewhale", zh: "安装 · Codewhale" },
   metaDescription: { en: "Install Codewhale, connect your model, and start your first task. Guides for macOS, Linux, Windows, package managers, and source builds.", zh: "安装 Codewhale、连接模型并开始第一项任务。提供 macOS、Linux、Windows、包管理器与源码编译指南。" },
-  title: { en: "From install to your first task.", zh: "从安装到完成第一项任务。" },
-  lead: { en: "Install Codewhale on macOS or Linux with the command below. Choose your model, open a project, and tell it what you want to do.", zh: "在 macOS 或 Linux 上运行下方命令安装 Codewhale。选择模型，打开项目，然后告诉它你想做什么。" },
-  installer: { en: "The installer checks the release’s SHA-256 checksum and installs codewhale and codew to ~/.local/bin. Both commands open the same app.", zh: "安装器会校验发布文件的 SHA-256，并将 codewhale 和 codew 安装到 ~/.local/bin。两个命令打开的是同一个应用。" },
-  inspect: { en: "Read the installer", zh: "查看安装脚本" },
-  other: { en: "Windows and other install options", zh: "Windows 与其他安装方式" },
-  firstRun: { en: "Connect a model. Start a task.", zh: "连接模型，开始任务。" },
-  modes: { en: "Use Plan to explore before making changes, Work to build, and Operate for ongoing work. /mode opens the mode picker; /config opens settings. Permissions are separate: choose Ask, Auto-Review, or Full Access. Plan blocks file changes and shell execution.", zh: "用 Plan 在修改前探索，用 Work 构建，用 Operate 处理持续性工作。/mode 打开模式选择器，/config 打开设置。权限单独设置：Ask、Auto-Review 或 Full Access。Plan 禁止文件修改与 shell 执行。" },
-  guide: { en: "Getting-started guide", zh: "入门指南" },
-  verify: { en: "Check your setup", zh: "检查配置" },
-  verifyLead: { en: "Confirm the installed version, then check your provider connection and local tools. codewhale doctor explains anything that needs attention.", zh: "确认已安装版本，再检查提供商连接与本地工具。codewhale doctor 会说明需要处理的问题。" },
-  latest: { en: "Latest GitHub release: {tag}", zh: "最新 GitHub 发布：{tag}" },
-  latestUnavailable: { en: "Check GitHub for the latest release", zh: "前往 GitHub 查看最新发布" },
-  update: { en: "Keep Codewhale up to date", zh: "保持 Codewhale 更新" },
-  updateLead: { en: "For a release binary, run codewhale update. If you used a package manager, update with that package manager.", zh: "发布二进制可运行 codewhale update 更新。通过包管理器安装的版本，请使用相应包管理器更新。" },
-  alternatives: { en: "Other ways to install", zh: "其他安装方式" },
-  alternativesLead: { en: "Choose the option that fits your machine. Package-manager versions may differ from the latest GitHub release.", zh: "选择适合你设备的安装方式。包管理器中的版本可能与最新 GitHub 发布不同。" },
-  binaries: { en: "Download a release binary", zh: "下载发布二进制" },
-  binariesLead: { en: "Download for macOS, Linux, or Windows, and verify its checksum. Windows users can also run the Linux version in WSL2.", zh: "下载 macOS、Linux 或 Windows 版本，并校验文件。Windows 用户也可以在 WSL2 中运行 Linux 版本。" },
-  checksum: { en: "Verify checksum", zh: "校验文件" },
-  npmLead: { en: "Requires Node 18+. The npm package downloads a verified release binary and installs both codewhale and codew.", zh: "需要 Node 18+。npm 包会下载已校验的发布二进制，并安装 codewhale 与 codew。" },
-  cargo: { en: "Build with Cargo", zh: "通过 Cargo 编译" },
-  cargoLead: { en: "Requires Rust 1.88+. Installs codewhale to ~/.cargo/bin. Linux builds also need pkg-config and libdbus-1-dev.", zh: "需要 Rust 1.88+，安装到 ~/.cargo/bin。Linux 编译还需要 pkg-config 和 libdbus-1-dev。" },
-  brewLead: { en: "The Homebrew formula is codewhale; the tap retains its original repository name.", zh: "Homebrew formula 名为 codewhale；tap 保留了原仓库名称。" },
-  dockerLead: { en: "Keep your Codewhale files in the named volume and mount your project at /workspace. Replace latest with a release tag to pin the version.", zh: "用命名卷保存 Codewhale 文件，将项目挂载到 /workspace。将 latest 替换为发布标签可固定版本。" },
-  source: { en: "Build from source", zh: "从源码编译" },
-  sourceLead: { en: "Use a source build to try development changes or contribute a fix.", zh: "使用源码构建体验开发中的改动或贡献修复。" },
-  mirrors: { en: "Mirrors for your network", zh: "适合你的网络的镜像" },
-  cnb: { en: "CNB mirror", zh: "CNB 镜像" },
-  cnbLead: { en: "Build the latest known release from the community CNB mirror. Mirrors may take time to catch up with a new GitHub release.", zh: "通过社区 CNB 镜像编译最新已知发布版本。镜像同步新的 GitHub 发布可能需要时间。" },
-  tunaLead: { en: "For Cargo downloads through Tsinghua’s TUNA mirror, add this to ~/.cargo/config.toml, then run the Cargo install command above.", zh: "通过清华 TUNA 镜像下载 Cargo 依赖时，将下方内容加入 ~/.cargo/config.toml，再运行上方的 Cargo 安装命令。" },
-  mirrorDocs: { en: "Mirror setup and verification", zh: "镜像配置与校验" },
-  next: { en: "Make it yours", zh: "按你的习惯配置" },
-  config: { en: "Settings and configuration", zh: "设置与配置" },
-  models: { en: "Models and providers", zh: "模型与提供商" },
-  help: { en: "Troubleshooting and FAQ", zh: "故障排查与常见问题" },
+  source: { en: "Read the verified guide on GitHub", zh: "查看 GitHub 上已验证的指南" },
+  translationNotice: { en: "This verified guide is in English. The Chinese translation has not yet been updated for this revision.", zh: "本页显示已验证的英文指南。中文译文尚未更新至此修订版。" },
+  configuration: { en: "Settings and configuration", zh: "设置与配置" },
 } as const;

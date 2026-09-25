@@ -45,6 +45,7 @@ import {
   getLegalPrivacy,
   getLegalTerms,
   pickText,
+  pickTextLocale,
   splitToken,
   splitTokens,
 } from "./dictionaries";
@@ -59,7 +60,6 @@ import type { ChromeDict, HomeDict } from "./dictionaries/types";
 const NON_PROSE_KEYS = new Set([
   "wordmarkSeal",
   "dateLocale",
-  "githubFallback",
   "tickerLiveTag",
 ]);
 
@@ -72,7 +72,6 @@ const CHROME_PROSE_KEYS = [
   "navPrimaryAria",
   "navHomeAria",
   "wordmarkTag",
-  "starsAria",
   "traceLabel",
   "traceTabsAria",
   "menuOpen",
@@ -116,6 +115,7 @@ const HOME_PROSE_KEYS = [
   "heroTitle",
   "heroIntro",
   "getCodewhale",
+  "heroInstallAria",
   "exploreProduct",
   "shotPreview",
   "shotBuild",
@@ -480,6 +480,8 @@ describe("website dictionaries", () => {
     expect(pickText(pair, "zh")).toBe("中文");
     expect(pickText(pair, "en")).toBe("English");
     expect(pickText(pair, "ja"), "non-zh locales read the English side").toBe("English");
+    expect(pickTextLocale("zh")).toBe("zh");
+    for (const locale of ["en", "ja", "ar"]) expect(pickTextLocale(locale)).toBe("en");
   });
 
   it("keeps the gain, models, availability, and surface lists structurally aligned", () => {

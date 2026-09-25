@@ -16,6 +16,7 @@ export const home: HomeDict = {
   heroIntro:
     "{brand} et proporciona agents que poden crear programari, treballar amb els teus fitxers i convertir les tasques repetitives en fluxos de treball reutilitzables. Digues-los què vols aconseguir i tria els models allotjats o locals adequats per a la feina, amb la llibertat de canviar de proveïdor sobre la marxa.",
   getCodewhale: "Obtenir Codewhale",
+  heroInstallAria: "Ordre d'instal·lació",
   exploreProduct: "Explorar el producte",
   shotPreview: "Vista prèvia del terminal",
   shotBuild: "build de desenvolupament v{version}",

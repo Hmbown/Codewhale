@@ -309,7 +309,7 @@ fn known_context_window_for_model(model_lower: &str) -> Option<u32> {
         | "mimo-v2.5-tts-voicedesign"
         | "mimo-v2.5-tts-voiceclone"
         | "mimo-v2-tts" => Some(8_000),
-        "grok-4.6" | "grok-4.5" => Some(500_000),
+        "grok-4.7" | "grok-4.6" | "grok-4.5" => Some(500_000),
         "grok-4.3" => Some(1_000_000),
         "grok-build" => Some(512_000),
         "grok-composer-2.5-fast" => Some(200_000),

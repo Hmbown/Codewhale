@@ -36,7 +36,7 @@ export default async function ToolsPage({ params }: { params: Promise<{ locale: 
       <section id="compatibility" className="scroll-mt-32">
         <h2 className="font-display text-2xl mb-1">{t(TOOLS_COPY.compatibilityTitle)}</h2>
         <p className="text-ink-soft mt-3 leading-relaxed">{t(TOOLS_COPY.compatibility)}</p>
-        <Link href="https://github.com/Hmbown/CodeWhale/blob/main/docs/RUNTIME_SIMPLIFICATION_DESIGN.md" className="inline-block mt-3 font-mono text-xs uppercase tracking-wider text-indigo hover:underline">
+        <Link href="https://github.com/Hmbown/CodeWhale/blob/main/docs/RUNTIME_SIMPLIFICATION_DESIGN.md" className="inline-block mt-3 text-xs text-indigo hover:underline">
           docs/RUNTIME_SIMPLIFICATION_DESIGN.md →
         </Link>
       </section>

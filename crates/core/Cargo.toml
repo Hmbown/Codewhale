@@ -16,20 +16,16 @@ chrono.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 codewhale-config = { path = "../config", version = "0.10.0" }
-codewhale-execpolicy = { path = "../execpolicy", version = "0.10.0" }
 codewhale-hooks = { path = "../hooks", version = "0.10.0" }
 codewhale-mcp = { path = "../mcp", version = "0.10.0" }
 codewhale-protocol = { path = "../protocol", version = "0.10.0" }
 codewhale-state = { path = "../state", version = "0.10.0" }
-codewhale-tools = { path = "../tools", version = "0.10.0" }
 regex = "1.11"
 sha2.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
-tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "time"] }

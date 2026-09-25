@@ -1408,6 +1408,10 @@ impl TaskManager {
         session_id: &str,
         binding: Option<&crate::runtime_threads::RuntimeStoreBinding>,
     ) -> Result<SharedTaskManager> {
+        // Resolve the sessions root's canonical spelling off this runtime
+        // once, so the saved-store confinement checks here and in later
+        // `/resume` / `/load` switches are pure comparisons (#6522).
+        crate::runtime_threads::prepare_canonical_sessions_root().await;
         let runtime_threads = Arc::new(RuntimeThreadManager::open_for_session(
             api_config.clone(),
             cfg.default_workspace.clone(),
@@ -1578,6 +1582,22 @@ impl TaskManager {
 
     pub(crate) fn execution_scope(&self) -> &str {
         &self.execution_lease.scope
+    }
+
+    /// Apply `edit` to the runtime threads' authoritative config and reload
+    /// it, so runtime-chat and queued runtime turns see a setting the UI just
+    /// persisted instead of their startup snapshot. No runtime manager is a
+    /// no-op.
+    pub(crate) async fn reload_runtime_config_with(
+        &self,
+        edit: impl FnOnce(&mut crate::config::Config),
+    ) -> Result<()> {
+        let Some(runtime) = &self.runtime_threads else {
+            return Ok(());
+        };
+        let mut config = runtime.read_config().clone();
+        edit(&mut config);
+        runtime.reload_config(config).await.map(|_| ())
     }
 
     pub(crate) fn session_store_binding(

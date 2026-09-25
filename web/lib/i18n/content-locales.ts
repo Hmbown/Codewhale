@@ -1,8 +1,9 @@
 import { defaultLocale, locales } from "./config";
 
-/** Routes whose page bodies are genuinely localized beyond English/Chinese. */
+/** Routes whose page-body translation coverage differs from English/Chinese. */
 const ROUTE_CONTENT_LOCALES: Readonly<Record<string, readonly string[]>> = {
   "/": locales,
+  "/install": ["en"],
   "/docs/guide": ["en", "zh", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"],
 };
 

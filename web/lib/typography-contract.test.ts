@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { resolveWhale } from "./whale-tokens";
 import { siteCss } from "./site-css";
@@ -23,6 +23,21 @@ describe("typography contract", () => {
     expect(LAYOUT).not.toMatch(/next\/font\/google/);
     expect(TAILWIND).not.toMatch(/Newsreader|JetBrains|widest|wider/);
     expect(TAILWIND).toMatch(/textTransform:\s*false/);
+  });
+
+  it("leaves no caller on the ungenerated all-caps or wide-tracking utilities", () => {
+    // Tailwind no longer emits these, so a surviving class is a silent no-op
+    // that reads as intent. Labels are sentence case at normal tracking.
+    const offenders: string[] = [];
+    for (const dir of ["../app/", "../components/"]) {
+      for (const entry of readdirSync(new URL(dir, import.meta.url), { recursive: true })) {
+        const path = String(entry);
+        if (!path.endsWith(".tsx")) continue;
+        const source = readFileSync(new URL(dir + path, import.meta.url), "utf8");
+        if (/\b(uppercase|tracking-wider|tracking-widest)\b/.test(source)) offenders.push(dir + path);
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 
   it("resolves every role to Shannon Sans and code to the system mono stack", () => {

@@ -1621,9 +1621,13 @@ fn workflow_cards_report_lifecycle_children_phases_and_failures() {
     run.input_summary = Some("action: run".to_string());
     run.output = Some(run_output);
     let text = lines_text(&run.lines_with_mode(120, true, RenderMode::Live));
-    assert!(text.contains("children"), "child count: {text:?}");
+    assert!(
+        text.contains("/3 done"),
+        "settled/total child count: {text:?}"
+    );
     assert!(text.contains("phase"), "phase count: {text:?}");
-    assert!(text.contains("fail"), "failure count: {text:?}");
+    // #6503: a run with no failures does not announce `0 fail`.
+    assert!(!text.contains("fail"), "no zero failure count: {text:?}");
     assert!(
         !text.contains("status:"),
         "the body must not repeat the header lifecycle: {text:?}"

@@ -251,6 +251,7 @@ pub const DEFAULT_OPENCODE_ZEN_MODEL: &str = "gpt-5.6";
 pub const DEFAULT_OPENCODE_ZEN_BASE_URL: &str = "https://opencode.ai/zen/v1";
 pub const DEFAULT_META_MODEL: &str = "muse-spark-1.2";
 pub const DEFAULT_META_BASE_URL: &str = "https://api.meta.ai/v1";
+pub const XAI_GROK_4_7_MODEL: &str = "grok-4.7";
 pub const XAI_GROK_4_6_MODEL: &str = "grok-4.6";
 pub const DEFAULT_XAI_MODEL: &str = XAI_GROK_4_6_MODEL;
 pub const XAI_GROK_4_5_MODEL: &str = "grok-4.5";

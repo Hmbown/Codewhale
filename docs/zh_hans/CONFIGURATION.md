@@ -313,7 +313,38 @@ model = "glm-5-turbo"
 thinking = "off"        # 可选;默认 off
 ```
 
-分类器调用只在 `[auto.router]` 已设置**且**该 provider 有 key 时发生——`router_available = router_configured && has_api_key_for(...)`(`crates/tui/src/model_inventory.rs:206-218`)。任一条件不满足意味着由启发式决定，而不是失败。回合的路由回执(`/status` → Auto)记录是哪一种。
+分类器调用只在 `[auto.router]` 已设置**且**该 provider 有 key 时发生——`router_available = router_configured && has_api_key_for(...)`(`crates/tui/src/model_inventory.rs`)。任一条件不满足、或分类器调用出错/超时时，由本地回退决定。回合的路由回执(`/status` → Auto)记录是哪一种；你配置了但无法运行或失败的路由器(缺 key、HTTP 错误、超时、无效回答)会显示为 `Auto router: failing — …`,而不是被静默忽略。
+
+#### 设置模型路由
+
+`/router`(也可用 `/model router`)打开同一个 Router 设置视图，提供以下预设。每个预设只写入 `[auto.router]`,不会被自动选中。
+
+| 预设 | 写入内容 | 成本与隐私 |
+| --- | --- | --- |
+| `/router jev` | TypeSafe 的决策模型 Jev,经由 OpenRouter(`typesafe/jev-1.13`)或 TypeSafe 直连，取决于你有哪个 key | 每轮约 $0.00002(每百万输入 token $0.042,输出免费)。你的最新请求和最多六行近期上下文会发送到 OpenRouter → TypeSafe(或 TypeSafe)。 |
+| `/router fast` | 当前 provider 可运行的快速档，关闭思考 | 使用你已有的 key;分类器看到同样的请求文本。 |
+| `/router off` | 删除 `[auto.router]` | 不调用路由器；Auto 回合使用默认模型，`[auto] cost_saving = true` 时使用快速档(Off 不改动该设置)。 |
+| `/router custom` | 不写入；打印可手动编辑的 TOML | — |
+
+选择 Jev 或 Fast 会用固定的示例请求做**一次测试调用**,并显示它选择的档位、概率与置信度、延迟和 provider 报告的费用。随后按 `Enter`(或 `/router save <预设>`)通过常规配置写入器保存；按 `Esc` 放弃。TypeSafe 已于 2026-09-22 暂停新用户注册，因此 OpenRouter 是新用户的默认路线。TypeSafe key 读取自 `TYPESAFE_API_KEY`、`typesafe` 密钥存储条目，或 `[providers.typesafe] api_key` / `api_key_env`。
+
+#### 决策路由器(`kind = "decision"`)
+
+决策路由器每回合向一个非生成式决策模型提一个有类型的问题——在当前 provider 的 `fast` 和 `strong` 档之间做 Choice,外加一个思考档位——并得到校准过的概率。不解析任何散文。
+
+```toml
+[auto.router]
+kind = "decision"             # 默认 "chat"
+provider = "openrouter"       # 或 "typesafe"
+model = "typesafe/jev-1.13"   # 也可用 "~typesafe/jev-latest";TypeSafe 直连用 "jev-latest"
+timeout_secs = 2
+min_confidence = 0.5          # 默认 0.5,限制在 0..1
+```
+
+- 只有当前 provider 有可运行的 strong/fast 档位对时才会调用路由器；否则不调用、不花费。
+- 置信度低于 `min_confidence` 的回答走本地回退。在 `[auto] cost_saving` 下，回答 `strong` 还需要至少 0.75 的概率，否则回合留在快速档。
+- 未知的 `kind`,或决策路由器的 `provider` 不是 `openrouter` / `typesafe`,会让路由器处于未配置状态并显示为 failing。
+- 决策路由器忽略 `thinking`。OpenRouter 的花费像其他路由用量一样记录；TypeSafe 直连的花费只显示在回执上。
 
 要在解析后的路径引导(bootstrap) MCP 和 skills 目录，运行 `codewhale setup`。要只搭建 MCP，运行 `codewhale mcp init`。
 
@@ -1022,12 +1053,12 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 - `mistral` 模型与推理契约：`[providers.mistral]` 默认 `mistral-code-latest`；`MISTRAL_MODEL` 覆盖它，两者都设置时通用 `CODEWHALE_MODEL` 覆盖胜出。当前选择器还列出 `mistral-medium-latest`、`mistral-small-latest` 和 `mistral-large-latest`。在确切的官方 HTTPS `/v1` 路由上，Medium 和 Small 只接受 `reasoning_effort = "none" | "high"` 并重放多态思考块。弃用的原生 Magistral ID 仍可显式配置，保持始终推理，绝不接收可调努力字段。
 - `context_window`(整数，可选的 provider 表键)：当 OpenAI 兼容网关、托管模型别名或自托管运行时的上限与 Codewhale 的静态模型表不同时，覆盖活动 `[providers.<name>]` 路由的总上下文窗口。例如，`[providers.openai] context_window = 1000000` 让 OpenAI 兼容的 DashScope/Qwen 路由按 1M-token 窗口做预算，而不是保守回退。对 Kimi Code K3，保持 `model = "k3"`，只在会员计划包含 1M 访问时设置 `[providers.moonshot] context_window = 1048576`；否则省略它，以保留 262,144-token 安全基线。该值必须大于 0，影响提示上下文备注、压缩阈值、上下文压力检查和请求输出上限。完整解析顺序，以及如何看到哪一级产生了当前窗口：[上下文长度(context window)](#上下文长度context-window)。
 - `path_suffix`(字符串，可选的 provider 表键)：覆盖不为 `/v1/chat/completions` 服务的 OpenAI 兼容网关的聊天补全路径。例如，`[providers.openai] path_suffix = "/chat/completions"` 把聊天请求发送到未版本化的 base URL 加 `/chat/completions`；`models` 和 `beta/*` 请求保持正常路由。
-- `reasoning_stream_style`(字符串，可选的 provider 表键)：覆盖活动 provider 路由如何把流式推理与答案文本分开。用 `separate_field` 处理 `reasoning_content` / `reasoning` 增量，`inline_tags` 用于在 `delta.content` 内流式 `<think>...</think>` 的网关，`none` 则把传入内容完全按答案文本渲染。
+- `reasoning_stream_style`(字符串，可选的 provider 表键)：覆盖活动 provider 路由如何把流式推理与答案文本分开。用 `separate_field` 处理 `reasoning_content` / `reasoning` 增量，`inline_tags` 用于在 `delta.content` 内流式 `<think>...</think>` 的网关，`none` 则把传入内容完全按答案文本渲染。未设置时，每条 Chat Completions 路由都使用 `separate_field`(Mistral 一方路由使用其类型化思考块)；仅当网关把答案放在 `reasoning_content` 里流式发送时才设置 `none`。
 - `[providers.<name>.auth]`(表，可选):provider 作用域的认证源元数据。`source = "command"` 存储命令 argv 加可选 `timeout_ms`；`source = "secret"` 存储 `secret_id`。这个切片让 provider 就绪、`/provider` 和 doctor JSON 报告认证源类别，而不暴露命令 argv 输出或秘密值；执行命令和解析外部秘密材料由后续的解析器工作处理。
 - `insecure_skip_tls_verify`(bool，可选的 provider 表键)：旧兼容键，默认禁用。活动 provider 表上为 true 时，provider 客户端拒绝该配置，而不是跳过 TLS 证书验证。企业或私有 CA 包用 `SSL_CERT_FILE`；`codewhale doctor` 报告此设置的过期使用。
 - `default_text_model`(字符串，可选):DeepSeek 和 `deepseek-anthropic` 默认 `deepseek-v4-pro`，OpenAI 是 `gpt-5.6`，xAI 是 `grok-4.6`，NVIDIA NIM 是 `deepseek-ai/deepseek-v4-pro`，AtlasCloud 是 `deepseek-ai/deepseek-v4-flash`，Wanjie Ark 是 `deepseek-reasoner`，火山方舟是 `DeepSeek-V4-Pro`，OpenRouter 和 Novita 是 `deepseek/deepseek-v4-pro`，小米 MiMo 是 `mimo-v2.5-pro`，Fireworks 是 `accounts/fireworks/models/deepseek-v4-pro`，SiliconFlow 和 DeepInfra 是 `deepseek-ai/DeepSeek-V4-Pro`，Arcee AI 是 `trinity-large-thinking`，Moonshot 是 `kimi-k2.7-code`，MiniMax 是 `MiniMax-M3`，Z.ai 是 `GLM-5.3`，StepFun 是 `step-3.7-flash`，千帆是 `ernie-4.0-turbo-8k`，Sakana AI 是 `fugu`，SGLang/vLLM 是 `deepseek-ai/DeepSeek-V4-Pro`，本地 Ollama 是 `deepseek-v4-flash`，Ollama Cloud 是 `gpt-oss:120b`。Hugging Face 和 Together AI 都默认 `deepseek-ai/DeepSeek-V4-Pro`；`openai-codex` 默认 `gpt-5.6`；`anthropic` 默认 `claude-sonnet-4-6`；`openmodel` 默认 `deepseek-v4-flash`。当前公开 DeepSeek ID 是 `deepseek-v4-pro` 和 `deepseek-v4-flash`，两者都是 1M 上下文窗口、384K 最大输出、默认启用思考模式。DeepSeek 的实时定价/模型页现在把 Pro 后端标为 `DeepSeek-V4-Pro-0813`；可调用的 API ID 仍是 `deepseek-v4-pro`，所以 Codewhale 不发送后端标签或 Claude Code 特有的 `deepseek-v4-pro[1m]` 选择器。DeepSeek 于 2026 年 7 月 24 日退役 `deepseek-chat` 和 `deepseek-reasoner`；直接官方路由把两者迁移到 `deepseek-v4-flash`，省略的推理设置保留它们之前的不思考(`off`)和思考(`high`)意图。显式 `reasoning_effort` 胜出，Wanjie Ark、聚合器、自托管运行时和自定义端点上的 provider 自有 id 不会全局重写。SiliconFlow 保留自己的映射：`deepseek-reasoner` 和 `deepseek-r1` 选择其 Pro 模型，而 `deepseek-chat` 和 `deepseek-v3` 选择 Flash。Provider 特有映射在受支持处把 `deepseek-v4-pro` / `deepseek-v4-flash` 翻译成每个 provider 的模型 ID。OpenRouter 还识别最近的较大 ID，如 `arcee-ai/trinity-large-thinking`、`minimax/minimax-m3`、`minimax/minimax-m2.7`、`xiaomi/mimo-v2.5-pro`、`qwen/qwen3.6-flash`、`qwen/qwen3.6-35b-a3b`、`qwen/qwen3.6-max-preview`、`qwen/qwen3.6-27b`、`qwen/qwen3.6-plus`、`qwen/qwen3.7-max`、`google/gemma-4-31b-it`、`moonshotai/kimi-k2.7-code`、`moonshotai/kimi-k2.6`、`nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` 和 `nvidia/nemotron-3-ultra-550b-a55b`；直接 Arcee 用 `trinity-large-thinking` 和 `trinity-large-preview` 这样的裸 ID；直接 Moonshot 识别 `kimi-k3`、`kimi-k2.7-code` 和 `kimi-k2.6`。确切的 Kimi Code 端点识别 K3 的裸 `k3` 和 K2.7 的 `kimi-for-coding`；这些会员 ID 与直接 Moonshot ID 不同，从不跨路由重写。直接 MiniMax 识别 `MiniMax-M3` 和记录的 M2.x 聊天模型 ID；直接 Z.ai 识别 `GLM-5.3`(默认)、`GLM-5.2`、`GLM-5.1` 和 `GLM-5-Turbo`，OpenRouter 识别匹配的 `z-ai/glm-5.1`、`z-ai/glm-5.2`、`z-ai/glm-5.3` 和 `z-ai/glm-5-turbo` ID——`GLM-5.3` 自 2026-08-13 起在 Z.ai Coding Plan 上线；它从 `GLM-5.2` 继承其目录元数据，直到 Z.ai 发布不同的 5.3 数字，不携带价格，显式 `GLM-5.2` 选择保持自己的 id；直接 Sakana 识别 `fugu` 和 `fugu-ultra-20260615`；直接小米 MiMo 识别聊天 ID `mimo-v2.5-pro`、`mimo-v2.5-pro-ultraspeed` 和 `mimo-v2.5`，而 TTS ID 通过 `codewhale speech` / `tts` 选择。通用 `openai`、`atlascloud`、`wanjie-ark`、`xiaomi-mimo`、`arcee`、`moonshot`、`minimax`、`openmodel`、`zai`、`stepfun`、`qianfan`、`sakana`、本地 Ollama 和 Ollama Cloud 模型 ID 在已知别名规范化后原样透传。带自定义 `base_url` 的 OpenRouter 和 SiliconFlow provider 配置也保留显式模型值，这让 OpenAI 兼容网关能接受裸模型 ID。用 `/models` 或 `codewhale models` 从你的配置端点发现实时 ID。`CODEWHALE_MODEL` 为单个进程覆盖它；`DEEPSEEK_MODEL` 是旧别名。
 - TelecomJS 只把 `deepseek-v4-pro` 用作刷新前的保守回退。其 key 作用域 `/models` 目录可用后，选择器使用那些实时行；Codewhale 在该路由上省略不支持的推理请求字段。
-- `reasoning_effort`(字符串，可选)：`off`、`low`、`medium`、`high`、`max`、`xhigh` 或 `ultracode`；默认已配置的 UI 层级。DeepSeek Platform 收到顶层 `thinking` / `reasoning_effort` 字段。Ollama Cloud 的 OpenAI 兼容 Chat Completions 路由保留其记录的 `none` / `low` / `medium` / `high` / `max` 阶梯(`off` 作为 `none` 发送；`xhigh` 和 `ultracode` 规范化为 `max`)。确切 `https://api.x.ai/v1` 上的直接 xAI `grok-4.6` 收到顶层 `reasoning_effort = "low" | "medium" | "high" | "xhigh"`；`off` 规范化为 `high`，`max`/`ultracode` 为 `xhigh`，`auto` 让字段省略，这样 xAI 记录的默认 `high` 生效。自定义 xAI 兼容 `base_url` 不继承该方言。确切 `https://api.moonshot.ai/v1` 上的直接 Moonshot `kimi-k3` 始终思考，只收到顶层 `reasoning_effort = "low" | "high" | "max"`；`off` 规范化为 `low`，`medium` 为 `high`。确切 `https://api.kimi.com/coding/v1` 上的 Kimi Code 会员 `k3` 改为收到嵌套 `thinking.effort`，其 `off` 设置也规范化为启用的 `low`。常规调度 `auto` 使用 Codewhale 的自动推理选择器，发送具体的路由规范化层级；只有省略推理设置时才让 provider 默认值控制。相邻网关和模型/端点组合保留通用 Moonshot 契约。OpenAI Codex 把过期 `off` 规范化为 `low`，把 `max` / `ultracode` 作为 Responses `xhigh` 发送。Z.ai 收到记录的 `thinking` 控制，把启用思考视为 GLM coding high/max 通道。NVIDIA NIM 通过 `chat_template_kwargs` 收到等效设置。
+- `reasoning_effort`(字符串，可选)：`off`、`low`、`medium`、`high`、`max`、`xhigh` 或 `ultracode`；默认已配置的 UI 层级。DeepSeek Platform 收到顶层 `thinking` / `reasoning_effort` 字段。Ollama Cloud 的 OpenAI 兼容 Chat Completions 路由保留其记录的 `none` / `low` / `medium` / `high` / `max` 阶梯(`off` 作为 `none` 发送；`xhigh` 和 `ultracode` 规范化为 `max`)。确切 `https://api.x.ai/v1` 上的直接 xAI `grok-4.7` 和 `grok-4.6` 收到顶层 `reasoning_effort = "low" | "medium" | "high" | "xhigh"`(阶梯来自内置目录行；`grok-4.5` 把 `xhigh` 映射为 `high`，没有记录 effort 的行如 `grok-4.3` 不发送该字段)；Grok 推理无法关闭，因此 `off` 规范化为 `high`，`max`/`ultracode` 为 `xhigh`，`auto` 让字段省略，这样 xAI 记录的默认 `high` 生效。自定义 xAI 兼容 `base_url` 不继承该方言。确切 `https://api.moonshot.ai/v1` 上的直接 Moonshot `kimi-k3` 始终思考，只收到顶层 `reasoning_effort = "low" | "high" | "max"`；`off` 规范化为 `low`，`medium` 为 `high`。确切 `https://api.kimi.com/coding/v1` 上的 Kimi Code 会员 `k3` 改为收到嵌套 `thinking.effort`，其 `off` 设置也规范化为启用的 `low`。常规调度 `auto` 使用 Codewhale 的自动推理选择器，发送具体的路由规范化层级；只有省略推理设置时才让 provider 默认值控制。相邻网关和模型/端点组合保留通用 Moonshot 契约。OpenAI Codex 把过期 `off` 规范化为 `low`，把 `max` / `ultracode` 作为 Responses `xhigh` 发送。Z.ai 收到记录的 `thinking` 控制，把启用思考视为 GLM coding high/max 通道。NVIDIA NIM 通过 `chat_template_kwargs` 收到等效设置。
 - `verbosity`(字符串，可选)：`normal` 或 `concise`。`normal` 保持默认的对话式提示。`concise` 追加一块提示纪律，用于直接、少废话的输出；CLI 非交互命令(`exec` 和 `eval`)默认 `concise`，除非 config/环境/CLI 覆盖它。用 `CODEWHALE_VERBOSITY` 或旧别名 `DEEPSEEK_VERBOSITY` 按进程覆盖。
 - `telemetry`(bool，可选)：当前 0.9.12 源码中匿名使用计数**默认 `true`**。第 `5` 版告知列明 Codewhale 和 PostHog，说明默认开启且可退出；不会代替用户记录同意。此前明确退出的选择继续有效。这里的 `false` 是持久退出：删除随机安装 id、清空缓冲和 dry-run 记录并写入持续生效的 tombstone，优先于命令行或环境中的 `true`。在 `/settings` 中明确重新开启，或执行 `codewhale config set telemetry true`，会更新现有偏好和隐私记录，供新会话使用。`CODEWHALE_TELEMETRY=0`（旧别名 `DEEPSEEK_TELEMETRY`）或 `--telemetry false` 只关闭本次运行而不擦除用户状态。仓库本地配置不能修改这个偏好。`codewhale config telemetry` 显示告知，`codewhale config get telemetry` 报告偏好和隐私状态。完整 schema 和退出规则：[`TELEMETRY.md`](TELEMETRY.md)。
 - `telemetry_endpoint`(字符串，可选)：批次 POST 到哪。保持未设置会选择随附默认 **`https://telemetry.codewhale.net/v1/telemetry`**——[`TELEMETRY.md`](TELEMETRY.md) 中描述的第一方接入服务，其源码在 `telemetry-ingest/`。这个键只决定*被允许的会话*发送到哪里；它不能覆盖选择退出。把它设为**空字符串**是保持启用且不联系任何人的方式：每个批次随后写入 `$CODEWHALE_HOME/telemetry/dryrun.jsonl`，完全不构造 HTTP 客户端，所以你可以读到原本会发送的确切内容。任何其他值直接替换默认值。要求 `https://`;普通 `http://` 只对 loopback 主机接受，并且没有环境变量可以覆盖该拒绝。被拒绝的端点会让遥测在本次运行关闭，而不是回退到明文或默认值。用 `CODEWHALE_TELEMETRY_ENDPOINT`(旧别名 `DEEPSEEK_TELEMETRY_ENDPOINT`)按进程覆盖，其中空值意味着同样的"不联系任何人"。仓库本地的 `.codewhale/config.toml` 不能设置它。
@@ -1326,6 +1357,25 @@ exec_policy = true
 
 配置的 API provider 先被尝试。运行时失败或空结果通过 DuckDuckGo 然后 Bing 可见地降级；结构化搜索回执记录每一步。缺失配置和网络策略拒绝失败关闭，不把查询发送到另一个 provider。
 
+**Provider 原生搜索。** 当路由的 provider 提供自带的网页搜索工具（OpenAI、xAI、Anthropic、DeepSeek、Kimi 等）时，该搜索可以排在已配置 provider 之前。它是在当前路由上的一次独立模型调用。`[search] native` 决定顺序：
+
+- 不设置（默认）：只有在没有配置搜索 provider 时原生搜索才优先；通过 `[search] provider`、`CODEWHALE_SEARCH_PROVIDER`、Tavily key 或会话内 `/search` 选择的 provider 优先；
+- `native = true`：即使固定了 provider，原生搜索也优先；
+- `native = false`：从不使用原生搜索。
+
+原生搜索的回答完整返回；过大的工具输出会溢出到会话 artifact，模型可以分页取回。
+
+**时效与区域。** `recency` 和 `locale` 会在后端 API 支持时转发，搜索回执会报告每一项是否生效：
+
+| 后端 | 时效 | 区域 |
+| --- | --- | --- |
+| Firecrawl | `tbs=qdr:d/w/m/y` | 从地区部分取 `country`（`de-DE` → `DE`）；只有语言时忽略 |
+| Tavily | `time_range` | 不发送（Tavily 使用国家全名） |
+| SearXNG | `time_range` | `language`，原样发送 |
+| Serply | 不发送（文档未说明） | `hl` 语言，`gl` 国家 |
+
+时效会向上取整到后端最接近的窗口（天、周、月、年），所以 `recency = 10` 会搜索最近一个月。其他后端忽略这两项，并在回执中说明。
+
 对服务 DuckDuckGo 兼容 HTML 的私有/内部搜索服务，保持 `provider = "duckduckgo"` 并设置 `base_url`；Codewhale 把 `q` 查询参数追加到该端点，并把网络策略应用到它的主机。自定义端点不回退到公共 Bing。`CODEWHALE_SEARCH_BASE_URL` 可按进程覆盖；`DEEPSEEK_SEARCH_BASE_URL` 仍作为旧别名接受。
 
 **SearXNG**([docs](https://docs.searxng.org/dev/search_api.html))使用配置实例的 JSON API。设置 `provider = "searxng"` 和 `base_url = "https://your-searxng.example"`；Codewhale 调用 `/search?q=...&format=json`。Codewhale 默认不使用公共 SearXNG 实例，因为公共实例常禁用 JSON 输出或对 API 流量限速。
@@ -1362,6 +1412,7 @@ Codewhale 按 `score` 从高到低排序返回行，再对排序结果应用 `ma
 provider = "firecrawl" # 也 duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya | serply
 # base_url = "https://search.example/" # provider = "duckduckgo" 时可选;"searxng" 时必填
 # api_key = "YOUR_KEY" # firecrawl 可选;其他 API 提供商必填
+# native = false # provider 原生搜索:不设置 = 仅在未配置 provider 时使用
 ```
 
 ## 本地媒体附件

@@ -16,6 +16,7 @@ export const home: HomeDict = {
   heroIntro:
     "{brand} ti offre agenti che possono creare software, lavorare con i tuoi file e trasformare le attività ripetitive in flussi di lavoro riutilizzabili. Di’ loro cosa vuoi realizzare e scegli i modelli ospitati o locali adatti al lavoro, con la libertà di cambiare provider mentre procedi.",
   getCodewhale: "Ottieni Codewhale",
+  heroInstallAria: "Comando di installazione",
   exploreProduct: "Esplora il prodotto",
   shotPreview: "Anteprima del terminale",
   shotBuild: "build di sviluppo v{version}",

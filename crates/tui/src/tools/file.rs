@@ -2270,9 +2270,15 @@ impl ToolSpec for EditFileTool {
                             // missed; show the first lines of the search text
                             // so it can compare against the file's contents.
                             return Err(ToolError::execution_failed(format!(
-                                "Search string not found in {}. The search text starts with:\n{}\nRecovery: call File with action=\"read\" path=\"{path_str}\" to inspect the current contents, then retry with a search string copied from the file.",
+                                "Search string not found in {}. The search text starts with:\n{}\n{}Recovery: retry with the search copied from the lines above, or call File with action=\"read\" path=\"{path_str}\" to inspect the current contents.",
                                 file_path.display(),
                                 preview_search_for_error(search),
+                                nearest_match_hint(
+                                    normalized_contents.as_ref(),
+                                    normalized_search.as_ref(),
+                                    crlf_positions.is_some(),
+                                    search.contains('\r'),
+                                ),
                             )));
                         }
                         [(start, end)] => ((*start, *end), Some("punctuation")),
@@ -2568,6 +2574,130 @@ fn preprocessor_directive(line: &str) -> Option<&str> {
 /// Build a short, line-truncated preview of a (possibly very long) search
 /// payload for error messages, so the model can compare what it searched for
 /// against the file's actual contents without the error message ballooning.
+/// The file region most like a search that did not match (#6542), with
+/// 1-based line numbers and a note on whitespace / line-ending differences,
+/// so the next edit can copy the real text instead of re-reading the file.
+///
+/// Known limitation: candidates are anchored on the search's first
+/// non-blank line, so a search whose first line is also wrong may report
+/// no similar region even when later lines exist in the file.
+fn nearest_match_hint(
+    contents: &str,
+    search: &str,
+    file_has_crlf: bool,
+    search_has_cr: bool,
+) -> String {
+    const MAX_SCANNED_LINES: usize = 50_000;
+    const MAX_EXCERPT_LINES: usize = 12;
+    const MAX_EXCERPT_LINE_LEN: usize = 200;
+    const MIN_SCORE: f32 = 0.5;
+
+    let line_ratio = |a: &str, b: &str| -> f32 {
+        let (a, b) = (a.trim(), b.trim());
+        if a == b {
+            1.0
+        } else {
+            similar::TextDiff::from_chars(a, b).ratio()
+        }
+    };
+    let file_lines: Vec<&str> = contents.lines().take(MAX_SCANNED_LINES).collect();
+    let search_lines: Vec<&str> = search.lines().collect();
+    let Some(anchor) = search_lines.iter().position(|line| !line.trim().is_empty()) else {
+        return String::new();
+    };
+    let window = search_lines.len().min(file_lines.len()).max(1);
+
+    let mut anchors: Vec<(f32, usize)> = file_lines
+        .iter()
+        .enumerate()
+        .filter(|(index, line)| *index >= anchor && !line.trim().is_empty())
+        .map(|(index, line)| (line_ratio(search_lines[anchor], line), index - anchor))
+        .collect();
+    anchors.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    let best = anchors
+        .into_iter()
+        .take(8)
+        .map(|(_, start)| {
+            let end = (start + window).min(file_lines.len());
+            let score = search_lines
+                .iter()
+                .zip(&file_lines[start..end])
+                .map(|(want, have)| line_ratio(want, have))
+                .sum::<f32>()
+                / window as f32;
+            (score, start, end)
+        })
+        .max_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
+
+    let mut notes = Vec::new();
+    if search_has_cr && !file_has_crlf {
+        notes.push(
+            "the search contains carriage returns (CRLF) but the file uses LF line endings"
+                .to_string(),
+        );
+    }
+    let Some((score, start, end)) = best.filter(|(score, ..)| *score >= MIN_SCORE) else {
+        let mut hint = String::from("No similar region found in the file.\n");
+        for note in notes {
+            hint.push_str(&format!("Note: {note}.\n"));
+        }
+        return hint;
+    };
+    let region = &file_lines[start..end];
+    let strip_trailing = |lines: &[&str]| -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.trim_end().to_string())
+            .collect()
+    };
+    let collapse = |lines: &[&str]| -> String {
+        lines
+            .iter()
+            .flat_map(|line| line.split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if strip_trailing(region) == strip_trailing(&search_lines) {
+        notes.push("the closest region differs only in trailing whitespace".to_string());
+    } else if collapse(region) == collapse(&search_lines) {
+        let tabs = |lines: &[&str]| lines.iter().any(|line| line.starts_with('\t'));
+        if tabs(region) != tabs(&search_lines) {
+            notes
+                .push("the closest region differs only in whitespace (tabs vs spaces)".to_string());
+        } else {
+            notes.push("the closest region differs only in whitespace".to_string());
+        }
+    }
+    if file_has_crlf {
+        notes.push("the file uses CRLF line endings; LF in the search is fine".to_string());
+    }
+
+    let width = end.to_string().len();
+    let mut hint = format!(
+        "Closest match (lines {}-{}, {:.0}% similar):\n",
+        start + 1,
+        end,
+        score * 100.0
+    );
+    for (offset, line) in region.iter().take(MAX_EXCERPT_LINES).enumerate() {
+        let mut shown: String = line.chars().take(MAX_EXCERPT_LINE_LEN).collect();
+        if line.chars().count() > MAX_EXCERPT_LINE_LEN {
+            shown.push_str("...");
+        }
+        hint.push_str(&format!("{:>width$}\t{shown}\n", start + offset + 1));
+    }
+    if region.len() > MAX_EXCERPT_LINES {
+        hint.push_str(&format!(
+            "... ({} more lines)\n",
+            region.len() - MAX_EXCERPT_LINES
+        ));
+    }
+    for note in notes {
+        hint.push_str(&format!("Note: {note}.\n"));
+    }
+    hint
+}
+
 fn preview_search_for_error(search: &str) -> String {
     const MAX_PREVIEW_LINES: usize = 3;
     const MAX_PREVIEW_LINE_LEN: usize = 80;

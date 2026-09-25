@@ -191,6 +191,7 @@
 .folio-hero-copy h1 { grid-column: 1; grid-row: 1 / 3; max-width: none; font-size: clamp(2.75rem, 5vw, 4.5rem); line-height: 1.06; text-wrap: balance; }
 .folio-hero-copy .folio-lede { grid-column: 2; grid-row: 1; margin-top: 0; align-self: end; }
 .folio-hero-copy .folio-actions { grid-column: 2; grid-row: 2; align-self: start; margin-top: 1.25rem; }
+.folio-hero-copy .hero-install { grid-column: 2; grid-row: 3; }
 .folio-shot { grid-column: 1; grid-row: 2; width: min(100%, 56rem); justify-self: center; margin-top: 0; }
 .folio-chapter { grid-column: 1; grid-row: 3; justify-self: start; }
 .product-install-grid > div, .product-composer, .product-composer > div { min-width: 0; }

@@ -109,7 +109,7 @@ pub enum StatusKind {
 impl StatusKind {
     /// Every kind, for exhaustive checks. Consumed by the non-color-meaning
     /// test gate rather than by a runtime renderer.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub const ALL: [StatusKind; 6] = [
         StatusKind::Ready,
         StatusKind::Working,

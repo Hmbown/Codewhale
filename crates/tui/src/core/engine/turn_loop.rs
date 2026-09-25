@@ -787,6 +787,9 @@ impl Engine {
         // failure to the user. `StreamRetryBudget` enforces that bound in
         // mechanism — `authorize()` is the only way to spend a resume.
         let mut stream_retry_budget = StreamRetryBudget::default();
+        // The user hears about images the route cannot see once per turn,
+        // not once per step and not for images replayed from history.
+        let mut image_omission_notified = false;
 
         loop {
             if self.cancel_token.is_cancelled() {
@@ -1543,6 +1546,8 @@ impl Engine {
             // to a vision-capable model later makes it visible again; only the
             // outbound copy is rewritten, and it is rewritten to text that says
             // why rather than being dropped.
+            let fresh_images =
+                crate::image_attach::images_since_last_user_prompt(&request.messages);
             let stripped_images = crate::image_attach::strip_images_when_unsupported(
                 &mut request.messages,
                 self.active_route_capabilities.image_input,
@@ -1553,6 +1558,16 @@ impl Engine {
                     "{stripped_images} image block(s) replaced with text: model {} does not accept image input",
                     self.session.model
                 ));
+                if fresh_images > 0 && !image_omission_notified {
+                    image_omission_notified = true;
+                    let status = codewhale_localization::tr(
+                        codewhale_localization::resolve_locale(&self.config.locale_tag),
+                        codewhale_localization::MessageId::ImageInputOmitted,
+                    )
+                    .replace("{model}", &self.session.model)
+                    .replace("{count}", &fresh_images.to_string());
+                    let _ = self.tx_event.send(Event::status(status)).await;
+                }
             }
             let tool_request_snapshot =
                 crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request_with_surface(
@@ -1665,6 +1680,9 @@ impl Engine {
                         && !image_rejection_recovered
                     {
                         image_rejection_recovered = true;
+                        // This path tells the user itself; the resend must
+                        // not announce the same omission a second time.
+                        image_omission_notified = true;
                         self.active_route_capabilities.image_input = CapabilityState::Unsupported;
                         crate::logging::warn(format!(
                             "model {} rejected image content; resending with images replaced by text",

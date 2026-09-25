@@ -63,7 +63,7 @@ model-visible link resolution remain follow-up work.
 ## API auth
 
 Future workroom endpoints should inherit the same auth middleware as other
-protected routes (`/thread`, `/app`, `/tool`, etc.):
+protected routes (`/thread`, `/app`, `/prompt`, etc.):
 
 - `Authorization: Bearer <token>` header required
 - Token validated against the runtime's configured bearer token(s)

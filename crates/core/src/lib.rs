@@ -17,44 +17,25 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use std::time::Duration;
-
 use anyhow::{Result, anyhow};
 use codewhale_config::{ConfigToml, ProviderKind};
-use codewhale_execpolicy::{
-    AskForApproval, ExecApprovalRequirement, ExecPolicyContext, ExecPolicyDecision,
-    ExecPolicyEngine,
-};
 use codewhale_hooks::{HookDispatcher, HookEvent};
 use codewhale_mcp::{
     McpManager, McpStartupCompleteEvent, McpStartupStatus as McpManagerStartupStatus,
 };
 use codewhale_protocol::{
-    AppResponse, EventFrame, ExecApprovalRequestEvent, ResponseChannel, ReviewDecision, Status,
-    Thread, ThreadForkParams, ThreadGoal, ThreadGoalClearParams, ThreadGoalGetParams,
-    ThreadGoalProgressParams, ThreadGoalSetParams, ThreadGoalStatus, ThreadListParams,
-    ThreadReadParams, ThreadRequest, ThreadResponse, ThreadResumeParams, ThreadSetNameParams,
-    ThreadStatus, ToolPayload, UserInputRequestEvent,
+    AppResponse, EventFrame, ResponseChannel, Status, Thread, ThreadForkParams, ThreadGoal,
+    ThreadGoalClearParams, ThreadGoalGetParams, ThreadGoalProgressParams, ThreadGoalSetParams,
+    ThreadGoalStatus, ThreadListParams, ThreadReadParams, ThreadRequest, ThreadResponse,
+    ThreadResumeParams, ThreadSetNameParams, ThreadStatus,
 };
 use codewhale_state::{
     JobStateRecord, JobStateStatus, SessionSource, StateStore, ThreadGoalRecord,
     ThreadGoalStatus as PersistedThreadGoalStatus, ThreadListFilters, ThreadMetadata,
     ThreadStatus as PersistedThreadStatus,
 };
-use codewhale_tools::{ToolCall, ToolRegistry};
 use serde_json::{Value, json};
-use tokio::time;
 use uuid::Uuid;
-
-/// Per-tool dispatch budget for the headless runtime. Matches the generous
-/// subagent default so long-running tools are not cut off prematurely.
-fn tool_dispatch_timeout() -> Duration {
-    if cfg!(test) {
-        Duration::from_millis(50)
-    } else {
-        Duration::from_secs(300)
-    }
-}
 
 /// How a new thread's conversation history is initialized.
 #[derive(Debug, Clone)]
@@ -908,18 +889,17 @@ impl ThreadManager {
     }
 }
 
-/// Top-level runtime combining config, threads, tools, MCP, and hooks.
+/// Top-level headless runtime combining config, threads, MCP, and hooks.
+///
+/// It does not execute tools and holds no approval policy: the Engine behind
+/// the app-server's runtime bridge is the only tool and approval authority.
 pub struct Runtime {
     /// Resolved application configuration.
     pub config: ConfigToml,
     /// Manages conversation thread lifecycle.
     pub thread_manager: ThreadManager,
-    /// Registry of callable tools.
-    pub tool_registry: Arc<ToolRegistry>,
     /// Manager for MCP server connections.
     pub mcp_manager: Arc<McpManager>,
-    /// Engine for evaluating execution policy decisions.
-    pub exec_policy: ExecPolicyEngine,
     /// Dispatcher for lifecycle hooks.
     pub hooks: HookDispatcher,
     /// Manager for background job lifecycle.
@@ -931,9 +911,7 @@ impl Runtime {
     pub fn new(
         config: ConfigToml,
         state: StateStore,
-        tool_registry: Arc<ToolRegistry>,
         mcp_manager: Arc<McpManager>,
-        exec_policy: ExecPolicyEngine,
         hooks: HookDispatcher,
     ) -> Self {
         let mut jobs = JobManager::default();
@@ -943,9 +921,7 @@ impl Runtime {
         Self {
             config,
             thread_manager: ThreadManager::new(state),
-            tool_registry,
             mcp_manager,
-            exec_policy,
             hooks,
             jobs,
         }
@@ -955,39 +931,12 @@ impl Runtime {
     /// changes without a restart.  Called by the app-server after
     /// `ConfigSet` or `ConfigUnset`.
     ///
-    /// Only `config.toml` is touched by those operations, so the sibling
-    /// `permissions.toml` (and therefore `exec_policy`) is left unchanged.
-    ///
     /// Fields that the TUI caches on its `App` struct (`api_provider`,
     /// `reasoning_effort`, `mcp_config_path`, `skills_dir`, …) are read
     /// live from `self.config` here via `resolve_runtime_options`, so they
     /// take effect on the next prompt turn without any extra plumbing.
     pub fn update_config(&mut self, config: ConfigToml) {
         self.config = config;
-    }
-
-    /// Reload the live configuration **and** the exec policy from a
-    /// freshly-loaded `ConfigStore`.  Used by the app-server's
-    /// `ConfigReload` request, which re-reads both `config.toml` and the
-    /// sibling `permissions.toml` from disk.
-    ///
-    /// Unlike `update_config`, this also refreshes `self.exec_policy` so
-    /// externally edited permission rules take effect without a restart.
-    ///
-    /// Mirrors the TUI `reload_runtime_config` codepath for everything
-    /// that is reachable from the headless `Runtime`. The TUI-only caches
-    /// (`last_effective_reasoning_effort`, `model_compaction_budget`,
-    /// `ui_locale`, …) do not exist on `Runtime` and need no work here.
-    ///
-    /// **Not** refreshed by this call:
-    /// * `mcp_manager` — MCP server connections are loaded once at
-    ///   startup from `mcp_config_path`. Changing `mcp_config_path` or the
-    ///   referenced `mcp.json` still requires a headless-runtime restart;
-    ///   the TUI owns a separate explicit `/mcp reload` operation.
-    /// * `tool_registry` — built once at startup.
-    pub fn reload_config_and_policy(&mut self, config: ConfigToml, exec_policy: ExecPolicyEngine) {
-        self.config = config;
-        self.exec_policy = exec_policy;
     }
 
     fn persisted_thread_data(&self, thread_id: &str) -> Result<Value> {
@@ -1318,292 +1267,6 @@ impl Runtime {
         }
     }
 
-    /// Evaluates execution policy and dispatches a tool call.
-    pub async fn invoke_tool(
-        &self,
-        call: ToolCall,
-        approval_mode: AskForApproval,
-        cwd: &Path,
-    ) -> Result<Value> {
-        let fallback_cwd = cwd.display().to_string();
-        let (command, policy_cwd, execution_kind) = call.execution_subject(&fallback_cwd);
-        let policy_tool = match &call.payload {
-            ToolPayload::LocalShell { .. } => "exec_shell",
-            _ => call.name.as_str(),
-        };
-        let policy_path = permission_path_for_call(&call);
-        let decision = self.exec_policy.check(ExecPolicyContext {
-            command: &command,
-            cwd: &policy_cwd,
-            tool: Some(policy_tool),
-            path: policy_path.as_deref(),
-            ask_for_approval: approval_mode,
-            sandbox_mode: None,
-        })?;
-        let precheck = policy_precheck_payload(&decision, &command, &policy_cwd, execution_kind);
-        let response_id = format!("tool-{}", Uuid::new_v4());
-        let call_id = call
-            .raw_tool_call_id
-            .clone()
-            .unwrap_or_else(|| format!("tool-call-{}", Uuid::new_v4()));
-        self.hooks
-            .emit(HookEvent::ToolLifecycle {
-                response_id: response_id.clone(),
-                tool_name: call.name.clone(),
-                phase: "precheck".to_string(),
-                payload: precheck.clone(),
-            })
-            .await;
-
-        if !decision.allow {
-            let reason = decision.reason().to_string();
-            let approval_id = format!("approval-{}", Uuid::new_v4());
-            let error_frame = EventFrame::Error {
-                response_id: response_id.clone(),
-                message: reason.clone(),
-            };
-            self.hooks
-                .emit(HookEvent::ApprovalLifecycle {
-                    approval_id,
-                    phase: "denied".to_string(),
-                    reason: Some(reason.clone()),
-                })
-                .await;
-            self.hooks
-                .emit(HookEvent::GenericEventFrame {
-                    frame: Box::new(error_frame.clone()),
-                })
-                .await;
-            return Ok(json!({
-                "ok": false,
-                "status": "denied",
-                "execution_kind": execution_kind,
-                "response_id": response_id,
-                "precheck": precheck,
-                "error": reason,
-                "events": [event_frame_payload(&error_frame)],
-            }));
-        }
-
-        if decision.requires_approval {
-            let approval_id = format!("approval-{}", Uuid::new_v4());
-            let reason = decision.reason().to_string();
-            let maybe_approval_frame = approval_request_frame(
-                &decision.requirement,
-                decision.matched_rule.as_deref(),
-                call_id,
-                approval_id.clone(),
-                response_id.clone(),
-                command.clone(),
-                policy_cwd.clone(),
-            );
-            self.hooks
-                .emit(HookEvent::ApprovalLifecycle {
-                    approval_id: approval_id.clone(),
-                    phase: "requested".to_string(),
-                    reason: Some(reason.clone()),
-                })
-                .await;
-            let mut events = Vec::new();
-            if let Some(frame) = maybe_approval_frame {
-                self.hooks
-                    .emit(HookEvent::GenericEventFrame {
-                        frame: Box::new(frame.clone()),
-                    })
-                    .await;
-                events.push(event_frame_payload(&frame));
-            }
-            return Ok(json!({
-                "ok": false,
-                "status": "approval_required",
-                "execution_kind": execution_kind,
-                "response_id": response_id,
-                "approval_id": approval_id,
-                "precheck": precheck,
-                "error": reason,
-                "events": events,
-            }));
-        }
-
-        // Headless `request_user_input`: mirror the approval fire-and-return
-        // branch (issue #3102). The TUI intercepts this tool by name before
-        // dispatch and blocks on a reply channel; the headless runtime instead
-        // emits a typed `UserInputRequest` frame and returns a
-        // `user_input_required` status so the client can render the question.
-        // It does NOT block — consistent with the headless approval model,
-        // which has no resume channel either.
-        //
-        // The reply goes to the runtime API
-        // (`POST /v1/user-input/{thread_id}/{request_id}`), which owns the
-        // pending request and can resume the turn. The app-server control
-        // transport cannot: it executes only `thread/interrupt` mid-turn, so
-        // an answer sent over it would queue behind the very turn that is
-        // waiting for it. `AppRequest::SubmitUserInput` therefore refuses
-        // explicitly instead of pretending to have delivered the answer.
-        if call.name == REQUEST_USER_INPUT_TOOL_NAME {
-            let request_id = format!("user-input-{}", Uuid::new_v4());
-            let arguments = match &call.payload {
-                ToolPayload::Function { arguments } => arguments.as_str(),
-                // Custom/Mcp/LocalShell can't carry a user_input payload; fall
-                // through to the generic dispatch error below.
-                _ => "",
-            };
-            let maybe_frame = user_input_request_frame(
-                call_id.clone(),
-                response_id.clone(),
-                request_id.clone(),
-                arguments,
-            );
-            let mut events = Vec::new();
-            if let Some(frame) = maybe_frame {
-                self.hooks
-                    .emit(HookEvent::GenericEventFrame {
-                        frame: Box::new(frame.clone()),
-                    })
-                    .await;
-                events.push(event_frame_payload(&frame));
-            }
-            return Ok(json!({
-                "ok": false,
-                "status": "user_input_required",
-                "execution_kind": execution_kind,
-                "response_id": response_id,
-                "request_id": request_id,
-                "precheck": precheck,
-                "events": events,
-            }));
-        }
-
-        let start_frame = EventFrame::ToolCallStart {
-            response_id: response_id.clone(),
-            tool_name: call.name.clone(),
-            arguments: tool_payload_value(&call.payload),
-        };
-        self.hooks
-            .emit(HookEvent::GenericEventFrame {
-                frame: Box::new(start_frame.clone()),
-            })
-            .await;
-        self.hooks
-            .emit(HookEvent::ToolLifecycle {
-                response_id: response_id.clone(),
-                tool_name: call.name.clone(),
-                phase: "dispatching".to_string(),
-                payload: json!({
-                    "call_id": call_id,
-                    "execution_kind": execution_kind
-                }),
-            })
-            .await;
-
-        match time::timeout(
-            tool_dispatch_timeout(),
-            self.tool_registry.dispatch(call.clone(), true),
-        )
-        .await
-        {
-            Ok(Ok(tool_output)) => {
-                let success = tool_output.success();
-                let status = if success { "completed" } else { "failed" };
-                let result_frame = EventFrame::ToolCallResult {
-                    response_id: response_id.clone(),
-                    tool_name: call.name.clone(),
-                    output: tool_output_value(&tool_output),
-                };
-                self.hooks
-                    .emit(HookEvent::GenericEventFrame {
-                        frame: Box::new(result_frame.clone()),
-                    })
-                    .await;
-                self.hooks
-                    .emit(HookEvent::ToolLifecycle {
-                        response_id: response_id.clone(),
-                        tool_name: call.name,
-                        phase: status.to_string(),
-                        payload: json!({ "ok": success }),
-                    })
-                    .await;
-                Ok(json!({
-                    "ok": success,
-                    "status": status,
-                    "execution_kind": execution_kind,
-                    "response_id": response_id,
-                    "precheck": precheck,
-                    "output": tool_output,
-                    "events": [
-                        event_frame_payload(&start_frame),
-                        event_frame_payload(&result_frame)
-                    ]
-                }))
-            }
-            Ok(Err(err)) => {
-                let message = format!("{err:?}");
-                let error_frame = EventFrame::Error {
-                    response_id: response_id.clone(),
-                    message: message.clone(),
-                };
-                self.hooks
-                    .emit(HookEvent::GenericEventFrame {
-                        frame: Box::new(error_frame.clone()),
-                    })
-                    .await;
-                self.hooks
-                    .emit(HookEvent::ToolLifecycle {
-                        response_id: response_id.clone(),
-                        tool_name: call.name,
-                        phase: "failed".to_string(),
-                        payload: json!({ "error": message.clone() }),
-                    })
-                    .await;
-                Ok(json!({
-                    "ok": false,
-                    "status": "failed",
-                    "execution_kind": execution_kind,
-                    "response_id": response_id,
-                    "precheck": precheck,
-                    "error": message,
-                    "events": [
-                        event_frame_payload(&start_frame),
-                        event_frame_payload(&error_frame)
-                    ]
-                }))
-            }
-            Err(_elapsed) => {
-                let seconds = tool_dispatch_timeout().as_secs().max(1);
-                let message = format!("Tool '{}' timed out after {seconds}s", call.name);
-                let error_frame = EventFrame::Error {
-                    response_id: response_id.clone(),
-                    message: message.clone(),
-                };
-                self.hooks
-                    .emit(HookEvent::GenericEventFrame {
-                        frame: Box::new(error_frame.clone()),
-                    })
-                    .await;
-                self.hooks
-                    .emit(HookEvent::ToolLifecycle {
-                        response_id: response_id.clone(),
-                        tool_name: call.name,
-                        phase: "failed".to_string(),
-                        payload: json!({ "error": message.clone(), "timeout": true }),
-                    })
-                    .await;
-                Ok(json!({
-                    "ok": false,
-                    "status": "timeout",
-                    "execution_kind": execution_kind,
-                    "response_id": response_id,
-                    "precheck": precheck,
-                    "error": message,
-                    "events": [
-                        event_frame_payload(&start_frame),
-                        event_frame_payload(&error_frame)
-                    ]
-                }))
-            }
-        }
-    }
-
     /// Starts all configured MCP servers and emits startup events via hooks.
     pub async fn mcp_startup(&self) -> McpStartupCompleteEvent {
         let mut updates = Vec::new();
@@ -1761,24 +1424,6 @@ fn preview_from_initial_history(initial_history: &InitialHistory) -> String {
     }
 }
 
-fn permission_path_for_call(call: &ToolCall) -> Option<String> {
-    match &call.payload {
-        ToolPayload::Function { arguments } => serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            }),
-        ToolPayload::Mcp { raw_arguments, .. } => raw_arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        ToolPayload::Custom { .. } | ToolPayload::LocalShell { .. } => None,
-    }
-}
-
 fn truncate_preview(value: &str) -> String {
     value.chars().take(120).collect()
 }
@@ -1863,168 +1508,6 @@ fn to_persisted_source(source: &codewhale_protocol::SessionSource) -> SessionSou
         codewhale_protocol::SessionSource::Unknown => SessionSource::Unknown,
     }
 }
-
-fn approval_request_frame(
-    requirement: &ExecApprovalRequirement,
-    matched_rule: Option<&str>,
-    call_id: String,
-    approval_id: String,
-    turn_id: String,
-    command: String,
-    cwd: String,
-) -> Option<EventFrame> {
-    let ExecApprovalRequirement::NeedsApproval {
-        reason,
-        proposed_execpolicy_amendment,
-        proposed_network_policy_amendments,
-    } = requirement
-    else {
-        return None;
-    };
-
-    let mut available_decisions = vec![
-        ReviewDecision::Approved,
-        ReviewDecision::ApprovedForSession,
-        ReviewDecision::Denied,
-        ReviewDecision::Abort,
-    ];
-    if proposed_execpolicy_amendment
-        .as_ref()
-        .is_some_and(|amendment| !amendment.prefixes.is_empty())
-    {
-        available_decisions.push(ReviewDecision::ApprovedExecpolicyAmendment);
-    }
-    available_decisions.extend(proposed_network_policy_amendments.iter().cloned().map(
-        |amendment| ReviewDecision::NetworkPolicyAmendment {
-            host: amendment.host,
-            action: amendment.action,
-        },
-    ));
-
-    Some(EventFrame::ExecApprovalRequest {
-        request: ExecApprovalRequestEvent {
-            call_id,
-            approval_id,
-            turn_id,
-            command,
-            cwd,
-            reason: reason.clone(),
-            matched_rule: matched_rule.map(|rule| rule.to_string().into_boxed_str()),
-            network_approval_context: None,
-            proposed_execpolicy_amendment: proposed_execpolicy_amendment
-                .as_ref()
-                .map(|amendment| amendment.prefixes.clone())
-                .unwrap_or_default(),
-            proposed_network_policy_amendments: proposed_network_policy_amendments.clone(),
-            additional_permissions: Vec::new(),
-            available_decisions,
-        },
-    })
-}
-
-/// Build an [`EventFrame::UserInputRequest`] for a headless
-/// `request_user_input` tool call, mirroring [`approval_request_frame`].
-///
-/// `arguments` is the raw JSON arguments string the model supplied to the
-/// `request_user_input` tool (a `ToolPayload::Function` body). On parse
-/// failure we return `None` so the caller falls through to the generic tool
-/// error path rather than silently dropping the request.
-fn user_input_request_frame(
-    call_id: String,
-    turn_id: String,
-    request_id: String,
-    arguments: &str,
-) -> Option<EventFrame> {
-    let parsed: Value = serde_json::from_str(arguments).ok()?;
-    // Extract the `questions` array and lift it into the headless event
-    // shape. We tolerate missing `allow_free_text`/`multi_select` (default
-    // false) and extra fields, matching the lenient TUI `from_value` path.
-    let questions = parsed.get("questions").cloned().filter(Value::is_array)?;
-    let request = UserInputRequestEvent {
-        call_id,
-        turn_id,
-        request_id,
-        questions: serde_json::from_value(questions).ok()?,
-    };
-    Some(EventFrame::UserInputRequest { request })
-}
-
-fn approval_requirement_payload(requirement: &ExecApprovalRequirement) -> Value {
-    match requirement {
-        ExecApprovalRequirement::Skip {
-            bypass_sandbox,
-            proposed_execpolicy_amendment,
-        } => json!({
-            "type": "skip",
-            "bypass_sandbox": bypass_sandbox,
-            "reason": requirement.reason(),
-            "proposed_execpolicy_amendment": proposed_execpolicy_amendment
-                .as_ref()
-                .map(|amendment| amendment.prefixes.clone())
-                .unwrap_or_default()
-        }),
-        ExecApprovalRequirement::NeedsApproval {
-            reason,
-            proposed_execpolicy_amendment,
-            proposed_network_policy_amendments,
-        } => json!({
-            "type": "needs_approval",
-            "reason": reason,
-            "proposed_execpolicy_amendment": proposed_execpolicy_amendment
-                .as_ref()
-                .map(|amendment| amendment.prefixes.clone())
-                .unwrap_or_default(),
-            "proposed_network_policy_amendments": proposed_network_policy_amendments
-        }),
-        ExecApprovalRequirement::Forbidden { reason } => json!({
-            "type": "forbidden",
-            "reason": reason
-        }),
-    }
-}
-
-fn policy_precheck_payload(
-    decision: &ExecPolicyDecision,
-    command: &str,
-    cwd: &str,
-    execution_kind: &str,
-) -> Value {
-    json!({
-        "execution_kind": execution_kind,
-        "command": command,
-        "cwd": cwd,
-        "allow": decision.allow,
-        "requires_approval": decision.requires_approval,
-        "matched_rule": decision.matched_rule.clone(),
-        "phase": decision.requirement.phase(),
-        "reason": decision.reason(),
-        "requirement": approval_requirement_payload(&decision.requirement)
-    })
-}
-
-fn tool_payload_value(payload: &ToolPayload) -> Value {
-    serde_json::to_value(payload).unwrap_or_else(
-        |_| json!({"type":"serialization_error","message":"tool payload unavailable"}),
-    )
-}
-
-fn tool_output_value(output: &codewhale_protocol::ToolOutput) -> Value {
-    serde_json::to_value(output).unwrap_or_else(
-        |_| json!({"type":"serialization_error","message":"tool output unavailable"}),
-    )
-}
-
-fn event_frame_payload(frame: &EventFrame) -> Value {
-    serde_json::to_value(frame)
-        .unwrap_or_else(|_| json!({"event":"error","message":"failed to encode event frame"}))
-}
-
-/// Tool name that triggers the headless clarification-question flow.
-///
-/// Mirrors the TUI's `REQUEST_USER_INPUT_NAME`
-/// (`crates/tui/src/core/engine/tool_catalog.rs`); duplicated here rather than
-/// depended on across crates so `core` stays free of `tui` imports.
-const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
 
 fn json_optional_string(value: &Value) -> Option<String> {
     if value.is_null() {
@@ -2153,7 +1636,6 @@ fn job_state_status_to_runtime(status: JobStateStatus) -> JobStatus {
 mod tests {
     use super::*;
     use codewhale_protocol::ThreadResumeParams;
-    use codewhale_tools::ToolCallSource;
 
     fn temp_core_state(name: &str) -> StateStore {
         let dir =
@@ -2190,61 +1672,6 @@ mod tests {
     }
 
     // ── JobManager: lifecycle ──────────────────────────────────────────
-
-    #[test]
-    fn permission_path_for_call_extracts_function_path_argument() {
-        let call = ToolCall {
-            name: "read_file".to_string(),
-            payload: ToolPayload::Function {
-                arguments: json!({ "path": "README.md" }).to_string(),
-            },
-            source: ToolCallSource::Direct,
-            raw_tool_call_id: None,
-        };
-
-        assert_eq!(
-            permission_path_for_call(&call).as_deref(),
-            Some("README.md")
-        );
-    }
-
-    #[test]
-    fn permission_path_for_call_extracts_mcp_path_argument() {
-        let call = ToolCall {
-            name: "mcp_fs_read".to_string(),
-            payload: ToolPayload::Mcp {
-                server: "fs".to_string(),
-                tool: "read".to_string(),
-                raw_arguments: json!({ "path": "secrets/token.txt" }),
-                raw_tool_call_id: None,
-            },
-            source: ToolCallSource::Direct,
-            raw_tool_call_id: None,
-        };
-
-        assert_eq!(
-            permission_path_for_call(&call).as_deref(),
-            Some("secrets/token.txt")
-        );
-    }
-
-    #[test]
-    fn permission_path_for_call_ignores_shell_payload() {
-        let call = ToolCall {
-            name: "exec_shell".to_string(),
-            payload: ToolPayload::LocalShell {
-                params: codewhale_protocol::LocalShellParams {
-                    command: "cargo test".to_string(),
-                    cwd: None,
-                    timeout_ms: None,
-                },
-            },
-            source: ToolCallSource::Direct,
-            raw_tool_call_id: None,
-        };
-
-        assert_eq!(permission_path_for_call(&call), None);
-    }
 
     #[test]
     fn thread_goal_progress_accumulates_durable_accounting() {
@@ -2285,86 +1712,6 @@ mod tests {
         assert_eq!(persisted.tokens_used, 750);
         assert_eq!(persisted.time_used_seconds, 12);
         assert_eq!(persisted.continuation_count, 1);
-    }
-
-    #[test]
-    fn approval_request_frame_includes_matched_rule() {
-        let requirement = ExecApprovalRequirement::NeedsApproval {
-            reason: "Typed ask rule 'tool=exec_shell command=cargo test' requires approval."
-                .to_string(),
-            proposed_execpolicy_amendment: None,
-            proposed_network_policy_amendments: Vec::new(),
-        };
-
-        let frame = approval_request_frame(
-            &requirement,
-            Some("tool=exec_shell command=cargo test"),
-            "call-1".to_string(),
-            "approval-1".to_string(),
-            "turn-1".to_string(),
-            "cargo test --workspace".to_string(),
-            "/repo".to_string(),
-        )
-        .expect("approval frame");
-
-        let EventFrame::ExecApprovalRequest { request } = frame else {
-            panic!("expected exec approval request frame");
-        };
-        assert_eq!(
-            request.matched_rule.as_deref(),
-            Some("tool=exec_shell command=cargo test")
-        );
-        assert_eq!(request.reason, requirement.reason());
-    }
-
-    #[test]
-    fn user_input_request_frame_lifts_questions_from_arguments() {
-        // issue #3102: the headless frame constructor must parse the model's
-        // `request_user_input` arguments and lift the questions into the
-        // UserInputRequestEvent, defaulting the boolean flags when omitted.
-        let arguments = r#"{"questions":[{"header":"Scope","id":"scope","question":"Which?","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}],"allow_free_text":true}]}"#;
-        let frame = user_input_request_frame(
-            "call-1".to_string(),
-            "turn-1".to_string(),
-            "ui-1".to_string(),
-            arguments,
-        )
-        .expect("user input frame");
-
-        let EventFrame::UserInputRequest { request } = frame else {
-            panic!("expected user_input_request frame");
-        };
-        assert_eq!(request.call_id, "call-1");
-        assert_eq!(request.turn_id, "turn-1");
-        assert_eq!(request.request_id, "ui-1");
-        assert_eq!(request.questions.len(), 1);
-        assert_eq!(request.questions[0].id, "scope");
-        assert!(request.questions[0].allow_free_text);
-        // multi_select omitted in the payload → defaults to false.
-        assert!(!request.questions[0].multi_select);
-        assert_eq!(request.questions[0].options.len(), 2);
-    }
-
-    #[test]
-    fn user_input_request_frame_returns_none_on_invalid_arguments() {
-        // On parse failure the constructor returns None so invoke_tool falls
-        // through to the generic tool error path instead of silently dropping.
-        let frame = user_input_request_frame(
-            "call-1".to_string(),
-            "turn-1".to_string(),
-            "ui-1".to_string(),
-            "not json",
-        );
-        assert!(frame.is_none());
-
-        // Valid JSON but missing the questions array is also rejected.
-        let frame = user_input_request_frame(
-            "call-1".to_string(),
-            "turn-1".to_string(),
-            "ui-1".to_string(),
-            r#"{"foo":"bar"}"#,
-        );
-        assert!(frame.is_none());
     }
 
     #[test]
@@ -3101,78 +2448,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_tool_returns_timeout_status_for_slow_tools() {
-        use async_trait::async_trait;
-        use codewhale_config::ConfigToml;
-        use codewhale_execpolicy::{AskForApproval, ExecPolicyEngine};
-        use codewhale_hooks::HookDispatcher;
-        use codewhale_mcp::McpManager;
-        use codewhale_protocol::{ToolKind, ToolOutput, ToolPayload};
-        use codewhale_tools::{FunctionCallError, ToolDescriptor, ToolHandler, ToolInvocation};
-
-        struct SlowTool;
-        #[async_trait]
-        impl ToolHandler for SlowTool {
-            fn kind(&self) -> ToolKind {
-                ToolKind::Function
-            }
-
-            async fn handle(
-                &self,
-                _invocation: ToolInvocation,
-            ) -> std::result::Result<ToolOutput, FunctionCallError> {
-                time::sleep(Duration::from_millis(200)).await;
-                Ok(ToolOutput::Function {
-                    body: Some(json!("late")),
-                    success: true,
-                })
-            }
-        }
-
-        let mut registry = ToolRegistry::default();
-        registry
-            .register(
-                ToolDescriptor {
-                    name: "slow_tool".to_string(),
-                    input_schema: json!({"type":"object"}),
-                    output_schema: json!({"type":"object"}),
-                    supports_parallel_tool_calls: true,
-                    timeout_ms: None,
-                },
-                Arc::new(SlowTool),
-            )
-            .expect("register slow tool");
-
-        let runtime = Runtime::new(
-            ConfigToml::default(),
-            temp_core_state("invoke-tool-timeout"),
-            Arc::new(registry),
-            Arc::new(McpManager::default()),
-            ExecPolicyEngine::new(vec![], vec![]),
-            HookDispatcher::default(),
-        );
-
-        let result = runtime
-            .invoke_tool(
-                ToolCall {
-                    name: "slow_tool".to_string(),
-                    payload: ToolPayload::Function {
-                        arguments: "{}".to_string(),
-                    },
-                    source: ToolCallSource::Direct,
-                    raw_tool_call_id: None,
-                },
-                AskForApproval::Never,
-                Path::new("/tmp/codewhale"),
-            )
-            .await
-            .expect("invoke tool");
-
-        assert_eq!(result["status"], "timeout");
-        assert_eq!(result["ok"], false);
-    }
-
-    #[tokio::test]
     async fn thread_message_is_refused_rather_than_faked() {
         // This arm used to record the user message, emit canned
         // ResponseStart/ResponseDelta("queued")/ResponseEnd frames and report
@@ -3182,9 +2457,7 @@ mod tests {
         let mut runtime = Runtime::new(
             ConfigToml::default(),
             temp_core_state("message-refused"),
-            Arc::new(ToolRegistry::default()),
             Arc::new(McpManager::default()),
-            ExecPolicyEngine::new(vec![], vec![]),
             HookDispatcher::default(),
         );
         let spawned = runtime

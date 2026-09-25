@@ -305,7 +305,10 @@ impl std::ops::Deref for AppendLog {
 /// Per-turn ephemeral data. Cleared at every turn boundary.
 ///
 /// **Phase 1 scaffolding** — not yet wired into the engine request path.
-#[cfg_attr(not(test), expect(dead_code))]
+/// `allow`, not `expect`: its only non-test use is a field of the dead
+/// `ThreeZoneRequest`, which rustc 1.89 counts as a use and newer rustc does
+/// not, so an expectation is unfulfilled on the MSRV (#6543).
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
 pub struct TurnScratch {
     pub working_set: Vec<String>,

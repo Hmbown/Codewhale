@@ -430,7 +430,7 @@ request broad fan-out and let the manager drain it without creating an
 unbounded population.
 
 By default every admitted child may start immediately — there is no artificial
-throttle. Request the fan-out the work actually needs and let the runtime
+throttle beyond the rate-limit governor described below. Request the fan-out the work actually needs and let the runtime
 queue and drain it; the caps above are enforcement, not a reason to
 pre-refuse valid work. If you want gentler fan-out, lower `[subagents].launch_concurrency`
 (how many direct children start at once); children beyond that limit **queue**
@@ -444,6 +444,29 @@ counts both **running** and **queued** agents, while `launch_concurrency` keeps
 instantaneous execution bounded. Completed / failed / cancelled records persist
 for inspection but don't occupy an admission slot. Agents that lost their
 `task_handle` (e.g. across a process restart) also don't count against the cap.
+
+### Rate-limit governor
+
+The one automatic throttle is the rate-limit governor. It watches provider
+rate limits (HTTP 429) across a 60-second window. After repeated limits it
+shrinks the number of launch slots; under a sustained burst it pauses new
+launches entirely. Steady successes add slots back one at a time. It never
+interrupts an agent that is already running, and quota exhaustion is not
+treated as a throttle.
+
+While the governor is holding launches back, it says so in two places:
+
+- a queued agent's row gives the reason, for example
+  `launch slots throttled to 4/8 after 2 provider rate limit(s) in the last 60s`
+  or `launches paused after 4 provider rate limit(s) in the last 60s`, and the
+  time its wall budget ends;
+- `GET /v1/agent-runs` returns a `governor` object next to `runs`, with
+  `launch_slots`, `max_launch_slots`, `paused`, `recent_rate_limits`, and a
+  `status` line while launches are held back. It describes launches made by the
+  runtime serving the request (Fleet runs).
+
+Known limitation: the `/subagents` register header does not show the governor
+line yet; the TUI receives agent lists from the Engine without governor state.
 
 Provider profiles let one config stay aggressive for direct API routes while
 keeping subscription or aggregator routes gentle. Every key under
@@ -574,6 +597,14 @@ zero representation for that default never cancels a finite inherited cap.
 `wall_time_secs` accepts 1 through 86400, with an operator-configurable
 1800-second default. It includes admission queue time, model requests, and
 tools. The effective absolute deadline is persisted.
+
+The wall clock starts when the agent is started, not when it gets a launch
+slot. This is deliberate. The queue wait and the run share one deadline, so a
+saturated or rate-limited fleet cannot keep an agent alive past the budget
+you gave it. The cost is that time spent queued is time taken from the run.
+The queued row says so instead of hiding it: it names the reason for the wait
+and the time the wall budget ends. If agents regularly spend a large share of
+their budget queued, start fewer at once or raise `wall_time_secs`.
 
 For example, a focused review can request:
 

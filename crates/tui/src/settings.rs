@@ -431,9 +431,10 @@ pub struct Settings {
     /// Archived provider model choices used only by the config selection
     /// migration. Preserve them on unrelated settings saves until migrated.
     pub provider_models: Option<std::collections::HashMap<String, String>>,
-    /// Provider-scoped model IDs intentionally enabled for the ordinary model
-    /// picker. Missing on older files; current and saved provider choices are
-    /// seeded at load time so the migration is additive and non-breaking.
+    /// Legacy additive picker list written by older builds on every model
+    /// switch. Nothing reads it any more (#6533): the picker ranks by recent
+    /// use instead. Parsed and preserved only so old files load and survive
+    /// unrelated saves until a cleanup removes the table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_models: Option<std::collections::HashMap<String, Vec<String>>>,
     /// Exact provider/model tuples pinned to the top of model choosers, in
@@ -2084,29 +2085,6 @@ impl Settings {
                 "Default thinking effort: auto, off, low, medium, high, max, or default",
             ),
         ]
-    }
-
-    /// Add a model to a provider's enabled chooser set without removing prior
-    /// choices. IDs are compared case-insensitively but preserve their wire
-    /// spelling on disk.
-    #[cfg(test)]
-    pub fn enable_model_for_provider(&mut self, provider: &str, model: &str) {
-        let provider = provider.trim();
-        let model = model.trim();
-        if provider.is_empty() || model.is_empty() || model.eq_ignore_ascii_case("auto") {
-            return;
-        }
-        let models = self
-            .enabled_models
-            .get_or_insert_with(std::collections::HashMap::new)
-            .entry(provider.to_string())
-            .or_default();
-        if !models
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(model))
-        {
-            models.push(model.to_string());
-        }
     }
 
     /// Toggle one exact provider/model pin without touching credentials or
@@ -4323,26 +4301,22 @@ mod tests {
     }
 
     #[test]
-    fn model_chooser_preferences_do_not_write_a_startup_selection() {
-        let mut settings = Settings::default();
-
-        settings.enable_model_for_provider("openrouter", "anthropic/claude-sonnet-4");
-        settings.enable_model_for_provider("openrouter", "qwen/qwen3.7-plus");
-        settings.enable_model_for_provider("openrouter", "QWEN/QWEN3.7-PLUS");
-        settings.enable_model_for_provider("openrouter", "auto");
-
+    fn legacy_enabled_models_table_still_loads_and_round_trips() {
+        let settings: Settings = toml::from_str(
+            r#"
+[enabled_models]
+zai = ["GLM-5.2", "GLM-5.3"]
+"#,
+        )
+        .expect("legacy enabled_models loads");
         assert!(settings.provider_models.is_none());
         assert_eq!(
             settings
                 .enabled_models
                 .as_ref()
-                .and_then(|models| models.get("openrouter")),
-            Some(&vec![
-                "anthropic/claude-sonnet-4".to_string(),
-                "qwen/qwen3.7-plus".to_string(),
-            ])
+                .and_then(|models| models.get("zai")),
+            Some(&vec!["GLM-5.2".to_string(), "GLM-5.3".to_string()])
         );
-
         let encoded = toml::to_string(&settings).expect("serialize enabled models");
         let decoded: Settings = toml::from_str(&encoded).expect("deserialize enabled models");
         assert_eq!(decoded.enabled_models, settings.enabled_models);

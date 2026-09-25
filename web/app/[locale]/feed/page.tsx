@@ -88,8 +88,8 @@ export default async function FeedPage({ params }: { params: Promise<{ locale: s
             <div className="lg:col-span-6">
               <div className="hairline-t hairline-b hairline-l hairline-r bg-paper">
                 <div className="bg-indigo text-paper px-4 py-3 flex items-baseline justify-between">
-                  <h2 className="font-cjk text-base tracking-wider">合并请求 · Pull Requests</h2>
-                  <span className="font-mono text-[0.7rem] uppercase tabular tracking-widest">{pulls.length} 条</span>
+                  <h2 className="font-cjk text-base">合并请求 · Pull Requests</h2>
+                  <span className="text-xs tabular">{pulls.length} 条</span>
                 </div>
                 <div className="px-4">
                   {pulls.length > 0 ? (
@@ -104,8 +104,8 @@ export default async function FeedPage({ params }: { params: Promise<{ locale: s
             <div className="lg:col-span-6">
               <div className="hairline-t hairline-b hairline-l hairline-r bg-paper">
                 <div className="bg-paper-deep text-ink px-4 py-3 flex items-baseline justify-between">
-                  <h2 className="font-cjk text-base tracking-wider">议题 · Issues</h2>
-                  <span className="font-mono text-[0.7rem] uppercase tabular tracking-widest">{issues.length} 条</span>
+                  <h2 className="font-cjk text-base">议题 · Issues</h2>
+                  <span className="text-xs tabular">{issues.length} 条</span>
                 </div>
                 <div className="px-4">
                   {issues.length > 0 ? (
@@ -156,8 +156,8 @@ export default async function FeedPage({ params }: { params: Promise<{ locale: s
             <div className="lg:col-span-6">
               <div className="hairline-t hairline-b hairline-l hairline-r bg-paper">
                 <div className="bg-indigo text-paper px-4 py-3 flex items-baseline justify-between">
-                  <h2 className="font-cjk text-base tracking-wider">合并 · Pull Requests</h2>
-                  <span className="font-mono text-[0.7rem] uppercase tabular tracking-widest">{pulls.length} shown</span>
+                  <h2 className="font-cjk text-base">合并 · Pull Requests</h2>
+                  <span className="text-xs tabular">{pulls.length} shown</span>
                 </div>
                 <div className="px-4">
                   {pulls.length > 0 ? (
@@ -172,8 +172,8 @@ export default async function FeedPage({ params }: { params: Promise<{ locale: s
             <div className="lg:col-span-6">
               <div className="hairline-t hairline-b hairline-l hairline-r bg-paper">
                 <div className="bg-paper-deep text-ink px-4 py-3 flex items-baseline justify-between">
-                  <h2 className="font-cjk text-base tracking-wider">议题 · Issues</h2>
-                  <span className="font-mono text-[0.7rem] uppercase tabular tracking-widest">{issues.length} shown</span>
+                  <h2 className="font-cjk text-base">议题 · Issues</h2>
+                  <span className="text-xs tabular">{issues.length} shown</span>
                 </div>
                 <div className="px-4">
                   {issues.length > 0 ? (

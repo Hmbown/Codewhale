@@ -69,10 +69,6 @@ pub struct TurnContext {
 
     /// Number of tool calls made in this turn.
 
-    /// Whether the turn has been cancelled
-    #[expect(dead_code)]
-    pub cancelled: bool,
-
     /// Usage for this turn
     pub usage: Usage,
 
@@ -134,7 +130,6 @@ impl TurnContext {
                 ..Default::default()
             },
             last_request_snapshot: None,
-            cancelled: false,
             usage: Usage {
                 input_tokens: 0,
                 output_tokens: 0,
@@ -172,12 +167,6 @@ impl TurnContext {
     #[must_use]
     pub fn steps_used(&self) -> u32 {
         self.step
-    }
-
-    /// Cancel the turn
-    #[expect(dead_code)]
-    pub fn cancel(&mut self) {
-        self.cancelled = true;
     }
 
     /// Get the elapsed time

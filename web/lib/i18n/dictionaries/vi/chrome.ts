@@ -9,10 +9,6 @@ import type { ChromeDict } from "../types";
  * (repository), mức quyền (permission posture), biên nhận (receipt). Product
  * terms — Codewhale, Plan / Work / Operate, Ask / Auto-Review / Full Access,
  * fleet, Workflow, Runtime — stay literal, as they do in the TUI.
- *
- * The masthead pairs a Vietnamese primary label with a short English
- * secondary one; the Han seals are the English edition's own device and are
- * not borrowed here (only the 深 wordmark glyph is shared).
  */
 export const chrome: ChromeDict = {
   navDocs: "Tài liệu",
@@ -24,22 +20,11 @@ export const chrome: ChromeDict = {
   navCommunity: "Cộng đồng",
   navContribute: "Đóng góp",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
-
   navProduct: "Sản phẩm",
   navModels: "Mô hình",
   navPlugins: "Plugin",
-  navProductSecondary: "Product",
-  navModelsSecondary: "Models",
-  navPluginsSecondary: "Plugins",
 
   skipToContent: "Bỏ qua tới nội dung chính",
-
 
   navPrimaryAria: "Điều hướng chính",
   navHomeAria: "Trang chủ Codewhale",
@@ -47,17 +32,12 @@ export const chrome: ChromeDict = {
   installCta: "Cài đặt →",
 
   authSignIn: "Đăng nhập",
-  authRegister: "Đăng ký",
-  authGroupAria: "Tài khoản",
 
   wordmarkSeal: "深",
   wordmarkTag: "mọi mô hình, trên máy của bạn",
 
   issueLabel: "Số ra {date}",
   dateLocale: "vi-VN",
-
-  starsAria: "Số sao trên GitHub",
-  githubFallback: "GitHub",
 
   tickerLiveLabel: "Trực tiếp",
   tickerLiveTag: "LIVE",
@@ -78,8 +58,8 @@ export const chrome: ChromeDict = {
   themeAuto: "tự động",
   themeLight: "sáng",
   themeDark: "tối",
-  themeAria: "Giao diện tài liệu: {mode} (nhấn để đổi)",
-  themeTitle: "Giao diện tài liệu · tự động / sáng / tối",
+  themeAria: "Giao diện: {mode} (nhấn để đổi)",
+  themeTitle: "Giao diện · tự động / sáng / tối",
 
   footerTagline:
     "Tạo những gì bạn muốn và tự động hóa công việc hằng ngày bằng các mô hình bạn chọn.",

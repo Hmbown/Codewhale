@@ -47,7 +47,7 @@ function LoginForm({ locale, error }: { locale: string; error: boolean }) {
         </label>
         <button
           type="submit"
-          className="w-full px-5 py-3 bg-indigo text-paper font-mono text-sm uppercase tracking-wider hover:bg-indigo-deep transition-colors"
+          className="w-full portal-button portal-button-primary"
         >
           {isZh ? "登录 →" : "Sign in →"}
         </button>
@@ -128,7 +128,7 @@ export default async function AdminPage({
         <form method="POST" action={`/api/admin/logout?locale=${locale}`}>
           <button
             type="submit"
-            className="font-mono text-xs text-ink-mute hover:text-indigo uppercase tracking-wider"
+            className="text-xs text-ink-mute hover:text-indigo transition-colors"
           >
             {isZh ? "退出 →" : "Sign out →"}
           </button>

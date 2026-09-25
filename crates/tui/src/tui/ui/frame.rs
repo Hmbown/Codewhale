@@ -553,7 +553,12 @@ fn register_clickable_chrome_for_hover(app: &App) {
             MessageId::KbCloseMenu,
         ),
         (
-            app.viewport.last_workflow_panel_area,
+            // Only the header row is the toggle/cancel affordance. Registering
+            // the whole panel painted the link glow (accent fg + underline on
+            // every cell) across the entire card whenever the pointer rested
+            // on it, and a pointer left there when the terminal lost focus
+            // kept it lit (#6503).
+            crate::tui::mouse_ui::workflow_panel_header_area(app),
             MessageId::CmdWorkflowDescription,
         ),
     ];
@@ -1018,6 +1023,7 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         search_provider: config.search_provider(),
         search_api_key: config.search.as_ref().and_then(|s| s.api_key.clone()),
         search_base_url: config.search.as_ref().and_then(|s| s.base_url.clone()),
+        search_native: config.search_native(),
         tools_always_load: config.tools_always_load(),
         user_input_limits: config.user_input_limits(),
         user_input_timeout: config.user_input_timeout(),

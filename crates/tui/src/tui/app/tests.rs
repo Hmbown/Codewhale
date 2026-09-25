@@ -582,6 +582,8 @@ fn auto_reasoning_change_invalidates_the_previous_route_and_receipt() {
         reason: crate::model_routing::AutoRouteReason::LocalFallback(
             crate::model_routing::AutoRouteHeuristicReason::DeclaredDefault,
         ),
+        decision: None,
+        router_failure: None,
     });
     app.last_effective_reasoning_effort =
         Some(EffectiveReasoningEffort::Tier(ReasoningEffort::Max));

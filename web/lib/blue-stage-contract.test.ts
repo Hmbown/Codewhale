@@ -96,21 +96,17 @@ describe("GPUI public-surface contract", () => {
 
     expect(mobile).toMatch(/\.site-nav-inner\s*\{\s*gap:\s*0\.5rem/);
     expect(mobile).toMatch(/\.site-nav-actions\s*\{[\s\S]*?min-width:\s*0/);
-    expect(mobile).toMatch(
-      /\.site-nav-actions select\s*\{[\s\S]*?width:\s*6\.75rem;[\s\S]*?min-width:\s*0/,
-    );
     expect(CSS).toMatch(/\.paper-wordmark-mark\s*\{[^}]*height:\s*22px;/);
     expect(CSS).toMatch(/\.paper-wordmark-logo\s*\{[^}]*height:\s*20px;/);
     expect(CSS).toMatch(/\.site-nav-actions\s*\{[\s\S]*?flex-shrink:\s*0/);
     expect(CSS).toMatch(/\.site-nav-actions\s*>\s*\*\s*\{\s*flex-shrink:\s*0/);
     expect(CSS).toMatch(/@media \(max-width: 900px\)[\s\S]*?\.site-github-link\s*\{\s*display:\s*none/);
-    expect(mobile).not.toMatch(/body:has\(\.product-home\) \.site-nav-actions select/);
     // The locale <select> and the home wordmark must keep a usable hit
     // target on every viewport, not only below 520px. Long native option
-    // labels and 2xl companion text used to collapse the wordmark to 0.
-    expect(CSS).toMatch(
-      /\.site-nav-actions select\s*\{\s*width:\s*6\.75rem;\s*max-width:\s*6\.75rem;\s*min-width:\s*0;/,
-    );
+    // labels and 2xl companion text used to collapse the wordmark to 0; the
+    // select now sits inside the fixed icon box instead of sizing the row.
+    expect(CSS).not.toMatch(/\.site-nav-actions select/);
+    expect(CSS).toMatch(/\.nav-locale select\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*0;/);
     // `min-width` is the floor that keeps the wordmark clickable; the shrink
     // factor stays at 1 so the compact controls are never the ones pushed
     // past `overflow-x: clip` when the row is over budget.

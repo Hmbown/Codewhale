@@ -171,20 +171,7 @@ pub(crate) fn documented_deepseek_files_api_for_route(
     wire_model_id: &str,
     base_url: &str,
 ) -> CapabilityState {
-    if !matches!(
-        provider,
-        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
-    ) {
-        return CapabilityState::Unknown;
-    }
-    let normalized = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
-    if !matches!(
-        normalized.as_str(),
-        "https://api.deepseek.com"
-            | "https://api.deepseek.com/v1"
-            | "https://api.deepseek.com/beta"
-            | "https://api.deepseek.com/anthropic"
-    ) {
+    if !is_official_deepseek_route(provider, base_url) {
         return CapabilityState::Unknown;
     }
     let model = wire_model_id.trim().to_ascii_lowercase();
@@ -193,6 +180,55 @@ pub(crate) fn documented_deepseek_files_api_for_route(
     } else {
         CapabilityState::Unknown
     }
+}
+
+/// Return the image-input fact for exact DeepSeek direct Flash routes.
+///
+/// DeepSeek's Vision guide documents image input for `deepseek-flash` over
+/// Chat Completions, Responses *and* Messages; the legacy `deepseek-v4-flash`
+/// and `deepseek-v4-flash-vision-exp` ids are served by the same model
+/// (verified 2026-09-23, #6421). The curated offering rows are scoped to the
+/// canonical `deepseek` provider and its OpenAI-compatible hosts, so the
+/// Messages route — `deepseek-anthropic`, or canonical DeepSeek with
+/// `wire = "anthropic"` (the `/anthropic` base URL) — needs this route-aware
+/// projection. A custom compatible host or any other model stays `Unknown`.
+#[must_use]
+pub(crate) fn documented_deepseek_image_input_for_route(
+    provider: ProviderKind,
+    wire_model_id: &str,
+    base_url: &str,
+) -> CapabilityState {
+    if !is_official_deepseek_route(provider, base_url) {
+        return CapabilityState::Unknown;
+    }
+    let model = wire_model_id.trim().to_ascii_lowercase();
+    if matches!(
+        model.as_str(),
+        "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4-flash-vision-exp"
+    ) {
+        CapabilityState::Supported
+    } else {
+        CapabilityState::Unknown
+    }
+}
+
+/// A DeepSeek provider kind on one of DeepSeek's own hosts, in either wire
+/// dialect.
+fn is_official_deepseek_route(provider: ProviderKind, base_url: &str) -> bool {
+    if !matches!(
+        provider,
+        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
+    ) {
+        return false;
+    }
+    let normalized = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "https://api.deepseek.com"
+            | "https://api.deepseek.com/v1"
+            | "https://api.deepseek.com/beta"
+            | "https://api.deepseek.com/anthropic"
+    )
 }
 
 /// Capability facts owned by one provider/model route offering.

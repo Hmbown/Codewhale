@@ -205,6 +205,7 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     ("muse-spark-1.2", ModelProvider::Meta),
     ("muse-spark-1.2-contributor", ModelProvider::Meta),
     // --- xAI / Grok (config DEFAULT_XAI_MODEL) ---
+    ("grok-4.7", ModelProvider::Xai),
     ("grok-4.6", ModelProvider::Xai),
     ("grok-4.5", ModelProvider::Xai),
     ("grok-4.3", ModelProvider::Xai),
@@ -333,6 +334,7 @@ mod tests {
             ("muse-spark-1.1", Some(1_000_000)),
             ("muse-spark-1.2", Some(1_000_000)),
             ("muse-spark-1.2-contributor", Some(1_000_000)),
+            ("grok-4.7", Some(500_000)),
             ("grok-4.6", Some(500_000)),
             ("grok-4.5", Some(500_000)),
             ("grok-4.3", Some(1_000_000)),

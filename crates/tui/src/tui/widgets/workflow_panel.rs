@@ -30,6 +30,13 @@ use codewhale_palette as palette;
 const MAX_VISIBLE_ROWS: usize = 8;
 /// Maximum phase summary chips shown in the expanded body.
 const MAX_PHASE_SUMMARY: usize = 6;
+/// Widest the live header's short title may grow (#6503). The goal is a
+/// prompt, not a name; the header only needs enough of it to recognise the run.
+const HEADER_TITLE_MAX_COLS: usize = 48;
+/// Below this the title is noise; drop it and keep the counts.
+const HEADER_TITLE_MIN_COLS: usize = 8;
+/// Widest a live child-row name column grows before it truncates.
+const ROW_LABEL_MAX_COLS: usize = 24;
 /// Newest rejected dispatches retained by the panel. The workflow journal is
 /// the durable, unbounded source of truth; this is only a compact UI tail.
 const MAX_DISPATCH_FAILURES_RETAINED: usize = 12;
@@ -84,7 +91,9 @@ impl WorkflowPanelLifecycle {
     fn color(self) -> ratatui::style::Color {
         match self {
             Self::Pending => palette::TEXT_MUTED,
-            Self::Running => palette::STATUS_WARNING,
+            // A healthy run is accent, not attention: warning/error colours
+            // are reserved for states that need the user (#6503).
+            Self::Running => palette::WHALE_ACTION,
             Self::Succeeded => palette::STATUS_SUCCESS,
             Self::Degraded => palette::STATUS_WARNING,
             Self::Failed => palette::STATUS_ERROR,
@@ -148,10 +157,10 @@ impl WorkflowRowStatus {
     fn color(self) -> ratatui::style::Color {
         match self {
             Self::Pending => palette::TEXT_MUTED,
-            Self::Running => palette::STATUS_WARNING,
-            // Waiting is a healthy state — `is_running` says so, and `is_failure`
-            // excludes it. Failure red is reserved for actual failure, so a row
-            // queued behind a dependency must not read like a crashed one.
+            // Running is the normal state of a live row, so it reads neutral
+            // (#6503). Waiting covers `needs_user` / `blocked`, which do want
+            // attention; failure red stays reserved for actual failure.
+            Self::Running => palette::TEXT_TOOL_OUTPUT,
             Self::Waiting => palette::STATUS_WARNING,
             Self::Succeeded => palette::STATUS_SUCCESS,
             Self::Failed | Self::SchemaFailed => palette::STATUS_ERROR,
@@ -432,6 +441,27 @@ impl WorkflowPanelPhase {
             }
         }
         (done, running, failed, cancelled)
+    }
+
+    /// Labelled non-zero counts, e.g. `4 running · 1 done` (#6503). Replaces
+    /// the unlabelled `[0✓ 5… 0! 0⊘]` glyph counters.
+    fn counts_text(&self, locale: Locale, separator: &str) -> String {
+        let (done, running, failed, cancelled) = self.counts();
+        let counts = [
+            (running, MessageId::WorkflowCountRunning),
+            (done, MessageId::WorkflowCountDone),
+            (failed, MessageId::WorkflowCountFailed),
+            (cancelled, MessageId::WorkflowCountCancelled),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, id)| count_text(locale, id, count))
+        .collect::<Vec<_>>();
+        if counts.is_empty() {
+            tr(locale, MessageId::WorkflowNoTasksYet).into_owned()
+        } else {
+            counts.join(separator)
+        }
     }
 }
 
@@ -952,22 +982,73 @@ impl WorkflowPanel {
         })
     }
 
-    /// Compact one-line history-card summary: lifecycle, children, phases,
-    /// failures, elapsed (#4122 AC). The free-text goal lives on the expanded
-    /// body so the fixed header summary budget (≈56 cols) never drops counts.
+    /// Compact one-line history-card summary: lifecycle, settled/total
+    /// children, phases, failures (only when there are any), elapsed (#4122,
+    /// #6503). The free-text goal lives on the expanded body so the fixed
+    /// header summary budget (≈56 cols) never drops counts.
     #[must_use]
     pub fn compact_summary_text(&self, width: usize) -> String {
-        let (_done, total) = self.done_total();
-        let (failed, _cancelled) = self.failure_cancel_counts();
-        let phases = self.phase_count();
-        let elapsed = self.elapsed_label();
-        let child_word = if total == 1 { "child" } else { "children" };
-        let phase_word = if phases == 1 { "phase" } else { "phases" };
         let raw = format!(
-            "workflow {life} · {total} {child_word} · {phases} {phase_word} · {failed} fail · {elapsed}",
+            "workflow {life} · {counts}",
             life = self.lifecycle.display_label(self.locale),
+            counts = self.summary_counts_text(),
         );
         truncate_line_to_width(&raw, width.max(1))
+    }
+
+    /// `N/M done · P phases[ · F failed][ · C cancelled] · elapsed`. The
+    /// settled count is left out until a child exists.
+    fn summary_counts_text(&self) -> String {
+        let (_, total) = self.done_total();
+        let phases = self.phase_count();
+        let phase_id = if phases == 1 {
+            MessageId::WorkflowPhaseCountOne
+        } else {
+            MessageId::WorkflowPhaseCountMany
+        };
+        let settled = if total > 0 {
+            format!("{} · ", self.settled_text())
+        } else {
+            String::new()
+        };
+        format!(
+            "{settled}{phases}{problems} · {elapsed}",
+            phases = count_text(self.locale, phase_id, phases),
+            problems = self.problem_counts_suffix(),
+            elapsed = self.elapsed_label(),
+        )
+    }
+
+    /// `N/M done`, localized.
+    fn settled_text(&self) -> String {
+        let (done, total) = self.done_total();
+        tr(self.locale, MessageId::WorkflowSettledOfTotal)
+            .replace("{done}", &done.to_string())
+            .replace("{total}", &total.to_string())
+    }
+
+    /// ` · N failed · N cancelled`, each only when non-zero (#6503): a
+    /// healthy run does not spend header columns announcing `0 fail`.
+    fn problem_counts_suffix(&self) -> String {
+        let (failed, cancelled) = self.failure_cancel_counts();
+        let mut out = String::new();
+        if failed > 0 {
+            out.push_str(" · ");
+            out.push_str(&count_text(
+                self.locale,
+                MessageId::WorkflowCountFailed,
+                failed,
+            ));
+        }
+        if cancelled > 0 {
+            out.push_str(" · ");
+            out.push_str(&count_text(
+                self.locale,
+                MessageId::WorkflowCountCancelled,
+                cancelled,
+            ));
+        }
+        out
     }
 
     /// Elapsed label shared with direct sub-agent cards.
@@ -986,10 +1067,13 @@ impl WorkflowPanel {
     }
 
     /// Compact summary line content (without card chrome). Callers in
-    /// `history.rs` wrap this with the shared tool-header + rail.
+    /// `history.rs` wrap this with the shared tool-header + rail, whose status
+    /// word already states the lifecycle — so it is not repeated here
+    /// (`fanout running · workflow running · …`, #6503).
     #[must_use]
     pub fn history_header_summary(&self, width: usize) -> String {
-        self.compact_summary_text(width)
+        let raw = format!("workflow · {}", self.summary_counts_text());
+        truncate_line_to_width(&raw, width.max(1))
     }
 
     /// Expanded history-card body lines (phase/child summaries, links,
@@ -1017,11 +1101,11 @@ impl WorkflowPanel {
         if !self.phases.is_empty() {
             let mut chips = Vec::new();
             for (idx, phase) in self.phases.iter().take(MAX_PHASE_SUMMARY).enumerate() {
-                let (done, running, failed, cancelled) = phase.counts();
                 let marker = crate::tui::glyphs::selection_marker(idx == self.selected_phase);
                 chips.push(format!(
-                    "{marker}{title}[{done}✓ {running}… {failed}! {cancelled}⊘]",
-                    title = short_label(&phase.title, 14),
+                    "{marker}{title} ({counts})",
+                    title = short_label(&phase.title, 24),
+                    counts = phase.counts_text(self.locale, ", "),
                 ));
             }
             if self.phases.len() > MAX_PHASE_SUMMARY {
@@ -1676,14 +1760,16 @@ impl WorkflowPanel {
         }
     }
 
-    /// Header line: expand glyph, lifecycle, label, done/total, phases,
-    /// fail/cancel counts, budget spent/remaining.
+    /// Header line (#6503): expand glyph, short title, lifecycle, settled /
+    /// total, failures and cancellations only when non-zero, elapsed, budget,
+    /// cancel hint. The title is the only elastic field: it shrinks (on a
+    /// word boundary) so the counts never fall off the right edge, and the
+    /// full goal stays in the history card's expanded `goal:` line.
     #[must_use]
     pub fn header_text(&self, width: usize) -> String {
         let glyph = if self.expanded { '▼' } else { '▶' };
-        let (done, total) = self.done_total();
-        let (failed, cancelled) = self.failure_cancel_counts();
-        let phases = self.phase_count();
+        let focus = if self.keyboard_focus { "*" } else { "" };
+        let (_, total) = self.done_total();
         let budget =
             format_budget_chrome(self.budget_spent, self.budget_remaining, self.budget_total);
         let cancel_hint = if self.lifecycle.is_running() {
@@ -1695,12 +1781,35 @@ impl WorkflowPanel {
             let end = self.completed_at_ms.unwrap_or_else(now_ms);
             crate::elapsed::format_elapsed_ms(end.saturating_sub(self.started_at_ms))
         };
-        let focus = if self.keyboard_focus { "*" } else { "" };
-        let raw = format!(
-            "{glyph}{focus} workflow {life} · {label} · {done}/{total} · {phases} phases · {failed} fail · {cancelled} cancel · {elapsed}{budget}{cancel_hint}",
+        let head = format!("{glyph}{focus} ");
+        let settled = if total > 0 {
+            format!(" · {}", self.settled_text())
+        } else {
+            String::new()
+        };
+        let tail = format!(
+            "{life}{settled}{problems} · {elapsed}{budget}{cancel_hint}",
             life = self.lifecycle.display_label(self.locale),
-            label = self.label,
+            problems = self.problem_counts_suffix(),
         );
+        let fixed = UnicodeWidthStr::width(head.as_str())
+            + UnicodeWidthStr::width(tail.as_str())
+            + UnicodeWidthStr::width(" · ");
+        let title_budget = width.saturating_sub(fixed).min(HEADER_TITLE_MAX_COLS);
+        let title = self.label.split_whitespace().collect::<Vec<_>>().join(" ");
+        let title = if title.is_empty() {
+            "workflow".to_string()
+        } else {
+            title
+        };
+        let raw = if title_budget >= HEADER_TITLE_MIN_COLS {
+            format!(
+                "{head}{title} · {tail}",
+                title = crate::tui::ui_text::semantic_truncate(&title, title_budget)
+            )
+        } else {
+            format!("{head}{tail}")
+        };
         truncate_line_to_width(&raw, width.max(1))
     }
 
@@ -1780,26 +1889,6 @@ impl WorkflowPanel {
             return lines;
         }
 
-        // Phase summary strip.
-        if !self.phases.is_empty() {
-            let mut chips = Vec::new();
-            for (idx, phase) in self.phases.iter().take(MAX_PHASE_SUMMARY).enumerate() {
-                let (done, running, failed, cancelled) = phase.counts();
-                let marker = crate::tui::glyphs::selection_marker(idx == self.selected_phase);
-                chips.push(format!(
-                    "{marker}{title}[{done}✓ {running}… {failed}! {cancelled}⊘]",
-                    title = short_label(&phase.title, 14),
-                ));
-            }
-            if self.phases.len() > MAX_PHASE_SUMMARY {
-                chips.push(format!("+{}", self.phases.len() - MAX_PHASE_SUMMARY));
-            }
-            lines.push(Line::from(Span::styled(
-                truncate_line_to_width(&chips.join("  "), content_width),
-                Style::default().fg(palette::TEXT_MUTED),
-            )));
-        }
-
         if !self.gates.is_empty() {
             lines.push(Line::from(Span::styled(
                 truncate_line_to_width(&format!("gates: {}", self.gates_summary()), content_width),
@@ -1809,11 +1898,11 @@ impl WorkflowPanel {
 
         let mut dispatch_failure_lines = self.render_dispatch_failure_lines(content_width);
 
-        // Selected phase rows.
+        // Selected phase: one labelled line, then one line per child (#6503).
         if let Some(phase) = self.phases.get(self.selected_phase) {
             lines.push(Line::from(Span::styled(
                 truncate_line_to_width(
-                    &format!("phase: {} ({} rows)", phase.title, phase.rows.len()),
+                    &self.phase_line_text(self.selected_phase, content_width),
                     content_width,
                 ),
                 Style::default()
@@ -1822,9 +1911,33 @@ impl WorkflowPanel {
             )));
 
             let now = now_ms();
+            let default_route = self.default_route_receipt();
+            let label_cols = phase
+                .rows
+                .iter()
+                .take(MAX_VISIBLE_ROWS)
+                .map(|row| short_label(&row.label, ROW_LABEL_MAX_COLS).width())
+                .max()
+                .unwrap_or(0);
+            let status_cols = phase
+                .rows
+                .iter()
+                .take(MAX_VISIBLE_ROWS)
+                .map(|row| row.status.display_label(self.locale).width())
+                .max()
+                .unwrap_or(0);
             let mut shown = 0usize;
             for row in phase.rows.iter().take(MAX_VISIBLE_ROWS) {
-                let block = self.render_row_lines(row, content_width, now);
+                let block = self.render_row_lines(
+                    row,
+                    RowLayout {
+                        width: content_width,
+                        label_cols,
+                        status_cols,
+                    },
+                    default_route.as_deref(),
+                    now,
+                );
                 let more_after = phase.rows.len() > shown + 1;
                 let reserved_tail = usize::from(more_after)
                     + dispatch_failure_lines.len()
@@ -1881,54 +1994,100 @@ impl WorkflowPanel {
         lines
     }
 
-    /// One row renders as its status line plus its receipt line (#4039).
-    ///
-    /// The receipt is not optional and not hover-gated: a row that is live or
-    /// completed always states the route it was launched on, and a completed
-    /// row always states what that route cost.
+    /// `phase 2/3 Verify · 4 running · 1 done` — labelled counts, zero
+    /// counts omitted (#6503). Only the title is elastic: it shrinks (on a
+    /// word boundary) so the counts survive a long runtime-supplied title.
+    fn phase_line_text(&self, idx: usize, width: usize) -> String {
+        let Some(phase) = self.phases.get(idx) else {
+            return String::new();
+        };
+        let prefix = format!(
+            "{} ",
+            tr(self.locale, MessageId::WorkflowPhaseOrdinal)
+                .replace("{n}", &(idx + 1).to_string())
+                .replace("{total}", &self.phases.len().to_string())
+        );
+        let suffix = format!(" · {}", phase.counts_text(self.locale, " · "));
+        let title = phase.title.split_whitespace().collect::<Vec<_>>().join(" ");
+        crate::tui::ui_text::semantic_truncate_with_affixes(&prefix, &title, &suffix, width)
+    }
+
+    /// The launch route most children of this run share (ties go to the
+    /// earliest row). Live rows repeat their route receipt only when it
+    /// differs from this default; the full receipt for every row stays in
+    /// the history card's detail view (#6503, #4039).
+    fn default_route_receipt(&self) -> Option<String> {
+        let mut tally: Vec<(String, usize)> = Vec::new();
+        for row in self.phases.iter().flat_map(|phase| phase.rows.iter()) {
+            let receipt = route_receipt_parts(row, self.locale).join(" · ");
+            match tally.iter_mut().find(|(seen, _)| *seen == receipt) {
+                Some((_, count)) => *count += 1,
+                None => tally.push((receipt, 1)),
+            }
+        }
+        let best = tally.iter().map(|(_, count)| *count).max()?;
+        tally
+            .into_iter()
+            .find(|(_, count)| *count == best)
+            .map(|(receipt, _)| receipt)
+    }
+
+    /// One child is one line (#6503); a route receipt line follows only when
+    /// this child was launched on a route other than the run's default.
     fn render_row_lines(
         &self,
         row: &WorkflowPanelRow,
-        width: usize,
+        layout: RowLayout,
+        default_route: Option<&str>,
         now_ms: u64,
     ) -> Vec<Line<'static>> {
-        let mut lines = vec![self.render_row_line(row, width, now_ms)];
-        lines.extend(
-            receipt_line_strings(row, self.locale, width, 4)
-                .into_iter()
-                .map(|text| {
-                    Line::from(Span::styled(text, Style::default().fg(palette::TEXT_MUTED)))
-                }),
-        );
+        let mut lines = vec![self.render_row_line(row, layout, now_ms)];
+        let route = route_receipt_parts(row, self.locale);
+        if self.show_workflow_receipts && default_route != Some(route.join(" · ").as_str()) {
+            lines.extend(
+                pack_receipt_lines(route, layout.width, 4)
+                    .into_iter()
+                    .map(|text| {
+                        Line::from(Span::styled(text, Style::default().fg(palette::TEXT_MUTED)))
+                    }),
+            );
+        }
         lines
     }
 
-    fn render_row_line(&self, row: &WorkflowPanelRow, width: usize, now_ms: u64) -> Line<'static> {
-        let elapsed_ms = row_elapsed_ms(row, now_ms);
-        let elapsed = crate::elapsed::format_elapsed_ms(elapsed_ms);
-        let role = row.profile.as_deref().unwrap_or("-");
-        let model = match (row.model.as_deref(), row.strength.as_deref()) {
-            (Some(m), Some(s)) => format!("{m}/{s}"),
-            (Some(m), None) => m.to_string(),
-            (None, Some(s)) => s.to_string(),
-            (None, None) => "-".to_string(),
-        };
-        let worktree = if row.worktree { "wt" } else { "main" };
-        let schema = row
-            .schema_error
-            .as_deref()
-            .or(row.error.as_deref())
-            .map(|e| format!(" !{}", short_label(e, 24)))
-            .unwrap_or_default();
-        let text = format!(
-            "  {mark} {status:<9} {label} · {role} · {model} · {worktree} · {lane} · {elapsed}{schema}",
-            mark = role_mark(row.profile.as_deref()),
-            status = row.status.display_label(self.locale),
-            label = short_label(&row.label, 18),
-            lane = lane_track(row, elapsed_ms.max(1), 10, now_ms),
-        );
+    /// `  name  state  model  elapsed[  wt][  N tok][  ! error]` — only
+    /// fields that carry information: no placeholder dashes, no default
+    /// `main` checkout marker, no synthetic progress bar (#6503).
+    fn render_row_line(
+        &self,
+        row: &WorkflowPanelRow,
+        layout: RowLayout,
+        now_ms: u64,
+    ) -> Line<'static> {
+        let label = short_label(&row.label, ROW_LABEL_MAX_COLS);
+        let status = row.status.display_label(self.locale);
+        let mut fields = vec![
+            pad_to_width(&label, layout.label_cols),
+            pad_to_width(&status, layout.status_cols),
+        ];
+        if let Some(model) = row.model.as_deref().and_then(short_model_name) {
+            fields.push(model);
+        }
+        fields.push(crate::elapsed::format_elapsed_ms(row_elapsed_ms(
+            row, now_ms,
+        )));
+        if row.worktree {
+            fields.push("wt".to_string());
+        }
+        if let Some(tokens) = row.usage.as_ref().and_then(WorkflowRowUsage::token_total) {
+            fields.push(format!("{tokens} tok"));
+        }
+        if let Some(error) = row.schema_error.as_deref().or(row.error.as_deref()) {
+            fields.push(format!("! {}", short_label(error, 40)));
+        }
+        let text = format!("  {}", fields.join("  "));
         Line::from(Span::styled(
-            truncate_line_to_width(&text, width),
+            truncate_line_to_width(text.trim_end(), layout.width),
             Style::default().fg(row.status.color()),
         ))
     }
@@ -2074,11 +2233,42 @@ fn lifecycle_from_status(status: &str) -> WorkflowPanelLifecycle {
     }
 }
 
+/// `{count} running`-style labelled count.
+fn count_text(locale: Locale, id: MessageId, count: usize) -> String {
+    tr(locale, id).replace("{count}", &count.to_string())
+}
+
 fn localized_field(locale: Locale, id: MessageId, value: &str) -> String {
     tr(locale, id).replace("{value}", value)
 }
 
-fn receipt_parts(row: &WorkflowPanelRow, locale: Locale) -> Vec<String> {
+/// Column budget shared by every live row in one phase.
+#[derive(Debug, Clone, Copy)]
+struct RowLayout {
+    width: usize,
+    label_cols: usize,
+    status_cols: usize,
+}
+
+fn pad_to_width(text: &str, cols: usize) -> String {
+    let pad = cols.saturating_sub(text.width());
+    format!("{text}{}", " ".repeat(pad))
+}
+
+/// `deepseek/deepseek-flash` → `deepseek-flash`: the provider prefix is route
+/// provenance, which lives in the receipt, not the row.
+fn short_model_name(model: &str) -> Option<String> {
+    let name = model.trim().rsplit('/').next().unwrap_or_default().trim();
+    let name = crate::tui::app::bound_agent_activity_text(name)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!name.is_empty()).then(|| short_label(&name, 28))
+}
+
+/// Launch route only: role, provider/model, requested→effective reasoning,
+/// route source (#4039).
+fn route_receipt_parts(row: &WorkflowPanelRow, locale: Locale) -> Vec<String> {
     let unknown = tr(locale, MessageId::WorkflowReceiptUnknown).into_owned();
     let role = WorkflowRowRoute::field(row.route.role.as_ref(), locale);
     let provider = WorkflowRowRoute::field(row.route.provider.as_ref(), locale);
@@ -2090,7 +2280,7 @@ fn receipt_parts(row: &WorkflowPanelRow, locale: Locale) -> Vec<String> {
         .route_source
         .map(WorkflowRouteSource::as_str)
         .unwrap_or(unknown.as_str());
-    let mut parts = vec![
+    vec![
         localized_field(locale, MessageId::WorkflowReceiptRole, &role),
         format!("{provider}/{model}"),
         localized_field(
@@ -2099,8 +2289,13 @@ fn receipt_parts(row: &WorkflowPanelRow, locale: Locale) -> Vec<String> {
             &format!("{requested}→{effective}"),
         ),
         localized_field(locale, MessageId::WorkflowReceiptVia, source),
-    ];
+    ]
+}
 
+/// Full receipt: launch route plus, for a settled row, what it cost.
+fn receipt_parts(row: &WorkflowPanelRow, locale: Locale) -> Vec<String> {
+    let unknown = tr(locale, MessageId::WorkflowReceiptUnknown).into_owned();
+    let mut parts = route_receipt_parts(row, locale);
     if let Some(usage) = row.usage.as_ref() {
         let tokens = usage.token_total().map_or_else(
             || unknown.clone(),
@@ -2136,13 +2331,19 @@ fn receipt_line_strings(
     width: usize,
     requested_indent: usize,
 ) -> Vec<String> {
+    pack_receipt_lines(receipt_parts(row, locale), width, requested_indent)
+}
+
+/// Pack receipt fields into indented lines that fit `width`, wrapping whole
+/// fields first and hard-wrapping only a field wider than the line.
+fn pack_receipt_lines(parts: Vec<String>, width: usize, requested_indent: usize) -> Vec<String> {
     let indent = requested_indent.min(width.saturating_sub(1));
     let prefix = " ".repeat(indent);
     let available = width.saturating_sub(indent).max(1);
     let mut packed = Vec::new();
     let mut current = String::new();
 
-    for part in receipt_parts(row, locale) {
+    for part in parts {
         if UnicodeWidthStr::width(part.as_str()) > available {
             if !current.is_empty() {
                 packed.push(std::mem::take(&mut current));
@@ -2402,14 +2603,35 @@ mod tests {
             .join("\n")
     }
 
-    /// #4039: a live row states the exact role, provider, model, requested →
-    /// effective reasoning, and route source the runtime reported — and keeps
-    /// stating them after the session routes somewhere else.
+    /// Detail view: the history card's expanded body, which carries every
+    /// row's full receipt (#4039) now that live rows are one line (#6503).
+    fn detail(panel: &WorkflowPanel, width: u16) -> String {
+        panel
+            .history_expanded_lines(width, &WorkflowHistoryExtras::default())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// #4039: a row's receipt states the exact role, provider, model,
+    /// requested → effective reasoning, and route source the runtime reported
+    /// — and keeps stating them after the session routes somewhere else.
+    /// #6503: the live panel repeats a receipt only for a row whose route
+    /// differs from the run's default; the detail view keeps all of them.
     #[test]
     fn row_route_receipt_is_exact_and_survives_a_later_model_switch() {
         let mut panel = WorkflowPanel::new("workflow_abc", "audit", 1_000);
         panel.apply_json_event(&task_started_json("t1", "deepseek", "deepseek-v4-flash"));
-        let before = rendered(&panel, 200);
+        let live = rendered(&panel, 200);
+        assert!(!live.contains("via agent_profile.model"), "{live}");
+        assert!(live.contains("deepseek-v4-flash"), "{live}");
+        let before = detail(&panel, 200);
         assert!(before.contains("role verifier"), "{before}");
         assert!(before.contains("deepseek/deepseek-v4-flash"), "{before}");
         assert!(before.contains("reasoning high→max"), "{before}");
@@ -2420,9 +2642,13 @@ mod tests {
         // The session now routes elsewhere: a later task lands on another
         // provider/model. The already-launched row must not follow it.
         panel.apply_json_event(&task_started_json("t2", "moonshot", "kimi-k3"));
-        let after = rendered(&panel, 200);
+        let after = detail(&panel, 200);
         assert!(after.contains("deepseek/deepseek-v4-flash"), "{after}");
         assert!(after.contains("moonshot/kimi-k3"), "{after}");
+        // Live: the diverging second route is called out; the default is not.
+        let live = rendered(&panel, 200);
+        assert!(live.contains("moonshot/kimi-k3"), "{live}");
+        assert!(!live.contains("deepseek/deepseek-v4-flash"), "{live}");
         let t1 = panel
             .phases
             .iter()
@@ -2468,8 +2694,12 @@ mod tests {
             "status": "succeeded",
         }));
 
-        let text = rendered(&panel, 200);
+        let text = detail(&panel, 200);
         assert!(text.contains("tokens 160 (provider-reported)"), "{text}");
+        // The live row keeps only the known total, inline.
+        let live = rendered(&panel, 200);
+        assert!(live.contains("160 tok"), "{live}");
+        assert!(!live.contains("tokens unknown"), "{live}");
         assert!(text.contains("tools 3"), "{text}");
         assert!(text.contains("tokens unknown · tools unknown"), "{text}");
         let t2 = panel
@@ -2537,7 +2767,7 @@ mod tests {
             "task_id": "t1",
             "status": "succeeded",
         }));
-        let text = rendered(&panel, 200);
+        let text = detail(&panel, 200);
         let unknown_route = "role unknown · unknown/unknown · reasoning unknown→unknown";
         assert!(text.contains(unknown_route), "{text}");
         assert!(text.contains("via unknown"), "{text}");
@@ -2592,7 +2822,7 @@ mod tests {
                 "token_source": "foreign-source",
             },
         }));
-        let text = rendered(&panel, 200);
+        let text = detail(&panel, 200);
         assert!(text.contains("tokens 0 (unknown)"), "{text}");
         assert!(!text.contains("foreign-source"), "{text}");
     }
@@ -2614,13 +2844,8 @@ mod tests {
             },
         }));
 
-        for (width, height) in [(40_u16, 12_usize), (60, 16), (80, 24)] {
-            let lines = panel.render_lines_bounded(width, Some(height));
-            assert!(
-                lines.len() <= height,
-                "{width}x{height}: {} lines",
-                lines.len()
-            );
+        for width in [40_u16, 60, 80] {
+            let lines = panel.history_expanded_lines(width, &WorkflowHistoryExtras::default());
             let text = lines
                 .iter()
                 .map(|line| {
@@ -2640,10 +2865,7 @@ mod tests {
                 "tools 3",
                 "duration 2s",
             ] {
-                assert!(
-                    text.contains(required),
-                    "{width}x{height} lost {required}: {text}"
-                );
+                assert!(text.contains(required), "{width} lost {required}: {text}");
             }
             assert!(lines.iter().all(|line| line.width() <= usize::from(width)));
         }
@@ -2839,10 +3061,10 @@ mod tests {
         assert!(header.contains('▼'), "running auto-expands: {header}");
         assert!(header.contains("running"), "{header}");
         assert!(header.contains("ship v0.8.68"), "{header}");
-        assert!(header.contains("0/1"), "{header}");
-        assert!(header.contains("1 phases"), "{header}");
-        assert!(header.contains("0 fail"), "{header}");
-        assert!(header.contains("0 cancel"), "{header}");
+        assert!(header.contains("0/1 done"), "{header}");
+        // #6503: zero failure/cancel counts are not printed.
+        assert!(!header.contains("0 fail"), "{header}");
+        assert!(!header.contains("0 cancel"), "{header}");
         assert!(
             header.contains("budget 1200 used / 10000")
                 || header.contains("budget 1.2k used / 10k")
@@ -2882,18 +3104,17 @@ mod tests {
             })
             .collect();
         let joined = text.join("\n");
-        assert!(joined.contains("Analyze"), "{joined}");
-        assert!(joined.contains("Verify"), "{joined}");
+        assert!(joined.contains("phase 2/2 Verify · 1 running"), "{joined}");
         assert!(joined.contains("run tests"), "{joined}");
-        assert!(joined.contains("implementer"), "{joined}");
         assert!(joined.contains("pro"), "{joined}");
-        assert!(joined.contains("main"), "{joined}"); // no worktree
+        // The default checkout is not announced; only a worktree is.
+        assert!(!joined.contains("main"), "{joined}");
         // Analyze scout is not in selected phase body
         assert!(!joined.contains("scout crates"), "{joined}");
     }
 
     #[test]
-    fn rows_show_status_label_role_model_worktree_elapsed_schema() {
+    fn rows_show_status_label_model_worktree_elapsed_schema() {
         let mut panel = started_panel();
         panel.apply_event(WorkflowPanelEvent::TaskSchemaValidationFailed {
             task_id: "t1".to_string(),
@@ -2913,7 +3134,6 @@ mod tests {
             .join("\n");
         assert!(joined.contains("schema"), "{joined}");
         assert!(joined.contains("scout crates"), "{joined}");
-        assert!(joined.contains("explore"), "{joined}");
         assert!(joined.contains("deepseek-v4-flash"), "{joined}");
         assert!(joined.contains("wt"), "{joined}");
         assert!(joined.contains("missing field"), "{joined}");
@@ -3483,7 +3703,7 @@ mod tests {
             joined.contains("failed") || joined.contains("fail"),
             "{joined}"
         );
-        assert!(joined.contains("1 child"), "{joined}");
+        assert!(joined.contains("1/1 done"), "{joined}");
         assert!(joined.contains("1 phase"), "{joined}");
         assert!(joined.contains("1 fail"), "{joined}");
         // elapsed is present (0s or more depending on timestamps)
@@ -3571,10 +3791,7 @@ mod tests {
             joined.contains("success") || joined.contains("explore"),
             "{joined}"
         );
-        assert!(
-            joined.contains("1 child") || joined.contains("1 children"),
-            "{joined}"
-        );
+        assert!(joined.contains("1/1 done"), "{joined}");
         assert!(joined.contains("3s") || joined.contains("s"), "{joined}");
 
         let expanded = panel.render_history_card(
@@ -3638,7 +3855,7 @@ mod tests {
         let panel = WorkflowPanel::from_run_json(&value).expect("hydrate");
         assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Succeeded);
         let compact = panel.compact_summary_text(120);
-        assert!(compact.contains("1 child"), "{compact}");
+        assert!(compact.contains("1/1 done"), "{compact}");
         assert!(compact.contains("success"), "{compact}");
         let expanded = panel.history_expanded_lines(120, &WorkflowHistoryExtras::default());
         let joined: String = expanded
@@ -3720,7 +3937,7 @@ mod tests {
             header.contains("success") || header.contains("completed"),
             "{header}"
         );
-        assert!(header.contains("0 fail"), "{header}");
+        assert!(!header.contains("fail"), "{header}");
         assert!(
             header.contains("4/") || header.contains("4 child") || header.contains("0/"),
             "{header}"
@@ -3740,7 +3957,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(scout_joined.contains("map crates"), "{scout_joined}");
-        assert!(scout_joined.contains("main"), "{scout_joined}");
         assert!(
             !scout_joined.contains(" wt "),
             "read-only scouts stay on main: {scout_joined}"
@@ -3859,7 +4075,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(ver_text.contains("verifier"), "{ver_text}");
-        assert!(ver_text.contains("main"), "{ver_text}");
+        assert!(
+            !ver_text.contains("  wt"),
+            "verifier stays on main: {ver_text}"
+        );
     }
 
     /// WF-A3: partial failure + synthesis — fail count visible, summary card.
@@ -4019,5 +4238,191 @@ mod tests {
             header.contains("cancel") || header.contains("cancelled"),
             "{header}"
         );
+    }
+
+    /// The founder's #6503 card: a 2-phase, 5-child run, all children on the
+    /// same explore route, captured while every child is still running.
+    fn founder_card_panel() -> WorkflowPanel {
+        let goal = "Compare the freshly cloned Cline repo (refs/cline @ 8abfde69) against the \
+                    Codewhale codebase across five axes, producing concrete, evidence-backed \
+                    transferable learnings for Codewhale";
+        let mut panel = WorkflowPanel::new("workflow_6503", goal, now_ms().saturating_sub(14_000));
+        panel.apply_event(WorkflowPanelEvent::PhaseStarted {
+            title: format!("workflow: {goal}"),
+            at_ms: 1,
+        });
+        panel.apply_event(WorkflowPanelEvent::PhaseStarted {
+            title: "plan".to_string(),
+            at_ms: 2,
+        });
+        for label in [
+            "loop-prompt",
+            "tools-approval",
+            "models-context",
+            "surfaces-sdk",
+            "evals-mcp-agents",
+        ] {
+            panel.apply_json_event(&json!({
+                "type": "task_started",
+                "at_ms": now_ms().saturating_sub(14_000),
+                "task_id": label,
+                "workflow_task_label": label,
+                "model": "deepseek-flash",
+                "resolved_role": "explore",
+                "resolved_provider": "deepseek",
+                "resolved_model": "deepseek-flash",
+                "requested_reasoning": "inherit",
+                "effective_reasoning": "max",
+                "route_source": "agent_profile.model",
+                "worktree": false,
+            }));
+        }
+        panel
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// #6503 acceptance at a narrow (80) and a wide (200) terminal: one
+    /// header line with a short title, one labelled phase line, one line per
+    /// child with its model once, no placeholders, no static bar, no
+    /// repeated provenance, and running is not painted in an alarm colour.
+    #[test]
+    fn founder_workflow_card_is_one_line_per_child_at_80_and_200_columns() {
+        let mut panel = founder_card_panel();
+        let labels = [
+            "loop-prompt",
+            "tools-approval",
+            "models-context",
+            "surfaces-sdk",
+            "evals-mcp-agents",
+        ];
+        let started: Vec<u64> = labels
+            .iter()
+            .map(|label| panel.find_row_mut(label).expect("row").started_at_ms)
+            .collect();
+        for width in [80_u16, 200] {
+            // Bracket the render with the clock so the elapsed assertion
+            // holds however long the process was descheduled (#6520 review).
+            let before = now_ms();
+            let lines = panel.render_lines(width);
+            let after = now_ms();
+            let text: Vec<String> = lines.iter().map(line_text).collect();
+            let joined = text.join("\n");
+            assert_eq!(lines.len(), 7, "header + phase + 5 children:\n{joined}");
+            for line in &text {
+                assert!(line.width() <= usize::from(width), "{width}: {line:?}");
+            }
+
+            let header = &text[0];
+            assert!(header.contains("running · 0/5 done"), "{header}");
+            assert!(header.contains("Compare the freshly"), "{header}");
+            assert!(
+                !header.contains("transferable"),
+                "title stays short: {header}"
+            );
+            assert!(!header.contains("fail"), "{header}");
+            assert!(header.contains("[c] cancel"), "{header}");
+
+            assert_eq!(text[1], "phase 2/2 plan · 5 running", "{joined}");
+
+            for ((row, label), started) in text[2..].iter().zip(labels).zip(&started) {
+                assert!(row.contains(label), "{row}");
+                assert!(row.contains("running"), "{row}");
+                assert_eq!(row.matches("deepseek-flash").count(), 1, "{row}");
+                let lo = before.saturating_sub(*started) / 1000;
+                let hi = after.saturating_sub(*started) / 1000;
+                assert!(
+                    (lo..=hi)
+                        .any(|secs| row.contains(&crate::elapsed::format_elapsed_ms(secs * 1000))),
+                    "elapsed within [{lo}s, {hi}s]: {row}"
+                );
+                for noise in [
+                    "–",
+                    " - ",
+                    "==",
+                    "main",
+                    "role ",
+                    "via ",
+                    "reasoning",
+                    "deepseek/",
+                ] {
+                    assert!(!row.contains(noise), "{width}: {noise:?} in {row:?}");
+                }
+            }
+            // Columns align: every child's state starts in the same column.
+            let state_cols: Vec<usize> = text[2..]
+                .iter()
+                .map(|row| row.find("running").expect("state"))
+                .collect();
+            assert!(state_cols.windows(2).all(|w| w[0] == w[1]), "{joined}");
+
+            assert_eq!(lines[0].spans[0].style.fg, Some(palette::WHALE_ACTION));
+            for line in &lines[2..] {
+                let fg = line.spans[0].style.fg;
+                assert_ne!(
+                    fg,
+                    Some(palette::STATUS_WARNING),
+                    "running is not attention"
+                );
+                assert_ne!(fg, Some(palette::STATUS_ERROR), "running is not failure");
+            }
+        }
+    }
+
+    /// #6520 review: a long runtime-supplied phase title shrinks; the labelled
+    /// counts after it never fall off the right edge.
+    #[test]
+    fn long_phase_title_truncates_before_the_counts() {
+        let mut panel = founder_card_panel();
+        // The five running children live in phase 2; give it the long
+        // `workflow: {goal}` title a runtime can supply.
+        panel.phases[1].title = format!("workflow: {}", panel.label);
+        for width in [40_usize, 60, 80] {
+            let line = panel.phase_line_text(1, width);
+            assert!(line.width() <= width, "{width}: {line:?}");
+            assert!(line.starts_with("phase 2/2 "), "{line:?}");
+            assert!(
+                line.ends_with(" · 5 running"),
+                "{width}: counts kept: {line:?}"
+            );
+            assert!(line.contains('…'), "{width}: title truncated: {line:?}");
+        }
+    }
+
+    /// #6503: problems still surface — a failed child is labelled in the
+    /// header and phase line, painted as failure, and carries its error.
+    #[test]
+    fn founder_workflow_card_surfaces_failure_only_when_present() {
+        let mut panel = founder_card_panel();
+        panel.apply_json_event(&json!({
+            "type": "task_completed",
+            "at_ms": now_ms(),
+            "task_id": "surfaces-sdk",
+            "status": "failed",
+        }));
+        if let Some(row) = panel.find_row_mut("surfaces-sdk") {
+            row.error = Some("provider timeout".to_string());
+        }
+        for width in [80_u16, 200] {
+            let lines = panel.render_lines(width);
+            let text: Vec<String> = lines.iter().map(line_text).collect();
+            assert!(text[0].contains("1/5 done · 1 failed"), "{}", text[0]);
+            assert_eq!(text[1], "phase 2/2 plan · 4 running · 1 failed");
+            let failed = lines
+                .iter()
+                .find(|line| line_text(line).contains("surfaces-sdk"))
+                .expect("failed row");
+            assert_eq!(failed.spans[0].style.fg, Some(palette::STATUS_ERROR));
+            assert!(
+                line_text(failed).contains("! provider timeout"),
+                "{:?}",
+                text
+            );
+        }
     }
 }

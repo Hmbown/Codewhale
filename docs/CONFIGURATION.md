@@ -706,8 +706,55 @@ A classifier call happens only when `[auto.router]` names both `provider` and
 `ModelInventory::from_config` (`crates/tui/src/model_inventory.rs`). If either
 condition fails, or the classifier call errors or times out, the local
 fallback decides: the default model, or the fast sibling under `cost_saving`.
-That is a fallback, not a failure. The turn's route receipt
-(`/status` → Auto) records which path was taken.
+The turn's route receipt (`/status` → Auto) records which path was taken, and a
+router you configured that cannot run or fails (missing key, HTTP error,
+timeout, invalid answer) is shown as `Auto router: failing — …` rather than
+silently ignored.
+
+#### Set up model routing
+
+`/router` (also `/model router`) opens one Router setup view with these
+presets. Each writes only `[auto.router]`; none is ever chosen for you.
+
+| Preset | What it writes | Cost and privacy |
+| --- | --- | --- |
+| `/router jev` | Jev, TypeSafe's decision model, over OpenRouter (`typesafe/jev-1.13`) or TypeSafe direct, whichever key you have | About $0.00002 per turn ($0.042 per million input tokens, output free). Your latest request and up to six recent context lines go to OpenRouter → TypeSafe (or TypeSafe). |
+| `/router fast` | The active provider's runnable fast tier with thinking off | Your existing key; the classifier sees the same request text. |
+| `/router off` | Removes `[auto.router]` | No router call; Auto turns use the default model, or the fast tier while `[auto] cost_saving = true` (Off leaves that setting alone). |
+| `/router custom` | Nothing; prints the TOML to edit | — |
+
+Choosing Jev or Fast makes **one test call** with a fixed sample request and
+shows the tier it picked, the probabilities and confidence, the latency and the
+provider-reported cost. `Enter` (or `/router save <preset>`) then saves through
+the normal config writer; `Esc` discards it. TypeSafe paused new signups on
+2026-09-22, so OpenRouter is the default route for new users. A TypeSafe key is
+read from `TYPESAFE_API_KEY`, the `typesafe` secret-store entry, or
+`[providers.typesafe] api_key` / `api_key_env`.
+
+#### Decision routers (`kind = "decision"`)
+
+A decision router asks a non-generative decision model one typed question per
+turn — a Choice between the active provider's `fast` and `strong` tiers, plus a
+thinking level — and gets calibrated probabilities back. No prose is parsed.
+
+```toml
+[auto.router]
+kind = "decision"             # default "chat"
+provider = "openrouter"       # or "typesafe"
+model = "typesafe/jev-1.13"   # "~typesafe/jev-latest" also works; TypeSafe direct: "jev-latest"
+timeout_secs = 2
+min_confidence = 0.5          # default 0.5, clamped to 0..1
+```
+
+- The router is called only when the active provider has a runnable strong/fast
+  pair; otherwise there is no call and no spend.
+- An answer below `min_confidence` takes the local fallback. Under
+  `[auto] cost_saving`, a `strong` answer also needs a probability of at least
+  0.75, or the turn stays on the fast tier.
+- An unknown `kind`, or a decision `provider` other than `openrouter` /
+  `typesafe`, leaves the router unconfigured and shown as failing.
+- `thinking` is ignored for decision routers. OpenRouter spend is recorded like
+  any routed usage; TypeSafe-direct spend appears on the receipt only.
 
 Two `[auto]` keys shape routing (`AutoConfig` in `crates/tui/src/config.rs`):
 
@@ -728,7 +775,8 @@ cross_provider = false  # default false
   is configured to use. The classifier is only shown that provider's models,
   and the fallback never leaves it. Setting `cross_provider = true` lets the
   classifier choose among every runnable provider. There is no interactive
-  toggle; it has to be set in config.
+  toggle for `cross_provider`; it has to be set in config. A decision router
+  always chooses within the active provider.
 
 To bootstrap MCP and skills directories at their resolved paths, run `codewhale setup`.
 To only scaffold MCP, run `codewhale mcp init`.
@@ -1929,12 +1977,12 @@ reasoning contract, and all four membership ids omit generic sampling fields.
 - `mistral` model and reasoning contract: `[providers.mistral]` defaults to `mistral-code-latest`; `MISTRAL_MODEL` overrides it and the generic `CODEWHALE_MODEL` override wins when both are set. The current picker also lists `mistral-medium-latest`, `mistral-small-latest`, and `mistral-large-latest`. On exact first-party HTTPS `/v1` routes, Medium and Small accept only `reasoning_effort = "none" | "high"` and replay polymorphic thinking blocks. Deprecated native Magistral IDs may still be configured explicitly, remain always-reasoning, and never receive the adjustable effort field.
 - `context_window` (integer, optional provider-table key): override the total context window for the active `[providers.<name>]` route when an OpenAI-compatible gateway, hosted model alias, or self-hosted runtime has a different limit than Codewhale's static model table. For example, `[providers.openai] context_window = 1000000` lets an OpenAI-compatible DashScope/Qwen route budget against a 1M-token window instead of the conservative fallback. For Kimi Code K3, keep `model = "k3"` and set `[providers.moonshot] context_window = 1048576` only when the membership plan includes 1M access; otherwise omit it to retain the 262,144-token safe baseline. The value must be greater than 0 and affects prompt context notes, compaction thresholds, context-pressure checks, and request output caps. Full resolution order, and how to see which rung produced the current window: [Context length (context window)](#context-length-context-window).
 - `path_suffix` (string, optional provider-table key): override the chat-completions path for OpenAI-compatible gateways that do not serve `/v1/chat/completions`. For example, `[providers.openai] path_suffix = "/chat/completions"` sends chat requests to the unversioned base URL plus `/chat/completions`; `models` and `beta/*` requests keep their normal routing.
-- `reasoning_stream_style` (string, optional provider-table key): override how streaming reasoning is separated from answer text for the active provider route. Use `separate_field` for `reasoning_content` / `reasoning` deltas, `inline_tags` for gateways that stream `<think>...</think>` inside `delta.content`, or `none` to render incoming content exactly as answer text.
+- `reasoning_stream_style` (string, optional provider-table key): override how streaming reasoning is separated from answer text for the active provider route. Use `separate_field` for `reasoning_content` / `reasoning` deltas, `inline_tags` for gateways that stream `<think>...</think>` inside `delta.content`, or `none` to render incoming content exactly as answer text. When unset, every Chat Completions route uses `separate_field` (Mistral's first-party route uses its typed thinking blocks); set `none` only for a gateway that streams its answer inside `reasoning_content`.
 - `[providers.<name>.auth]` (table, optional): provider-scoped auth source metadata. `source = "command"` stores a command argv plus optional `timeout_ms`; `source = "secret"` stores a `secret_id`. This slice lets provider readiness, `/provider`, and doctor JSON report the auth source class without exposing command argv output or secret values; executing commands and resolving external secret material is handled by the follow-up resolver work.
 - `insecure_skip_tls_verify` (bool, optional provider-table key): legacy compatibility key, disabled by default. When true on the active provider table, provider clients reject the configuration instead of skipping TLS certificate verification. Use `SSL_CERT_FILE` for corporate or private CA bundles; `codewhale doctor` reports stale uses of this setting.
 - `default_text_model` (string, optional): defaults to `deepseek-flash` for DeepSeek and `deepseek-anthropic`, `gpt-5.6` for OpenAI, `grok-4.6` for xAI, `deepseek-ai/deepseek-v4-pro` for NVIDIA NIM, `deepseek-ai/deepseek-v4-flash` for AtlasCloud, `deepseek-reasoner` for Wanjie Ark, `DeepSeek-V4-Pro` for Volcengine Ark, `deepseek/deepseek-v4-pro` for OpenRouter and Novita, `mimo-v2.5-pro` for Xiaomi MiMo, `accounts/fireworks/models/deepseek-v4-pro` for Fireworks, `deepseek-ai/DeepSeek-V4-Pro` for SiliconFlow and DeepInfra, `trinity-large-thinking` for Arcee AI, `kimi-k2.7-code` for Moonshot, `MiniMax-M3` for MiniMax, `GLM-5.3` for Z.ai, `step-3.7-flash` for StepFun, `ernie-4.0-turbo-8k` for Qianfan, `fugu` for Sakana AI, `deepseek-ai/DeepSeek-V4-Pro` for SGLang/vLLM, `deepseek-v4-flash` for local Ollama, and `gpt-oss:120b` for Ollama Cloud. Hugging Face and Together AI both default to `deepseek-ai/DeepSeek-V4-Pro`; `openai-codex` defaults to `gpt-5.6`; `anthropic` defaults to `claude-sonnet-4-6`; `openmodel` defaults to `deepseek-v4-flash`. Current public DeepSeek IDs include `deepseek-v4-pro` and `deepseek-flash` (V4.1 Flash, shipped as the unversioned id), both with 1M context windows, 384K max output, and thinking mode enabled by default. DeepSeek's live pricing/model page now labels the Pro backend `DeepSeek-V4-Pro-0813`; the callable API ID remains `deepseek-v4-pro`, so Codewhale does not send the backend label or the Claude Code-specific `deepseek-v4-pro[1m]` selector. DeepSeek retires `deepseek-chat` and `deepseek-reasoner` on July 24, 2026; direct first-party routes migrate both to `deepseek-v4-flash`, with omitted reasoning settings preserving their former non-thinking (`off`) and thinking (`high`) intent. Explicit `reasoning_effort` wins, and provider-owned ids on Wanjie Ark, aggregators, self-hosted runtimes, and custom endpoints are not globally rewritten. SiliconFlow retains its own mapping: `deepseek-reasoner` and `deepseek-r1` select its Pro model while `deepseek-chat` and `deepseek-v3` select Flash. Provider-specific mappings translate `deepseek-v4-pro` / `deepseek-v4-flash` to each provider's model ID where supported. OpenRouter also recognizes recent large IDs such as `arcee-ai/trinity-large-thinking`, `minimax/minimax-m3`, `minimax/minimax-m2.7`, `xiaomi/mimo-v2.5-pro`, `qwen/qwen3.6-flash`, `qwen/qwen3.6-35b-a3b`, `qwen/qwen3.6-max-preview`, `qwen/qwen3.6-27b`, `qwen/qwen3.6-plus`, `qwen/qwen3.7-max`, `google/gemma-4-31b-it`, `moonshotai/kimi-k2.7-code`, `moonshotai/kimi-k2.6`, `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`, and `nvidia/nemotron-3-ultra-550b-a55b`; direct Arcee uses bare IDs such as `trinity-large-thinking` and `trinity-large-preview`; direct Moonshot recognizes `kimi-k3`, `kimi-k2.7-code`, and `kimi-k2.6`. The exact Kimi Code endpoint recognizes bare `k3` for K3 and `kimi-for-coding` for K2.7; those membership IDs are distinct from the direct Moonshot IDs and are never rewritten across routes. Direct MiniMax recognizes `MiniMax-M3` and the documented M2.x chat model IDs; direct Z.ai recognizes `GLM-5.3` (the default), `GLM-5.2`, `GLM-5.1`, and `GLM-5-Turbo`, and OpenRouter recognizes the matching `z-ai/glm-5.1`, `z-ai/glm-5.2`, `z-ai/glm-5.3`, and `z-ai/glm-5-turbo` IDs — `GLM-5.3` has been live on the Z.ai Coding Plan since 2026-08-13; it inherits its catalog metadata from `GLM-5.2` until Z.ai publishes distinct 5.3 numbers and carries no price, and an explicit `GLM-5.2` selection keeps its own id; direct Sakana recognizes `fugu` and `fugu-ultra-20260615`; direct Xiaomi MiMo recognizes chat IDs `mimo-v2.5-pro`, `mimo-v2.5-pro-ultraspeed`, and `mimo-v2.5`, while TTS IDs are selected through `codewhale speech` / `tts`. Generic `openai`, `atlascloud`, `wanjie-ark`, `xiaomi-mimo`, `arcee`, `moonshot`, `minimax`, `openmodel`, `zai`, `stepfun`, `qianfan`, `sakana`, local Ollama, and Ollama Cloud model IDs are passed through unchanged after known aliases are normalized. OpenRouter and SiliconFlow provider configs with a custom `base_url` also preserve explicit model values, which lets OpenAI-compatible gateways accept bare model IDs. Use `/models` or `codewhale models` to discover live IDs from your configured endpoint. `CODEWHALE_MODEL` overrides this for a single process; `DEEPSEEK_MODEL` is the legacy alias.
 - TelecomJS uses `deepseek-v4-pro` only as a conservative pre-refresh fallback. Once its key-scoped `/models` catalog is available, the picker uses those live rows; Codewhale omits unsupported reasoning request fields on this route.
-- `reasoning_effort` (string, optional): `off`, `low`, `medium`, `high`, `max`, `xhigh`, or `ultracode`; defaults to the configured UI tier. DeepSeek Platform receives top-level `thinking` / `reasoning_effort` fields. Ollama Cloud's OpenAI-compatible Chat Completions route preserves its documented `none` / `low` / `medium` / `high` / `max` ladder (`off` is sent as `none`; `xhigh` and `ultracode` normalize to `max`). Direct xAI `grok-4.6` on exact `https://api.x.ai/v1` receives top-level `reasoning_effort = "low" | "medium" | "high" | "xhigh"`; `off` normalizes to `high`, `max`/`ultracode` to `xhigh`, and `auto` leaves the field omitted so xAI's documented default `high` applies. A custom xAI-compatible `base_url` does not inherit that dialect. Direct Moonshot `kimi-k3` on exact `https://api.moonshot.ai/v1` is always-thinking and receives only top-level `reasoning_effort = "low" | "high" | "max"`; `off` normalizes to `low`, and `medium` to `high`. Kimi Code membership `k3` on exact `https://api.kimi.com/coding/v1` instead receives nested `thinking.effort`, and its `off` setting also normalizes to enabled `low`. Normal dispatched `auto` uses Codewhale's auto-reasoning selector and sends a concrete route-normalized tier; only an omitted reasoning setting leaves the provider default in control. Neighboring gateways and model/endpoint combinations retain the generic Moonshot contract. OpenAI Codex normalizes stale `off` to `low` and sends `max` / `ultracode` as Responses `xhigh`. Z.ai receives documented `thinking` controls and treats enabled thinking as the GLM coding high/max lane. NVIDIA NIM receives equivalent settings through `chat_template_kwargs`.
+- `reasoning_effort` (string, optional): `off`, `low`, `medium`, `high`, `max`, `xhigh`, or `ultracode`; defaults to the configured UI tier. DeepSeek Platform receives top-level `thinking` / `reasoning_effort` fields. Ollama Cloud's OpenAI-compatible Chat Completions route preserves its documented `none` / `low` / `medium` / `high` / `max` ladder (`off` is sent as `none`; `xhigh` and `ultracode` normalize to `max`). Direct xAI `grok-4.7` and `grok-4.6` on exact `https://api.x.ai/v1` receive top-level `reasoning_effort = "low" | "medium" | "high" | "xhigh"` (the ladder comes from the bundled catalog row; `grok-4.5` maps `xhigh` to `high`, and rows without a documented effort such as `grok-4.3` get no field); Grok reasoning cannot be disabled, so `off` normalizes to `high`, `max`/`ultracode` to `xhigh`, and `auto` leaves the field omitted so xAI's documented default `high` applies. A custom xAI-compatible `base_url` does not inherit that dialect. Direct Moonshot `kimi-k3` on exact `https://api.moonshot.ai/v1` is always-thinking and receives only top-level `reasoning_effort = "low" | "high" | "max"`; `off` normalizes to `low`, and `medium` to `high`. Kimi Code membership `k3` on exact `https://api.kimi.com/coding/v1` instead receives nested `thinking.effort`, and its `off` setting also normalizes to enabled `low`. Normal dispatched `auto` uses Codewhale's auto-reasoning selector and sends a concrete route-normalized tier; only an omitted reasoning setting leaves the provider default in control. Neighboring gateways and model/endpoint combinations retain the generic Moonshot contract. OpenAI Codex normalizes stale `off` to `low` and sends `max` / `ultracode` as Responses `xhigh`. Z.ai receives documented `thinking` controls and treats enabled thinking as the GLM coding high/max lane. NVIDIA NIM receives equivalent settings through `chat_template_kwargs`.
 - `verbosity` (string, optional): `normal` or `concise`. `normal` keeps the
   default conversational prompt. `concise` appends a prompt discipline block
   for direct, low-chatter output; CLI noninteractive commands (`exec` and
@@ -2940,6 +2988,35 @@ result visibly degrades through DuckDuckGo and then Bing; the structured search
 receipt records every hop. Missing configuration and network-policy denials
 fail closed without sending the query to another provider.
 
+**Provider-native search.** On routes whose provider offers its own web-search
+tool (OpenAI, xAI, Anthropic, DeepSeek, Kimi and others), that search can run
+ahead of the configured provider. It is a separate model call on the active
+route. `[search] native` decides the order:
+
+- unset (default): native search leads only when no search provider is
+  configured; a provider chosen in `[search] provider`,
+  `CODEWHALE_SEARCH_PROVIDER`, a Tavily key, or `/search` in-session wins;
+- `native = true`: native search leads even when a provider is pinned;
+- `native = false`: native search is never used.
+
+The native answer is returned whole; oversized tool output spills to a session
+artifact the model can page back.
+
+**Recency and locale.** `recency` and `locale` are forwarded where the
+backend's API takes them, and the search receipt reports each as honored or
+ignored:
+
+| Backend | Recency | Locale |
+| --- | --- | --- |
+| Firecrawl | `tbs=qdr:d/w/m/y` | `country` from the region (`de-DE` → `DE`); a bare language is ignored |
+| Tavily | `time_range` | not sent (Tavily takes country names) |
+| SearXNG | `time_range` | `language`, as given |
+| Serply | not sent (undocumented) | `hl` language, `gl` country |
+
+Recency is rounded up to the backend's nearest window (day, week, month,
+year), so `recency = 10` searches the last month. Other backends ignore both
+knobs and say so in the receipt.
+
 For a private/internal search service that serves DuckDuckGo-compatible HTML,
 keep `provider = "duckduckgo"` and set `base_url`; Codewhale appends the `q`
 query parameter to that endpoint and applies network policy to its host.
@@ -3019,6 +3096,7 @@ any non-empty `[search] api_key` and is configured by that key or
 provider = "firecrawl" # also duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya | serply
 # base_url = "https://search.example/" # optional with provider = "duckduckgo"; required with "searxng"
 # api_key = "YOUR_KEY" # optional for firecrawl; required by the other API providers
+# native = false # provider-native search: unset = only when no provider is configured
 ```
 
 ## Local Media Attachments

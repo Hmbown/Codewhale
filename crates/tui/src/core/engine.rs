@@ -452,6 +452,9 @@ pub struct EngineConfig {
     pub search_api_key: Option<String>,
     /// Optional DuckDuckGo-compatible HTML endpoint override.
     pub search_base_url: Option<String>,
+    /// `Config::search_native`: `None` lets provider-native search lead on
+    /// routes that offer it; `Some(false)` keeps the chosen provider first.
+    pub search_native: Option<bool>,
     /// Per-step DeepSeek API timeout for sub-agent `create_message` requests.
     /// Resolved from `[subagents] api_timeout_secs` (clamped to 1..=3600)
     /// once at engine construction, then threaded onto every
@@ -600,6 +603,7 @@ impl Default for EngineConfig {
             search_provider: crate::config::SearchProvider::default(),
             search_api_key: None,
             search_base_url: None,
+            search_native: None,
             subagent_api_timeout: Duration::from_secs(
                 crate::config::DEFAULT_SUBAGENT_API_TIMEOUT_SECS,
             ),
@@ -3558,6 +3562,9 @@ impl Engine {
                     }
                     Op::SetSearchProvider { provider } => {
                         self.config.search_provider = provider;
+                        // A provider picked in-session is a pin; only an
+                        // explicit `[search] native = true` still leads.
+                        self.config.search_native.get_or_insert(false);
                     }
                     Op::Shutdown => {
                         break;
@@ -6201,7 +6208,9 @@ impl Engine {
         ctx.search_api_key = self.config.search_api_key.clone();
         ctx.search_base_url = self.config.search_base_url.clone();
         ctx.route_capabilities = route.capabilities;
-        if route.capabilities.server_side_web_search.is_supported() {
+        if route.capabilities.server_side_web_search.is_supported()
+            && self.config.search_native != Some(false)
+        {
             ctx.provider_native_search = route
                 .client
                 .as_ref()

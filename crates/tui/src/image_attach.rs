@@ -215,8 +215,13 @@ pub enum ImageAttachError {
     Unreadable { path: String, reason: String },
     /// The file is zero bytes.
     Empty { path: String },
-    /// Over [`MAX_IMAGE_BYTES`].
-    TooLarge { path: String, bytes: usize },
+    /// Over `limit` bytes: [`MAX_IMAGE_BYTES`] for already-encoded bytes, the
+    /// larger source bound when attach-time downscaling applies.
+    TooLarge {
+        path: String,
+        bytes: usize,
+        limit: usize,
+    },
     /// Magic bytes identify a format no provider in the set accepts.
     UnsupportedFormat { path: String, detected: String },
     /// Magic bytes match nothing we recognize as an image.
@@ -232,12 +237,12 @@ impl std::fmt::Display for ImageAttachError {
             Self::Empty { path } => {
                 write!(f, "Cannot attach {path}: the file is empty")
             }
-            Self::TooLarge { path, bytes } => write!(
+            Self::TooLarge { path, bytes, limit } => write!(
                 f,
                 "Cannot attach {path}: {} exceeds the {} per-image limit. \
                  Downscale or crop it first.",
                 human_bytes(*bytes),
-                human_bytes(MAX_IMAGE_BYTES),
+                human_bytes(*limit),
             ),
             Self::UnsupportedFormat { path, detected } => write!(
                 f,
@@ -501,18 +506,11 @@ pub fn encode_image_bytes(bytes: &[u8], path: &str) -> Result<AttachedImage, Ima
         return Err(ImageAttachError::TooLarge {
             path: path.to_string(),
             bytes: bytes.len(),
+            limit: MAX_IMAGE_BYTES,
         });
     }
     let Some(media_type) = sniff_media_type(bytes) else {
-        return Err(match detect_rejected_format(bytes) {
-            Some(detected) => ImageAttachError::UnsupportedFormat {
-                path: path.to_string(),
-                detected: detected.to_string(),
-            },
-            None => ImageAttachError::NotAnImage {
-                path: path.to_string(),
-            },
-        });
+        return Err(format_error(bytes, path));
     };
     let payload = STANDARD.encode(bytes);
     Ok(AttachedImage {
@@ -522,17 +520,42 @@ pub fn encode_image_bytes(bytes: &[u8], path: &str) -> Result<AttachedImage, Ima
     })
 }
 
+fn format_error(bytes: &[u8], path: &str) -> ImageAttachError {
+    match detect_rejected_format(bytes) {
+        Some(detected) => ImageAttachError::UnsupportedFormat {
+            path: path.to_string(),
+            detected: detected.to_string(),
+        },
+        None => ImageAttachError::NotAnImage {
+            path: path.to_string(),
+        },
+    }
+}
+
+/// Longest edge an attached image is sent at. A Retina screenshot is 3–6k px
+/// and often over [`MAX_IMAGE_BYTES`] as PNG; larger images are downscaled
+/// and re-encoded when attached rather than refused.
+pub const ATTACH_MAX_EDGE_PX: u32 = 2048;
+
 /// Read, validate and encode an image file.
+///
+/// Images over [`ATTACH_MAX_EDGE_PX`] or [`MAX_IMAGE_BYTES`] are decoded under
+/// the decompression-bomb guard, fitted to the edge and re-encoded on
+/// `read_media`'s budget ladder (PNG for flat or alpha content, JPEG for
+/// photos). Known limit: an animated GIF that needs downscaling keeps only
+/// its first frame. Sources above `read_media`'s source bound are refused.
 pub fn attach_image_from_path(path: &Path) -> Result<AttachedImage, ImageAttachError> {
     let display = path.display().to_string();
+    let source_limit = crate::tools::read_media::MAX_SOURCE_IMAGE_BYTES;
     // Check the size from metadata first so a multi-gigabyte file is refused
     // without being read into memory.
     if let Ok(meta) = std::fs::metadata(path) {
         let len = meta.len();
-        if len > MAX_IMAGE_BYTES as u64 {
+        if len > source_limit as u64 {
             return Err(ImageAttachError::TooLarge {
                 path: display,
                 bytes: usize::try_from(len).unwrap_or(usize::MAX),
+                limit: source_limit,
             });
         }
     }
@@ -540,7 +563,61 @@ pub fn attach_image_from_path(path: &Path) -> Result<AttachedImage, ImageAttachE
         path: display.clone(),
         reason: error.to_string(),
     })?;
-    encode_image_bytes(&bytes, &display)
+    if bytes.len() > source_limit {
+        return Err(ImageAttachError::TooLarge {
+            path: display,
+            bytes: bytes.len(),
+            limit: source_limit,
+        });
+    }
+    let oversized_edge = ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok())
+        .is_some_and(|(width, height)| width.max(height) > ATTACH_MAX_EDGE_PX);
+    if bytes.len() <= MAX_IMAGE_BYTES && !oversized_edge {
+        return encode_image_bytes(&bytes, &display);
+    }
+    if sniff_media_type(&bytes).is_none() {
+        return Err(format_error(&bytes, &display));
+    }
+    let unreadable = |reason: String| ImageAttachError::Unreadable {
+        path: display.clone(),
+        reason,
+    };
+    let (image, _, _) =
+        decode_and_guard_image(&bytes).map_err(|error| unreadable(error.to_string()))?;
+    let (encoded, _) =
+        crate::tools::read_media::fit_and_encode(&image, ATTACH_MAX_EDGE_PX, MAX_IMAGE_BYTES, path)
+            .map_err(|error| unreadable(error.to_string()))?;
+    encode_image_bytes(&encoded, &display)
+}
+
+/// Image blocks sent from the latest user prompt onward: this turn's
+/// attachments and tool-result images, not ones replayed from history.
+#[must_use]
+pub fn images_since_last_user_prompt(messages: &[codewhale_models::Message]) -> usize {
+    let is_prompt = |message: &codewhale_models::Message| {
+        message.role == codewhale_models::Role::User
+            && message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { .. } | ContentBlock::ImageUrl { .. }
+                )
+            })
+    };
+    let start = messages.iter().rposition(is_prompt).unwrap_or(0);
+    messages[start..]
+        .iter()
+        .flat_map(|message| &message.content)
+        .map(|block| match block {
+            ContentBlock::ImageUrl { .. } => 1,
+            ContentBlock::ToolResult { content_blocks, .. } => {
+                content_blocks.as_ref().map_or(0, Vec::len)
+            }
+            _ => 0,
+        })
+        .sum()
 }
 
 /// Split a `data:<media-type>;base64,<payload>` URL.

@@ -2,6 +2,7 @@ import { Fragment } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { GettingStartedSteps } from "@/components/getting-started-steps";
+import { HeroInstall } from "@/components/hero-install";
 import { InstallCodeBlock } from "@/components/install-code-block";
 import { Strata } from "@/components/strata";
 import { getFacts } from "@/lib/facts";
@@ -81,6 +82,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                 {d.exploreProduct}
               </Link>
             </div>
+            <HeroInstall ariaLabel={d.heroInstallAria} copyLabel={d.copy} copiedLabel={d.copied} />
           </div>
 
           {/* Exact-build PTY capture of an empty session. No fabricated

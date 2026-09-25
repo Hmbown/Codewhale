@@ -254,6 +254,16 @@ pub fn bundled_offerings() -> Vec<ProviderModelOffering> {
         server_side_web_search: CapabilityState::Supported,
         ..RouteCapabilities::default()
     };
+    // DeepSeek's Vision guide documents image input for `deepseek-flash`
+    // over Chat Completions, Responses and Messages; the legacy
+    // `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` names are served
+    // by the same model (verified 2026-09-23, #6421). Pro stays text-only.
+    // This curated row wins identity collisions over the Models.dev asset, so
+    // correcting only the asset left the resolved route stripping images.
+    let flash_capabilities = RouteCapabilities {
+        image_input: CapabilityState::Supported,
+        ..documented_capabilities
+    };
     let documented_limits = RouteLimits {
         context_tokens: Some(1_000_000),
         input_tokens: None,
@@ -267,7 +277,7 @@ pub fn bundled_offerings() -> Vec<ProviderModelOffering> {
             endpoint_key: "responses".to_string(),
             default_for_provider: true,
             limits: documented_limits,
-            capabilities: documented_capabilities,
+            capabilities: flash_capabilities,
             pricing: PricingSku::UnknownOrStale,
         },
         ProviderModelOffering {
@@ -287,7 +297,7 @@ pub fn bundled_offerings() -> Vec<ProviderModelOffering> {
             endpoint_key: "responses".to_string(),
             default_for_provider: false,
             limits: documented_limits,
-            capabilities: documented_capabilities,
+            capabilities: flash_capabilities,
             pricing: PricingSku::UnknownOrStale,
         },
         // Vision-experimental sibling of v4-flash, verified live on
@@ -301,10 +311,7 @@ pub fn bundled_offerings() -> Vec<ProviderModelOffering> {
             endpoint_key: "chat".to_string(),
             default_for_provider: false,
             limits: documented_limits,
-            capabilities: RouteCapabilities {
-                image_input: CapabilityState::Supported,
-                ..documented_capabilities
-            },
+            capabilities: flash_capabilities,
             pricing: PricingSku::UnknownOrStale,
         },
     ];

@@ -16,6 +16,7 @@ export const home: HomeDict = {
   heroIntro:
     "{brand} のエージェントは、ソフトウェアを開発し、ファイルを扱い、繰り返し行う作業を再利用できるワークフローにまとめられます。達成したいことを伝えて仕事に合うホスト型またはローカルのモデルを選び、必要に応じてプロバイダーを自由に切り替えながら作業を進めてください。",
   getCodewhale: "Codewhale を入手",
+  heroInstallAria: "インストールコマンド",
   exploreProduct: "製品を見る",
   shotPreview: "ターミナルのプレビュー",
   shotBuild: "v{version} 開発ビルド",

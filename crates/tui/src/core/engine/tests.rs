@@ -25688,3 +25688,31 @@ async fn supervisor_update_refreshes_error_map_and_generation() {
         "an empty sweep emits nothing"
     );
 }
+
+/// #6540: every summary call billed ~219k input tokens at a 0% cache hit
+/// because the summary request dropped the reasoning tier the parent turn
+/// sends, and reasoning routes render that tier at the head of the prompt.
+/// The compaction envelope must carry the exact tier the turn loop resolves.
+#[test]
+fn compaction_envelope_carries_the_turn_reasoning_tier() {
+    let (mut engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
+    for effort in [Some("high"), Some("auto"), None] {
+        engine.session.reasoning_effort = effort.map(str::to_string);
+        let turn_effort = super::turn_loop::resolve_auto_effort(
+            effort,
+            engine.api_provider,
+            &engine.api_config.active_route_base_url(),
+            &engine.config.model,
+        );
+        let prepared = engine.prepare_compaction_envelope(CompactionConfig::default());
+        assert_eq!(prepared.reasoning_effort, turn_effort, "{effort:?}");
+    }
+    engine.session.reasoning_effort = Some("high".to_string());
+    assert_eq!(
+        engine
+            .prepare_compaction_envelope(CompactionConfig::default())
+            .reasoning_effort
+            .as_deref(),
+        Some("high")
+    );
+}

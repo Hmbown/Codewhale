@@ -16,6 +16,7 @@ export const home: HomeDict = {
   heroIntro:
     "{brand}은 소프트웨어를 개발하고 파일을 다루며 반복 작업을 재사용 가능한 워크플로로 바꿀 수 있는 에이전트를 제공합니다. 무엇을 이루고 싶은지 알려 주고 작업에 맞는 호스팅형 또는 로컬 모델을 선택하면, 작업을 진행하면서 제공업체도 자유롭게 바꿀 수 있습니다.",
   getCodewhale: "Codewhale 받기",
+  heroInstallAria: "설치 명령",
   exploreProduct: "제품 살펴보기",
   shotPreview: "터미널 미리보기",
   shotBuild: "v{version} 개발 빌드",

@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::{
     ProviderNativeSearchClient, ProviderNativeSearchRequest, ProviderNativeSearchResponse,
-    bounded_answer, citation_from_url, citations_from_text, push_citation,
+    citation_from_url, citations_from_text, joined_answer, push_citation,
 };
 use crate::{
     client::api_url,
@@ -304,7 +304,7 @@ fn parse_final_message(message: &Map<String, Value>) -> ProviderNativeSearchResp
         .map(citations_from_text)
         .unwrap_or_default();
     ProviderNativeSearchResponse {
-        answer: bounded_answer(answer.into_iter().collect()),
+        answer: joined_answer(answer.into_iter().collect()),
         citations,
     }
 }

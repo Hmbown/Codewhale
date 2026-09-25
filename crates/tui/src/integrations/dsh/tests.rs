@@ -604,10 +604,13 @@ fn connect_update_disable_enable_remove_lifecycle_writes_only_owned_files() {
     );
     let report = compute_status(&paths, detection, Ok(moved), false, avail()).unwrap();
     assert!(matches!(report.state, DshIntegrationState::Detected { .. }));
-    // Every write stayed under the integration root.
+    // Every write stayed under the integration root, apart from Codewhale's
+    // own audit log in the same home (#6534).
+    let audit_log = paths.codewhale_home.join("audit.log");
+    assert!(audit_log.is_file(), "audit events land in this home");
     for entry in walk(&paths.root.parent().unwrap().parent().unwrap().to_path_buf()) {
         assert!(
-            entry.starts_with(&paths.root),
+            entry.starts_with(&paths.root) || entry == audit_log,
             "unexpected file {}",
             entry.display()
         );
@@ -1097,6 +1100,11 @@ fn install_update_remove_bundle_lifecycle_uses_documented_plugin_commands() {
     assert!(install_bundle(&paths, &detection, &runner, &avail(), DshAppBundle::Web).is_err());
     let plan = super::plan(&paths, &detection, &id, "web", false, false, true).unwrap();
     apply_plan(&paths, &detection, &plan, DshReceiptEvent::Connect).unwrap();
+    // #6534: the audit event lands in this test's Codewhale home, not the
+    // process's (real) home.
+    let audit = std::fs::read_to_string(paths.codewhale_home.join("audit.log"))
+        .expect("audit log beside the integration state");
+    assert!(audit.contains("integration.dsh.connect"), "{audit}");
 
     // pnpm missing → truthful refusal, nothing written.
     let err = install_bundle(

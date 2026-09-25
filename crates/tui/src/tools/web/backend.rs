@@ -297,9 +297,28 @@ impl SearchBackend for ConfiguredSearchBackend<'_> {
     }
 
     fn capabilities(&self) -> QueryCapabilities {
-        // All current adapters enforce result count. Other knobs are either
-        // post-filtered by the shared harness or reported as not honored.
-        QueryCapabilities::count_only()
+        // All current adapters enforce result count. Recency and locale are
+        // forwarded where the backend's API takes them (see `QueryFilters` in
+        // `web_search.rs`); every other knob is post-filtered by the shared
+        // harness or reported as not honored.
+        let (recency, locale) = match self.provider() {
+            SearchProvider::Firecrawl | SearchProvider::Searxng => (true, true),
+            SearchProvider::Tavily => (true, false),
+            SearchProvider::Serply => (false, true),
+            _ => (false, false),
+        };
+        let state = |supported: bool| {
+            if supported {
+                QueryCapabilityState::Supported
+            } else {
+                QueryCapabilityState::Unsupported
+            }
+        };
+        QueryCapabilities {
+            recency: state(recency),
+            locale: state(locale),
+            ..QueryCapabilities::count_only()
+        }
     }
 
     async fn search(

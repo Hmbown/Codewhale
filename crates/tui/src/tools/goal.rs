@@ -1142,6 +1142,15 @@ impl ToolSpec for UpdateGoalTool {
         }
         let snapshot = {
             let mut state = lock_goal_state(&self.goal_state)?;
+            // #6542: with no goal there is nothing to update. Say so as a
+            // successful no-op rather than an error the model retries.
+            if state.objective.is_none() {
+                return Ok(ToolResult::success(format!(
+                    "No goal is set, so update_goal(status: {status}) changed nothing. \
+                     Continue the user's request directly; create_goal only if the user \
+                     asked for a tracked goal."
+                )));
+            }
             match status.as_str() {
                 "complete" => {
                     let evidence = input
@@ -1254,6 +1263,29 @@ mod tests {
         assert!(message.contains("create_goal"), "{message}");
         // The rejected call must not have mutated goal state.
         assert!(state.lock().expect("goal lock").is_active());
+    }
+
+    #[tokio::test]
+    async fn update_goal_without_a_goal_is_a_clear_no_op() {
+        let state = new_shared_goal_state();
+        let update = UpdateGoalTool::new(state.clone());
+        for input in [
+            json!({"status": "complete", "evidence": "done"}),
+            json!({"status": "blocked", "blocker": "x"}),
+            json!({"status": "advisory", "advisory": "note"}),
+        ] {
+            let result = update
+                .execute(input, &ToolContext::new("."))
+                .await
+                .expect("no goal is a no-op, not an error");
+            assert!(result.success);
+            assert!(
+                result.content.contains("No goal is set"),
+                "{}",
+                result.content
+            );
+        }
+        assert!(state.lock().expect("goal lock").objective.is_none());
     }
 
     #[tokio::test]

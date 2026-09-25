@@ -1,8 +1,8 @@
 "use client";
 
 /**
- * <ThemeToggle> — a compact System / Light / Dark control in the site nav,
- * shown on every page.
+ * <ThemeToggle> — an icon-only System / Light / Dark control in the site nav,
+ * shown on every page. The current mode is in its accessible name.
  *
  * The whole site follows the OS appearance by default, the way the GPUI
  * client follows its `set_theme` light/dark pair: with no `data-theme` on
@@ -20,6 +20,7 @@
 
 import { useEffect, useState } from "react";
 import { fill } from "@/lib/i18n/dictionaries";
+import { Icon, type IconName } from "./icon";
 
 type Mode = "system" | "light" | "dark";
 const ORDER: Mode[] = ["system", "light", "dark"];
@@ -79,22 +80,19 @@ export function ThemeToggle({
     light: lightLabel,
     dark: darkLabel,
   };
-  const glyph: Record<Mode, string> = { system: "◐", light: "☀", dark: "☾" };
+  const glyph: Record<Mode, IconName> = { system: "monitor", light: "sun", dark: "moon" };
   const shown = mounted ? mode : "system";
 
   return (
     <button
       type="button"
       onClick={cycle}
-      className="inline-flex items-center gap-1.5 px-1.5 py-0.5 hairline-l hairline-r hairline-t hairline-b hover:text-indigo transition-colors"
+      className="nav-icon-button"
       aria-label={fill(ariaTemplate, { mode: labels[shown] })}
       title={titleLabel}
       suppressHydrationWarning
     >
-      <span aria-hidden>{glyph[shown]}</span>
-      <span className="hidden 2xl:inline" suppressHydrationWarning>
-        {labels[shown]}
-      </span>
+      <Icon name={glyph[shown]} className="nav-icon" />
     </button>
   );
 }

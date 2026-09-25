@@ -16,10 +16,9 @@ use tokio::time::timeout as tokio_timeout;
 
 use crate::config::{
     TOGETHER_INKLING_MODEL, is_exact_direct_moonshot_k3_route, is_exact_kimi_code_k3_route,
-    is_exact_xai_grok_4_6_route, is_exact_zai_chat_route, is_exact_zai_forced_thinking_route,
-    is_exact_zai_tiered_effort_route, is_kimi_code_membership_model,
-    minimax_m3_route_uses_max_completion_tokens, moonshot_base_url_is_exact_kimi_code,
-    wire_model_for_provider_route,
+    is_exact_zai_chat_route, is_exact_zai_forced_thinking_route, is_exact_zai_tiered_effort_route,
+    is_kimi_code_membership_model, minimax_m3_route_uses_max_completion_tokens,
+    moonshot_base_url_is_exact_kimi_code, wire_model_for_provider_route,
 };
 
 // The bounded response-header wait (`stream_open_timeout`) and its env
@@ -93,22 +92,25 @@ fn apply_openai_reasoning_effort(
     body["reasoning_effort"] = json!(effort);
 }
 
-fn apply_xai_grok_4_6_reasoning_effort(
+/// xAI's first-party `reasoning_effort` ladder, driven by the bundled
+/// catalog row for the exact model id: a row that documents an `effort`
+/// option gets the field (`xhigh` only where the row lists it — grok-4.7 and
+/// grok-4.6 do, grok-4.5 maps it to `high`); a row without one (grok-4.3,
+/// grok-build) or no row at all sends nothing. Grok reasoning cannot be
+/// disabled, so `off` is sent as the documented default `high`
+/// (<https://docs.x.ai/docs/guides/reasoning>).
+fn apply_xai_grok_reasoning_effort(
     body: &mut Value,
     provider: ApiProvider,
     base_url: &str,
     model: &str,
     effort: Option<&str>,
 ) {
-    if !(is_exact_xai_grok_4_6_route(provider, base_url, model)
-        || (provider == ApiProvider::Xai
-            && codewhale_config::provider::is_exact_xai_platform_route(
-                codewhale_config::ProviderKind::Xai,
-                base_url,
-            )
-            && model
-                .trim()
-                .eq_ignore_ascii_case(crate::config::XAI_GROK_4_5_MODEL)))
+    if provider != ApiProvider::Xai
+        || !codewhale_config::provider::is_exact_xai_platform_route(
+            codewhale_config::ProviderKind::Xai,
+            base_url,
+        )
     {
         return;
     }
@@ -116,11 +118,20 @@ fn apply_xai_grok_4_6_reasoning_effort(
         return;
     };
     let model = model.trim().to_ascii_lowercase();
-    let supports_xhigh = model == crate::config::XAI_GROK_4_6_MODEL;
-    let supports_effort = supports_xhigh || model == crate::config::XAI_GROK_4_5_MODEL;
-    if !supports_effort {
+    let Some(row) =
+        codewhale_config::catalog::bundled_models_dev_catalog().provider_model("xai", &model)
+    else {
         return;
-    }
+    };
+    let Some(documented) = row
+        .reasoning_options
+        .iter()
+        .find(|option| option["type"] == "effort")
+        .and_then(|option| option["values"].as_array())
+    else {
+        return;
+    };
+    let supports_xhigh = documented.iter().any(|value| value == "xhigh");
     let wire_effort = match effort.trim().to_ascii_lowercase().as_str() {
         "auto" | "automatic" | "" => return,
         "off" | "disabled" | "none" | "false" | "high" => "high",
@@ -579,7 +590,7 @@ pub(super) fn apply_route_reasoning_controls(
     apply_minimax_route_reasoning_controls(body, provider, base_url, model, effort);
     apply_inkling_reasoning_effort(body, provider, model, effort);
     apply_openai_reasoning_effort(body, provider, model, effort);
-    apply_xai_grok_4_6_reasoning_effort(body, provider, base_url, model, effort);
+    apply_xai_grok_reasoning_effort(body, provider, base_url, model, effort);
     apply_direct_moonshot_k3_reasoning_effort(body, provider, base_url, model, effort);
     apply_kimi_code_k3_reasoning_effort(body, provider, base_url, model, effort);
     apply_zai_route_reasoning_controls(body, provider, base_url, model, effort);
@@ -3478,6 +3489,14 @@ fn should_replay_reasoning_content_for_provider_on_route(
         return true;
     }
 
+    // Xiaomi MiMo's API requires the assistant `reasoning_content` back on
+    // tool-call turns (omitting it is a 400), for every MiMo chat model, not
+    // only the ids the offline catalog marks as reasoning (#6501). A turn
+    // that produced no reasoning replays nothing.
+    if provider == ApiProvider::XiaomiMimo {
+        return true;
+    }
+
     if is_exact_mistral_chat_route(provider, base_url)
         && mistral_model_has_adjustable_reasoning(model)
     {
@@ -3496,77 +3515,11 @@ fn should_replay_reasoning_content_for_provider_on_route(
     model_supports_reasoning(model)
 }
 
-/// Should the SSE parser treat incoming `reasoning_content` deltas as thinking
-/// (vs. inlining them as answer text)?
-///
-/// DeepSeek-family models are classified on any provider because their API
-/// requires `reasoning_content` replay on later turns (#1739 / #1694). Other
-/// known reasoning-capable large models are classified only on providers whose
-/// streaming shape exposes reasoning fields, so `reasoning`/`reasoning_content`
-/// deltas become Thinking cells instead of leaking as normal answer text.
+/// Test shorthand: does this route surface `reasoning_content` /
+/// `reasoning` / `reasoning_details` deltas as Thinking by default?
 #[cfg(test)]
 fn is_reasoning_model_for_stream(provider: ApiProvider, model: &str) -> bool {
-    is_reasoning_model_for_stream_on_route(provider, "", model)
-}
-
-/// Route-aware stream classification for providers that share model names.
-fn is_reasoning_model_for_stream_on_route(
-    provider: ApiProvider,
-    base_url: &str,
-    model: &str,
-) -> bool {
-    if is_exact_kimi_code_k3_route(provider, base_url, model)
-        || is_exact_direct_moonshot_k3_route(provider, base_url, model)
-    {
-        return true;
-    }
-
-    if is_exact_modelstudio_chat_route(provider, base_url)
-        && (modelstudio_model_is_thinking_only(model)
-            || modelstudio_model_supports_preserve_thinking(model))
-    {
-        return true;
-    }
-
-    if requires_reasoning_content(model) {
-        return true;
-    }
-
-    // Model Studio's OpenAI-compatible endpoints (Token Plan / Coding Plan)
-    // stream hybrid-model reasoning as `delta.reasoning_content` (DashScope
-    // dialect) whenever thinking is on — and for the qwen3.x families thinking
-    // is on by server default. Surface those deltas as Thinking instead of
-    // inlining them into the answer text. `reasoning_content` is deliberately
-    // NOT replayed back on later turns (the provider is absent from
-    // `provider_accepts_reasoning_content`): DashScope does not require the
-    // reasoning field in request history.
-    if matches!(
-        provider,
-        ApiProvider::ModelstudioTokenPlan
-            | ApiProvider::ModelstudioTokenPlanAnthropic
-            | ApiProvider::ModelstudioCodingPlan
-            | ApiProvider::ModelstudioCodingPlanAnthropic
-    ) && model_supports_reasoning(model)
-    {
-        return true;
-    }
-
-    // ModelScope's OpenAI-compatible inference API streams hybrid-model
-    // reasoning as `delta.reasoning_content` (the DashScope dialect) for the
-    // Qwen and ZhipuAI families, whose model ids carry a `qwen/` or
-    // `zhipuai/` namespace prefix. Surface those deltas as Thinking instead
-    // of inlining them into the answer text. As with Model Studio above,
-    // `reasoning_content` is deliberately NOT replayed back on later turns:
-    // the provider is absent from `provider_accepts_reasoning_content`, and
-    // the DashScope dialect does not require the reasoning field in history.
-    if provider == ApiProvider::Modelscope {
-        let lower = model.to_ascii_lowercase();
-        if lower.starts_with("qwen/") || lower.starts_with("zhipuai/") {
-            return true;
-        }
-    }
-
-    provider_accepts_reasoning_content(provider) && model_supports_reasoning(model)
+    reasoning_stream_style_for_stream(provider, model, None) == ReasoningStreamStyle::SeparateField
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3604,11 +3557,20 @@ fn reasoning_stream_style_for_route(
             "Ignoring unrecognized reasoning_stream_style `{configured}`; expected separate_field, inline_tags, or none"
         ));
     }
-    if is_reasoning_model_for_stream_on_route(provider, base_url, model) {
-        ReasoningStreamStyle::SeparateField
-    } else {
-        ReasoningStreamStyle::None
-    }
+    // #6501: the dedicated reasoning fields are reasoning on every
+    // Chat Completions route that sends them (DeepSeek, xAI, Xiaomi MiMo,
+    // Kimi, GLM, MiniMax, DashScope, vLLM/SGLang reasoning parsers, OpenRouter,
+    // Ollama, ...), and the non-streaming parser already treats them that way
+    // unconditionally. Gating the stream on a provider allowlist AND a
+    // per-model catalog row meant every unlisted provider (xAI, StepFun,
+    // Together, Ollama, the Codewhale gateway, ...) and every model id newer
+    // than the offline catalog (grok-4.7, a fresh MiMo id) rendered its
+    // reasoning as answer prose. Surfacing a field that never arrives costs
+    // nothing; a gateway that really puts its answer in `reasoning_content`
+    // opts out with `reasoning_stream_style = "none"`. Replay of reasoning in
+    // request history stays separately gated by
+    // `should_replay_reasoning_content_for_provider_on_route`.
+    ReasoningStreamStyle::SeparateField
 }
 
 fn parse_reasoning_stream_style(value: &str) -> Option<ReasoningStreamStyle> {
@@ -4937,9 +4899,9 @@ mod alias_thinking_detection_tests {
         apply_inkling_reasoning_effort, apply_kimi_code_fixed_sampling,
         apply_kimi_code_k3_reasoning_effort, apply_openai_reasoning_effort,
         apply_provider_token_limit, apply_route_reasoning_controls, is_reasoning_model_for_stream,
-        is_reasoning_model_for_stream_on_route, provider_accepts_reasoning_content,
-        reasoning_stream_style_for_route, requires_reasoning_content,
-        should_replay_reasoning_content, should_replay_reasoning_content_for_provider,
+        provider_accepts_reasoning_content, reasoning_stream_style_for_route,
+        requires_reasoning_content, should_replay_reasoning_content,
+        should_replay_reasoning_content_for_provider,
         should_replay_reasoning_content_for_provider_on_route,
     };
     use crate::config::ApiProvider;
@@ -5544,11 +5506,6 @@ mod alias_thinking_detection_tests {
             crate::config::KIMI_CODE_K3_MODEL,
             Some("high"),
         ));
-        assert!(is_reasoning_model_for_stream_on_route(
-            ApiProvider::Moonshot,
-            kimi_code,
-            crate::config::KIMI_CODE_K3_MODEL,
-        ));
         assert_eq!(
             reasoning_stream_style_for_route(
                 ApiProvider::Moonshot,
@@ -5565,11 +5522,9 @@ mod alias_thinking_detection_tests {
             crate::config::KIMI_CODE_K3_MODEL,
             Some("high"),
         ));
-        assert!(!is_reasoning_model_for_stream_on_route(
-            ApiProvider::Moonshot,
-            direct_moonshot,
-            crate::config::KIMI_CODE_K3_MODEL,
-        ));
+        // Display is not replay: a reasoning field that arrives on the
+        // neighboring route still renders as Thinking (#6501), while the
+        // replay contract above stays scoped to the exact membership route.
         assert_eq!(
             reasoning_stream_style_for_route(
                 ApiProvider::Moonshot,
@@ -5577,7 +5532,7 @@ mod alias_thinking_detection_tests {
                 crate::config::KIMI_CODE_K3_MODEL,
                 None,
             ),
-            ReasoningStreamStyle::None
+            ReasoningStreamStyle::SeparateField
         );
         assert!(
             should_replay_reasoning_content_for_provider_on_route(
@@ -5686,24 +5641,49 @@ mod alias_thinking_detection_tests {
     }
 
     #[test]
-    fn grok_46_uses_exact_first_party_reasoning_effort_ladder() {
-        for (requested, expected) in [
-            ("off", "high"),
-            ("low", "low"),
-            ("medium", "medium"),
-            ("high", "high"),
-            ("xhigh", "xhigh"),
-            ("max", "xhigh"),
+    fn grok_47_and_46_use_exact_first_party_reasoning_effort_ladder() {
+        // Both catalog rows document low/medium/high/xhigh; reasoning cannot
+        // be disabled, so `off` is the documented default `high`.
+        for model in [
+            crate::config::XAI_GROK_4_7_MODEL,
+            crate::config::XAI_GROK_4_6_MODEL,
         ] {
+            for (requested, expected) in [
+                ("off", "high"),
+                ("low", "low"),
+                ("medium", "medium"),
+                ("high", "high"),
+                ("xhigh", "xhigh"),
+                ("max", "xhigh"),
+            ] {
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ApiProvider::Xai,
+                    crate::config::DEFAULT_XAI_BASE_URL,
+                    model,
+                    Some(requested),
+                );
+                assert_eq!(
+                    body,
+                    json!({ "reasoning_effort": expected }),
+                    "{model} {requested}"
+                );
+            }
+        }
+
+        // A row without a documented effort option (grok-4.3) and an id the
+        // catalog does not know send nothing.
+        for model in [crate::config::XAI_GROK_4_3_MODEL, "grok-9-unknown"] {
             let mut body = json!({});
             apply_route_reasoning_controls(
                 &mut body,
                 ApiProvider::Xai,
                 crate::config::DEFAULT_XAI_BASE_URL,
-                crate::config::XAI_GROK_4_6_MODEL,
-                Some(requested),
+                model,
+                Some("medium"),
             );
-            assert_eq!(body, json!({ "reasoning_effort": expected }), "{requested}");
+            assert_eq!(body, json!({}), "{model}");
         }
 
         let mut provider_default = json!({});
@@ -6225,10 +6205,6 @@ mod alias_thinking_detection_tests {
                     !should_replay_reasoning_content_for_provider(provider, model, None),
                     "{provider:?} {model}"
                 );
-                assert!(
-                    !is_reasoning_model_for_stream(provider, model),
-                    "stream classification must fail closed too: {provider:?} {model}"
-                );
             }
         }
     }
@@ -6477,39 +6453,67 @@ mod alias_thinking_detection_tests {
     }
 
     #[test]
-    fn stream_does_not_classify_generic_model_as_reasoning() {
-        // #1542 no-regression guard: a genuine non-DeepSeek model on the
-        // openai provider must NOT be treated as a reasoning model, so the
-        // parser keeps inlining any `reasoning_content` it emits as text.
-        assert!(!is_reasoning_model_for_stream(
-            ApiProvider::Openai,
-            "qwen3-coder"
-        ));
-        assert!(!is_reasoning_model_for_stream(
-            ApiProvider::Openai,
-            "claude-sonnet-4-6"
-        ));
-        // Non-DeepSeek model on a reasoning-aware provider is also unchanged.
-        assert!(!is_reasoning_model_for_stream(
-            ApiProvider::Deepseek,
-            "qwen3-coder"
+    fn stream_surfaces_reasoning_fields_on_every_unconfigured_route() {
+        // #6501: grok-4.7 on xAI and a MiMo id newer than the offline catalog
+        // streamed their reasoning as answer prose because the stream gate
+        // required a provider allowlist AND a catalog row. The reasoning
+        // fields are reasoning on every route that sends them; only an
+        // explicit `reasoning_stream_style = "none"` restores pass-through.
+        for (provider, model) in [
+            (ApiProvider::Xai, "grok-4.7"),
+            (ApiProvider::Xai, "grok-4.6"),
+            (ApiProvider::XiaomiMimo, "mimo-v2.7-pro-unreleased"),
+            (ApiProvider::XiaomiMimo, "mimo-v2.6-pro"),
+            (ApiProvider::Openai, "qwen3-coder"),
+            (ApiProvider::Deepseek, "qwen3-coder"),
+            (ApiProvider::Stepfun, "step-3.5"),
+            (ApiProvider::Together, "any/model"),
+            (ApiProvider::Ollama, "gpt-oss:20b"),
+            (ApiProvider::Codewhale, "grok-4.7"),
+        ] {
+            assert!(
+                is_reasoning_model_for_stream(provider, model),
+                "{provider:?} {model} must surface reasoning fields as Thinking"
+            );
+        }
+        assert_eq!(
+            super::reasoning_stream_style_for_stream(ApiProvider::Xai, "grok-4.7", Some("none")),
+            ReasoningStreamStyle::None,
+            "an explicit route override still wins"
+        );
+    }
+
+    #[test]
+    fn xiaomi_mimo_replays_reasoning_for_every_model_id() {
+        // #6501: MiMo returns 400 when a tool-call turn omits the assistant
+        // `reasoning_content`, including ids newer than the offline catalog.
+        for model in ["mimo-v2.5-pro", "mimo-v2.6-pro", "mimo-v2.7-pro-unreleased"] {
+            assert!(
+                should_replay_reasoning_content_for_provider(ApiProvider::XiaomiMimo, model, None),
+                "{model}"
+            );
+        }
+        assert!(!should_replay_reasoning_content_for_provider(
+            ApiProvider::XiaomiMimo,
+            "mimo-v2.6-pro",
+            Some("off"),
         ));
     }
 
     #[test]
-    fn stream_classification_matches_replay_predicate() {
-        // The streaming classifier and the replay predicate must agree on
-        // model identity, or stream parsing and message sanitisation disagree
-        // about where reasoning tokens live. Effort=None isolates the
-        // model/provider dimension shared by both.
-        for model in ["deepseek-v4-pro", "deepseek-reasoner", "qwen3-coder"] {
-            for provider in [ApiProvider::Openai, ApiProvider::Deepseek] {
-                assert_eq!(
-                    is_reasoning_model_for_stream(provider, model),
-                    should_replay_reasoning_content_for_provider(provider, model, None),
-                    "stream vs replay disagree for {model} on {provider:?}"
-                );
-            }
+    fn stream_display_does_not_authorize_reasoning_replay() {
+        // #1542 stays fixed: rendering a reasoning delta as Thinking must not
+        // make a provider that rejects `reasoning_content` receive it back.
+        for (provider, model) in [
+            (ApiProvider::Openai, "qwen3-coder"),
+            (ApiProvider::Openai, "claude-sonnet-4-6"),
+            (ApiProvider::Xai, "grok-4.7"),
+        ] {
+            assert!(is_reasoning_model_for_stream(provider, model));
+            assert!(
+                !should_replay_reasoning_content_for_provider(provider, model, None),
+                "{provider:?} {model}"
+            );
         }
     }
 }
@@ -7436,7 +7440,7 @@ mod mistral_reasoning_tests {
                 "mistral-medium-latest",
                 None,
             ),
-            ReasoningStreamStyle::None
+            ReasoningStreamStyle::SeparateField
         );
     }
 

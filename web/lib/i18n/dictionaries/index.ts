@@ -426,7 +426,12 @@ export function getDigest(locale: string): DigestDict {
  * stay locale-agnostic.
  */
 export function pickText(pair: { en: string; zh: string }, locale: string): string {
-  return locale === "zh" ? pair.zh : pair.en;
+  return pair[pickTextLocale(locale)];
+}
+
+/** The actual language selected by the legacy two-language content bridge. */
+export function pickTextLocale(locale: string): "en" | "zh" {
+  return locale === "zh" ? "zh" : "en";
 }
 
 /** Reference dictionaries (parity baseline for the locale checks). */

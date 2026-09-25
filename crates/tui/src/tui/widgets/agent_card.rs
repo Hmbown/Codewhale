@@ -1377,8 +1377,8 @@ mod tests {
             "shared compact lifecycle: {joined}"
         );
         assert!(
-            joined.contains("1 child") || joined.contains("children"),
-            "shared child count: {joined}"
+            joined.contains("1/1 done"),
+            "shared settled/total count: {joined}"
         );
         let expanded = panel.render_history_card(
             100,

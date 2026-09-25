@@ -2967,6 +2967,90 @@ mod tests {
         }
     }
 
+    /// #6502: the close control names Esc only while Esc closes the dock.
+    /// Unfocused, Esc stops the running turn, so the `×` stands alone and
+    /// the Esc hint stays with the turn status.
+    #[test]
+    fn close_control_names_esc_only_while_esc_closes_the_dock() {
+        let tab_row = |app: &mut App| {
+            render_rows(app, 80, 8)
+                .into_iter()
+                .find(|row| row.contains("Tasks"))
+                .expect("dock tab row")
+        };
+        let mut app = app();
+        add_todos(&mut app, 3);
+        app.is_loading = true;
+
+        let row = tab_row(&mut app);
+        assert!(
+            !row.contains("Esc"),
+            "unfocused dock must not claim Esc: {row:?}"
+        );
+
+        app.work_surface.focused = true;
+        let row = tab_row(&mut app);
+        assert!(
+            row.contains("Esc"),
+            "focused dock names its close key: {row:?}"
+        );
+        assert!(
+            super::handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).is_some(),
+            "the advertised Esc is the one that closes the dock"
+        );
+        assert!(app.work_surface.dismissed);
+        assert!(!app.work_surface.focused);
+    }
+
+    /// #6502 review: a row action that opens no view (the Context panel's
+    /// `/compact` row) leaves a stale `opened` owner. The hint must follow
+    /// what Esc will really do: close the dock when nothing is stacked above
+    /// it, and stay quiet while a detail pager owns Esc.
+    #[test]
+    fn esc_hint_follows_the_pending_detail_state() {
+        let tab_row = |app: &mut App| {
+            render_rows(app, 80, 8)
+                .into_iter()
+                .find(|row| row.contains("Tasks"))
+                .expect("dock tab row")
+        };
+        let mut app = app();
+        add_todos(&mut app, 3);
+        app.is_loading = true;
+        app.work_surface.focused = true;
+        let row = super::model::project(&mut app)
+            .into_iter()
+            .find(|row| row.selectable)
+            .expect("work row");
+
+        // A detail pager is on screen: Esc closes it, not the dock.
+        app.work_surface.opened = Some(row.id.clone());
+        app.view_stack.push(crate::tui::pager::PagerView::from_text(
+            "Work · test".to_string(),
+            "body",
+            40,
+        ));
+        let rendered = tab_row(&mut app);
+        assert!(
+            !rendered.contains("Esc"),
+            "Esc belongs to the open detail: {rendered:?}"
+        );
+        app.view_stack.pop();
+
+        // The row's command opened nothing: `opened` is stale, and the
+        // advertised Esc closes the dock in one press.
+        let rendered = tab_row(&mut app);
+        assert!(
+            rendered.contains("Esc"),
+            "stale owner must not hide the dock's close key: {rendered:?}"
+        );
+        assert!(
+            super::handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).is_some()
+        );
+        assert!(app.work_surface.dismissed, "one Esc closes the dock");
+        assert!(app.work_surface.opened.is_none());
+    }
+
     #[test]
     fn narrow_dock_drops_counts_before_optional_tabs() {
         let mut app = app();

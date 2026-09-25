@@ -16,6 +16,7 @@ export const home: HomeDict = {
   heroIntro:
     "{brand} cung cấp các tác tử có thể xây dựng phần mềm, làm việc với tệp và biến những tác vụ lặp lại thành quy trình có thể tái sử dụng. Hãy cho chúng biết bạn muốn hoàn thành điều gì rồi chọn mô hình chạy trên máy chủ hoặc cục bộ phù hợp với công việc, đồng thời bạn có thể tự do chuyển đổi nhà cung cấp trong quá trình làm việc.",
   getCodewhale: "Tải Codewhale",
+  heroInstallAria: "Lệnh cài đặt",
   exploreProduct: "Khám phá sản phẩm",
   shotPreview: "Xem trước terminal",
   shotBuild: "bản phát triển v{version}",

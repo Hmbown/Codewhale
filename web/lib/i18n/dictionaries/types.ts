@@ -31,23 +31,6 @@ export interface ChromeDict {
   navContribute: string;
 
   /**
-   * Bilingual secondary nav labels — the small companion label the
-   * newspaper masthead sets beside each primary link.
-   *
-   * The English edition uses the Han seal pair (文档 / 指引 / …) as an
-   * editorial device; every other locale supplies its OWN pairing (native
-   * primary, short English secondary). Never hardcode Han characters at a
-   * call site — a locale that wants no second label still needs a value
-   * here, because empty strings are rejected by dictionaries.test.ts.
-   */
-  navDocsSecondary: string;
-  navStartSecondary: string;
-  navInstallSecondary: string;
-  navFaqSecondary: string;
-  navCommunitySecondary: string;
-  navContributeSecondary: string;
-
-  /**
    * The primary strip: Product / Models / Plugins / Docs. The
    * older six (Start, Install, FAQ, Community, Contribute) stay in the
    * dictionary for the compact sheet's second group and the footer.
@@ -55,9 +38,6 @@ export interface ChromeDict {
   navProduct: string;
   navModels: string;
   navPlugins: string;
-  navProductSecondary: string;
-  navModelsSecondary: string;
-  navPluginsSecondary: string;
 
   /**
    * Skip-to-content link rendered before the nav in app/[locale]/layout.tsx.
@@ -74,11 +54,11 @@ export interface ChromeDict {
   /** Mobile-menu and masthead call to action, e.g. "Install →". */
   installCta: string;
 
-  /** Header account links to the Codewhale app (app.codewhale.net). */
+  /**
+   * The header's one identity door to the Codewhale app (app.codewhale.net).
+   * Account creation is offered on the sign-in page, not beside it.
+   */
   authSignIn: string;
-  authRegister: string;
-  /** aria-label for the header account link group. */
-  authGroupAria: string;
 
   /** Wordmark seal glyph beside the masthead brand (components/seal.tsx). */
   wordmarkSeal: string;
@@ -93,11 +73,6 @@ export interface ChromeDict {
    * masthead date renders in English for every non-Chinese locale.
    */
   dateLocale: string;
-
-  /** aria-label on the star-count link, e.g. "GitHub stars". */
-  starsAria: string;
-  /** Star-badge label when the live count is unavailable. */
-  githubFallback: string;
 
   /** Live-ticker seal label (components/ticker.tsx). */
   tickerLiveLabel: string;
@@ -210,6 +185,8 @@ export interface HomeDict {
   heroIntro: string;
   /** Primary action → /install, e.g. "Get Codewhale". */
   getCodewhale: string;
+  /** Accessible name for the hero install command and its platform choice. */
+  heroInstallAria: string;
   /** Secondary action → /product, e.g. "Explore the product". */
   exploreProduct: string;
 

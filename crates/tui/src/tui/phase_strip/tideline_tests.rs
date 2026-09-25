@@ -418,6 +418,24 @@ fn interrupt_hint_shows_at_zero_and_one_use_and_clears_at_two() {
     assert!(tideline_footer_from_app(&mut app, 120).hint.is_none());
 }
 
+/// #6502: while the workbar owns focus, Esc closes the workbar instead of
+/// interrupting, so the posture bar must not promise an interrupt.
+#[test]
+fn interrupt_hint_stands_down_while_the_workbar_owns_esc() {
+    let mut app = session_app();
+    app.is_loading = true;
+    app.work_surface.focused = true;
+    let facts = tideline_footer_from_app(&mut app, 120);
+    assert!(
+        facts
+            .hint
+            .as_ref()
+            .is_none_or(|(text, _)| !text.contains("Esc")),
+        "{:?}",
+        facts.hint.as_ref().map(|(text, _)| text)
+    );
+}
+
 /// The open double-tap window advertises the second Enter until that steer
 /// has fired twice.
 #[test]

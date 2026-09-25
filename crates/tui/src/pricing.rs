@@ -717,10 +717,13 @@ fn known_pricing_for_model(model_lower: &str) -> Option<ModelPricing> {
         "meta/muse-spark-1.2-contributor" | "muse-spark-1.2-contributor" => {
             Some(usd_only_pricing(0.002, 0.10, 0.20))
         }
-        // Grok 4.6 / 4.5 / 4.3 double all token rates when the prompt reaches
-        // 200K. Metadata-only lookups use the standard tier; turn auditing
-        // below selects the exact usage-aware tier for the direct xAI route.
-        "grok-4.6" | "grok-4.5" | "grok-4.3" => grok_tiered_pricing(model_lower, false),
+        // Grok 4.7 / 4.6 / 4.5 / 4.3 double all token rates when the prompt
+        // reaches 200K. Metadata-only lookups use the standard tier; turn
+        // auditing below selects the exact usage-aware tier for the direct
+        // xAI route.
+        "grok-4.7" | "grok-4.6" | "grok-4.5" | "grok-4.3" => {
+            grok_tiered_pricing(model_lower, false)
+        }
         // Anthropic first-party rates including the published cache-read
         // discounts and 5-minute cache-write rates (2026-07-09 audit,
         // https://platform.claude.com/docs/en/about-claude/pricing). These sit
@@ -942,12 +945,14 @@ fn is_minimax_m3(model: &str) -> bool {
 /// doubled tier once a prompt reaches 200K tokens. Verified 2026-08-17 against
 /// the model pages, whose embedded price tables carry both the standard and
 /// `LongContext` columns at exactly 2x:
+/// - <https://docs.x.ai/docs/models/grok-4.7>: 0.50 / 2.00 / 6.00 (verified
+///   2026-09-23: $4.00 / $1.00 / $12.00 at or above 200K)
 /// - <https://docs.x.ai/docs/models/grok-4.6>: 0.50 / 2.00 / 6.00
 /// - <https://docs.x.ai/docs/models/grok-4.5>: 0.30 / 2.00 / 6.00
 /// - <https://docs.x.ai/docs/models/grok-4.3>: 0.20 / 1.25 / 2.50
 fn grok_tiered_pricing(model_lower: &str, long_context: bool) -> Option<ModelPricing> {
     let (cache_read, input, output) = match model_lower {
-        "grok-4.6" => (0.50, 2.00, 6.00),
+        "grok-4.7" | "grok-4.6" => (0.50, 2.00, 6.00),
         "grok-4.5" => (0.30, 2.00, 6.00),
         "grok-4.3" => (0.20, 1.25, 2.50),
         _ => return None,
@@ -963,7 +968,7 @@ fn grok_tiered_pricing(model_lower: &str, long_context: bool) -> Option<ModelPri
 fn is_grok_tiered(model: &str) -> bool {
     matches!(
         model.trim().to_ascii_lowercase().as_str(),
-        "grok-4.6" | "grok-4.5" | "grok-4.3"
+        "grok-4.7" | "grok-4.6" | "grok-4.5" | "grok-4.3"
     )
 }
 

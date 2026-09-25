@@ -72,6 +72,7 @@ mod model_context;
 mod model_inventory;
 mod model_profile;
 mod model_registry;
+mod model_relevance;
 mod model_routing;
 mod models_dev_live;
 mod native_memory;
@@ -14912,6 +14913,7 @@ mod doctor_endpoint_tests {
                 provider: Some(crate::config::SearchProvider::Tavily),
                 base_url: None,
                 api_key: None,
+                native: None,
             }),
             ..Default::default()
         };
@@ -14961,6 +14963,7 @@ mod doctor_endpoint_tests {
                 provider: Some(crate::config::SearchProvider::DuckDuckGo),
                 base_url: None,
                 api_key: None,
+                native: None,
             }),
             ..Default::default()
         };
@@ -15004,6 +15007,7 @@ mod doctor_endpoint_tests {
                 provider: Some(crate::config::SearchProvider::Bing),
                 base_url: None,
                 api_key: None,
+                native: None,
             }),
             ..Default::default()
         };

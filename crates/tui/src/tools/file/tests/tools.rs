@@ -1909,6 +1909,50 @@ async fn test_edit_file_not_found_shows_search_preview() {
     );
 }
 
+/// #6542 — a missed search returns the nearest region with line numbers and
+/// names a whitespace-only difference, so the retry can copy the real text.
+#[tokio::test]
+async fn edit_miss_returns_nearest_excerpt_with_line_numbers_and_whitespace_note() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    fs::write(
+        tmp.path().join("near.rs"),
+        "fn a() {}\n\nfn compute(x: u32) -> u32 {\n    x + 1\n}\n",
+    )
+    .expect("write");
+    read_before_edit(&ctx, "near.rs").await;
+
+    let err = EditFileTool
+        .execute(
+            json!({
+                "path": "near.rs",
+                "search": "fn compute(x: u32) -> u32 {   \n    x + 1\n}",
+                "replace": "fn compute(x: u32) -> u32 {\n    x + 2\n}"
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("trailing whitespace keeps the search from matching")
+        .to_string();
+    assert!(err.contains("Closest match (lines 3-5"), "{err}");
+    assert!(err.contains("3\tfn compute(x: u32) -> u32 {"), "{err}");
+    assert!(err.contains("trailing whitespace"), "{err}");
+
+    let err = EditFileTool
+        .execute(
+            json!({
+                "path": "near.rs",
+                "search": "completely unrelated text\nnothing like it",
+                "replace": "x"
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("no match")
+        .to_string();
+    assert!(err.contains("No similar region"), "{err}");
+}
+
 /// #157 / #5209 — `replacement` is an unambiguous synonym for `replace`, so
 /// the edit the model asked for is the edit that lands. The #5209 guarantee
 /// being protected is that the file and the receipt agree: a reported

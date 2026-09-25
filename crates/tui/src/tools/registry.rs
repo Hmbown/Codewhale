@@ -778,7 +778,7 @@ impl ToolRegistryBuilder {
 
     /// Include only read-only file tools (read, list).
     #[must_use]
-    #[cfg_attr(not(test), expect(dead_code))]
+    #[cfg(test)]
     pub fn with_read_only_file_tools(self) -> Self {
         use super::file::{ListDirTool, ReadFileTool};
         use super::file_tool::FileTool;
@@ -1449,8 +1449,17 @@ impl ToolRegistryBuilder {
     /// Build the registry with the given context.
     #[must_use]
     pub fn build(self, context: ToolContext) -> ToolRegistry {
+        // A route known to be text-only cannot see what `read_media` returns,
+        // so it is not offered there (`image_ocr` remains for text in images).
+        let blind = context.route_capabilities.image_input
+            == codewhale_config::route::CapabilityState::Unsupported;
         let mut registry = ToolRegistry::new(context);
-        registry.register_all(self.tools);
+        registry.register_all(
+            self.tools
+                .into_iter()
+                .filter(|tool| !(blind && tool.name() == "read_media"))
+                .collect(),
+        );
         registry
     }
 }

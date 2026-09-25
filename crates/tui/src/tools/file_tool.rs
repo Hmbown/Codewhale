@@ -227,7 +227,7 @@ impl FileTool {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
+    #[cfg(test)]
     pub const fn read_only(name: &'static str) -> Self {
         Self {
             name,

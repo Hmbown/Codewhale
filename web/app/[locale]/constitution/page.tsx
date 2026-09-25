@@ -90,7 +90,7 @@ export default async function ConstitutionPage({ params }: { params: Promise<{ l
         <div className="grid md:grid-cols-3 gap-0 col-rule hairline-t hairline-b">
           {LAYERS.map((layer) => (
             <div key={layer.n} className="p-6">
-              <div className="font-mono uppercase tracking-widest mb-2 text-[0.7rem] text-indigo">{layer.n}</div>
+              <div className="mb-2 text-xs text-indigo">{layer.n}</div>
               <h2 className="font-display text-xl mb-1">{isZh ? layer.name.zh : layer.name.en}</h2>
               <div className="font-mono text-[0.68rem] text-ink-mute mb-3 break-all">
                 {isZh ? layer.pathZh : layer.path}
@@ -138,13 +138,13 @@ export default async function ConstitutionPage({ params }: { params: Promise<{ l
         <div className="flex flex-wrap items-center gap-3">
           <Link
             href={p("/install")}
-            className="px-5 py-3 bg-indigo text-paper font-mono text-sm uppercase tracking-wider hover:bg-indigo-deep transition-colors"
+            className="portal-button portal-button-primary"
           >
             {isZh ? "安装 →" : "Install →"}
           </Link>
           <Link
             href="https://github.com/Hmbown/CodeWhale/blob/main/docs/CONFIGURATION.md#constitution-project-instructions-and-repo-authority"
-            className="px-5 py-3 font-mono text-sm uppercase tracking-wider text-ink-mute hover:text-indigo transition-colors"
+            className="px-5 py-3 text-sm text-ink-mute hover:text-indigo transition-colors"
           >
             {isZh ? "配置文档 ↗" : "Configuration ↗"}
           </Link>

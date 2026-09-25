@@ -61,21 +61,6 @@ pub struct TuiLogGuard {
     #[cfg(windows)]
     redirected_stderr_handle: Option<windows::Win32::Foundation::HANDLE>,
     _file: File,
-    // Exposed via `log_path()` for diagnostics (e.g. `/doctor`,
-    // `--print-log-path`). Currently no caller — keep the accessor
-    // wired up so adding one later doesn't require revisiting the
-    // guard struct.
-    #[expect(dead_code)]
-    log_path: PathBuf,
-}
-
-impl TuiLogGuard {
-    /// Path the subscriber is writing to.
-    #[must_use]
-    #[expect(dead_code)]
-    pub fn log_path(&self) -> &std::path::Path {
-        &self.log_path
-    }
 }
 
 #[cfg(unix)]
@@ -206,7 +191,6 @@ pub fn init() -> Result<TuiLogGuard> {
         #[cfg(windows)]
         redirected_stderr_handle,
         _file: file,
-        log_path,
     })
 }
 

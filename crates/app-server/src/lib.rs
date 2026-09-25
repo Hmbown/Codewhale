@@ -23,9 +23,8 @@ use codewhale_protocol::{
     ThreadGoalClearParams, ThreadGoalGetParams, ThreadGoalSetParams, ThreadRequest, ThreadResponse,
 };
 use codewhale_state::StateStore;
-use codewhale_tools::{ToolCall, ToolRegistry};
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
@@ -105,7 +104,7 @@ struct AppState {
     config_path: Option<PathBuf>,
     config: Arc<RwLock<codewhale_config::ConfigToml>>,
     /// Read/write split mirrors [`Runtime`]'s own receivers: `&self`
-    /// operations (tool calls, status, MCP startup) share a read guard and
+    /// operations (status, MCP startup) share a read guard and
     /// run concurrently; `&mut self` turns (prompt/thread) and config pushes
     /// take the write guard because the runtime genuinely requires
     /// exclusivity there.
@@ -148,13 +147,6 @@ struct InFlightTurn {
 }
 
 type TurnRegistry = Arc<Mutex<HashMap<String, InFlightTurn>>>;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ToolCallRequest {
-    call: ToolCall,
-    #[serde(default)]
-    cwd: Option<PathBuf>,
-}
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -370,6 +362,19 @@ async fn shutdown_signal() {
     }
 }
 
+/// Protected routes the `Capabilities` response advertises. A test sends a
+/// request to each one through [`app_router`], so an entry here without a
+/// handler fails the tests instead of shipping a dead route.
+///
+/// There is no `/tool`: a direct tool call outside a turn would need its own
+/// tool catalog and approval decision, and the Engine behind the runtime
+/// bridge is the only tool and approval authority. Tools run inside turns
+/// (`/prompt`, `/thread` messages). This server does not surface approvals:
+/// `RuntimeBridge::stream_turn_events` forwards only `item.delta` and the
+/// turn's completion, and there is no decision route, so approval-gated work
+/// belongs on the Runtime API (`/v1/threads/*`, `POST /v1/approvals/{id}`).
+const ADVERTISED_ROUTES: &[&str] = &["/thread", "/app", "/prompt", "/jobs", "/mcp/startup"];
+
 fn app_router(state: AppState, cors_origins: &[String]) -> Router {
     let protected_routes = Router::new()
         .route(
@@ -385,7 +390,6 @@ fn app_router(state: AppState, cors_origins: &[String]) -> Router {
                 MAX_RUNTIME_IMAGE_BODY_BYTES,
             )),
         )
-        .route("/tool", post(tool_handler))
         .route("/jobs", get(jobs_handler))
         .route("/mcp/startup", post(mcp_startup_handler))
         .route(
@@ -731,38 +735,6 @@ async fn prompt_handler(State(state): State<AppState>, Json(req): Json<PromptReq
     }
 }
 
-async fn tool_handler(
-    State(state): State<AppState>,
-    Json(req): Json<ToolCallRequest>,
-) -> (StatusCode, Json<Value>) {
-    let cwd = req
-        .cwd
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    // Resolve approval policy from config instead of hardcoding.
-    let approval_mode = {
-        let cfg = state.config.read().await;
-        cfg.approval_policy
-            .as_deref()
-            .and_then(|p| match p.trim().to_ascii_lowercase().as_str() {
-                "auto" | "yolo" => Some(codewhale_execpolicy::AskForApproval::UnlessTrusted),
-                "never" | "deny" => Some(codewhale_execpolicy::AskForApproval::Never),
-                _ => None,
-            })
-            .unwrap_or(codewhale_execpolicy::AskForApproval::OnRequest)
-    };
-    // `invoke_tool` takes `&self`, so long-running tool executions share a
-    // read guard: they run concurrently with each other and with status
-    // reads instead of serializing every request behind one Mutex.
-    let runtime = state.runtime.read().await;
-    match runtime.invoke_tool(req.call, approval_mode, &cwd).await {
-        Ok(value) => (StatusCode::OK, Json(value)),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "ok": false, "error": err.to_string() })),
-        ),
-    }
-}
-
 async fn jobs_handler(State(state): State<AppState>) -> Json<AppResponse> {
     let runtime = state.runtime.read().await;
     Json(runtime.app_status())
@@ -816,7 +788,6 @@ fn build_state_with_transport(
     let store = ConfigStore::load(config_path)?;
     let config_path = has_explicit_config_path.then(|| store.path().to_path_buf());
     let config = store.config.clone();
-    let exec_policy = store.exec_policy_engine();
     let registry = ModelRegistry::default();
 
     let state_db_path = config_path
@@ -849,9 +820,7 @@ fn build_state_with_transport(
     let runtime = Runtime::new(
         config.clone(),
         state_store,
-        Arc::new(ToolRegistry::default()),
         Arc::new(McpManager::default()),
-        exec_policy,
         hooks,
     );
 
@@ -2486,7 +2455,7 @@ async fn process_app_request(
         AppRequest::Capabilities => AppResponse {
             ok: true,
             data: json!({
-                "routes": ["/thread", "/app", "/prompt", "/tool", "/jobs", "/mcp/startup"],
+                "routes": ADVERTISED_ROUTES,
                 "config": ["get", "set", "unset", "list", "reload"],
                 "events": ["response_start", "response_delta", "response_end", "tool_call_start", "tool_call_result", "mcp_startup_update", "mcp_startup_complete"],
                 "transport": "stdio+http",
@@ -2519,7 +2488,7 @@ async fn process_app_request(
             // child runtime along with its thread map. A single typo'd key
             // would orphan every in-flight thread on that bridge.
             if ok {
-                apply_config_update(state, snapshot, None, true).await;
+                apply_config_update(state, snapshot, true).await;
             }
             AppResponse {
                 ok,
@@ -2538,7 +2507,7 @@ async fn process_app_request(
             // See ConfigSet: a failed unset changed nothing and must not tear
             // down the runtime bridge.
             if ok {
-                apply_config_update(state, snapshot, None, true).await;
+                apply_config_update(state, snapshot, true).await;
             }
             AppResponse {
                 ok,
@@ -2574,13 +2543,11 @@ async fn process_app_request(
                     };
                 }
             };
-            let new_config = store.config.clone();
-            let new_exec_policy = store.exec_policy_engine();
-
             // Disk is already the source of truth here, so nothing to
-            // persist; the exec policy rides along so the runtime picks up
-            // external `permissions.toml` edits too.
-            apply_config_update(state, new_config, Some(new_exec_policy), false).await;
+            // persist. External `permissions.toml` edits reach the Engine
+            // because the update invalidates the runtime bridge; the next
+            // turn's child loads both files fresh.
+            apply_config_update(state, store.config, false).await;
 
             AppResponse {
                 ok: true,
@@ -2656,15 +2623,11 @@ async fn process_app_request(
 /// rather than minting replacements (#6246). Shared by `ConfigSet` /
 /// `ConfigUnset` / `ConfigReload`.
 ///
-/// `exec_policy` is `Some` only on the reload path, which re-reads
-/// `permissions.toml` from disk; set/unset intentionally leave the live
-/// exec policy alone (use `ConfigReload` to pick up external permission
-/// edits). `persist` is false on the reload path because disk is already
-/// the source of truth there.
+/// `persist` is false on the reload path because disk is already the source
+/// of truth there.
 async fn apply_config_update(
     state: &AppState,
     snapshot: codewhale_config::ConfigToml,
-    exec_policy: Option<codewhale_execpolicy::ExecPolicyEngine>,
     persist: bool,
 ) {
     if persist && let Err(e) = persist_config(state, snapshot.clone()).await {
@@ -2674,17 +2637,10 @@ async fn apply_config_update(
         let mut cfg = state.config.write().await;
         *cfg = snapshot.clone();
     }
-    // Sync into the live Runtime so the next turn picks up the change
-    // without a restart. MCP server connections are NOT refreshed here —
-    // see `Runtime::reload_config_and_policy` for the headless boundary;
-    // the TUI's explicit `/mcp reload` operation is a separate path.
-    {
-        let mut runtime = state.runtime.write().await;
-        match exec_policy {
-            Some(policy) => runtime.reload_config_and_policy(snapshot, policy),
-            None => runtime.update_config(snapshot),
-        }
-    }
+    // Sync into the live Runtime so status reads see the change without a
+    // restart. MCP server connections are NOT refreshed here; the TUI's
+    // explicit `/mcp reload` operation is a separate path.
+    state.runtime.write().await.update_config(snapshot);
     invalidate_runtime_bridge(state).await;
 }
 
@@ -2831,6 +2787,82 @@ mod tests {
         assert_eq!(body["data"]["value"], "sk-d***cret");
     }
 
+    /// Every route `Capabilities` advertises must reach a handler. A POST
+    /// with an empty JSON body is enough: a registered handler answers with
+    /// its own status (200, or 422 for a body it rejects), while a path with
+    /// no handler answers 404 and a wrong method 405.
+    #[tokio::test]
+    async fn every_advertised_route_has_a_handler() {
+        let (_app, tmp) = app_with_config(Some("test-token"));
+        let state = build_state(Some(tmp.path().join("config.toml")), None).expect("state");
+        let caps = process_app_request(&state, AppRequest::Capabilities, AppTransport::Http).await;
+        let advertised: Vec<String> =
+            serde_json::from_value(caps.data["routes"].clone()).expect("routes list");
+        assert_eq!(advertised, ADVERTISED_ROUTES);
+
+        for route in &advertised {
+            let mut status = StatusCode::METHOD_NOT_ALLOWED;
+            for method in [Method::POST, Method::GET] {
+                let (app, _tmp) = app_with_config(Some("test-token"));
+                let body = if method == Method::POST {
+                    Body::from("{}")
+                } else {
+                    Body::empty()
+                };
+                status = app
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(route.as_str())
+                            .header(header::AUTHORIZATION, "Bearer test-token")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(body)
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("response")
+                    .status();
+                if status != StatusCode::METHOD_NOT_ALLOWED {
+                    break;
+                }
+            }
+            assert!(
+                status != StatusCode::NOT_FOUND
+                    && status != StatusCode::METHOD_NOT_ALLOWED
+                    && !status.is_server_error(),
+                "advertised route {route} has no working handler: {status}"
+            );
+        }
+    }
+
+    /// `/tool` ran calls against an empty tool registry under an approval
+    /// mapping of its own. It is gone from both the router and the
+    /// advertised list; tools run only inside Engine turns.
+    #[tokio::test]
+    async fn tool_route_is_not_served_or_advertised() {
+        let (app, tmp) = app_with_config(Some("test-token"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/tool")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"call":{"name":"exec_shell","payload":{"type":"local_shell","command":["true"]}}}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let state = build_state(Some(tmp.path().join("config.toml")), None).expect("state");
+        let caps = process_app_request(&state, AppRequest::Capabilities, AppTransport::Http).await;
+        let advertised = caps.data["routes"].as_array().expect("routes list");
+        assert!(!advertised.iter().any(|route| route == "/tool"));
+    }
+
     #[tokio::test]
     async fn cors_does_not_allow_arbitrary_origins() {
         let (app, _tmp) = app_with_config(Some("test-token"));
@@ -2856,44 +2888,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_state_loads_permissions_into_runtime_policy() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let config_path = tmp.path().join("config.toml");
-        fs::write(&config_path, "api_key = \"sk-deepseek-secret\"\n").expect("write config");
-        fs::write(
-            tmp.path().join("permissions.toml"),
-            r#"
-            [[rules]]
-            tool = "exec_shell"
-            command = "cargo test"
-            "#,
-        )
-        .expect("write permissions");
-
-        let state = build_state(Some(config_path), None).expect("state");
-        let runtime = state.runtime.read().await;
-        let decision = runtime
-            .exec_policy
-            .check(codewhale_execpolicy::ExecPolicyContext {
-                command: "cargo test --workspace",
-                cwd: "/workspace",
-                tool: Some("exec_shell"),
-                path: None,
-                ask_for_approval: codewhale_execpolicy::AskForApproval::UnlessTrusted,
-                sandbox_mode: Some("workspace-write"),
-            })
-            .expect("policy check");
-
-        assert!(decision.allow);
-        assert!(decision.requires_approval);
-        assert_eq!(
-            decision.matched_rule.as_deref(),
-            Some("tool=exec_shell command=cargo test")
-        );
-    }
-
-    #[tokio::test]
-    async fn config_reload_refreshes_runtime_config_and_exec_policy_from_disk() {
+    async fn config_reload_refreshes_runtime_config_from_disk() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config_path = tmp.path().join("config.toml");
         fs::write(
@@ -2901,45 +2896,20 @@ mod tests {
             "api_key = \"sk-deepseek-secret\"\nmodel = \"deepseek-chat\"\n",
         )
         .expect("write config");
-        // No permissions.toml at startup → exec_policy starts empty.
         let state = build_state(Some(config_path.clone()), None).expect("state");
-
-        // Sanity: initial runtime sees the on-disk model and has no rule.
         {
             let runtime = state.runtime.read().await;
             assert_eq!(runtime.config.model.as_deref(), Some("deepseek-chat"));
-            let decision = runtime
-                .exec_policy
-                .check(codewhale_execpolicy::ExecPolicyContext {
-                    command: "cargo test",
-                    cwd: "/workspace",
-                    tool: Some("exec_shell"),
-                    path: None,
-                    ask_for_approval: codewhale_execpolicy::AskForApproval::UnlessTrusted,
-                    sandbox_mode: Some("workspace-write"),
-                })
-                .expect("policy check");
-            assert!(decision.matched_rule.is_none());
         }
 
-        // Edit both files on disk: new model + a permission rule.
         fs::write(
             &config_path,
             "api_key = \"sk-deepseek-secret\"\nmodel = \"deepseek-reasoner\"\n",
         )
         .expect("rewrite config");
-        fs::write(
-            tmp.path().join("permissions.toml"),
-            r#"
-            [[rules]]
-            tool = "exec_shell"
-            command = "cargo test"
-            "#,
-        )
-        .expect("write permissions");
 
-        // ConfigReload must re-read both files and push them into the
-        // live Runtime without a restart.
+        // ConfigReload must re-read the file and push it into the live
+        // Runtime without a restart.
         let response =
             process_app_request(&state, AppRequest::ConfigReload, AppTransport::Stdio).await;
         assert!(response.ok, "reload should succeed");
@@ -2950,32 +2920,15 @@ mod tests {
             let cfg = state.config.read().await;
             assert_eq!(cfg.model.as_deref(), Some("deepseek-reasoner"));
         }
-        // The live Runtime reflects both the new model and the new rule.
+        // The live Runtime reflects the new model.
         {
             let runtime = state.runtime.read().await;
             assert_eq!(runtime.config.model.as_deref(), Some("deepseek-reasoner"));
-            let decision = runtime
-                .exec_policy
-                .check(codewhale_execpolicy::ExecPolicyContext {
-                    command: "cargo test --workspace",
-                    cwd: "/workspace",
-                    tool: Some("exec_shell"),
-                    path: None,
-                    ask_for_approval: codewhale_execpolicy::AskForApproval::UnlessTrusted,
-                    sandbox_mode: Some("workspace-write"),
-                })
-                .expect("policy check");
-            assert!(decision.allow);
-            assert!(decision.requires_approval);
-            assert_eq!(
-                decision.matched_rule.as_deref(),
-                Some("tool=exec_shell command=cargo test")
-            );
         }
     }
 
     #[tokio::test]
-    async fn config_set_propagates_to_runtime_config_without_touching_exec_policy() {
+    async fn config_set_propagates_to_runtime_config() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config_path = tmp.path().join("config.toml");
         fs::write(
@@ -2985,8 +2938,7 @@ mod tests {
         .expect("write config");
         let state = build_state(Some(config_path.clone()), None).expect("state");
 
-        // Set a new model via the API. Only config.toml is touched; no
-        // permissions.toml exists, so exec_policy must stay empty.
+        // Set a new model via the API.
         let response = process_app_request(
             &state,
             AppRequest::ConfigSet {
@@ -3002,19 +2954,6 @@ mod tests {
         {
             let runtime = state.runtime.read().await;
             assert_eq!(runtime.config.model.as_deref(), Some("deepseek-reasoner"));
-            // exec_policy was empty at startup and must remain empty.
-            let decision = runtime
-                .exec_policy
-                .check(codewhale_execpolicy::ExecPolicyContext {
-                    command: "cargo test",
-                    cwd: "/workspace",
-                    tool: Some("exec_shell"),
-                    path: None,
-                    ask_for_approval: codewhale_execpolicy::AskForApproval::UnlessTrusted,
-                    sandbox_mode: Some("workspace-write"),
-                })
-                .expect("policy check");
-            assert!(decision.matched_rule.is_none());
         }
         // The on-disk file was persisted.
         let persisted = fs::read_to_string(&config_path).expect("read config");
@@ -3186,7 +3125,7 @@ mod tests {
 
         // An unrelated config snapshot still rebuilds the bridge child.
         let snapshot = state.config.read().await.clone();
-        apply_config_update(&state, snapshot, None, false).await;
+        apply_config_update(&state, snapshot, false).await;
         assert!(
             state.runtime_bridge.lock().await.is_none(),
             "config update must drop the cached bridge",

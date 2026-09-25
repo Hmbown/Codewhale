@@ -3,9 +3,7 @@ import type { ChromeDict } from "../types";
 /**
  * Simplified Chinese chrome — a native rewrite mirroring the current
  * English direction (the wordmark tag is "any model, on your machine";
- * the retired "local-first" framing is gone). Nav pairs each Chinese
- * primary label with a short English secondary — the inverse of the
- * English edition's Han companion labels.
+ * the retired "local-first" framing is gone).
  */
 export const chrome: ChromeDict = {
   navDocs: "文档",
@@ -15,22 +13,11 @@ export const chrome: ChromeDict = {
   navCommunity: "社区",
   navContribute: "贡献",
 
-  navDocsSecondary: "Docs",
-  navStartSecondary: "Start",
-  navInstallSecondary: "Install",
-  navFaqSecondary: "FAQ",
-  navCommunitySecondary: "Community",
-  navContributeSecondary: "Contribute",
-
   navProduct: "产品",
   navModels: "模型",
   navPlugins: "插件",
-  navProductSecondary: "Product",
-  navModelsSecondary: "Models",
-  navPluginsSecondary: "Plugins",
 
   skipToContent: "跳转到主要内容",
-
 
   navPrimaryAria: "主导航",
   navHomeAria: "Codewhale 首页",
@@ -38,17 +25,12 @@ export const chrome: ChromeDict = {
   installCta: "安装 →",
 
   authSignIn: "登录",
-  authRegister: "创建账户",
-  authGroupAria: "账户",
 
   wordmarkSeal: "深",
   wordmarkTag: "任意模型，本机运行",
 
   issueLabel: "第 {date} 期",
   dateLocale: "zh-CN",
-
-  starsAria: "GitHub 星标数",
-  githubFallback: "GitHub",
 
   tickerLiveLabel: "实 时",
   tickerLiveTag: "LIVE",
@@ -69,8 +51,8 @@ export const chrome: ChromeDict = {
   themeAuto: "自动",
   themeLight: "浅色",
   themeDark: "深色",
-  themeAria: "文档主题：{mode}（点击切换）",
-  themeTitle: "文档主题 · 自动 / 浅色 / 深色",
+  themeAria: "主题：{mode}（点击切换）",
+  themeTitle: "主题 · 自动 / 浅色 / 深色",
 
   footerTagline:
     "用你选择的模型构建想做的项目，并自动处理日常工作。",

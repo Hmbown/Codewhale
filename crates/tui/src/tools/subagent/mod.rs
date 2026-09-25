@@ -4199,9 +4199,8 @@ impl SubAgentManager {
     }
 
     /// The rate-limit governor backing [`Self::launch_gate`]; exposed so the
-    /// engine can stamp it onto root runtimes and tests can drive the
-    /// adaptive scheduler. (Surfacing governor state in status events is a
-    /// parent-repo follow-up.)
+    /// engine can stamp it onto root runtimes, `GET /v1/agent-runs` can report
+    /// it (addendum F5), and tests can drive the adaptive scheduler.
     #[must_use]
     pub(crate) fn rate_limit_governor(&self) -> Arc<governor::RateLimitGovernor> {
         Arc::clone(&self.governor)
@@ -6234,6 +6233,32 @@ impl SubAgentManager {
         self.agents
             .get(agent_id)
             .map(|agent| self.snapshot_for_listing(agent))
+    }
+
+    /// Write-scoped descendants of `ancestor` that the same Stop cancelled and
+    /// that carry no preservation receipt yet (F4 per-descendant receipts).
+    /// Read-only descendants are skipped: they have no baseline to inventory.
+    fn freshly_cancelled_writing_descendants(&self, ancestor: &str) -> Vec<String> {
+        self.agents
+            .values()
+            .filter(|agent| {
+                agent.id != ancestor
+                    && agent.status == SubAgentStatus::Cancelled
+                    && agent.result.as_deref() == Some(CANCELLED_BY_PARENT_RESULT)
+                    && self
+                        .worker_records
+                        .get(&agent.id)
+                        .is_some_and(|record| record.spec.runtime_profile.permissions.write)
+                    && self
+                        .ensure_caller_controls_descendant(
+                            &agent.id,
+                            Some(ancestor),
+                            "agent/cancel",
+                        )
+                        .is_ok()
+            })
+            .map(|agent| agent.id.clone())
+            .collect()
     }
 
     /// Terminalize a child that already left `Running` but whose worker record
@@ -11994,6 +12019,11 @@ fn budget_partial_result(
 /// isolated-worktree checkpoint a budget death gets, off the manager lock,
 /// and appends it to the child's result. Read-only children have no
 /// delivery baseline and are returned unchanged.
+///
+/// A Stop cascades to the child's descendants (`cancel_agent_for_session`),
+/// so each write-scoped descendant stopped with it gets its own receipt too:
+/// the work a grandchild left is named on the grandchild's record instead of
+/// vanishing behind the parent's single line.
 pub(crate) async fn preserve_cancelled_work(
     manager: &SharedSubAgentManager,
     snapshot: SubAgentResult,
@@ -12002,6 +12032,20 @@ pub(crate) async fn preserve_cancelled_work(
         || snapshot.result.as_deref() != Some(CANCELLED_BY_PARENT_RESULT)
     {
         return snapshot;
+    }
+    let descendants = manager
+        .read()
+        .await
+        .freshly_cancelled_writing_descendants(&snapshot.agent_id);
+    for descendant in descendants {
+        if let Some(note) =
+            budget_work_preservation_note(manager, &descendant, "cancelled with its parent").await
+        {
+            manager
+                .write()
+                .await
+                .append_cancel_preservation_note(&descendant, &note);
+        }
     }
     let Some(note) =
         budget_work_preservation_note(manager, &snapshot.agent_id, "cancelled by parent").await
@@ -14904,9 +14948,22 @@ async fn run_subagent(
         budget_handback::repair_stopped_tool_calls(&mut messages, cause);
         // Unavailable or rejected reports must not replace the recorded work
         // used by the deterministic fallback.
+        let digest = budget_handback::fallback_partial_text(&messages);
         if final_result.is_none() {
-            final_result = Some(budget_handback::fallback_partial_text(&messages));
+            final_result = Some(digest.clone());
         }
+        // #6536: the digest is the deliverable until a model report
+        // replaces it, so record it before the hand-back turn can fail.
+        let digest_artifact = budget_handback::write_digest_artifact(
+            runtime,
+            &agent_id,
+            format!("# Budget hand-back digest\n\nStop cause: {cause}\n\n{digest}\n"),
+        )
+        .await;
+        let saved_at = digest_artifact
+            .as_ref()
+            .map(|path| format!(" (saved at {})", path.display()))
+            .unwrap_or_default();
         match budget_handback::request_report(
             runtime,
             &agent_id,
@@ -14923,14 +14980,31 @@ async fn run_subagent(
                 text,
                 usage_reported,
             } => {
+                if digest_artifact.is_some() {
+                    // A finished report augments the recorded digest.
+                    budget_handback::write_digest_artifact(
+                        runtime,
+                        &agent_id,
+                        format!(
+                            "# Budget hand-back report\n\nStop cause: {cause}\n\n{text}\n\n## Deterministic digest\n\n{digest}\n"
+                        ),
+                    )
+                    .await;
+                }
                 final_result = Some(text);
-                let mut note = "One tools-disabled model hand-back turn produced this partial report using the reserved allowance. The assignment is not complete.".to_string();
+                let mut note = format!(
+                    "One tools-disabled model hand-back turn produced this partial report using the reserved allowance{saved_at}. The assignment is not complete."
+                );
                 if !usage_reported {
                     note.push_str(" Reporting-call usage was not provided; the measured total is only a subtotal, not a zero-cost report.");
                 }
                 handback_note = Some(note);
             }
-            budget_handback::Outcome::Fallback(note) => handback_note = Some(note),
+            budget_handback::Outcome::Fallback(note) => {
+                handback_note = Some(format!(
+                    "{note} The model's own hand-back report did not finish, so the deterministic digest below is this child's deliverable{saved_at}."
+                ));
+            }
             budget_handback::Outcome::Cancelled => {
                 let checkpoint = build_subagent_checkpoint(
                     &agent_id,

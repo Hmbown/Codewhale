@@ -25,7 +25,7 @@ export function FeedCard({ item, dense = false }: { item: FeedItem; dense?: bool
   return (
     <article className={`hairline-b py-4 ${dense ? "" : "px-1"}`}>
       <div className="flex items-baseline gap-3 mb-1.5">
-        <span className="font-mono text-[0.66rem] uppercase tracking-widest text-indigo">
+        <span className="text-xs text-indigo">
           {k.label} <span className="font-cjk text-ink-mute normal-case tracking-normal ml-1">{k.cn}</span>
         </span>
         <span className="font-mono text-[0.7rem] text-ink-mute tabular">#{item.number}</span>

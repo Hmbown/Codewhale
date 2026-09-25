@@ -65,7 +65,6 @@ pub(crate) enum Recency {
 
 impl Recency {
     #[must_use]
-    #[cfg(test)]
     pub(crate) const fn days(self) -> u16 {
         match self {
             Self::Day => 1,

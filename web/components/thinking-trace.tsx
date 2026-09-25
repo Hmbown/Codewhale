@@ -80,7 +80,7 @@ export function ThinkingTrace({ locale = "en" }: { locale?: string }) {
               <span className="w-2.5 h-2.5 rounded-full bg-jade inline-block" />
               <span className="w-2.5 h-2.5 rounded-full bg-ochre inline-block" />
               <span className="w-2.5 h-2.5 rounded-full bg-indigo inline-block" />
-              <span className="ml-2.5 font-mono text-[0.66rem] uppercase tracking-widest text-ink-mute">
+              <span className="ml-2.5 text-xs text-ink-mute">
                 codewhale — thinking
               </span>
             </div>
@@ -90,7 +90,7 @@ export function ThinkingTrace({ locale = "en" }: { locale?: string }) {
           </div>
 
           {/* context */}
-          <div className="px-4 pt-4 text-[0.66rem] font-mono uppercase tracking-wider text-ink-mute">
+          <div className="px-4 pt-4 text-xs text-ink-mute">
             {isZh ? s.context.zh : s.context.en}
           </div>
 
@@ -103,7 +103,7 @@ export function ThinkingTrace({ locale = "en" }: { locale?: string }) {
           {/* cited authority */}
           <div className="px-4 pb-3 flex flex-wrap gap-1.5">
             {s.cites.map((c) => (
-              <span key={c} className="pill text-[0.58rem] tracking-wider">
+              <span key={c} className="pill text-[0.58rem]">
                 {c}
               </span>
             ))}

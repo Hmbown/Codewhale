@@ -69,7 +69,7 @@ export function InstallBinary({ copyLabel, copiedLabel, verifyHeading = "Verify 
             type="button"
             onClick={() => setArch(a)}
             aria-pressed={arch === a}
-            className={`px-3 py-1.5 font-mono text-[0.7rem] tracking-wider transition-colors ${
+            className={`px-3 py-1.5 text-xs transition-colors ${
               i > 0 ? "hairline-l" : ""
             } ${arch === a ? "bg-indigo text-paper" : "bg-paper hover:bg-paper-deep"}`}
           >

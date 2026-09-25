@@ -83,13 +83,9 @@
   filter: brightness(0) invert(0.93);
 }
 
-.paper-star-badge {
-  font-family: var(--font-body);
-  font-size: 0.75rem;
-}
-
 .paper-install-cta {
   align-items: center;
+  justify-content: center;
   min-height: 2.25rem;
   padding: 0.35rem 0.85rem;
   background: var(--indigo);
@@ -106,68 +102,104 @@
   color: var(--paper);
 }
 
-.paper-auth {
-  display: inline-flex;
+/* The one identity door: a quiet text control beside the primary action. */
+.paper-auth-signin {
   align-items: center;
-  gap: 0.5rem;
-}
-
-.paper-auth-signin,
-.paper-auth-register {
-  align-items: center;
+  justify-content: center;
   min-height: 2.25rem;
   padding: 0.35rem 0.75rem;
+  color: var(--ink);
   font-family: var(--font-body);
   font-size: 0.8125rem;
   font-weight: 600;
-  transition: background-color var(--dur-state) var(--ease-spring), color var(--dur-state) var(--ease-spring), border-color var(--dur-state) var(--ease-spring);
+  border-radius: var(--radius-control);
+  transition: background-color var(--dur-state) var(--ease-spring);
 }
 
-.paper-auth-signin,
-.paper-auth-register {
-  color: var(--ink);
-}
+.paper-auth-signin:hover { background: var(--hover); }
 
-.paper-auth-signin:hover,
-.paper-auth-register:hover {
-  color: var(--indigo);
-}
-
+/* Actions sit 2px apart, as related rail controls in the GPUI client; the
+   text door and primary action take a group gap before them. */
 .site-nav-actions {
   display: flex;
   flex-shrink: 0;
   align-items: center;
-  gap: 0.65rem;
+  gap: 2px;
 }
 
 .site-nav-actions > * { flex-shrink: 0; }
+.site-nav-actions > .paper-auth-signin { margin-left: 0.5rem; }
+.site-nav-actions > .paper-install-cta { margin-left: 0.25rem; }
 
-/* Native <select> sizes to the selected option (Safari) or the longest
-   option (Chrome). Unbounded, "Bahasa Indonesia (sebagian)" / "Deutsch
-   (teilweise)" push the compact controls past overflow-x: clip. */
-.site-nav-actions select {
-  width: 6.75rem;
-  max-width: 6.75rem;
-  min-width: 0;
-}
-
-.site-github-link {
+/* Quiet icon controls (theme, language, GitHub, menu): a 40px target around
+   a 20px glyph, the GPUI rail metrics. Muted at rest, full ink on hover and
+   while the control is expanded; the accessible name carries the state. */
+.nav-icon-button {
+  position: relative;
   display: inline-flex;
-  min-height: 2.25rem;
+  width: 2.5rem;
+  height: 2.5rem;
   align-items: center;
-  padding: 0.35rem 0.75rem;
-  border: 1px solid var(--hairline);
+  justify-content: center;
+  color: var(--ink-soft);
   border-radius: var(--radius-control);
-  font-family: var(--font-body);
-  font-size: 0.75rem;
-  font-weight: 600;
+  cursor: pointer;
+  transition: background-color var(--dur-state) var(--ease-spring), color var(--dur-state) var(--ease-spring);
 }
 
-.site-github-link:hover { border-color: var(--ink); }
+.nav-icon-button:hover,
+.nav-icon-button[aria-expanded="true"] {
+  background: var(--hover);
+  color: var(--ink);
+}
 
-.brand-mark { width: 1rem; height: 1rem; display: block; }
+.nav-icon { display: block; width: 1.25rem; height: 1.25rem; }
 
-.paper-star-badge .brand-mark { margin-right: 0.3rem; }
+/* The native <select> stays the control (keyboard, screen readers, the
+   platform picker) but is transparent over the globe glyph, so the icon is
+   the whole hit target. Its focus ring moves to the visible box. */
+.nav-locale select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+  font-size: 1rem;
+}
+
+.nav-locale:has(select:focus-visible) {
+  box-shadow: 0 0 0 var(--gpui-focus-width) var(--ring);
+}
+
+/* Compact sheet rows: one label per destination, a chevron, a selected fill
+   for the current page rather than a decorative bar. */
+.mm-list > li + li { border-top: 1px solid var(--hairline); }
+
+.mm-link {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-height: 3.25rem;
+  padding-inline: 0.5rem;
+  color: var(--ink);
+  font-size: 1.0625rem;
+  border-radius: var(--radius-control);
+  transition: background-color var(--dur-state) var(--ease-spring);
+}
+
+.mm-link:hover { background: var(--hover); }
+.mm-link[aria-current="page"] { background: var(--selected); }
+.mm-link-chevron { margin-left: auto; color: var(--ink-mute); }
+
+.mm-action {
+  display: flex;
+  width: 100%;
+  min-height: 2.75rem;
+  margin-top: 0.75rem;
+}
+
+.mm-action.paper-install-cta { margin-top: 1.5rem; }
 
 .nav-link {
   font-family: var(--font-body);

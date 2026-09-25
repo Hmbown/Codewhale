@@ -1513,6 +1513,9 @@ pub(crate) async fn handle_view_events(
                     Ok(recovery) => {
                         let session = recovery.session;
                         let next_config = config.clone();
+                        // Keep the saved-store confinement check a pure
+                        // comparison on this runtime (#6522).
+                        crate::runtime_threads::prepare_canonical_sessions_root().await;
                         let respawn = match apply_loaded_session_config_snapshot(
                             app,
                             config,

@@ -68,7 +68,7 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
               <div key={key} className="hairline-t hairline-b hairline-l hairline-r bg-paper">
                 <div className="bg-paper-deep text-ink px-4 py-2 flex items-center justify-between">
                   <div className="flex items-center gap-3">
-                    <span className="font-mono text-xs uppercase tracking-wider text-indigo">
+                    <span className="text-xs text-indigo">
                       {isZh ? label.zh : label.en}
                     </span>
                     {draft.targetNumber && (
@@ -92,13 +92,13 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
                         <button
                           onClick={() => handleAction(key, "post", editBody)}
                           disabled={loading === key}
-                          className="px-4 py-2 bg-indigo text-paper font-mono text-xs uppercase tracking-wider hover:bg-indigo-deep transition-colors disabled:opacity-50"
+                          className="portal-button portal-button-primary disabled:opacity-50"
                         >
                           {isZh ? "确认发布" : "Post edited"}
                         </button>
                         <button
                           onClick={() => setEditing(null)}
-                          className="px-4 py-2 hairline-t hairline-b hairline-l hairline-r font-mono text-xs uppercase tracking-wider hover:bg-paper-deep transition-colors"
+                          className="portal-button portal-button-secondary"
                         >
                           {isZh ? "取消" : "Cancel"}
                         </button>
@@ -113,20 +113,20 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
                         <button
                           onClick={() => handleAction(key, "post")}
                           disabled={loading === key}
-                          className="px-4 py-2 bg-indigo text-paper font-mono text-xs uppercase tracking-wider hover:bg-indigo-deep transition-colors disabled:opacity-50"
+                          className="portal-button portal-button-primary disabled:opacity-50"
                         >
                           {isZh ? "发布评论" : "Post as comment"}
                         </button>
                         <button
                           onClick={() => startEdit(draft)}
-                          className="px-4 py-2 hairline-t hairline-b hairline-l hairline-r font-mono text-xs uppercase tracking-wider hover:bg-paper-deep transition-colors"
+                          className="portal-button portal-button-secondary"
                         >
                           {isZh ? "编辑后发布" : "Edit & post"}
                         </button>
                         <button
                           onClick={() => handleAction(key, "discard")}
                           disabled={loading === key}
-                          className="px-4 py-2 font-mono text-xs uppercase tracking-wider text-ink-mute hover:text-indigo transition-colors disabled:opacity-50"
+                          className="px-4 py-2 text-sm text-ink-mute hover:text-indigo transition-colors disabled:opacity-50"
                         >
                           {isZh ? "丢弃" : "Discard"}
                         </button>
@@ -152,7 +152,7 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
             return (
               <div key={key} className="hairline-t py-3 px-4 opacity-60">
                 <div className="flex items-center gap-3 mb-1">
-                  <span className="font-mono text-xs uppercase tracking-wider text-ink-mute">
+                  <span className="text-xs text-ink-mute">
                     {isZh ? label.zh : label.en}
                   </span>
                   {draft.targetNumber && (

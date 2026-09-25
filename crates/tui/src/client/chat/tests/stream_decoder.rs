@@ -512,15 +512,15 @@ fn modelstudio_streams_reasoning_content_as_thinking() {
         );
     }
 
-    // A non-reasoning model id on the same route keeps the old
-    // pass-through semantics (no fabricated Thinking surface).
+    // A model id the catalog does not know still routes the reasoning field
+    // to Thinking (#6501); a model that sends no reasoning field gets none.
     let style = reasoning_stream_style_for_route(
         ApiProvider::ModelstudioTokenPlan,
         crate::config::DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL,
         "qwen3.8-max-lite-unknown",
         None,
     );
-    assert_eq!(style, ReasoningStreamStyle::None);
+    assert_eq!(style, ReasoningStreamStyle::SeparateField);
 }
 
 #[test]
@@ -640,7 +640,80 @@ fn exact_kimi_code_k3_streams_reasoning_content_as_thinking() {
         crate::config::KIMI_CODE_K3_MODEL,
         None,
     );
-    assert_eq!(generic_style, ReasoningStreamStyle::None);
+    assert_eq!(generic_style, ReasoningStreamStyle::SeparateField);
+}
+
+/// #6501 regression: the founder's grok-4.7 (xAI) and mimo-v2.6-pro
+/// (Xiaomi MiMo) sessions persisted the reasoning summary glued to the answer
+/// in one Text block ("...I should help them find large f...Sure, I'd be
+/// happy to help"). Decode that stream shape through the real route style.
+#[test]
+fn issue_6501_reasoning_field_never_leaks_into_answer_text_on_unlisted_routes() {
+    for (provider, base_url, model) in [
+        (
+            ApiProvider::Xai,
+            crate::config::DEFAULT_XAI_BASE_URL,
+            "grok-4.7",
+        ),
+        (
+            ApiProvider::XiaomiMimo,
+            "https://token-plan-sgp.xiaomimimo.com/v1",
+            "mimo-v2.7-pro-unreleased",
+        ),
+        (
+            ApiProvider::Openai,
+            "https://gateway.example.test/v1",
+            "some-new-reasoner",
+        ),
+    ] {
+        let style = reasoning_stream_style_for_route(provider, base_url, model, None);
+        assert_eq!(style, ReasoningStreamStyle::SeparateField, "{provider:?}");
+        let events = decode_chunks_with_style(
+            &[
+                r#"{"choices":[{"delta":{"role":"assistant","reasoning_content":"The user wants help finding large files"}}]}"#,
+                r#"{"choices":[{"delta":{"reasoning_content":"..."}}]}"#,
+                r#"{"choices":[{"delta":{"content":"Sure, I'd be happy to help."}}]}"#,
+                r#"{"choices":[{"delta":{"reasoning":"then a tool"}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"exec_shell","arguments":"{}"}}]}}]}"#,
+                r#"{"choices":[{"finish_reason":"tool_calls"}]}"#,
+            ],
+            style,
+        );
+        assert_eq!(
+            thinking_delta_text(&events),
+            "The user wants help finding large files...then a tool",
+            "{provider:?}"
+        );
+        assert_eq!(
+            text_delta_text(&events),
+            "Sure, I'd be happy to help.",
+            "{provider:?}: reasoning must not reach answer text"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::ContentBlockStart {
+                    content_block: ContentBlockStart::ToolUse { .. },
+                    ..
+                }
+            )),
+            "{provider:?}: reasoning -> tool call transition must keep the tool call"
+        );
+    }
+
+    // The explicit opt-out keeps the legacy pass-through for gateways that
+    // really stream their answer in `reasoning_content`.
+    let passthrough = decode_chunks_with_style(
+        &[r#"{"choices":[{"delta":{"reasoning_content":"answer via reasoning field"}}]}"#],
+        reasoning_stream_style_for_route(
+            ApiProvider::Openai,
+            "https://gateway.example.test/v1",
+            "some-new-reasoner",
+            Some("none"),
+        ),
+    );
+    assert_eq!(thinking_delta_text(&passthrough), "");
+    assert_eq!(text_delta_text(&passthrough), "answer via reasoning field");
 }
 
 #[test]
@@ -704,7 +777,7 @@ fn reasoning_style_none_keeps_inline_tags_visible_text() {
 fn configured_reasoning_style_overrides_route_default() {
     assert_eq!(
         reasoning_stream_style_for_stream(ApiProvider::Openai, "custom-minimax", None),
-        ReasoningStreamStyle::None
+        ReasoningStreamStyle::SeparateField
     );
     assert_eq!(
         reasoning_stream_style_for_stream(

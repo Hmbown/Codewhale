@@ -145,7 +145,7 @@ export function FaqSearch({
                 </div>
                 {item.sources && item.sources.length > 0 && (
                   <div className="mt-3 flex items-center gap-2 flex-wrap">
-                    <span className="font-mono text-[0.66rem] text-ink-mute uppercase tracking-wider">
+                    <span className="text-xs text-ink-mute">
                       {isZh ? "来源" : "Sources"}:
                     </span>
                     {item.sources.map((s) => {

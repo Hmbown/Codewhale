@@ -803,7 +803,7 @@ export default async function FaqPage({ params }: { params: Promise<{ locale: st
           </p>
           <a
             href="https://github.com/Hmbown/CodeWhale/issues/new/choose"
-            className="inline-flex items-center gap-2 px-5 py-3 bg-indigo text-paper font-mono text-sm uppercase tracking-wider hover:bg-indigo-deep transition-colors"
+            className="portal-button portal-button-primary gap-2"
           >
             {isZh ? "提交 Issue →" : "Open an issue →"}
           </a>

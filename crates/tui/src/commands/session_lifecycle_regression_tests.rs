@@ -118,6 +118,8 @@ fn save_preserves_latest_auto_route_receipt() {
         reason: crate::model_routing::AutoRouteReason::LocalFallback(
             crate::model_routing::AutoRouteHeuristicReason::DeclaredDefault,
         ),
+        decision: None,
+        router_failure: None,
     };
     app.set_model_selection("auto".to_string());
     app.last_effective_provider = Some(crate::config::ApiProvider::Zai);

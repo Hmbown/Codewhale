@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { currentNavHref, type ChromeLink } from "@/lib/i18n/links";
+import { Icon } from "./icon";
 
 export function MobileMenu({
   links,
@@ -13,8 +14,6 @@ export function MobileMenu({
   installLabel,
   signInHref,
   signInLabel,
-  registerHref,
-  registerLabel,
   openLabel,
   closeLabel,
   navAria,
@@ -26,8 +25,6 @@ export function MobileMenu({
   installLabel: string;
   signInHref: string;
   signInLabel: string;
-  registerHref: string;
-  registerLabel: string;
   openLabel: string;
   closeLabel: string;
   /** Accessible name for the dialog's navigation landmark. */
@@ -128,10 +125,10 @@ export function MobileMenu({
       }
     };
 
-    // Tailwind's xl boundary hides the compact controls. Close immediately
+    // Tailwind's lg boundary hides the compact controls. Close immediately
     // when a live resize crosses it so an invisible sheet cannot retain the
     // body's scroll lock.
-    const desktop = window.matchMedia("(min-width: 1280px)");
+    const desktop = window.matchMedia("(min-width: 1024px)");
     const onDesktop = (event: MediaQueryListEvent | MediaQueryList) => {
       if (event.matches) closeImmediately();
     };
@@ -162,42 +159,26 @@ export function MobileMenu({
         ref={toggleRef}
         type="button"
         onClick={onToggle}
-        className="xl:hidden inline-flex items-center justify-center w-9 h-9 hairline-t hairline-b hairline-l hairline-r hover:bg-paper-deep transition-colors"
+        className="nav-icon-button lg:hidden"
         aria-label={open ? closeLabel : openLabel}
         aria-expanded={open}
         aria-controls="mobile-menu"
       >
-        {open ? (
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden>
-            <path d="M2 2L12 12M12 2L2 12" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-          </svg>
-        ) : (
-          <svg width="16" height="12" viewBox="0 0 16 12" fill="none" aria-hidden>
-            <path d="M0 1H16M0 6H16M0 11H16" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-          </svg>
-        )}
+        <Icon name={open ? "x" : "menu"} className="nav-icon" />
       </button>
 
       {open && typeof document !== "undefined" &&
         createPortal(<div
           ref={menuRef}
           id="mobile-menu"
-          className={`mm-panel xl:hidden fixed inset-0 z-40 bg-paper overflow-y-auto${closing ? " mm-closing" : ""}`}
+          className={`mm-panel lg:hidden fixed inset-0 z-40 bg-paper overflow-y-auto${closing ? " mm-closing" : ""}`}
           role="dialog"
           aria-modal="true"
           aria-label={navAria}
         >
-          <div className="flex min-h-[5.75rem] items-center justify-between px-6 hairline-b">
-            <span className="font-display text-lg">{navAria}</span>
-            <button
-              type="button"
-              onClick={close}
-              className="inline-flex h-9 w-9 items-center justify-center hairline-t hairline-b hairline-l hairline-r hover:bg-paper-deep transition-colors"
-              aria-label={closeLabel}
-            >
-              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden>
-                <path d="M2 2L12 12M12 2L2 12" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-              </svg>
+          <div className="flex min-h-[3.85rem] items-center justify-end px-4 hairline-b">
+            <button type="button" onClick={close} className="nav-icon-button" aria-label={closeLabel}>
+              <Icon name="x" className="nav-icon" />
             </button>
           </div>
           {/* Only one nav landmark is exposed at a time (the desktop nav is
@@ -205,7 +186,7 @@ export function MobileMenu({
               landmark name and the inner nav stays unlabeled — two nested
               "Primary" landmarks would read as duplication. */}
           <nav className="px-6 py-4">
-            <ul className="divide-y divide-[rgba(20,35,82,0.14)]">
+            <ul className="mm-list">
               {[...links, ...moreLinks].map((l) => {
                 const isActive = l.href === currentHref;
                 return (
@@ -213,14 +194,11 @@ export function MobileMenu({
                     <Link
                       href={l.href}
                       onClick={() => setOpen(false)}
-                      className={`flex items-baseline gap-3 py-4 hover:text-indigo transition-colors ${isActive ? "text-indigo" : ""}`}
+                      className="mm-link"
                       aria-current={isActive ? "page" : undefined}
                     >
-                      <span className="font-display text-lg">{l.label}</span>
-                      {l.secondary && (
-                        <span className="font-cjk text-sm text-ink-mute">{l.secondary}</span>
-                      )}
-                      <span className="ml-auto font-mono text-xs text-ink-mute">→</span>
+                      <span>{l.label}</span>
+                      <Icon name="chevron-right" className="nav-icon mm-link-chevron" />
                     </Link>
                   </li>
                 );
@@ -230,28 +208,18 @@ export function MobileMenu({
             <Link
               href={installHref}
               onClick={() => setOpen(false)}
-              className="mt-6 block w-full text-center px-5 py-3 bg-indigo text-paper font-mono text-sm uppercase tracking-wider hover:bg-indigo-deep transition-colors"
+              className="mm-action paper-install-cta"
             >
               {installLabel}
             </Link>
-            <div className="mt-3 grid grid-cols-2 gap-3">
-              <Link
-                href={signInHref}
-                data-usage="login"
-                onClick={() => setOpen(false)}
-                className="block text-center px-5 py-3 hairline-t hairline-b hairline-l hairline-r font-mono text-sm uppercase tracking-wider hover:bg-paper-deep transition-colors"
-              >
-                {signInLabel}
-              </Link>
-              <Link
-                href={registerHref}
-                data-usage="signup"
-                onClick={() => setOpen(false)}
-                className="block text-center px-5 py-3 hairline-t hairline-b hairline-l hairline-r font-mono text-sm uppercase tracking-wider text-indigo hover:bg-paper-deep transition-colors"
-              >
-                {registerLabel}
-              </Link>
-            </div>
+            <Link
+              href={signInHref}
+              data-usage="login"
+              onClick={() => setOpen(false)}
+              className="mm-action paper-auth-signin"
+            >
+              {signInLabel}
+            </Link>
           </nav>
         </div>, document.body)}
     </>

@@ -33,6 +33,7 @@ mod profile;
 mod provider;
 mod queue;
 mod rlm;
+pub(in crate::commands) mod router;
 mod setup;
 mod stash;
 mod subagents;
@@ -81,6 +82,10 @@ impl CommandGroup for CoreCommands {
             Box::new(FunctionCommand::new(
                 model::ModelCmd::info(),
                 model::ModelCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                router::RouterCmd::info(),
+                router::RouterCmd::execute,
             )),
             Box::new(FunctionCommand::new(
                 models::ModelsCmd::info(),

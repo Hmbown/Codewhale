@@ -3176,6 +3176,51 @@ impl std::fmt::Display for StoreAdoptionRefusal {
     }
 }
 
+/// Canonical spellings of configured sessions roots, keyed by the lexical
+/// root `resolve_state_dir("sessions")` returns (tests move the state dir per
+/// case, so one slot is not enough). The confinement predicate compares
+/// against this instead of resolving a path itself, so a `/resume`, `/load`
+/// or launch resume on the UI runtime never waits on filesystem resolution:
+/// those entry points warm the cache on a blocking thread first
+/// ([`prepare_canonical_sessions_root`]) (#6522).
+static CANONICAL_SESSIONS_ROOTS: std::sync::Mutex<Vec<(PathBuf, PathBuf)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn cached_canonical_sessions_root(sessions: &Path) -> Option<PathBuf> {
+    CANONICAL_SESSIONS_ROOTS
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(lexical, _)| lexical == sessions)
+        .map(|(_, canonical)| canonical.clone())
+}
+
+/// Resolve and remember the canonical form of `sessions`. Blocking: reach it
+/// through [`prepare_canonical_sessions_root`] from async code. A root that
+/// does not exist yet is not remembered, so a later call can still resolve it.
+fn resolve_canonical_sessions_root(sessions: &Path) -> Option<PathBuf> {
+    let canonical = sessions.canonicalize().ok()?;
+    if let Ok(mut cache) = CANONICAL_SESSIONS_ROOTS.lock()
+        && !cache.iter().any(|(lexical, _)| lexical == sessions)
+    {
+        cache.push((sessions.to_path_buf(), canonical.clone()));
+    }
+    Some(canonical)
+}
+
+/// Resolve the configured sessions root's canonical spelling on a blocking
+/// thread so the store-confinement checks that follow on the UI runtime are
+/// pure comparisons.
+pub(crate) async fn prepare_canonical_sessions_root() {
+    let Ok(sessions) = codewhale_config::resolve_state_dir("sessions") else {
+        return;
+    };
+    if cached_canonical_sessions_root(&sessions).is_some() {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || resolve_canonical_sessions_root(&sessions)).await;
+}
+
 /// Durable host authority shared by conversations created in that host.
 /// A conversation id can change at launch; the locked Runtime store cannot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3197,7 +3242,26 @@ impl RuntimeStoreBinding {
         let Some(store_name) = self.data_dir.file_name().and_then(|name| name.to_str()) else {
             return Ok(false);
         };
-        if session_dir.parent() != Some(sessions.as_path())
+        // A host records its binding from the store's canonical root
+        // (`checked_runtime_store_root`), while the configured sessions root
+        // is lexical. The two differ whenever an ancestor is spelled another
+        // way — Windows `\\?\C:\` verbatim prefixes and 8.3 short names, or
+        // a symlinked home/TMPDIR on Unix — and every real binding then read
+        // as unconfined, so no switch could ever adopt it (#6418). Accept the
+        // configured spelling or its canonical form only; nothing in the
+        // binding's own path is resolved, so the symlink checks below still
+        // fail closed.
+        //
+        // The canonical root comes from the cache the async entry points
+        // (`TaskManager::start`, `/resume`, `/load`) warm off the UI runtime
+        // via `prepare_canonical_sessions_root`; only a caller that never
+        // warmed it (synchronous tests and tools) resolves it here.
+        let parent = session_dir.parent();
+        let under_sessions = parent == Some(sessions.as_path())
+            || cached_canonical_sessions_root(&sessions)
+                .or_else(|| resolve_canonical_sessions_root(&sessions))
+                .is_some_and(|canonical| parent == Some(canonical.as_path()));
+        if !under_sessions
             || !(store_name == "runtime" || store_name.starts_with("runtime-recovered-"))
             || !session_dir
                 .file_name()
@@ -11531,6 +11595,7 @@ impl RuntimeThreadManager {
                 search_provider: cfg.search_provider(),
                 search_api_key: cfg.search.as_ref().and_then(|s| s.api_key.clone()),
                 search_base_url: cfg.search.as_ref().and_then(|s| s.base_url.clone()),
+                search_native: cfg.search_native(),
                 tools_always_load: if isolated_chat {
                     HashSet::new()
                 } else {

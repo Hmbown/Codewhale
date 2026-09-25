@@ -364,6 +364,53 @@ pub(super) async fn request_report(
     }
 }
 
+const HANDBACK_DIGEST_DIR: &str = "subagent-results";
+
+/// Private state-root path of a child's budget-death result artifact
+/// (#6536). Derived from `agent_id`, never accepted from input.
+fn digest_artifact_relative_path(agent_id: &str) -> PathBuf {
+    let digest = crate::hashing::sha256_hex(agent_id.as_bytes());
+    Path::new(".codewhale")
+        .join("state")
+        .join(HANDBACK_DIGEST_DIR)
+        .join(format!("{digest}.md"))
+}
+
+/// Record the child's budget-death deliverable as a private file under the
+/// manager state root (#6536). Written before the hand-back turn with the
+/// deterministic digest, so a report that never finishes cannot leave the
+/// run without a deliverable; a finished report is written over it with the
+/// digest kept below. Blocking IO runs under `spawn_blocking`.
+///
+/// Known limitation: the file outlives the agent record; removing an agent
+/// does not delete it.
+pub(super) async fn write_digest_artifact(
+    runtime: &SubAgentRuntime,
+    agent_id: &str,
+    body: String,
+) -> Option<PathBuf> {
+    let state_root = runtime.manager.read().await.state_root.clone();
+    let agent = agent_id.to_string();
+    let written = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        let relative = digest_artifact_relative_path(&agent);
+        let path = checked_subagent_state_path(&state_root, &relative)?;
+        create_private_subagent_transcript(&state_root, &path, body.as_bytes())?;
+        Ok(path)
+    })
+    .await;
+    match written {
+        Ok(Ok(path)) => Some(path),
+        Ok(Err(error)) => {
+            tracing::warn!(target: "subagent", agent_id, %error, "budget digest artifact not written");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(target: "subagent", agent_id, %error, "budget digest artifact task failed");
+            None
+        }
+    }
+}
+
 /// Deterministic fallback body when no model hand-back report exists (#6194).
 ///
 /// Prefers the last recorded assistant text. When a budget death interrupts a

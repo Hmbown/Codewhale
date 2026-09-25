@@ -1355,11 +1355,15 @@ pub(crate) fn tideline_footer_from_app(app: &mut App, width: u16) -> TidelineFoo
             crate::tui::footer_hints::ENTER_AGAIN,
         ))
     } else if matches!(phase, ShellPhase::Working | ShellPhase::Verifying) {
-        Some((
-            tr(app.ui_locale, MessageId::FooterHintEscInterrupt).into_owned(),
-            ChromeInk::MetadataHint,
-            crate::tui::footer_hints::ESC_INTERRUPT,
-        ))
+        // #6502: while the workbar owns focus, Esc closes the workbar and the
+        // turn keeps running, so the interrupt promise would be false.
+        (!app.work_surface.focused).then(|| {
+            (
+                tr(app.ui_locale, MessageId::FooterHintEscInterrupt).into_owned(),
+                ChromeInk::MetadataHint,
+                crate::tui::footer_hints::ESC_INTERRUPT,
+            )
+        })
     } else if crate::tui::agent_focus::shell_shortcuts_available(app, false) {
         Some((
             crate::tui::agent_focus::footer_agent_hints(app),

@@ -38,6 +38,9 @@ PATTERNS = {
         r"symlink_metadata|read_dir|canonicalize|exists|set_permissions|"
         r"hard_link|soft_link|symlink|File|OpenOptions|DirBuilder)\b"
     ),
+    # Method form (`path.canonicalize()`) resolves the path on the calling
+    # thread exactly like `std::fs::canonicalize` (#6522 review).
+    "path_canonicalize": re.compile(r"\.canonicalize\s*\(\s*\)"),
 }
 
 ATTR_RE = re.compile(r"#\s*\[([^\]]*)\]")

@@ -625,6 +625,7 @@ pub(crate) async fn run_exec_agent(
             .search
             .as_ref()
             .and_then(|s| s.api_key.clone()),
+        search_native: execution_config.search_native(),
         search_base_url: execution_config
             .search
             .as_ref()
