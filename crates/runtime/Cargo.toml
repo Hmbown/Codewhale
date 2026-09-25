@@ -1,0 +1,54 @@
+[package]
+name = "codewhale-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless Codewhale runtime: engine, tools, sessions and stores, with no terminal UI dependency"
+
+[lints]
+workspace = true
+
+# Test helpers (process-global state guards, snapshots, diff renders) that
+# the TUI's tests use. Only the TUI's [dev-dependencies] enables it, so it
+# never reaches a release build (resolver 2). Every item behind it is `pub`.
+[features]
+test-support = []
+
+[lib]
+name = "codewhale_runtime"
+path = "src/lib.rs"
+
+# This crate must never depend on codewhale-tui, codewhale-cli, ratatui,
+# crossterm, ansi-to-tui or a terminal component kit.
+# scripts/check-command-crate-boundaries.py enforces that with `cargo tree -p`.
+[dependencies]
+ahash = "0.8"
+anyhow.workspace = true
+chrono.workspace = true
+codewhale-config = { path = "../config", version = "0.10.0" }
+codewhale-core = { path = "../core", version = "0.10.0" }
+codewhale-memory = { path = "../memory", version = "0.10.0" }
+codewhale-models = { path = "../models", version = "0.10.0" }
+fd-lock = "4.0.4"
+lru = "0.18"
+regex = "1.11"
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
+sha2.workspace = true
+tokio.workspace = true
+tokio-util = { version = "0.7.16", features = ["io"] }
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+codewhale-models = { path = "../models", version = "0.10.0", features = [
+    "test-support",
+] }
+tempfile.workspace = true
+wait-timeout = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

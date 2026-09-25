@@ -19,6 +19,7 @@ members = [
     "crates/paths",
     "crates/protocol",
     "crates/release",
+    "crates/runtime",
     "crates/secrets",
     "crates/state",
     "crates/telemetry",

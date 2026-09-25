@@ -14,15 +14,15 @@ const CRASH_REPAIR_CONTENT: &str =
     "Tool call interrupted by process exit; terminal status: crashed_and_repaired.";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ToolRepairReceipt {
-    pub(crate) repaired_call_ids: Vec<String>,
-    pub(crate) duplicate_result_ids: Vec<String>,
-    pub(crate) orphan_result_ids: Vec<String>,
+pub struct ToolRepairReceipt {
+    pub repaired_call_ids: Vec<String>,
+    pub duplicate_result_ids: Vec<String>,
+    pub orphan_result_ids: Vec<String>,
 }
 
 impl ToolRepairReceipt {
     #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.repaired_call_ids.is_empty()
             && self.duplicate_result_ids.is_empty()
             && self.orphan_result_ids.is_empty()
@@ -46,7 +46,7 @@ impl ToolRepairReceipt {
 /// quarantined by removing them from model-visible history. Every dangling
 /// call receives a synthetic error result directly after its assistant call
 /// message. A visible system receipt makes the repair apparent after resume.
-pub(crate) fn repair_tool_call_pairs(messages: &mut Vec<Message>) -> ToolRepairReceipt {
+pub fn repair_tool_call_pairs(messages: &mut Vec<Message>) -> ToolRepairReceipt {
     repair_tool_call_pairs_inner(messages, true)
 }
 
@@ -55,9 +55,7 @@ pub(crate) fn repair_tool_call_pairs(messages: &mut Vec<Message>) -> ToolRepairR
 /// Anthropic-style APIs interpret a final assistant message as a completion
 /// prefill. Pair repair must therefore leave the synthetic user tool result as
 /// the request tail; the durable session-facing path owns the visible receipt.
-pub(crate) fn repair_tool_call_pairs_for_provider(
-    messages: &mut Vec<Message>,
-) -> ToolRepairReceipt {
+pub fn repair_tool_call_pairs_for_provider(messages: &mut Vec<Message>) -> ToolRepairReceipt {
     repair_tool_call_pairs_inner(messages, false)
 }
 

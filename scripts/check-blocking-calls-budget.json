@@ -250,7 +250,7 @@
   "crates/tui/src/mcp_server.rs": {
     "std_fs": 1
   },
-  "crates/tui/src/media_originals.rs": {
+  "crates/runtime/src/media_originals.rs": {
     "path_canonicalize": 2,
     "std_fs": 6
   },

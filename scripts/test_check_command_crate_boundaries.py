@@ -126,6 +126,25 @@ class TreeModeTests(unittest.TestCase):
     def test_clean_tree_passes(self) -> None:
         self.assertEqual(mod.check_tree_packages(self.RULE, {"anyhow", "serde"}), [])
 
+    def test_runtime_rule_is_tree_mode(self) -> None:
+        rule = next(r for r in mod.BOUNDARY_RULES if r.package == "codewhale-runtime")
+        self.assertEqual(rule.mode, "tree")
+        self.assertIn("ratatui", rule.forbidden_packages)
+        self.assertIn("crossterm", rule.forbidden_packages)
+
+    def test_runtime_source_scan(self) -> None:
+        self.assertEqual(
+            mod.check_runtime_source_text("// ratatui::Frame is not used here\nfn f() {}\n", "a.rs"),
+            [],
+        )
+        for source in (
+            "use crossterm::terminal;",
+            "let _ = ratatui::style::Color::Reset;",
+            'const X: &str = include_str!("../../tui/assets/x.json");',
+        ):
+            with self.subTest(source=source):
+                self.assertTrue(mod.check_runtime_source_text(source, "a.rs"))
+
     def test_ui_library_in_tree_fails(self) -> None:
         violations = mod.check_tree_packages(self.RULE, {"anyhow", "ratatui", "crossterm"})
         self.assertEqual(len(violations), 2)

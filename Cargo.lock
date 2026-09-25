@@ -1054,6 +1054,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewhale-runtime"
+version = "0.10.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "chrono",
+ "codewhale-config",
+ "codewhale-core",
+ "codewhale-memory",
+ "codewhale-models",
+ "fd-lock",
+ "libc",
+ "lru",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "uuid",
+ "wait-timeout",
+]
+
+[[package]]
 name = "codewhale-secrets"
 version = "0.10.0"
 dependencies = [
@@ -1151,6 +1178,7 @@ dependencies = [
  "codewhale-paths",
  "codewhale-protocol",
  "codewhale-release",
+ "codewhale-runtime",
  "codewhale-secrets",
  "codewhale-telemetry",
  "codewhale-tools",

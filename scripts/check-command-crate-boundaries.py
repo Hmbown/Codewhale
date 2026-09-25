@@ -66,6 +66,25 @@ class BoundaryRule:
     source_scan: Callable[[str, str], list] | None = None
 
 
+RUNTIME_PACKAGE = "codewhale-runtime"
+RUNTIME_DIR = REPO_ROOT / "crates" / "runtime" / "src"
+RUNTIME_FORBIDDEN_PACKAGES = (
+    "codewhale-tui",
+    "codewhale-cli",
+    "ratatui",
+    "ratatui-core",
+    "ratatui-widgets",
+    "crossterm",
+    "ansi-to-tui",
+    "codewhale-tui-kit",
+    "codewhale-ratatui",
+)
+RUNTIME_FORBIDDEN_SOURCE = [
+    (re.compile(r"\b(ratatui|crossterm|codewhale_tui)::"), "terminal UI path"),
+    (re.compile(r"^\s*(pub\s+)?use\s+(ratatui|crossterm|codewhale_tui)\b"), "terminal UI import"),
+    (re.compile(r"include_(str|bytes)!\(\s*\"[^\"]*\.\./tui/"), "include reaching into crates/tui"),
+]
+
 # Filled in below once the scan functions exist.
 BOUNDARY_RULES: tuple[BoundaryRule, ...] = ()
 
@@ -282,6 +301,25 @@ def check_source_dir(rule: BoundaryRule) -> list[BoundaryViolation]:
     return violations
 
 
+def check_runtime_source_text(text: str, display_path: str) -> list[BoundaryViolation]:
+    """Runtime source may not name a terminal UI crate (comments ignored)."""
+    violations: list[BoundaryViolation] = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        code = line.split("//", 1)[0]
+        if not code.strip():
+            continue
+        for pattern, label in RUNTIME_FORBIDDEN_SOURCE:
+            if pattern.search(code):
+                violations.append(
+                    BoundaryViolation(
+                        "source-scan",
+                        f"{display_path}:{line_no}",
+                        f"forbidden {label} in codewhale-runtime: {line.strip()}",
+                    )
+                )
+    return violations
+
+
 def check_contract_source() -> list[BoundaryViolation]:
     """Scan contract production source for forbidden imports and symbols."""
     return check_source_dir(next(r for r in BOUNDARY_RULES if r.package == CONTRACT_PACKAGE))
@@ -360,6 +398,17 @@ BOUNDARY_RULES = (
         "metadata",
         (FORBIDDEN_TUI_PACKAGE,),
         "the shared sanitizer must stay UI-free",
+    ),
+    # The headless runtime split out of the TUI (docs/design/TUI_DECONSTRUCTION.md):
+    # never a terminal UI crate or library, checked with per-package feature
+    # resolution because the TUI turns on palette's `ratatui` feature.
+    BoundaryRule(
+        RUNTIME_PACKAGE,
+        "tree",
+        RUNTIME_FORBIDDEN_PACKAGES,
+        "the runtime must not link terminal UI code",
+        RUNTIME_DIR,
+        check_runtime_source_text,
     ),
 )
 TUI_FREE_PACKAGES = tuple(rule.package for rule in metadata_rules())

@@ -7,7 +7,7 @@ use codewhale_models::SystemBlock;
 use super::fragment::{FragmentId, FragmentRender, FragmentRole, ModelContextFragment};
 
 /// Incremental render of WorldState against a previous snapshot.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorldStateDiff {
     /// Fragments whose content hash changed (or are new).
@@ -41,13 +41,16 @@ impl WorldState {
         render
     }
 
+    // Exported from codewhale-runtime, so clippy now asks for `is_empty`;
+    // the move adds no API (runtime split, behavior-free).
+    #[allow(clippy::len_without_is_empty)]
     #[must_use]
     pub fn len(&self) -> usize {
         self.fragments.len()
     }
 
     /// Full render of every fragment in stable `FragmentId` order.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn render_full(&self) -> String {
         self.fragments
@@ -59,7 +62,7 @@ impl WorldState {
 
     /// Diff against a previous WorldState. Unchanged fragments are retained
     /// (listed, not reinjected into `updated`).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn render_diff(&self, previous: Option<&WorldState>) -> WorldStateDiff {
         let Some(previous) = previous else {
@@ -220,7 +223,7 @@ impl WorldStateSnapshot {
     }
 
     /// Flat text fallback for callers that still expect `SystemPrompt::Text`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn render_text(&self) -> String {
         let world = self.world_state.render_full();
