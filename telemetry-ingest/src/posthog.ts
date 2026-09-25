@@ -44,12 +44,14 @@ export async function deliverPostHog(batch: Batch, config: PostHogConfig): Promi
   try {
     // Copy no incoming headers or connection metadata. Cloudflare may still
     // add platform headers; the operator guard requires a staging receipt for
-    // the actual egress path. Never follow a redirect carrying the token.
+    // the actual egress path. Never follow a redirect carrying the token:
+    // Workers rejects `redirect: "error"` with a TypeError, so "manual" returns
+    // any 3xx unfollowed and the body (with the token) never leaves for it.
     const response = await fetch(`${config.POSTHOG_HOST}/batch/`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body,
-      redirect: "error",
+      redirect: "manual",
       credentials: "omit",
       signal: AbortSignal.timeout(POSTHOG_TIMEOUT_MS),
     });
