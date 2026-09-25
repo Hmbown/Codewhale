@@ -147,6 +147,7 @@ pub use tui::ambient_life::pet_sim as pet;
 mod turn_route_plan;
 mod utils;
 mod vision;
+mod voice;
 mod work_graph;
 mod worker_profile;
 mod working_set;
