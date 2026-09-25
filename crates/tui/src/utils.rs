@@ -41,6 +41,27 @@ impl io::Write for CountingWriter {
 const LOG_FINGERPRINT_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const LOG_FINGERPRINT_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+/// Compact token-count label for a model's context or output window:
+/// `1M`, `1.05M`, `262K`, `500`. Shared by the model picker and the fleet
+/// capability badges. Not the same scale as `agent_roster::format_tokens`
+/// (`1.2k`), which labels usage rather than window size.
+pub(crate) fn format_context_window(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        if tokens.is_multiple_of(1_000_000) {
+            format!("{}M", tokens / 1_000_000)
+        } else {
+            format!("{:.2}M", tokens as f64 / 1_000_000.0)
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string()
+        }
+    } else if tokens >= 1_000 {
+        format!("{}K", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
 /// Return a stable, non-reversible log label for an identifier.
 ///
 /// This is meant for correlation in diagnostics where the raw value may be a
