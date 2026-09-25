@@ -235,8 +235,8 @@ fn rollback(snapshots: &[Snapshot]) {
 // implementation without depending on this crate. Re-exported here to keep
 // the existing `codewhale_config::persistence::*` public API stable.
 pub use codewhale_secrets::redact::{
-    REDACTED, RedactionPolicy, redact_json_secrets, redact_model_bound_secrets, redact_secrets,
-    redact_secrets_with,
+    REDACTED, RedactionPolicy, redact_json_secrets, redact_model_bound_json_secrets,
+    redact_model_bound_secrets, redact_secrets, redact_secrets_with,
 };
 
 #[cfg(test)]
@@ -360,6 +360,45 @@ mod tests {
         assert!(tx.commit().is_err());
         // The newly created file must be removed on rollback, not left behind.
         assert!(!fresh.exists());
+    }
+
+    #[test]
+    fn compact_json_and_query_strings_mask_their_credentials() {
+        let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJlLXZhbHVl";
+        let refresh = "rt_Q2x9fK3mZ7pL1vB8nH4sT6wY0aE5cR2d";
+        let cases = [
+            format!(
+                r#"{{"tokens":{{"id_token":"{jwt}","access_token":"{jwt}","refresh_token":"{refresh}"}}}}"#
+            ),
+            format!(r#"{{"token_type":"Bearer","access_token":"{jwt}"}}"#),
+            format!(r#"[{{"Authorization":"Bearer {jwt}"}}]"#),
+            format!("https://example.test/cb?state=abc&access_token={jwt}&x=1"),
+        ];
+        for policy in [RedactionPolicy::CredentialShaped, RedactionPolicy::KeyBased] {
+            for case in &cases {
+                let out = redact_secrets_with(case, policy);
+                assert!(!out.contains(jwt), "{policy:?} leaked a JWT: {out}");
+                assert!(
+                    !out.contains(refresh),
+                    "{policy:?} leaked a refresh token: {out}"
+                );
+            }
+        }
+        // Structure and harmless members stay byte-exact.
+        assert_eq!(
+            redact_model_bound_secrets(&cases[1]),
+            r#"{"token_type":"Bearer","access_token":"[redacted]"}"#
+        );
+        let json = serde_json::json!({
+            "summary": format!("{{\"access_token\":\"{jwt}\"}}"),
+            "stdout_summary": "token = make_token()",
+            "api_key": "short",
+            "access_token": jwt,
+        });
+        let masked = redact_model_bound_json_secrets(&json);
+        assert!(!masked.to_string().contains(jwt), "{masked}");
+        assert_eq!(masked["stdout_summary"], "token = make_token()");
+        assert_eq!(masked["api_key"], "short");
     }
 
     #[test]

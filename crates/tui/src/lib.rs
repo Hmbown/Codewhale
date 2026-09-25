@@ -8133,7 +8133,7 @@ async fn print_doctor_stored_secrets_report() {
         let files = session_secret_scrub::session_files(manager.sessions_dir());
         let total = files.len();
         let checked: Vec<PathBuf> = files.into_iter().take(DOCTOR_SECRET_SCAN_FILES).collect();
-        session_secret_scrub::scrub_files(&checked, false)
+        session_secret_scrub::scrub_files(&checked, None)
             .ok()
             .map(|report| (report, total))
     })
@@ -8167,7 +8167,7 @@ async fn print_doctor_stored_secrets_report() {
 fn run_sessions_scrub_secrets(apply: bool) -> Result<()> {
     let manager = session_manager::SessionManager::default_location()?;
     let files = session_secret_scrub::session_files(manager.sessions_dir());
-    let report = session_secret_scrub::scrub_files(&files, apply)?;
+    let report = session_secret_scrub::scrub_files(&files, apply.then_some(&manager))?;
     let affected = report.files_with_secrets.len();
     if affected == 0 {
         println!(

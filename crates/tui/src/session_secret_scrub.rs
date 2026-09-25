@@ -61,31 +61,70 @@ pub(crate) fn session_files(sessions_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Scan `files`; with `apply`, rewrite each affected file atomically with its
-/// tool-result credentials masked.
-pub(crate) fn scrub_files(files: &[PathBuf], apply: bool) -> io::Result<ScrubReport> {
+/// tool-result credentials masked. Each rewrite re-reads its file under the
+/// same per-session lock every session save takes, so a live session saving
+/// at the same moment is never overwritten with older content.
+pub(crate) fn scrub_files(
+    files: &[PathBuf],
+    apply: Option<&crate::session_manager::SessionManager>,
+) -> io::Result<ScrubReport> {
     let mut report = ScrubReport::default();
     for path in files {
         report.files_scanned += 1;
-        let Ok(raw) = std::fs::read(path) else {
-            report.unreadable.push(path.clone());
-            continue;
+        let scan = match apply {
+            None => scrub_file(path, false)?,
+            Some(manager) => {
+                // `<id>.json` and `checkpoints/<id>.json` share the id's lock.
+                let session_id = path.file_stem().and_then(|stem| stem.to_str());
+                match session_id
+                    .map(|id| manager.with_session_file_lock(id, || scrub_file(path, true)))
+                {
+                    Some(Ok(Some(scan))) => scan,
+                    // A deleted session is not resurrected by a rewrite.
+                    Some(Ok(None)) => FileScan::Clean,
+                    // No lockable session id: leave the file untouched.
+                    None => FileScan::Unreadable,
+                    Some(Err(error)) if error.kind() == io::ErrorKind::InvalidInput => {
+                        FileScan::Unreadable
+                    }
+                    Some(Err(error)) => return Err(error),
+                }
+            }
         };
-        let Ok(mut value) = serde_json::from_slice::<Value>(&raw) else {
-            report.unreadable.push(path.clone());
-            continue;
-        };
-        let redacted = scrub_value(&mut value);
-        if redacted == 0 {
-            continue;
-        }
-        report.tool_results_with_secrets += redacted;
-        report.files_with_secrets.push(path.clone());
-        if apply {
-            let bytes = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
-            codewhale_config::persistence::atomic_write(path, &bytes).map_err(io::Error::other)?;
+        match scan {
+            FileScan::Unreadable => report.unreadable.push(path.clone()),
+            FileScan::Clean => {}
+            FileScan::Dirty(redacted) => {
+                report.tool_results_with_secrets += redacted;
+                report.files_with_secrets.push(path.clone());
+            }
         }
     }
     Ok(report)
+}
+
+enum FileScan {
+    Unreadable,
+    Clean,
+    Dirty(usize),
+}
+
+fn scrub_file(path: &Path, apply: bool) -> io::Result<FileScan> {
+    let Ok(raw) = std::fs::read(path) else {
+        return Ok(FileScan::Unreadable);
+    };
+    let Ok(mut value) = serde_json::from_slice::<Value>(&raw) else {
+        return Ok(FileScan::Unreadable);
+    };
+    let redacted = scrub_value(&mut value);
+    if redacted == 0 {
+        return Ok(FileScan::Clean);
+    }
+    if apply {
+        let bytes = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
+        codewhale_config::persistence::atomic_write(path, &bytes).map_err(io::Error::other)?;
+    }
+    Ok(FileScan::Dirty(redacted))
 }
 
 /// Mask credentials in every `tool_result` text field below `value`.
@@ -173,7 +212,7 @@ mod tests {
         let files = session_files(dir.path());
         assert_eq!(files.len(), 4, "{files:?}");
 
-        let report = scrub_files(&files, false).expect("scan");
+        let report = scrub_files(&files, None).expect("scan");
         assert_eq!(report.files_scanned, 4);
         assert_eq!(report.files_with_secrets.len(), 2, "{report:?}");
         assert_eq!(report.tool_results_with_secrets, 6);
@@ -183,8 +222,11 @@ mod tests {
             "a scan must not rewrite anything"
         );
 
-        let applied = scrub_files(&files, true).expect("scrub");
+        let manager =
+            crate::session_manager::SessionManager::new(dir.path().to_path_buf()).expect("manager");
+        let applied = scrub_files(&files, Some(&manager)).expect("scrub");
         assert_eq!(applied.files_with_secrets.len(), 2);
+        assert_eq!(applied.unreadable, vec![dir.path().join("broken.json")]);
         for path in [&dirty, &checkpoint] {
             let text = std::fs::read_to_string(path).unwrap();
             assert!(!text.contains(TOKEN), "{text}");
@@ -193,7 +235,7 @@ mod tests {
             assert_eq!(value["messages"][0]["content"][0]["text"], "show auth");
         }
         assert_eq!(
-            scrub_files(&files, false)
+            scrub_files(&files, None)
                 .expect("rescan")
                 .files_with_secrets,
             Vec::<PathBuf>::new(),

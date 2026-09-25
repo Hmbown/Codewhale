@@ -18179,9 +18179,18 @@ async fn runtime_tool_items_store_tool_output_with_credentials_masked() -> Resul
         .send(EngineEvent::ToolCallComplete {
             id: "tool-cat-auth".to_string(),
             name: "exec_command".to_string(),
+            // Real `exec_shell` metadata shape: the summaries carry the
+            // first stdout line, here compact JSON as `jq -c` prints it.
             result: Ok(crate::tools::spec::ToolResult::success(format!(
                 "{{\n  \"access_token\": \"{TOKEN}\",\n  \"note\": \"keep me\"\n}}\n"
-            ))),
+            ))
+            .with_metadata(json!({
+                "exit_code": 0,
+                "summary": format!("{{\"tokens\":{{\"access_token\":\"{TOKEN}\"}}}}"),
+                "stdout_summary": format!("{{\"tokens\":{{\"access_token\":\"{TOKEN}\"}}}}"),
+                "stderr_summary": format!("export OPENAI_API_KEY={TOKEN}"),
+                "stdout_len": 120,
+            }))),
         })
         .await?;
     harness
@@ -18209,6 +18218,9 @@ async fn runtime_tool_items_store_tool_output_with_credentials_masked() -> Resul
         .context("the tool item keeps its ordinary output")?;
     let stored = serde_json::to_string(tool_item)?;
     assert!(!stored.contains(TOKEN), "{stored}");
+    let metadata = tool_item.metadata.as_ref().context("tool metadata kept")?;
+    assert_eq!(metadata["stdout_len"], 120, "ordinary metadata survives");
+    assert_eq!(metadata["exit_code"], 0);
     let events = serde_json::to_string(&manager.events_since(&thread.id, None)?)?;
     assert!(!events.contains(TOKEN), "the event log holds no live token");
     Ok(())

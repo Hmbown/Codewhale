@@ -43,7 +43,16 @@ pub const REDACTED: &str = "[redacted]";
 /// one flat keyed assignment.
 #[must_use]
 pub fn redact_json_secrets(value: &serde_json::Value) -> serde_json::Value {
-    redact_json_secrets_at(value, 0)
+    redact_json_with(value, RedactionPolicy::KeyBased, 0)
+}
+
+/// [`redact_json_secrets`] for tool metadata that keeps the model-bound
+/// policy: string leaves go through [`redact_model_bound_secrets`], and a
+/// sensitive key's value is masked only when it looks like a credential, so
+/// ordinary summaries, paths and counts stay byte-exact.
+#[must_use]
+pub fn redact_model_bound_json_secrets(value: &serde_json::Value) -> serde_json::Value {
+    redact_json_with(value, RedactionPolicy::CredentialShaped, 0)
 }
 
 /// Maximum nesting depth the JSON redactor descends. Aligned with
@@ -51,7 +60,11 @@ pub fn redact_json_secrets(value: &serde_json::Value) -> serde_json::Value {
 /// deeper is redacted wholesale.
 const MAX_REDACT_JSON_DEPTH: usize = 128;
 
-fn redact_json_secrets_at(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+fn redact_json_with(
+    value: &serde_json::Value,
+    policy: RedactionPolicy,
+    depth: usize,
+) -> serde_json::Value {
     if depth > MAX_REDACT_JSON_DEPTH {
         return serde_json::Value::String(REDACTED.to_string());
     }
@@ -60,10 +73,17 @@ fn redact_json_secrets_at(value: &serde_json::Value, depth: usize) -> serde_json
             object
                 .iter()
                 .map(|(key, value)| {
-                    let value = if key_is_sensitive(key) {
+                    let masked = key_is_sensitive(key)
+                        && match policy {
+                            RedactionPolicy::KeyBased => true,
+                            RedactionPolicy::CredentialShaped => {
+                                value.as_str().is_some_and(value_looks_like_credential)
+                            }
+                        };
+                    let value = if masked {
                         serde_json::Value::String(REDACTED.to_string())
                     } else {
-                        redact_json_secrets_at(value, depth + 1)
+                        redact_json_with(value, policy, depth + 1)
                     };
                     (key.clone(), value)
                 })
@@ -72,10 +92,12 @@ fn redact_json_secrets_at(value: &serde_json::Value, depth: usize) -> serde_json
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
                 .iter()
-                .map(|item| redact_json_secrets_at(item, depth + 1))
+                .map(|item| redact_json_with(item, policy, depth + 1))
                 .collect(),
         ),
-        serde_json::Value::String(text) => serde_json::Value::String(redact_secrets(text)),
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(redact_secrets_with(text, policy))
+        }
         scalar => scalar.clone(),
     }
 }
@@ -226,6 +248,10 @@ fn redact_line(line: &str, policy: RedactionPolicy) -> String {
             changed = true;
             masked.push(word.replace(trimmed, REDACTED));
             spaced = SpacedAssignment::None;
+        } else if let Some(redacted) = redact_structured_word(trimmed, policy) {
+            changed = true;
+            masked.push(word.replace(trimmed, &redacted));
+            spaced = SpacedAssignment::None;
         } else {
             masked.push(word.to_string());
             spaced = spaced.advance(trimmed);
@@ -282,6 +308,52 @@ impl SpacedAssignment {
         }
         Self::None
     }
+}
+
+/// Compact JSON and query strings (`{"tokens":{"access_token":"eyJ…"}}`,
+/// `curl`, `jq -c`, `?access_token=…&x=1`) carry no spaces, so the word pass
+/// sees the whole document as one word whose first separator belongs to a
+/// harmless key. Split such a word on its structure and offer every member to
+/// the same keyed and bare-token checks; the delimiters are kept byte-exact.
+fn redact_structured_word(word: &str, policy: RedactionPolicy) -> Option<String> {
+    const DELIMITERS: [char; 7] = ['{', '}', '[', ']', ',', '&', '?'];
+    if !word.contains(DELIMITERS) {
+        return None;
+    }
+    let mut out = String::with_capacity(word.len());
+    let mut changed = false;
+    let mut start = 0;
+    for (idx, ch) in word.match_indices(DELIMITERS) {
+        changed |= push_structured_segment(&mut out, &word[start..idx], policy);
+        out.push_str(ch);
+        start = idx + ch.len();
+    }
+    changed |= push_structured_segment(&mut out, &word[start..], policy);
+    changed.then_some(out)
+}
+
+fn push_structured_segment(out: &mut String, segment: &str, policy: RedactionPolicy) -> bool {
+    // A value an earlier pass already masked (`?token=***`) stays as it is.
+    let already_masked = segment.split_once(['=', ':']).is_some_and(|(_, value)| {
+        let (core, _) = strip_value_quotes(value);
+        !core.is_empty() && core.chars().all(|c| c == '*')
+    });
+    if segment.is_empty() || already_masked {
+        out.push_str(segment);
+        return false;
+    }
+    if let Some(redacted) = redact_inline_keyed_assignment(segment, policy) {
+        out.push_str(&redacted);
+        return true;
+    }
+    let (core, _) = strip_value_quotes(segment);
+    let core = core.trim_end_matches(['"', '\'']);
+    if !core.is_empty() && (looks_like_secret_token(core) || is_jwt_shaped(core)) {
+        out.push_str(&segment.replacen(core, REDACTED, 1));
+        return true;
+    }
+    out.push_str(segment);
+    false
 }
 
 fn trim_word_punctuation(word: &str) -> &str {
