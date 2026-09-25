@@ -1027,3 +1027,29 @@ mod screen_mode_tests {
         assert_eq!(inline_viewport_rows(&backend), 24);
     }
 }
+
+/// The terminal UI's implementation of the runtime's one terminal port
+/// (`crate::host_terminal`). The composition root installs it for every host
+/// this binary launches, so runtime code (the shell tools, the dispatcher)
+/// reaches raw mode only through it and never links crossterm.
+struct TuiHostTerminal;
+
+impl crate::host_terminal::HostTerminal for TuiHostTerminal {
+    fn suspend_raw_mode(&self) -> bool {
+        let was_enabled = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+        if was_enabled {
+            let _ = disable_raw_mode();
+        }
+        was_enabled
+    }
+
+    fn resume_raw_mode(&self) {
+        let _ = enable_raw_mode();
+    }
+}
+
+/// Install the TUI as the process's terminal host. Idempotent: the first
+/// install wins.
+pub(crate) fn install_host_terminal() {
+    let _ = crate::host_terminal::install(Box::new(TuiHostTerminal));
+}

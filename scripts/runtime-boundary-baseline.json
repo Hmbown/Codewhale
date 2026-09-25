@@ -4,7 +4,7 @@
     "prod": 84,
     "test": 95,
     "late": 2,
-    "uilib": 10,
+    "uilib": 1,
     "doc": 1
   },
   "counts": {
@@ -38,8 +38,7 @@
       "core|exec_agent": 1
     },
     "uilib": {
-      "shell_dispatcher|crossterm": 3,
-      "tools|crossterm": 7
+      "tools|crossterm": 1
     },
     "doc": {
       "core|tui": 1

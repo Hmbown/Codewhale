@@ -30,6 +30,8 @@ mod shell_dispatcher;
 // The legacy text tool-call parser lives in codewhale-core now; keep the
 // `crate::tool_parser` path the suites use.
 use codewhale_core::tool_parser;
+// `shell_dispatcher` reaches raw mode through the runtime's terminal port.
+use codewhale_runtime::host_terminal;
 
 mod adaptive_evidence_acceptance;
 mod cache_guard;

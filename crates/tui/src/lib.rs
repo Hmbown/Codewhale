@@ -131,9 +131,10 @@ use codewhale_release::tls;
 // re-exports; the split deletes it by rewriting these paths to
 // `codewhale_runtime::` (docs/design/TUI_DECONSTRUCTION.md).
 use codewhale_runtime::{
-    context_budget, continual_harness, elapsed, fast_hash, goal_loop, hashing, llm_response_cache,
-    media_originals, model_context, native_memory, prompt_zones, regex_cache, retry_status,
-    safe_label, session_tree, skill_state, sleep_guard, tool_history_repair, workspace_discovery,
+    context_budget, continual_harness, elapsed, fast_hash, goal_loop, hashing, host_terminal,
+    llm_response_cache, media_originals, model_context, native_memory, prompt_zones, regex_cache,
+    retry_status, safe_label, session_tree, skill_state, sleep_guard, tool_history_repair,
+    workspace_discovery,
 };
 mod todo_snapshot;
 mod tool_inspection;
@@ -1717,6 +1718,10 @@ fn run_with_args(args: Vec<String>) -> Result<()> {
     startup_trace::mark_process_start();
     configure_windows_console_utf8();
     install_rustls_crypto_provider();
+    // The TUI is the terminal host for every mode this binary runs
+    // (interactive, exec, serve): runtime code reaches raw mode and
+    // notification delivery only through this port.
+    crate::tui::ui::install_host_terminal();
 
     // ── Process hardening (#2183) ─────────────────────────────────────────
     // MUST run before Tokio is booted and before any threads are spawned.

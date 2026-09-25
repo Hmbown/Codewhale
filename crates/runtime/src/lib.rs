@@ -17,6 +17,7 @@ pub mod elapsed;
 pub mod fast_hash;
 pub mod goal_loop;
 pub mod hashing;
+pub mod host_terminal;
 pub mod llm_response_cache;
 pub mod media_originals;
 pub mod model_context;
