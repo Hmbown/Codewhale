@@ -13846,10 +13846,12 @@ async fn approval_timeout_denies_clears_ui_and_next_turn_can_start() -> Result<(
 
     let decision = tokio::time::timeout(Duration::from_secs(2), harness.recv_approval_event())
         .await
-        .context("approval timeout should deny the engine")?;
+        .context("approval timeout should resolve the engine's wait")?;
+    // The engine hears a timeout, not the user's denial, so the model and the
+    // approval receipt both say "timed out" and the budget slot is refunded.
     assert_eq!(
         decision,
-        Some(MockApprovalEvent::Denied {
+        Some(MockApprovalEvent::TimedOut {
             id: "tool_timeout".to_string(),
         })
     );

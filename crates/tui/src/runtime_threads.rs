@@ -13265,7 +13265,10 @@ impl RuntimeThreadManager {
                             )
                             .await
                             .ok();
-                            let _ = engine.deny_tool_call(id).await;
+                            // The engine records and reports a timeout, not
+                            // the user's denial, and refunds the call's
+                            // tool-call budget slot.
+                            let _ = engine.deny_tool_call_timed_out(id).await;
                         }
                     }
                 }

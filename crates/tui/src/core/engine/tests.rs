@@ -5735,6 +5735,87 @@ async fn tool_call_budget_refunds_calls_blocked_by_admission_gates() {
     );
 }
 
+/// An approval card that expires unanswered is a timeout, not the user's
+/// denial: the model is told so, and the call — which never ran — gives its
+/// tool-call budget slot back, so a cap of 1 still admits the next call.
+#[tokio::test]
+async fn approval_timeout_is_reported_as_timeout_and_refunds_the_budget() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+
+    let workspace = tempdir().expect("tempdir");
+    fs::write(workspace.path().join("fixture.txt"), "fixture\n").expect("write fixture");
+    let mock = std::sync::Arc::new(MockLlmClient::new(vec![
+        canned::tool_call_turn("call-timeout", "bash", r#"{"command":"echo first"}"#),
+        canned::tool_call_turn("call-after", "read_file", r#"{"path":"fixture.txt"}"#),
+        canned::simple_text_turn("done"),
+    ]));
+    let client: crate::core::model_client::SharedModelClient = mock.clone();
+    let config = Config::default();
+    let mut engine_config = deterministic_engine_config(workspace.path());
+    engine_config.exec_policy_engine = ask_rule_engine("echo first");
+    engine_config.max_tool_calls = Some(1);
+    let (engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
+    let task = tokio::spawn(engine.run());
+    handle
+        .send(external_user_message_op(
+            "Run the command, then read the fixture.",
+            AppMode::Agent,
+            &config,
+        ))
+        .await
+        .expect("send turn");
+
+    let mut timed_out = None;
+    let mut after = None;
+    let mut rx = handle.rx_event.write().await;
+    loop {
+        let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+            .await
+            .expect("timed out waiting for the turn")
+            .expect("engine event stream closed");
+        match event {
+            Event::ApprovalRequired { id, .. } if id == "call-timeout" => {
+                handle
+                    .deny_tool_call_timed_out(&id)
+                    .await
+                    .expect("expire the approval card");
+            }
+            Event::ApprovalRequired { id, .. } => {
+                handle.approve_tool_call(&id).await.expect("approve");
+            }
+            Event::ToolCallComplete { id, result, .. } if id == "call-timeout" => {
+                timed_out = Some(result);
+            }
+            Event::ToolCallComplete { id, result, .. } if id == "call-after" => {
+                after = Some(result);
+            }
+            Event::TurnComplete { status, error, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(rx);
+
+    let timeout = timed_out
+        .expect("the expired call reports a completion")
+        .expect_err("an expired approval never runs the call")
+        .to_string();
+    assert!(timeout.contains("timed out"), "{timeout}");
+    assert!(timeout.contains("did not deny"), "{timeout}");
+    assert!(
+        !timeout.contains("denied by user"),
+        "a timeout must not read as the user's refusal: {timeout}"
+    );
+    let after = after
+        .expect("the next call reports a completion")
+        .expect("the expired call refunded its slot, so the cap of 1 admits this call");
+    assert!(after.content.contains("fixture"), "{after:?}");
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    task.await.expect("engine task");
+}
+
 /// #4415 AC(b): a 4-call parallel batch proposed with 2 calls remaining is
 /// truncated to the first 2 calls in proposal order; the excess 2 are
 /// rejected with the same typed reason, and the batch is counted in full.
