@@ -413,6 +413,7 @@
   "CmdConstitutionDescription": "स्थायी संविधान कानून और पूर्वावलोकन प्रबंधित करें",
   "CmdContextDescription": "संदर्भ निरीक्षक या सोर्स-मैप रिपोर्ट खोलें",
   "CmdCostDescription": "सत्र लागत का विवरण दिखाएँ",
+  "CmdReceiptsDescription": "दिखाएँ कि इस सत्र ने क्या किया: फ़ाइलें, कमांड, स्वीकृतियाँ",
   "CmdDiffDescription": "सत्र शुरू होने के बाद के फ़ाइल बदलाव दिखाएँ",
   "CmdEditDescription": "अंतिम संदेश संशोधित कर पुनः सबमिट करें",
   "CmdExitDescription": "एप्लिकेशन से बाहर निकलें",

@@ -382,4 +382,5 @@ command = "echo 'Running tool: $TOOL_NAME'"
 - `~/.codewhale/sessions/checkpoints/` - Crash checkpoint + offline queue persistence
 - `~/.codewhale/snapshots/` - Side-git pre/post-turn workspace snapshots for `/restore` and `revert_turn`
 - `~/.codewhale/tasks/` - Background task records, queue, timelines, artifacts
-- `~/.codewhale/audit.log` - Append-only audit events for credential + approval/elevation actions
+- `~/.codewhale/audit.log` - Append-only security events: credential saves and clears, hook environment key names, compaction passes, goal completions, the terminal's approval routing, Auto-Review verdicts, and outbound network decisions when `[network]` auditing is on. Not an action record: it holds no commands or file changes, and app or `serve` turns write no approvals there. See `docs/RECEIPTS.md` for what a session did
+- `~/.codewhale/sessions/<id>/approval_receipts.jsonl` - Every approval ask and decision for a session, including who decided

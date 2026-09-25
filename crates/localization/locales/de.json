@@ -413,6 +413,7 @@
   "CmdConstitutionDescription": "Geltende Verfassungsregeln und Vorschauen verwalten",
   "CmdContextDescription": "Kontext-Inspektor oder Source-Map-Bericht öffnen",
   "CmdCostDescription": "Sitzungskosten-Aufschlüsselung anzeigen",
+  "CmdReceiptsDescription": "Anzeigen, was diese Sitzung getan hat: Dateien, Befehle, Freigaben",
   "CmdDiffDescription": "Dateiänderungen seit Sitzungsbeginn anzeigen",
   "CmdEditDescription": "Letzte Nachricht überarbeiten und erneut senden",
   "CmdExitDescription": "Anwendung beenden",

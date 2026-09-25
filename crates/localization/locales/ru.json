@@ -413,6 +413,7 @@
   "CmdConstitutionDescription": "Управление постоянной конституцией и предпросмотрами",
   "CmdContextDescription": "Открыть инспектор контекста или отчёт source-map",
   "CmdCostDescription": "Показать разбивку стоимости сессии",
+  "CmdReceiptsDescription": "Показать, что сделала эта сессия: файлы, команды, одобрения",
   "CmdDiffDescription": "Показать изменения файлов с начала сессии",
   "CmdEditDescription": "Изменить и повторно отправить последнее сообщение",
   "CmdExitDescription": "Выйти из приложения",

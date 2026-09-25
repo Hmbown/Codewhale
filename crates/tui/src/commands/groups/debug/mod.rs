@@ -5,6 +5,7 @@ mod balance;
 mod cache;
 mod change;
 mod preview_request;
+mod receipts;
 mod tokens;
 mod tool_inspection;
 mod undo;
@@ -24,6 +25,7 @@ impl CommandGroup for DebugCommands {
         cached_command_list!(vec![
             Box::new(FunctionCommand::new(&TOKENS_INFO, run_tokens)),
             Box::new(FunctionCommand::new(&COST_INFO, run_cost)),
+            Box::new(FunctionCommand::new(&RECEIPTS_INFO, run_receipts)),
             Box::new(FunctionCommand::new(&BALANCE_INFO, run_balance)),
             Box::new(FunctionCommand::new(&CACHE_INFO, run_cache)),
             Box::new(FunctionCommand::new(
@@ -53,6 +55,12 @@ static COST_INFO: CommandInfo = CommandInfo {
     aliases: &[],
     usage: "/cost",
     description_id: MessageId::CmdCostDescription,
+};
+static RECEIPTS_INFO: CommandInfo = CommandInfo {
+    name: "receipts",
+    aliases: &["receipt"],
+    usage: "/receipts [json] [<turn>]",
+    description_id: MessageId::CmdReceiptsDescription,
 };
 static BALANCE_INFO: CommandInfo = CommandInfo {
     name: "balance",
@@ -133,6 +141,9 @@ fn run_tokens(app: &mut App, arg: Option<&str>) -> CommandResult {
 fn run_cost(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "cost", arg)
 }
+fn run_receipts(app: &mut App, arg: Option<&str>) -> CommandResult {
+    run_registered(app, "receipts", arg)
+}
 fn run_balance(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "balance", arg)
 }
@@ -175,6 +186,7 @@ pub(in crate::commands) fn dispatch(
     let result = match command {
         "tokens" => tokens::tokens(app),
         "cost" => tokens::cost(app),
+        "receipts" | "receipt" => receipts::receipts(app, arg),
         "balance" => balance::balance(app),
         "cache" => cache::cache(app, arg),
         "preview-request" | "preview_request" | "dryrun" => {

@@ -1,35 +1,190 @@
-# Runtime Receipts
+# Receipts
 
-This document sketches a future read-only receipt export for completed runtime
-turns. It is a protocol note, not an implemented endpoint.
+A receipt answers "what did this session do?" from the records Codewhale
+already keeps. It lists, in order, the files changed, commands run, web and
+MCP calls, agents started, approvals (and who decided each one), and
+failures, with totals on top. It also counts what ran without asking, and
+names the permission posture that let it.
 
-The goal is to let a local supervisor audit one completed turn without
-screen-scraping the terminal transcript. A receipt should summarize the durable
-runtime records that Codewhale already owns: thread metadata, turn status, turn
-items, event sequence lineage, usage when available, approval decisions, and
-side-effect boundaries.
+```text
+# Receipt: Fix the parser
+thread thr_19a0141a · /work/repo · deepseek-flash · Ask · 2026-09-24 10:00 UTC → 2026-09-24 10:05 UTC
+
+Changed 1 file (+2 −1) · ran 1 command · made 1 MCP call · 2 approvals by you · 1 approval by session rule · 1 ran without asking under Ask · 1 denied · 1 other failure
+
+1. edited src/parse.rs (+2 −1) · 1.0s
+2. ran `cargo test -p parser` in /work/repo — exit 0 · 2.5s · approved by you
+3. did not run: ran `rm -rf build` · denied by you
+4. called linear · list_issues · 1.0s · approved by session rule
+5. turn failed — failed: provider returned 500
+
+Not recorded:
+- Shell file changes: files a command changes (for example `rm` or a build) are not itemized; only file tools are.
+```
+
+## Surfaces
+
+All three share one builder (`crates/tui/src/receipts.rs`), so they cannot
+disagree.
+
+| Surface | What it reads |
+| --- | --- |
+| `/receipts [json] [<turn>]` in the terminal | The current session's transcript and approval log |
+| `codewhale receipts [ID\|--last] [--turn T] [--format md\|json]` | A saved session (id or unique prefix) or a Runtime thread (`thr_…`); with no id, the most recently updated one. `receipt` is an alias |
+| `GET /v1/threads/{id}/receipt`, `GET /v1/threads/{id}/turns/{turn_id}/receipt` | A Runtime thread (the app, `codewhale serve`), behind the normal `/v1` bearer boundary |
+
+All three only read. They never call a provider, run a tool, write a file,
+or change runtime state.
+
+`codewhale receipts` reads Runtime threads from the machine's default store
+(`tasks/runtime/`, or `$CODEWHALE_RUNTIME_DIR`). A thread kept in one
+terminal session's own store (`sessions/<id>/runtime/`) is not found by id;
+the API reads whatever store its server owns.
+
+## Where the facts come from
+
+| Session kind | Record | Holds |
+| --- | --- | --- |
+| Terminal session | `sessions/<id>.json` | Every tool call and its result text, in order; each prompt's `<turn_meta>` names the posture the turn ran under |
+| Terminal session | `sessions/<id>/approval_receipts.jsonl` | Every approval ask and decision, with time and who decided |
+| Runtime thread | `tasks/runtime/turns`, `items` | Every tool call with its input, status, start and end time, and structured result (exit code, diff, agent status); each turn's `permission_posture` |
+| Runtime thread | `tasks/runtime/events/<thread>.jsonl` | `approval.required` / `approval.decided`, with the flags that say who decided |
+
+### Who decided an approval
+
+| Receipt says | Meaning | Recorded as |
+| --- | --- | --- |
+| by you | A person answered: the terminal card, the app, the web mirror, or an API client acting for them | `decided_by: "user"`; Runtime event with no `auto` flag |
+| by session rule | A remembered "for this session" rule answered | `decided_by: "session_rule"`; Runtime event with `auto` and a `grant_id` |
+| by posture | The mode or permission posture answered without a prompt | `decided_by: "posture"`; Runtime event with `auto` or `posture` |
+| approval timed out | The card expired unanswered | outcome `timeout` |
+| turn stopped while waiting / nobody could be asked | Codewhale resolved it: the turn ended or was cancelled | `decided_by: "host"` |
+| approved (no "by") | A record written before 0.10.1, or a sub-agent's request | no `decided_by` |
+
+### Ran without asking
+
+Most calls never produce an approval. Under Full Access nothing asks; under
+Ask, reads and allowed tools run without a prompt, and a remembered rule can
+skip one. Those calls leave no approval record, so the receipt counts them
+instead: `ran_without_asking` is every file change, command, code run, web
+or MCP call, and agent start that ran with no approval on record. The totals
+line names the postures the turns ran under (`9 ran without asking under
+Full Access`). Reads are not counted.
+
+Terminal sessions started before 0.9.10 (2026-08-20) have no approval log,
+so their receipts do not count this and say why.
+
+### Not recorded
+
+The receipt says so instead of guessing:
+
+- **Shell file changes.** Files a command changes (`rm`, a build, a
+  generator) are not itemized. Only file tools (`write`, `edit`,
+  `apply_patch`) are.
+- **Terminal-session exit codes, durations, and timestamps.** A terminal
+  session saves each call and its result text, not the structured result. A
+  failed shell call's exit code is read from the shell tool's own closing
+  line (`Command exited with code N`); a passing one shows no code.
+- **Line counts for whole-file writes** in terminal sessions, and whether the
+  file existed before.
+- **Who decided** for approvals recorded before 0.10.1 and for sub-agent
+  approvals.
+- **Which calls asked first** in terminal sessions started before 0.9.10.
+- **Why a call ran without asking** beyond the turn's posture: the record
+  does not say whether the posture, an allow rule, or a remembered grant let
+  it through.
 
 ## Non-Goals
 
-A receipt is not a safety certification, provider compatibility certification,
-or hosted attestation. It must not call providers, execute tools, write memory,
-write project files, mutate runtime state, or expose API keys.
+A receipt is not a safety certification, a provider compatibility
+certification, or a hosted attestation (`claim_ceiling` in the JSON says so).
+It exports no reasoning text and no raw tool output. Commands, search
+queries, and error lines are bounded (200, 120, and 160 characters) and pass
+through the shared secret redactor. A receipt lists at most 2,000 actions;
+totals always cover every action, and `omitted_actions` counts the rest.
 
-Receipts should not export raw chain-of-thought or private reasoning by default.
-When reasoning custody is represented, use stable item ids, counts, hashes, or
-explicit `unavailable` fields rather than raw hidden content.
+## JSON shape
 
-## Candidate Surfaces
+`--format json`, `/receipts json`, and the API return the same object:
 
-Potential local-only surfaces:
-
-```text
-codewhale receipt export --thread <thread_id> --turn <turn_id> --format json
-GET /v1/threads/{thread_id}/turns/{turn_id}/receipt
+```json
+{
+  "schema_id": "codewhale.receipt/v1",
+  "source": {
+    "kind": "thread",
+    "id": "thr_19a0141a",
+    "title": "Fix the parser",
+    "workspace": "/work/repo",
+    "model": "deepseek-flash",
+    "started_at": "2026-09-24T10:00:00Z",
+    "updated_at": "2026-09-24T10:05:00Z"
+  },
+  "postures": ["Ask"],
+  "totals": {
+    "files_changed": 1, "files_created": 0, "files_deleted": 0,
+    "lines_added": 2, "lines_removed": 1, "line_counts_complete": true,
+    "commands": 1, "commands_failed": 0, "code_runs": 0, "network": 0,
+    "mcp_calls": 1, "plugin_calls": 0, "subagents": 0,
+    "approvals": {
+      "total": 3, "approved": 2, "denied": 1, "timed_out": 0,
+      "not_answered": 0, "pending": 0, "by_you": 2, "by_session_rule": 1,
+      "by_posture": 0, "decider_not_recorded": 0
+    },
+    "ran_without_asking": 1, "failures": 1, "other_tool_calls": 0
+  },
+  "actions": [
+    {
+      "seq": 2, "turn": "turn_1", "at": "2026-09-24T10:02:00Z",
+      "call_id": "call_test", "tool": "exec_shell",
+      "kind": "command", "command": "cargo test -p parser",
+      "cwd": "/work/repo", "exit_code": 0,
+      "status": "ok", "duration_ms": 2500,
+      "approval": {
+        "decision": "approved", "decided_by": "user",
+        "at": "2026-09-24T10:01:59Z"
+      }
+    }
+  ],
+  "omitted_actions": 0,
+  "not_recorded": ["Shell file changes: …"],
+  "claim_ceiling": [
+    "local_record_only",
+    "not_safety_certification",
+    "not_provider_compatibility_certification"
+  ]
+}
 ```
 
-Both surfaces should share the existing runtime API auth boundary. They should
-only read persisted runtime records and append-only events.
+`kind` is one of `file_change` (`files[]` with `path`, `change` =
+`edited|created|deleted|written`, optional `lines_added`/`lines_removed`),
+`command` (`command`, `cwd`, `exit_code`), `code` (`exit_code`, `nested[]`
+tool calls an `execute_tools` program made), `network` (`action`, `host`,
+`query`), `mcp` (`server`, `plugin`), `subagent` (`name`, `agent_id`,
+`outcome`), `approval` (an approval with no matching call), `tool` (any other
+call, listed only when it failed), or `turn_failed`. `status` is `ok`,
+`failed`, `not_run` (held at approval), `interrupted`, `running`, or
+`unknown` (no result in the record). A terminal session's `turn` is the turn
+number; a thread's is the turn id.
+
+## `audit.log` is not the receipt
+
+`~/.codewhale/audit.log` is a security-event log: credential saves and
+clears, hook environment key names, compaction passes, goal completions, the
+terminal's own approval routing, Auto-Review verdicts (`tool.gate.decision`,
+since 0.10.1), and outbound network decisions when `[network]` auditing is
+on. It has never held commands or file changes, and
+turns run by the app or `codewhale serve` write no approvals there. Their
+approvals are in the session's `approval_receipts.jsonl` and the thread's
+event log, which is where receipts read them.
+
+A quiet `audit.log` does not mean nothing ran. It gets an approval line only
+when the terminal routes an approval request. Since 0.8.66
+(`1c68e3bb32`, 2026-06-29) the engine decides auto-allowed calls itself, so
+they never become requests; under Full Access almost nothing does. On one
+developer machine the last `tool.approval.*` line was written on 2026-08-19,
+the last `tool.approval.auto_approve` line on 2026-06-30, and the writes
+after that were test runs, which since `244368675b` go to a scratch log. Use
+a receipt to see what ran.
 
 ## Review Receipts
 
@@ -75,109 +230,21 @@ checked-out revision; validate it with the same base, path, and input limit.
 It does not cover the rest of a pull request or prove that separately reviewed
 changes work together.
 
-## Current Data Sources
-
-The current runtime store already persists the core inputs a receipt builder
-would need:
-
-- `ThreadRecord`: model, workspace, mode, shell/trust/auto-approve flags,
-  title, task linkage, and latest turn metadata.
-- `TurnRecord`: turn status, input summary, timestamps, duration, usage, error,
-  steer count, and item ids.
-- `TurnItemRecord`: item kind, lifecycle status, summary, optional detail,
-  metadata, artifact refs, and item timestamps.
-- `RuntimeEventRecord`: thread id, turn id, item id, event name, JSON payload,
-  timestamp, and monotonic `seq` values per runtime store.
-
-Not every receipt field can be filled from those records today. If a provider or
-store does not persist a value, the receipt should say `available: false` or
-`unavailable`, not infer it from UI text.
-
-## Draft Schema Shape
-
-```json
-{
-  "schema_id": "codewhale.conformance-receipt/v0",
-  "thread": {
-    "id": "thr_...",
-    "model": "deepseek-v4-pro",
-    "mode": "agent",
-    "auto_approve": false,
-    "trust_mode": false,
-    "allow_shell": false
-  },
-  "turn": {
-    "id": "turn_...",
-    "status": "completed",
-    "started_at": "2026-06-02T01:00:00Z",
-    "ended_at": "2026-06-02T01:00:12Z",
-    "duration_ms": 12000
-  },
-  "reasoning_custody": {
-    "raw_reasoning_exported": false,
-    "available": false,
-    "reason": "reasoning blocks are not persisted as receipt-ready records"
-  },
-  "tool_lineage": {
-    "tool_call_count": 1,
-    "tool_result_count": 1,
-    "unmatched_tool_call_ids": [],
-    "unmatched_tool_result_ids": []
-  },
-  "usage_evidence": {
-    "available": true,
-    "usage": {
-      "prompt_tokens": 123,
-      "completion_tokens": 45
-    },
-    "provider_cache_breakdown_available": false
-  },
-  "source_event_lineage": {
-    "first_seq": 10,
-    "last_seq": 42,
-    "event_count": 33,
-    "missing_event_ranges": []
-  },
-  "side_effect_boundary": {
-    "approval_required_count": 1,
-    "approval_allowed_count": 0,
-    "approval_denied_count": 1,
-    "command_execution_count": 0,
-    "file_change_count": 0,
-    "sandbox_denied_count": 0
-  },
-  "claim_ceiling": [
-    "local_receipt_only",
-    "not_safety_certification",
-    "not_provider_compatibility_certification"
-  ]
-}
-```
-
 ## Builder Rules
 
-A receipt builder should be deterministic and conservative:
+The builder is deterministic and conservative:
 
-1. Load the thread and turn by id, then reject mismatched `thread_id` values.
-2. Load only item ids referenced by the turn.
-3. Read event records for the thread and filter by `turn_id`.
-4. Preserve event sequence boundaries with `first_seq`, `last_seq`, and any
-   detected gaps.
-5. Count approval, command, file, sandbox, and tool events from typed records or
-   known event names only.
-6. Mark unavailable evidence explicitly instead of deriving it from free-form
-   summaries.
-7. Emit no raw tool output beyond existing item summaries unless a later schema
-   adds a separate redaction policy.
-
-## Incremental Implementation Path
-
-The safest implementation path is:
-
-1. Land this protocol note and settle field names/non-goals.
-2. Add protocol structs and JSON snapshot fixtures for completed, failed, and
-   approval-denied turns.
-3. Add a pure builder over `ThreadRecord`, `TurnRecord`, `TurnItemRecord`, and
-   `RuntimeEventRecord`.
-4. Expose the local runtime API endpoint.
-5. Add the CLI export command and optional validation mode.
+1. A thread receipt loads the thread, its turns, the items each turn lists
+   (plus items that name the turn but are not listed yet, for a live turn),
+   and the thread's `approval.*` events. A turn id from another thread is
+   rejected.
+2. A session receipt reads `tool_use`/`tool_result` pairs from the
+   transcript and replays the approval log; a log that does not replay is
+   reported, not half-used.
+3. Approvals attach to their call by tool call id. One with no matching call
+   is listed on its own.
+4. File changes come from a tool's structured mutation record (the applied
+   diff) when saved, otherwise from the call's own input (an edit's
+   replacement text, a patch's hunks). A failed call changed nothing and
+   carries no counts.
+5. Nothing is derived from display text or model prose.

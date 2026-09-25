@@ -413,6 +413,7 @@
   "CmdConstitutionDescription": "Gestiona la llei constitucional permanent i les previsualitzacions",
   "CmdContextDescription": "Obre l'inspector de context o l'informe del mapa de fonts",
   "CmdCostDescription": "Mostra el desglossament de costos de la sessió",
+  "CmdReceiptsDescription": "Mostra què ha fet aquesta sessió: fitxers, ordres, aprovacions",
   "CmdDiffDescription": "Mostra els canvis en fitxers des de l'inici de la sessió",
   "CmdEditDescription": "Revisa i torna a enviar l'últim missatge",
   "CmdExitDescription": "Surt de l'aplicació",

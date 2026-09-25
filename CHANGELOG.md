@@ -24,9 +24,23 @@ quieter, and Fleet runs can be checked before they spend anything.
   one test call before it saves, `/status` shows the router's choice, cost and
   latency, and a failing router is shown as failing
   ([#6525](https://github.com/Hmbown/Codewhale/issues/6525)).
+- Receipts: `/receipts`, `codewhale receipts [ID|--last] [--format md|json]`,
+  and `GET /v1/threads/{id}/receipt` (plus a per-turn form) list what a session
+  did, one line per action: files changed with line counts, commands with exit
+  codes, web and MCP calls, agents, approvals and who gave them, and failures.
+  They also count what ran without asking and name the posture each turn ran
+  under, read from the turn's own record. All three read the records Codewhale
+  already keeps and say what those records do not hold
+  ([docs/RECEIPTS.md](docs/RECEIPTS.md)). `audit.log` is not that record: it
+  logs security events, and it logs an approval only when one is requested,
+  which under Full Access is almost never.
 
 ### Fixed
 
+- Approvals now record who decided: you, a session rule, or the posture. An
+  automatic approval used to be saved exactly like one you gave, and an app
+  approval that expired was saved as your denial. `GET /v1/approvals` now
+  returns `decided_by`.
 - Network audit lines now go to the same `audit.log` as every other audit
   event (`$CODEWHALE_HOME` included), and test runs no longer append to your
   real one.

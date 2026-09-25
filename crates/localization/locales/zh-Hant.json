@@ -301,6 +301,7 @@
   "CmdCostCoverage": "已涵蓋：{turns} 個計費回合中有 {priced} 個已定價。",
   "CmdCostCoverageUnknownLegacy": "涵蓋範圍：未知。此工作階段儲存時尚未記錄逐回合定價涵蓋，因此無法確定上述金額已計入多少。",
   "CmdCostDescription": "顯示本工作階段的費用明細",
+  "CmdReceiptsDescription": "顯示本工作階段做了什麼：檔案、指令、核准",
   "CmdCostEstimateOnly": "這是估算值而非帳單：依據供應商回報的 token 用量與公開價格在本機計算，可能與實際帳單不同。",
   "CmdCostLivePricingDowngraded": "無法驗證此路由的即時供應商價格（{defects}）；改用內建的公開價格。",
   "CmdCostLivePricingUnavailable": "無法驗證此路由的即時供應商價格（{defects}），且沒有可用的內建費率；此筆支出未知。",

@@ -416,6 +416,7 @@
   "CmdConstitutionDescription": "Quản lý hiến pháp cố định và bản xem trước",
   "CmdContextDescription": "Mở trình kiểm tra ngữ cảnh phiên thu gọn",
   "CmdCostDescription": "Hiển thị chi tiết chi phí của phiên làm việc",
+  "CmdReceiptsDescription": "Hiển thị những gì phiên làm việc này đã làm: tệp, lệnh, phê duyệt",
   "CmdDiffDescription": "Hiển thị các thay đổi của tệp kể từ khi bắt đầu phiên",
   "CmdEditDescription": "Chỉnh sửa và gửi lại tin nhắn gần nhất",
   "CmdExitDescription": "Thoát ứng dụng",

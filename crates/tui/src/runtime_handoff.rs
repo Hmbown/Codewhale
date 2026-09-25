@@ -1135,7 +1135,7 @@ pub(crate) fn is_runtime_owned_user_message(message: &Message) -> bool {
 /// historical leading shape. Requiring a separate prompt block prevents a
 /// user who submits `<turn_meta>…</turn_meta>` as ordinary text from minting
 /// authority.
-fn turn_metadata_text(message: &Message) -> Option<(usize, &str)> {
+pub(crate) fn turn_metadata_text(message: &Message) -> Option<(usize, &str)> {
     if message.content.len() < 2 {
         return None;
     }

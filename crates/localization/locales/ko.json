@@ -416,6 +416,7 @@
   "CmdConstitutionDescription": "상시 헌법 규칙과 미리보기를 관리합니다",
   "CmdContextDescription": "컨텍스트 인스펙터 또는 소스맵 리포트를 엽니다",
   "CmdCostDescription": "세션 비용 내역을 표시합니다",
+  "CmdReceiptsDescription": "이 세션이 한 일을 표시합니다: 파일, 명령, 승인",
   "CmdDiffDescription": "세션 시작 이후 파일 변경 사항을 표시합니다",
   "CmdEditDescription": "마지막 메시지를 수정해서 다시 보냅니다",
   "CmdExitDescription": "애플리케이션을 종료합니다",

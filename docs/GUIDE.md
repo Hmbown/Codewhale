@@ -286,9 +286,11 @@ the last measured average stays visible. Both readings use the same
 accumulators `/status` prints in full. Missing evidence is omitted rather than
 estimated. On narrow rows the pair sheds before cost and context.
 
-The transcript is the audit trail. When Codewhale reads files, runs commands,
-or edits code, the action appears there. If a command fails, use the visible
-failure output as part of your next instruction instead of starting over.
+Every file read, command, and edit appears in the transcript as it happens.
+`/receipts` lists what the session did, one line per action; see
+[What Codewhale records](#what-codewhale-records). If a command fails, use the
+visible failure output as part of your next instruction instead of starting
+over.
 
 The composer accepts normal prompts and slash commands. Type `/` to discover
 available commands. Use file mentions when you want the model to focus on a
@@ -382,6 +384,7 @@ Common commands for first-time users:
 | `/workflows` | Open the live Workflow run dashboard: every run this workspace's journal keeps, with phases, children, progress, and host-side cancel |
 | `/config` | Edit runtime and provider settings |
 | `/statusline` | Choose which footer status chips are visible |
+| `/receipts` | List what this session did: files changed, commands run, web and MCP calls, agents, approvals and who gave them, failures |
 | `/compact` | Summarize long context to recover token budget |
 | `/copy` | Copy the last completed assistant response to the clipboard |
 | `/review` | Ask for a structured review workflow |
@@ -488,6 +491,38 @@ the transcript easier to review and the final diff easier to merge.
 
 Next: [TOOL_SURFACE.md](TOOL_SURFACE.md) lists the tool surface and
 [SANDBOX.md](SANDBOX.md) explains sandbox behavior.
+
+### What Codewhale records
+
+Codewhale keeps these records on your machine, under `~/.codewhale/`:
+
+- **The session.** `sessions/<id>.json` holds the full conversation,
+  including every tool call and its result text. App and `codewhale serve`
+  threads keep each call as a turn item under `tasks/runtime/`, with its
+  input, status, start and end time, and structured result.
+- **Approvals.** `sessions/<id>/approval_receipts.jsonl` records every
+  approval Codewhale asked for, the decision, and who made it: you, a
+  session rule, or the active posture. App threads also record each decision
+  in their event log. A call that ran without asking (Full Access, an allow
+  rule, a remembered grant) has no approval record; the posture each turn
+  ran under is saved with the turn.
+- **Undo points.** Workspace snapshots let `/undo` and `/restore` roll files
+  back.
+- **Security events.** `audit.log` records credential changes, hook
+  environment key names, compaction passes, the terminal's approval
+  routing, and Auto-Review verdicts. It is not a list of what a session did.
+
+To see what a session did, run `/receipts`, or from a shell:
+
+```bash
+codewhale receipts --last
+codewhale receipts <session-id> --format json
+```
+
+A receipt says what it cannot show. Files changed by a shell command (for
+example `rm` or a build) are not itemized; only file tools are. Terminal
+sessions do not save a passing command's exit code or how long each call
+took. [RECEIPTS.md](RECEIPTS.md) has the full contract.
 
 ## 8. Sub-agents and Parallel Work
 

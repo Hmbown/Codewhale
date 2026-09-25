@@ -7444,6 +7444,73 @@ async fn thread_usage_endpoint_scopes_totals_to_one_thread() -> Result<()> {
     Ok(())
 }
 
+/// `GET /v1/threads/{id}/receipt` and its per-turn form sit behind the same
+/// bearer boundary as every `/v1` route, answer with the shared receipt
+/// shape, and 404 an unknown thread or a turn from elsewhere.
+#[tokio::test]
+async fn thread_receipt_routes_require_auth_and_return_the_receipt_shape() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-receipt-api-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let token = "receipt-test-token".to_string();
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_and_token(root, sessions_dir, Some(token.clone())).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let created: serde_json::Value = client
+        .post(format!("http://{addr}/v1/threads"))
+        .bearer_auth(&token)
+        .json(&json!({}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let id = created["id"].as_str().expect("thread id").to_string();
+
+    for path in [
+        format!("/v1/threads/{id}/receipt"),
+        format!("/v1/threads/{id}/turns/turn_x/receipt"),
+    ] {
+        let anonymous = client.get(format!("http://{addr}{path}")).send().await?;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+
+    let receipt: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{id}/receipt"))
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["schema_id"], "codewhale.receipt/v1");
+    assert_eq!(receipt["source"]["kind"], "thread");
+    assert_eq!(receipt["source"]["id"], id);
+    assert_eq!(receipt["actions"], json!([]));
+    assert_eq!(receipt["totals"]["commands"], 0);
+    assert!(receipt["not_recorded"].is_array());
+
+    let foreign_turn = client
+        .get(format!(
+            "http://{addr}/v1/threads/{id}/turns/turn_x/receipt"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    assert_eq!(foreign_turn.status(), StatusCode::NOT_FOUND);
+    let missing = client
+        .get(format!("http://{addr}/v1/threads/thr_missing/receipt"))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
 /// `GET /v1/approvals` serves the account-wide approval history behind the
 /// approvals log: decided rows carry their outcome + decision time, pending
 /// asks read "pending" with no decision time, newest ask first. A corrupt
@@ -7486,6 +7553,7 @@ async fn approvals_endpoint_lists_decided_and_pending_newest_first() -> Result<(
             tool_call_id: "tool-1".into(),
             outcome: ApprovalOutcome::Denied,
             created_at: at(11),
+            decided_by: Some(crate::approval_log::ApprovalDecider::User),
         },
     )?;
     store.append(
@@ -7516,6 +7584,8 @@ async fn approvals_endpoint_lists_decided_and_pending_newest_first() -> Result<(
     assert_eq!(rows[1]["approval_id"], "tool-1");
     assert_eq!(rows[1]["tool_name"], "exec_shell");
     assert_eq!(rows[1]["outcome"], "denied");
+    assert_eq!(rows[1]["decided_by"], "user");
+    assert!(rows[0].get("decided_by").is_none());
     assert_eq!(rows[1]["asked_at"], "2026-09-10T10:00:00Z");
     assert_eq!(rows[1]["decided_at"], "2026-09-10T11:00:00Z");
 

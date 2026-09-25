@@ -416,6 +416,7 @@
   "CmdConstitutionDescription": "See and amend your constitution",
   "CmdContextDescription": "Open the context inspector",
   "CmdCostDescription": "Show session cost breakdown",
+  "CmdReceiptsDescription": "Show what this session did: files, commands, approvals",
   "CmdDiffDescription": "Show changes since this session started",
   "CmdEditDescription": "Edit and resend your last message",
   "CmdExitDescription": "Quit",

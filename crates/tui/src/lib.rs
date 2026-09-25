@@ -90,6 +90,7 @@ mod provider_lake;
 mod provider_readiness;
 mod purge;
 pub mod reasoning_preference;
+mod receipts;
 mod regex_cache;
 mod remote_control;
 mod remote_setup;
@@ -301,6 +302,24 @@ enum Commands {
         search: Option<String>,
         #[command(subcommand)]
         command: Option<SessionsCommand>,
+    },
+    /// Show what a session did: files changed, commands run, web and MCP
+    /// calls, agents, approvals, and failures, read from its saved record
+    #[command(visible_alias = "receipt")]
+    Receipts {
+        /// Session id or unique prefix, or a Runtime thread id (thr_...).
+        /// Omit it (or pass --last) for the most recently updated one.
+        #[arg(value_name = "SESSION_ID")]
+        id: Option<String>,
+        /// Use the most recently updated session or thread
+        #[arg(long, conflicts_with = "id")]
+        last: bool,
+        /// Limit to one turn: a thread's turn id, or a session's turn number
+        #[arg(long, value_name = "TURN")]
+        turn: Option<String>,
+        /// Output format
+        #[arg(long, value_enum, default_value = "md")]
+        format: receipts::ReceiptFormat,
     },
     /// Create default AGENTS.md in current directory
     Init,
@@ -1970,7 +1989,8 @@ fn diagnostic_worker_count(command: Option<&Commands>) -> Option<usize> {
             Commands::Doctor(_)
             | Commands::Eval(_)
             | Commands::SessionDiagnostics(_)
-            | Commands::Sessions { .. },
+            | Commands::Sessions { .. }
+            | Commands::Receipts { .. },
         ) => true,
         // Only the read-only status report; mutating setup keeps defaults.
         Some(Commands::Setup(args)) => args.status,
@@ -2028,7 +2048,12 @@ fn telemetry_session_source(command: Option<&Commands>) -> codewhale_telemetry::
 fn telemetry_command_is_read_only(command: Option<&Commands>) -> bool {
     matches!(
         command,
-        Some(Commands::Doctor(_) | Commands::SessionDiagnostics(_) | Commands::Sessions { .. })
+        Some(
+            Commands::Doctor(_)
+                | Commands::SessionDiagnostics(_)
+                | Commands::Sessions { .. }
+                | Commands::Receipts { .. }
+        )
     ) || matches!(command, Some(Commands::Setup(args)) if args.status)
 }
 
@@ -2313,6 +2338,16 @@ async fn run_async_main_dispatch(
                     run_sessions_export(&id, output.as_deref(), skip_artifacts, compression, force)
                 }
             },
+            Commands::Receipts {
+                id,
+                last,
+                turn,
+                format,
+            } => receipts::run_receipts_command(
+                if last { None } else { id.as_deref() },
+                turn.as_deref(),
+                format,
+            ),
             Commands::Init => init_project(),
             Commands::Login { api_key } => run_login(api_key),
             Commands::Logout => run_logout(),

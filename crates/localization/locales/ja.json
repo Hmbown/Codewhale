@@ -416,6 +416,7 @@
   "CmdConstitutionDescription": "恒久憲法ルールとプレビューを管理",
   "CmdContextDescription": "コンパクトなセッションコンテキスト検査ツールを開く",
   "CmdCostDescription": "セッションのコスト内訳を表示",
+  "CmdReceiptsDescription": "このセッションの実行内容を表示: ファイル、コマンド、承認",
   "CmdDiffDescription": "セッション開始以降のファイル変更を表示",
   "CmdEditDescription": "最後のメッセージを編集して再送信",
   "CmdExitDescription": "アプリを終了",

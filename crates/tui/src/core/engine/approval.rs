@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use crate::approval_log::{ApprovalOutcome, ApprovalReceipt};
+use crate::approval_log::{ApprovalDecider, ApprovalOutcome, ApprovalReceipt};
 use crate::core::events::Event;
 use crate::tools::spec::ToolError;
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
@@ -41,9 +41,11 @@ use super::Engine;
 pub(super) enum ApprovalDecision {
     Approved {
         id: String,
+        by: ApprovalDecider,
     },
     Denied {
         id: String,
+        by: ApprovalDecider,
     },
     /// The interactive card expired unanswered (#6101): the configured
     /// bound denied the call, not the operator.
@@ -60,6 +62,7 @@ pub(super) enum ApprovalDecision {
     RetryWithPolicy {
         id: String,
         policy: crate::sandbox::SandboxPolicy,
+        by: ApprovalDecider,
     },
 }
 
@@ -136,12 +139,16 @@ impl Engine {
         })
     }
 
+    /// Record the decision half. `decided_by` is `None` only for a timeout,
+    /// whose outcome already names what ended the wait; a yes or a no always
+    /// says who answered.
     async fn commit_approval_outcome(
         &self,
         tool_id: &str,
         outcome: ApprovalOutcome,
+        decided_by: Option<ApprovalDecider>,
     ) -> Result<(), ToolError> {
-        self.commit_approval_receipt(ApprovalReceipt::decided(tool_id, outcome))
+        self.commit_approval_receipt(ApprovalReceipt::decided_with(tool_id, outcome, decided_by))
             .await
     }
 
@@ -154,8 +161,12 @@ impl Engine {
         self.commit_approval_receipt(ApprovalReceipt::asked(tool_id, tool_name))
             .await?;
         if self.tx_event.send(event).await.is_err() {
-            self.commit_approval_outcome(tool_id, ApprovalOutcome::Unavailable)
-                .await?;
+            self.commit_approval_outcome(
+                tool_id,
+                ApprovalOutcome::Unavailable,
+                Some(ApprovalDecider::Host),
+            )
+            .await?;
             return Err(ToolError::execution_failed(
                 "Approval request could not reach its decision host; tool execution was blocked."
                     .to_string(),
@@ -215,14 +226,14 @@ impl Engine {
                 }
                 _ = self.cancel_token.cancelled() => {
                     let suffix = self.cancel_reason_suffix();
-                    self.commit_approval_outcome(tool_id, ApprovalOutcome::Cancelled).await?;
+                    self.commit_approval_outcome(tool_id, ApprovalOutcome::Cancelled, Some(ApprovalDecider::Host)).await?;
                     return Err(ToolError::cancelled(
                         format!("Request cancelled while awaiting approval{suffix}"),
                     ));
                 }
                 decision = self.rx_approval.recv() => {
                     let Some(decision) = decision else {
-                        self.commit_approval_outcome(tool_id, ApprovalOutcome::Unavailable).await?;
+                        self.commit_approval_outcome(tool_id, ApprovalOutcome::Unavailable, Some(ApprovalDecider::Host)).await?;
                         return Err(ToolError::execution_failed(
                             "Approval channel closed — engine is shutting down. \
                              The approval modal can no longer reach the engine; \
@@ -231,20 +242,20 @@ impl Engine {
                         ));
                     };
                     match decision {
-                        ApprovalDecision::Approved { id } if id == tool_id => {
-                            self.commit_approval_outcome(tool_id, ApprovalOutcome::ApprovedOnce).await?;
+                        ApprovalDecision::Approved { id, by } if id == tool_id => {
+                            self.commit_approval_outcome(tool_id, ApprovalOutcome::ApprovedOnce, Some(by)).await?;
                             return Ok(ApprovalResult::Approved);
                         }
-                        ApprovalDecision::Denied { id } if id == tool_id => {
-                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Denied).await?;
+                        ApprovalDecision::Denied { id, by } if id == tool_id => {
+                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Denied, Some(by)).await?;
                             return Ok(ApprovalResult::Denied);
                         }
                         ApprovalDecision::TimedOut { id } if id == tool_id => {
-                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Timeout).await?;
+                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Timeout, None).await?;
                             return Ok(ApprovalResult::Denied);
                         }
                         ApprovalDecision::Unavailable { id } if id == tool_id => {
-                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Unavailable).await?;
+                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Unavailable, Some(ApprovalDecider::Host)).await?;
                             return Err(ToolError::execution_failed(
                                 "The approval request for this call was no longer current \
                                  (its turn had ended), so it was not shown to the user and \
@@ -252,10 +263,11 @@ impl Engine {
                                     .to_string(),
                             ));
                         }
-                        ApprovalDecision::RetryWithPolicy { id, policy } if id == tool_id => {
+                        ApprovalDecision::RetryWithPolicy { id, policy, by } if id == tool_id => {
                             self.commit_approval_outcome(
                                 tool_id,
                                 ApprovalOutcome::RetryWithPolicy { policy: policy.clone() },
+                                Some(by),
                             ).await?;
                             return Ok(ApprovalResult::RetryWithPolicy(policy));
                         }
