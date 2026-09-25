@@ -26,8 +26,14 @@ fn note(workspace: &Path, content: Option<&str>) -> CommandResult {
 
     let notes_path = notes_path(workspace);
     let (command, rest) = split_command(input);
+    let command = command.to_ascii_lowercase();
+    if !matches!(command.as_str(), "path" | "help")
+        && let Err(error) = ensure_notes_target_in_workspace(&notes_path, workspace)
+    {
+        return CommandResult::error(error);
+    }
 
-    match command.to_ascii_lowercase().as_str() {
+    match command.as_str() {
         "add" => append_note_command(&notes_path, rest),
         "list" => list_notes_command(&notes_path),
         "show" => show_note_command(&notes_path, rest),
@@ -49,6 +55,39 @@ fn notes_path(workspace: &Path) -> PathBuf {
         return primary;
     }
     workspace.join(".deepseek").join("notes.md")
+}
+
+/// The notes file lives in the workspace, which may be a cloned repository:
+/// a committed `notes.md -> ~/.zshrc` or a symlinked `.codewhale/` must not
+/// let `/note clear` empty (or `/note list` print) a file outside it. Same
+/// rule as the `note` tool.
+fn ensure_notes_target_in_workspace(notes_path: &Path, workspace: &Path) -> Result<(), String> {
+    if let Ok(meta) = fs::symlink_metadata(notes_path)
+        && (meta.file_type().is_symlink() || !meta.is_file())
+    {
+        return Err(format!(
+            "Refusing to use {}: the notes path is a symlink or not a regular file.",
+            notes_path.display()
+        ));
+    }
+    let (Some(parent), Ok(root)) = (notes_path.parent(), fs::canonicalize(workspace)) else {
+        return Ok(());
+    };
+    // Only existing ancestors can redirect; the rest is created as real
+    // directories.
+    let mut existing = parent.to_path_buf();
+    while !existing.exists() {
+        if !existing.pop() {
+            return Ok(());
+        }
+    }
+    match fs::canonicalize(&existing) {
+        Ok(resolved) if !resolved.starts_with(&root) => Err(format!(
+            "Refusing to use {}: its directory resolves outside the workspace.",
+            notes_path.display()
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn split_command(input: &str) -> (&str, Option<&str>) {
@@ -447,6 +486,27 @@ mod tests {
         assert!(listed.contains("1. First note"));
         assert!(listed.contains("2. Third note"));
         assert!(!listed.contains("Second note"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn note_commands_refuse_notes_that_leave_the_workspace() {
+        let tmpdir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let rc = outside.path().join("zshrc");
+        std::fs::write(&rc, "export PATH=keep\n").unwrap();
+        std::fs::create_dir_all(tmpdir.path().join(".deepseek")).unwrap();
+        std::os::unix::fs::symlink(&rc, notes_path(&tmpdir)).unwrap();
+        for command in ["clear", "remove 1", "edit 1 x", "list", "hello"] {
+            let result = note(tmpdir.path(), Some(command));
+            assert!(result.is_error, "/note {command} must be refused");
+        }
+        assert_eq!(std::fs::read_to_string(&rc).unwrap(), "export PATH=keep\n");
+
+        let linked = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), linked.path().join(".deepseek")).unwrap();
+        assert!(note(linked.path(), Some("clear")).is_error);
+        assert!(!outside.path().join("notes.md").exists());
     }
 
     #[test]

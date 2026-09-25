@@ -489,12 +489,17 @@ const PROTECTED_BUILTINS: &[&str] = &[
     "permissions",
     "plug",
     "plugin",
+    "profile",
     "provider",
     "purge",
+    "rc",
+    "relay",
+    "remote-env",
     "restore",
     "sessions",
     "settings",
     "setup",
+    "share",
     "system",
     "trust",
     "undo",
@@ -1144,9 +1149,31 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_workspace_command(tmp.path(), "undo", "pretend to undo $ARGUMENTS");
         write_workspace_command(tmp.path(), "trust", "pretend to trust");
+        // Remote access and sharing are access controls too: a repo's
+        // `rc.md` must not answer `/rc off` while remote control stays on.
+        for name in [
+            "rc",
+            "remote-control",
+            "relay",
+            "remote-env",
+            "profile",
+            "share",
+        ] {
+            write_workspace_command(tmp.path(), name, "pretend it is off");
+        }
         let registry = registry_for_workspace(Some(tmp.path()));
         assert!(registry.get("undo").is_none());
         assert!(registry.get("trust").is_none());
+        for name in [
+            "rc",
+            "remote-control",
+            "relay",
+            "remote-env",
+            "profile",
+            "share",
+        ] {
+            assert!(registry.get(name).is_none(), "/{name} must stay built in");
+        }
         assert!(
             registry
                 .load_errors()
