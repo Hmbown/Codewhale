@@ -28,6 +28,13 @@ export const CHANGELOG: ChangelogRelease[] = [
     "compareUrl": "https://github.com/Hmbown/CodeWhale/compare/v0.10.0...HEAD",
     "sections": [
       {
+        "heading": "Contributors",
+        "items": [
+          "@dajiaohuang — codewhale config set checks a known setting's value against its schema type before saving it (#6568)."
+        ],
+        "itemCount": 1
+      },
+      {
         "heading": "Added",
         "items": [
           "Official model routing: /router (also /model router) sets up the Auto router with presets: Jev (TypeSafe's decision model, via OpenRouter or a TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes one test call before it saves, /status shows the router's choice, cost and latency, and a failing router is shown as failing (#6525)."
@@ -37,6 +44,8 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Fixed",
         "items": [
+          "The installation page is generated from docs/INSTALL.md, so the website and the guide can no longer disagree; broken anchors and unsafe links fail the build (#6450).",
+          "codewhale config set refuses a value of the wrong type for a known setting (a word for an on/off switch, text for a number, a choice outside the list) instead of saving it (#6568, thanks @dajiaohuang).",
           "A turn that stops producing output now reports itself: the turn loop records its phase and last progress, and an overdue phase surfaces instead of hanging silently until the stream idle timeout. A delegated agent's final result is never dropped when the host is busy, so a finished child no longer leaves a ghost Running row behind (#6184).",
           "Git commands run by tools never stop to ask for a password, passphrase or host-key confirmation inside the terminal, and git_fetch has a timeout (#6184).",
           "A provider response that ends cleanly with no text and no tool call is retried before the turn fails, and the failure names how many retries ran (#6310).",
@@ -46,11 +55,9 @@ export const CHANGELOG: ChangelogRelease[] = [
           "\"Allow for this conversation\" records a grant for that tool and argument class instead of switching the whole thread to Full Access, so the call you just approved is no longer failed by a Permissions change. An approval also survives a Permissions change that only widens what is allowed, grants end when a thread is archived or deleted, and web.run open grants are scoped by host. Full Access covers MCP tools that declare themselves destructive in every host, including…",
           "web.run retries a refused page once with a browser user agent, and one site's failure no longer fails the whole call or drops its search results.",
           "Hooks treat bash, Bash and exec_shell as one tool in tool_name conditions, so the documented example fires.",
-          "macOS no longer reports Codewhale's ordinary heap as GPU (IOAccelerator) memory.",
-          "Code highlighting uses less memory, and long transcripts, the pager and the session picker do less work on the event loop; session previews load in the background (#6014).",
-          "The composer's send cue follows the draft, not a paste in progress (#6397)."
+          "macOS no longer reports Codewhale's ordinary heap as GPU (IOAccelerator) memory."
         ],
-        "itemCount": 14
+        "itemCount": 16
       },
       {
         "heading": "Experience",
