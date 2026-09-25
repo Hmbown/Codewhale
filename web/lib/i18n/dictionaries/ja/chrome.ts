@@ -33,24 +33,7 @@ export const chrome: ChromeDict = {
 
   authSignIn: "ログイン",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "どんなモデルでも、あなたのマシンで",
-
-  issueLabel: "{date} 号",
   dateLocale: "ja-JP",
-
-  tickerLiveLabel: "速 報",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "マージ",
-  tickerOpened: "オープン",
-  tickerClosed: "クローズ",
-  tickerReleased: "リリース",
-  tickerFirstContribution: "初コントリビュート",
-  tickerBy: "{handle} さん",
-  tickerAria: "リポジトリの最近の動き",
-
-  traceLabel: "推論トレース",
-  traceTabsAria: "セッションの抜粋",
 
   menuOpen: "メニューを開く",
   menuClose: "メニューを閉じる",

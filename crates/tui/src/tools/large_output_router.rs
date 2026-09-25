@@ -229,12 +229,11 @@ impl LargeOutputRouter {
         &self,
         tool_name: &str,
         result: &ToolResult,
-        _raw_bypass: bool,
     ) -> (EvidenceRouting, usize, usize) {
         let threshold = self.config.threshold_for(tool_name);
         let estimated_tokens = estimate_tokens(&result.content);
-        // `raw=true` no longer bypasses the context bound. Exact bytes remain
-        // available through the artifact handle, so bypass is unnecessary.
+        // There is no per-call bypass of the context bound: exact bytes stay
+        // available through the artifact handle.
         let routing = EvidenceRouting::from_token_estimate(estimated_tokens, threshold);
         (routing, estimated_tokens, threshold)
     }
@@ -394,10 +393,10 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_evidence_cannot_bypass_context_bound_with_raw_flag() {
+    fn oversized_result_becomes_handle_only_evidence() {
         let router = LargeOutputRouter::default();
         let big = make_result(&"a".repeat(100_000));
-        let (routing, _, _) = router.evidence_routing("exec_shell", &big, true);
+        let (routing, _, _) = router.evidence_routing("bash", &big);
         assert_eq!(routing, EvidenceRouting::HandleOnly);
     }
 

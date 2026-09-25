@@ -26,11 +26,8 @@ export const home: HomeDict = {
   releaseUnavailable: "릴리스 상태를 확인할 수 없음",
   currentSource: "소스",
   sourceCandidate: "미공개",
-  providerRoutes: "프로바이더 {count}개",
   publishedRelease: "공개됨",
   figcaptionSourceCandidate: "미공개",
-  chapterTerminal: "당신의 터미널",
-  chapterTerminalTitle: "만들고 싶은 것부터 시작하세요",
   gainHeading: "Codewhale로 할 수 있는 일",
   gainLede: "프로젝트나 질문, 자동화하고 싶은 작업에서 시작해 에이전트 하나와 함께 진행하거나 큰 작업의 여러 부분을 여러 에이전트에게 나누어 맡길 수 있습니다.",
   gain: [
@@ -47,7 +44,6 @@ export const home: HomeDict = {
       "에이전트에 호스팅형 또는 로컬 모델을 사용하고 서로 다른 모델과 역할이 각각 적합한 작업을 맡도록 할 수 있습니다."
     ]
   ],
-  chapterModels: "당신의 모델",
   modelsHeading: "작업마다 선택할 수 있는 다양한 모델",
   modelsBody:
     "호스팅형 모델 제공업체에 직접 연결하거나 게이트웨이로 여러 제공업체를 이용하거나 모델을 로컬에서 실행한 뒤, 작업하면서 세션별로 사용할 모델을 선택할 수 있습니다.",
@@ -61,7 +57,6 @@ export const home: HomeDict = {
   startLede: "Codewhale을 설치하고 모델을 연결하면 터미널에서 첫 작업을 설명할 수 있으며, 여러 에이전트가 작업을 나누어 맡도록 하고 싶을 때 Fleet을 추가할 수 있습니다.",
   startGuideLink: "시작 가이드 읽기",
   startVocabularyLink: "제품 용어 보기",
-  chapterAccount: "Codewhale 받기",
   availabilityHeading: "Codewhale을 사용할 수 있는 곳",
   availabilityLede: "Codewhale은 지금 터미널에서 사용할 수 있으며, 웹 앱과 데스크톱 앱, 클라우드 컴퓨터는 개발 중입니다.",
   availability: [

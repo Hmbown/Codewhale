@@ -656,8 +656,7 @@ fn contract_nonnegative_int(input: &Value, key: &str) -> Result<Option<usize>, T
     let Some(value) = input.get(key) else {
         return Ok(None);
     };
-    let number = value
-        .as_u64()
+    let number = codewhale_tools::json_nonnegative_integer(value)
         .ok_or_else(|| ToolError::invalid_input(format!("{key} must be a non-negative integer")))?;
     usize::try_from(number)
         .map(Some)

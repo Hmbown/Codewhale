@@ -30,7 +30,7 @@ export default async function GuidePage({ params }: { params: Promise<{ locale: 
       </section>
 
       <section id="path" className="scroll-mt-32">
-        <GettingStartedSteps locale={locale} />
+        <GettingStartedSteps locale={locale} headingLevel={2} />
       </section>
 
       {session?.status === "published" && (

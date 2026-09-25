@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { currentNavHref, type ChromeLink } from "@/lib/i18n/links";
 import { Icon } from "./icon";
+import { ArrowLabel } from "./arrow-label";
 
 export function MobileMenu({
   links,
@@ -171,7 +172,7 @@ export function MobileMenu({
         createPortal(<div
           ref={menuRef}
           id="mobile-menu"
-          className={`mm-panel lg:hidden fixed inset-0 z-40 bg-paper overflow-y-auto${closing ? " mm-closing" : ""}`}
+          className={`mm-panel lg:hidden fixed inset-0 z-40 bg-canvas overflow-y-auto${closing ? " mm-closing" : ""}`}
           role="dialog"
           aria-modal="true"
           aria-label={navAria}
@@ -198,7 +199,7 @@ export function MobileMenu({
                       aria-current={isActive ? "page" : undefined}
                     >
                       <span>{l.label}</span>
-                      <Icon name="chevron-right" className="nav-icon mm-link-chevron" />
+                      <Icon name="chevron-right" className="nav-icon mm-link-chevron icon-flip" />
                     </Link>
                   </li>
                 );
@@ -210,7 +211,7 @@ export function MobileMenu({
               onClick={() => setOpen(false)}
               className="mm-action paper-install-cta"
             >
-              {installLabel}
+              <ArrowLabel text={installLabel} />
             </Link>
             <Link
               href={signInHref}

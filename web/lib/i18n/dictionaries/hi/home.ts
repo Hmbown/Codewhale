@@ -26,11 +26,8 @@ export const home: HomeDict = {
   releaseUnavailable: "रिलीज़ स्थिति उपलब्ध नहीं",
   currentSource: "सोर्स",
   sourceCandidate: "अप्रकाशित",
-  providerRoutes: "{count} प्रोवाइडर",
   publishedRelease: "प्रकाशित",
   figcaptionSourceCandidate: "अप्रकाशित",
-  chapterTerminal: "आपका टर्मिनल",
-  chapterTerminalTitle: "किसी ऐसी चीज़ से शुरू करें जिसे आप बनाना चाहते हैं",
   gainHeading:
     "Codewhale से आप क्या कर सकते हैं",
   gainLede:
@@ -49,7 +46,6 @@ export const home: HomeDict = {
       "अपने एजेंटों के लिए होस्टेड या लोकल मॉडल इस्तेमाल करें और काम के हिस्से उनके लिए उपयुक्त मॉडल और भूमिकाओं को सौंपें।"
     ]
   ],
-  chapterModels: "आपके मॉडल",
   modelsHeading: "हर काम के लिए मॉडल का चुनाव",
   modelsBody:
     "होस्टेड मॉडल देने वाले किसी प्रदाता से सीधे जुड़ें, कई प्रदाताओं से जुड़ने के लिए गेटवे इस्तेमाल करें या मॉडल लोकल चलाएँ, फिर काम करते हुए चुनें कि हर सेशन में कौन-सा मॉडल इस्तेमाल हो।",
@@ -64,7 +60,6 @@ export const home: HomeDict = {
     "Codewhale इंस्टॉल करके मॉडल कनेक्ट करने के बाद आप टर्मिनल में अपना पहला काम बता सकते हैं और जब कई एजेंटों के बीच काम बाँटना चाहें, तब Fleet जोड़ सकते हैं।",
   startGuideLink: "शुरुआती गाइड पढ़ें",
   startVocabularyLink: "उत्पाद शब्दावली देखें",
-  chapterAccount: "Codewhale लें",
   availabilityHeading: "आप Codewhale कहाँ इस्तेमाल कर सकते हैं",
   availabilityLede:
     "आप आज ही Codewhale को अपने टर्मिनल में इस्तेमाल कर सकते हैं, जबकि हम वेब ऐप, डेस्कटॉप ऐप और क्लाउड कंप्यूटर बनाने पर काम कर रहे हैं।",

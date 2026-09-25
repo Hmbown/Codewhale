@@ -45,7 +45,7 @@ impl RuntimePolicyProjection {
             .and_then(ApprovalMode::from_config_value)
             .filter(|permission| *permission != ApprovalMode::Never)
             .unwrap_or_else(|| {
-                if legacy_yolo_alias(mode) || auto_approve {
+                if AppMode::is_legacy_bypass_alias(mode) || auto_approve {
                     ApprovalMode::Bypass
                 } else {
                     ApprovalMode::Suggest
@@ -73,7 +73,7 @@ impl RuntimePolicyProjection {
                     "unsupported permission posture {value:?}; expected ask, auto-review, or full-access"
                 )
             })?,
-            None if legacy_yolo_alias(mode) || auto_approve.unwrap_or(false) => ApprovalMode::Bypass,
+            None if AppMode::is_legacy_bypass_alias(mode) || auto_approve.unwrap_or(false) => ApprovalMode::Bypass,
             None => ApprovalMode::Suggest,
         };
         if permission == ApprovalMode::Never {
@@ -107,17 +107,6 @@ pub(crate) fn parse_runtime_mode(value: &str) -> Option<AppMode> {
         "normal" => Some(AppMode::Agent),
         other => AppMode::parse(other),
     }
-}
-
-/// Legacy mode spellings that carried the Full Access posture. `AppMode::
-/// parse` folds them to Agent; the posture is re-derived from the raw wire
-/// value so old persisted shapes keep their permission meaning.
-#[must_use]
-fn legacy_yolo_alias(mode: &str) -> bool {
-    matches!(
-        mode.trim().to_ascii_lowercase().as_str(),
-        "yolo" | "4" | "bypass" | "bypass-permissions" | "bypasspermissions"
-    )
 }
 
 #[cfg(test)]

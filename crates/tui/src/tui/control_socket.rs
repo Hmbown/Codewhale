@@ -26,8 +26,7 @@
 //! ```json
 //! {"id":"1","method":"message","params":{"text":"hello"}}
 //! {"id":"2","method":"interrupt","params":{}}
-//! {"id":"3","method":"relaunch","params":{}}
-//! {"id":"4","method":"status","params":{}}
+//! {"id":"3","method":"status","params":{}}
 //! ```
 //!
 //! Success responses echo the id and carry a `type`-tagged result:
@@ -35,8 +34,7 @@
 //! ```json
 //! {"id":"1","result":{"type":"message_sent","delivery":"dispatched"}}
 //! {"id":"2","result":{"type":"interrupted","cancelled":true}}
-//! {"id":"3","result":{"type":"relaunching"}}
-//! {"id":"4","result":{"type":"status","turn_state":"idle","goal":{"objective":null,"status":"active","paused":false}}}
+//! {"id":"3","result":{"type":"status","turn_state":"idle","goal":{"objective":null,"status":"active","paused":false}}}
 //! ```
 //!
 //! Failures are `{"id":…,"error":{"code":…,"message":…}}` with codes
@@ -52,14 +50,6 @@
 //! - `interrupt` — the exact Esc-shaped "cancel the active turn" body
 //!   (`escape_cancel_request`), shared with the Esc key path so the two
 //!   cannot drift. `cancelled` reports whether active work was in flight.
-//! - `relaunch` — routed through the slash-command path
-//!   (`crate::commands::execute("/relaunch", app)`): **no relaunch logic
-//!   lives here**. The `/relaunch` command is built on the
-//!   `pr/relaunch-command` branch; this verb is the seam that calls the same
-//!   command the user's `/relaunch` would. Until that command lands, the
-//!   verb reports the command's own "unknown command" error verbatim, and
-//!   once it lands the verb inherits its save-and-quit handoff with no
-//!   changes here.
 //! - `status` — answered by the socket thread directly from a snapshot the
 //!   event loop republishes every iteration: `turn_state`
 //!   (`idle | in_progress | waiting`) and `goal`
@@ -72,8 +62,7 @@
 //!    [`SessionControl::reconcile`] (bind/rebind/unbind when the owned
 //!    session id changes), [`SessionControl::update_status`] (publish the
 //!    snapshot for `status`), and [`SessionControl::drain`] (execute queued
-//!    verbs on the UI thread; a `true` return asks the loop to quit, which
-//!    is how `relaunch` reuses the ordinary `/exit` teardown).
+//!    verbs on the UI thread).
 //! 2. The socket runs on background threads; verbs that touch UI state cross
 //!    to the event loop over an mpsc channel and answer over a response
 //!    channel with a 5 s timeout (a dispatch-to-app pattern).
@@ -102,7 +91,7 @@ use std::thread;
 
 use serde::{Deserialize, Serialize};
 
-use crate::tui::app::{App, AppAction, ComposerSubmitAction, QueuedMessage, SubmitDisposition};
+use crate::tui::app::{App, ComposerSubmitAction, QueuedMessage, SubmitDisposition};
 use crate::tui::streaming::StreamDisplayClock;
 use crate::tui::ui::{DispatchRecovery, dispatch_composer_message, escape_cancel_request};
 
@@ -160,7 +149,6 @@ struct Request {
 enum Method {
     Message(MessageParams),
     Interrupt(EmptyParams),
-    Relaunch(EmptyParams),
     Status(EmptyParams),
 }
 
@@ -187,7 +175,6 @@ pub(crate) struct PendingCommand {
 pub(crate) enum ControlCommand {
     Message { text: String },
     Interrupt,
-    Relaunch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -230,7 +217,6 @@ enum ResponseResult {
     Interrupted {
         cancelled: bool,
     },
-    Relaunching,
     Status {
         turn_state: TurnState,
         goal: GoalSnapshot,
@@ -401,9 +387,7 @@ impl SessionControl {
     }
 
     /// Execute verbs queued by the socket thread on the UI thread and answer
-    /// their clients. Returns `true` when a verb requested app quit (the
-    /// `relaunch` seam) — the caller returns from the event loop and reuses
-    /// the ordinary `/exit` teardown path.
+    /// their clients.
     pub(crate) async fn drain(
         &mut self,
         app: &mut App,
@@ -411,13 +395,12 @@ impl SessionControl {
         engine_handle: &crate::core::engine::EngineHandle,
         current_streaming_text: &mut String,
         stream_display_clock: &mut StreamDisplayClock,
-    ) -> bool {
+    ) {
         if !self.enabled {
-            return false;
+            return;
         }
-        let mut quit = false;
         while let Ok(pending) = self.commands_rx.try_recv() {
-            let (do_quit, response) = execute_command(
+            let response = execute_command(
                 app,
                 config,
                 engine_handle,
@@ -430,9 +413,7 @@ impl SessionControl {
             // The client may have disconnected while we worked; that must
             // never fail the loop.
             let _ = pending.respond_to.send(response);
-            quit |= do_quit;
         }
-        quit
     }
 }
 
@@ -473,7 +454,7 @@ fn snapshot_from_app(app: &App) -> StatusSnapshot {
     }
 }
 
-/// Execute one verb on the UI thread. Returns `(quit, response_json)`.
+/// Execute one verb on the UI thread and return its response line.
 async fn execute_command(
     app: &mut App,
     config: &crate::config::Config,
@@ -482,17 +463,14 @@ async fn execute_command(
     stream_display_clock: &mut StreamDisplayClock,
     id: String,
     command: ControlCommand,
-) -> (bool, String) {
+) -> String {
     match command {
         ControlCommand::Message { text } => {
             if text.trim().is_empty() {
-                return (
-                    false,
-                    response_error(
-                        &id,
-                        "invalid_request",
-                        "message text must not be empty".to_string(),
-                    ),
+                return response_error(
+                    &id,
+                    "invalid_request",
+                    "message text must not be empty".to_string(),
                 );
             }
             // Queued delivery is the default under load: while a turn is in
@@ -520,10 +498,7 @@ async fn execute_command(
             .await;
             app.needs_redraw = true;
             let delivery = if busy { "queued" } else { "dispatched" };
-            (
-                false,
-                response_ok(id, ResponseResult::MessageSent { delivery }),
-            )
+            response_ok(id, ResponseResult::MessageSent { delivery })
         }
         ControlCommand::Interrupt => {
             let had_active_work = app.is_loading
@@ -536,10 +511,7 @@ async fn execute_command(
             if !had_active_work {
                 // Nothing Esc-cancel would cancel: quiet no-op, like an Esc
                 // on an idle app that has nothing else to act on.
-                return (
-                    false,
-                    response_ok(id, ResponseResult::Interrupted { cancelled: false }),
-                );
+                return response_ok(id, ResponseResult::Interrupted { cancelled: false });
             }
             let _ = escape_cancel_request(
                 app,
@@ -548,32 +520,7 @@ async fn execute_command(
                 stream_display_clock,
             );
             app.needs_redraw = true;
-            (
-                false,
-                response_ok(id, ResponseResult::Interrupted { cancelled: true }),
-            )
-        }
-        ControlCommand::Relaunch => {
-            // Seam: the exact same command path `/relaunch` uses. When the
-            // /relaunch command lands (pr/relaunch-command), this returns its
-            // save-and-quit action and the quit flag below reuses the /exit
-            // teardown; until then the command's own error is reported.
-            let result = crate::commands::execute("/relaunch", app);
-            if result.is_error {
-                return (
-                    false,
-                    response_error(
-                        &id,
-                        "command_error",
-                        result
-                            .message
-                            .unwrap_or_else(|| "relaunch failed".to_string()),
-                    ),
-                );
-            }
-            let quit = matches!(result.action, Some(AppAction::Quit));
-            app.needs_redraw = true;
-            (quit, response_ok(id, ResponseResult::Relaunching))
+            response_ok(id, ResponseResult::Interrupted { cancelled: true })
         }
     }
 }
@@ -814,7 +761,6 @@ fn handle_connection(
             commands_tx,
         ),
         Method::Interrupt(_) => dispatch_to_app(request.id, ControlCommand::Interrupt, commands_tx),
-        Method::Relaunch(_) => dispatch_to_app(request.id, ControlCommand::Relaunch, commands_tx),
     };
     write_response_line(stream.get_mut(), &response);
 }
@@ -917,18 +863,29 @@ mod tests {
                 r#"{"id":"2","method":"interrupt","params":{}}"#,
                 "interrupt",
             ),
-            (r#"{"id":"3","method":"relaunch","params":{}}"#, "relaunch"),
-            (r#"{"id":"4","method":"status","params":{}}"#, "status"),
+            (r#"{"id":"3","method":"status","params":{}}"#, "status"),
         ] {
             let request: Request = serde_json::from_str(raw).expect("verb request");
             let got = match request.method {
                 Method::Message(_) => "message",
                 Method::Interrupt(_) => "interrupt",
-                Method::Relaunch(_) => "relaunch",
                 Method::Status(_) => "status",
             };
             assert_eq!(got, want);
         }
+    }
+
+    /// #6516: `relaunch` was advertised but always failed, because no
+    /// `/relaunch` command exists. It is gone; a supervisor still sending it
+    /// gets a parse error naming the verbs that do exist.
+    #[test]
+    fn retired_relaunch_verb_is_rejected() {
+        let error =
+            serde_json::from_str::<Request>(r#"{"id":"3","method":"relaunch","params":{}}"#)
+                .expect_err("relaunch must not parse");
+        let message = error.to_string();
+        assert!(message.contains("unknown variant"), "{message}");
+        assert!(message.contains("status"), "{message}");
     }
 
     #[test]
@@ -979,9 +936,6 @@ mod tests {
             interrupted,
             r#"{"id":"2","result":{"type":"interrupted","cancelled":true}}"#
         );
-
-        let relaunching = response_ok("3".into(), ResponseResult::Relaunching);
-        assert_eq!(relaunching, r#"{"id":"3","result":{"type":"relaunching"}}"#);
 
         let status = response_ok(
             "4".into(),

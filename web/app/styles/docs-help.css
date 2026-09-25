@@ -50,10 +50,6 @@
   border-top: 1px solid var(--stage-line);
 }
 
-.docs-task-row .docs-topic-source {
-  font-size: 0.75rem;
-}
-
 .docs-help {
   display: grid;
   grid-template-columns: minmax(0, 1.3fr) minmax(12rem, 0.7fr);

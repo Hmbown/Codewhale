@@ -23,14 +23,14 @@ describe("docs breadcrumbs", () => {
     expect(resolveDocsBreadcrumbs("en", "/en/docs/mcp")).toEqual([
       { name: "Home", href: "/en" },
       { name: "Docs", href: "/en/docs" },
-      { name: "Extending" },
-      { name: "MCP" },
+      { name: "Extend and automate" },
+      { name: "Connect tools with MCP" },
     ]);
     expect(resolveDocsBreadcrumbs("zh", "/zh/docs/modes/")).toEqual([
       { name: "首页", href: "/zh" },
       { name: "文档", href: "/zh/docs" },
-      { name: "核心概念" },
-      { name: "模式" },
+      { name: "日常使用" },
+      { name: "设置模式与审批" },
     ]);
     expect(resolveDocsTopic("en", "/en/docs/guide")?.id).toBe("guide");
   });
@@ -54,7 +54,7 @@ describe("docs breadcrumbs", () => {
       {
         "@type": "ListItem",
         position: 3,
-        name: "Sandbox & Approval",
+        name: "Limit what commands can touch",
         item: `${SITE_URL}/en/docs/sandbox`,
       },
     ]);

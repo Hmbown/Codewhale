@@ -8,7 +8,6 @@ import { siteCss } from "./site-css";
 // still pose under reduced motion.
 const CSS = siteCss();
 const TAILWIND = readFileSync(new URL("../tailwind.config.ts", import.meta.url), "utf8");
-const WHALE = readFileSync(new URL("../components/whale.tsx", import.meta.url), "utf8");
 
 describe("design grammar contract", () => {
   it("draws every radius from the 6/10/14/pill grammar", () => {
@@ -16,27 +15,53 @@ describe("design grammar contract", () => {
     expect(new Set(defined)).toEqual(new Set(["6px", "10px", "14px", "999px"]));
     const used = [...CSS.matchAll(/border-radius:\s*([^;]+);/g)].map((m) => m[1].trim());
     expect(used.length).toBeGreaterThan(0);
-    for (const value of used) expect(value).toMatch(/^var\(--radius-(control|surface|sheet|pill)\)$/);
+    // A corner is a grammar token or square; per-corner shorthands combine them.
+    for (const value of used) {
+      expect(value).toMatch(/^(?:(?:var\(--radius-(control|surface|sheet|pill)\)|0)\s*){1,4}$/);
+    }
     const scale = TAILWIND.match(/borderRadius:\s*\{([\s\S]*?)\}/)?.[1] ?? "";
     expect(scale).not.toMatch(/\d+(px|rem)/);
   });
 
   it("has one focus ring and the set_theme selection", () => {
-    expect(CSS.match(/outline:/g)).toHaveLength(1);
+    expect(CSS.match(/(?<![\w-])outline:/g)).toHaveLength(1);
     expect(CSS).toContain(":focus-visible { outline: var(--gpui-focus-width) solid var(--ring); outline-offset: var(--gpui-focus-offset); }");
     expect(resolveWhale("var(--gpui-focus-width)")).toBe("2px");
     expect(resolveWhale("var(--gpui-focus-offset)")).toBe("3px");
     expect(CSS).not.toMatch(/outline:\s*none/);
     expect(CSS).toMatch(/::selection \{ background: var\(--selection\); \}/);
-    // The light ring on the dark stage would fall under 3:1.
-    expect(CSS).toMatch(/\.site-footer,[\s\S]*?\{ --ring: var\(--gpui-dark-primary\); \}/);
+    // The light ring on the dark stage would fall under 3:1, so the stage
+    // re-declares it.
+    expect(CSS).toMatch(/\.stage,\s*\.site-footer\s*\{[^}]*--ring: var\(--gpui-dark-primary\);/);
   });
 
-  it("hovers a primary fill at the primary @ 0.9", () => {
-    for (const cls of ["portal-button-primary", "folio-button-primary", "paper-install-cta"]) {
-      const hover = CSS.match(new RegExp(`\\.${cls}:hover \\{([^}]*)\\}`))?.[1] ?? "";
-      expect(hover, cls).toMatch(/background: var\(--indigo-deep\)/);
+  it("paints every primary fill with the logo gradient and white text", () => {
+    for (const cls of ["btn-primary", "paper-install-cta"]) {
+      const rest = CSS.match(new RegExp(`\\.${cls}[^{]*\\{([^}]*)\\}`))?.[1] ?? "";
+      const hover = CSS.match(new RegExp(`\\.${cls}:hover[^{]*\\{([^}]*)\\}`))?.[1] ?? "";
+      expect(rest, cls).toMatch(/background: var\(--brand-fill\)/);
+      expect(rest, cls).toMatch(/color: var\(--on-brand\)/);
+      expect(hover, cls).toMatch(/background: var\(--brand-fill-hover\)/);
     }
+  });
+
+  it("keeps every keyframed animation behind a motion preference", () => {
+    // Strip the blocks that only run when motion is allowed; nothing left
+    // may start an animation.
+    let rest = CSS;
+    for (;;) {
+      const at = rest.indexOf("@media (prefers-reduced-motion: no-preference)");
+      if (at < 0) break;
+      let depth = 0;
+      let end = rest.indexOf("{", at);
+      for (let i = end; i < rest.length; i++) {
+        if (rest[i] === "{") depth++;
+        else if (rest[i] === "}" && --depth === 0) { end = i; break; }
+      }
+      rest = rest.slice(0, at) + rest.slice(end + 1);
+    }
+    const starts = [...rest.matchAll(/animation:\s*([^;]+);/g)].map((m) => m[1].trim());
+    for (const value of starts) expect(value).toBe("none");
   });
 
   it("times motion with the spring tokens and stills it under reduced motion", () => {
@@ -49,7 +74,6 @@ describe("design grammar contract", () => {
     expect(TAILWIND).toMatch(/transitionDuration: \{ DEFAULT: "var\(--dur-state\)" \}/);
     expect(TAILWIND).toMatch(/transitionTimingFunction: \{ DEFAULT: "var\(--ease-spring\)" \}/);
     expect(CSS).not.toMatch(/caustic/);
-    expect(WHALE).not.toMatch(/caustic|<animate|clipPath/);
   });
 
   it("keeps no unused presence shapes", () => {

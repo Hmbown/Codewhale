@@ -46,7 +46,7 @@ describe("typography contract", () => {
     expect(rootVar("font-mono")).toMatch(/^ui-monospace,/);
     expect(rootVar("font-cjk")).not.toMatch(/Serif|(?<!sans-)serif/);
     expect(resolveWhale(rootVar("text-mono"))).toBe("0.8125rem");
-    expect(rootVar("text-prose")).toBe("0.9375rem");
+    expect(rootVar("text-prose")).toBe("1.0625rem");
   });
 
   it("preloads only the Latin subset of Shannon Sans", () => {

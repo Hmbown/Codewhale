@@ -1,46 +1,149 @@
 import type { DocsTroubleshootingDict } from "../types";
 
 /**
- * English reference dictionary for
- * `app/[locale]/docs/troubleshooting/page.tsx`. Copy moved verbatim from the
- * page's `isZh` ternaries — any wording change belongs in its own commit,
- * never mixed into a structural move.
+ * English reference dictionary for `app/[locale]/docs/troubleshooting/page.tsx`
+ * ("Fix a problem"). Error texts and fixes come from docs/INSTALL.md §13
+ * (every one was hit while writing that guide), docs/OPERATIONS_RUNBOOK.md,
+ * docs/KEYBINDINGS.md (Ctrl-B), crates/tui/src/runtime_log.rs (log path),
+ * and docs/DOCKER.md.
  */
 export const docsTroubleshooting: DocsTroubleshootingDict = {
-  metaTitle: "Troubleshooting · Codewhale Docs",
+  metaTitle: "Fix a problem · Codewhale Docs",
   metaDescription:
-    "Quick triage for common issues: hung turns, the offline queue, crash recovery, schema errors, MCP failures, and Docker notes.",
+    "Diagnose Codewhale in one command, then fix the common problems: command not found, no reply, a rejected key, network errors, a stuck turn, a session that will not resume, and MCP servers.",
   bodyClassName: "text-ink-soft leading-relaxed",
-  overviewTitle: "Troubleshooting",
-  overviewLead:
-    "Start with quick triage: confirm the binary and config (codewhale --version, ~/.codewhale/config.toml), enable verbose logs with RUST_LOG=codewhale_tui=debug when needed (RUST_LOG=codewhale_tui::client=debug for HTTP retries/reconnects; logs land in ~/.codewhale/logs/), and capture the current state of ~/.codewhale/sessions and ~/.codewhale/tasks.",
-  incidents: [
-    [
-      "Turn hangs or the stream stops",
-      "If a foreground shell command is still running, press Ctrl+B to move it to the background (the turn keeps running and the command becomes a background job under /jobs); use Esc or Ctrl+C to cancel the turn itself. Inspect codewhale_tui::client retry logs and endpoint connectivity, and after a restart confirm the previously in-flight turn shows as interrupted rather than running.",
-    ],
-    [
-      "Network outage / offline behavior",
-      "New prompts queue while offline, persisted per session to ~/.codewhale/sessions/checkpoints/<session-id>.offline_queue.json (a legacy global offline_queue.json is adopted once on upgrade). Inspect with /queue list, restore connectivity, then re-send queued entries (/queue edit <n> plus Enter, or the normal input flow); the queue file clears when the queue empties.",
-    ],
-    [
-      "Crash recovery",
-      "Each session checkpoints to ~/.codewhale/sessions/checkpoints/<session-id>.json (a legacy latest.json is still read but no longer written); startup begins a fresh session unless --resume/--continue is supplied. Resume explicitly with codewhale --resume <id> or Ctrl+R in the TUI; if the checkpoint schema is newer than the binary supports, upgrade the binary or remove the stale checkpoint.",
-    ],
-    [
-      "Persistent state schema errors",
-      "Errors like schema vX is newer than supported vY affect sessions, runtime thread/turn/item records, and tasks. Confirm the binary version, back up the state directory before editing, then either run a newer compatible binary or archive the incompatible records and regenerate state.",
-    ],
-    [
-      "MCP / tool execution failures",
-      "Validate the ~/.codewhale/mcp.json schema and server command paths, confirm the server process starts manually, and check sandbox denials in TUI history/logs. Use /mcp validate for diagnostics, temporarily disable a failing server to isolate the issue, and re-enable after verification.",
-    ],
+  title: "Fix a problem",
+  lede:
+    "Start with one diagnostic command, then find your symptom below. Each fix names the exact message you will see.",
+  sections: [
+    {
+      id: "diagnose",
+      title: "Run the diagnostics",
+      blocks: [
+        {
+          code: `codewhale --version
+codewhale doctor
+codewhale doctor --probe-api                  # one real test call to your provider
+codewhale auth status --provider deepseek     # which key is in use`,
+          lang: "Terminal",
+        },
+        {
+          p: "`codewhale doctor --json` produces a diagnostics bundle without secrets, ready to attach to an issue. Plain `doctor` does not tell you which key is active and exits successfully even with no key; use `auth status` for that.",
+        },
+      ],
+    },
+    {
+      id: "install",
+      title: "Install and update",
+      blocks: [
+        {
+          rows: [
+            ["`codewhale: command not found`", "`~/.local/bin` is not on your PATH in this terminal. Add `export PATH=\"$HOME/.local/bin:$PATH\"` to your shell profile and open a new terminal."],
+            ["`npm error code EACCES`", "Your Node install is owned by the system. Do not use sudo: point npm at a folder you own with `npm config set prefix \"$HOME/.npm-global\"`, add its `bin` to your PATH, and install again."],
+            ["`refusing to replace existing ~/.local/bin/codewhale`", "A different version is already there. Run `codewhale update`, or remove the old binaries first."],
+            ["`checksum mismatch`", "The download was corrupted or altered, and nothing was installed. Try again; if it repeats, do not use a mirror."],
+            ["`The package-managed executable was not changed.`", "You installed with npm, Cargo, or Homebrew. Update with that tool, for example `npm install -g codewhale`."],
+          ],
+        },
+      ],
+    },
+    {
+      id: "model",
+      title: "No reply, or the key is rejected",
+      blocks: [
+        {
+          rows: [
+            ["Your message appears but nothing answers", "No key is configured, and v0.10.0 does not warn you. Press F3, choose your provider, and paste the key."],
+            ["`API key not found`", "No key anywhere. Save one with `codewhale auth set --provider <name>`."],
+            ["`Authentication Fails … is invalid`", "The key is wrong or revoked. Run `auth status` to see which source is used — a saved key beats an environment variable — then save the right key or `codewhale auth clear --provider <name>`."],
+            ["`Network error: SSE stream request failed …`", "Usually no connection to the provider. Check with `curl -sI https://api.deepseek.com` (a 401 means it is reachable). Behind a proxy, export `HTTPS_PROXY`. On Windows or strict proxies, try `CODEWHALE_FORCE_HTTP1=1`."],
+          ],
+        },
+      ],
+    },
+    {
+      id: "turn",
+      title: "A turn is stuck",
+      blocks: [
+        {
+          list: [
+            "Press Esc to cancel the turn. Esc also closes menus first, so press it again if a menu was open.",
+            "If a long shell command is holding the turn, press Ctrl-B to move it into the background. The turn continues, and `/jobs` shows the command.",
+            "`/retry` sends the last request again.",
+          ],
+        },
+        {
+          p: "For a detailed record, start Codewhale with `RUST_LOG=codewhale_tui=debug` (or `RUST_LOG=codewhale_tui::client=debug` for connection retries). Logs are written to `~/.codewhale/logs/`.",
+        },
+      ],
+    },
+    {
+      id: "sessions",
+      title: "Resume a session",
+      blocks: [
+        {
+          code: `codewhale sessions            # list saved sessions
+codewhale resume <id>         # an id or a unique prefix
+codewhale -c                  # the latest session in this folder`,
+          lang: "Terminal",
+        },
+        {
+          p: "Inside Codewhale, Ctrl-R opens the session picker. `No saved sessions found for workspace` after `codewhale exec --continue` means the earlier run was a plain `exec`, which is not saved; use `--output-format stream-json` for runs you want to continue.",
+        },
+        {
+          p: "Messages you send while offline wait in a queue, saved with the session. `/queue list` shows them. When the connection is back, open one with `/queue edit <n>` and press Enter to send it.",
+        },
+      ],
+    },
+    {
+      id: "mcp",
+      title: "MCP tools are missing",
+      blocks: [
+        {
+          list: [
+            "After changing `mcp.json` or a server's credentials, run `/mcp reload`. `/mcp validate` only refreshes what you see.",
+            "Run the server's command yourself in a shell to confirm it starts.",
+            "If the config file is missing or broken, `codewhale mcp init --force` writes a fresh one.",
+          ],
+        },
+      ],
+    },
+    {
+      id: "docker",
+      title: "Run in Docker",
+      blocks: [
+        {
+          code: `docker volume create codewhale-home
+docker run --rm -it \\
+  -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \\
+  -v codewhale-home:/home/codewhale/.codewhale \\
+  -v "$PWD:/workspace" -w /workspace \\
+  ghcr.io/hmbown/codewhale:latest`,
+          lang: "Terminal",
+        },
+        {
+          p: "The image runs as a non-root user and keeps your settings and sessions in the named volume. Pin a release tag instead of `latest` for repeatable setups, use one volume per project, and never bake keys into an image.",
+        },
+      ],
+    },
   ],
-  dockerTitle: "Docker notes",
-  dockerLead:
-    "Each release publishes a multi-arch Linux image to GitHub Container Registry. The default image is a conservative runtime image: it runs as the non-root codewhale user (UID/GID 1000:1000), grants no passwordless sudo, and keeps user state in a volume mounted at /home/codewhale/.codewhale. Pin a release tag instead of latest for reproducible installs.",
-  dockerToolboxNote:
-    "When a project needs apt-get, compiler toolchains, or package managers inside the container, do not change the default image contract — build an explicit toolbox image from docs/examples/Dockerfile.toolbox, and use one named state volume per project so sessions, config, and the offline queue do not bleed across workspaces. Never bake API keys or SSH private keys into custom images.",
+  next: [
+    {
+      href: "/docs/auth",
+      label: "Connect a provider",
+      note: "Save a key, check which one is used, or switch to a local model.",
+    },
+    {
+      href: "/install",
+      label: "Install Codewhale",
+      note: "Every install method, with the output each step should print.",
+    },
+    {
+      href: "/docs/review",
+      label: "Review what changed",
+      note: "Roll files back to the snapshot before a turn went wrong.",
+    },
+  ],
   sourceNote:
-    "Source documents: docs/OPERATIONS_RUNBOOK.md, docs/DOCKER.md · Update docs-map.ts when changing.",
+    "Source documents: docs/INSTALL.md §13, docs/OPERATIONS_RUNBOOK.md, docs/DOCKER.md · Update docs-map.ts when changing.",
 };

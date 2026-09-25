@@ -1,38 +1,100 @@
 import type { DocsSandboxDict } from "../types";
 
-/** 中文对照见 `en/docs-sandbox.ts`,文案自页面的 `isZh` 三元逐字迁入。 */
+/** 「限制命令的访问范围」页的简体中文词典；与 `en/docs-sandbox.ts` 逐段对应。 */
 export const docsSandbox: DocsSandboxDict = {
-  metaTitle: "沙箱与审批 · Codewhale 文档",
-  metaDescription: "macOS Seatbelt、Linux 可选 bubblewrap、平台缺口和审批策略的真实边界。",
+  metaTitle: "限制命令的访问范围 · Codewhale 文档",
+  metaDescription:
+    "了解 macOS、Linux 和 Windows 上用哪种操作系统沙箱包裹 shell 命令，在可选的平台上开启它，并决定命令能写到哪里。",
   bodyClassName: "text-ink-soft leading-[1.9] tracking-wide",
-  overviewTitle: "沙箱与审批",
-  overviewLead:
-    "Codewhale 可以启动由模型提出的 shell 命令。审批策略、感知工作区的文件工具和操作系统命令包装器是三个独立的控制：一次审批不是沙箱，选择 workspace-write 也不代表当前平台有可用的 OS 包装器。本页只描述已经接入命令执行路径的行为。",
-  platforms: [
-    [
-      "macOS · Seatbelt",
-      "Codewhale 探测 /usr/bin/sandbox-exec；探测成功且策略要求沙箱时，子命令会被包上运行时生成的 Seatbelt profile：广泛的文件系统读取、按策略限制的写入、仅在策略允许时放行网络。探测失败则如实报告无 OS 沙箱。",
-    ],
-    [
-      "Linux · 可选 bubblewrap",
-      "Linux 命令沙箱是显式启用的：设置 prefer_bwrap = true，且 /usr/bin/bwrap 是可执行文件时才选用。子命令得到只读根视图，writable 挂载来自解析后的策略；默认隔离网络命名空间，仅在策略开启 network_access 时加 --share-net。未启用或未安装 bwrap 时报告 none。",
-    ],
-    [
-      "Windows · 无 OS 沙箱",
-      "Windows 命令路径目前报告无 OS 沙箱。主机权限和审批策略仍然有效，但它们不是 Codewhale 的 OS 命令沙箱。",
-    ],
-    [
-      "外部 OpenSandbox 执行",
-      '配置 sandbox_backend = "opensandbox" 后，shell 执行会发往配置的 OpenSandbox 兼容 HTTP 端点，而不是启动本地子进程。隔离保证属于所配置的服务及其运营者。',
-    ],
+  title: "限制命令的访问范围",
+  lede:
+    "批准一条命令，决定的是它能不能运行；沙箱决定的是它运行之后能碰到什么。只要操作系统提供沙箱，Codewhale 就会使用它；没有沙箱时，也会如实告诉你。",
+  sections: [
+    {
+      id: "platforms",
+      title: "查看你的平台提供了什么",
+      blocks: [
+        {
+          rows: [
+            ["macOS", "Seatbelt，启动检查通过后自动启用。命令可以广泛读取，写入范围由沙箱模式限定，只有模式允许时才能联网。"],
+            ["Linux", "bubblewrap，但需要你手动开启（见下文）。不开启时，命令在没有操作系统沙箱的情况下运行。"],
+            ["Windows", "目前没有操作系统沙箱。你的审批设置和 Windows 自身的权限仍然有效。"],
+            ["外部服务", "设置 `sandbox_backend = \"opensandbox\"` 后，shell 命令会在你配置的 OpenSandbox 兼容服务上运行；隔离效果由该服务负责保证。"],
+          ],
+        },
+        { p: "问问 Codewhale 它找到了哪一种：" },
+        { code: "codewhale doctor\ncodewhale setup --status", lang: "终端" },
+        {
+          p: "两条命令报告的都是应用你的设置之后实际可用的沙箱。仓库里存在但没有接入执行路径的代码，Codewhale 从不把它算作沙箱。",
+        },
+      ],
+    },
+    {
+      id: "linux",
+      title: "开启 Linux 沙箱",
+      blocks: [
+        { p: "先安装 bubblewrap，再在 `~/.codewhale/config.toml` 中加一行来启用：" },
+        {
+          code: `sudo apt install bubblewrap      # Fedora: dnf install bubblewrap · Arch: pacman -S bubblewrap
+
+# ~/.codewhale/config.toml
+prefer_bwrap = true`,
+          lang: "终端 / config.toml",
+        },
+        {
+          p: "只有当 `/usr/bin/bwrap` 存在且可执行时，Codewhale 才会使用它。此后，命令看到的是只读的系统视图，只能写入沙箱模式允许的位置，除非模式允许，否则无法联网。",
+        },
+      ],
+    },
+    {
+      id: "mode",
+      title: "决定命令能写到哪里",
+      blocks: [
+        { code: 'sandbox_mode = "workspace-write"', lang: "config.toml" },
+        {
+          rows: [
+            ["read-only", "命令只能读，不能写。"],
+            ["workspace-write", "命令只能写入工作区和临时文件夹，其他地方都不行。"],
+            ["danger-full-access", "不使用操作系统沙箱。只在你不怕损坏的机器或容器里使用。"],
+            ["external-sandbox", "你已经运行在隔离环境里，Codewhale 不再额外加一层。"],
+          ],
+          codeTerms: true,
+        },
+        {
+          p: "前两种模式只有在沙箱可用时才会真正生效——在没有 bubblewrap 的 Linux 上，以及在 Windows 上，它们只是设置，背后没有操作系统沙箱。仓库自带的配置只能让模式更严格，不能更宽松。对单次无界面运行，可以给 `codewhale exec` 传 `--sandbox <模式>`；`--auto` 只会自动批准工具，绝不会放宽沙箱。",
+        },
+      ],
+    },
+    {
+      id: "limits",
+      title: "了解局限",
+      blocks: [
+        {
+          list: [
+            "命令启动前会检查沙箱是否可用，但受主机策略或容器限制影响，沙箱仍可能在启动时失败。",
+            "命令报出“Permission denied”并不能证明是沙箱拦下了它。只有沙箱自己报告的拒绝，Codewhale 才会标记为沙箱拒绝。",
+            "任何沙箱都无法防御内核漏洞，也无法防住所有类型的资源耗尽。",
+          ],
+        },
+      ],
+    },
   ],
-  policiesTitle: "策略与回退",
-  policiesLead:
-    "本地 {sandboxMode} 取值为 {readOnly}、{workspaceWrite}、{dangerFullAccess} 或 {externalSandbox}。前两者只在选中且可用的 Seatbelt 或 bubblewrap 包装器下被强制执行；{dangerFullAccess} 有意绕过本地 OS 包装器；{externalSandbox} 声明执行已被外部隔离。没有选中包装器时，shell 命令在没有 Codewhale OS 隔离的情况下运行——审批规则和感知工作区的原生文件工具仍是独立的控制。",
-  diagnosticsTitle: "诊断与限制",
-  diagnosticsLead:
-    "codewhale setup --status、codewhale doctor、codewhale doctor --json 和 diagnostics 工具会报告应用 bubblewrap 偏好后本地可用的包装器。拒绝归因是保守的：子命令的通用 Permission denied 本身并不能证明是 Codewhale 的沙箱拦截了它，未沙箱化的命令失败永远不会被标记为沙箱拒绝。",
-  diagnosticsLimits:
-    "限制同样如实说明：可用性在启动前检查，选中的包装器仍可能因主机策略、容器限制或竞态而失败；bubblewrap 会忽略缺失或不是目录的可写根；没有任何沙箱能防御内核漏洞或所有资源耗尽与侧信道攻击。",
-  sourceNote: "来源文档：docs/SANDBOX.md · 更新时请同步修改 docs-map.ts。",
+  next: [
+    {
+      href: "/docs/modes",
+      label: "设置模式与审批",
+      note: "决定哪些命令需要停下来等你批准。",
+    },
+    {
+      href: "/docs/trust",
+      label: "了解哪些数据会离开本机",
+      note: "提供商会收到什么、哪些留在本地，以及遥测会发送什么。",
+    },
+    {
+      href: "/docs/configuration",
+      label: "修改设置",
+      note: "这些配置项写在哪里，以及仓库可以覆盖哪些。",
+    },
+  ],
+  sourceNote: "来源文档：docs/SANDBOX.md、docs/CONFIGURATION.md · 修改时同步更新 docs-map.ts。",
 };

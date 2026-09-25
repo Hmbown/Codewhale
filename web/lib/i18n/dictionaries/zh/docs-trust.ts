@@ -1,55 +1,103 @@
 import type { DocsTrustDict } from "../types";
 
-/**
- * Simplified-Chinese dictionary for `app/[locale]/docs/trust/page.tsx`.
- * Statements trace to docs/SANDBOX.md, docs/AUTHORIZATION_ORDER.md,
- * docs/TELEMETRY.md, and docs/public-surface-facts.json.
- */
+/** 「了解哪些数据会离开本机」页的简体中文词典；与 `en/docs-trust.ts` 逐段对应。 */
 export const docsTrust: DocsTrustDict = {
-  metaTitle: "安全与信任 · Codewhale 文档",
+  metaTitle: "了解哪些数据会离开本机 · Codewhale 文档",
   metaDescription:
-    "哪些内容留在你的机器上、托管提供商会收到什么、审批与 OS 沙箱有何区别、遥测发送什么以及如何关闭，以及在哪里报告安全漏洞。",
+    "哪些内容留在本地、模型提供商会收到什么、用量统计发送什么以及如何关闭、审计日志在哪里，以及如何报告安全漏洞。",
   bodyClassName: "text-ink-soft leading-[1.9] tracking-wide",
-  overviewTitle: "安全与信任",
-  overviewLead:
-    "这一页说明 Codewhale 如何处理你的代码、命令和数据——按实际实现来写，而不是按意图来写。每一条都取自仓库中的文档，事实门禁会在每次构建时核对。",
-  boundaryTitle: "你的数据去了哪里",
-  boundaries: [
-    ["本地 Runtime", "Runtime、工作区状态和审计日志都留在你的机器上。"],
-    ["托管提供商", "你选择的托管提供商会收到本轮推理所需的上下文。中间没有强制经过 Codewhale 的中继。"],
-    ["本地推理", "回环地址的本地模型路由（vLLM、Ollama、SGLang）可以让推理完全留在本机。"],
-    ["账户", "本地 Runtime 不需要账户。"],
-    ["Plan 模式", "Plan 是只读的。"],
+  title: "了解哪些数据会离开本机",
+  lede:
+    "Codewhale 在你的电脑上运行，只与你选择的模型提供商通信。这一页按目前的实际实现，列出数据分别去了哪里、匿名用量统计包含什么，以及如何关闭它。",
+  sections: [
+    {
+      id: "boundaries",
+      title: "你的工作内容去了哪里",
+      blocks: [
+        {
+          rows: [
+            ["留在本机", "运行时、你的工作区、会话历史、快照和审计日志。"],
+            ["发给你的提供商", "每个回合所需的上下文——你的消息、Codewhale 为这一回合读取的文件和工具结果——直接发给你选定的提供商，中间没有 Codewhale 中转。"],
+            ["完全留在本地", "使用本地模型（Ollama、vLLM、SGLang）时，推理完全不离开你的机器。"],
+            ["无需账户", "在本地安装和运行 Codewhale 不需要 Codewhale 账户。"],
+            ["Plan 模式", "不能修改文件，也不能运行 shell 命令。但它被允许进行的资料查询仍可能访问外部服务。"],
+          ],
+        },
+        {
+          p: "你添加的工具可能把数据发到别处：MCP 服务器、网页搜索或钩子都以你的权限运行，能访问到它们能访问的一切。只添加你信任的工具。",
+        },
+      ],
+    },
+    {
+      id: "telemetry",
+      title: "了解用量统计会发送什么",
+      blocks: [
+        {
+          p: "Codewhale 默认开启匿名用量统计，并在你第一次启动时明确告知，写明处理方是 Codewhale 和 PostHog。它具体包含：",
+        },
+        {
+          rows: [
+            ["从不发送", "提示词、回复、代码、diff、文件内容、文件名/仓库名/分支名、路径、模型 id、MCP 服务器名称、API 密钥或令牌、错误信息文本、按键记录，以及任何按回合或按工具的时间线。"],
+            ["开启时发送", "版本与平台类别、会话时长与结果、以固定类别统计的功能与错误计数，以及一个每 90 天更换一次的随机安装 id。"],
+            ["发往哪里", "`https://telemetry.codewhale.net/v1/telemetry`，一个第一方服务，源码就在仓库中。它不存储 IP 地址、国家或位置，不保留请求日志，数据保存三个月。"],
+            ["PostHog", "只有在服务运营方另行配置后，才会转发给 PostHog；转发的字段完全相同，不会多出任何内容。"],
+          ],
+        },
+      ],
+    },
+    {
+      id: "turn-off",
+      title: "关闭用量统计",
+      blocks: [
+        {
+          code: `codewhale config set telemetry false   # stop, and erase the local id and buffer
+CODEWHALE_TELEMETRY=0 codewhale        # stop for this process, erase nothing`,
+          lang: "终端",
+        },
+        {
+          p: "配置项是持久的选择：之后的版本都会沿用，命令行参数或环境变量也无法把它重新打开。你也可以在 `/settings` 中切换。关闭后，保存在你机器上的数据会被删除；已经发送的记录只与刚被删除的那个随机 id 关联，并会在三个月后过期。",
+        },
+        {
+          p: "想确切看到会发送什么、但又不真的发送，可以在 `~/.codewhale/config.toml` 中设置 `telemetry_endpoint = \"\"`。此后每一批数据都会逐字节写入本机的 `$CODEWHALE_HOME/telemetry/dryrun.jsonl`，不会建立任何网络连接。",
+        },
+      ],
+    },
+    {
+      id: "audit",
+      title: "查看本地审计日志",
+      blocks: [
+        {
+          p: "凭据、审批和提权相关的事件会追加写入 `$CODEWHALE_HOME/audit.log`（默认是 `~/.codewhale/audit.log`）。写入是尽力而为的：写入失败时会记录失败，而不是隐瞒。这份日志从不离开你的机器。",
+        },
+      ],
+    },
+    {
+      id: "report",
+      title: "报告安全漏洞",
+      blocks: [
+        {
+          p: "请把安全问题发送到下方邮箱，不要公开提交 issue。请附上你的 Codewhale 版本（`codewhale --version`），如有复现步骤也请一并提供。",
+        },
+      ],
+    },
   ],
-  approvalTitle: "审批不是沙箱",
-  approvalLead:
-    "审批姿态——Ask、Auto-Review、Full Access——决定一条被提议的命令在执行前是否先展示给你。某一层的批准从来不是全局放行：后面的层仍然可以要求审查或阻止调用，而且批准也不等于操作系统级的沙箱授权。完整的模型工具调用流水线有九个有序的层，从有效配置、钩子、类型化权限规则、仓库法则、人工审批，直到执行沙箱。",
-  sandboxTitle: "各平台的 OS 沙箱",
-  sandboxLead: "这里只描述已接入命令执行路径的行为，Codewhale 会报告它实际选用的机制。",
-  sandboxes: [
-    ["macOS — Seatbelt", "sandbox-exec 的运行时探测成功时自动启用。报告为 {seatbelt}。"],
-    ["Linux — bubblewrap", "需显式启用：{preferBwrap} 且 /usr/bin/bwrap 可执行。报告为 {bwrap}。"],
-    ["没有 bwrap 的 Linux", "默认没有 OS 包装层。报告为 {none}。"],
-    ["Windows", "当前实现没有 OS 包装层。报告为 {none}。"],
-    ["外部服务", "{opensandbox} 会把执行路由到兼容 OpenSandbox 的服务。"],
+  next: [
+    {
+      href: "/docs/sandbox",
+      label: "限制命令的访问范围",
+      note: "各平台上操作系统沙箱实际限制了什么。",
+    },
+    {
+      href: "/docs/modes",
+      label: "设置模式与审批",
+      note: "决定 Codewhale 不经询问可以做什么。",
+    },
+    {
+      href: "/docs/auth",
+      label: "连接模型提供商",
+      note: "选择由谁接收你的回合内容——或者用本地模型让它留在本机。",
+    },
   ],
-  sandboxNote:
-    "仓库中还有一个 seccomp 模块和一份未来的 Windows 辅助程序契约。两者都没有接入子命令启动，所以 Codewhale 不会宣传它们：只存在于源码中的沙箱代码不能证明某条命令受到了限制。",
-  telemetryTitle: "遥测，精确到每一项",
-  telemetryLead: "Codewhale 0.9.13 默认统计匿名使用量，并在首次启动时告知你；早先的 0.9.11 版本会先询问。关闭是会被后续版本保留的选择，在早先的自愿开启政策下记录的关闭也始终有效。显示告知绝不会代你记录任何同意；处理方为 Codewhale 和 PostHog。",
-  telemetry: [
-    ["永远不收集", "对话、代码、prompt、文件、文件/仓库/分支名、模型内容、凭据，以及任何逐轮或逐工具的时间线。"],
-    ["开启时发送", "版本与平台类别、会话时长与结果、功能与错误计数、封闭枚举，以及一个每 90 天轮换的随机安装 id。"],
-    ["端点", "{endpoint}——第一方 Cloudflare Worker，源码在仓库的 telemetry-ingest/ 目录下。"],
-    ["第一方存储", "没有 IP、国家或地理位置列。不记录请求日志。保留期固定为三个月。"],
-    ["PostHog", "可选转发需要运营方单独配置，并验证出口不会转发客户端 IP。PostHog 保留期由项目另行设置；源码支持不代表该处理方已启用。"],
-    ["自己审计", "设置 {dryRun}：批次会追加写入你机器上的 {dryRunFile}，与服务器本应收到的内容逐字节一致，且不会构造任何 HTTP 客户端。"],
-    ["关闭", "{configOff} 或 {envOff}。"],
-  ],
-  auditTitle: "本地审计日志",
-  auditLead: "敏感事件——凭证、审批和提权事件——会尽力追加写入 {auditLog}。写入失败会被记录而不是隐藏。提供商的 token 与缓存用量在可用时会在本地显示。",
-  reportTitle: "报告安全漏洞",
-  reportLead: "安全报告请通过邮件发给维护者，而不是提交公开 issue。请附上页眉中的版本号，如有复现步骤也请一并提供。",
-  reportCta: "给维护者发邮件",
-  sourceNote: "源文档：docs/SANDBOX.md、docs/AUTHORIZATION_ORDER.md、docs/TELEMETRY.md、docs/public-surface-facts.json · 修改时请同步更新 docs-map.ts。",
+  sourceNote:
+    "来源文档：docs/public-surface-facts.json（trust）、docs/TELEMETRY.md、docs/SANDBOX.md · 修改时同步更新 docs-map.ts。",
 };

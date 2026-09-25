@@ -14,23 +14,20 @@ export const home: HomeDict = {
     "借助开源智能体和你选择的云端或本地 AI 模型，开发软件、处理文件，并自动完成日常任务。",
   heroTitle: "用你选择的模型，完成开发和自动化任务",
   heroIntro:
-    "{brand} 是一个开源智能体，能够读取文件、编辑代码、运行命令并检查结果。在终端或本地浏览器中使用它，连接你选择的云端或本地模型。工具和权限由你决定；对话与工具执行结果保存在会话中。",
+    "{brand} 是一个开源智能体，能够读取文件、编辑代码、运行命令，并可运行测试来检查结果。在终端或本地浏览器中使用它，连接你选择的云端或本地模型。工具和权限由你决定；对话与工具执行结果保存在会话中。",
   getCodewhale: "获取 Codewhale",
   heroInstallAria: "安装命令",
   exploreProduct: "了解产品",
   shotPreview: "终端预览",
-  shotBuild: "v{version} 开发版本",
+  shotBuild: "v{version} 预发布版本",
   screenshotAlt:
-    "Codewhale v{version} 开发版本：鲸鱼标志、新会话、消息输入区、Ask 权限、Work 模式和模型状态。由隔离终端会话的实际画面渲染。",
+    "Codewhale v{version} 预发布版本：鲸鱼标志、新会话、消息输入区、Ask 权限、Work 模式和模型状态。由隔离终端会话的实际画面渲染。",
   latestRelease: "最新发布 {tag}",
   releaseUnavailable: "发布状态暂不可用",
   currentSource: "源码",
   sourceCandidate: "未发布",
-  providerRoutes: "{count} 个提供商",
   publishedRelease: "已发布",
   figcaptionSourceCandidate: "未发布",
-  chapterTerminal: "你的终端",
-  chapterTerminalTitle: "从你想做的项目开始",
   gainHeading: "你可以用 Codewhale 做什么",
   gainLede: "从具体目标开始：修复错误、理解项目，或把重复任务变成工作流程。先用一个智能体，需要时再拆分大型任务。",
   gain: [
@@ -47,7 +44,6 @@ export const home: HomeDict = {
       "开始前设定权限，处理审批请求，随时中断正在运行的任务。查看对话与工具结果，再决定如何继续。"
     ]
   ],
-  chapterModels: "你的模型",
   modelsHeading: "为每项任务选择合适的模型",
   modelsBody:
     "为每个会话选择提供商和模型：使用 API 密钥、受支持的提供商登录方式，或本地模型。Codewhale 账户与模型连接各有用途。",
@@ -61,7 +57,6 @@ export const home: HomeDict = {
   startLede: "安装已发布版本，连接模型，然后在项目文件夹中尝试一项任务。智能体团队是可选的；先用一个智能体，等任务适合拆分时再增加。",
   startGuideLink: "阅读新手指引",
   startVocabularyLink: "查名词",
-  chapterAccount: "获取 Codewhale",
   availabilityHeading: "你可以在哪里使用 Codewhale",
   availabilityLede: "终端与本地浏览器客户端现已可用。桌面和托管网页应用正基于同一会话模型开发；各端的开放状态分别列在下方。",
   availability: [
@@ -73,7 +68,7 @@ export const home: HomeDict = {
     [
       "托管网页应用",
       "开发预览",
-      "开发预览版支持使用 Codewhale 账户登录并配对计算机。托管任务执行仍在验证中。"
+      "使用 Codewhale 账户登录后，在正在运行的终端会话中输入 /rc，即可在网页应用中继续。托管任务执行仍在验证中。"
     ],
     [
       "桌面端",
@@ -92,7 +87,7 @@ export const home: HomeDict = {
   surfaces: [
     ["文件与命令", "在你设定的权限内读取项目、编辑文件、运行测试并查看命令输出。"],
     ["插件与 MCP", "连接更多工具和服务。智能体使用插件前，需由你审核并启用。"],
-    ["Computer Use · 源码预览", "当前源码包含用于查看和操作其他应用的插件，需主动启用并授予必要的系统权限。"],
+    ["Computer Use · 预览", "让智能体查看并操作其他应用的插件，需主动启用并授予它请求的系统权限。"],
     ["保存的会话", "将对话和工具结果保存在一起。本地浏览器连接到你电脑上的同一个 Codewhale 会话；继续保存的工作，无需从头开始。"],
     ["Fleet", "把任务分配给不同模型和角色的智能体，并跟踪它们的进度。"],
   ],

@@ -265,6 +265,14 @@
   --gpui-dark-accent-rgb: 48 49 52;
   --gpui-dark-list-active: #37393d;
   --gpui-dark-list-active-rgb: 55 57 61;
+  --gpui-dark-attention: #e8b077;
+  --gpui-dark-attention-rgb: 232 176 119;
+  --gpui-dark-live: #9ec7b2;
+  --gpui-dark-live-rgb: 158 199 178;
+  --gpui-dark-danger: #e39a90;
+  --gpui-dark-danger-rgb: 227 154 144;
+  --gpui-dark-border-strong: #828386;
+  --gpui-dark-border-strong-rgb: 130 131 134;
   --gpui-light-bg: #faf8f5;
   --gpui-light-bg-rgb: 250 248 245;
   --gpui-light-text: #28292b;
@@ -285,11 +293,20 @@
   --gpui-light-accent-rgb: 232 229 224;
   --gpui-light-list-active: #dfdcd6;
   --gpui-light-list-active-rgb: 223 220 214;
+  --gpui-light-attention: #86520d;
+  --gpui-light-attention-rgb: 134 82 13;
+  --gpui-light-live: #3a6352;
+  --gpui-light-live-rgb: 58 99 82;
+  --gpui-light-danger: #9e3f36;
+  --gpui-light-danger-rgb: 158 63 54;
+  --gpui-light-border-strong: #807c76;
+  --gpui-light-border-strong-rgb: 128 124 118;
 }
-/* GPUI design 1.0.0; sha256 a0c23f8a235bbc61e42fb8a60795ae7d9825dbbd1730142acc9ffec9c0abb3af. */
+/* GPUI design 1.1.1; sha256 c08d7d4b253afe340207658b1f233dd1a9dbe94fa57e925bde025a3db70543ee. */
 :root {
   --gpui-radius-control: 6px;
   --gpui-radius-panel: 10px;
+  --gpui-radius-sheet: 14px;
   --gpui-focus-width: 2px;
   --gpui-focus-offset: 3px;
   --gpui-spacing-compact: 4px;

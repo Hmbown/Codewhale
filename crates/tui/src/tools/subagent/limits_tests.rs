@@ -322,6 +322,51 @@ async fn launch_narrows_all_limits_and_continuation_cannot_restart_deadline() {
 }
 
 #[tokio::test]
+async fn explicit_wall_time_may_exceed_the_built_in_default() {
+    let tmp = tempdir().unwrap();
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(
+        tmp.path().to_path_buf(),
+        4,
+    )));
+    let mut runtime = stub_runtime().child_runtime();
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    runtime.manager = Arc::clone(&manager);
+    runtime.worker_profile.wall_time_secs = None;
+    runtime.cancel_token.cancel(); // inspect admission; no provider request may run
+    let spawn = |guard: &mut SubAgentManager, wall_time: Option<Duration>| {
+        let child = guard
+            .spawn_background_with_assignment_options(
+                Arc::clone(&manager),
+                runtime.clone(),
+                FleetRole::Scout,
+                "inspect".to_string(),
+                SubAgentAssignment::new("inspect".to_string(), None),
+                Some(vec![]),
+                SubAgentSpawnOptions {
+                    wall_time,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        guard.worker_records[&child.agent_id]
+            .spec
+            .runtime_profile
+            .wall_time_secs
+    };
+    let mut guard = manager.write().await;
+    assert_eq!(
+        spawn(&mut guard, None),
+        Some(DEFAULT_CHILD_WALL_TIME.as_secs())
+    );
+    assert_eq!(
+        spawn(&mut guard, Some(Duration::from_secs(4 * 60 * 60))),
+        Some(4 * 60 * 60),
+        "an explicit request may raise the built-in 30-minute default"
+    );
+}
+
+#[tokio::test]
 async fn resume_intersects_saved_write_shell_and_tool_permissions_with_current_caller() {
     let tmp = tempdir().unwrap();
     let manager = Arc::new(RwLock::new(SubAgentManager::new(

@@ -36,26 +36,7 @@ export const chrome: ChromeDict = {
 
   authSignIn: "로그인",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "어떤 모델이든, 당신의 머신에서",
-
-  // Newspaper dating: Korean papers write the issue date with the 자 suffix
-  // (8월 3일자), so the label is the date itself rather than "제N호".
-  issueLabel: "{date}자",
   dateLocale: "ko-KR",
-
-  tickerLiveLabel: "실시간",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "병합됨",
-  tickerOpened: "열림",
-  tickerClosed: "닫힘",
-  tickerReleased: "릴리스",
-  tickerFirstContribution: "첫 기여",
-  tickerBy: "{handle} 님",
-  tickerAria: "저장소 최근 활동",
-
-  traceLabel: "추론 기록",
-  traceTabsAria: "세션 발췌",
 
   menuOpen: "메뉴 열기",
   menuClose: "메뉴 닫기",

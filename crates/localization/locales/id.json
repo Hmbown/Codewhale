@@ -1141,7 +1141,6 @@
   "PendingApprovalInAgent": "Persetujuan diperlukan di {agent} — /agents",
   "ApprovalTruncationHint": "  … terpotong · tekan {details} untuk detail lengkap",
   "ApprovalFullAccessPolicyBlocked": "Diblokir {tool}: Full Access tidak dapat melewati kebijakan ini",
-  "AutoReviewQuestionSkipped": "Auto-Review melewati pertanyaan pengguna dan lanjut secara mandiri",
   "ApprovalChooseHint": "Pilih: ",
   "ApprovalChooseAction": "Enter untuk opsi terpilih, atau tekan y/a/d langsung",
   "ApprovalIntentLabel": "Maksud: ",

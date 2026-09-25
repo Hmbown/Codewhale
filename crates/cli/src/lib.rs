@@ -108,7 +108,10 @@ struct Cli {
     provider: Option<String>,
     #[arg(long)]
     model: Option<String>,
-    #[arg(long = "output-mode")]
+    /// Retired (#6516): nothing ever read it. Still accepted, hidden and
+    /// ignored, so existing scripts keep running; using it prints a
+    /// deprecation notice instead of failing the invocation.
+    #[arg(long = "output-mode", hide = true, value_name = "MODE")]
     output_mode: Option<String>,
     #[arg(
         long = "verbosity",
@@ -699,7 +702,7 @@ enum LaneCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Start a lane under a Runtime backend (tmux|inline|vm|ci).
+    /// Start a lane under a Runtime backend (tmux|inline).
     Start {
         /// Workflow name (e.g. `stopship`).
         #[arg(long)]
@@ -713,7 +716,7 @@ enum LaneCommand {
         /// Free-form goal text.
         #[arg(long)]
         goal: Option<String>,
-        /// Runtime backend: tmux, inline, vm, or ci.
+        /// Runtime backend: tmux or inline.
         #[arg(long, default_value = "tmux")]
         runtime: String,
         /// Create an isolated worktree under this repo root.
@@ -758,7 +761,7 @@ enum WorkflowCommand {
         /// Free-form goal text recorded on the Lane and passed into workflow args.
         #[arg(long)]
         goal: Option<String>,
-        /// Runtime backend: tmux, inline, vm, or ci.
+        /// Runtime backend: tmux or inline.
         #[arg(long, default_value = "tmux")]
         runtime: String,
         /// Explicit Workflow source path, overriding name-based resolution.
@@ -1972,6 +1975,14 @@ fn apply_runtime_set_overrides(cli: &mut Cli) -> Result<()> {
     Ok(())
 }
 
+/// `--output-mode` is retired (#6516): accepted so old scripts keep running,
+/// but a caller who passes it is told it does nothing.
+fn retired_output_mode_warning(cli: &Cli) -> Option<&'static str> {
+    cli.output_mode.as_ref().map(|_| {
+        "warning: --output-mode has no effect and is ignored; it will be removed in a future release"
+    })
+}
+
 fn run() -> Result<()> {
     let matches = Cli::command().get_matches();
     let project_bundle_scope = config_command_targets_project(&matches);
@@ -1998,6 +2009,9 @@ fn run() -> Result<()> {
     if !matches!(command, Some(Commands::Config(_))) {
         apply_runtime_set_overrides(&mut cli)?;
     }
+    if let Some(warning) = retired_output_mode_warning(&cli) {
+        eprintln!("{warning}");
+    }
 
     let pipe_api_key_handoff = matches!(
         &command,
@@ -2016,7 +2030,6 @@ fn run() -> Result<()> {
         api_key: cli.api_key.clone(),
         base_url: cli.base_url.clone(),
         auth_mode: None,
-        output_mode: cli.output_mode.clone(),
         log_level: cli.log_level.clone(),
         telemetry: cli.telemetry,
         approval_policy: cli.approval_policy.clone(),
@@ -5562,8 +5575,7 @@ fn apply_tui_env(cli: &Cli, resolved_runtime: &ResolvedRuntimeOptions, passthrou
             || provider.to_string(),
             |provider| provider.as_str().to_string(),
         );
-        set_tui_env("CODEWHALE_PROVIDER", &provider);
-        set_tui_env("DEEPSEEK_PROVIDER", provider);
+        set_tui_env("CODEWHALE_PROVIDER", provider);
     }
     if !(uses_raw_tui_provider
         || (cli.profile.is_some()
@@ -5581,23 +5593,15 @@ fn apply_tui_env(cli: &Cli, resolved_runtime: &ResolvedRuntimeOptions, passthrou
     }
     if let Some(model) = cli.model.as_ref() {
         set_tui_env("CODEWHALE_MODEL", model);
-        set_tui_env("DEEPSEEK_MODEL", model);
-    }
-    if let Some(output_mode) = cli.output_mode.as_ref() {
-        set_tui_env("CODEWHALE_OUTPUT_MODE", output_mode);
-        set_tui_env("DEEPSEEK_OUTPUT_MODE", output_mode);
     }
     if let Some(v) = verbosity.as_ref() {
         set_tui_env("CODEWHALE_VERBOSITY", v);
-        set_tui_env("DEEPSEEK_VERBOSITY", v);
     }
     if let Some(log_level) = cli.log_level.as_ref() {
         set_tui_env("CODEWHALE_LOG_LEVEL", log_level);
-        set_tui_env("DEEPSEEK_LOG_LEVEL", log_level);
     }
     let telemetry = resolved_runtime.telemetry.to_string();
-    set_tui_env("CODEWHALE_TELEMETRY", &telemetry);
-    set_tui_env("DEEPSEEK_TELEMETRY", &telemetry);
+    set_tui_env("CODEWHALE_TELEMETRY", telemetry);
     let floor = cli.telemetry == Some(false) || codewhale_config::telemetry_floor_in_force();
     set_tui_env(
         codewhale_config::TELEMETRY_FLOOR_ENV,
@@ -5605,15 +5609,12 @@ fn apply_tui_env(cli: &Cli, resolved_runtime: &ResolvedRuntimeOptions, passthrou
     );
     if let Some(endpoint) = resolved_runtime.telemetry_endpoint.as_ref() {
         set_tui_env("CODEWHALE_TELEMETRY_ENDPOINT", endpoint);
-        set_tui_env("DEEPSEEK_TELEMETRY_ENDPOINT", endpoint);
     }
     if let Some(policy) = cli.approval_policy.as_ref() {
         set_tui_env("CODEWHALE_APPROVAL_POLICY", policy);
-        set_tui_env("DEEPSEEK_APPROVAL_POLICY", policy);
     }
     if let Some(mode) = cli.sandbox_mode.as_ref() {
         set_tui_env("CODEWHALE_SANDBOX_MODE", mode);
-        set_tui_env("DEEPSEEK_SANDBOX_MODE", mode);
     }
     if cli.yolo {
         set_tui_env("CODEWHALE_YOLO", "true");
@@ -5629,7 +5630,6 @@ fn apply_tui_env(cli: &Cli, resolved_runtime: &ResolvedRuntimeOptions, passthrou
     }
     if let Some(base_url) = cli.base_url.as_ref() {
         set_tui_env("CODEWHALE_BASE_URL", base_url);
-        set_tui_env("DEEPSEEK_BASE_URL", base_url);
     }
 }
 
@@ -5832,7 +5832,6 @@ mod tests {
             base_url: "http://localhost:8000/v1".to_string(),
             auth_mode: None,
             insecure_skip_tls_verify: false,
-            output_mode: None,
             log_level: None,
             telemetry: false,
             telemetry_source: codewhale_config::TelemetrySource::Default,
@@ -7795,6 +7794,7 @@ verbosity = "project-imported"
         let (_dir, _tui) = install_fake_tui_binary();
         let _provider = ScopedEnvVar::remove("DEEPSEEK_PROVIDER");
         let _model = ScopedEnvVar::remove("DEEPSEEK_MODEL");
+        let _codewhale_model = ScopedEnvVar::remove("CODEWHALE_MODEL");
         let _base_url = ScopedEnvVar::remove("DEEPSEEK_BASE_URL");
         let _api_key = ScopedEnvVar::remove("DEEPSEEK_API_KEY");
         let _cli_api_key = ScopedEnvVar::remove("CODEWHALE_CLI_API_KEY");
@@ -7855,10 +7855,15 @@ verbosity = "project-imported"
         assert!(joined.contains("\"issue\":\"4375\""));
         assert!(joined.contains("\"token_budget\":25000"));
         assert!(joined.contains("\"verify\":true"));
+        assert!(process.environment.iter().any(|(key, value)| {
+            key == "CODEWHALE_MODEL" && value == "explicit-workflow-model"
+        }));
         assert!(
-            process.environment.iter().any(|(key, value)| {
-                key == "DEEPSEEK_MODEL" && value == "explicit-workflow-model"
-            })
+            !process
+                .environment
+                .iter()
+                .any(|(key, _)| key == "DEEPSEEK_MODEL"),
+            "the dispatcher must not write the retired DEEPSEEK_* twins (#6516)"
         );
         assert!(
             !process
@@ -11018,7 +11023,6 @@ verbosity = "project-imported"
             "--model",
             "--config",
             "--profile",
-            "--output-mode",
             "--log-level",
             "--telemetry",
             "--base-url",
@@ -11037,6 +11041,22 @@ verbosity = "project-imported"
                 "expected help to contain token: {token}"
             );
         }
+    }
+
+    /// #6516: `--output-mode` never had a reader. It stays accepted so old
+    /// scripts keep running, but it is no longer advertised.
+    #[test]
+    fn retired_output_mode_flag_is_accepted_but_hidden() {
+        let cli = parse_ok(&["deepseek", "--output-mode", "json", "doctor"]);
+        assert_eq!(cli.output_mode.as_deref(), Some("json"));
+        let warning = retired_output_mode_warning(&cli).expect("using the flag warns");
+        assert!(warning.contains("--output-mode has no effect"), "{warning}");
+        assert_eq!(
+            retired_output_mode_warning(&parse_ok(&["deepseek", "doctor"])),
+            None
+        );
+        let rendered = help_for(&["deepseek", "--help"]);
+        assert!(!rendered.contains("--output-mode"), "{rendered}");
     }
 
     #[test]

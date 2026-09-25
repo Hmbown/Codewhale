@@ -3,8 +3,10 @@ import Image from "next/image";
 import Link from "next/link";
 import { GettingStartedSteps } from "@/components/getting-started-steps";
 import { HeroInstall } from "@/components/hero-install";
+import { Icon, type IconName } from "@/components/icon";
 import { InstallCodeBlock } from "@/components/install-code-block";
-import { Strata } from "@/components/strata";
+import { Status, type StatusTone } from "@/components/status-badge";
+import { WhalePose } from "@/components/whale-pose";
 import { getFacts } from "@/lib/facts";
 import { GETTING_STARTED_STEPS } from "@/lib/content/getting-started";
 import { fill, getHome, splitToken } from "@/lib/i18n/dictionaries";
@@ -23,16 +25,22 @@ import { TERMINAL_SCREENSHOT } from "@/lib/media-manifest";
 // caching. `getFacts()` rejects legacy or older KV snapshots.
 export const revalidate = 300;
 
+// Row order is shared by every locale's `gain`, `surfaces` and
+// `availability` lists, so the marks and states follow the row, not a word.
+const GAIN_ICONS: IconName[] = ["terminal", "repeat", "shield"];
+const SURFACE_ICONS: IconName[] = ["terminal", "plug", "monitor", "folder", "users"];
+// Released · development preview · development build · in development.
+const AVAILABILITY_TONES: StatusTone[] = ["ready", "attention", "idle", "idle"];
+
 /**
- * The Tidal Folio homepage: a sheet read under the sea.
+ * The whale-road homepage: the promise and the install plate in the sky,
+ * the whale resting on one calm horizon, and everything else in the sea
+ * below it, which continues into the footer.
  *
- * Every visible string resolves through `getHome(locale)` — English,
- * Chinese, and every other routed locale take the identical path, with the
- * English dictionary as the build-time-guaranteed fallback. The only literals
- * left in this file are code-owned per docs/VOICE.md: the product control
- * vocabulary (`Plan · Work · Operate`, `Ask · Auto-Review · Full Access`),
- * the install command, package-manager and mirror proper nouns, the chapter
- * numerals, and the screenshot path.
+ * Every visible string resolves through `getHome(locale)`. The only literals
+ * left here are code-owned per docs/VOICE.md: the product control vocabulary
+ * (`Plan · Work · Operate`, `Ask · Auto-Review · Full Access`), package
+ * channel proper nouns, and the screenshot path.
  */
 export default async function HomePage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
@@ -53,244 +61,297 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
   const ledeParts = splitToken(d.heroIntro, "brand");
 
   return (
-    <div className="product-home">
+    <div className="home">
       <script
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: serializeJsonLd(jsonLd) }}
       />
 
-      {/* THE PLATE — paper at the top left, the water rising from the bottom
-          right, the real terminal floating at the waterline. */}
-      <section className="folio-hero">
-        <Strata variant="hero" />
-        <div className="product-container folio-hero-grid">
-          <div className="folio-hero-copy">
-            <h1>{d.heroTitle}</h1>
-            <p className="folio-lede">
-              {ledeParts.map((part, index) => (
-                <Fragment key={index}>
-                  {index > 0 && <span className="font-semibold text-ink">Codewhale</span>}
-                  {part}
-                </Fragment>
+      {/* THE SKY — the promise, the one primary action, the install plate,
+          and the whale resting on the horizon. */}
+      <section className="home-hero" aria-labelledby="home-title">
+        <div className="home-sky">
+          <div className="home-hero-inner">
+            <div className="home-hero-copy">
+              <h1 id="home-title" className="home-title">{d.heroTitle}</h1>
+              <p className="home-lede">
+                {ledeParts.map((part, index) => (
+                  <Fragment key={index}>
+                    {index > 0 && <strong>Codewhale</strong>}
+                    {part}
+                  </Fragment>
+                ))}
+              </p>
+              <div className="actions">
+                <Link href={`/${locale}/install`} className="btn btn-primary btn-lg">
+                  {d.getCodewhale}
+                </Link>
+                <Link href={`/${locale}/product`} className="btn btn-ghost btn-lg">
+                  {d.exploreProduct}
+                  <Icon name="arrow-right" className="icon icon-flip" />
+                </Link>
+              </div>
+              <HeroInstall ariaLabel={d.heroInstallAria} copyLabel={d.copy} copiedLabel={d.copied} />
+            </div>
+            <div className="home-whale">
+              <WhalePose pose="rest" priority />
+            </div>
+          </div>
+        </div>
+
+        {/* THE HORIZON — one straight line; nothing stands on it but the whale. */}
+        <div className="horizon" aria-hidden="true" />
+      </section>
+
+      {/* THE SEA — deep water in dark, continuing into the footer; shallow
+          water settling back to paper in light. */}
+      <div className="home-sea sea-continues">
+        <div className="sea-texture" aria-hidden="true" />
+        <div className="home-reflection" aria-hidden="true">
+          <WhalePose pose="rest" />
+        </div>
+
+        <div className="home-sea-body">
+          {/* The real terminal, just under the surface. Exact-build PTY
+              capture of an empty session: no fabricated conversation,
+              connected tools or completion metrics. */}
+          <section className="home-section" aria-label={d.shotPreview}>
+            <figure className="figure home-shot">
+              <div className="figure-frame">
+                <Image
+                  src={TERMINAL_SCREENSHOT.src}
+                  alt={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
+                  width={TERMINAL_SCREENSHOT.width}
+                  height={TERMINAL_SCREENSHOT.height}
+                  sizes="(max-width: 62rem) calc(100vw - 2rem), 60rem"
+                  unoptimized
+                />
+              </div>
+              <figcaption className="figure-caption">
+                <span>
+                  {d.shotPreview} · {fill(d.shotBuild, { version: TERMINAL_SCREENSHOT.version })}
+                </span>
+                {/* Each fact is its own translated unit; nothing is
+                    concatenated around a token. */}
+                <span
+                  className="status-line"
+                  data-source-state={sourceIsPublished ? "published release" : "source candidate"}
+                  data-source-state-label={sourceIsPublished ? d.publishedRelease : d.figcaptionSourceCandidate}
+                >
+                  <Status tone={publishedRelease ? "ready" : "idle"}>
+                    {publishedRelease
+                      ? fill(d.latestRelease, { tag: publishedRelease.tag })
+                      : d.releaseUnavailable}
+                  </Status>
+                  <span>{`${sourceIsPublished ? d.currentSource : d.sourceCandidate} v${sourceVersion}`}</span>
+                  <span>{facts.license ?? "MIT"}</span>
+                </span>
+              </figcaption>
+            </figure>
+          </section>
+
+          {/* WHAT YOU CAN DO */}
+          <section className="home-section" aria-labelledby="home-gain">
+            <div className="section-head">
+              <div className="section-head-text">
+                <h2 className="section-title" id="home-gain">{d.gainHeading}</h2>
+                <p className="section-scope">{d.gainLede}</p>
+              </div>
+            </div>
+            <div className="grid-3">
+              {d.gain.map(([title, body], index) => (
+                <div key={title} className="tile">
+                  <span className="tile-icon" aria-hidden="true">
+                    <Icon name={GAIN_ICONS[index] ?? "terminal"} />
+                  </span>
+                  <h3>{title}</h3>
+                  <p>{body}</p>
+                </div>
               ))}
-            </p>
-            <div className="folio-actions">
-              <Link href={`/${locale}/install`} className="folio-button folio-button-primary">
-                {d.getCodewhale}
-              </Link>
-              <Link href={`/${locale}/product`} className="folio-button">
-                {d.exploreProduct}
+            </div>
+          </section>
+
+          {/* TOOLS, CONNECTED APPS, SAVED WORK */}
+          <section className="home-section" aria-labelledby="home-surfaces">
+            <div className="section-head">
+              <div className="section-head-text">
+                <h2 className="section-title" id="home-surfaces">{d.surfacesHeading}</h2>
+              </div>
+              <Link href={`/${locale}/runtime`} className="section-link">
+                {d.runtimeLink}
+                <Icon name="arrow-right" className="icon icon-flip" />
               </Link>
             </div>
-            <HeroInstall ariaLabel={d.heroInstallAria} copyLabel={d.copy} copiedLabel={d.copied} />
-          </div>
+            <ul className="dir-list dir-list-card" role="list">
+              {d.surfaces.map(([name, description], index) => (
+                <li key={name}>
+                  <div className="dir-row">
+                    <span className="dir-mark" aria-hidden="true">
+                      <Icon name={SURFACE_ICONS[index] ?? "terminal"} />
+                    </span>
+                    <span className="dir-text">
+                      <span className="dir-title">{name}</span>
+                      <span className="dir-purpose">{description}</span>
+                    </span>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </section>
 
-          {/* Exact-build PTY capture of an empty session. No fabricated
-              conversation, connected tools or completion metrics. */}
-          <figure className="folio-shot">
-            <Image
-              src={TERMINAL_SCREENSHOT.src}
-              alt={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
-              width={TERMINAL_SCREENSHOT.width}
-              height={TERMINAL_SCREENSHOT.height}
-              sizes="(max-width: 58rem) calc(100vw - 2rem), 56rem"
-              unoptimized
-              priority
-            />
-            <figcaption>
-              <p className="dotline">
-                <span>{d.shotPreview}</span>
-                <span>{fill(d.shotBuild, { version: TERMINAL_SCREENSHOT.version })}</span>
-              </p>
-              {/*
-                The TUI header grammar: a `cw` chip and a dot chain. Each fact is
-                its own translated unit — the separators are CSS punctuation, so
-                nothing is concatenated around a token and no locale inherits an
-                English joining word.
-              */}
-              <p
-                className="paper-facts dotline"
-                data-source-state={sourceIsPublished ? "published release" : "source candidate"}
-                data-source-state-label={sourceIsPublished ? d.publishedRelease : d.figcaptionSourceCandidate}
-              >
-                <span className="dotline-chip">cw</span>
-                <span>
-                  {publishedRelease
-                    ? fill(d.latestRelease, { tag: publishedRelease.tag })
-                    : d.releaseUnavailable}
-                </span>
-                <span>
-                  {`${sourceIsPublished ? d.currentSource : d.sourceCandidate} v${sourceVersion}`}
-                </span>
-                <span>{facts.license ?? "MIT"}</span>
-              </p>
-            </figcaption>
-          </figure>
-
-          <aside className="folio-chapter">
-            <span className="folio-chapter-num">01 / {d.chapterTerminal}</span>
-            <p className="folio-chapter-title">{d.chapterTerminalTitle}</p>
-          </aside>
-        </div>
-      </section>
-
-      {/* WHAT YOU GAIN — three ruled columns on paper. */}
-      <section className="folio-section">
-        <div className="product-container">
-          <h2>{d.gainHeading}</h2>
-          <p className="folio-section-lede">{d.gainLede}</p>
-          <div className="folio-gain-grid">
-            {d.gain.map(([title, body]) => (
-              <div key={title}>
-                <h3>{title}</h3>
-                <p>{body}</p>
+          {/* YOUR MODELS */}
+          <section className="home-section" aria-labelledby="home-models">
+            <div className="split">
+              <div className="section-head-text">
+                <h2 className="section-title" id="home-models">{d.modelsHeading}</h2>
+                <p className="section-scope">{d.modelsBody}</p>
+                <Link href={`/${locale}/models`} className="section-link">
+                  {d.modelsLink}
+                  <Icon name="arrow-right" className="icon icon-flip" />
+                </Link>
               </div>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      {/* Tools and saved work, before setup details. */}
-      <section className="folio-section">
-        <div className="product-container">
-          <h2>{d.surfacesHeading}</h2>
-          <dl className="folio-fact-list mt-8">
-            {d.surfaces.map(([name, description]) => (
-              <div key={name}>
-                <dt>{name}</dt>
-                <dd>{description}</dd>
-              </div>
-            ))}
-          </dl>
-          <Link href={`/${locale}/runtime`} className="folio-link">
-            {d.runtimeLink}
-          </Link>
-        </div>
-      </section>
-
-      {/* 02 — YOUR MODELS */}
-      <section className="folio-section">
-        <div className="product-container folio-chapter-grid">
-          <div>
-            <span className="folio-running-head">02 / {d.chapterModels}</span>
-            <h2>{d.modelsHeading}</h2>
-            <p className="folio-section-lede">{d.modelsBody}</p>
-            <Link href={`/${locale}/models`} className="folio-link">
-              {d.modelsLink}
-            </Link>
-          </div>
-          <dl className="folio-fact-list">
-            {d.modelsFacts.map(([kind, description]) => (
-              <div key={kind}>
-                <dt>{kind}</dt>
-                <dd>{description}</dd>
-              </div>
-            ))}
-            <div>
-              <dt>Plan · Work · Operate</dt>
-              <dd>Ask · Auto-Review · Full Access</dd>
+              <dl className="def-rows">
+                {d.modelsFacts.map(([kind, description]) => (
+                  <div key={kind} className="def-row">
+                    <dt>{kind}</dt>
+                    <dd>{description}</dd>
+                  </div>
+                ))}
+                <div className="def-row home-modes">
+                  <dt>Plan · Work · Operate</dt>
+                  <dd>Ask · Auto-Review · Full Access</dd>
+                </div>
+              </dl>
             </div>
-          </dl>
-        </div>
-      </section>
+          </section>
 
-      {/* 03 — START */}
-      <section className="product-start">
-        <div className="product-container">
-          <span className="folio-running-head">03 / {d.startHeading}</span>
-          <h2>{d.startHeading}</h2>
-          <p className="product-start-lede">{d.startLede}</p>
-          <GettingStartedSteps locale={locale} />
-          <div className="product-start-links">
-            <Link href={`/${locale}/docs/guide`}>{d.startGuideLink}</Link>
-            <Link href={`/${locale}/docs/vocabulary`}>{d.startVocabularyLink}</Link>
-          </div>
-        </div>
-      </section>
+          {/* START */}
+          <section className="home-section product-start" aria-labelledby="home-start">
+            <div className="section-head">
+              <div className="section-head-text">
+                <h2 className="section-title" id="home-start">{d.startHeading}</h2>
+                <p className="section-scope">{d.startLede}</p>
+              </div>
+            </div>
+            <GettingStartedSteps locale={locale} />
+            <div className="product-start-links">
+              <Link href={`/${locale}/docs/guide`} className="section-link">
+                {d.startGuideLink}
+                <Icon name="arrow-right" className="icon icon-flip" />
+              </Link>
+              <Link href={`/${locale}/docs/vocabulary`} className="section-link">
+                {d.startVocabularyLink}
+                <Icon name="arrow-right" className="icon icon-flip" />
+              </Link>
+            </div>
+          </section>
 
-      {/* THE WATERLINE. Everything below is one water column: the same
-          component grammar, re-inked with the dark whale tokens by the
-          shared below-the-waterline rule in globals.css. */}
-      <div className="folio-waterline" aria-hidden="true">
-        <Strata variant="band" />
-      </div>
-      <div className="ocean-column">
-        {/* 04 — WHERE IT RUNS TODAY */}
-        <section className="folio-availability">
-          <div className="product-container">
-            <span className="folio-running-head">04 / {d.chapterAccount}</span>
-            <h2>{d.availabilityHeading}</h2>
-            <p className="folio-section-lede">{d.availabilityLede}</p>
-            <dl className="folio-availability-list">
-              {d.availability.map(([surface, status, detail]) => (
-                <div key={surface}>
+          {/* WHERE IT RUNS TODAY — each surface with a mark and a word. */}
+          <section className="home-section" aria-labelledby="home-availability">
+            <div className="section-head">
+              <div className="section-head-text">
+                <h2 className="section-title" id="home-availability">{d.availabilityHeading}</h2>
+                <p className="section-scope">{d.availabilityLede}</p>
+              </div>
+            </div>
+            <dl className="def-rows">
+              {d.availability.map(([surface, status, detail], index) => (
+                <div key={surface} className="def-row">
                   <dt>{surface}</dt>
                   <dd>
-                    <strong>{status}</strong>
+                    <Status tone={AVAILABILITY_TONES[index] ?? "idle"}>{status}</Status>
                     {detail}
                   </dd>
                 </div>
               ))}
             </dl>
-            <p className="folio-availability-note">{d.availabilityNote}</p>
-            <a href={APP_SIGNUP_URL} className="folio-link" data-usage="signup">
-              {d.accountLink}
-            </a>
-          </div>
-        </section>
+            <p className="section-scope mt-4">{d.availabilityNote}</p>
+            <div className="actions mt-3">
+              <a href={APP_SIGNUP_URL} className="section-link" data-usage="signup">
+                {d.accountLink}
+                <Icon name="arrow-right" className="icon icon-flip" />
+              </a>
+            </div>
+          </section>
 
-        {/* Install band — the composer plate. */}
-        <section className="product-install-band">
-          <div className="product-container product-install-grid">
-            <h2>{d.installBandHeading}</h2>
-            <div>
-              {/* `❯` is a code-owned literal, like the install command it
-                  prompts for — it is the product's glyph, not a sentence. */}
-              <div className="product-composer">
-                <span className="product-composer-prompt" aria-hidden>
-                  ❯
-                </span>
-                <InstallCodeBlock
-                  cmd={GETTING_STARTED_STEPS[0].commands[0]}
-                  copyLabel={d.copy}
-                  copiedLabel={d.copied}
-                />
+          {/* INSTALL — the command again, where the page ends. */}
+          <section className="home-section" aria-labelledby="home-install">
+            <div className="home-install">
+              <div className="section-head-text">
+                <h2 className="section-title" id="home-install">{d.installBandHeading}</h2>
+                <p className="home-install-channels">
+                  GitHub Releases ({d.binaries}) · npm · Cargo · Docker · Windows · Android / Termux · {d.chinaMirrors}
+                </p>
+                <Link href={`/${locale}/install`} className="section-link">
+                  {d.installGuideLink}
+                  <Icon name="arrow-right" className="icon icon-flip" />
+                </Link>
               </div>
-              <p className="dotline">
-                <span>GitHub Releases · {d.binaries}</span>
-                <span>npm</span>
-                <span>Cargo</span>
-                <span>Docker</span>
-                <span>Nix</span>
-                <span>Windows</span>
-                <span>Android / Termux</span>
-                <span>{d.chinaMirrors}</span>
-              </p>
-              <Link href={`/${locale}/install`}>{d.installGuideLink}</Link>
+              <InstallCodeBlock
+                cmd={GETTING_STARTED_STEPS[0].commands[0]}
+                copyLabel={d.copy}
+                copiedLabel={d.copied}
+              />
             </div>
-          </div>
-        </section>
+          </section>
 
-        {/* Community */}
-        <section className="product-community">
-          <div className="product-container product-community-grid">
-            <div>
-              <h2>{d.communityHeading}</h2>
-              <p>{d.communityBody}</p>
+          {/* COMMUNITY */}
+          <section className="home-section" aria-labelledby="home-community">
+            <div className="split">
+              <div className="section-head-text">
+                <h2 className="section-title" id="home-community">{d.communityHeading}</h2>
+                <p className="section-scope">{d.communityBody}</p>
+              </div>
+              <nav aria-label={d.communityLinksAria}>
+                <ul className="dir-list dir-list-card" role="list">
+                  <li>
+                    <a href={REPO_URL} className="dir-row">
+                      <span className="dir-mark" aria-hidden="true"><Icon name="github" /></span>
+                      <span className="dir-text"><span className="dir-title">GitHub</span></span>
+                      <span className="dir-action" aria-hidden="true"><Icon name="external" /></span>
+                    </a>
+                  </li>
+                  <li>
+                    <a href={REPO_ISSUES_URL} className="dir-row">
+                      <span className="dir-mark" aria-hidden="true"><Icon name="alert" /></span>
+                      <span className="dir-text"><span className="dir-title">Issues</span></span>
+                      <span className="dir-action" aria-hidden="true"><Icon name="external" /></span>
+                    </a>
+                  </li>
+                  <li>
+                    <a href={DISCORD_URL} className="dir-row">
+                      <span className="dir-mark" aria-hidden="true"><Icon name="message" /></span>
+                      <span className="dir-text"><span className="dir-title">Discord</span></span>
+                      <span className="dir-action" aria-hidden="true"><Icon name="external" /></span>
+                    </a>
+                  </li>
+                  <li>
+                    <Link href={`/${locale}/contribute`} className="dir-row">
+                      <span className="dir-mark" aria-hidden="true"><Icon name="git-pull-request" /></span>
+                      <span className="dir-text"><span className="dir-title">{d.contribute}</span></span>
+                      <span className="dir-action" aria-hidden="true"><Icon name="chevron-right" className="icon icon-flip" /></span>
+                    </Link>
+                  </li>
+                  <li>
+                    {publishedRelease ? (
+                      <a href={publishedRelease.url} className="dir-row">
+                        <span className="dir-mark" aria-hidden="true"><Icon name="package" /></span>
+                        <span className="dir-text"><span className="dir-title">{publishedRelease.tag}</span></span>
+                        <span className="dir-action" aria-hidden="true"><Icon name="external" /></span>
+                      </a>
+                    ) : (
+                      <a href={REPO_RELEASES_URL} className="dir-row">
+                        <span className="dir-mark" aria-hidden="true"><Icon name="package" /></span>
+                        <span className="dir-text"><span className="dir-title">Releases</span></span>
+                        <span className="dir-action" aria-hidden="true"><Icon name="external" /></span>
+                      </a>
+                    )}
+                  </li>
+                </ul>
+              </nav>
             </div>
-            <nav aria-label={d.communityLinksAria}>
-              <a href={REPO_URL}>GitHub</a>
-              <a href={REPO_ISSUES_URL}>Issues</a>
-              <a href={DISCORD_URL}>Discord</a>
-              <Link href={`/${locale}/contribute`}>{d.contribute}</Link>
-              {publishedRelease ? (
-                <a href={publishedRelease.url}>{publishedRelease.tag}</a>
-              ) : (
-                <a href={REPO_RELEASES_URL}>Releases</a>
-              )}
-            </nav>
-          </div>
-        </section>
+          </section>
+        </div>
       </div>
     </div>
   );

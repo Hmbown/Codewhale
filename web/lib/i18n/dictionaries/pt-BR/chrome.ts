@@ -27,24 +27,7 @@ export const chrome: ChromeDict = {
 
   authSignIn: "Entrar",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "qualquer modelo, na sua máquina",
-
-  issueLabel: "Edição {date}",
   dateLocale: "pt-BR",
-
-  tickerLiveLabel: "Ao vivo",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "mesclado",
-  tickerOpened: "aberto",
-  tickerClosed: "fechado",
-  tickerReleased: "lançado",
-  tickerFirstContribution: "primeira contribuição",
-  tickerBy: "por {handle}",
-  tickerAria: "Atividade recente do repositório",
-
-  traceLabel: "rastro de raciocínio",
-  traceTabsAria: "Trechos da sessão",
 
   menuOpen: "Abrir menu",
   menuClose: "Fechar menu",

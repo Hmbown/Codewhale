@@ -1,43 +1,128 @@
 import type { DocsRuntimeApiDict } from "../types";
 
 /**
- * English reference dictionary for `app/[locale]/docs/runtime-api/page.tsx`.
- * Copy moved verbatim from the page's `isZh` ternaries — any wording change
- * belongs in its own commit, never mixed into a structural move.
+ * English reference dictionary for `app/[locale]/docs/runtime-api/page.tsx`
+ * ("Automate with the Runtime API"). Checked against docs/RUNTIME_API.md
+ * (entrypoints, defaults, auth, endpoints) and the handlers in
+ * crates/tui/src/runtime_api.rs (`POST /v1/threads` → 201 ThreadRecord).
  */
 export const docsRuntimeApi: DocsRuntimeApiDict = {
-  metaTitle: "Runtime API · Codewhale Docs",
+  metaTitle: "Automate with the Runtime API · Codewhale Docs",
   metaDescription:
-    "Local HTTP/SSE, JSON-RPC stdio, and ACP entrypoints for integrations, bridges, and automation.",
+    "Drive Codewhale from your own scripts and apps: run one-shot prompts in CI, or start the local HTTP API and send turns, stream events, and answer approvals.",
   bodyClassName: "text-ink-soft leading-relaxed",
-  overviewTitle: "Runtime API",
-  overviewLead:
-    "codewhale app-server is the canonical local runtime API and control plane. Local SDKs, mobile/remote-control clients, and editor integrations talk to it instead of screen-scraping terminal output. The engine runs as a local-only process: every API binds to localhost by default — no hosted relay, no provider-token custody, no secret leakage. codewhale serve --http / --mobile remain compatibility aliases for app-server --http / --mobile and launch the identical server; new integrations should target app-server.",
-  entries: [
-    ["http", "The full /v1/* HTTP/SSE runtime API (canonical entry), default 127.0.0.1:7878."],
-    ["mobile", "The runtime API plus the /mobile phone control page."],
-    [
-      "stdio",
-      "Newline-delimited JSON-RPC 2.0 control transport with no listener, for local SDKs and probes.",
-    ],
-    [
-      "web",
-      "The loopback-only browser client, embedded in the binary and opened in the default browser.",
-    ],
-    ["doctor", "Machine-readable health and capability report."],
-    ["acp", "ACP (Agent Client Protocol) stdio adapter for editors such as Zed."],
-    [
-      "exec",
-      "The one-shot headless worker (stream-json, fleet subprocess, CI primitive) — not part of this API, but it shares the same runtime and event vocabulary.",
-    ],
+  title: "Automate with the Runtime API",
+  lede:
+    "Scripts and apps can drive the same engine you use in the terminal. For a single job, use `codewhale exec`. For an app that needs threads, live events, and approvals, run the local Runtime API. Everything runs on your machine; there is no hosted relay.",
+  sections: [
+    {
+      id: "exec",
+      title: "Run one job from a script",
+      blocks: [
+        {
+          code: `codewhale exec "Reply with exactly: pong"
+codewhale exec --auto "fix the failing test and run it again"
+codewhale exec --auto --output-format stream-json "update the changelog"`,
+          lang: "Terminal",
+        },
+        {
+          p: "Plain `exec` answers once without tools. `--auto` lets it use tools and approves them automatically, so use it only in a repository or container you trust; it never widens the [sandbox](/docs/sandbox). `--output-format stream-json` prints one JSON event per line and saves the session so `--continue` can pick it up. `--max-turns` and `--allowed-tools` put limits on a run.",
+        },
+      ],
+    },
+    {
+      id: "start",
+      title: "Start the Runtime API",
+      blocks: [
+        {
+          code: `export CODEWHALE_RUNTIME_TOKEN="$(openssl rand -hex 32)"
+codewhale app-server --http            # http://127.0.0.1:7878`,
+          lang: "Terminal",
+        },
+        {
+          p: "Set the token yourself before starting; if you do not, Codewhale generates one for the process and does not print it. Every `/v1/*` request must send it as `Authorization: Bearer <token>`. `--port` changes the port.",
+        },
+      ],
+    },
+    {
+      id: "turn",
+      title: "Send a turn and watch it",
+      blocks: [
+        {
+          code: `API=http://127.0.0.1:7878
+AUTH="Authorization: Bearer $CODEWHALE_RUNTIME_TOKEN"
+
+THREAD=$(curl -s -X POST "$API/v1/threads" -H "$AUTH" \\
+  -H "Content-Type: application/json" -d '{}' | jq -r .id)
+
+curl -s -X POST "$API/v1/threads/$THREAD/turns" -H "$AUTH" \\
+  -H "Content-Type: application/json" -d '{"prompt": "Summarize README.md"}'
+
+curl -N "$API/v1/threads/$THREAD/events?since_seq=0" -H "$AUTH"`,
+          lang: "Terminal",
+        },
+        {
+          p: "A thread is a conversation; a turn is one request and everything Codewhale does for it. The events stream replays from the sequence number you give and then stays open for new events, so a client that reconnects misses nothing.",
+        },
+        {
+          rows: [
+            ["Stop a turn", "`POST /v1/threads/{id}/turns/{turn_id}/interrupt`"],
+            ["Answer an approval", "`POST /v1/approvals/{approval_id}`"],
+            ["Steer a running turn", "`POST /v1/threads/{id}/turns/{turn_id}/steer`"],
+            ["List saved sessions", "`GET /v1/sessions`"],
+          ],
+        },
+        {
+          p: "[docs/RUNTIME_API.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/RUNTIME_API.md) lists every route, request body, and event.",
+        },
+      ],
+    },
+    {
+      id: "other",
+      title: "Pick another connection",
+      blocks: [
+        {
+          rows: [
+            ["codewhale app-server --stdio", "JSON-RPC over standard input and output, with no network listener. Good for an SDK or a local probe."],
+            ["codewhale serve --acp", "Agent Client Protocol for editors such as Zed."],
+            ["codewhale serve --mcp", "Offer Codewhale's tools to another MCP client. See [Connect tools with MCP](/docs/mcp)."],
+            ["codewhale web", "The built-in [browser client](/docs/web), on the same API."],
+            ["codewhale doctor --json", "Health and capabilities as JSON, with no secrets."],
+          ],
+          codeTerms: true,
+        },
+      ],
+    },
+    {
+      id: "security",
+      title: "Keep it private",
+      blocks: [
+        {
+          list: [
+            "The server listens on `127.0.0.1` by default. The token is a local guard, not a replacement for TLS or a VPN; do not expose the port to a network.",
+            "`--insecure-no-auth` is accepted only on a loopback address.",
+            "The API never returns your provider keys. Health and capability reports carry only metadata — no secrets, file contents, or messages.",
+          ],
+        },
+      ],
+    },
   ],
-  stdioTitle: "Probe without model tokens",
-  stdioLead:
-    "The stdio control transport can be probed without spending model tokens. capabilities returns the advertised method families (thread/*, app/*, prompt/*) and the full method list; the method set is pinned by a drift test in crates/app-server/src/lib.rs, so SDK and local integration clients can rely on it not changing silently.",
-  interruptNote:
-    "A live turn can be asked to stop with thread/interrupt (or POST /v1/threads/{id}/turns/{turn_id}/interrupt over HTTP); when no turn is streaming the reply carries interrupted: false — not an error, just nothing to stop.",
-  securityTitle: "Security boundary",
-  securityLead:
-    "The runtime API token is read from {authToken}, then {runtimeTokenEnv}, then {legacyTokenEnv}; {insecureFlag} is only accepted with a loopback bind. Cross-origin browser requests are rejected by the CORS allow-list. Before selecting a non-loopback bind — especially {mobileFlag} — read the full deployment and authentication contract in docs/RUNTIME_API.md.",
+  next: [
+    {
+      href: "/docs/web",
+      label: "Open the browser client",
+      note: "A ready-made client for the same API.",
+    },
+    {
+      href: "/docs/hooks",
+      label: "Run commands on events",
+      note: "React to session events without writing a client.",
+    },
+    {
+      href: "/docs/fleet",
+      label: "Run a workflow",
+      note: "Durable, multi-step runs you can check from any terminal.",
+    },
+  ],
   sourceNote: "Source document: docs/RUNTIME_API.md · Update docs-map.ts when changing.",
 };

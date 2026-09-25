@@ -158,7 +158,7 @@ Installed checksummed release commands:
 PATH selects no codewhale command; this install is /home/you/.local/bin/codewhale
 ```
 
-#### macOS notes
+### macOS notes
 
 Re-checked on macOS 26.1, Apple silicon (`macos-arm64`), with a fresh `HOME`:
 

@@ -3,21 +3,20 @@ import type { DocsShellDict } from "../types";
 /**
  * English reference dictionary for the docs shell: the portal hero in
  * `app/[locale]/docs/layout.tsx`, the hub metadata, the task/topic search,
- * the sidebar and breadcrumb chrome, the release-truth band, and the
- * contextual help band that closes every docs page.
+ * the sidebar and breadcrumb chrome, the release-truth band, the contextual
+ * help band that closes every docs page, and the shared page-body chrome.
  */
 export const docsShell: DocsShellDict = {
   metaTitle: "Docs · Codewhale",
   metaDescription:
-    "Codewhale documentation: install, user guide, configuration, providers, account and keys, cloud computers, security and trust, core concepts, tools, MCP, skills, sandbox, runtime API, troubleshooting.",
+    "Install Codewhale, connect a provider, and get work done: modes and approvals, reviewing changes, workflows, sub-agents, MCP tools, hooks, the Runtime API, and troubleshooting.",
   portalMark: "Codewhale documentation",
-  heroTitle: "Find the guidance you need.",
+  heroTitle: "Get something done with Codewhale.",
   heroLead:
-    "Start from a task or a topic. Every page states which repository document it is drawn from and which release it describes.",
+    "Start from what you want to do. Each page says what you need, shows commands you can run today, and points to the next step.",
   installCta: "Install Codewhale",
-  sourceDocsCta: "Browse source docs ↗",
 
-  releaseLabel: "Release truth",
+  releaseLabel: "Release",
   releasePublished: "Latest release {tag} · {date}",
   releaseCandidate:
     "These pages describe the {version} source candidate, which is not published yet.",
@@ -39,7 +38,7 @@ export const docsShell: DocsShellDict = {
     "Try a different word — searches match English and Chinese — or browse the complete docs directory on GitHub.",
   emptyCta: "GitHub docs directory ↗",
   indexNote:
-    "Web guides stay on codewhale.net. Source docs open the complete reference in the GitHub repository. Tasks come from docs-tasks.ts and topics from docs-map.ts; both registries live in the repository.",
+    "Web guides open on codewhale.net. Source docs open the full reference in the GitHub repository.",
 
   sidebarHeading: "Documentation",
   sidebarAria: "Documentation index",
@@ -49,10 +48,14 @@ export const docsShell: DocsShellDict = {
 
   helpTitle: "Need more than this page?",
   helpLead:
-    "Every guide is drawn from a repository document. If it is wrong or missing something, the fastest fix is to say so where the maintainer will see it.",
+    "Every guide is checked against a document in the repository. If something is wrong or missing, say so where the maintainer will see it.",
   helpSource: "Source: {name}",
-  helpTroubleshooting: "Troubleshooting",
+  helpTroubleshooting: "Fix a problem",
   helpFaq: "FAQ",
   helpDiscord: "Ask on Discord ↗",
   helpIssue: "Report a docs problem ↗",
+
+  nextHeading: "Next",
+  noteLabel: "Note:",
+  onThisPage: "On this page",
 };

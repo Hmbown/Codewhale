@@ -17,7 +17,6 @@ import { INSTALL_GUIDE } from "./install-guide.generated";
 import { getChrome, getHome } from "./i18n/dictionaries";
 import { footerProjectLinks } from "./i18n/links";
 import { TERMINAL_SCREENSHOT } from "./media-manifest";
-import { siteCss } from "./site-css";
 
 const root = new URL("../../", import.meta.url);
 
@@ -458,7 +457,7 @@ done
     expect(roadmap.indexOf('{ title: "Local web client"')).toBeLessThan(
       roadmap.indexOf('title: "Underway"'),
     );
-    expect(roadmap).toContain("Implemented in the v0.9.1 source candidate");
+    expect(roadmap).toContain("In published releases: `codewhale web`");
     for (const name of matrix.toolSurface.defaultActive) {
       expect(toolDoc, name).toContain(`\`${name}\``);
       expect(toolsPage, name).toContain(name);
@@ -590,7 +589,7 @@ done
     // the media manifest instead of a stale version embedded in translations.
     expect(homepage).toContain("alt={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}");
     expect(homepage).toContain("fill(d.shotBuild, { version: TERMINAL_SCREENSHOT.version })");
-    expect(getHome("en").shotBuild).toBe("v{version} development build");
+    expect(getHome("en").shotBuild).toBe("v{version} pre-release build");
     for (const locale of ["en", "zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"]) {
       const home = getHome(locale);
       expect(home.shotBuild, `${locale} shotBuild`).toContain("{version}");
@@ -599,60 +598,6 @@ done
       expect(home.screenshotAlt, `${locale} alt`).toContain("Work");
       expect(home.screenshotAlt, `${locale} alt`).not.toMatch(/171acee|0\.9\.12|Full Access/);
     }
-  });
-
-  it("keeps the standalone wire strip a record of GitHub, not a summary of it", () => {
-    const ticker = text("web/components/ticker.tsx");
-    const github = text("web/lib/github.ts");
-
-    // An empty or unreachable feed removes the strip. No skeleton, no
-    // placeholder row, no invented item.
-    expect(ticker).toContain("if (!ordered.length) return null;");
-
-    // Drafts are the author's own not-ready marker, not an event.
-    expect(ticker).toContain("EVENT_STATES.includes(item.state)");
-    expect(ticker).not.toContain('"draft"');
-
-    // Every verb resolves through the caller's dictionary — the strip never
-    // hardcodes an English event word next to a translated page.
-    for (const key of [
-      "tickerMerged",
-      "tickerOpened",
-      "tickerClosed",
-      "tickerReleased",
-      "tickerFirstContribution",
-      "tickerBy",
-      "tickerAria",
-    ] as const) {
-      for (const locale of ["en", "zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id"]) {
-        expect(getChrome(locale)[key].trim().length, `${locale} ${key}`).toBeGreaterThan(0);
-      }
-    }
-    expect(getChrome("en").tickerBy).toContain("{handle}");
-
-    // The first-contribution mark is GitHub's verdict, copied, never ours.
-    expect(github).toContain('association === "FIRST_TIME_CONTRIBUTOR"');
-    expect(ticker).toContain("item.firstTimeContributor");
-
-    // A verb is dated by its own event, so a merge is never dated by a later
-    // comment on the thread.
-    expect(github).toContain("eventAt");
-    expect(ticker).toContain("item.eventAt ?? item.updatedAt");
-
-    // Merged pull requests, issues, and releases — the whole life of the repo,
-    // within the existing three-call budget.
-    expect(github).toContain("/releases?per_page=");
-    expect(github).toContain('kind: "release"');
-  });
-
-  it("keeps reduced motion static without hiding the reasoning trace", () => {
-    const css = siteCss();
-
-    expect(css).toMatch(
-      /@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\.ticker-track\s*\{\s*animation:\s*none;\s*\}[\s\S]*?\}/,
-    );
-    // Freezing the track must not also hide the entries it stopped scrolling.
-    expect(css).toMatch(/\.ticker-viewport\s*\{\s*overflow-x:\s*auto;\s*\}/);
   });
 
   it("keeps the homepage free of fabricated demo panels", () => {

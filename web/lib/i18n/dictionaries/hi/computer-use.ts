@@ -38,7 +38,4 @@ export const computerUse: ComputerUseDict = {
   demo: "बैकग्राउंड जाँच देखें",
   source: "सोर्स और अन्य प्लेटफ़ॉर्म",
   platforms: "यह डाउनलोड Mac के लिए है। Windows और Linux पर फ़िलहाल सोर्स प्लगइन और होस्ट-साइड सेटअप का उपयोग होता है।",
-  installTitle: "Mac के लिए Computer Use",
-  installLead: "Computer Use हेल्पर से बैकग्राउंड में ऐप नियंत्रण जोड़ें। Mac की अनुमतियाँ सेट करें, बैकग्राउंड जाँच चलाएँ और मेनू बार से हेल्पर का इनपुट रोकें या बंद करें।",
-  installLink: "Computer Use डाउनलोड और सेटअप",
 };

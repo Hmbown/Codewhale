@@ -1,28 +1,98 @@
 import type { DocsWebDict } from "../types";
 
-/** 中文对照见 `en/docs-web.ts`,文案自页面的 `isZh` 三元逐字迁入。 */
+/** 「打开浏览器客户端」页的简体中文词典；与 `en/docs-web.ts` 逐段对应。 */
 export const docsWeb: DocsWebDict = {
-  metaTitle: "浏览器客户端 · Codewhale 文档",
-  metaDescription: "仅回环的内嵌浏览器客户端：一次性引导、会话 Cookie 与本地信任边界。",
+  metaTitle: "打开浏览器客户端 · Codewhale 文档",
+  metaDescription:
+    "在你自己机器上的浏览器标签页里使用 Codewhale，或者用 /rc 在 Codewhale 网页应用中接着使用正在终端里运行的会话。",
   bodyClassName: "text-ink-soft leading-[1.9] tracking-wide",
-  overviewTitle: "浏览器客户端",
-  overviewLead:
-    "{webCommand} 在 canonical 运行时 API 之上打开 Codewhale 内嵌的浏览器客户端。它是一个纯本地界面：服务器始终绑定 {loopbackHost}，无法改绑到局域网地址，也无法在关闭运行时认证的情况下运行。默认地址是 {defaultUrl}；端口冲突时用 {portExample} 换一个回环端口。Ctrl+C 停止进程，浏览器会话随之结束。",
-  overviewBody:
-    "当前客户端提供响应式的线程与搜索侧栏、由运行时持有的会话事实、transcript 与工具收据，以及输入区。它可以创建、选择、重命名和归档线程；发起或引导回合；中断工作；处理审批；回答运行时的用户输入请求。浏览器只是同一个本地运行时的另一视图——不会创建第二个云账号，不会把 provider 凭据复制进浏览器存储，也不会削弱已配置的审批与沙箱策略。",
-  authTitle: "认证边界",
-  authLead:
-    "启动 URL 携带的是一个随机、短寿命、一次性的引导凭证——绝不是运行时 bearer 令牌。一次回环请求把它换成 HttpOnly、SameSite=Strict、进程本地的会话 Cookie，并立即使该凭证失效。重用、过期、畸形或非回环的引导尝试都会失败关闭。运行时令牌不会出现在渲染的 HTML、浏览器存储、URL 查询或片段、或浏览器启动参数中。携带 Cookie 的状态变更请求还必须出示精确的本地 web 源；跨源浏览器请求会被拒绝。",
-  localTitle: "本地就是本地",
-  localLead:
-    "{webCommand} 只接受 {portFlag}——没有 {hostFlag}，也没有关闭认证的选项。不要把它当公开网站，也不要通过路由器转发、公开反向代理或隧道暴露它的端口。单独的 {mobileCommand} 和 {httpFlag} 模式有不同的部署与认证约定，操作它们（尤其是选择非回环绑定）之前请阅读运行时 API 文档。",
-  remoteTitle: "从网页应用远程控制",
-  remoteLead:
-    "现已可用。要在已登录的 Codewhale 网页应用中继续正在运行的本地会话，请在该会话里输入 /rc，或用 codewhale rc 启动，然后在浏览器中批准一次性代码。租约有效期间，浏览器接管新的提示与审批，终端保持为可读的安全界面；两端都仍可中断。",
-  remoteBody:
-    "连接后，横幅和一条文字稿说明会显示实时会话链接。/rc open 在浏览器中打开它，/rc link 打印它，/rc status 显示会话归属，/rc stop 把会话交还给终端。连接中断时，本地输入会保持锁定，直到最后一个网页租约过期，因此两个控制端永远不会争抢。从同一终端登记的每个文件夹共享一个稳定的设备 ID，所以网页应用按机器而不是按会话列出计算机。这与上面的本机浏览器客户端不同：/rc 把本地会话与你的账户配对；codewhale web 只是提供一个不需要账户的本地页面。",
-  troubleshootingTitle: "常见问题",
-  troubleshootingLead:
-    "端口 7878 被占用时用 --port 换一个。浏览器无法打开时命令会报错退出，而不会留下可重用的引导凭证；检查系统默认浏览器设置后重新启动。页面能打开但 provider 不可用时，查 codewhale doctor 和 /provider——web 命令不配置也不迁移 provider 凭据。会话过期后重启 codewhale web 以签发新的进程本地会话；重用旧的引导 URL 本来就会失败。",
-  sourceNote: "来源文档：docs/WEB.md · 更新时请同步修改 docs-map.ts。",
+  title: "打开浏览器客户端",
+  lede:
+    "比起终端，更喜欢浏览器窗口？Codewhale 可以在你的机器上提供自己的客户端。它只是同一个本地会话的另一种视图——审批相同、沙箱相同，也不需要账户。",
+  sections: [
+    {
+      id: "start",
+      title: "启动",
+      blocks: [
+        { p: "在你希望 Codewhale 工作的文件夹中运行：" },
+        { code: "codewhale web\ncodewhale web --port 8788   # if 7878 is taken", lang: "终端" },
+        {
+          p: "Codewhale 会在 `http://127.0.0.1:7878` 启动本地服务，打印一个一次性链接，并在默认浏览器中打开它。如果浏览器没有打开，请在十分钟内使用打印出来的链接。在终端按 Ctrl+C 即可停止，浏览器会话也随之结束。",
+        },
+      ],
+    },
+    {
+      id: "use",
+      title: "在浏览器中工作",
+      blocks: [
+        {
+          p: "浏览器客户端可以列出和搜索你的会话线程，显示对话记录及每个工具的结果，并提供输入框。你可以开始、引导或中断一个回合，回应审批，给线程改名或归档。你的提供商密钥始终留在 Codewhale 中，不会被复制到浏览器存储里。",
+        },
+      ],
+    },
+    {
+      id: "local",
+      title: "只在本机使用",
+      blocks: [
+        {
+          list: [
+            "服务只监听 `127.0.0.1`。没有任何选项能把它开放到你的网络，也无法在不认证的情况下运行。",
+            "链接中携带的是一次性代码，而不是你的访问令牌。打开链接时，这个代码会换成一个绑定到当前进程的 cookie，随即失效。",
+            "不要通过路由器、公共代理或隧道转发这个端口。如果要在手机或另一台机器上使用，请参阅 [Runtime API](/docs/runtime-api)，并先读一读它的认证规则。",
+          ],
+        },
+      ],
+    },
+    {
+      id: "remote",
+      title: "在网页应用中接着使用会话",
+      blocks: [
+        {
+          p: "这是另一回事：它把已经在终端里运行的会话交给已登录的 Codewhale 网页应用，让你可以换一台设备继续。这需要一个 [Codewhale 账户](/docs/auth#account)。",
+        },
+        {
+          code: `/rc          # in the running session; approve the one-time code in your browser
+/rc status   # who controls the session now
+/rc link     # print the session link
+/rc stop     # hand control back to the terminal`,
+          lang: "Codewhale",
+        },
+        {
+          p: "网页应用接管会话期间，新的提示和审批都来自浏览器，终端仍可查看内容。任何一方都可以中断。你也可以用 `codewhale rc` 直接以这种方式启动会话。",
+        },
+      ],
+    },
+    {
+      id: "fix",
+      title: "遇到问题时",
+      blocks: [
+        {
+          rows: [
+            ["端口被占用", "用 `--port` 指定一个空闲端口。"],
+            ["浏览器没有打开", "在十分钟内，把打印出来的链接复制到同一台机器上的浏览器中打开。"],
+            ["链接已过期或已被使用", "这是预期行为。重新运行 `codewhale web` 获取新链接。"],
+            ["模型没有回复", "web 命令不负责配置提供商。请检查 `codewhale doctor` 和 `/provider`。"],
+          ],
+        },
+      ],
+    },
+  ],
+  next: [
+    {
+      href: "/docs/runtime-api",
+      label: "用 Runtime API 自动化",
+      note: "浏览器客户端所基于的本地 API。",
+    },
+    {
+      href: "/docs/auth",
+      label: "连接模型提供商",
+      note: "为浏览器客户端接上一个模型。",
+    },
+    {
+      href: "/docs/modes",
+      label: "设置模式与审批",
+      note: "浏览器中同样适用这些审批设置。",
+    },
+  ],
+  sourceNote: "来源文档：docs/WEB.md · 修改时同步更新 docs-map.ts。",
 };

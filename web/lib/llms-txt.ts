@@ -29,7 +29,7 @@ const EXTRA_PAGES: readonly { path: string; title: string; description: string }
     path: "/runtime",
     title: "Runtime & Integrations",
     description:
-      "Local Runtime API, HTTP/SSE, baseline ACP stdio adapter, MCP servers, and the Phase 0 VS Code companion.",
+      "Local Runtime API, HTTP/SSE, baseline ACP stdio adapter, MCP servers, and an early VS Code companion.",
   },
   {
     path: "/constitution",

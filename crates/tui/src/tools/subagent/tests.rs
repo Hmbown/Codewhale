@@ -5833,6 +5833,7 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
         "detached",
         "exact_files",
         "expected_artifact",
+        "fork_context",
         "limit",
         "max_output_tokens",
         "max_steps",
@@ -5860,7 +5861,6 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
     );
     for unadvertised in [
         "max_depth",
-        "fork_context",
         "workspace_policy",
         "worktree_base",
         "worktree_branch",
@@ -5928,6 +5928,31 @@ fn agent_start_schema_documents_hidden_spawn_requirements() {
         assert!(
             cwd.contains(needle),
             "cwd description should teach {needle:?}: {cwd}"
+        );
+    }
+}
+
+#[test]
+fn spawn_limits_accept_whole_number_floats_and_still_refuse_fractions() {
+    // Providers that serialize every number as a float send `900.0`.
+    let request = parse_spawn_request(&json!({
+        "prompt": "p",
+        "max_steps": 300.0,
+        "wall_time_secs": 900.0,
+        "max_output_tokens": 4096.0,
+    }))
+    .expect("whole-number floats are integers");
+    assert_eq!(request.max_steps, Some(300));
+    assert_eq!(request.wall_time, Some(Duration::from_secs(900)));
+    assert_eq!(request.max_output_tokens, Some(4096));
+
+    for bad in [json!(2.5), json!(0.0), json!(-1.0), json!("900")] {
+        let error = parse_spawn_request(&json!({"prompt": "p", "wall_time_secs": bad}))
+            .expect_err("fractional, zero, negative and string limits stay refused")
+            .to_string();
+        assert!(
+            error.contains("wall_time_secs must be between 1 and"),
+            "{error}"
         );
     }
 }
@@ -21163,6 +21188,8 @@ const READ_ONLY_CHILD_ENVELOPE_BYTE_CEILING: usize = 89_000;
 // base prompt's progress-narration rule (E4, 5cf9db3d6) and the workflow
 // Fleet origin list (26cfaf8de), net of the read/bash wording trims
 // (105ad9d3e).
+// The agent schema's `fork_context` property (2026-09-25) fit under this
+// ceiling by trimming the `resume_from` and `wall_time_secs` descriptions.
 const PARENT_SURFACE_BYTE_CEILING: usize = 88_715;
 
 #[tokio::test]

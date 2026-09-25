@@ -22,7 +22,7 @@ export function DocsSidebar({ locale }: { locale: string }) {
   const byCategory = getTopicsByCategory();
 
   return (
-    <aside className="docs-sidebar min-w-0">
+    <aside className="docs-sidebar min-w-0" aria-label={t.sidebarHeading}>
       <div className="lg:sticky lg:top-24">
         <div className="docs-sidebar-heading">
           <Link href={`/${locale}/docs`}>

@@ -2358,8 +2358,8 @@ async fn run_async_main_dispatch(
                     let _ = parse_sandbox_policy(sandbox, true, Vec::new(), false, false)?;
                     config.sandbox_mode = Some(sandbox.to_ascii_lowercase());
                 }
-                // Honour CODEWHALE_BASE_URL / DEEPSEEK_BASE_URL forwarded by
-                // the CLI dispatcher from --base-url.
+                // Honour CODEWHALE_BASE_URL (forwarded by the CLI dispatcher
+                // from --base-url) or the user-set legacy DEEPSEEK_BASE_URL.
                 if let Ok(env_url) = std::env::var("CODEWHALE_BASE_URL")
                     .or_else(|_| std::env::var("DEEPSEEK_BASE_URL"))
                 {
@@ -18974,7 +18974,6 @@ api_key = "test-only-key"
                 alternate_screen: Some("never".to_string()),
                 mouse_capture: None,
                 selection_copy_markdown: None,
-                terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
                 turn_wall_clock_secs: None,
@@ -19075,7 +19074,6 @@ api_key = "test-only-key"
                 alternate_screen: None,
                 mouse_capture: Some(false),
                 selection_copy_markdown: None,
-                terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
                 turn_wall_clock_secs: None,
@@ -19114,7 +19112,6 @@ api_key = "test-only-key"
                 alternate_screen: None,
                 mouse_capture: Some(true),
                 selection_copy_markdown: None,
-                terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
                 turn_wall_clock_secs: None,
@@ -19207,7 +19204,6 @@ api_key = "test-only-key"
                 alternate_screen: None,
                 mouse_capture: Some(true),
                 selection_copy_markdown: None,
-                terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
                 turn_wall_clock_secs: None,

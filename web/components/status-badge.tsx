@@ -1,14 +1,28 @@
 /**
- * <StatusBadge> — honest availability labels for public surfaces.
+ * State is a mark and a word, never colour alone.
  *
- * Used wherever the site shows something that is not a shipped, stable
- * feature: experimental bridges, preview platforms, pending media, and
- * unavailable states. The label is always visible text — never color alone —
- * so the state is conveyed accessibly in both locales.
+ * <Status> is the general form: a dot in the tone's colour and the word in
+ * text. `live` lights its dot (bioluminescence) and is only for something
+ * the site actually observes; nothing static qualifies.
+ *
+ * <StatusBadge> keeps the older availability vocabulary (experimental,
+ * preview, pending, unavailable) for the pages that still use it.
  */
 
+import type { ReactNode } from "react";
 import type { LocalizedText } from "@/lib/content/vocabulary";
 import { pickText } from "@/lib/i18n/dictionaries";
+
+export type StatusTone = "ready" | "attention" | "idle" | "live" | "danger" | "accent";
+
+export function Status({ tone, children }: { tone: StatusTone; children: ReactNode }) {
+  return (
+    <span className={`status status-${tone}`}>
+      <span className="status-dot" aria-hidden="true" />
+      {children}
+    </span>
+  );
+}
 
 export type StatusKind = "experimental" | "preview" | "pending" | "unavailable";
 
