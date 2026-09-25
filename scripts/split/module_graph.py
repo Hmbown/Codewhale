@@ -24,8 +24,9 @@ Categories counted (keyed `from|to`):
             ...). A test edge constrains a crate move exactly like a
             production edge;
 * ``uilib`` closure files that use a UI library (`ratatui`, `crossterm`,
-            `codewhale_tui`, or `codewhale_palette` while it still pulls in
-            ratatui), keyed `module|library`;
+            `codewhale_tui`), keyed `module|library`. `codewhale_palette` is
+            not one since its `ratatui` feature became optional (RS-3); the
+            runtime links it with `default-features = false`;
 * ``doc``   intra-doc links in closure doc comments that point at UI code
             (`crate::tui::...`, `crate::commands::...`). rustdoc checks them
             once the module is public in `codewhale-runtime`.
@@ -287,7 +288,7 @@ class Crate:
 
 USE_RE = re.compile(r"\buse\s+crate::")
 PATH_RE = re.compile(r"(?<![\$\w])crate::(\w+)")
-UILIB_RE = re.compile(r"(?<![\w:])(ratatui|crossterm|codewhale_tui|codewhale_palette)(?:::|\s*;|\s*\{)")
+UILIB_RE = re.compile(r"(?<![\w:])(ratatui|crossterm|codewhale_tui)(?:::|\s*;|\s*\{)")
 DOC_LINK_RE = re.compile(r"\[`?crate::(tui|commands)\b")
 
 
@@ -475,10 +476,6 @@ def build_report(tui_src: Path = TUI_SRC, runtime_src: Path = RUNTIME_SRC) -> Re
             lines = src.split("\n")
             for m in UILIB_RE.finditer(code):
                 lib = m.group(1)
-                if crate is runtime and lib == "codewhale_palette":
-                    # The runtime crate links palette without its ratatui
-                    # feature; the cargo-tree rule proves that side.
-                    continue
                 line = code.count("\n", 0, m.start()) + 1
                 key = f"{mod}|{lib}"
                 counts["uilib"][key] += 1

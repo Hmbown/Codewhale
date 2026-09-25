@@ -4,7 +4,7 @@
     "prod": 84,
     "test": 95,
     "late": 2,
-    "uilib": 13,
+    "uilib": 10,
     "doc": 1
   },
   "counts": {
@@ -38,7 +38,6 @@
       "core|exec_agent": 1
     },
     "uilib": {
-      "settings|codewhale_palette": 3,
       "shell_dispatcher|crossterm": 3,
       "tools|crossterm": 7
     },
