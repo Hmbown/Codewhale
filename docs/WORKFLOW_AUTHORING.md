@@ -157,10 +157,11 @@ workers, but users and agents may override any slot when the task calls for it.
 ## Experimental search is a Workflow option
 
 Experimental search generalizes the existing best-of-N recipe without adding a
-new product mode, scheduler, or sub-agent API. A provider-neutral
-`WorkflowSearchSpec` freezes the objective, baseline, model request and resolved
-version, public evidence, evaluator hash, hard gates, scoring rule, budgets,
-write scope, rounds, and review-only integration policy before admission.
+new product mode, scheduler, or sub-agent API. The proposed search spec would
+freeze the objective, baseline, model request and resolved version, public
+evidence, evaluator hash, hard gates, scoring rule, budgets, write scope,
+rounds, and review-only integration policy before admission; it is a design,
+not shipped code.
 
 The current JS starter supports structured generation and read-only review with
 `strategy: "search"`. Runtime-owned command gates, hidden evaluation, benchmark

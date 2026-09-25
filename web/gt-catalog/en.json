@@ -14,21 +14,7 @@
     "navHomeAria": "Codewhale home",
     "installCta": "Install →",
     "authSignIn": "Sign in",
-    "wordmarkSeal": "深",
-    "wordmarkTag": "any model, on your machine",
-    "issueLabel": "Issue {date}",
     "dateLocale": "en-US",
-    "tickerLiveLabel": "实 时",
-    "tickerLiveTag": "LIVE",
-    "tickerMerged": "merged",
-    "tickerOpened": "opened",
-    "tickerClosed": "closed",
-    "tickerReleased": "released",
-    "tickerFirstContribution": "first contribution",
-    "tickerBy": "by {handle}",
-    "tickerAria": "Recent repository activity",
-    "traceLabel": "reasoning trace",
-    "traceTabsAria": "Session excerpts",
     "menuOpen": "Open menu",
     "menuClose": "Close menu",
     "themeAuto": "auto",
@@ -63,22 +49,19 @@
     "metaTitle": "Codewhale — Build and automate with the models you choose",
     "metaDescription": "Build software, work with your files, and automate everyday tasks using open-source agents and your choice of hosted or local AI models.",
     "heroTitle": "Build and automate with the models you choose",
-    "heroIntro": "{brand} is an open-source agent that reads files, edits code, runs commands, and checks its work. Use it in your terminal or local browser with a hosted or local model. You choose the tools and permissions; the session keeps the conversation and tool results.",
+    "heroIntro": "{brand} is an open-source agent that reads files, edits code, runs commands, and can run your tests to check its work. Use it in your terminal or local browser with a hosted or local model. You choose the tools and permissions; the session keeps the conversation and tool results.",
     "getCodewhale": "Get Codewhale",
     "heroInstallAria": "Install command",
     "exploreProduct": "Explore the product",
     "shotPreview": "Terminal preview",
-    "shotBuild": "v{version} development build",
-    "screenshotAlt": "Codewhale v{version} development build: whale mark, new session, message composer, Ask permissions, Work mode and model status. Rendered from an isolated terminal capture.",
+    "shotBuild": "v{version} pre-release build",
+    "screenshotAlt": "Codewhale v{version} pre-release build: whale mark, new session, message composer, Ask permissions, Work mode and model status. Rendered from an isolated terminal capture.",
     "latestRelease": "Latest release {tag}",
     "releaseUnavailable": "Release status unavailable",
     "currentSource": "Source",
     "sourceCandidate": "Unreleased",
-    "providerRoutes": "{count} providers",
     "publishedRelease": "released",
     "figcaptionSourceCandidate": "unreleased",
-    "chapterTerminal": "Your terminal",
-    "chapterTerminalTitle": "Start with something you want to make",
     "gainHeading": "What you can do with Codewhale",
     "gainLede": "Ask for a concrete result: fix a bug, understand a project, or turn a repeated task into a workflow. Start with one agent and split larger jobs when useful.",
     "gain": [
@@ -95,7 +78,6 @@
         "Set permissions before work starts, respond to approval requests, and interrupt a running task. Review the conversation and tool results before continuing."
       ]
     ],
-    "chapterModels": "Your models",
     "modelsHeading": "A choice of models for every task",
     "modelsBody": "Choose the provider and model for each session: connect with an API key, use a supported provider sign-in, or run a local model. Your Codewhale account and your model connection serve different purposes.",
     "modelsFacts": [
@@ -117,7 +99,6 @@
     "startLede": "Install the published release, connect a model, then try one task in your project folder. A team of agents is optional; start with one and add more when the work can be split.",
     "startGuideLink": "Read the getting-started guide",
     "startVocabularyLink": "Look up a term",
-    "chapterAccount": "Get Codewhale",
     "availabilityHeading": "Where you can use Codewhale",
     "availabilityLede": "The terminal and local browser client are available now. Desktop and hosted web apps are being developed around the same session model; their availability is listed separately below.",
     "availability": [
@@ -129,7 +110,7 @@
       [
         "Hosted web app",
         "Development preview",
-        "Sign in with a Codewhale account and pair a computer in the development preview. Hosted task execution is still being qualified."
+        "Sign in with a Codewhale account, then type /rc in a running terminal session to continue it from the web app. Hosted task execution is still being qualified."
       ],
       [
         "Desktop",
@@ -155,8 +136,8 @@
         "Connect additional tools and services. Review and enable plugins before the agent can use them."
       ],
       [
-        "Computer Use · source preview",
-        "The current source includes a plugin for seeing and interacting with other applications. Enable it explicitly and grant the required system permissions."
+        "Computer Use · preview",
+        "A plugin that lets the agent see and operate other applications. Enable it explicitly and grant the system permissions it asks for."
       ],
       [
         "Saved sessions",
@@ -180,25 +161,24 @@
     "contribute": "Send a pull request"
   },
   "docs-guide": {
-    "metaTitle": "Getting started · Codewhale Docs",
-    "metaDescription": "Install Codewhale, connect a model, and start your first task. Add a Fleet when you want a roster of models and roles.",
+    "metaTitle": "Start your first task · Codewhale Docs",
+    "metaDescription": "Install Codewhale, connect a model, and give it a task in your project. Add a Fleet later if you want several models and roles.",
     "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewTitle": "Getting started",
-    "overviewLead": "Install Codewhale, connect your model, and give it a task. Fleet setup is optional.",
+    "overviewTitle": "Start your first task",
+    "overviewLead": "Four steps take you from nothing installed to a finished first task. Each step links to the page with the details; the Fleet step is optional.",
     "sessionTitle": "Watch a real session",
     "sessionLead": "Follow a task from the first request to the finished result.",
-    "nextTitle": "Where next",
-    "sourceNote": "For more detail, see the user guide and keyboard shortcuts in the documentation."
+    "nextTitle": "Next",
+    "sourceNote": "Source documents: docs/GUIDE.md, docs/INSTALL.md, docs/KEYBINDINGS.md · Update docs-map.ts when changing."
   },
   "docs-shell": {
     "metaTitle": "Docs · Codewhale",
-    "metaDescription": "Codewhale documentation: install, user guide, configuration, providers, account and keys, cloud computers, security and trust, core concepts, tools, MCP, skills, sandbox, runtime API, troubleshooting.",
+    "metaDescription": "Install Codewhale, connect a provider, and get work done: modes and approvals, reviewing changes, workflows, sub-agents, MCP tools, hooks, the Runtime API, and troubleshooting.",
     "portalMark": "Codewhale documentation",
-    "heroTitle": "Find the guidance you need.",
-    "heroLead": "Start from a task or a topic. Every page states which repository document it is drawn from and which release it describes.",
+    "heroTitle": "Get something done with Codewhale.",
+    "heroLead": "Start from what you want to do. Each page says what you need, shows commands you can run today, and points to the next step.",
     "installCta": "Install Codewhale",
-    "sourceDocsCta": "Browse source docs ↗",
-    "releaseLabel": "Release truth",
+    "releaseLabel": "Release",
     "releasePublished": "Latest release {tag} · {date}",
     "releaseCandidate": "These pages describe the {version} source candidate, which is not published yet.",
     "releaseMatches": "These pages describe {tag}, the published release.",
@@ -216,563 +196,1707 @@
     "emptyTitle": "No matching entry",
     "emptyBody": "Try a different word — searches match English and Chinese — or browse the complete docs directory on GitHub.",
     "emptyCta": "GitHub docs directory ↗",
-    "indexNote": "Web guides stay on codewhale.net. Source docs open the complete reference in the GitHub repository. Tasks come from docs-tasks.ts and topics from docs-map.ts; both registries live in the repository.",
+    "indexNote": "Web guides open on codewhale.net. Source docs open the full reference in the GitHub repository.",
     "sidebarHeading": "Documentation",
     "sidebarAria": "Documentation index",
     "breadcrumbAria": "Breadcrumb",
     "breadcrumbHome": "Home",
     "breadcrumbDocs": "Docs",
     "helpTitle": "Need more than this page?",
-    "helpLead": "Every guide is drawn from a repository document. If it is wrong or missing something, the fastest fix is to say so where the maintainer will see it.",
+    "helpLead": "Every guide is checked against a document in the repository. If something is wrong or missing, say so where the maintainer will see it.",
     "helpSource": "Source: {name}",
-    "helpTroubleshooting": "Troubleshooting",
+    "helpTroubleshooting": "Fix a problem",
     "helpFaq": "FAQ",
     "helpDiscord": "Ask on Discord ↗",
-    "helpIssue": "Report a docs problem ↗"
+    "helpIssue": "Report a docs problem ↗",
+    "nextHeading": "Next",
+    "noteLabel": "Note:",
+    "onThisPage": "On this page"
   },
   "docs-hooks": {
-    "metaTitle": "Hooks · Codewhale Docs",
-    "metaDescription": "The shipped lifecycle hooks: mutable message_submit, tool_call_before decisions, turn_end, and sub-agent observer events.",
+    "metaTitle": "Run commands on events · Codewhale Docs",
+    "metaDescription": "Run your own scripts when a session starts, before a tool call, when a turn ends, or when Codewhale is waiting for you — to add context, enforce a rule, or get notified.",
     "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewTitle": "Hooks",
-    "overviewLead": "Hooks attach your own commands to Codewhale's lifecycle: inject context before a message is submitted, enforce policy before a tool call, and audit turns or sub-agent activity. This page describes what currently ships; docs/rfcs/1364-hooks-lifecycle.md is the design RFC for this surface, and docs/CONFIGURATION.md carries the full configuration schema.",
-    "configIntro": "Hooks are configured under {hooksTable} entries in config.toml; run {hooksCommand} in the TUI to see every configured hook grouped by event — name, command preview, timeout, and condition — plus the global {enabledKey} state.",
-    "events": [
-      [
-        "message_submit (mutable)",
-        "Runs before a submitted message is added to history or sent to the model. The hook receives JSON on stdin; exit 0 with stdout JSON carrying a non-empty text field replaces the submitted text, and exit 2 blocks the submission before the turn starts. Multiple hooks run serially in config order, each receiving the previous hook's output. Hooks marked background = true are observer-only and cannot transform or block."
-      ],
-      [
-        "tool_call_before (decision)",
-        "Runs before each tool call executes. Beyond the exit-2 hard deny (which always wins), a foreground hook may print a JSON decision on stdout with exit 0: allow / deny / ask, plus updatedInput to rewrite the tool input and additionalContext appended to the tool result the model sees. When several hooks match, precedence is deny > ask > allow; tool_name conditions support * globs (mcp__* matches every MCP tool). Full Access does not open tool-approval prompts, so ask does not downgrade that posture."
-      ],
-      [
-        "turn_end (observer)",
-        "Fires after each model turn ends, once usage, cost, notifications, receipts, and queue-recovery state have settled. The stdin JSON carries fields such as status, duration_ms, usage, totals, and queued_message_count. Stdout is ignored and failures are warn-only — the hook cannot block input, mutate the transcript, or change the next queued follow-up."
-      ],
-      [
-        "subagent_spawn / subagent_complete (observer)",
-        "Observe sub-agent start and completion with bounded JSON metadata on stdin (agent_id, status, truncated prompt/result previews). Failures are warn-only and never block scheduling or change prompts or results; use the transcript handle returned by agent when full detail is needed."
-      ]
+    "title": "Run commands on events",
+    "lede": "Hooks run a command of yours at set moments in a Codewhale session. Use them to block a risky command, add context to a message, log what happened, or get told when Codewhale is waiting for you.",
+    "sections": [
+      {
+        "id": "first-hook",
+        "title": "Add your first hook",
+        "blocks": [
+          {
+            "p": "Hooks live in `~/.codewhale/config.toml`. This one prints a line whenever a session starts:"
+          },
+          {
+            "code": "[hooks]\nenabled = true\n\n[[hooks.hooks]]\nname = \"announce\"\nevent = \"session_start\"\ncommand = \"echo 'Codewhale session started'\"",
+            "lang": "config.toml"
+          },
+          {
+            "p": "Start a session, then run `/hooks` to see every configured hook, whether hooks are on, and any entry that was rejected. `/hooks events` lists the event names."
+          }
+        ]
+      },
+      {
+        "id": "gate",
+        "title": "Block a command before it runs",
+        "blocks": [
+          {
+            "p": "A `tool_call_before` hook sees each tool call before it executes and can allow it, deny it, or force an approval prompt. This one refuses force-pushes. Save the script and make it executable:"
+          },
+          {
+            "code": "#!/bin/sh\n# ~/.codewhale/hooks/no-force-push.sh\ncase \"$DEEPSEEK_TOOL_ARGS\" in\n  *\"push --force\"*|*\"push -f\"*)\n    echo '{\"decision\": \"deny\", \"reason\": \"Force-push is blocked by a hook.\"}' ;;\nesac\nexit 0",
+            "lang": "no-force-push.sh"
+          },
+          {
+            "code": "[[hooks.hooks]]\nname = \"no-force-push\"\nevent = \"tool_call_before\"\ncommand = \"~/.codewhale/hooks/no-force-push.sh\"\ncondition = { type = \"tool_name\", name = \"bash\" }",
+            "lang": "config.toml"
+          },
+          {
+            "p": "The hook reads the call from environment variables and answers with JSON on standard output: `allow`, `deny`, or `ask`, plus an optional `reason`, a rewritten input (`updatedInput`), or extra context for the model (`additionalContext`). Exit code 2 always denies. When several hooks answer, deny beats ask, and ask beats allow."
+          },
+          {
+            "note": "`ask` forces a prompt in Ask and Auto-Review. Full Access never shows approval prompts, so there `ask` does not add one."
+          }
+        ]
+      },
+      {
+        "id": "events",
+        "title": "Choose the moment",
+        "blocks": [
+          {
+            "p": "Three events can change what happens next. The rest only observe; their output is ignored and a failure is a warning."
+          },
+          {
+            "rows": [
+              [
+                "message_submit",
+                "Before your message reaches the model. Can replace the text or block it."
+              ],
+              [
+                "tool_call_before",
+                "Before each tool call. Can allow, deny, ask, rewrite the input, or add context."
+              ],
+              [
+                "shell_env",
+                "Before each shell command. Can add environment variables."
+              ],
+              [
+                "session_start / session_end",
+                "When a session opens or closes cleanly."
+              ],
+              [
+                "turn_end",
+                "After a turn finishes, with its status, duration, and token usage."
+              ],
+              [
+                "tool_call_after",
+                "After each tool result, with its exit code when there is one."
+              ],
+              [
+                "waiting_for_user",
+                "When Codewhale starts waiting for an approval, an answer, or a paused goal."
+              ],
+              [
+                "session_idle / session_busy",
+                "When the session settles or starts working again."
+              ],
+              [
+                "session_error / on_error",
+                "When a turn fails for good, or on any error or failed tool."
+              ],
+              [
+                "mode_change",
+                "When you switch between Plan, Work, and Operate."
+              ],
+              [
+                "subagent_spawn / subagent_complete",
+                "When a sub-agent starts or finishes."
+              ]
+            ],
+            "codeTerms": true
+          },
+          {
+            "p": "A `condition` narrows when a hook fires: by tool name (with `*` globs), tool category, mode, or exit code, and combinations with `all` and `any`. A condition that can never match its event is rejected when the config loads, so a gate you think is armed never sits silently inert."
+          }
+        ]
+      },
+      {
+        "id": "options",
+        "title": "Set timeouts and failure behavior",
+        "blocks": [
+          {
+            "rows": [
+              [
+                "timeout_secs",
+                "How long the hook may run. Default 30."
+              ],
+              [
+                "continue_on_error",
+                "`true` (default): a failing hook only warns. `false`: the failure blocks."
+              ],
+              [
+                "background",
+                "`true` runs the hook as an observer only; it cannot block or rewrite."
+              ],
+              [
+                "working_dir",
+                "Under `[hooks]`: where hooks run. Default: the session's workspace."
+              ]
+            ],
+            "codeTerms": true
+          },
+          {
+            "note": "`[hooks] default_timeout_secs` replaces every hook's own `timeout_secs`, not just the missing ones. Leave it unset if you want per-hook timeouts."
+          }
+        ]
+      },
+      {
+        "id": "project",
+        "title": "Use hooks a repository ships",
+        "blocks": [
+          {
+            "p": "A repository can include hooks in `.codewhale/hooks.toml`. Because they run commands on your machine, they load only after you trust the workspace and approve that exact file:"
+          },
+          {
+            "code": "/hooks review\n/hooks approve <digest>\n/hooks revoke",
+            "lang": "Codewhale"
+          },
+          {
+            "p": "`/hooks review` shows the commands and a digest of the file; approving that digest enables those exact bytes from the next session. Any change to the file needs a new approval. Review the scripts the commands call, too."
+          }
+        ]
+      },
+      {
+        "id": "headless",
+        "title": "Use hooks in scripts and CI",
+        "blocks": [
+          {
+            "p": "Hooks run in the interactive session. `codewhale exec` fires none by default; add `--hooks` to fire `tool_call_before` and `shell_env`. With no one to answer, an `ask` becomes a deny."
+          },
+          {
+            "code": "codewhale exec --auto --hooks \"run the test suite and fix the first failure\"",
+            "lang": "Terminal"
+          }
+        ]
+      }
     ],
-    "projectTitle": "Project-local hooks",
-    "projectLead": "Repositories can ship policy in <workspace>/.codewhale/hooks.toml. Because project hooks are executable shell configuration, Codewhale loads them only after the workspace is trusted through the trust prompt or a trust_level = \"trusted\" entry in user-owned config — session /trust on and legacy .deepseek/trusted markers do not enable project hooks by themselves. Once trusted, project hooks are appended after the global hooks from config.toml, so they run last and win updatedInput ties. A malformed trusted project file logs a warning and startup falls back to global hooks only.",
-    "sourceNote": "Source documents: docs/rfcs/1364-hooks-lifecycle.md (design RFC), docs/CONFIGURATION.md (configuration schema) · Update docs-map.ts when changing."
+    "next": [
+      {
+        "href": "/docs/modes",
+        "label": "Set modes and approvals",
+        "note": "How hook decisions combine with Ask, Auto-Review, and Full Access."
+      },
+      {
+        "href": "/docs/mcp",
+        "label": "Connect tools with MCP",
+        "note": "Gate MCP tools with the same `tool_call_before` hooks."
+      },
+      {
+        "href": "/docs/configuration",
+        "label": "Change settings",
+        "note": "Where `config.toml` lives and what a project may override."
+      }
+    ],
+    "sourceNote": "Source documents: docs/HOOKS.md (authoritative), docs/CONFIGURATION.md · Update docs-map.ts when changing."
   },
   "docs-troubleshooting": {
-    "metaTitle": "Troubleshooting · Codewhale Docs",
-    "metaDescription": "Quick triage for common issues: hung turns, the offline queue, crash recovery, schema errors, MCP failures, and Docker notes.",
+    "metaTitle": "Fix a problem · Codewhale Docs",
+    "metaDescription": "Diagnose Codewhale in one command, then fix the common problems: command not found, no reply, a rejected key, network errors, a stuck turn, a session that will not resume, and MCP servers.",
     "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewTitle": "Troubleshooting",
-    "overviewLead": "Start with quick triage: confirm the binary and config (codewhale --version, ~/.codewhale/config.toml), enable verbose logs with RUST_LOG=codewhale_tui=debug when needed (RUST_LOG=codewhale_tui::client=debug for HTTP retries/reconnects; logs land in ~/.codewhale/logs/), and capture the current state of ~/.codewhale/sessions and ~/.codewhale/tasks.",
-    "incidents": [
-      [
-        "Turn hangs or the stream stops",
-        "If a foreground shell command is still running, press Ctrl+B to move it to the background (the turn keeps running and the command becomes a background job under /jobs); use Esc or Ctrl+C to cancel the turn itself. Inspect codewhale_tui::client retry logs and endpoint connectivity, and after a restart confirm the previously in-flight turn shows as interrupted rather than running."
-      ],
-      [
-        "Network outage / offline behavior",
-        "New prompts queue while offline, persisted per session to ~/.codewhale/sessions/checkpoints/<session-id>.offline_queue.json (a legacy global offline_queue.json is adopted once on upgrade). Inspect with /queue list, restore connectivity, then re-send queued entries (/queue edit <n> plus Enter, or the normal input flow); the queue file clears when the queue empties."
-      ],
-      [
-        "Crash recovery",
-        "Each session checkpoints to ~/.codewhale/sessions/checkpoints/<session-id>.json (a legacy latest.json is still read but no longer written); startup begins a fresh session unless --resume/--continue is supplied. Resume explicitly with codewhale --resume <id> or Ctrl+R in the TUI; if the checkpoint schema is newer than the binary supports, upgrade the binary or remove the stale checkpoint."
-      ],
-      [
-        "Persistent state schema errors",
-        "Errors like schema vX is newer than supported vY affect sessions, runtime thread/turn/item records, and tasks. Confirm the binary version, back up the state directory before editing, then either run a newer compatible binary or archive the incompatible records and regenerate state."
-      ],
-      [
-        "MCP / tool execution failures",
-        "Validate the ~/.codewhale/mcp.json schema and server command paths, confirm the server process starts manually, and check sandbox denials in TUI history/logs. Use /mcp validate for diagnostics, temporarily disable a failing server to isolate the issue, and re-enable after verification."
-      ]
+    "title": "Fix a problem",
+    "lede": "Start with one diagnostic command, then find your symptom below. Each fix names the exact message you will see.",
+    "sections": [
+      {
+        "id": "diagnose",
+        "title": "Run the diagnostics",
+        "blocks": [
+          {
+            "code": "codewhale --version\ncodewhale doctor\ncodewhale doctor --probe-api                  # one real test call to your provider\ncodewhale auth status --provider deepseek     # which key is in use",
+            "lang": "Terminal"
+          },
+          {
+            "p": "`codewhale doctor --json` produces a diagnostics bundle without secrets, ready to attach to an issue. Plain `doctor` does not tell you which key is active and exits successfully even with no key; use `auth status` for that."
+          }
+        ]
+      },
+      {
+        "id": "install",
+        "title": "Install and update",
+        "blocks": [
+          {
+            "rows": [
+              [
+                "`codewhale: command not found`",
+                "`~/.local/bin` is not on your PATH in this terminal. Add `export PATH=\"$HOME/.local/bin:$PATH\"` to your shell profile and open a new terminal."
+              ],
+              [
+                "`npm error code EACCES`",
+                "Your Node install is owned by the system. Do not use sudo: point npm at a folder you own with `npm config set prefix \"$HOME/.npm-global\"`, add its `bin` to your PATH, and install again."
+              ],
+              [
+                "`refusing to replace existing ~/.local/bin/codewhale`",
+                "A different version is already there. Run `codewhale update`, or remove the old binaries first."
+              ],
+              [
+                "`checksum mismatch`",
+                "The download was corrupted or altered, and nothing was installed. Try again; if it repeats, do not use a mirror."
+              ],
+              [
+                "`The package-managed executable was not changed.`",
+                "You installed with npm, Cargo, or Homebrew. Update with that tool, for example `npm install -g codewhale`."
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "id": "model",
+        "title": "No reply, or the key is rejected",
+        "blocks": [
+          {
+            "rows": [
+              [
+                "Your message appears but nothing answers",
+                "No key is configured, and v0.10.0 does not warn you. Press F3, choose your provider, and paste the key."
+              ],
+              [
+                "`API key not found`",
+                "No key anywhere. Save one with `codewhale auth set --provider <name>`."
+              ],
+              [
+                "`Authentication Fails … is invalid`",
+                "The key is wrong or revoked. Run `auth status` to see which source is used — a saved key beats an environment variable — then save the right key or `codewhale auth clear --provider <name>`."
+              ],
+              [
+                "`Network error: SSE stream request failed …`",
+                "Usually no connection to the provider. Check with `curl -sI https://api.deepseek.com` (a 401 means it is reachable). Behind a proxy, export `HTTPS_PROXY`. On Windows or strict proxies, try `CODEWHALE_FORCE_HTTP1=1`."
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "id": "turn",
+        "title": "A turn is stuck",
+        "blocks": [
+          {
+            "list": [
+              "Press Esc to cancel the turn. Esc also closes menus first, so press it again if a menu was open.",
+              "If a long shell command is holding the turn, press Ctrl-B to move it into the background. The turn continues, and `/jobs` shows the command.",
+              "`/retry` sends the last request again."
+            ]
+          },
+          {
+            "p": "For a detailed record, start Codewhale with `RUST_LOG=codewhale_tui=debug` (or `RUST_LOG=codewhale_tui::client=debug` for connection retries). Logs are written to `~/.codewhale/logs/`."
+          }
+        ]
+      },
+      {
+        "id": "sessions",
+        "title": "Resume a session",
+        "blocks": [
+          {
+            "code": "codewhale sessions            # list saved sessions\ncodewhale resume <id>         # an id or a unique prefix\ncodewhale -c                  # the latest session in this folder",
+            "lang": "Terminal"
+          },
+          {
+            "p": "Inside Codewhale, Ctrl-R opens the session picker. `No saved sessions found for workspace` after `codewhale exec --continue` means the earlier run was a plain `exec`, which is not saved; use `--output-format stream-json` for runs you want to continue."
+          },
+          {
+            "p": "Messages you send while offline wait in a queue, saved with the session. `/queue list` shows them. When the connection is back, open one with `/queue edit <n>` and press Enter to send it."
+          }
+        ]
+      },
+      {
+        "id": "mcp",
+        "title": "MCP tools are missing",
+        "blocks": [
+          {
+            "list": [
+              "After changing `mcp.json` or a server's credentials, run `/mcp reload`. `/mcp validate` only refreshes what you see.",
+              "Run the server's command yourself in a shell to confirm it starts.",
+              "If the config file is missing or broken, `codewhale mcp init --force` writes a fresh one."
+            ]
+          }
+        ]
+      },
+      {
+        "id": "docker",
+        "title": "Run in Docker",
+        "blocks": [
+          {
+            "code": "docker volume create codewhale-home\ndocker run --rm -it \\\n  -e DEEPSEEK_API_KEY=\"$DEEPSEEK_API_KEY\" \\\n  -v codewhale-home:/home/codewhale/.codewhale \\\n  -v \"$PWD:/workspace\" -w /workspace \\\n  ghcr.io/hmbown/codewhale:latest",
+            "lang": "Terminal"
+          },
+          {
+            "p": "The image runs as a non-root user and keeps your settings and sessions in the named volume. Pin a release tag instead of `latest` for repeatable setups, use one volume per project, and never bake keys into an image."
+          }
+        ]
+      }
     ],
-    "dockerTitle": "Docker notes",
-    "dockerLead": "Each release publishes a multi-arch Linux image to GitHub Container Registry. The default image is a conservative runtime image: it runs as the non-root codewhale user (UID/GID 1000:1000), grants no passwordless sudo, and keeps user state in a volume mounted at /home/codewhale/.codewhale. Pin a release tag instead of latest for reproducible installs.",
-    "dockerToolboxNote": "When a project needs apt-get, compiler toolchains, or package managers inside the container, do not change the default image contract — build an explicit toolbox image from docs/examples/Dockerfile.toolbox, and use one named state volume per project so sessions, config, and the offline queue do not bleed across workspaces. Never bake API keys or SSH private keys into custom images.",
-    "sourceNote": "Source documents: docs/OPERATIONS_RUNBOOK.md, docs/DOCKER.md · Update docs-map.ts when changing."
+    "next": [
+      {
+        "href": "/docs/auth",
+        "label": "Connect a provider",
+        "note": "Save a key, check which one is used, or switch to a local model."
+      },
+      {
+        "href": "/install",
+        "label": "Install Codewhale",
+        "note": "Every install method, with the output each step should print."
+      },
+      {
+        "href": "/docs/review",
+        "label": "Review what changed",
+        "note": "Roll files back to the snapshot before a turn went wrong."
+      }
+    ],
+    "sourceNote": "Source documents: docs/INSTALL.md §13, docs/OPERATIONS_RUNBOOK.md, docs/DOCKER.md · Update docs-map.ts when changing."
   },
   "docs-configuration": {
-    "metaTitle": "Configuration · Codewhale Docs",
-    "metaDescription": "Where config.toml is read from, the per-project overlay, credential precedence, and legacy path migration.",
+    "metaTitle": "Change settings · Codewhale Docs",
+    "metaDescription": "Find Codewhale's config file, change a setting from the session or the shell, try one for a single run, and see what a repository is allowed to override.",
     "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewTitle": "Configuration",
-    "overviewLead": "Codewhale reads its configuration from ~/.codewhale/config.toml (the legacy ~/.deepseek/config.toml is still read as a fallback). The --config flag and the CODEWHALE_CONFIG_PATH environment variable can point elsewhere; --config wins when both are set, and environment variable overrides are applied after the file is loaded.",
-    "auditLead": "Inside the TUI, {auditCommand} shows which documented keys can change in the current session, which can also be persisted, and which stay file-only or restart-only — treat its “Command / reason” column as the source of truth before editing by hand.",
-    "overlayTitle": "Per-project overlay",
-    "overlayLead": "When a workspace contains a regular-file <workspace>/.codewhale/config.toml, the safe values it declares are merged on top of the global config (legacy <workspace>/.deepseek/config.toml files are still read when the Codewhale path is absent; symlinked project configs are rejected). This lets a repository suggest a model or tighten the local safety posture without touching the user's global config. Pass --no-project-config to skip the overlay for one launch.",
-    "overlayLimits": "The overlay is intentionally narrow: it supports model, reasoning_effort, approval_policy and sandbox_mode (tightening values only), notes_path, max_subagents (clamped to 1..=128), and allow_shell (false applies, true is ignored). Credentials, endpoints, provider selection, MCP config, hooks, skills, and instructions = [...] stay user-global — a repo-local config.toml that declares api_key, base_url, or provider is ignored, so a cloned repository cannot pick arbitrary local files into the prompt.",
-    "credentialsTitle": "Credential lookup",
-    "credentialsLead": "For the active provider, the API key resolves in this order, first match wins: the route's own auth contract (OAuth routes use their consented token; auth_mode = \"none\" sends no key), then an explicit {apiKey}, then the config file api_key, then an api_key_env binding, then the secret store written by codewhale auth set (a file under ~/.codewhale/secrets/ by default; the OS keyring only when CODEWHALE_SECRET_BACKEND=system), then the provider's own environment variable, which is only sent to that provider's official endpoint. {authStatus} inspects the active provider's config file, secret-store backend, environment variable, winning source, and last-four label without printing the key itself. Hosted, generic OpenAI-compatible, self-hosted, or native Anthropic routes are selected with {providerConfig} or {providerFlag}; the full registry lives on the Models & providers page and in docs/PROVIDERS.md.",
-    "legacyTitle": "Legacy .deepseek/ paths",
-    "legacyLead": "Codewhale was renamed from DeepSeek-TUI. To avoid breaking existing installs, the runtime reads state from the new ~/.codewhale/ location but falls back to ~/.deepseek/ when only the legacy directory exists, and always writes to ~/.codewhale/ — read-with-fallback, write-to-new. State-dir resolution is consolidated in resolve_state_dir / ensure_state_dir in crates/config/src/lib.rs, and every legacy path reference carries an audited keep decision.",
+    "title": "Change settings",
+    "lede": "Most settings can be changed without opening a file: from the session with `/config`, or from the shell with `codewhale config`. This page shows where settings live, how to change them, and what a repository can and cannot change for you.",
+    "sections": [
+      {
+        "id": "file",
+        "title": "Find the config file",
+        "blocks": [
+          {
+            "p": "Your settings live in `~/.codewhale/config.toml`. Print the exact path, or open the file in your editor:"
+          },
+          {
+            "code": "codewhale config path\ncodewhale config edit",
+            "lang": "Terminal"
+          },
+          {
+            "p": "To use a different file, pass `--config <path>` or set `CODEWHALE_CONFIG_PATH`; the flag wins when both are set. Codewhale was once called DeepSeek-TUI: if only an old `~/.deepseek/` folder exists, it is still read, and new settings are always written to `~/.codewhale/`."
+          }
+        ]
+      },
+      {
+        "id": "change",
+        "title": "Change a setting",
+        "blocks": [
+          {
+            "p": "Inside a session, `/config` opens the settings editor and `/settings` opens the settings screen. `/config audit` lists which settings can change in this session, which can be saved, and which only take effect after a restart — check it before editing by hand."
+          },
+          {
+            "p": "From the shell:"
+          },
+          {
+            "code": "codewhale config get tools\ncodewhale config set telemetry false\ncodewhale config unset telemetry\ncodewhale config dump       # the settings in effect, secrets redacted\ncodewhale config doctor     # unknown keys, empty secrets, malformed URLs",
+            "lang": "Terminal"
+          },
+          {
+            "p": "`config set` handles its named keys; for anything else it tells you which TOML table to edit instead of guessing."
+          }
+        ]
+      },
+      {
+        "id": "one-run",
+        "title": "Try a setting for one run",
+        "blocks": [
+          {
+            "p": "`--set KEY=VALUE` changes a setting for one launch and saves nothing. It accepts `provider`, `model`, `verbosity`, `approval_policy`, `sandbox_mode`, and `telemetry`, and can be repeated."
+          },
+          {
+            "code": "codewhale --set model=deepseek-v4-pro --set sandbox_mode=read-only",
+            "lang": "Terminal"
+          }
+        ]
+      },
+      {
+        "id": "project",
+        "title": "Share settings with a repository",
+        "blocks": [
+          {
+            "p": "A repository can include `.codewhale/config.toml` to suggest settings to everyone who works in it. Only a few keys are honored, and safety settings can only get stricter:"
+          },
+          {
+            "rows": [
+              [
+                "model",
+                "The default model for this repository."
+              ],
+              [
+                "reasoning_effort",
+                "For example `\"high\"` for a complex codebase."
+              ],
+              [
+                "approval_policy, sandbox_mode",
+                "Only values stricter than yours."
+              ],
+              [
+                "allow_shell",
+                "`false` turns shell commands off; `true` is ignored."
+              ],
+              [
+                "max_subagents",
+                "Fewer parallel sub-agents, from 1 to 128."
+              ],
+              [
+                "notes_path",
+                "Keep notes in the repository."
+              ]
+            ],
+            "codeTerms": true
+          },
+          {
+            "p": "Keys, endpoints, provider choice, MCP servers, hooks, skills, and extra instruction files always come from your own config, so a cloned repository cannot point Codewhale at its own server or files. Start with `--no-project-config` to ignore a repository's file for one launch."
+          },
+          {
+            "p": "Project instructions — how an agent should work in this repository — belong in `AGENTS.md` instead. Run `/init` to create one."
+          }
+        ]
+      }
+    ],
+    "next": [
+      {
+        "href": "/docs/auth",
+        "label": "Connect a provider",
+        "note": "Save a key and see which one Codewhale is using."
+      },
+      {
+        "href": "/docs/modes",
+        "label": "Set modes and approvals",
+        "note": "The settings most people change first."
+      },
+      {
+        "href": "/docs/hooks",
+        "label": "Run commands on events",
+        "note": "Add your own scripts to the `[hooks]` table."
+      }
+    ],
     "sourceNote": "Source documents: docs/CONFIGURATION.md, docs/LEGACY_PATHS.md · Update docs-map.ts when changing."
   },
-  "docs-constitution": {
-    "metaTitle": "Constitution and /constitution · Codewhale Docs",
-    "metaDescription": "User-global constitution, repo-local law, project instructions, and runtime boundaries.",
-    "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewTitle": "Constitution and /constitution",
-    "overviewTitleAside": "宪章与 /constitution",
-    "overviewLead": "Codewhale gives the agent an accountable address, then a legal system for context conflicts. {constitutionCommand} is the primary personal constitution surface: guided setup stores structured user-global data in {homeConfig} and renders it as model-facing prose. Repos can still add local law via {repoConfig}; runtime policy separately encodes modes, approval, sandbox, cost, and tool boundaries.",
-    "principles": [
-      [
-        "userGlobal",
-        "Use /constitution for standing personal law across projects. It is structured data rendered to prose, not a raw prompt editor."
-      ],
-      [
-        "repoLocal",
-        ".codewhale/constitution.json is optional project policy for protected invariants, branch rules, verification, and escalation."
-      ],
-      [
-        "runtime",
-        "Constitution text may express preferences, but approval, sandbox, shell, network, trust, and MCP permissions remain enforced config."
-      ]
-    ],
-    "authorityNote": "Standard project instructions still live in AGENTS.md; memory and handoffs rank below constitutions and project instructions; the full base-prompt Markdown override is an expert escape hatch, not the normal setup path. See {configDocs}.",
-    "configDocsLabel": "configuration docs",
-    "sourceNote": "Source document: docs/ARCHITECTURE.md · Update docs-map.ts when changing."
-  },
   "docs-fleet": {
-    "metaTitle": "Fleet & Workflow · Codewhale Docs",
-    "metaDescription": "The durable Agent roster and member-selection layer, plus the optional Workflow orchestration overlay.",
+    "metaTitle": "Run a workflow · Codewhale Docs",
+    "metaDescription": "Save roles and models in a Fleet, write a repeatable Workflow, run it as a Lane you can watch and stop, and run batches of tasks with durable workers.",
     "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewTitle": "Fleet & Workflow",
-    "overviewLead": "Fleet is the durable roster: who is available and which member is selected. It is not an execution or authority engine. Runtime launches and tracks the selected member as a headless codewhale exec run, owns retry and remote placement, and writes the durable receipts and ledger projection. The ledger file, saved rosters, config tables, and the workflow --fleet flag share the Fleet name.",
-    "runTitle": "Run a fleet",
-    "runLead": "The Runtime's fleet-run projection lives in the workspace's .codewhale/fleet.jsonl ledger, with worker logs under .codewhale/fleet/. codewhale fleet resume <run-id> asks Runtime to replay the ledger and reconcile stale leases; it is idempotent after a manager exit, laptop sleep, or runtime restart.",
-    "statusLead": "The TUI command {fleetStatusTui} and the shell command {fleetStatusShell} read the same durable fleet ledger. Use {fleetWorkers} (or {subagents}) for the sub-agents attached only to the current interactive session.",
-    "profilesTitle": "Saved fleets, roles, and /fleet setup",
-    "profilesLead": "{fleetSaved} opens the picker for named saved fleets; bare /fleet opens the selected fleet's member roster. In v0.9.11, /fleet setup edits the selected named fleet. With no named fleet selected, it opens profile setup: choose a role and model, adjust optional thinking settings, then review before saving. Profiles live in project scope (.codewhale/agents/<role>.toml) or personal scope ($CODEWHALE_HOME/agents/<role>.toml); a same-id project profile wins. Runtime separately owns trust, filesystem/network reach, secrets, approvals, sandboxing, and tools, so profile storage scope never widens execution authority.",
-    "workflowTitle": "Workflow orchestration",
-    "workflowLead": "Ordinary multi-agent work does not need Workflow: send normal messages in Operate and let Codewhale prefer background workers when parallelism, isolation, or duration makes delegation useful. Use Workflow when ordered phases, gates, shared budgets, replay, or deterministic fan-in matter. A Workflow script coordinates only: it selects fleet members but has no filesystem or shell; Runtime launches the real workers under live authority policy. Scripts use a declarative compile-only JS subset that lowers to a typed WorkflowSpec validated and executed by Rust; import, fetch, process, eval, and async/await are rejected.",
-    "workflowLimits": "Default validation bounds: up to 1,000 worker agents per Workflow run, Workflow IR structural nesting no deeper than 5, loops must declare max_iterations, and dynamic expand nodes must declare max_children plus a template. Runtime child delegation is a separate execution budget: it defaults to 3 levels and has an opt-in hard ceiling of 8. These are population and shape limits, not launch concurrency: Runtime admits at most 16 live workers for one run and queues the rest. Omitted or zero max_steps stays unbounded; only a positive value adds a model-turn ceiling.",
-    "sourceNote": "Source documents: docs/FLEET.md, docs/WORKFLOW_AUTHORING.md · Update docs-map.ts when changing."
+    "title": "Run a workflow",
+    "lede": "For most multi-step work you only need to ask: in Operate, Codewhale plans the steps and runs independent ones in parallel. Write a Workflow when you want the same ordered plan every time — phases, parallel branches, and a summary — with a record of each run.",
+    "sections": [
+      {
+        "id": "fleet",
+        "title": "Save roles in a Fleet",
+        "blocks": [
+          {
+            "p": "Your Fleet is the list of roles Codewhale can hand work to, and the model each role uses. Set it up once inside a session:"
+          },
+          {
+            "code": "/fleet setup\n/fleet\n/fleet saved",
+            "lang": "Codewhale"
+          },
+          {
+            "p": "`/fleet setup` walks you through a role, its model (or “use the session's model”), and where to save it: this project, or your personal profile for every repository. You review the exact file before it is written. `/fleet` shows the members of the selected Fleet, and `/fleet saved` switches between named Fleets."
+          },
+          {
+            "p": "A Fleet only chooses who does the work. What a worker may read, write, or run still comes from your workspace trust, [approval setting](/docs/modes), and sandbox."
+          }
+        ]
+      },
+      {
+        "id": "write",
+        "title": "Write a workflow",
+        "blocks": [
+          {
+            "p": "A Workflow is a JavaScript file in your repository's `workflows/` folder. It describes steps; it does not do the work itself. This one reviews two areas in parallel, then combines the findings. Save it as `workflows/docs_readiness.workflow.js`:"
+          },
+          {
+            "code": "export default workflow({\n  \"id\": \"docs-readiness\",\n  \"goal\": \"Review the docs and code for gaps, then summarize the next edit\",\n  \"nodes\": [\n    {\n      \"branch\": {\n        \"id\": \"parallel-review\",\n        \"parallel\": true,\n        \"children\": [\n          { \"agent\": { \"id\": \"code-review\", \"prompt\": \"Inspect src/ for undocumented behavior.\",\n                       \"agent_type\": \"review\", \"mode\": \"read_only\", \"file_scope\": [\"src\"] } },\n          { \"agent\": { \"id\": \"docs-review\", \"prompt\": \"Inspect docs/ for stale or missing steps.\",\n                       \"agent_type\": \"review\", \"mode\": \"read_only\", \"file_scope\": [\"docs\"] } }\n        ]\n      }\n    },\n    {\n      \"reduce\": {\n        \"id\": \"summary\",\n        \"inputs\": [\"code-review\", \"docs-review\"],\n        \"prompt\": \"Combine the findings into the safest next edit.\"\n      }\n    }\n  ]\n});",
+            "lang": "workflows/docs_readiness.workflow.js"
+          },
+          {
+            "p": "Steps can be `agent`, `branch`, `sequence`, `reduce`, `loop_until`, `cond`, `expand`, and `teacher_review`. A workflow file has no file, shell, or network access of its own, and `import`, `fetch`, `eval`, and `async` are rejected. The agents it starts do the real work, under your normal permissions."
+          },
+          {
+            "note": "One run can start up to 1,000 agents, with at most 16 working at once; the rest wait for a slot. Loops must declare `max_iterations`."
+          }
+        ]
+      },
+      {
+        "id": "run",
+        "title": "Run it",
+        "blocks": [
+          {
+            "code": "codewhale workflow run docs-readiness --runtime inline\ncodewhale workflow run docs-readiness --goal \"prepare the 1.2 release\" --verify",
+            "lang": "Terminal"
+          },
+          {
+            "p": "Codewhale finds `workflows/docs_readiness.workflow.js` from the name, checks it, and starts it. `--runtime inline` runs it in this terminal. The default, `tmux`, runs it in a detached tmux session that keeps going after you close the terminal. `--verify` runs the verification gates after a successful finish, and `--fleet <name>` uses a named Fleet instead of the built-in roles."
+          },
+          {
+            "p": "To keep the work off your checkout, add `--worktree-repo . --branch <name>`: the run gets its own git worktree and branch."
+          },
+          {
+            "p": "Inside a session, `/workflow` starts a workflow and `/workflows` lists or cancels the runs in that session."
+          }
+        ]
+      },
+      {
+        "id": "watch",
+        "title": "Watch and stop a run",
+        "blocks": [
+          {
+            "p": "Each run is a Lane. Lanes are saved to disk, so you can check on them from any terminal:"
+          },
+          {
+            "code": "codewhale lane list\ncodewhale lane status <lane-id>\ncodewhale lane logs <lane-id>\ncodewhale lane attach <lane-id>\ncodewhale lane interrupt <lane-id>",
+            "lang": "Terminal"
+          },
+          {
+            "p": "`lane list`, `lane status`, and `lane interrupt` accept `--json` and print a machine-readable receipt. In a session, `/lane` offers the same controls with the same results."
+          }
+        ]
+      },
+      {
+        "id": "batch",
+        "title": "Run a batch of tasks",
+        "blocks": [
+          {
+            "p": "When you have a list of separate tasks rather than one plan, write them as a task file and run them as a Fleet run. Each task names its goal, its role, and the paths it may write. [The tutorial](https://github.com/Hmbown/CodeWhale/blob/main/docs/FLEET_WORKFLOW_TUTORIAL.md) has a complete `tasks.json`."
+          },
+          {
+            "code": "codewhale fleet init\ncodewhale fleet run tasks.json --max-workers 4\ncodewhale fleet status\ncodewhale fleet logs <worker-id>\ncodewhale fleet resume <run-id>\ncodewhale fleet stop --all",
+            "lang": "Terminal"
+          },
+          {
+            "p": "`fleet status` counts queued, running, finished, and failed work from this workspace's run record. `fleet resume` picks a run back up after the laptop slept or the manager exited, without starting a new one. For the agents attached to your current session only, use `/fleet workers` (or `/subagents`)."
+          }
+        ]
+      }
+    ],
+    "next": [
+      {
+        "href": "/docs/subagents",
+        "label": "Run agents in parallel",
+        "note": "Hand independent pieces of one task to sub-agents without writing a workflow."
+      },
+      {
+        "href": "/docs/review",
+        "label": "Review what changed",
+        "note": "Check the diff a run produced and get a review before you push."
+      },
+      {
+        "href": "/docs/vocabulary",
+        "label": "Product terms",
+        "note": "Fleet, Workflow, Lane, and Runtime, each in one sentence."
+      }
+    ],
+    "sourceNote": "Source documents: docs/FLEET.md, docs/FLEET_WORKFLOW_TUTORIAL.md, docs/WORKFLOW_AUTHORING.md · Update docs-map.ts when changing."
   },
   "docs-mcp": {
-    "metaTitle": "MCP · Codewhale Docs",
-    "metaDescription": "Consume external tool servers over the Model Context Protocol, or expose Codewhale itself as an MCP server.",
+    "metaTitle": "Connect tools with MCP · Codewhale Docs",
+    "metaDescription": "Add Model Context Protocol servers so Codewhale can use more tools, sign in to remote servers, run Codewhale itself as an MCP server, and try code mode.",
     "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewLead": "Codewhale can load additional tools via MCP (Model Context Protocol). MCP servers can be local stdio processes that the TUI starts, or remote URL-based servers that speak Streamable HTTP with legacy SSE fallback. A successfully connected server registers its tools into the model catalog; a failed or disabled server is never presented as an available tool.",
-    "overviewConfig": "The config file defaults to {configPath} (the legacy {legacyConfigPath} is still read when the Codewhale file is absent), overridable with {configPathOption} or {configEnvVar}. The {serversKey} key used by other clients is accepted too.",
-    "setupTitle": "Setup and management",
-    "setupLead": "Bootstrap a starter config with {initCommand}; inside the TUI, {mcpCommand} opens a compact manager showing each server's enabled state, transport, command or URL, timeouts, and connection errors. Common commands:",
-    "setupReload": "Config edits made from the TUI are written immediately, but the model-visible MCP tool pool is not hot-reloaded — the manager marks it restart-required. /mcp validate and /mcp reload reconnect to refresh the on-screen snapshot.",
-    "authTitle": "Remote authentication",
-    "authLead": "URL-based servers can use static headers, env-derived env_headers, bearer_token_env_var, or OAuth. Precedence is conservative: headers and env_headers apply first; bearer_token_env_var adds an Authorization header only when one is not already set; OAuth login tokens likewise never override an explicit header. Avoid committing literal Authorization headers — prefer env_headers, bearer_token_env_var, or OAuth login so secrets stay outside the MCP file.",
-    "toolsTitle": "Tool naming and safety",
-    "toolsLead": "Discovered MCP tools are exposed to the model as {toolNamePattern} — a server named {gitServer} with a {statusTool} tool becomes {gitStatusTool}. MCP tools flow through the same approval framework as built-in tools: read-only MCP helpers can run without prompts when policy permits, side-effectful MCP tools require approval, and Full Access does not bypass hard policy holds.",
-    "toolsTrust": "Only configure MCP servers you trust, and treat MCP server configuration as equivalent to running code on your machine. Reviewed local plugin bundles can also contribute MCP servers: they reuse the same MCP manager, approval, and network-policy paths, appear under namespaced <plugin>-<server> identities, and are held to a stricter boundary than hand-written mcp.json.",
-    "serverTitle": "Codewhale as an MCP server",
-    "serverLead": "{serveMcp} runs Codewhale as an stdio MCP server so other sessions (or any MCP client) can call its tools; {mcpServerCommand} is the equivalent dispatcher entrypoint. {addSelfCommand} resolves the current binary path and writes the server into your MCP config. Keep the modes distinct: {serveHttp} is the runtime HTTP/SSE API, a separate surface.",
-    "sourceNote": "Source document: docs/MCP.md · Update docs-map.ts when changing."
+    "title": "Connect tools with MCP",
+    "lede": "MCP servers give Codewhale more tools — a database, an issue tracker, a browser. Add a local server that Codewhale starts for you, or a remote server by URL. Its tools then go through the same approvals as built-in ones.",
+    "sections": [
+      {
+        "id": "add",
+        "title": "Add a server",
+        "blocks": [
+          {
+            "code": "codewhale mcp add git --command \"uvx\" --arg \"mcp-server-git\"\ncodewhale mcp add docs --url \"https://example.com/mcp\"\ncodewhale mcp list\ncodewhale mcp validate",
+            "lang": "Terminal"
+          },
+          {
+            "p": "`--command` starts a local server over stdio; repeat `--arg` for each argument. `--url` connects to a remote server over Streamable HTTP, with legacy SSE as a fallback. `mcp validate` checks the config and the servers you require."
+          },
+          {
+            "p": "Inside a session, `/mcp` opens the MCP manager: each server's state, transport, timeouts, errors, and discovered tools. The same actions are available there, for example `/mcp add stdio <name> <command>` and `/mcp add http <name> <url>`."
+          },
+          {
+            "note": "An MCP server runs with your permissions. Add only servers you trust, as you would any program you install."
+          }
+        ]
+      },
+      {
+        "id": "remote-auth",
+        "title": "Sign in to a remote server",
+        "blocks": [
+          {
+            "p": "For a server that uses OAuth, add it by URL and log in. For a bearer token, keep the token in an environment variable instead of the config file:"
+          },
+          {
+            "code": "codewhale mcp login docs\ncodewhale mcp add tracker --url \"https://example.com/mcp\" --bearer-token-env-var TRACKER_TOKEN",
+            "lang": "Terminal"
+          },
+          {
+            "p": "An explicit Authorization header always wins: headers from config apply first, then the bearer-token variable, then a stored OAuth login. `codewhale mcp logout <name>` removes the stored login on this machine; the provider may keep its own grant until you revoke it there."
+          }
+        ]
+      },
+      {
+        "id": "config",
+        "title": "Edit the config file",
+        "blocks": [
+          {
+            "p": "Servers live in `~/.codewhale/mcp.json`. `codewhale mcp init` writes a starter file. The `mcpServers` key used by other clients works too, so you can paste an existing entry."
+          },
+          {
+            "code": "{\n  \"servers\": {\n    \"example\": {\n      \"command\": \"node\",\n      \"args\": [\"./path/to/your-mcp-server.js\"],\n      \"env\": {},\n      \"disabled\": false\n    }\n  }\n}",
+            "lang": "mcp.json"
+          },
+          {
+            "p": "After editing the file, run `/mcp reload` in the session; no restart is needed. A server starts only when a turn needs one of its tools, unless you mark it `\"required\": true` to connect at startup."
+          }
+        ]
+      },
+      {
+        "id": "tool-names",
+        "title": "Find the tools",
+        "blocks": [
+          {
+            "p": "Each tool appears to the model as `mcp_<server>_<tool>`: a server named `git` with a `status` tool becomes `mcp_git_status`. `codewhale mcp tools <server>` lists what a server offers. A server that fails to connect or is disabled never shows up as an available tool."
+          },
+          {
+            "p": "MCP tools follow your [approval setting](/docs/modes): listing and reading a server's resources and prompts can run without a prompt when policy allows, and tools with side effects ask first. Full Access does not override repository rules or managed policy."
+          }
+        ]
+      },
+      {
+        "id": "serve",
+        "title": "Run Codewhale as an MCP server",
+        "blocks": [
+          {
+            "p": "Other MCP clients — including another Codewhale session — can use Codewhale's tools. Register it once:"
+          },
+          {
+            "code": "codewhale mcp add-self\ncodewhale mcp tools codewhale",
+            "lang": "Terminal"
+          },
+          {
+            "p": "`add-self` writes an entry that runs `codewhale serve --mcp` over stdio. Each client starts its own process; no network port is opened. `codewhale serve --http` is a different thing — the [Runtime API](/docs/runtime-api) for apps."
+          }
+        ]
+      },
+      {
+        "id": "code-mode",
+        "title": "Compose tool calls with code mode (experimental)",
+        "blocks": [
+          {
+            "p": "Code mode lets the model write one short JavaScript program that calls several tools, loops, and filters results, instead of making each call as a separate step. Only the program's final value goes back to the model, which keeps long lookups compact. It is off by default. Try it for one session, or turn it on in config:"
+          },
+          {
+            "code": "codewhale --enable code_mode\n\n# ~/.codewhale/config.toml\n[features]\ncode_mode = true",
+            "lang": "Terminal / config.toml"
+          },
+          {
+            "list": [
+              "Only read-only tools that need no approval can run inside a program. Anything that writes, runs a shell command, or would ask you stops the program and reports which call it refused.",
+              "MCP tools cannot be called from a program yet. Use them as ordinary tool calls.",
+              "Limits per program: 50 tool calls, 4 at a time, 30 seconds, and 16 KiB returned.",
+              "Code mode is not available in Plan mode."
+            ]
+          }
+        ]
+      }
+    ],
+    "next": [
+      {
+        "href": "/docs/hooks",
+        "label": "Run commands on events",
+        "note": "Check or rewrite a tool call before it runs, including MCP tools."
+      },
+      {
+        "href": "/docs/modes",
+        "label": "Set modes and approvals",
+        "note": "Decide which MCP calls stop for your approval."
+      },
+      {
+        "href": "/docs/runtime-api",
+        "label": "Automate with the Runtime API",
+        "note": "Drive Codewhale from your own app or script over HTTP."
+      }
+    ],
+    "sourceNote": "Source documents: docs/MCP.md, crates/tui/src/tools/codemode.rs · Update docs-map.ts when changing."
   },
   "docs-modes": {
-    "metaTitle": "Modes · Codewhale Docs",
-    "metaDescription": "Plan, Work, Operate modes and independent permission postures.",
+    "metaTitle": "Set modes and approvals · Codewhale Docs",
+    "metaDescription": "Choose Plan, Work, or Operate for the kind of work, and Ask, Auto-Review, or Full Access for how often Codewhale stops to ask you.",
     "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewTitle": "Modes",
-    "overviewLead": "A mode decides how Codewhale handles the work. A permission posture decides how it handles consequential tool calls. They are separate controls.",
-    "modes": [
-      [
-        "Plan",
-        "Read-only investigation and planning. Codewhale can inspect the workspace, but it cannot run shell commands or edit files."
-      ],
-      [
-        "Work",
-        "Normal interactive coding. Codewhale can inspect, edit, and use tools; shell availability and approval prompts follow the active configuration and permission posture."
-      ],
-      [
-        "Operate",
-        "Multitask coordination from the same composer. The parent can inspect, edit, and use shell or MCP tools under the same permission posture, sandbox, and safety rules as Work. Fleet workers are preferred for independent, parallel, background, or long-running work, but delegation is not required for every executable step. Workflow is optional unless the work needs ordered phases, gates, or deterministic fan-in."
-      ]
+    "title": "Set modes and approvals",
+    "lede": "Two separate controls decide what Codewhale does on its own. The mode sets the kind of work — look, change, or coordinate. The approval setting decides when it stops to ask you. Change either one from the keyboard at any time between turns.",
+    "sections": [
+      {
+        "id": "modes",
+        "title": "Pick a mode",
+        "blocks": [
+          {
+            "rows": [
+              [
+                "Plan",
+                "Look and plan only. Codewhale can read the workspace and research, but it cannot edit files or run shell commands. Use it to understand a codebase or agree on an approach first."
+              ],
+              [
+                "Work",
+                "Everyday coding. Codewhale reads, edits, and runs commands, within the approval setting you chose. This is the default."
+              ],
+              [
+                "Operate",
+                "Larger goals. Same permissions as Work, but Codewhale plans named steps, hands independent steps to sub-agents in parallel, and checks each result before it reports done."
+              ]
+            ]
+          },
+          {
+            "p": "Press Tab with an empty composer to cycle Plan → Work → Operate, or type `/mode` to open the picker. You can also switch directly:"
+          },
+          {
+            "code": "/mode plan\n/mode work\n/mode operate",
+            "lang": "Codewhale"
+          },
+          {
+            "p": "The mode you pick becomes the mode your next session starts in. Codewhale refuses mode changes while a turn is running; press Esc to stop the turn first."
+          }
+        ]
+      },
+      {
+        "id": "approvals",
+        "title": "Choose when it asks",
+        "blocks": [
+          {
+            "p": "Press Shift+Tab to cycle Ask → Auto-Review → Full Access. Plan is always read-only, whatever you pick here."
+          },
+          {
+            "rows": [
+              [
+                "Ask",
+                "The default. File edits inside the workspace are applied and shown to you as a diff. Shell commands and other consequential tools stop for your approval."
+              ],
+              [
+                "Auto-Review",
+                "Never stops to ask. Calls that are provably safe run. Publishing and destructive background actions are always blocked. Anything else gets one independent model review; high-risk calls and failed reviews are denied, not run."
+              ],
+              [
+                "Full Access",
+                "No approval prompts. Repository rules and managed policy still block what they block. Use it only in a workspace you trust."
+              ]
+            ]
+          },
+          {
+            "note": "Ask applies workspace file edits without asking. Commit or stash anything you care about before you start, and use [Review what changed](/docs/review) to check or roll back edits."
+          }
+        ]
+      },
+      {
+        "id": "prompt",
+        "title": "Answer an approval prompt",
+        "blocks": [
+          {
+            "p": "When Codewhale stops at an approval, it shows the exact command. Answer with one key:"
+          },
+          {
+            "rows": [
+              [
+                "y",
+                "Allow this call once."
+              ],
+              [
+                "a",
+                "Allow it for the rest of this session."
+              ],
+              [
+                "n",
+                "Deny it. Codewhale is told the call was refused."
+              ],
+              [
+                "Esc",
+                "Stop the whole turn."
+              ]
+            ],
+            "codeTerms": true
+          },
+          {
+            "p": "The highlighted option on a new prompt is Deny, so pressing Enter without reading refuses the call. To change that, or to deny prompts that wait too long, set it in `~/.codewhale/config.toml`:"
+          },
+          {
+            "code": "[approval]\ndefault_selection = \"allow_once\"   # default: \"deny\"\ntimeout_seconds = 300              # default: wait indefinitely",
+            "lang": "config.toml"
+          }
+        ]
+      }
     ],
-    "switchingTitle": "Switch modes",
-    "switchingLead": "When the composer is idle, press {tab} to cycle Plan → Work → Operate. When a completion menu is open, Tab accepts the completion; during an active turn, it can queue the current draft as the next follow-up.",
-    "switchingCommandLead": "Run /mode to open the picker, or switch directly:",
-    "permissionsTitle": "Permission postures",
-    "permissionsLead": "Plan is always Read Only. When the composer is idle in Work or Operate, press {shiftTab} to cycle Ask → Auto-Review → Full Access. Run {configCommand} to inspect or edit the current session permission; project or managed policy may lock or tighten it.",
-    "postures": [
-      [
-        "Ask",
-        "Ask before tools that can make consequential changes."
-      ],
-      [
-        "Auto-Review",
-        "Fully autonomous: it never stops to ask you. Proven-safe calls run, publish-like and destructive background actions are blocked, and anything else goes to a one-shot model review; high-risk calls and unresolved holds are denied rather than turned into a prompt."
-      ],
-      [
-        "Full Access",
-        "Run tools without approval prompts and enable trusted-workspace access. Repository rules and managed constraints still apply; use it only in a workspace you trust."
-      ]
+    "next": [
+      {
+        "href": "/docs/review",
+        "label": "Review what changed",
+        "note": "See the diff for a session and roll files back to an earlier turn."
+      },
+      {
+        "href": "/docs/sandbox",
+        "label": "Limit what commands can touch",
+        "note": "An approval is not a sandbox. See what the operating system enforces on each platform."
+      },
+      {
+        "href": "/docs/subagents",
+        "label": "Run agents in parallel",
+        "note": "What Operate does with independent steps, and how to watch it."
+      }
     ],
-    "sourceNote": "Source document: docs/MODES.md · Update docs-map.ts when changing."
+    "sourceNote": "Source documents: docs/MODES.md, docs/INSTALL.md §10, docs/CONFIGURATION.md · Update docs-map.ts when changing."
   },
   "docs-runtime-api": {
-    "metaTitle": "Runtime API · Codewhale Docs",
-    "metaDescription": "Local HTTP/SSE, JSON-RPC stdio, and ACP entrypoints for integrations, bridges, and automation.",
+    "metaTitle": "Automate with the Runtime API · Codewhale Docs",
+    "metaDescription": "Drive Codewhale from your own scripts and apps: run one-shot prompts in CI, or start the local HTTP API and send turns, stream events, and answer approvals.",
     "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewTitle": "Runtime API",
-    "overviewLead": "codewhale app-server is the canonical local runtime API and control plane. Local SDKs, mobile/remote-control clients, and editor integrations talk to it instead of screen-scraping terminal output. The engine runs as a local-only process: every API binds to localhost by default — no hosted relay, no provider-token custody, no secret leakage. codewhale serve --http / --mobile remain compatibility aliases for app-server --http / --mobile and launch the identical server; new integrations should target app-server.",
-    "entries": [
-      [
-        "http",
-        "The full /v1/* HTTP/SSE runtime API (canonical entry), default 127.0.0.1:7878."
-      ],
-      [
-        "mobile",
-        "The runtime API plus the /mobile phone control page."
-      ],
-      [
-        "stdio",
-        "Newline-delimited JSON-RPC 2.0 control transport with no listener, for local SDKs and probes."
-      ],
-      [
-        "web",
-        "The loopback-only browser client, embedded in the binary and opened in the default browser."
-      ],
-      [
-        "doctor",
-        "Machine-readable health and capability report."
-      ],
-      [
-        "acp",
-        "ACP (Agent Client Protocol) stdio adapter for editors such as Zed."
-      ],
-      [
-        "exec",
-        "The one-shot headless worker (stream-json, fleet subprocess, CI primitive) — not part of this API, but it shares the same runtime and event vocabulary."
-      ]
+    "title": "Automate with the Runtime API",
+    "lede": "Scripts and apps can drive the same engine you use in the terminal. For a single job, use `codewhale exec`. For an app that needs threads, live events, and approvals, run the local Runtime API. Everything runs on your machine; there is no hosted relay.",
+    "sections": [
+      {
+        "id": "exec",
+        "title": "Run one job from a script",
+        "blocks": [
+          {
+            "code": "codewhale exec \"Reply with exactly: pong\"\ncodewhale exec --auto \"fix the failing test and run it again\"\ncodewhale exec --auto --output-format stream-json \"update the changelog\"",
+            "lang": "Terminal"
+          },
+          {
+            "p": "Plain `exec` answers once without tools. `--auto` lets it use tools and approves them automatically, so use it only in a repository or container you trust; it never widens the [sandbox](/docs/sandbox). `--output-format stream-json` prints one JSON event per line and saves the session so `--continue` can pick it up. `--max-turns` and `--allowed-tools` put limits on a run."
+          }
+        ]
+      },
+      {
+        "id": "start",
+        "title": "Start the Runtime API",
+        "blocks": [
+          {
+            "code": "export CODEWHALE_RUNTIME_TOKEN=\"$(openssl rand -hex 32)\"\ncodewhale app-server --http            # http://127.0.0.1:7878",
+            "lang": "Terminal"
+          },
+          {
+            "p": "Set the token yourself before starting; if you do not, Codewhale generates one for the process and does not print it. Every `/v1/*` request must send it as `Authorization: Bearer <token>`. `--port` changes the port."
+          }
+        ]
+      },
+      {
+        "id": "turn",
+        "title": "Send a turn and watch it",
+        "blocks": [
+          {
+            "code": "API=http://127.0.0.1:7878\nAUTH=\"Authorization: Bearer $CODEWHALE_RUNTIME_TOKEN\"\n\nTHREAD=$(curl -s -X POST \"$API/v1/threads\" -H \"$AUTH\" \\\n  -H \"Content-Type: application/json\" -d '{}' | jq -r .id)\n\ncurl -s -X POST \"$API/v1/threads/$THREAD/turns\" -H \"$AUTH\" \\\n  -H \"Content-Type: application/json\" -d '{\"prompt\": \"Summarize README.md\"}'\n\ncurl -N \"$API/v1/threads/$THREAD/events?since_seq=0\" -H \"$AUTH\"",
+            "lang": "Terminal"
+          },
+          {
+            "p": "A thread is a conversation; a turn is one request and everything Codewhale does for it. The events stream replays from the sequence number you give and then stays open for new events, so a client that reconnects misses nothing."
+          },
+          {
+            "rows": [
+              [
+                "Stop a turn",
+                "`POST /v1/threads/{id}/turns/{turn_id}/interrupt`"
+              ],
+              [
+                "Answer an approval",
+                "`POST /v1/approvals/{approval_id}`"
+              ],
+              [
+                "Steer a running turn",
+                "`POST /v1/threads/{id}/turns/{turn_id}/steer`"
+              ],
+              [
+                "List saved sessions",
+                "`GET /v1/sessions`"
+              ]
+            ]
+          },
+          {
+            "p": "[docs/RUNTIME_API.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/RUNTIME_API.md) lists every route, request body, and event."
+          }
+        ]
+      },
+      {
+        "id": "other",
+        "title": "Pick another connection",
+        "blocks": [
+          {
+            "rows": [
+              [
+                "codewhale app-server --stdio",
+                "JSON-RPC over standard input and output, with no network listener. Good for an SDK or a local probe."
+              ],
+              [
+                "codewhale serve --acp",
+                "Agent Client Protocol for editors such as Zed."
+              ],
+              [
+                "codewhale serve --mcp",
+                "Offer Codewhale's tools to another MCP client. See [Connect tools with MCP](/docs/mcp)."
+              ],
+              [
+                "codewhale web",
+                "The built-in [browser client](/docs/web), on the same API."
+              ],
+              [
+                "codewhale doctor --json",
+                "Health and capabilities as JSON, with no secrets."
+              ]
+            ],
+            "codeTerms": true
+          }
+        ]
+      },
+      {
+        "id": "security",
+        "title": "Keep it private",
+        "blocks": [
+          {
+            "list": [
+              "The server listens on `127.0.0.1` by default. The token is a local guard, not a replacement for TLS or a VPN; do not expose the port to a network.",
+              "`--insecure-no-auth` is accepted only on a loopback address.",
+              "The API never returns your provider keys. Health and capability reports carry only metadata — no secrets, file contents, or messages."
+            ]
+          }
+        ]
+      }
     ],
-    "stdioTitle": "Probe without model tokens",
-    "stdioLead": "The stdio control transport can be probed without spending model tokens. capabilities returns the advertised method families (thread/*, app/*, prompt/*) and the full method list; the method set is pinned by a drift test in crates/app-server/src/lib.rs, so SDK and local integration clients can rely on it not changing silently.",
-    "interruptNote": "A live turn can be asked to stop with thread/interrupt (or POST /v1/threads/{id}/turns/{turn_id}/interrupt over HTTP); when no turn is streaming the reply carries interrupted: false — not an error, just nothing to stop.",
-    "securityTitle": "Security boundary",
-    "securityLead": "The runtime API token is read from {authToken}, then {runtimeTokenEnv}, then {legacyTokenEnv}; {insecureFlag} is only accepted with a loopback bind. Cross-origin browser requests are rejected by the CORS allow-list. Before selecting a non-loopback bind — especially {mobileFlag} — read the full deployment and authentication contract in docs/RUNTIME_API.md.",
+    "next": [
+      {
+        "href": "/docs/web",
+        "label": "Open the browser client",
+        "note": "A ready-made client for the same API."
+      },
+      {
+        "href": "/docs/hooks",
+        "label": "Run commands on events",
+        "note": "React to session events without writing a client."
+      },
+      {
+        "href": "/docs/fleet",
+        "label": "Run a workflow",
+        "note": "Durable, multi-step runs you can check from any terminal."
+      }
+    ],
     "sourceNote": "Source document: docs/RUNTIME_API.md · Update docs-map.ts when changing."
   },
   "docs-sandbox": {
-    "metaTitle": "Sandbox & Approval · Codewhale Docs",
-    "metaDescription": "The honest boundary: macOS Seatbelt, opt-in Linux bubblewrap, platform gaps, and approval policy.",
+    "metaTitle": "Limit what commands can touch · Codewhale Docs",
+    "metaDescription": "See which operating-system sandbox wraps shell commands on macOS, Linux, and Windows, turn it on where it is optional, and choose how much a command may write.",
     "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewTitle": "Sandbox & Approval",
-    "overviewLead": "Codewhale can launch shell commands proposed by a model. Approval policy, workspace-aware tools, and an operating-system command wrapper are separate controls: an approval is not a sandbox, and selecting workspace-write does not prove the current platform has an OS wrapper available. This page describes only behavior wired into the command execution path.",
-    "platforms": [
-      [
-        "macOS · Seatbelt",
-        "Codewhale probes /usr/bin/sandbox-exec; when the probe succeeds and the policy requests a sandbox, the child command is wrapped in a generated Seatbelt profile: broad filesystem reads, policy-limited writes, and network only when the policy enables it. A failed probe is reported honestly as no OS sandbox."
-      ],
-      [
-        "Linux · opt-in bubblewrap",
-        "Linux command sandboxing is opt-in: set prefer_bwrap = true and keep /usr/bin/bwrap executable. The child gets a read-only root view with writable mounts derived from the resolved policy; the network namespace is isolated by default and --share-net is added only when the policy enables network access. Without the opt-in, Codewhale reports none."
-      ],
-      [
-        "Windows · no OS sandbox",
-        "The Windows command path currently reports no OS sandbox. Host permissions and approval policy still apply, but they are not a Codewhale OS command sandbox."
-      ],
-      [
-        "External OpenSandbox execution",
-        "With sandbox_backend = \"opensandbox\", shell execution is sent to the configured OpenSandbox-compatible HTTP endpoint instead of starting a local child. Isolation guarantees belong to the configured service and its operator."
-      ]
+    "title": "Limit what commands can touch",
+    "lede": "Approving a command decides whether it runs. A sandbox decides what it can reach once it does. Codewhale uses the operating system's sandbox where one is available and tells you plainly when there is none.",
+    "sections": [
+      {
+        "id": "platforms",
+        "title": "Check what your platform provides",
+        "blocks": [
+          {
+            "rows": [
+              [
+                "macOS",
+                "Seatbelt, automatically, when its startup check succeeds. Commands get broad read access, writes limited by the sandbox mode, and network only when the mode allows it."
+              ],
+              [
+                "Linux",
+                "Bubblewrap, but only if you turn it on (below). Without it, commands run with no OS sandbox."
+              ],
+              [
+                "Windows",
+                "No OS sandbox today. Your approval setting and Windows permissions still apply."
+              ],
+              [
+                "External service",
+                "With `sandbox_backend = \"opensandbox\"`, shell commands run on an OpenSandbox-compatible service you configure; its isolation is that service's to guarantee."
+              ]
+            ]
+          },
+          {
+            "p": "Ask Codewhale which one it found:"
+          },
+          {
+            "code": "codewhale doctor\ncodewhale setup --status",
+            "lang": "Terminal"
+          },
+          {
+            "p": "Both report the sandbox that is actually available after your settings are applied. Codewhale never counts source code that is not wired in as a sandbox."
+          }
+        ]
+      },
+      {
+        "id": "linux",
+        "title": "Turn on the Linux sandbox",
+        "blocks": [
+          {
+            "p": "Install bubblewrap, then opt in with one line in `~/.codewhale/config.toml`:"
+          },
+          {
+            "code": "sudo apt install bubblewrap      # Fedora: dnf install bubblewrap · Arch: pacman -S bubblewrap\n\n# ~/.codewhale/config.toml\nprefer_bwrap = true",
+            "lang": "Terminal / config.toml"
+          },
+          {
+            "p": "Codewhale uses `/usr/bin/bwrap` only when that file exists and is executable. Commands then see a read-only view of the system, write only where the sandbox mode allows, and have no network unless the mode enables it."
+          }
+        ]
+      },
+      {
+        "id": "mode",
+        "title": "Choose how much a command may write",
+        "blocks": [
+          {
+            "code": "sandbox_mode = \"workspace-write\"",
+            "lang": "config.toml"
+          },
+          {
+            "rows": [
+              [
+                "read-only",
+                "Commands can read but not write."
+              ],
+              [
+                "workspace-write",
+                "Commands can write inside the workspace and temporary folders, and nowhere else."
+              ],
+              [
+                "danger-full-access",
+                "No OS sandbox. Use only on a machine or container you are prepared to lose."
+              ],
+              [
+                "external-sandbox",
+                "You are already running inside isolation, so Codewhale adds none of its own."
+              ]
+            ],
+            "codeTerms": true
+          },
+          {
+            "p": "The first two are enforced only where a sandbox is available — on Linux without bubblewrap, and on Windows, they are settings without an OS wrapper behind them. A repository's own config can make the mode stricter, never looser. For one headless run, pass `--sandbox <mode>` to `codewhale exec`; `--auto` approves tools but never widens the sandbox."
+          }
+        ]
+      },
+      {
+        "id": "limits",
+        "title": "Know the limits",
+        "blocks": [
+          {
+            "list": [
+              "Availability is checked before a command starts, but the sandbox can still fail at launch because of host policy or container restrictions.",
+              "A “Permission denied” from a command is not proof that the sandbox blocked it. Codewhale labels a denial as the sandbox's only when the sandbox itself reported it.",
+              "No sandbox protects against kernel vulnerabilities or every kind of resource exhaustion."
+            ]
+          }
+        ]
+      }
     ],
-    "policiesTitle": "Policies and fallbacks",
-    "policiesLead": "The local {sandboxMode} values are {readOnly}, {workspaceWrite}, {dangerFullAccess}, and {externalSandbox}. The first two are enforced by Seatbelt or bubblewrap only when that wrapper is selected and available; {dangerFullAccess} deliberately bypasses the local OS wrapper; {externalSandbox} declares that execution is already externally isolated. When no wrapper is selected, the shell command runs without Codewhale OS isolation — approval rules and workspace-aware native file tools remain separate controls.",
-    "diagnosticsTitle": "Diagnostics and limits",
-    "diagnosticsLead": "codewhale setup --status, codewhale doctor, codewhale doctor --json, and the diagnostics tool report the locally available wrapper after applying the resolved bubblewrap preference. Denial attribution is intentionally conservative: a child command's generic Permission denied is not by itself proof that Codewhale's sandbox blocked it, and unsandboxed command failures are never labeled sandbox denials.",
-    "diagnosticsLimits": "The limitations are stated just as plainly: availability is checked before launch, yet the selected wrapper can still fail because of host policy, container restrictions, or a race after the probe; bubblewrap ignores a configured writable root that is missing or not a directory; and no sandbox protects against kernel vulnerabilities or all resource-exhaustion and side-channel attacks.",
-    "sourceNote": "Source document: docs/SANDBOX.md · Update docs-map.ts when changing."
+    "next": [
+      {
+        "href": "/docs/modes",
+        "label": "Set modes and approvals",
+        "note": "Decide which commands stop for your approval."
+      },
+      {
+        "href": "/docs/trust",
+        "label": "See what leaves your machine",
+        "note": "What a provider receives, what stays local, and what telemetry sends."
+      },
+      {
+        "href": "/docs/configuration",
+        "label": "Change settings",
+        "note": "Where these keys live and what a repository may override."
+      }
+    ],
+    "sourceNote": "Source documents: docs/SANDBOX.md, docs/CONFIGURATION.md · Update docs-map.ts when changing."
   },
   "docs-subagents": {
-    "metaTitle": "Sub-Agents · Codewhale Docs",
-    "metaDescription": "The agent tool, fleet roles, context forking, worktree isolation, and concurrency caps.",
+    "metaTitle": "Run agents in parallel · Codewhale Docs",
+    "metaDescription": "Let Codewhale hand independent parts of a task to sub-agents, choose their roles, keep their edits in separate worktrees, and watch them work.",
     "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewTitle": "Sub-Agents",
-    "overviewLead": "A parent session launches one focused sub-agent through the agent tool and immediately gets back an agent_id, a compact receipt, and a transcript handle while the worker runs in the background. Sub-agents inherit the parent's tool registry by default, but they are leaf workers: they do not receive agent or nested lifecycle tools. agent launches detached background work — cancelling the parent turn stops the parent's wait path, but it does not kill already-opened child runs.",
-    "overviewFleetNote": "For work that must survive process restarts, sleep, or remote execution, prefer a fleet or a Workflow-backed fleet run over a short in-session agent call.",
-    "roles": [
-      [
-        "worker",
-        "Flexible multi-step execution of the parent's brief; writes and shell allowed. The default role."
-      ],
-      [
-        "scout",
-        "Read-only, maps the relevant code fast — “find every call site of Foo.”"
-      ],
-      [
-        "planner",
-        "Analyse and produce a strategy without executing — “design the migration; don't run it.”"
-      ],
-      [
-        "reviewer",
-        "Read-and-grade with severity scores — “audit this PR for bugs.”"
-      ],
-      [
-        "builder",
-        "Land a specific change with minimal edits; writes and shell allowed."
-      ],
-      [
-        "verifier",
-        "Run tests and validation gates and report the outcome; no code edits."
-      ],
-      [
-        "consultant",
-        "Read-only high-reasoning counsel for judgement calls and design critique."
-      ],
-      [
-        "custom",
-        "An explicit narrow tool allowlist for locked-down dispatch."
-      ]
+    "title": "Run agents in parallel",
+    "lede": "Codewhale can hand a focused piece of work to a sub-agent and keep going while it runs. Use this when a task splits into independent parts — mapping a codebase, reviewing a change, running tests — so they happen at the same time.",
+    "sections": [
+      {
+        "id": "ask",
+        "title": "Ask for it",
+        "blocks": [
+          {
+            "p": "You do not start sub-agents with a command; you ask in plain words. In Operate, Codewhale does this on its own for independent steps. In Work, say what you want split up:"
+          },
+          {
+            "code": "Use three explore agents in parallel: one maps the auth code,\none maps the billing code, one lists the tests that cover both.\nThen summarize what would break if we changed the session format.",
+            "lang": "Prompt"
+          },
+          {
+            "p": "Each sub-agent starts in the background and reports back when it finishes. Your composer stays free, and the parent turn picks up the results."
+          }
+        ]
+      },
+      {
+        "id": "roles",
+        "title": "Pick a role",
+        "blocks": [
+          {
+            "p": "A role is the stance a sub-agent takes. Name one in your request, or let Codewhale choose. A sub-agent never gets more permission than your session has."
+          },
+          {
+            "rows": [
+              [
+                "general",
+                "Does whatever the brief says; may edit and run commands. The default."
+              ],
+              [
+                "explore",
+                "Read-only. Maps the relevant code fast — “find every caller of this function.”"
+              ],
+              [
+                "planner",
+                "Designs an approach without changing anything."
+              ],
+              [
+                "reviewer",
+                "Reads and grades a change, with a severity for each finding."
+              ],
+              [
+                "implement",
+                "Lands one specific change with the smallest edit."
+              ],
+              [
+                "test",
+                "Runs tests and checks, then reports pass or fail. Does not edit code."
+              ],
+              [
+                "advisor",
+                "Short, careful second opinion on a judgment call. No commands."
+              ],
+              [
+                "custom",
+                "Only the tools you list, for tightly limited jobs."
+              ]
+            ],
+            "codeTerms": true
+          },
+          {
+            "p": "To give a role a specific model every time, save it with `/fleet setup` — see [Run a workflow](/docs/fleet)."
+          }
+        ]
+      },
+      {
+        "id": "worktrees",
+        "title": "Keep parallel edits apart",
+        "blocks": [
+          {
+            "p": "When two sub-agents would edit the same repository, ask for each to work in its own worktree. Codewhale creates a fresh git worktree and branch for that agent beside your repository, under `.codewhale-worktrees/`, so your checkout stays clean until you merge."
+          },
+          {
+            "p": "A worktree is isolation, not permission: an agent that should write still needs a writing role and the paths it may change. Two agents that claim the same files are stopped before either one edits anything."
+          }
+        ]
+      },
+      {
+        "id": "watch",
+        "title": "Watch and answer them",
+        "blocks": [
+          {
+            "code": "/subagents",
+            "lang": "Codewhale"
+          },
+          {
+            "p": "`/subagents` (the same view as `/fleet workers`) lists the agents attached to this session and what each one is doing. Select one to read its transcript."
+          },
+          {
+            "p": "Sub-agents follow your [approval setting](/docs/modes). In Ask, a call that needs approval appears in your session as a normal prompt while the agent waits. In Auto-Review, each held call gets the same independent review, and nothing prompts you. Every decision you did not make yourself is written to the agent's transcript."
+          }
+        ]
+      },
+      {
+        "id": "limits",
+        "title": "Know the limits",
+        "blocks": [
+          {
+            "rows": [
+              [
+                "Running at once",
+                "64 by default. Set `max_subagents` (up to 128) in `~/.codewhale/config.toml`."
+              ],
+              [
+                "Queued plus running",
+                "Up to 1,024; extra launches wait for a slot."
+              ],
+              [
+                "Nesting",
+                "A sub-agent may start its own, three levels deep by default, never more than eight."
+              ]
+            ]
+          },
+          {
+            "p": "These are ceilings, not targets. A few well-scoped agents with one clear summary beat many overlapping ones. For work that must survive a restart or a sleeping laptop, use a [Fleet run](/docs/fleet) instead."
+          }
+        ]
+      }
     ],
-    "forkTitle": "Context forking",
-    "forkLead": "{agentTool} starts fresh by default: the child gets its role prompt plus the task you pass. When the task depends on decisions, files, todos, or plan state already in the parent transcript, use {forkContext} — the runtime keeps the parent's request prefix byte-identical where available (preserving prefix-cache reuse), appends a structured state snapshot, then adds the sub-agent role instructions and task at the tail. Use fresh sessions for independent exploration and forked sessions for continuation, review, summarization, or compaction work.",
-    "worktreeTitle": "Worktree isolation",
-    "worktreeLead": "Launch parallel edit lanes with {worktreeFlag}: Codewhale creates a fresh git worktree and branch for the child (default {branchPattern}, checked out beside the parent repo under {worktreeDir}) so the parent checkout stays clean. Isolation is not write authority: a prompt-only worker starts read-only, and a writer also declares {writeAuthority} plus at least one normalized {writeRoots}, {exactFiles}, or {coordinationContracts} value. Overlapping shared write claims fail before any mutation.",
-    "capacityTitle": "Concurrency caps",
-    "capacityLead": "The sub-agent capacity source of truth is crates/tui/src/config/subagent_limits.rs: default configured concurrency is 64, maximum configured concurrency is 128, and maximum admitted running-plus-queued work is 1024. These are capacity ceilings, not advice to dispatch every slot — a manager should use the smallest useful fan-out, keep a single fan-in owner, and verify worker receipts before reporting combined completion.",
-    "sourceNote": "Source document: docs/SUBAGENTS.md · Update docs-map.ts when changing."
+    "next": [
+      {
+        "href": "/docs/fleet",
+        "label": "Run a workflow",
+        "note": "Turn a plan you repeat into a Workflow with phases and a record of each run."
+      },
+      {
+        "href": "/docs/work",
+        "label": "Track progress",
+        "note": "How the To-do list shows what is done, in progress, and left."
+      },
+      {
+        "href": "/docs/review",
+        "label": "Review what changed",
+        "note": "Check what the agents changed before you keep it."
+      }
+    ],
+    "sourceNote": "Source documents: docs/SUBAGENTS.md, docs/FLEET.md, docs/MODES.md · Update docs-map.ts when changing."
   },
   "docs-web": {
-    "metaTitle": "Browser Client · Codewhale Docs",
-    "metaDescription": "The loopback-only embedded browser client — one-time bootstrap, session cookie, the local trust boundary — and remote control of a running local session from the signed-in web app with /rc.",
+    "metaTitle": "Open the browser client · Codewhale Docs",
+    "metaDescription": "Work with Codewhale in a browser tab on your own machine, or continue a running terminal session from the Codewhale web app with /rc.",
     "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewTitle": "Browser Client",
-    "overviewLead": "{webCommand} opens Codewhale's embedded browser client over the canonical Runtime API. It is a local surface: the server always binds to {loopbackHost}, cannot be rebound to a LAN address, and cannot run with Runtime authentication disabled. The default address is {defaultUrl}; on a port collision, pick another loopback port with {portExample}. Stop the process with Ctrl+C and the browser session ends with it.",
-    "overviewBody": "The current client provides a responsive thread and search rail, Runtime-owned session facts, transcript and tool receipts, and a composer. It can create, select, rename, and archive threads; start or steer turns; interrupt work; resolve approvals; and answer Runtime user-input requests. The browser is another view of the same local Runtime — it does not create a second cloud account, copy provider credentials into browser storage, or weaken the configured approval and sandbox policies.",
-    "authTitle": "Authentication boundary",
-    "authLead": "The browser-launch URL carries a random, short-lived, one-time bootstrap capability — never the Runtime bearer token. A loopback request exchanges it for an HttpOnly, SameSite=Strict, process-local session cookie and immediately invalidates the capability. Reused, expired, malformed, and non-loopback bootstrap attempts fail closed. The Runtime token is never placed in rendered HTML, browser storage, URL queries or fragments, or browser-launch arguments. Cookie-authenticated state-changing requests must also present the exact local web origin; cross-origin browser requests are rejected.",
-    "localTitle": "Local means local",
-    "localLead": "{webCommand} accepts only {portFlag} — there is no {hostFlag} and no insecure-auth option on this command. Do not treat it as a public website or expose its port through router forwarding, a public reverse proxy, or a tunnel. The separate {mobileCommand} and {httpFlag} modes carry different deployment and authentication contracts; read the Runtime API documentation before operating either one, especially before selecting a non-loopback bind.",
-    "remoteTitle": "Remote control from the web app",
-    "remoteLead": "Available now. To continue the exact running local session from the signed-in Codewhale web app, type /rc in that session or launch with codewhale rc, then approve the one-time code in your browser. While the lease is active the browser owns new prompts and approvals and the terminal stays a readable safety surface; interrupt remains available from both.",
-    "remoteBody": "Once connected, the banner and a transcript note show the live session link. /rc open opens it in your browser, /rc link prints it, /rc status shows who owns the session, and /rc stop returns it to the terminal. A dropped connection keeps local input locked until the last web lease expires, so two controllers never race. Every folder you enroll from one terminal shares a single stable device id, so the web app lists one computer per machine, not one per session. This is different from the loopback browser client above: /rc pairs a local session with your account; codewhale web serves a local page with no account at all.",
-    "troubleshootingTitle": "Troubleshooting",
-    "troubleshootingLead": "If port 7878 is occupied, pass an unused --port. If the browser cannot be opened, the command exits with an error rather than leaving a reusable bootstrap capability behind; check the OS default-browser setup and start again. If the page loads but a provider is unavailable, inspect codewhale doctor and /provider — the web command does not configure or move provider credentials. If a session expired, restart codewhale web to mint a new process-local session; reusing an old bootstrap URL is expected to fail.",
+    "title": "Open the browser client",
+    "lede": "Prefer a browser window to a terminal? Codewhale can serve its own client on your machine. It is another view of the same local session — same approvals, same sandbox, no account.",
+    "sections": [
+      {
+        "id": "start",
+        "title": "Start it",
+        "blocks": [
+          {
+            "p": "Run this from the folder you want Codewhale to work in:"
+          },
+          {
+            "code": "codewhale web\ncodewhale web --port 8788   # if 7878 is taken",
+            "lang": "Terminal"
+          },
+          {
+            "p": "Codewhale starts a local server at `http://127.0.0.1:7878`, prints a one-time link, and opens it in your default browser. If the browser does not open, use the printed link within ten minutes. Press Ctrl+C in the terminal to stop; the browser session ends with it."
+          }
+        ]
+      },
+      {
+        "id": "use",
+        "title": "Work in the browser",
+        "blocks": [
+          {
+            "p": "The browser client lists and searches your threads, shows the transcript with each tool's result, and has a composer. You can start, steer, or interrupt a turn, answer approvals, and rename or archive threads. Your provider keys stay in Codewhale; nothing is copied into browser storage."
+          }
+        ]
+      },
+      {
+        "id": "local",
+        "title": "Keep it local",
+        "blocks": [
+          {
+            "list": [
+              "The server only listens on `127.0.0.1`. There is no option to open it to your network, and it cannot run without authentication.",
+              "The link carries a single-use code, not your access token. Opening it swaps the code for a cookie tied to this process, and the code stops working.",
+              "Do not forward the port through a router, a public proxy, or a tunnel. For a phone or another machine, see the [Runtime API](/docs/runtime-api) and read its authentication rules first."
+            ]
+          }
+        ]
+      },
+      {
+        "id": "remote",
+        "title": "Continue a session from the web app",
+        "blocks": [
+          {
+            "p": "This is different: it hands a session already running in your terminal to the signed-in Codewhale web app, so you can keep going from another device. It needs a [Codewhale account](/docs/auth#account)."
+          },
+          {
+            "code": "/rc          # in the running session; approve the one-time code in your browser\n/rc status   # who controls the session now\n/rc link     # print the session link\n/rc stop     # hand control back to the terminal",
+            "lang": "Codewhale"
+          },
+          {
+            "p": "While the web app holds the session, new prompts and approvals come from the browser, and the terminal stays readable. Either side can interrupt. You can also start a session this way with `codewhale rc`."
+          }
+        ]
+      },
+      {
+        "id": "fix",
+        "title": "If something goes wrong",
+        "blocks": [
+          {
+            "rows": [
+              [
+                "Port in use",
+                "Pass a free port with `--port`."
+              ],
+              [
+                "Browser did not open",
+                "Copy the printed link into a browser on the same machine within ten minutes."
+              ],
+              [
+                "Link expired or already used",
+                "That is expected. Run `codewhale web` again for a new one."
+              ],
+              [
+                "No model answers",
+                "The web command does not set up providers. Check `codewhale doctor` and `/provider`."
+              ]
+            ]
+          }
+        ]
+      }
+    ],
+    "next": [
+      {
+        "href": "/docs/runtime-api",
+        "label": "Automate with the Runtime API",
+        "note": "The local API the browser client is built on."
+      },
+      {
+        "href": "/docs/auth",
+        "label": "Connect a provider",
+        "note": "Give the browser client a model to talk to."
+      },
+      {
+        "href": "/docs/modes",
+        "label": "Set modes and approvals",
+        "note": "The same approvals apply in the browser."
+      }
+    ],
     "sourceNote": "Source document: docs/WEB.md · Update docs-map.ts when changing."
   },
   "docs-computers": {
-    "metaTitle": "Cloud computers · Codewhale Docs",
-    "metaDescription": "How a local Codewhale session proposes, confirms, and tracks a cloud agent on a Daytona computer — explicit forges, fail-closed credentials, and what is not built yet.",
+    "metaTitle": "Send a task to the cloud · Codewhale Docs",
+    "metaDescription": "Hand a coding task to a Codewhale cloud agent that works on a branch and opens a pull request — proposed first, started only when you confirm.",
     "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewTitle": "Cloud computers",
-    "overviewLead": "A local session can offload a coding task to a cloud computer the way an editor sends a cloud agent: the remote job raises a branch and is meant to open a pull request against an explicit forge. Local stays responsive. Spend and push never happen silently — a proposal is written first, and nothing creates a sandbox or pushes a branch until you confirm it.",
-    "proposeTitle": "Propose, then confirm",
-    "proposeLead": "The first command writes a proposal and exits. The second confirms it by id. The TUI has the same two steps as slash commands, and the {cloudAgent} spelling is an alias of {dispatch}.",
-    "jobsLead": "Cloud jobs are first-class on the existing jobs surface as {kind}. List, show, and cancel them from the TUI or the CLI:",
-    "remotesTitle": "Explicit forges",
-    "remotesLead": "A remote is never assumed to be GitHub. A remote named after a forge is that forge; any other remote is classified by its URL host. If more than one forge is present, pass {remoteFlag}.",
-    "remotes": [
-      [
-        "github · cnb · gitee (by remote name)",
-        "that forge, whatever the URL"
-      ],
-      [
-        "origin or other → github.com",
-        "github"
-      ],
-      [
-        "origin or other → cnb.cool",
-        "cnb"
-      ],
-      [
-        "origin or other → gitee.com",
-        "gitee"
-      ]
+    "title": "Send a task to the cloud",
+    "lede": "A cloud agent takes a task off your machine: it works in a fresh cloud sandbox, pushes a branch, and opens a pull request while you keep working locally. Nothing starts, costs money, or pushes until you confirm it.",
+    "sections": [
+      {
+        "id": "status",
+        "title": "Know what is ready",
+        "blocks": [
+          {
+            "note": "Cloud agents are a preview. The full lifecycle is covered by offline tests, but the live path — a real sandbox and a real pull request on each forge — has not been verified end to end yet. Private repositories are not supported yet."
+          }
+        ]
+      },
+      {
+        "id": "before",
+        "title": "Before you start",
+        "blocks": [
+          {
+            "list": [
+              "Sign in to your Codewhale account with `codewhale login`. Without it, a task can be proposed but not confirmed.",
+              "Make an account API key available as `CODEWHALE_API_KEY`, so the agent in the sandbox runs as your account. Without it, confirming is refused before anything is spent.",
+              "For GitHub, be signed in to the `gh` command-line tool; Codewhale uses that login to open the pull request."
+            ]
+          },
+          {
+            "code": "codewhale dispatch --status",
+            "lang": "Terminal"
+          },
+          {
+            "p": "`--status` shows the forges found in your git remotes and whether the required credentials are present. It never prints a secret."
+          }
+        ]
+      },
+      {
+        "id": "send",
+        "title": "Propose, then confirm",
+        "blocks": [
+          {
+            "code": "codewhale dispatch \"fix the flaky login test and open a PR\" --remote github\ncodewhale dispatch --confirm cloud_<id>",
+            "lang": "Terminal"
+          },
+          {
+            "p": "The first command only writes a proposal and prints its id. The second starts it. Codewhale may propose a cloud task on its own, but it never confirms one. In a session, use `/dispatch <task>` and `/dispatch confirm <id>`."
+          },
+          {
+            "p": "Once confirmed, the agent clones the repository into a new sandbox, does the work, pushes a new branch (never a force-push), and opens the pull request. The sandbox is deleted when the job finishes, fails, or is cancelled."
+          }
+        ]
+      },
+      {
+        "id": "track",
+        "title": "Track or cancel a job",
+        "blocks": [
+          {
+            "code": "codewhale dispatch --list\ncodewhale dispatch --show cloud_<id>\ncodewhale dispatch --cancel cloud_<id>",
+            "lang": "Terminal"
+          },
+          {
+            "p": "Cloud jobs also appear in `/jobs`. A job shows its progress, the branch, the pull request link once one exists, and how many minutes it ran — a runtime figure, not a bill. Cancelling tears the sandbox down right away."
+          }
+        ]
+      },
+      {
+        "id": "forge",
+        "title": "Choose where the pull request goes",
+        "blocks": [
+          {
+            "p": "Codewhale supports GitHub, CNB, and Gitee, and never assumes `origin` is GitHub. A remote named `github`, `cnb`, or `gitee` is that forge; any other remote is identified by its host. If your repository has more than one forge, pass `--remote`."
+          },
+          {
+            "p": "If a pull request cannot be opened — for example, a forge token is missing — the job is marked failed after the push and says that no pull request was opened. It never reports a link it does not have."
+          }
+        ]
+      }
     ],
-    "enableTitle": "Enable a Daytona computer",
-    "enableLead": "Credentials live in the process environment or in the Codewhale secret store — never in config.toml or models.toml, and never committed.",
-    "enableSteps": [
-      [
-        "Create an API key",
-        "In the Daytona dashboard under API keys."
-      ],
-      [
-        "Export it for the session",
-        "{apiKey}, optionally {apiUrl} for a non-default endpoint."
-      ],
-      [
-        "Or store it once",
-        "In the Codewhale secret slot {slot} (OS keyring or the $CODEWHALE_HOME secrets file). The {alias} alias is also accepted."
-      ]
-    ],
-    "cliNote": "An installed daytona CLI is not a credential. {status} and a bare {bare} report CLI presence separately from credential presence.",
-    "rulesTitle": "Fail-closed rules",
-    "rules": [
-      [
-        "No confirm",
-        "A {proposed} job is written; the command exits success; Daytona is not called; nothing is pushed."
-      ],
-      [
-        "Confirm, no credentials",
-        "A {refused} job is written; the command exits failure; no sandbox exists."
-      ],
-      [
-        "Confirm with credentials",
-        "A Daytona sandbox is created, labelled with the job id and forge. This slice does not claim a GitHub, CNB, or Gitee PR URL, and a missing forge token fails closed the same way."
-      ]
-    ],
-    "membershipTitle": "Who can dispatch",
-    "membershipLead": "Managed Agent surfaces authenticate to the same Codewhale membership — the {login} account session. Membership gates cloud agents, not local dispatch: `codewhale dispatch` with Daytona and forge credentials needs no account. Managed cloud agents do not name the infrastructure behind them; local dispatch names Daytona only because you bring your own Daytona key. Installing or running the local runtime needs no account at all.",
-    "leftoverTitle": "Not built yet",
-    "leftover": [
-      [
-        "Live watch",
-        "A log tail of a running sandbox."
-      ],
-      [
-        "Cancel that tears down",
-        "Cancelling a paid Daytona sandbox from the job surface."
-      ],
-      [
-        "Auto-decide",
-        "Codewhale may propose a dispatch; it must not confirm its own proposal."
-      ],
-      [
-        "The remote runner",
-        "The agent that actually raises the branch and opens the pull request."
-      ]
+    "next": [
+      {
+        "href": "/docs/auth",
+        "label": "Connect a provider",
+        "note": "Sign in to your Codewhale account and manage keys."
+      },
+      {
+        "href": "/docs/review",
+        "label": "Review what changed",
+        "note": "Review the agent's pull request before you merge it."
+      },
+      {
+        "href": "/docs/fleet",
+        "label": "Run a workflow",
+        "note": "Run longer, multi-step work on your own machine instead."
+      }
     ],
     "sourceNote": "Source documents: docs/DAYTONA_CLOUD_DISPATCH.md, docs/CODEWHALE_AGENT.md · Update docs-map.ts when changing."
   },
   "docs-auth": {
-    "metaTitle": "Account & keys · Codewhale Docs",
-    "metaDescription": "Provider keys versus the optional Codewhale account: how each is set, where each is stored, and what needs no account at all.",
+    "metaTitle": "Connect a provider · Codewhale Docs",
+    "metaDescription": "Give Codewhale a model: save a provider key, check which key is in use, or run a local model with no key. A Codewhale account is optional.",
     "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewTitle": "Account & keys",
-    "overviewLead": "Codewhale holds two unrelated kinds of credential, and it helps to keep them apart. A provider key lets a model answer. A Codewhale account is optional and gates the managed surfaces — cloud agents and chat channels. Installing and running the local runtime needs neither an account nor a key.",
-    "credentials": [
-      [
-        "Provider key (BYOK)",
-        "Your own key for DeepSeek, OpenAI, Anthropic, OpenRouter, a local runtime, or any other route. Set with {authSet}. Required for model replies."
-      ],
-      [
-        "Codewhale account",
-        "A browser device-flow session started by {login}. Optional. Gates cloud agents and the Codewhale Agent surfaces; never required locally."
-      ]
+    "title": "Connect a provider",
+    "lede": "Codewhale needs a model to answer. Save a key for a hosted provider, or point Codewhale at a model running on your own machine. You pay the provider directly; no Codewhale account is involved.",
+    "sections": [
+      {
+        "id": "save-key",
+        "title": "Save a provider key",
+        "blocks": [
+          {
+            "p": "Get an API key from your provider, then save it. Codewhale asks for the key and does not echo it. DeepSeek is the default provider, so it is the example here."
+          },
+          {
+            "code": "codewhale auth set --provider deepseek\ncodewhale auth status --provider deepseek",
+            "lang": "Terminal"
+          },
+          {
+            "p": "`auth status` names the source in use — config file, secret store, or environment variable — and shows only the last four characters. In a script, pipe the key in with `--api-key-stdin` instead of typing it."
+          },
+          {
+            "p": "You can also connect from inside Codewhale: press F3 (or type `/provider`), choose a provider, paste the key, then pick a model."
+          },
+          {
+            "note": "In v0.10.0, `auth set --provider deepseek` also switches your default model to DeepSeek Pro. Run `/model` if you want the faster, cheaper model back. Connecting through F3 keeps your current model."
+          }
+        ]
+      },
+      {
+        "id": "which-key",
+        "title": "Know which key is used",
+        "blocks": [
+          {
+            "p": "When a key is set in more than one place, the first match in this order wins:"
+          },
+          {
+            "steps": [
+              "`--api-key` on the command line, for one run.",
+              "`api_key` in `~/.codewhale/config.toml`.",
+              "The secret store written by `codewhale auth set`.",
+              "The provider's environment variable, such as `DEEPSEEK_API_KEY`."
+            ]
+          },
+          {
+            "p": "Exporting a new environment variable therefore does not replace a key you saved earlier. If a rotated key keeps failing, run `auth status` to see which source is active, then save the new key or clear the stored one:"
+          },
+          {
+            "code": "codewhale auth clear --provider deepseek",
+            "lang": "Terminal"
+          },
+          {
+            "p": "On Linux the secret store is a private file (mode 0600) under `~/.codewhale/secrets/`, not an OS keyring. `codewhale doctor --probe-api` makes one test call to confirm that the key and the network both work."
+          }
+        ]
+      },
+      {
+        "id": "other-providers",
+        "title": "Use another provider or a local model",
+        "blocks": [
+          {
+            "p": "`codewhale auth list` shows every provider Codewhale knows and whether each one has a key. The pattern is the same for all of them: `codewhale auth set --provider <name>`, or that provider's environment variable."
+          },
+          {
+            "p": "Local runners — Ollama, vLLM, and SGLang — need no key by default, and your prompts stay on your machine. Start the runner, then choose it:"
+          },
+          {
+            "code": "codewhale auth list\ncodewhale --provider ollama --model <model-tag>",
+            "lang": "Terminal"
+          },
+          {
+            "p": "The [models page](/models) lists providers, local setups, and how to switch models mid-session."
+          }
+        ]
+      },
+      {
+        "id": "account",
+        "title": "Sign in to a Codewhale account (optional)",
+        "blocks": [
+          {
+            "p": "A provider key and a Codewhale account are different things. The account is for account features only, such as cloud agents and continuing a session from the web app. Installing Codewhale and working locally never need one."
+          },
+          {
+            "rows": [
+              [
+                "codewhale login",
+                "Sign in through your browser with a one-time code."
+              ],
+              [
+                "codewhale account status",
+                "Show which account this profile is signed in to."
+              ],
+              [
+                "codewhale account logout",
+                "Remove this profile's session."
+              ],
+              [
+                "codewhale account keys list",
+                "List provider keys saved in your account. Values are never shown."
+              ]
+            ],
+            "codeTerms": true
+          },
+          {
+            "p": "`codewhale login` does not accept provider keys; those always go through `codewhale auth set`. The session is kept in your operating system's credential manager when one is available, and in the private Codewhale secrets file otherwise — for example over SSH or in a container."
+          }
+        ]
+      }
     ],
-    "providerTitle": "Provider keys",
-    "providerLead": "{authSet} saves the key for one provider. A process-level {apiKeyFlag} still wins for a single run. {login} is not a provider-key command: provider credentials are configured exclusively through {authSet}.",
-    "accountTitle": "The account session",
-    "accountLead": "{login} is the same browser device flow as {accountLogin}. The session is scoped to the selected {profile}, and the older {cloud} spelling remains an alias.",
-    "accountCommands": [
-      [
-        "codewhale login",
-        "Sign in through the browser device flow."
-      ],
-      [
-        "codewhale account status",
-        "Show the session for the selected profile."
-      ],
-      [
-        "codewhale account logout",
-        "Remove that session."
-      ]
+    "next": [
+      {
+        "href": "/docs/guide",
+        "label": "Start your first task",
+        "note": "Open Codewhale in a project and give it something concrete to do."
+      },
+      {
+        "href": "/docs/modes",
+        "label": "Set modes and approvals",
+        "note": "Decide whether Codewhale asks before it runs commands."
+      },
+      {
+        "href": "/docs/trust",
+        "label": "See what leaves your machine",
+        "note": "What the provider receives, what stays local, and how to turn usage counting off."
+      }
     ],
-    "storageTitle": "Where sessions live",
-    "storageLead": "Account sessions prefer the operating system's credential manager and fall back automatically to the private, 0600 Codewhale secrets file when no credential manager is available — headless hosts, SSH, containers.",
-    "vaultTitle": "The account's own key vault",
-    "vaultLead": "{keys} manages the signed-in account's bring-your-own-key vault without ever displaying a secret value.",
-    "portableTitle": "Moving to another machine",
-    "portableLead": "{portable} writes a secret-free bundle: credential and machine-specific keys are dropped, never replaced with a redacted placeholder, so the file is safe to carry and nothing in it can sign in as you.",
-    "appTitle": "Sign in on the web",
-    "appLead": "The hosted Codewhale app carries the same account. Sign in or register there; the local runtime keeps working without it.",
-    "appSignIn": "Sign in →",
-    "appRegister": "Register →",
-    "sourceNote": "Source documents: docs/CONFIGURATION.md, docs/CODEWHALE_AGENT.md, docs/PROVIDERS.md · Update docs-map.ts when changing."
+    "sourceNote": "Source documents: docs/INSTALL.md §8, docs/PROVIDERS.md, docs/CODEWHALE_AGENT.md · Update docs-map.ts when changing."
   },
   "docs-trust": {
-    "metaTitle": "Security & trust · Codewhale Docs",
-    "metaDescription": "What stays on your machine, what a hosted provider receives, how approvals and the OS sandbox differ, what telemetry sends and how to turn it off, and where to report a vulnerability.",
+    "metaTitle": "See what leaves your machine · Codewhale Docs",
+    "metaDescription": "What stays local, what a model provider receives, what usage counting sends and how to turn it off, where the audit log lives, and how to report a vulnerability.",
     "bodyClassName": "text-ink-soft leading-relaxed",
-    "overviewTitle": "Security & trust",
-    "overviewLead": "This page says what Codewhale does with your code, your commands, and your data — as implemented, not as intended. Each claim is drawn from a repository document that the facts gate checks on every build.",
-    "boundaryTitle": "Where your data goes",
-    "boundaries": [
-      [
-        "Local runtime",
-        "The runtime, workspace state, and audit log stay on your machine."
-      ],
-      [
-        "Hosted provider",
-        "The hosted provider you select receives the turn context required for inference. There is no mandatory Codewhale relay in between."
-      ],
-      [
-        "Local inference",
-        "A loopback local-model route (vLLM, Ollama, SGLang) can keep inference on your machine entirely."
-      ],
-      [
-        "Account",
-        "No account is required for the local runtime."
-      ],
-      [
-        "Plan mode",
-        "Plan is read-only."
-      ]
+    "title": "See what leaves your machine",
+    "lede": "Codewhale runs on your computer and talks to the model provider you choose. This page lists what goes where, what the anonymous usage count contains, and how to switch it off — as built today.",
+    "sections": [
+      {
+        "id": "boundaries",
+        "title": "Where your work goes",
+        "blocks": [
+          {
+            "rows": [
+              [
+                "Stays on your machine",
+                "The runtime, your workspace, session history, snapshots, and the audit log."
+              ],
+              [
+                "Goes to your provider",
+                "The context each turn needs — your messages, the files and tool results Codewhale reads for that turn — goes directly to the provider you selected. There is no Codewhale relay in between."
+              ],
+              [
+                "Stays local entirely",
+                "With a local model (Ollama, vLLM, SGLang), inference never leaves your machine."
+              ],
+              [
+                "Needs no account",
+                "Installing and running Codewhale locally needs no Codewhale account."
+              ],
+              [
+                "Plan mode",
+                "Cannot edit files or run shell commands. Research it is allowed to do may still contact outside services."
+              ]
+            ]
+          },
+          {
+            "p": "Tools you add can send data elsewhere: an MCP server, a web search, or a hook runs with your permissions and reaches whatever it reaches. Add only ones you trust."
+          }
+        ]
+      },
+      {
+        "id": "telemetry",
+        "title": "Know what usage counting sends",
+        "blocks": [
+          {
+            "p": "Codewhale counts anonymous usage by default and says so the first time you launch it, naming Codewhale and PostHog. Here is exactly what it covers:"
+          },
+          {
+            "rows": [
+              [
+                "Never sent",
+                "Prompts, responses, code, diffs, file contents, file or repository or branch names, paths, model ids, MCP server names, API keys or tokens, error message text, keystrokes, or any per-turn or per-tool timeline."
+              ],
+              [
+                "Sent while on",
+                "Version and platform classes, session length and outcome, feature and error counts as fixed categories, and a random install id that changes every 90 days."
+              ],
+              [
+                "Where it goes",
+                "`https://telemetry.codewhale.net/v1/telemetry`, a first-party service whose source is in the repository. It stores no IP address, country, or location, keeps no request logs, and holds data for three months."
+              ],
+              [
+                "PostHog",
+                "Forwarding to PostHog happens only if the service operator configures it separately; it carries the same fields and nothing more."
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "id": "turn-off",
+        "title": "Turn usage counting off",
+        "blocks": [
+          {
+            "code": "codewhale config set telemetry false   # stop, and erase the local id and buffer\nCODEWHALE_TELEMETRY=0 codewhale        # stop for this process, erase nothing",
+            "lang": "Terminal"
+          },
+          {
+            "p": "The config setting is the lasting choice: later versions keep it, and a command-line flag or environment variable cannot turn it back on. You can also switch it in `/settings`. Turning it off deletes what was kept on your machine; rows already sent are keyed only to the random id you just erased, and expire with the three-month window."
+          },
+          {
+            "p": "To see exactly what would be sent without sending anything, set `telemetry_endpoint = \"\"` in `~/.codewhale/config.toml`. Each batch is then written to `$CODEWHALE_HOME/telemetry/dryrun.jsonl` on your machine, byte for byte, and no network connection is made."
+          }
+        ]
+      },
+      {
+        "id": "audit",
+        "title": "Check the local audit log",
+        "blocks": [
+          {
+            "p": "Credential, approval, and elevation events are appended to `$CODEWHALE_HOME/audit.log` (by default `~/.codewhale/audit.log`). Writing is best-effort: if a write fails, the failure is logged rather than hidden. The log never leaves your machine."
+          }
+        ]
+      },
+      {
+        "id": "report",
+        "title": "Report a vulnerability",
+        "blocks": [
+          {
+            "p": "Email security reports to the address below instead of opening a public issue. Include your Codewhale version (`codewhale --version`) and steps to reproduce if you have them."
+          }
+        ]
+      }
     ],
-    "approvalTitle": "Approvals are not a sandbox",
-    "approvalLead": "Approval posture — Ask, Auto-Review, Full Access — decides whether a proposed command is shown to you before it runs. An approval from one layer is never a universal bypass: a later layer can still require review or block the call, and an approval is not an operating-system sandbox grant. The full model tool-call pipeline is nine ordered layers, from effective configuration through hooks, typed permission rules, repository law, and human approval to the execution sandbox.",
-    "sandboxTitle": "The OS sandbox, per platform",
-    "sandboxLead": "Only behaviour wired into the command execution path is described here, and Codewhale reports the mechanism it actually selected.",
-    "sandboxes": [
-      [
-        "macOS — Seatbelt",
-        "Automatic when the runtime probe of sandbox-exec succeeds. Reported as {seatbelt}."
-      ],
-      [
-        "Linux — bubblewrap",
-        "Opt-in: {preferBwrap} and an executable /usr/bin/bwrap. Reported as {bwrap}."
-      ],
-      [
-        "Linux without bwrap",
-        "No OS wrapper by default. Reported as {none}."
-      ],
-      [
-        "Windows",
-        "No OS wrapper in the current implementation. Reported as {none}."
-      ],
-      [
-        "External service",
-        "{opensandbox} routes execution to an OpenSandbox-compatible service."
-      ]
+    "next": [
+      {
+        "href": "/docs/sandbox",
+        "label": "Limit what commands can touch",
+        "note": "What the operating-system sandbox enforces on each platform."
+      },
+      {
+        "href": "/docs/modes",
+        "label": "Set modes and approvals",
+        "note": "Decide what Codewhale may do without asking."
+      },
+      {
+        "href": "/docs/auth",
+        "label": "Connect a provider",
+        "note": "Choose who receives your turns — or keep them local with a local model."
+      }
     ],
-    "sandboxNote": "The repository also contains a seccomp module and a future Windows helper contract. Neither is wired into child-command launch, so Codewhale does not advertise them: source-only sandbox code is not evidence that a command was restricted.",
-    "telemetryTitle": "Telemetry, exactly",
-    "telemetryLead": "Codewhale 0.9.13 counts anonymous usage by default and tells you so at first launch; the earlier 0.9.11 release asked first. Turning it off is a saved choice that later versions keep, and an opt-out recorded under the earlier opt-in policy stays off. Showing the notice never records any acceptance on your behalf; Codewhale and PostHog are named as the processors.",
-    "telemetry": [
-      [
-        "Never collected",
-        "Conversations, code, prompts, files, file/repo/branch names, model content, credentials, or any per-turn or per-tool timeline."
-      ],
-      [
-        "Sent while on",
-        "Version and platform classes, session duration and outcome, feature and error counters, closed enums, and a random install id that rotates every 90 days."
-      ],
-      [
-        "Endpoint",
-        "{endpoint} — a first-party Cloudflare Worker whose source is in the repository under telemetry-ingest/."
-      ],
-      [
-        "First-party storage",
-        "No IP, country, or geo column. No request logs. Retention is a fixed three months."
-      ],
-      [
-        "PostHog",
-        "Optional forwarding requires separate operator configuration and verified IP-safe egress. PostHog retention is a separate project setting; source support does not mean the processor is active."
-      ],
-      [
-        "Audit it yourself",
-        "Set {dryRun}: batches are appended to {dryRunFile} on your machine, byte for byte what the server would have received, and no HTTP client is constructed."
-      ],
-      [
-        "Turn it off",
-        "{configOff} or {envOff}."
-      ]
-    ],
-    "auditTitle": "Local audit log",
-    "auditLead": "Sensitive events — credential, approval, and elevation events — append best-effort to {auditLog}. Write failures are logged rather than hidden. Provider token and cache usage is shown locally when available.",
-    "reportTitle": "Report a vulnerability",
-    "reportLead": "Send security reports by email to the maintainer rather than filing a public issue. Include the version from the masthead and a reproduction if you have one.",
-    "reportCta": "Email the maintainer",
-    "sourceNote": "Source documents: docs/SANDBOX.md, docs/AUTHORIZATION_ORDER.md, docs/TELEMETRY.md, docs/public-surface-facts.json · Update docs-map.ts when changing."
+    "sourceNote": "Source documents: docs/public-surface-facts.json (trust), docs/TELEMETRY.md, docs/SANDBOX.md · Update docs-map.ts when changing."
   },
   "states": {
     "loadingLabel": "Loading…",
@@ -784,10 +1908,9 @@
     "reload": "Reload the page",
     "homeLink": "Back to the home page",
     "docsIndexLink": "Open the documentation index",
-    "notFoundTitle": "We all make typos.",
-    "notFoundBody": "This page doesn’t exist yet.\nNeither does this game.",
-    "notFoundHomeLink": "Return to base",
-    "notFoundPosterAlt": "A blue whale in tactical gear on the fictional Codwhale: Modern Whalefare game poster.",
+    "notFoundTitle": "This page isn’t here",
+    "notFoundBody": "The link may be out of date, or the address has a typo. Start again from the home page or the documentation.",
+    "notFoundHomeLink": "Go to the home page",
     "unavailableTitle": "The live record has not loaded",
     "unavailableBody": "The source did not answer the last refresh, or this page has not refreshed since it was built. Nothing is shown in its place.",
     "offlineTitle": "You are offline",
@@ -867,9 +1990,6 @@
     "notes": "Release notes",
     "demo": "See the background check",
     "source": "Source and other platforms",
-    "platforms": "This download is for Mac. Windows and Linux currently use the source plugin and host-side setup.",
-    "installTitle": "Computer Use for Mac",
-    "installLead": "Add background app control with the Computer Use helper. Set up Mac permissions, run a background check, and pause or stop helper input from your menu bar.",
-    "installLink": "Computer Use download and setup"
+    "platforms": "This download is for Mac. Windows and Linux currently use the source plugin and host-side setup."
   }
 }

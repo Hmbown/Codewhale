@@ -17,7 +17,7 @@ use crate::network_policy::{Decision, host_from_url};
 
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
-    optional_bool, optional_str, required_str,
+    optional_str, required_str,
 };
 
 pub(crate) const DEFAULT_FORMAT: &str = "wav";
@@ -135,10 +135,6 @@ impl ToolSpec for SpeechTool {
                     "type": "string",
                     "description": "Requested audio format. Default: wav. Providers commonly document wav and pcm16; mp3 is accepted when the API returns it.",
                     "enum": SUPPORTED_SPEECH_FORMATS
-                },
-                "stream": {
-                    "type": "boolean",
-                    "description": "Low-latency streaming request. The direct tool currently writes complete audio files only, so leave this false."
                 }
             },
             "required": ["text"]
@@ -181,11 +177,6 @@ impl ToolSpec for SpeechTool {
                 SUPPORTED_SPEECH_FORMATS.join(", ")
             ))
         })?;
-        if optional_bool(&input, "stream", false)? {
-            return Err(ToolError::invalid_input(
-                "stream=true low-latency speech output is not implemented in the direct tool yet; use stream=false to generate a complete audio file",
-            ));
-        }
         let output_raw = optional_str(&input, "output")?
             .map(str::trim)
             .filter(|value| !value.is_empty());
@@ -308,7 +299,6 @@ impl ToolSpec for SpeechTool {
             "base_url": openai_compatible_base_url(client.base_url()),
             "model": response.model,
             "format": response.audio_format,
-            "stream": false,
             "output": output_label,
             "absolute_output": output_path.display().to_string(),
             "bytes": response.audio_bytes.len(),
@@ -586,6 +576,8 @@ mod tests {
         let schema = tool.input_schema();
         assert!(schema.to_string().contains("mimo-v2.5-tts-voiceclone"));
         assert!(schema.to_string().contains("pcm16"));
-        assert!(schema.to_string().contains("stream"));
+        // #6516: the tool writes complete audio files only, so it no longer
+        // advertises a `stream` parameter it could only reject.
+        assert!(schema["properties"].get("stream").is_none());
     }
 }

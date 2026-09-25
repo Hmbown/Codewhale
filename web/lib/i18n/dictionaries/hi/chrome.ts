@@ -36,24 +36,7 @@ export const chrome: ChromeDict = {
 
   authSignIn: "साइन इन करें",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "कोई भी मॉडल, आपकी मशीन पर",
-
-  issueLabel: "{date} का अंक",
   dateLocale: "hi-IN",
-
-  tickerLiveLabel: "लाइव",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "मर्ज",
-  tickerOpened: "खोला गया",
-  tickerClosed: "बंद किया गया",
-  tickerReleased: "रिलीज़ हुआ",
-  tickerFirstContribution: "पहला योगदान",
-  tickerBy: "{handle} द्वारा",
-  tickerAria: "रिपॉज़िटरी की हालिया गतिविधि",
-
-  traceLabel: "रीज़निंग ट्रेस",
-  traceTabsAria: "सेशन के अंश",
 
   menuOpen: "मेनू खोलें",
   menuClose: "मेनू बंद करें",

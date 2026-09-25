@@ -1141,7 +1141,6 @@
   "PendingApprovalInAgent": "Freigabe nötig in {agent} — /agents",
   "ApprovalTruncationHint": "  … gekürzt · {details} für volle Details",
   "ApprovalFullAccessPolicyBlocked": "{tool} blockiert: Full Access kann diese Policy nicht umgehen",
-  "AutoReviewQuestionSkipped": "Auto-Review hat eine Nutzerfrage übersprungen und autonom fortgefahren",
   "ApprovalChooseHint": "Wahl: ",
   "ApprovalChooseAction": "Enter wählt die Option, oder direkt y/a/d drücken",
   "ApprovalIntentLabel": "Absicht: ",

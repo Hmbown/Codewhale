@@ -26,7 +26,7 @@ const RAW: Record<string, string> = (() => {
   for (const match of generated.matchAll(/--((?:whale|light|shoreline-light|shoreline|gpui)-[\w-]+):\s*([^;]+);/g)) {
     raw[match[1]] = match[2].trim();
   }
-  for (const match of globals.matchAll(/--(gpui-[\w-]+):\s*([^;]+);/g)) {
+  for (const match of globals.matchAll(/--((?:gpui|ocean|brand)-[\w-]+):\s*([^;]+);/g)) {
     raw[match[1]] = match[2].trim();
   }
   if (Object.keys(raw).length === 0) {
@@ -44,8 +44,8 @@ function flatten(name: string, seen = new Set<string>()): string {
   return flatten(alias[1], seen.add(name));
 }
 
-/** Resolve a `var(--whale-*)`, `var(--light-*)`, `var(--shoreline-*)`, or `var(--gpui-*)` reference to its literal value; pass anything else through. */
+/** Resolve a `var(--whale-*)`, `var(--light-*)`, `var(--shoreline-*)`, `var(--gpui-*)`, `var(--ocean-*)` or `var(--brand-*)` reference to its literal value; pass anything else through. */
 export function resolveWhale(value: string): string {
-  const match = value.match(/^var\(--((?:whale|light|shoreline-light|shoreline|gpui)-[\w-]+)\)$/);
+  const match = value.match(/^var\(--((?:whale|light|shoreline-light|shoreline|gpui|ocean|brand)-[\w-]+)\)$/);
   return match ? flatten(match[1]) : value;
 }

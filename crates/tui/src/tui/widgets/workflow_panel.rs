@@ -171,7 +171,7 @@ impl WorkflowRowStatus {
     fn from_ir_status(status: &str) -> Self {
         match status {
             "succeeded" | "completed" | "success" | "done" => Self::Succeeded,
-            "failed" | "error" | "replay_diverged" => Self::Failed,
+            "failed" | "error" => Self::Failed,
             "cancelled" | "canceled" => Self::Cancelled,
             "budget_exceeded" => Self::Failed,
             "running" => Self::Running,

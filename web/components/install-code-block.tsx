@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { Icon } from "./icon";
 import { recordUsage } from "./usage-counting";
 
 interface Props {
@@ -10,7 +11,12 @@ interface Props {
   copyLocale?: string;
 }
 
-export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copied ✓", copyLocale }: Props) {
+/**
+ * A command in a code block with one icon button that copies it. The check
+ * mark and the "Copied" announcement appear only after the clipboard write
+ * succeeds; a failed write never shows a false confirmation.
+ */
+export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copied", copyLocale }: Props) {
   const [copied, setCopied] = useState(false);
 
   const copy = async () => {
@@ -27,17 +33,23 @@ export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copie
   };
 
   return (
-    <div className="relative">
+    <div className="code">
+      <pre tabIndex={0} className="code-block">{cmd}</pre>
       <button
+        type="button"
         lang={copyLocale}
         onClick={copy}
-        aria-label={copied ? copiedLabel : copyLabel}
+        aria-label={copyLabel}
+        title={copyLabel}
         data-copied={copied}
-        className="copy-btn absolute top-3 right-3 z-10 px-3 py-1 bg-paper hairline-t hairline-b hairline-l hairline-r rounded text-xs hover:bg-indigo hover:text-paper transition-colors"
+        className="nav-icon-button nav-icon-button-sm code-copy"
       >
-        {copied ? copiedLabel : copyLabel}
+        <Icon name={copied ? "check" : "copy"} className="nav-icon" />
       </button>
-      <pre className="code-block text-[0.78rem] m-0 max-w-full pr-20">{cmd}</pre>
+      <span className="sr-only" aria-live="polite" lang={copyLocale}>
+        {/* The check mark is drawn by the icon; announce only the word. */}
+        {copied ? copiedLabel.replace(/\s*✓\s*$/u, "") : ""}
+      </span>
     </div>
   );
 }

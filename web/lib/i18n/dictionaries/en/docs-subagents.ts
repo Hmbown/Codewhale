@@ -1,47 +1,122 @@
 import type { DocsSubagentsDict } from "../types";
 
 /**
- * English reference dictionary for `app/[locale]/docs/subagents/page.tsx`.
- * Copy moved verbatim from the page's `isZh` ternaries — any wording change
- * belongs in its own commit, never mixed into a structural move.
+ * English reference dictionary for `app/[locale]/docs/subagents/page.tsx`
+ * ("Run agents in parallel"). Roles follow the current Fleet role table in
+ * docs/SUBAGENTS.md (general/explore/planner/reviewer/implement/test/
+ * advisor/custom); limits follow crates/tui/src/config/subagent_limits.rs
+ * and docs/CONFIGURATION.md (`max_subagents`, `[subagents]`).
  */
 export const docsSubagents: DocsSubagentsDict = {
-  metaTitle: "Sub-Agents · Codewhale Docs",
+  metaTitle: "Run agents in parallel · Codewhale Docs",
   metaDescription:
-    "The agent tool, fleet roles, context forking, worktree isolation, and concurrency caps.",
+    "Let Codewhale hand independent parts of a task to sub-agents, choose their roles, keep their edits in separate worktrees, and watch them work.",
   bodyClassName: "text-ink-soft leading-relaxed",
-  overviewTitle: "Sub-Agents",
-  overviewLead:
-    "A parent session launches one focused sub-agent through the agent tool and immediately gets back an agent_id, a compact receipt, and a transcript handle while the worker runs in the background. Sub-agents inherit the parent's tool registry by default, but they are leaf workers: they do not receive agent or nested lifecycle tools. agent launches detached background work — cancelling the parent turn stops the parent's wait path, but it does not kill already-opened child runs.",
-  overviewFleetNote:
-    "For work that must survive process restarts, sleep, or remote execution, prefer a fleet or a Workflow-backed fleet run over a short in-session agent call.",
-  roles: [
-    [
-      "worker",
-      "Flexible multi-step execution of the parent's brief; writes and shell allowed. The default role.",
-    ],
-    ["scout", "Read-only, maps the relevant code fast — “find every call site of Foo.”"],
-    [
-      "planner",
-      "Analyse and produce a strategy without executing — “design the migration; don't run it.”",
-    ],
-    ["reviewer", "Read-and-grade with severity scores — “audit this PR for bugs.”"],
-    ["builder", "Land a specific change with minimal edits; writes and shell allowed."],
-    ["verifier", "Run tests and validation gates and report the outcome; no code edits."],
-    [
-      "consultant",
-      "Read-only high-reasoning counsel for judgement calls and design critique.",
-    ],
-    ["custom", "An explicit narrow tool allowlist for locked-down dispatch."],
+  title: "Run agents in parallel",
+  lede:
+    "Codewhale can hand a focused piece of work to a sub-agent and keep going while it runs. Use this when a task splits into independent parts — mapping a codebase, reviewing a change, running tests — so they happen at the same time.",
+  sections: [
+    {
+      id: "ask",
+      title: "Ask for it",
+      blocks: [
+        {
+          p: "You do not start sub-agents with a command; you ask in plain words. In Operate, Codewhale does this on its own for independent steps. In Work, say what you want split up:",
+        },
+        {
+          code: `Use three explore agents in parallel: one maps the auth code,
+one maps the billing code, one lists the tests that cover both.
+Then summarize what would break if we changed the session format.`,
+          lang: "Prompt",
+        },
+        {
+          p: "Each sub-agent starts in the background and reports back when it finishes. Your composer stays free, and the parent turn picks up the results.",
+        },
+      ],
+    },
+    {
+      id: "roles",
+      title: "Pick a role",
+      blocks: [
+        {
+          p: "A role is the stance a sub-agent takes. Name one in your request, or let Codewhale choose. A sub-agent never gets more permission than your session has.",
+        },
+        {
+          rows: [
+            ["general", "Does whatever the brief says; may edit and run commands. The default."],
+            ["explore", "Read-only. Maps the relevant code fast — “find every caller of this function.”"],
+            ["planner", "Designs an approach without changing anything."],
+            ["reviewer", "Reads and grades a change, with a severity for each finding."],
+            ["implement", "Lands one specific change with the smallest edit."],
+            ["test", "Runs tests and checks, then reports pass or fail. Does not edit code."],
+            ["advisor", "Short, careful second opinion on a judgment call. No commands."],
+            ["custom", "Only the tools you list, for tightly limited jobs."],
+          ],
+          codeTerms: true,
+        },
+        {
+          p: "To give a role a specific model every time, save it with `/fleet setup` — see [Run a workflow](/docs/fleet).",
+        },
+      ],
+    },
+    {
+      id: "worktrees",
+      title: "Keep parallel edits apart",
+      blocks: [
+        {
+          p: "When two sub-agents would edit the same repository, ask for each to work in its own worktree. Codewhale creates a fresh git worktree and branch for that agent beside your repository, under `.codewhale-worktrees/`, so your checkout stays clean until you merge.",
+        },
+        {
+          p: "A worktree is isolation, not permission: an agent that should write still needs a writing role and the paths it may change. Two agents that claim the same files are stopped before either one edits anything.",
+        },
+      ],
+    },
+    {
+      id: "watch",
+      title: "Watch and answer them",
+      blocks: [
+        { code: "/subagents", lang: "Codewhale" },
+        {
+          p: "`/subagents` (the same view as `/fleet workers`) lists the agents attached to this session and what each one is doing. Select one to read its transcript.",
+        },
+        {
+          p: "Sub-agents follow your [approval setting](/docs/modes). In Ask, a call that needs approval appears in your session as a normal prompt while the agent waits. In Auto-Review, each held call gets the same independent review, and nothing prompts you. Every decision you did not make yourself is written to the agent's transcript.",
+        },
+      ],
+    },
+    {
+      id: "limits",
+      title: "Know the limits",
+      blocks: [
+        {
+          rows: [
+            ["Running at once", "64 by default. Set `max_subagents` (up to 128) in `~/.codewhale/config.toml`."],
+            ["Queued plus running", "Up to 1,024; extra launches wait for a slot."],
+            ["Nesting", "A sub-agent may start its own, three levels deep by default, never more than eight."],
+          ],
+        },
+        {
+          p: "These are ceilings, not targets. A few well-scoped agents with one clear summary beat many overlapping ones. For work that must survive a restart or a sleeping laptop, use a [Fleet run](/docs/fleet) instead.",
+        },
+      ],
+    },
   ],
-  forkTitle: "Context forking",
-  forkLead:
-    "{agentTool} starts fresh by default: the child gets its role prompt plus the task you pass. When the task depends on decisions, files, todos, or plan state already in the parent transcript, use {forkContext} — the runtime keeps the parent's request prefix byte-identical where available (preserving prefix-cache reuse), appends a structured state snapshot, then adds the sub-agent role instructions and task at the tail. Use fresh sessions for independent exploration and forked sessions for continuation, review, summarization, or compaction work.",
-  worktreeTitle: "Worktree isolation",
-  worktreeLead:
-    "Launch parallel edit lanes with {worktreeFlag}: Codewhale creates a fresh git worktree and branch for the child (default {branchPattern}, checked out beside the parent repo under {worktreeDir}) so the parent checkout stays clean. Isolation is not write authority: a prompt-only worker starts read-only, and a writer also declares {writeAuthority} plus at least one normalized {writeRoots}, {exactFiles}, or {coordinationContracts} value. Overlapping shared write claims fail before any mutation.",
-  capacityTitle: "Concurrency caps",
-  capacityLead:
-    "The sub-agent capacity source of truth is crates/tui/src/config/subagent_limits.rs: default configured concurrency is 64, maximum configured concurrency is 128, and maximum admitted running-plus-queued work is 1024. These are capacity ceilings, not advice to dispatch every slot — a manager should use the smallest useful fan-out, keep a single fan-in owner, and verify worker receipts before reporting combined completion.",
-  sourceNote: "Source document: docs/SUBAGENTS.md · Update docs-map.ts when changing.",
+  next: [
+    {
+      href: "/docs/fleet",
+      label: "Run a workflow",
+      note: "Turn a plan you repeat into a Workflow with phases and a record of each run.",
+    },
+    {
+      href: "/docs/work",
+      label: "Track progress",
+      note: "How the To-do list shows what is done, in progress, and left.",
+    },
+    {
+      href: "/docs/review",
+      label: "Review what changed",
+      note: "Check what the agents changed before you keep it.",
+    },
+  ],
+  sourceNote: "Source documents: docs/SUBAGENTS.md, docs/FLEET.md, docs/MODES.md · Update docs-map.ts when changing.",
 };

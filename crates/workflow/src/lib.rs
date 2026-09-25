@@ -5,7 +5,6 @@
 //! top only after their cancellation and evidence semantics are proven.
 
 mod elevation;
-pub mod experimental_search;
 /// Setup-time Fleet composition: a suggestion schema with no runtime authority.
 ///
 /// Deliberately **not** re-exported from the crate root. The setup wizard uses
@@ -23,8 +22,6 @@ mod model_policy;
 mod named_fleet;
 pub mod reasoning_router;
 pub mod redaction;
-mod replay;
-mod review_repair;
 mod role_resolve;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -82,11 +79,6 @@ pub use reasoning_router::{
 pub use redaction::{
     REDACTION_ABSOLUTE_PATH, REDACTION_RELATIVE_PATH, REDACTION_SECRET, Redaction,
     redact_for_disclosure,
-};
-pub use replay::*;
-pub use review_repair::{
-    IterationReceipt, IterationVerdict, ReviewRepairBounds, ReviewRepairError, ReviewRepairLoop,
-    ReviewRepairPolicy, RouteReceipt, RoutedBy, StopReason,
 };
 pub use role_resolve::{
     FleetRoleMap, FleetRoleResolveError, ResolvedWorkflowAgent, normalize_token,
@@ -754,7 +746,6 @@ pub enum WorkflowRunStatus {
     Failed,
     Cancelled,
     BudgetExceeded,
-    ReplayDiverged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -809,10 +800,6 @@ impl WorkflowExecution {
 
     pub fn mark_budget_exceeded(&mut self) {
         self.status = WorkflowRunStatus::BudgetExceeded;
-    }
-
-    pub(crate) fn mark_replay_diverged(&mut self) {
-        self.status = WorkflowRunStatus::ReplayDiverged;
     }
 
     fn should_stop_mock_execution(&self) -> bool {
@@ -1267,7 +1254,6 @@ fn mark_execution_for_status(execution: &mut WorkflowExecution, status: Workflow
         WorkflowRunStatus::Failed => execution.mark_failed(),
         WorkflowRunStatus::Cancelled => execution.mark_cancelled(),
         WorkflowRunStatus::BudgetExceeded => execution.mark_budget_exceeded(),
-        WorkflowRunStatus::ReplayDiverged => execution.mark_replay_diverged(),
     }
 }
 

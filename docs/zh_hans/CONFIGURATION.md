@@ -168,7 +168,7 @@ allow_shell = true
 
 覆盖刻意很窄——它覆盖仓库维护者最可能想要跨贡献者标准化的字段。凭据、端点、provider 选择、MCP 配置、hooks、skills、重试、热栏绑定和 `instructions = [...]` 设置保持用户全局。如果仓库本地配置声明了 `api_key`、`base_url`、`provider`、`mcp_config_path`、`hotbar`、`allow_shell = true` 或 `instructions`，Codewhale 会忽略该键并保留用户的全局设置。
 
-合并的 `codewhale` 运行时为 DeepSeek 认证和模型默认值使用同一个配置文件。`codewhale auth set --provider deepseek` 把 key 保存到 `~/.codewhale/config.toml`(需要时在首次启动迁移旧 `~/.deepseek/config.toml`)，`codewhale --model deepseek-v4-flash` 作为 `DEEPSEEK_MODEL` 转发给 TUI。
+合并的 `codewhale` 运行时为 DeepSeek 认证和模型默认值使用同一个配置文件。`codewhale auth set --provider deepseek` 把 key 保存到 `~/.codewhale/config.toml`(需要时在首次启动迁移旧 `~/.deepseek/config.toml`)，`codewhale --model deepseek-v4-flash` 作为 `CODEWHALE_MODEL` 转发给 TUI。分发器不再写入这些变量的 `DEEPSEEK_*` 孪生变量；你自己设置的 `DEEPSEEK_*` 值在对应的 `CODEWHALE_*` 未设置时仍作为旧别名读取。
 
 `codewhale login` 登录 Codewhale 账号——它与 `codewhale account login` 是同一个浏览器设备流(device flow)，不是 provider-key 命令。Provider 凭据完全通过 `codewhale auth set --provider <provider>` 配置。
 
@@ -411,7 +411,11 @@ update_uri = "https://internal.mirror.example/codewhale/releases/latest"
 
 ## Workshop 输出预算
 
-`[workshop]` 在工具结果超过 `large_output_threshold_tokens` 时，仍会把过大的工具结果路由到合成路径。两个可选的字节上限(#5367)在该路由之后提高模型可见的下限，并且永不降低：
+默认情况下，过大的工具结果采用有界溢出：低于字节阈值的结果保持内联，更大的结果给出首尾预览和一个模型可以回读的会话产物。不存在合成子代理，也没有逐调用的 `raw = true` 逃逸。
+
+`[workshop] large_output_threshold_tokens` 和 `[workshop.per_tool_thresholds]`(按模型可见的精确工具名，例如 `bash`)只有在进程通过 `CODEWHALE_ADAPTIVE_OUTPUT_ROUTING=1` 选择自适应证据路由时才生效。
+
+两个可选的字节上限(#5367)在任何情况下都适用，它们提高模型可见的下限，并且永不降低：
 
 - `read_result_max_bytes`——单个 `read` / `read_file` 结果的上限。缺省时保持编译期默认(`read` 为 50KiB / 2000 行，`read_file` 为 16KiB / 500 行)。
 - `tool_result_max_bytes`——溢出后通用工具结果的上限。缺省时保持 12K 字符的紧凑下限(窗口 ≥500K token 时为 48K)。硬上限 2MiB。
@@ -1156,9 +1160,8 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
   - `[snapshots].max_age_days`(int，默认 `7`)
   - 快照位于 `~/.codewhale/snapshots/<project_hash>/<worktree_hash>/.git`，旧 `~/.deepseek/snapshots/...` 仅在旧状态存在时回退，从不使用工作区自己的 `.git` 目录
 - `context.*`(可选):
-  - `[context].enabled`(bool，默认 `false`)
   - `[context].project_pack`(bool，默认 `false`)：在稳定提示前缀中包含确定性的项目上下文包(大型美化打印的目录列表)(#4781)。对弱工具调用模型有用；模型可以用一次 `File` 调用重建同样信息。
-  - 前 seam 管理器键(`verbatim_window_turns`、`l1_threshold`、`l2_threshold`、`l3_threshold`、`seam_model`)被**忽略**——为向后兼容解析，但自 2026-07-23 起任何地方都不读。
+  - 已移除的 seam 管理器键(`enabled`、`verbatim_window_turns`、`l1_threshold`、`l2_threshold`、`l3_threshold`、`seam_model`)如仍留在旧配置中会被忽略，不再加载。
 - `retry.*`(可选):API 请求的重试/退避设置：
   - `[retry].enabled`(bool，默认 `true`)
   - `[retry].max_retries`(int，默认 `3`)
@@ -1175,7 +1178,6 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 - `[notifications.event_sound]`(表，可选)：选择加入、确定性的逐事件声音提示。键：`enabled`(bool，默认 `false`)、`events`(kebab-case 事件名数组，默认 `["turn-complete", "approval-needed"]`)、`min_interval_ms`(int，默认 `2000`)、`quiet`(bool，默认 `false`)。见下方"事件声音提示"。
 - `tui.alternate_screen`(字符串，可选，默认 `auto`)：交互式会话启动时使用哪个屏幕。`auto` 和 `always` 在 TUI 拥有的备用屏幕上启动；`never` 以内联模式启动——与终端等高、不使用备用屏幕的 ratatui 视口，因此 shell 的回滚缓冲在会话期间保持完好，退出后仍可滚动。`/fullscreen` 与 `/inline` 在进程内切换；终端拒绝的切换会回滚并说明原因。内联模式在其视口内绘制整个转录——会话运行期间不会向宿主回滚缓冲写入任何内容。
 - `tui.mouse_capture`(bool，可选，非 Windows 终端和备用屏幕活动时的 Windows Terminal/ConEmu/Cmder 上默认 `true`；旧 Windows 控制台和 JetBrains JediTerm 内部——PyCharm/IDEA/CLion 等——为 `false`，那里鼠标事件转义作为乱码文本漏进输入流，见 #878 / #898)：启用内部鼠标滚动、转录选择、右键上下文动作和转录滚动条拖动。TUI 拥有的拖拽选择只复制转录文本，从段落中移除视觉换行列断点，保持选择限于转录窗格。设为 `false` 或带 `--no-mouse-capture` 运行使用原始终端选择；设为 `true` 或带 `--mouse-capture` 运行可在任何默认关闭处选择加入。在原始终端选择上，尤其是旧 Windows 控制台或鼠标捕获禁用时，选择可能跨越右侧栏并包含视觉换行，因为选择由终端而不是 TUI 拥有。
-- `tui.terminal_probe_timeout_ms`(int，可选)：兼容旧配置而保留的设置，现已不再使用。启动时在检查终端所有权后直接设置原始模式，不再因工作线程调度延迟而中止启动。
 - `tui.stream_chunk_timeout_secs`(int，可选，默认 `900`)：流式模型响应的每 SSE 块空闲超时。慢的本地或兼容服务器可以用 `/config stream_chunk_timeout_secs <seconds>` 提高；`0` 映射到默认，显式值必须 `1..=3600`。省略该键时旧 `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` 环境变量仍被遵循。
 - `tui.osc8_links`(bool，可选，macOS/Linux 默认开启，Windows 默认关闭)：在转录输出的 URL 周围发出 OSC 8 转义序列，这样支持的终端(iTerm2、Terminal.app 13+、Ghostty、Kitty、WezTerm、Alacritty、较新的 gnome-terminal/konsole)可以用终端的链接手势打开它们——通常是 macOS 上的 Cmd-click,Linux/Windows 上的 Ctrl-click。没有 OSC 8 支持的终端渲染普通标签并忽略转义。转义带外发出(不在缓冲区单元格内)，所以列损坏不是问题；只在终端错误渲染 OSC 8 终止符本身时设 `false`。Windows 旧控制台默认关闭；用 `true` 选择加入。
 - `transcript.prose_measure`(正整数，可选，默认缺省 = 全宽)：实时转录中散文单元格——用户消息、助手回答和推理/思考块——的换行上限，以列为单位(#5436)。缺省(或 `0`)使用全部内容宽度，与工具/状态单元格和 #5322 宽帧决策一致；前 105 列散文栏已移除。在超宽终端上设置正整数(例如 `[transcript]` 下的 `prose_measure = 120`)恢复有界的阅读度量。窄终端总是保持内容宽度——上限只从上方钳制。工具、diff 和状态单元格从不继承这个上限。无效值(负或非整数)在启动时以 `transcript.prose_measure` 配置错误被拒绝。每次渲染遍解析一次，所以主转录缓存和全屏覆盖层总是就有效宽度达成一致。

@@ -279,6 +279,29 @@ pub fn optional_str<'a>(
         .ok_or_else(|| type_mismatch(field, value, "a string"))
 }
 
+/// Read a JSON number as a non-negative integer, accepting whole-number
+/// floats such as `200.0`.
+///
+/// Several providers serialize every JSON number as a float, so a ranged
+/// `read` arrives as `{"offset": 200.0}`. Exact integers keep the `as_u64`
+/// fast path (so `u64::MAX` stays exact); a float is accepted only when it
+/// is finite, non-negative, has no fractional part and fits in `u64`.
+/// Negative, fractional, string and array values are still refused.
+#[must_use]
+pub fn json_nonnegative_integer(value: &Value) -> Option<u64> {
+    if let Some(number) = value.as_u64() {
+        return Some(number);
+    }
+    let float = value.as_f64()?;
+    // 2^64 is exactly representable as f64; anything at or above it overflows.
+    const U64_LIMIT: f64 = 18_446_744_073_709_551_616.0;
+    if float.is_finite() && float >= 0.0 && float.fract() == 0.0 && float < U64_LIMIT {
+        // The guards above make this cast exact.
+        return Some(float as u64);
+    }
+    None
+}
+
 /// Helper to extract a required u64 field from JSON input.
 ///
 /// Absence (field missing or `null`) is a `missing_field` error; a value
@@ -291,8 +314,7 @@ pub fn required_u64(input: &Value, field: &str) -> std::result::Result<u64, Tool
         return Err(ToolError::missing_field(field));
     }
     let value = value.expect("is_absent covers the None case");
-    value
-        .as_u64()
+    json_nonnegative_integer(value)
         .ok_or_else(|| type_mismatch(field, value, "a non-negative integer"))
 }
 
@@ -309,8 +331,7 @@ pub fn optional_u64(
         return Ok(default);
     }
     let value = value.expect("is_absent covers the None case");
-    value
-        .as_u64()
+    json_nonnegative_integer(value)
         .ok_or_else(|| type_mismatch(field, value, "a non-negative integer"))
 }
 
@@ -773,9 +794,27 @@ mod tests {
             u64::MAX
         );
 
+        // Whole-number floats are integers some providers send as `200.0`.
+        assert_eq!(
+            required_u64(&json!({"count": 200.0}), "count").unwrap(),
+            200
+        );
+        assert_eq!(required_u64(&json!({"count": 0.0}), "count").unwrap(), 0);
+        assert_eq!(
+            optional_u64(&json!({"count": 200.0}), "count", 7).unwrap(),
+            200
+        );
+
         // Present but wrongly typed is a type mismatch naming the field and
-        // the expected type — never a missing-field misdirection.
-        for value in [json!(-1), json!(2.5), json!("42")] {
+        // the expected type — never a missing-field misdirection. Floats that
+        // are negative, fractional or beyond u64 stay refused.
+        for value in [
+            json!(-1),
+            json!(-1.0),
+            json!(2.5),
+            json!(1.8446744073709552e19),
+            json!("42"),
+        ] {
             let err = required_u64(&json!({"count": value}), "count")
                 .expect_err("wrong type must not look missing")
                 .to_string();

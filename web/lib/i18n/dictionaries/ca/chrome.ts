@@ -38,24 +38,7 @@ export const chrome: ChromeDict = {
 
   authSignIn: "Inicia la sessió",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "qualsevol model, a la teva màquina",
-
-  issueLabel: "Edició del {date}",
   dateLocale: "ca-ES",
-
-  tickerLiveLabel: "En directe",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "fusionat",
-  tickerOpened: "obert",
-  tickerClosed: "tancat",
-  tickerReleased: "publicat",
-  tickerFirstContribution: "primera contribució",
-  tickerBy: "per {handle}",
-  tickerAria: "Activitat recent del repositori",
-
-  traceLabel: "traça de raonament",
-  traceTabsAria: "Extractes de sessió",
 
   menuOpen: "Obre el menú",
   menuClose: "Tanca el menú",

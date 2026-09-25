@@ -38,7 +38,4 @@ export const computerUse: ComputerUseDict = {
   demo: "查看后台检查演示",
   source: "源码与其他平台",
   platforms: "此下载适用于 Mac。Windows 和 Linux 目前通过源码插件及宿主端设置使用。",
-  installTitle: "Mac 版 Computer Use",
-  installLead: "通过 Computer Use 助手添加应用后台操作能力。设置 Mac 权限、运行后台检查，并从菜单栏暂停或停止助手输入。",
-  installLink: "Computer Use 下载与设置",
 };

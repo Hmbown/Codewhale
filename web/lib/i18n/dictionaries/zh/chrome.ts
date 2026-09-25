@@ -26,24 +26,7 @@ export const chrome: ChromeDict = {
 
   authSignIn: "登录",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "任意模型，本机运行",
-
-  issueLabel: "第 {date} 期",
   dateLocale: "zh-CN",
-
-  tickerLiveLabel: "实 时",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "已合并",
-  tickerOpened: "已开启",
-  tickerClosed: "已关闭",
-  tickerReleased: "已发布",
-  tickerFirstContribution: "首次贡献",
-  tickerBy: "作者 {handle}",
-  tickerAria: "仓库近期动态",
-
-  traceLabel: "推理痕迹",
-  traceTabsAria: "会话片段",
 
   menuOpen: "打开菜单",
   menuClose: "关闭菜单",

@@ -1,8 +1,8 @@
-// Bypassing the '@' alias to force TypeScript to find the file
-import { EmptyState } from "../../../components/surface-state";
-import { getDigest } from "../../../lib/i18n/dictionaries";
-import { getEnv } from "../../../lib/kv";
-import { buildPageMetadata } from "../../../lib/page-meta";
+import { PageHeader } from "@/components/page-header";
+import { EmptyState } from "@/components/surface-state";
+import { getDigest, pickTextLocale } from "@/lib/i18n/dictionaries";
+import { getEnv } from "@/lib/kv";
+import { buildPageMetadata } from "@/lib/page-meta";
 
 // Define the exact structure of the Digest data to fix all the 'any' type errors
 interface DigestSection {
@@ -78,58 +78,49 @@ export default async function DigestArchivePage({ params }: { params: Promise<{ 
     }
   }
 
-  // Handle empty state gracefully
+  // The records are bilingual; show the reader's language (English for
+  // every locale without a Chinese record).
+  const zh = pickTextLocale(locale) === "zh";
+
   if (digests.length === 0) {
     return (
-      <div className="route-state">
-        <h1 className="font-display text-3xl mb-6 tracking-crisp text-ink">
-          {t.emptyTitle}
-        </h1>
-        <EmptyState locale={locale} body={t.emptyBody} />
-      </div>
+      <>
+        <PageHeader title={t.title} lede={t.lead} pose="read" />
+        <div className="page-body">
+          <EmptyState locale={locale} title={t.emptyTitle} body={t.emptyBody} pose="sleep" />
+        </div>
+      </>
     );
   }
 
   return (
-    <div className="max-w-4xl mx-auto py-12 px-6">
-      <h1 className="font-display text-4xl mb-2 tracking-crisp text-ink">
-        {t.title}
-      </h1>
-      <p className="text-ink-mute mb-8">
-        {t.lead}
-      </p>
-
-      <div className="space-y-12">
-        {digests.map((digest: WeeklyDigest) => (
-          <article key={digest.weekId} className="border hairline rounded-lg p-6 bg-paper-card">
-            <header className="mb-6 hairline-b pb-4">
-              <span className="pill">
-                {digest.weekId}
-              </span>
-              <h2 className="font-display text-2xl mt-3 text-ink">{digest.titleEn}</h2>
-              <h3 className="font-cjk text-lg text-ink-soft mt-1">{digest.titleZh}</h3>
-            </header>
-
-            <div className="mb-6 space-y-4">
-              <p className="text-ink-soft leading-relaxed">{digest.summaryEn}</p>
-              <p className="text-ink-mute leading-relaxed italic">{digest.summaryZh}</p>
-            </div>
-
-            <div className="space-y-6">
-              {digest.sections.map((section: DigestSection, idx: number) => (
-                <section key={idx} className="border-l-2 border-paper-edge pl-4">
-                  <h4 className="font-display text-lg mb-2 text-ink">{section.heading}</h4>
-                  <ul className="list-disc list-inside space-y-1 text-ink-soft font-mono text-sm">
-                    {section.items.map((item: string, itemIdx: number) => (
-                      <li key={itemIdx}>{item}</li>
-                    ))}
-                  </ul>
-                </section>
-              ))}
-            </div>
-          </article>
-        ))}
+    <>
+      <PageHeader title={t.title} lede={t.lead} pose="read" />
+      <div className="page-body">
+        <div className="page-body-narrow digest-list">
+          {digests.map((digest: WeeklyDigest) => (
+            <article key={digest.weekId} className="changelog-release" lang={zh ? "zh" : "en"}>
+              <header className="digest-head">
+                <span className="pill tabular">{digest.weekId}</span>
+                <h2 className="section-title">{zh ? digest.titleZh : digest.titleEn}</h2>
+                <p className="section-scope">{zh ? digest.summaryZh : digest.summaryEn}</p>
+              </header>
+              <div className="changelog-sections">
+                {digest.sections.map((section: DigestSection, idx: number) => (
+                  <section key={idx}>
+                    <h3>{section.heading}</h3>
+                    <ul>
+                      {section.items.map((item: string, itemIdx: number) => (
+                        <li key={itemIdx}>{item}</li>
+                      ))}
+                    </ul>
+                  </section>
+                ))}
+              </div>
+            </article>
+          ))}
+        </div>
       </div>
-    </div>
+    </>
   );
 }

@@ -17781,6 +17781,127 @@ async fn shell_policy_uses_explicit_profile_and_actual_thread_workspace() -> Res
     Ok(())
 }
 
+#[tokio::test]
+async fn unset_thread_shell_takes_the_interactive_default_unless_policy_denies() -> Result<()> {
+    let _env = crate::test_support::lock_test_env();
+    let _shell_env = [
+        crate::test_support::EnvVarGuard::remove("CODEWHALE_ALLOW_SHELL"),
+        crate::test_support::EnvVarGuard::remove("DEEPSEEK_ALLOW_SHELL"),
+    ];
+    let dir = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+    let workspace = dir.path().join("thread-workspace");
+    fs::create_dir(&workspace)?;
+    let config_path = dir.path().join("config.toml");
+    fs::write(&config_path, "[profiles.restricted]\nallow_shell = false\n")?;
+    let manager = test_manager(dir.path().join("runtime"))?;
+    manager.config.write().allow_shell = None;
+
+    // Unset: an app-created conversation gets approval-gated shell.
+    let open = manager
+        .create_thread_with_shell_policy(
+            CreateThreadRequest {
+                workspace: Some(workspace.clone()),
+                ..Default::default()
+            },
+            Some(&config_path),
+            None,
+        )
+        .await?;
+    assert!(
+        open.allow_shell,
+        "unset allow_shell takes the interactive default"
+    );
+
+    // An explicit value is still honored exactly.
+    let explicit = manager
+        .create_thread_with_shell_policy(
+            CreateThreadRequest {
+                workspace: Some(workspace.clone()),
+                allow_shell: Some(false),
+                ..Default::default()
+            },
+            Some(&config_path),
+            None,
+        )
+        .await?;
+    assert!(!explicit.allow_shell);
+
+    // A profile-sourced setting wins over the default at creation. The host's
+    // merged snapshot is left unset, so `validate_shell_access_policy` reads a
+    // profile, environment or managed source as a denial whatever value that
+    // source sets; this pins the gate, not the value read from the profile.
+    let profile_denied = manager
+        .create_thread_with_shell_policy(
+            CreateThreadRequest {
+                workspace: Some(workspace.clone()),
+                ..Default::default()
+            },
+            Some(&config_path),
+            Some("restricted"),
+        )
+        .await?;
+    assert!(!profile_denied.allow_shell);
+
+    // A managed source likewise denies while the host's merged snapshot is
+    // unset. (With the host snapshot at `Some(true)` it would be allowed;
+    // that is main's existing behavior and not what this test pins.)
+    let managed = dir.path().join("managed.toml");
+    fs::write(&managed, "allow_shell = false\n")?;
+    manager.config.write().managed_config_path = Some(managed.to_string_lossy().into_owned());
+    let managed_denied = manager
+        .create_thread_with_shell_policy(
+            CreateThreadRequest {
+                workspace: Some(workspace.clone()),
+                ..Default::default()
+            },
+            Some(&config_path),
+            None,
+        )
+        .await?;
+    assert!(!managed_denied.allow_shell);
+    manager.config.write().managed_config_path = None;
+
+    // A project-local `allow_shell = false` in the thread's own folder wins
+    // even when the host's merged config would allow shell.
+    let project = workspace.join(codewhale_config::CODEWHALE_APP_DIR);
+    fs::create_dir(&project)?;
+    fs::write(project.join("config.toml"), "allow_shell = false\n")?;
+    let project_denied = manager
+        .create_thread_with_shell_policy(
+            CreateThreadRequest {
+                workspace: Some(workspace.clone()),
+                ..Default::default()
+            },
+            Some(&config_path),
+            None,
+        )
+        .await?;
+    assert!(!project_denied.allow_shell);
+
+    // An explicit opt-in runs the same check and is refused, exactly as a
+    // PATCH opt-in is, instead of bypassing the project restriction.
+    let refused = manager
+        .create_thread_with_shell_policy(
+            CreateThreadRequest {
+                workspace: Some(workspace.clone()),
+                allow_shell: Some(true),
+                ..Default::default()
+            },
+            Some(&config_path),
+            None,
+        )
+        .await
+        .expect_err("explicit allow_shell=true must not bypass a project restriction");
+    assert!(
+        refused
+            .to_string()
+            .contains("shell commands are restricted"),
+        "unexpected error: {refused}"
+    );
+    Ok(())
+}
+
 /// The thread summary's preview is read through `newest_message_text_by_turn`,
 /// so pin the selection rules it depends on: non-message items never win, an
 /// empty trailing message is skipped rather than reported, and a missing

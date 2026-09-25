@@ -35,8 +35,8 @@ export default async function (args) {
   ]);
 
   phase("Synthesize");
-  // Synthesizer must stay read-only: type "general" is write-capable and
-  // requires writeRoots/exactFiles/coordinationContracts (dogfood 2026-07-24).
+  // Synthesizer must stay read-only: type "general" is write-capable, and
+  // without declared writeRoots/exactFiles it would claim the workspace root.
   const summary = await task({
     description: "Synthesize audit findings for the operator.",
     label: "audit summary",

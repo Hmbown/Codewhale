@@ -19,16 +19,11 @@ order), Lane (one running Workflow), Runtime (where/how/authority), and Operate
   `task()` spawns block on that gate until a live slot frees, then route
   through fleet. A larger declared population therefore queues at the gate,
   not through fleet itself.
-- `WorkflowSearchSpec` is a provider-neutral TOML/Rust authoring boundary. It
-  validates bounded worktree writes, rounds, budgets, mandatory anti-test-
-  weakening posture, hard-gate commands, deterministic scoring, selection, and
-  review-only integration.
-- `hard_gates.commands` and `score.command` are parsed and validated only;
-  nothing in this slice executes them. Runtime-owned gate execution and
-  benchmark scoring are the evaluator host seam described below.
-- Freezing a spec records one deterministic search id and preregistration hash
-  over the baseline commit, requested and resolved model ids, public evidence
-  hash, evaluator hash, and the complete spec.
+- There is no typed search spec in the runtime today. A Rust prototype
+  (`WorkflowSearchSpec`) validated and froze the TOML shape below, but nothing
+  consumed it, so it was removed in 0.10.1 (#6517) rather than left to read as
+  live infrastructure. The evaluator host described below should reintroduce a
+  spec together with its first real caller.
 - `operate_best_of_n.workflow.js` supports `strategy: "search"` for 2–16
   structured independent candidates and one read-only reviewer. The stable
   shared instructions precede the candidate-specific suffix to favor provider
@@ -71,7 +66,7 @@ Provider account concurrency is not Runtime worker concurrency: the runtime keep
 16-live-worker ceiling, handles 429 responses and keep-alives outside the
 deterministic VM, and stops new admissions when the shared budget is exhausted.
 
-## Example authoring shape
+## Proposed authoring shape
 
 ```toml
 name = "speed-up-certificate"
@@ -112,6 +107,9 @@ policy = "pareto"
 retain_diversity = true
 ```
 
-This file is authoring input, not yet a runnable CLI promise. The next runtime
-slice is the evaluator host and aggregate receipt; after that, the natural-
-language authoring layer can safely compile a user's request into this shape.
+This shape is a design proposal: nothing parses it today and it is not a
+runnable CLI promise. The next runtime slice is the evaluator host and
+aggregate receipt, which must freeze the baseline, requested and resolved
+model ids, public evidence hash, evaluator hash, and the complete spec before
+admitting candidates; after that, the natural-language authoring layer can
+safely compile a user's request into this shape.

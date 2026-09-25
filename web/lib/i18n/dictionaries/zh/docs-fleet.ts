@@ -1,24 +1,151 @@
 import type { DocsFleetDict } from "../types";
 
+/** 「运行 Workflow」页的简体中文词典；与 `en/docs-fleet.ts` 逐段对应。 */
 export const docsFleet: DocsFleetDict = {
-  metaTitle: "Fleet 与 Workflow · Codewhale 文档",
-  metaDescription: "持久 Agent 花名册与成员选择层，以及可选的 Workflow 编排层。",
+  metaTitle: "运行 Workflow · Codewhale 文档",
+  metaDescription:
+    "在 Fleet 中保存角色和模型，编写可重复的 Workflow，把它作为可查看、可停止的 Lane 运行，并用持久的 worker 批量执行任务。",
   bodyClassName: "text-ink-soft leading-[1.9] tracking-wide",
-  overviewTitle: "Fleet 与 Workflow",
-  overviewLead:
-    "Fleet 是持久花名册：记录有哪些成员以及选中了哪一位。它不是执行或权限引擎。Runtime 将选定成员作为无头 codewhale exec 运行来启动和跟踪，负责重试与远程放置，并写入持久收据和台账投影。台账文件、已保存花名册、配置表和 Workflow 的 --fleet 标志都使用 Fleet 名称。",
-  runTitle: "运行一次 fleet",
-  runLead:
-    "Runtime 的 fleet 运行投影存放在工作区的 .codewhale/fleet.jsonl 台账中，worker 日志在 .codewhale/fleet/ 下。codewhale fleet resume <run-id> 会让 Runtime 重放台账并调和过期租约；该操作幂等，可在管理进程退出、笔记本睡眠或运行时重启后安全执行。",
-  statusLead:
-    "TUI 命令 {fleetStatusTui} 与 shell 命令 {fleetStatusShell} 读取同一份持久 fleet 台账。若要查看仅附着于当前交互会话的子 Agent，请使用 {fleetWorkers}（或 {subagents}）。",
-  profilesTitle: "已保存 fleet、角色与 /fleet setup",
-  profilesLead:
-    "{fleetSaved} 打开已命名保存 fleet 的选择器；裸 /fleet 打开当前所选 fleet 的成员花名册。在 v0.9.11 中，/fleet setup 编辑当前选中的命名 fleet。未选中命名 fleet 时，它打开角色档案设置：选择角色与模型、按需调整思考设置，然后核对并保存。档案可写在项目级（.codewhale/agents/<role>.toml）或个人级（$CODEWHALE_HOME/agents/<role>.toml）；同 ID 的项目档案优先。Runtime 另行负责信任、文件系统/网络范围、密钥、审批、沙箱和工具，因此档案存储范围不会扩大执行权限。",
-  workflowTitle: "Workflow 编排",
-  workflowLead:
-    "普通多 Agent 工作不需要 Workflow：在 Operate 里直接发消息，需要并行、隔离或长时间工作时让 Codewhale 优先委派后台 worker 即可。只有当工作需要有序阶段、门禁、共享预算、回放或确定性汇总时才用 Workflow。Workflow 脚本只负责协调：它选择 fleet 成员，但没有自己的文件系统或 shell；Runtime 在实时权限策略下启动真正的 worker。脚本使用编译专用的声明式 JS 子集，降低到类型化 WorkflowSpec 后由 Rust 校验与执行；import、fetch、process、eval、async/await 会被拒绝。",
-  workflowLimits:
-    "默认校验边界：每次 Workflow 运行最多 1,000 个 worker Agent、Workflow IR 结构嵌套深度不超过 5、循环必须声明 max_iterations、动态 expand 节点必须声明 max_children 和模板。Runtime 的子委派是独立执行预算：默认 3 层，可选择启用的硬上限为 8 层。这些是数量与结构上限，而非并发要求：Runtime 每个运行最多接纳 16 个存活 worker，其余排队。省略 max_steps 或设为 0 都保持无界；只有正值才增加模型轮次上限。",
-  sourceNote: "来源文档：docs/FLEET.md, docs/WORKFLOW_AUTHORING.md · 更新时请同步修改 docs-map.ts。",
+  title: "运行 Workflow",
+  lede:
+    "大多数多步骤工作，直接提出来就行：在 Operate 模式下，Codewhale 会自己规划步骤，并把彼此独立的步骤并行执行。如果你希望每次都按同一套有序计划来做——分阶段、并行分支、最后汇总——并且每次运行都留有记录，就写一个 Workflow。",
+  sections: [
+    {
+      id: "fleet",
+      title: "在 Fleet 中保存角色",
+      blocks: [
+        {
+          p: "Fleet 是 Codewhale 可以分派工作的角色列表，以及每个角色使用的模型。在会话中配置一次即可：",
+        },
+        { code: "/fleet setup\n/fleet\n/fleet saved", lang: "Codewhale" },
+        {
+          p: "`/fleet setup` 会带你选定一个角色、它使用的模型（或“沿用会话的模型”），以及保存位置：当前项目，或者对所有仓库都生效的个人配置。写入之前你会看到完整的文件内容。`/fleet` 显示当前所选 Fleet 的成员，`/fleet saved` 用于在已命名的 Fleet 之间切换。",
+        },
+        {
+          p: "Fleet 只决定由谁来做。一个 worker 能读、能写、能运行什么，仍然取决于你的工作区信任、[审批设置](/docs/modes)和沙箱。",
+        },
+      ],
+    },
+    {
+      id: "write",
+      title: "编写 Workflow",
+      blocks: [
+        {
+          p: "Workflow 是放在仓库 `workflows/` 文件夹中的一个 JavaScript 文件。它只描述步骤，本身不干活。下面这个例子先并行审查两个部分，再汇总结论。把它保存为 `workflows/docs_readiness.workflow.js`：",
+        },
+        {
+          code: `export default workflow({
+  "id": "docs-readiness",
+  "goal": "Review the docs and code for gaps, then summarize the next edit",
+  "nodes": [
+    {
+      "branch": {
+        "id": "parallel-review",
+        "parallel": true,
+        "children": [
+          { "agent": { "id": "code-review", "prompt": "Inspect src/ for undocumented behavior.",
+                       "agent_type": "review", "mode": "read_only", "file_scope": ["src"] } },
+          { "agent": { "id": "docs-review", "prompt": "Inspect docs/ for stale or missing steps.",
+                       "agent_type": "review", "mode": "read_only", "file_scope": ["docs"] } }
+        ]
+      }
+    },
+    {
+      "reduce": {
+        "id": "summary",
+        "inputs": ["code-review", "docs-review"],
+        "prompt": "Combine the findings into the safest next edit."
+      }
+    }
+  ]
+});`,
+          lang: "workflows/docs_readiness.workflow.js",
+        },
+        {
+          p: "可用的步骤类型有 `agent`、`branch`、`sequence`、`reduce`、`loop_until`、`cond`、`expand` 和 `teacher_review`。Workflow 文件本身不能访问文件、shell 或网络，`import`、`fetch`、`eval` 和 `async` 都会被拒绝。真正干活的是它启动的 Agent，它们按你平常的权限运行。",
+        },
+        {
+          note: "一次运行最多可启动 1,000 个 Agent，同时工作的最多 16 个，其余排队等待。循环必须声明 `max_iterations`。",
+        },
+      ],
+    },
+    {
+      id: "run",
+      title: "运行",
+      blocks: [
+        {
+          code: `codewhale workflow run docs-readiness --runtime inline
+codewhale workflow run docs-readiness --goal "prepare the 1.2 release" --verify`,
+          lang: "终端",
+        },
+        {
+          p: "Codewhale 会根据名字找到 `workflows/docs_readiness.workflow.js`，检查后启动。`--runtime inline` 在当前终端中运行；默认的 `tmux` 则在一个独立的 tmux 会话中运行，关闭终端后也会继续。`--verify` 会在成功完成后运行验证关卡，`--fleet <名称>` 则使用指定的 Fleet 而不是内置角色。",
+        },
+        {
+          p: "如果不想动到当前的工作副本，加上 `--worktree-repo . --branch <名称>`：这次运行会拥有自己的 git 工作树和分支。",
+        },
+        {
+          p: "在会话中，`/workflow` 用于启动 Workflow，`/workflows` 用于列出或取消本会话中的运行。",
+        },
+      ],
+    },
+    {
+      id: "watch",
+      title: "查看和停止运行",
+      blocks: [
+        { p: "每次运行都是一个 Lane。Lane 会保存到磁盘上，所以你可以在任何终端里查看：" },
+        {
+          code: `codewhale lane list
+codewhale lane status <lane-id>
+codewhale lane logs <lane-id>
+codewhale lane attach <lane-id>
+codewhale lane interrupt <lane-id>`,
+          lang: "终端",
+        },
+        {
+          p: "`lane list`、`lane status` 和 `lane interrupt` 都支持 `--json`，会输出一份机器可读的收据。在会话中，`/lane` 提供同样的操作，结果也完全一致。",
+        },
+      ],
+    },
+    {
+      id: "batch",
+      title: "批量运行任务",
+      blocks: [
+        {
+          p: "如果你手上是一串彼此独立的任务，而不是一套计划，就把它们写成任务文件，作为一次 Fleet 运行来执行。每个任务写明目标、角色和允许写入的路径。完整的 `tasks.json` 示例见[教程](https://github.com/Hmbown/CodeWhale/blob/main/docs/FLEET_WORKFLOW_TUTORIAL.md)。",
+        },
+        {
+          code: `codewhale fleet init
+codewhale fleet run tasks.json --max-workers 4
+codewhale fleet status
+codewhale fleet logs <worker-id>
+codewhale fleet resume <run-id>
+codewhale fleet stop --all`,
+          lang: "终端",
+        },
+        {
+          p: "`fleet status` 会根据当前工作区的运行记录，统计排队中、运行中、已完成和失败的工作。笔记本休眠或管理进程退出后，`fleet resume` 能接着原来的运行继续，而不会新开一次。如果只想看挂在当前会话上的 Agent，用 `/fleet workers`（或 `/subagents`）。",
+        },
+      ],
+    },
+  ],
+  next: [
+    {
+      href: "/docs/subagents",
+      label: "并行运行 Agent",
+      note: "不写 Workflow，也能把一个任务中彼此独立的部分交给子 Agent。",
+    },
+    {
+      href: "/docs/review",
+      label: "查看改动",
+      note: "检查一次运行产生的 diff，并在推送前做一次审查。",
+    },
+    {
+      href: "/docs/vocabulary",
+      label: "产品名词",
+      note: "用一句话分别说明 Fleet、Workflow、Lane 和 Runtime。",
+    },
+  ],
+  sourceNote:
+    "来源文档：docs/FLEET.md、docs/FLEET_WORKFLOW_TUTORIAL.md、docs/WORKFLOW_AUTHORING.md · 修改时同步更新 docs-map.ts。",
 };

@@ -1,4 +1,6 @@
-import Image from "next/image";
+import { Icon } from "@/components/icon";
+import { PageHeader, Section } from "@/components/page-header";
+import { Status } from "@/components/status-badge";
 import { getComputerUse } from "@/lib/i18n/dictionaries";
 import { buildPageMetadata } from "@/lib/page-meta";
 import { COMPUTER_USE_REPO, getComputerUseRelease } from "@/lib/computer-use-release";
@@ -17,74 +19,115 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   return buildPageMetadata({ path: "/computer-use", locale, title: copy.metaTitle, description: copy.metaDescription });
 }
 
+/**
+ * /computer-use — the Mac helper. The download button exists only while the
+ * release check reports a ready, verified release; otherwise the page says
+ * why there is no download and links the published releases.
+ */
 export default async function ComputerUsePage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
   const t = getComputerUse(locale);
   const release = await getComputerUseRelease((await getEnv()).GITHUB_TOKEN);
   // The disk image is the human download; the archive stays for the updater.
   const primary = release.status === "ready" ? (release.dmg ?? { downloadUrl: release.downloadUrl, size: release.size }) : null;
+
   return (
-    <div>
-      <section className="hero">
-        <div className="portal-container community-welcome-inner">
-          <div className="flex items-center gap-5 mb-5">
-            <Image src="/brand/computer-use.png" width={80} height={80} alt="" priority className="shrink-0" />
-            <h1>{t.title}</h1>
+    <>
+      <PageHeader
+        kicker={t.publisher}
+        title={t.title}
+        lede={t.lead}
+        pose="computer"
+        meta={
+          <>
+            {t.requirements}
+            <br />
+            {t.included}
+          </>
+        }
+      >
+        {release.status === "ready" && primary ? (
+          <div className="cu-download">
+            <div className="actions">
+              <a className="btn btn-primary btn-lg" href={primary.downloadUrl}>
+                {t.download}
+              </a>
+              <span className="page-meta tabular">
+                v{release.version} · {Math.ceil(primary.size / 1024 / 1024)} MB
+              </span>
+            </div>
+            <p className="status-line">
+              <a href={release.receiptUrl} className="link">{t.receipt}</a>
+              {release.dmg ? <a href={release.downloadUrl} className="link">{t.downloadZip}</a> : null}
+            </p>
           </div>
-          <p className="max-w-3xl">{t.lead}</p>
-          <p className="text-sm mt-4">{t.publisher}</p>
-          <div className="mt-8 max-w-3xl">
-            {release.status === "ready" && primary ? <>
-              <a className="portal-button portal-button-primary" href={primary.downloadUrl}>{t.download}</a>
-              <p className="text-sm mt-3">v{release.version} · {Math.ceil(primary.size / 1024 / 1024)} MB</p>
-              <p className="text-sm mt-1 flex flex-wrap gap-x-4">
-                <a href={release.receiptUrl} className="body-link">{t.receipt}</a>
-                {release.dmg ? <a href={release.downloadUrl} className="body-link">{t.downloadZip}</a> : null}
-              </p>
-            </> : <>
-              <h2 className="text-xl">{release.status === "pending" ? t.pendingTitle : t.unavailableTitle}</h2>
-              <p className="mt-2">{release.status === "pending" ? t.pendingBody : t.unavailableBody}</p>
-              <a href={`${COMPUTER_USE_REPO}/releases`} className="body-link mt-3 inline-block">{t.releases}</a>
-            </>}
+        ) : (
+          <div className="callout" role="status">
+            <p className="callout-title">
+              <Status tone={release.status === "pending" ? "attention" : "idle"}>
+                {release.status === "pending" ? t.pendingTitle : t.unavailableTitle}
+              </Status>
+            </p>
+            <p>{release.status === "pending" ? t.pendingBody : t.unavailableBody}</p>
+            <p>
+              <a href={`${COMPUTER_USE_REPO}/releases`} className="link">{t.releases}</a>
+            </p>
           </div>
-          <p className="text-sm mt-6">{t.requirements}<br />{t.included}</p>
-        </div>
-      </section>
+        )}
+      </PageHeader>
 
-      <section className="portal-section">
-        <div className="portal-container">
-          <h2 className="mb-8">{t.setup}</h2>
-          <ol className="grid md:grid-cols-2 gap-x-12 gap-y-8">
-            {t.steps.map((step, index) => <li key={index}>
-              <h3 className="mb-3">{index + 1}. {step.title}</h3>
-              <p className="text-ink-soft leading-relaxed max-w-2xl">{step.body}</p>
-            </li>)}
+      <div className="page-body">
+        <Section id="cu-setup" title={t.setup}>
+          <ol className="steps">
+            {t.steps.map((step, index) => (
+              <li key={index}>
+                <span className="gs-step-index" aria-hidden="true">{index + 1}</span>
+                <h3>{step.title}</h3>
+                <p>{step.body}</p>
+              </li>
+            ))}
           </ol>
-        </div>
-      </section>
+        </Section>
 
-      <section className="portal-section portal-section-muted">
-        <div className="portal-container grid md:grid-cols-2 gap-12">
-          <div><h2 className="mb-4">{t.controlsTitle}</h2>
-            <p className="text-ink-soft leading-relaxed">{t.controlsBody}</p>
-            <a href={`${COMPUTER_USE_REPO}/blob/main/docs/DEMO.md`} className="body-link mt-4 inline-block">{t.demo}</a>
+        <section className="page-section" aria-label={t.controlsTitle}>
+          <div className="grid-2">
+            <div className="tile">
+              <span className="tile-icon" aria-hidden="true"><Icon name="shield" /></span>
+              <h2 className="section-title">{t.controlsTitle}</h2>
+              <p>{t.controlsBody}</p>
+              <a href={`${COMPUTER_USE_REPO}/blob/main/docs/DEMO.md`} className="section-link">
+                {t.demo}
+                <Icon name="arrow-right" className="icon icon-flip" />
+              </a>
+            </div>
+            <div className="tile">
+              <span className="tile-icon" aria-hidden="true"><Icon name="repeat" /></span>
+              <h2 className="section-title">{t.updateTitle}</h2>
+              <p>{t.updateBody}</p>
+              <a href={`${COMPUTER_USE_REPO}/blob/main/CHANGELOG.md`} className="section-link">
+                {t.notes}
+                <Icon name="arrow-right" className="icon icon-flip" />
+              </a>
+            </div>
           </div>
-          <div><h2 className="mb-4">{t.updateTitle}</h2>
-            <p className="text-ink-soft leading-relaxed">{t.updateBody}</p>
-            <a href={`${COMPUTER_USE_REPO}/blob/main/CHANGELOG.md`} className="body-link mt-4 inline-block">{t.notes}</a>
-          </div>
-        </div>
-      </section>
+        </section>
 
-      <section className="portal-section">
-        <div className="portal-container">
-          <p className="text-ink-soft max-w-3xl">{t.platforms}</p>
-          <div className="portal-actions">
-            <a href={`${COMPUTER_USE_REPO}/blob/main/docs/TROUBLESHOOTING.md`} className="body-link">{t.help}</a>
-            <a href={COMPUTER_USE_REPO} className="body-link">{t.source}</a>
+        <section className="page-section">
+          <div className="callout">
+            <p className="callout-title">
+              <Icon name="info" className="icon" />
+              {t.platforms}
+            </p>
+            <div className="actions">
+              <a href={`${COMPUTER_USE_REPO}/blob/main/docs/TROUBLESHOOTING.md`} className="btn btn-secondary">{t.help}</a>
+              <a href={COMPUTER_USE_REPO} className="btn btn-ghost">
+                {t.source}
+                <Icon name="external" className="icon" />
+              </a>
+            </div>
           </div>
-        </div>
-      </section>
-    </div>
+        </section>
+      </div>
+    </>
   );
 }

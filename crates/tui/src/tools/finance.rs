@@ -208,10 +208,6 @@ impl ToolSpec for FinanceTool {
                     "type": "string",
                     "description": "Optional asset type hint such as equity, fund, crypto, or index."
                 },
-                "market": {
-                    "type": "string",
-                    "description": "Optional market hint retained for compatibility with finance-style tool calls."
-                },
                 "timeout_ms": {
                     "type": "integer",
                     "description": "Request timeout in milliseconds (default: 10000, max: 60000)."
@@ -253,7 +249,6 @@ impl ToolSpec for FinanceTool {
         }
 
         let type_hint = optional_str(&input, "type")?.map(str::trim);
-        let _market_hint = optional_str(&input, "market")?.map(str::trim);
         let timeout_ms =
             optional_u64(&input, "timeout_ms", DEFAULT_TIMEOUT_MS)?.clamp(100, MAX_TIMEOUT_MS);
 

@@ -65,7 +65,7 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
             const key = draftStorageKey(draft);
             const label = typeLabels[draft.type] ?? { en: draft.type, zh: draft.type };
             return (
-              <div key={key} className="hairline-t hairline-b hairline-l hairline-r bg-paper">
+              <div key={key} className="group-card">
                 <div className="bg-paper-deep text-ink px-4 py-2 flex items-center justify-between">
                   <div className="flex items-center gap-3">
                     <span className="text-xs text-indigo">
@@ -86,19 +86,19 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
                       <textarea
                         value={editBody}
                         onChange={(e) => setEditBody(e.target.value)}
-                        className="w-full h-48 p-3 bg-paper-deep hairline-t hairline-b hairline-l hairline-r font-mono text-sm resize-y"
+                        className="field-input h-48 py-3 font-mono text-sm resize-y"
                       />
                       <div className="flex gap-2">
                         <button
                           onClick={() => handleAction(key, "post", editBody)}
                           disabled={loading === key}
-                          className="portal-button portal-button-primary disabled:opacity-50"
+                          className="btn btn-primary disabled:opacity-50"
                         >
                           {isZh ? "确认发布" : "Post edited"}
                         </button>
                         <button
                           onClick={() => setEditing(null)}
-                          className="portal-button portal-button-secondary"
+                          className="btn btn-secondary"
                         >
                           {isZh ? "取消" : "Cancel"}
                         </button>
@@ -113,20 +113,20 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
                         <button
                           onClick={() => handleAction(key, "post")}
                           disabled={loading === key}
-                          className="portal-button portal-button-primary disabled:opacity-50"
+                          className="btn btn-primary disabled:opacity-50"
                         >
                           {isZh ? "发布评论" : "Post as comment"}
                         </button>
                         <button
                           onClick={() => startEdit(draft)}
-                          className="portal-button portal-button-secondary"
+                          className="btn btn-secondary"
                         >
                           {isZh ? "编辑后发布" : "Edit & post"}
                         </button>
                         <button
                           onClick={() => handleAction(key, "discard")}
                           disabled={loading === key}
-                          className="px-4 py-2 text-sm text-ink-mute hover:text-indigo transition-colors disabled:opacity-50"
+                          className="btn btn-danger"
                         >
                           {isZh ? "丢弃" : "Discard"}
                         </button>
@@ -158,7 +158,7 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
                   {draft.targetNumber && (
                     <span className="font-mono text-xs text-ink-mute tabular">#{draft.targetNumber}</span>
                   )}
-                  <span className="ml-auto pill pill-jade text-[0.6rem]">{isZh ? "已发布" : "posted"}</span>
+                  <span className="ml-auto status status-ready"><span className="status-dot" aria-hidden="true" />{isZh ? "已发布" : "posted"}</span>
                 </div>
                 <p className="text-xs text-ink-mute line-clamp-2">{(isZh ? draft.bodyZh : draft.bodyEn).slice(0, 120)}…</p>
               </div>

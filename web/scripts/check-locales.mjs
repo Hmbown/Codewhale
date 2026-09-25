@@ -31,7 +31,6 @@ const OPTIONAL_FILES = [
   "docs-hooks.ts",
   "docs-troubleshooting.ts",
   "docs-configuration.ts",
-  "docs-constitution.ts",
   "docs-fleet.ts",
   "docs-mcp.ts",
   "docs-modes.ts",

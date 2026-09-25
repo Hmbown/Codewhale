@@ -432,6 +432,45 @@ async fn contract_read_offset_oob_and_limit_continuation_match_contract() {
     );
 }
 
+/// Regression: grok-4.7 serializes every JSON number as a float, so its
+/// ranged reads arrive as `{"offset": 2.0, "limit": 1.0}`. Those used to
+/// fail with "offset must be a non-negative integer" on every call.
+#[tokio::test]
+async fn contract_read_accepts_whole_number_floats_and_still_refuses_fractions() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temporary.path().join("lines.txt"), "one\ntwo\nthree").expect("fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let ranged = ReadFileTool::execute_contract_read(
+        json!({"path": "lines.txt", "offset": 2.0, "limit": 1.0, "max_bytes": 200.0}),
+        &context,
+    )
+    .await
+    .expect("float-typed ranged read");
+    assert_eq!(
+        ranged.content,
+        "two\n\n[1 more lines in file (13B total). Use offset=3 to continue.]"
+    );
+
+    for (key, bad) in [
+        ("offset", json!(-1.0)),
+        ("offset", json!(2.5)),
+        ("limit", json!("2")),
+        ("limit", json!([2])),
+    ] {
+        let error =
+            ReadFileTool::execute_contract_read(json!({"path": "lines.txt", key: bad}), &context)
+                .await
+                .expect_err("non-integer must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{key} must be a non-negative integer")),
+            "{error}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn contract_read_uses_magic_not_extension_for_images() {
     let temporary = tempfile::tempdir().expect("tempdir");

@@ -28,11 +28,22 @@ impl AppMode {
             // mode. These spellings resolve to Act; the bypass posture they
             // imply is carried by the permission surface (settings load,
             // CLI/runtime wire), not by a mode.
-            "yolo" | "4" | "bypass" | "bypass-permissions" | "bypasspermissions" => {
-                Some(Self::Agent)
-            }
+            other if Self::is_legacy_bypass_alias(other) => Some(Self::Agent),
             _ => None,
         }
+    }
+
+    /// Legacy mode spellings (`yolo`, `4`, `bypass`, `bypass-permissions`,
+    /// `bypasspermissions`) that carried the Full Access posture. [`Self::parse`]
+    /// folds them to Act; callers that must preserve the permission meaning
+    /// (the `/mode` command, the runtime policy wire, persisted thread records)
+    /// ask this one predicate instead of keeping their own copy of the list.
+    #[must_use]
+    pub fn is_legacy_bypass_alias(value: &str) -> bool {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "yolo" | "4" | "bypass" | "bypass-permissions" | "bypasspermissions"
+        )
     }
 
     #[must_use]
@@ -142,6 +153,19 @@ mod tests {
         assert_eq!(AppMode::parse("4"), Some(AppMode::Agent));
         assert_eq!(AppMode::parse("bypass"), Some(AppMode::Agent));
         assert_eq!(AppMode::parse("bypass-permissions"), Some(AppMode::Agent));
+        for alias in [
+            "yolo",
+            " YOLO ",
+            "4",
+            "bypass",
+            "bypass-permissions",
+            "BypassPermissions",
+        ] {
+            assert!(AppMode::is_legacy_bypass_alias(alias), "{alias}");
+        }
+        for mode in ["agent", "act", "plan", "operate", "1", "full-access", ""] {
+            assert!(!AppMode::is_legacy_bypass_alias(mode), "{mode}");
+        }
         assert_eq!(AppMode::parse("multitask"), None);
         assert_eq!(AppMode::parse("5"), None);
         assert_eq!(AppMode::parse("fast"), None);

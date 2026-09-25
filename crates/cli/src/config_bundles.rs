@@ -1630,7 +1630,7 @@ verbosity = "quiet"
 telemetry = false
 
 [global]
-output_mode = "plain"
+log_level = "debug"
 "#;
 
     fn sample_bundle() -> PortableBundle {
@@ -1976,10 +1976,10 @@ verbosity = "quiet"
 log_level = "debug"
 
 [global]
-output_mode = "plain"
+telemetry = false
 "#;
         let bundle = parse_bundle_str(bundle_text, "t.toml").expect("bundle");
-        // verbosity already matches; log_level is new; output_mode is global-scope.
+        // verbosity already matches; log_level is new; telemetry is global-scope.
         let plan_global = plan_import(&bundle, &store.config, BundleScope::Global);
         assert!(
             plan_global
@@ -2002,7 +2002,7 @@ output_mode = "plain"
         assert!(
             plan_project
                 .skipped
-                .contains(&"global.output_mode".to_string())
+                .contains(&"global.telemetry".to_string())
         );
     }
 
@@ -2413,7 +2413,7 @@ verbosity = "verbose"
         for (entries, expected_model) in [
             ("verbosity = 'quiet'\n", "LiteralOldModel"),
             (
-                "provider = 'OpenAI'\nmodel = 'LiteralNewModel'\noutput_mode = 'plain'\n",
+                "provider = 'OpenAI'\nmodel = 'LiteralNewModel'\nlog_level = 'debug'\n",
                 "LiteralNewModel",
             ),
         ] {
@@ -2577,7 +2577,7 @@ schema_version = 1
 kind = "codewhale.portable-config"
 
 [global]
-output_mode = "plain"
+log_level = "trace"
 "#,
             "second.toml",
         )
@@ -2643,7 +2643,7 @@ output_mode = "plain"
         );
         let reloaded = ConfigStore::load(Some(path)).expect("created config reloads");
         assert_eq!(reloaded.config.verbosity.as_deref(), Some("quiet"));
-        assert_eq!(reloaded.config.output_mode.as_deref(), Some("plain"));
+        assert_eq!(reloaded.config.log_level.as_deref(), Some("debug"));
     }
 
     #[test]

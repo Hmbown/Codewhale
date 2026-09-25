@@ -1,43 +1,44 @@
-/* ---------- nav link ---------- */
+/* ------------------------------------------------------------------ */
+/*  Site chrome — the header, the mobile sheet, the footer sea          */
+/* ------------------------------------------------------------------ */
+
+/* ---------- header ---------- */
+/* The header floats on the sky: it paints the same ground as the top of the
+   page, pinned to the viewport, so at rest there is no bar at all. No glass,
+   no blur. A hairline marks it once content scrolls beneath. */
 .site-nav {
   position: sticky;
   z-index: 30;
   top: 0;
-  border-bottom: 1px solid var(--hairline);
-  background: rgb(var(--c-paper) / 0.94);
-  backdrop-filter: blur(10px);
+  background: var(--ground), var(--bg);
+  background-attachment: fixed;
+  background-repeat: no-repeat;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
 }
 
 .site-nav-inner {
   display: flex;
   width: var(--container);
-  min-height: 4.25rem;
+  min-height: 4rem;
   align-items: center;
   justify-content: space-between;
   gap: 1.5rem;
   margin-inline: auto;
 }
 
+.paper-nav-inner { padding-block: var(--space-2); }
+
 .site-wordmark {
   display: inline-flex;
   flex-shrink: 0;
   align-items: center;
-  gap: 0.7rem;
-  color: var(--ink);
-  font-family: var(--font-display);
-  font-size: 1.15rem;
-  font-weight: 600;
-  letter-spacing: -0.03em;
-}
-
-.paper-nav-inner {
-  min-height: 3.85rem;
-  padding-block: 0.55rem;
+  gap: var(--space-2);
+  color: var(--mark-ink);
+  border-radius: var(--radius-control);
 }
 
 .paper-wordmark {
   flex: 0 1 auto;
-  gap: 0.75rem;
   max-width: 15rem;
   min-width: 8.75rem;
   overflow: hidden;
@@ -46,76 +47,74 @@
 .paper-wordmark-text {
   display: flex;
   align-items: center;
-  gap: 8px;
-  line-height: 1.1;
+  gap: 0.5rem;
   min-width: 0;
 }
 
+/* The mark is the logo gradient; the wordmark is one ink (--mark-ink),
+   drawn through a mask so both appearances re-ink it without a filter or a
+   second file. */
 .paper-wordmark-mark {
   display: block;
   flex: 0 0 auto;
-  width: 22px;
-  height: 22px;
+  width: 34px;
+  height: 34px;
+  margin-inline: -3px;
 }
 
-/* The traced wordmark is ~7.1:1; when the compact nav clamps its width the
-   glyphs scale down inside the box instead of squashing. */
-.paper-wordmark-logo {
+.paper-wordmark-logo,
+.wordmark {
   display: block;
   flex: 0 1 auto;
-  width: auto;
   min-width: 0;
+  width: 128px;
   max-width: 100%;
   height: 20px;
-  object-fit: contain;
-  object-position: left center;
+  background: var(--mark-ink);
+  -webkit-mask: url("/brand/wordmark.svg") no-repeat left center / contain;
+  mask: url("/brand/wordmark.svg") no-repeat left center / contain;
+}
+[dir="rtl"] .paper-wordmark-logo,
+[dir="rtl"] .wordmark {
+  -webkit-mask-position: right center;
+  mask-position: right center;
 }
 
-/* The traced wordmark is navy ink (#142352), which disappears on the dark
-   scheme's charcoal. Under dark (OS or pinned) it is re-inked to the light
-   stage foreground; the footer already uses the reversed cut. */
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .paper-wordmark-logo {
-    filter: brightness(0) invert(0.93);
-  }
-}
-:root[data-theme="dark"] .paper-wordmark-logo {
-  filter: brightness(0) invert(0.93);
+@media (forced-colors: active) {
+  .paper-wordmark-logo,
+  .wordmark { background: CanvasText; }
 }
 
+/* The one primary action in the header, and the one identity door. */
 .paper-install-cta {
   align-items: center;
   justify-content: center;
   min-height: 2.25rem;
-  padding: 0.35rem 0.85rem;
-  background: var(--indigo);
-  color: var(--paper);
-  font-family: var(--font-body);
-  font-size: 0.8125rem;
+  padding-inline: var(--space-4);
+  background: var(--brand-fill);
+  color: var(--on-brand);
+  font-size: var(--text-ui);
   font-weight: 600;
   border-radius: var(--radius-control);
-  transition: background-color var(--dur-state) var(--ease-spring);
+  transition: box-shadow var(--dur-state) var(--ease-out);
 }
-
 .paper-install-cta:hover {
-  background: var(--indigo-deep);
-  color: var(--paper);
+  background: var(--brand-fill-hover);
+  color: var(--on-brand);
+  box-shadow: var(--glow-focus);
 }
 
-/* The one identity door: a quiet text control beside the primary action. */
 .paper-auth-signin {
   align-items: center;
   justify-content: center;
   min-height: 2.25rem;
-  padding: 0.35rem 0.75rem;
-  color: var(--ink);
-  font-family: var(--font-body);
-  font-size: 0.8125rem;
-  font-weight: 600;
+  padding-inline: var(--space-3);
+  color: var(--text);
+  font-size: var(--text-ui);
+  font-weight: 500;
   border-radius: var(--radius-control);
-  transition: background-color var(--dur-state) var(--ease-spring);
+  transition: background-color var(--dur-state) var(--ease-out);
 }
-
 .paper-auth-signin:hover { background: var(--hover); }
 
 /* Actions sit 2px apart, as related rail controls in the GPUI client; the
@@ -126,14 +125,13 @@
   align-items: center;
   gap: 2px;
 }
-
 .site-nav-actions > * { flex-shrink: 0; }
-.site-nav-actions > .paper-auth-signin { margin-left: 0.5rem; }
-.site-nav-actions > .paper-install-cta { margin-left: 0.25rem; }
+.site-nav-actions > .paper-auth-signin { margin-inline-start: 0.5rem; }
+.site-nav-actions > .paper-install-cta { margin-inline-start: 0.25rem; }
 
-/* Quiet icon controls (theme, language, GitHub, menu): a 40px target around
-   a 20px glyph, the GPUI rail metrics. Muted at rest, full ink on hover and
-   while the control is expanded; the accessible name carries the state. */
+/* Quiet icon controls: a 40px target around a 20px glyph. Muted at rest,
+   full ink on hover and while expanded; a pressed or current control takes
+   the neutral selected fill. */
 .nav-icon-button {
   position: relative;
   display: inline-flex;
@@ -141,16 +139,30 @@
   height: 2.5rem;
   align-items: center;
   justify-content: center;
-  color: var(--ink-soft);
+  color: var(--muted);
   border-radius: var(--radius-control);
   cursor: pointer;
-  transition: background-color var(--dur-state) var(--ease-spring), color var(--dur-state) var(--ease-spring);
+  transition-property: background-color, color, box-shadow;
+  transition-duration: var(--dur-state);
+  transition-timing-function: var(--ease-out);
 }
-
 .nav-icon-button:hover,
 .nav-icon-button[aria-expanded="true"] {
   background: var(--hover);
-  color: var(--ink);
+  color: var(--text);
+}
+.nav-icon-button[aria-pressed="true"],
+.nav-icon-button[aria-current="page"] {
+  background: var(--selected);
+  color: var(--text);
+}
+.nav-icon-button:active { opacity: 0.75; }
+.nav-icon-button:focus-visible { box-shadow: var(--glow-focus); }
+
+.nav-icon-button-sm { width: 2rem; height: 2rem; }
+.nav-icon-button-sm .nav-icon { width: 1rem; height: 1rem; }
+@media (pointer: coarse) {
+  .nav-icon-button-sm { width: 2.75rem; height: 2.75rem; }
 }
 
 .nav-icon { display: block; width: 1.25rem; height: 1.25rem; }
@@ -167,14 +179,45 @@
   cursor: pointer;
   font-size: 1rem;
 }
-
 .nav-locale:has(select:focus-visible) {
-  box-shadow: 0 0 0 var(--gpui-focus-width) var(--ring);
+  box-shadow: 0 0 0 var(--gpui-focus-width) var(--ring), var(--glow-focus);
 }
 
-/* Compact sheet rows: one label per destination, a chevron, a selected fill
-   for the current page rather than a decorative bar. */
-.mm-list > li + li { border-top: 1px solid var(--hairline); }
+/* ---------- primary nav links ---------- */
+/* Hover is a neutral wash. The current page keeps a 2px accent bar under
+   its label: the one place blue marks "here". */
+.nav-link {
+  position: relative;
+  padding: 0.375rem 0.5rem;
+  margin-inline: -0.5rem;
+  color: var(--text);
+  font-size: var(--text-ui);
+  font-weight: 500;
+  border-radius: var(--radius-control);
+  transition: background-color var(--dur-state) var(--ease-out);
+}
+.nav-link:hover { background: var(--hover); }
+.nav-link::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0.5rem;
+  bottom: -2px;
+  height: 2px;
+  background: var(--accent);
+  box-shadow: var(--glow);
+  opacity: 0;
+}
+.nav-link[aria-current="page"]::after { opacity: 1; }
+
+/* Compact viewports: the strip keeps the home control clickable. */
+@media (max-width: 520px) {
+  .site-nav-inner { gap: 0.5rem; }
+  .site-nav-actions { min-width: 0; }
+  .paper-wordmark { max-width: 9.75rem; }
+}
+
+/* ---------- the mobile sheet ---------- */
+.mm-list > li + li { border-top: 1px solid var(--line); }
 
 .mm-link {
   display: flex;
@@ -182,15 +225,17 @@
   gap: 0.75rem;
   min-height: 3.25rem;
   padding-inline: 0.5rem;
-  color: var(--ink);
+  color: var(--text);
   font-size: 1.0625rem;
   border-radius: var(--radius-control);
-  transition: background-color var(--dur-state) var(--ease-spring);
+  transition: background-color var(--dur-state) var(--ease-out);
 }
-
 .mm-link:hover { background: var(--hover); }
-.mm-link[aria-current="page"] { background: var(--selected); }
-.mm-link-chevron { margin-left: auto; color: var(--ink-mute); }
+.mm-link[aria-current="page"] { background: var(--selected); box-shadow: inset 3px 0 0 var(--accent); font-weight: 600; }
+@media (forced-colors: active) {
+  .mm-link[aria-current="page"] { outline-style: solid; outline-width: 2px; outline-color: Highlight; outline-offset: -2px; }
+}
+.mm-link-chevron { margin-inline-start: auto; color: var(--muted); }
 
 .mm-action {
   display: flex;
@@ -198,208 +243,132 @@
   min-height: 2.75rem;
   margin-top: 0.75rem;
 }
-
 .mm-action.paper-install-cta { margin-top: 1.5rem; }
 
-.nav-link {
-  font-family: var(--font-body);
-  font-size: 0.78rem;
-  letter-spacing: 0;
-  color: var(--ink);
-  position: relative;
-  padding: 0.25rem 0;
-}
-.nav-link::after {
-  content: "";
-  position: absolute;
-  left: 0; right: 0; bottom: -2px;
-  height: 2px;
-  background: var(--indigo);
-  transform: scaleX(0);
-  transform-origin: left;
-  transition: transform var(--dur-state) var(--ease-spring);
-}
-.nav-link:hover::after, .nav-link[aria-current="page"]::after { transform: scaleX(1); }
-
-/* ---------- footer ---------- */
+/* ---------- footer — the sea below the horizon ---------- */
+/* The footer is the stage in both appearances. Its top edge is the page's
+   one horizon: a straight line of light, the sea bright at the waterline
+   and deep within a few rows. */
 .site-footer {
   position: relative;
-  background: var(--ocean-deep);
-  color: var(--stage-soft);
-}
-
-/* The waterline before the seabed. Every page that is still on paper when
-   it reaches the footer descends here; the homepage is already under water
-   by then, so its column hides the band and the seabed simply continues. */
-.site-footer-waterline {
-  position: relative;
-  height: clamp(9rem, 18vw, 15rem);
   overflow: hidden;
-  background: var(--paper);
+  background: var(--sea), var(--ocean-floor);
+  color: var(--muted);
 }
-.site-footer-waterline > svg {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
+.site-footer > .horizon { position: absolute; inset: 0 0 auto; z-index: 1; }
+
+/* In dark, a page whose main already ends in the sea continues into the
+   footer with no second horizon. In light the home sea settles back to
+   paper, so the footer keeps its own horizon. */
+:root[data-theme="dark"] main:has(.sea-continues:last-child) + .site-footer { background: var(--ocean-floor); }
+:root[data-theme="dark"] main:has(.sea-continues:last-child) + .site-footer > .horizon,
+:root[data-theme="dark"] main:has(.sea-continues:last-child) + .site-footer > .sea-texture { display: none; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) main:has(.sea-continues:last-child) + .site-footer { background: var(--ocean-floor); }
+  :root:not([data-theme="light"]) main:has(.sea-continues:last-child) + .site-footer > .horizon,
+  :root:not([data-theme="light"]) main:has(.sea-continues:last-child) + .site-footer > .sea-texture { display: none; }
 }
-main:has(.ocean-column) + .site-footer .site-footer-waterline { display: none; }
-.site-footer-main { border-top: 1px solid rgb(var(--c-stage-soft) / 0.13); }
-main:has(.ocean-column) + .site-footer .site-footer-main { border-top-color: transparent; }
 
 .site-footer-main,
 .site-footer-meta {
+  position: relative;
   width: var(--container);
   margin-inline: auto;
 }
 
 .site-footer-main {
   display: grid;
-  grid-template-columns: minmax(16rem, 1.25fr) minmax(18rem, 0.75fr);
-  gap: 4rem;
-  padding-block: 2.8rem;
+  grid-template-columns: minmax(14rem, 1fr) minmax(0, 2fr);
+  gap: var(--space-7);
+  padding-block: 5.5rem var(--space-7);
 }
 
-.site-wordmark-footer { color: var(--stage-text); }
-.site-wordmark-footer img { display: block; width: auto; height: 18px; }
-.site-footer-brand p { max-width: 30rem; margin-top: 0.8rem; color: rgb(var(--c-stage-soft) / 0.62); font-size: 0.86rem; line-height: 1.6; }
+.site-footer-brand { display: grid; gap: var(--space-4); align-content: start; }
+.site-footer-brand p {
+  max-width: 26rem;
+  color: var(--muted);
+  font-size: var(--text-ui);
+  line-height: 1.6;
+}
+.site-footer-brand .whale-pose { --pose-size: 3rem; }
+.site-wordmark-footer { color: var(--text); justify-self: start; gap: var(--space-3); }
 
 .site-footer-links {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 2rem;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: var(--space-5);
 }
 
-.site-footer-links > div { display: flex; flex-direction: column; gap: 0.55rem; }
-.site-footer-links span { margin-bottom: 0.25rem; color: var(--ocean-current); font-family: var(--font-body); font-size: 0.75rem; }
-.site-footer-links a { color: rgb(var(--c-stage-soft) / 0.76); font-size: 0.82rem; }
-.site-footer-links a:hover { color: var(--stage-text); }
+.site-footer-group { display: grid; gap: var(--space-2); align-content: start; }
+
+.site-footer-label {
+  color: var(--muted);
+  font-size: var(--text-caption);
+  font-weight: 500;
+}
+
+.site-footer-list { display: grid; gap: 2px; }
+.site-footer-list a {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  min-height: 1.75rem;
+  padding-inline: var(--space-2);
+  margin-inline: calc(-1 * var(--space-2));
+  color: var(--text);
+  font-size: var(--text-ui);
+  border-radius: var(--radius-control);
+  transition: background-color var(--dur-state) var(--ease-out);
+}
+.site-footer-list a:hover { background: var(--hover); }
 
 .site-footer-meta {
-  display: grid;
-  grid-template-columns: 1fr auto auto;
-  gap: 1.5rem;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  padding-block: 1rem;
-  border-top: 1px solid rgb(var(--c-stage-soft) / 0.13);
-  color: rgb(var(--c-stage-soft) / 0.5);
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
+  justify-content: space-between;
+  gap: var(--space-3) var(--space-5);
+  padding-block: var(--space-4) var(--space-6);
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: var(--text-caption);
+}
+.site-footer-meta p { min-width: 0; max-width: 70ch; overflow-wrap: anywhere; }
+.site-footer-meta a {
+  color: var(--text);
+  text-decoration: underline;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 0.2em;
+}
+.site-footer-meta a:hover { text-decoration-color: currentColor; }
+.site-footer-meta-links { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-4); }
+
+@media (max-width: 900px) {
+  .site-footer-main { grid-template-columns: 1fr; gap: var(--space-6); }
 }
 
-.site-footer-meta a:hover { color: var(--ocean-current); }
-.site-footer-meta > div { display: flex; gap: 1rem; }
-.site-footer-meta > p { min-width: 0; max-width: 70ch; overflow-wrap: anywhere; }
-
-/* ---------- ticker ---------- */
-.ticker-viewport {
-  position: relative;
-  flex: 1 1 auto;
-  overflow: hidden;
+@media print {
+  .site-footer { background: none; color: inherit; border-top: 1px solid currentColor; }
+  .site-footer > .horizon { display: none; }
 }
 
-.ticker-track {
+/* ---------- usage counting: the privacy page's control ---------- */
+.usage-counting { display: grid; gap: var(--space-3); margin-top: var(--space-2); }
+.usage-counting-status { color: var(--text); font-weight: 500; }
+.usage-counting-elsewhere { color: var(--muted); font-size: var(--text-ui); }
+.usage-counting-button {
   display: inline-flex;
-  gap: 3rem;
-  white-space: nowrap;
-  animation: ticker 80s linear infinite;
-  padding-right: 3rem;
+  justify-self: start;
+  align-items: center;
+  min-height: 2.5rem;
+  padding-inline: var(--space-4);
+  color: var(--text);
+  background: var(--panel);
+  font-size: var(--text-ui);
+  font-weight: 500;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  transition: background-color var(--dur-state) var(--ease-out);
 }
-@keyframes ticker {
-  from { transform: translateX(0); }
-  to { transform: translateX(-50%); }
-}
-
-/* One wire entry: verb, number or tag, title, by-line, age. Baseline-aligned
-   so the mono verb sits on the same line as the title it qualifies. */
-.ticker-item {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 0.5rem;
-}
-
-/* The verb carries the state. Merges are the headline case, so they get the
-   one warm-neutral ink on the sheet; releases take ochre; anything closed
-   recedes to mute. Everything else is the action blue. */
-.ticker-verb {
-  color: var(--indigo);
-  font-size: 0.75rem;
-}
-
-.ticker-verb[data-event="merged"] { color: var(--jade); }
-.ticker-verb[data-event="published"] { color: var(--ochre); }
-.ticker-verb[data-event="closed"] { color: var(--ink-mute); }
-
-.ticker-num,
-.ticker-tag,
-.ticker-by,
-.ticker-age {
-  color: var(--ink-mute);
-}
-
-.ticker-title {
-  color: var(--ink);
-  max-width: 24rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* The contributor's handle is the point of the line, not a footnote. */
-.ticker-handle {
-  color: var(--ink);
-  font-weight: 600;
-}
-
-.ticker-first {
-  padding: 0 0.35rem;
-  border: 1px solid var(--ochre);
-  color: var(--ochre);
-  font-size: 0.75rem;
-}
-
-.ticker-sep { color: var(--paper-line-soft); }
-
-@media (prefers-reduced-motion: reduce) {
-  .ticker-track { animation: none; }
-  /* A frozen track would clip every entry past the fold with no way to reach
-     them. Stopping the motion must not also remove the content. */
-  .ticker-viewport { overflow-x: auto; }
-}
-
-/* ---------- ambient ---------- */
-/*
- * One effect, OPT-IN under `no-preference` rather than opted out under
- * `reduce`. A `reduce` override can be defeated by specificity; a gate cannot.
- * Reduced motion freezes the field — it never removes it, so the column's
- * gradient and the whale below are unconditional and only the movement is not.
- * The whale mark itself is always the still pose.
- *
- * The TUI's ambient life — fish, jellyfish, bubbles, the whale cameo — stays
- * out of scope. This page quotes the product's restraint doctrine in its own
- * copy. The standing loops on the whole site are three — ticker, caret, and
- * this one. Entrances are transitions, and the one-shot settles live in the
- * Motion section below under the same no-preference gate.
- */
-
-/* M1 — the column breath. Opacity only, on a 90s cycle: the TUI's authored
-   0.018–0.055 phase bias expressed as the same fraction of a mix. Opacity is
-   the one property that cannot cause layout work on an element four bands
-   tall. No position change, no hue shift, no filter. */
-@keyframes cw-breath {
-  0%, 100% { opacity: 0; }
-  50% { opacity: 0.045; }
-}
-
-@media (prefers-reduced-motion: no-preference) {
-  .ocean-column::after {
-    content: "";
-    position: absolute;
-    inset: 0;
-    z-index: -1;
-    pointer-events: none;
-    background: var(--stage-ambient);
-    opacity: 0;
-    animation: cw-breath 90s ease-in-out infinite;
-  }
-}
+.usage-counting-button:hover { background: var(--hover); }
