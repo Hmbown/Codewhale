@@ -48,6 +48,7 @@ const OPTIONAL_FILES = [
   "legal-terms.ts",
   "legal-privacy.ts",
   "digest.ts",
+  "faq.ts",
   "computer-use.ts",
 ];
 

@@ -30,9 +30,12 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Contributors",
         "items": [
+          "@gaord — let undo roll back files for the turn it is undoing (#6483), stopped resume and fork from duplicating threads and sessions (#6406), and exposed user-defined provider routes to native clients (#6404).",
+          "@Lstarsky0 — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine (#6405, #6417, #6499, #6574), tightened the Chinese-branching ceiling to 18 (#6403), and made Fleet publish without a two-link window (#6431).",
+          "@aboimpinto — restored a green Linux full-workspace test gate without loosening any test (#6581).",
           "@dajiaohuang — codewhale config set checks a known setting's value against its schema type before saving it (#6568)."
         ],
-        "itemCount": 1
+        "itemCount": 4
       },
       {
         "heading": "Added",

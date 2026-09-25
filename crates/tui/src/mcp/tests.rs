@@ -6081,7 +6081,12 @@ async fn legacy_sse_closed_stream_reconnects_and_retries_tool_call() {
         (headers, json)
     }
 
+    // A concurrent proxy fixture changes process-wide HTTP_PROXY/NO_PROXY.
+    // Hold the environment guard before the loopback guard, as other MCP
+    // tests do, so this server is always reached directly.
+    let _env = crate::test_support::lock_test_env();
     let _lock = lock_mcp_loopback_tests().await;
+    let _no_proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "*");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let active_sse = Arc::new(Mutex::new(None::<mpsc::UnboundedSender<Option<String>>>));

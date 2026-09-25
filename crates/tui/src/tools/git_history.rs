@@ -1385,6 +1385,7 @@ mod tests {
                     Ok(0) => break,
                     Ok(_) => continue, // the request itself
                     Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(e) => panic!("transport child outlived the deadline: {e}"),
                 }
             }

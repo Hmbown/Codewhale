@@ -2813,6 +2813,9 @@ mod turn_operation_lookup {
         })
     }
 
+    // Callers snapshot the manager-owned runtime directory. CODEWHALE_HOME is
+    // process-wide, so unrelated parallel tests can write elsewhere beneath
+    // the temporary root while a read-only operation is being checked.
     fn directory_bytes(
         root: &Path,
     ) -> Result<std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>> {
@@ -2876,13 +2879,13 @@ mod turn_operation_lookup {
             }
             assert_eq!(manager.store.owner_id, owner_id);
             assert!(manager.active.lock().await.engines.is_empty());
-            let before = directory_bytes(temp.path())?;
+            let before = directory_bytes(&runtime_dir)?;
             let observed = manager
                 .lookup_turn_operation(&thread.id, key)?
                 .context("accepted operation must remain available")?;
             assert_eq!(serde_json::to_value(observed)?, expected);
             assert!(manager.active.lock().await.engines.is_empty());
-            assert_eq!(directory_bytes(temp.path())?, before);
+            assert_eq!(directory_bytes(&runtime_dir)?, before);
         }
         Ok(())
     }
@@ -2893,7 +2896,8 @@ mod turn_operation_lookup {
         let _env = crate::test_support::lock_test_env();
         let temp = tempfile::tempdir()?;
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
-        let manager = test_manager(temp.path().join("runtime"))?;
+        let runtime_dir = temp.path().join("runtime");
+        let manager = test_manager(runtime_dir.clone())?;
         let thread = sample_thread("thr_lookup_incomplete");
         let turn = sample_turn(
             &thread.id,
@@ -2905,9 +2909,9 @@ mod turn_operation_lookup {
         let lock_path = manager
             .store
             .turn_operation_lock_path(&binding.operation_key_fingerprint)?;
-        let before = directory_bytes(temp.path())?;
+        let before = directory_bytes(&runtime_dir)?;
         assert!(manager.lookup_turn_operation(&thread.id, key)?.is_none());
-        assert_eq!(directory_bytes(temp.path())?, before);
+        assert_eq!(directory_bytes(&runtime_dir)?, before);
 
         drop(
             manager
@@ -2919,13 +2923,13 @@ mod turn_operation_lookup {
         manager.store.save_thread(&thread)?;
         manager.store.save_turn(&turn)?;
         manager.store.save_turn_operation_binding(&binding)?;
-        let before = directory_bytes(temp.path())?;
+        let before = directory_bytes(&runtime_dir)?;
         assert!(matches!(
             manager.lookup_turn_operation(&thread.id, key),
             Err(Incomplete)
         ));
         assert_eq!(
-            directory_bytes(temp.path())?,
+            directory_bytes(&runtime_dir)?,
             before,
             "lookup cannot recreate a missing lock"
         );
@@ -2936,13 +2940,13 @@ mod turn_operation_lookup {
                 .open_turn_operation_claim_lock(&binding.operation_key_fingerprint)?,
         );
         manager.store.remove_turn(&turn.id)?;
-        let before = directory_bytes(temp.path())?;
+        let before = directory_bytes(&runtime_dir)?;
         assert!(matches!(
             manager.lookup_turn_operation(&thread.id, key),
             Err(Incomplete)
         ));
         assert_eq!(
-            directory_bytes(temp.path())?,
+            directory_bytes(&runtime_dir)?,
             before,
             "lookup cannot recover a torn binding"
         );
@@ -2954,12 +2958,12 @@ mod turn_operation_lookup {
                 .open_turn_operation_claim_lock(&binding.operation_key_fingerprint)?,
         );
         let guard = claim.try_write()?;
-        let before = directory_bytes(temp.path())?;
+        let before = directory_bytes(&runtime_dir)?;
         assert!(matches!(
             manager.lookup_turn_operation(&thread.id, key),
             Err(Incomplete)
         ));
-        assert_eq!(directory_bytes(temp.path())?, before);
+        assert_eq!(directory_bytes(&runtime_dir)?, before);
         drop(guard);
         assert_eq!(
             manager.lookup_turn_operation(&thread.id, key)?.unwrap().id,
@@ -2976,7 +2980,8 @@ mod turn_operation_lookup {
         let _env = crate::test_support::lock_test_env();
         let temp = tempfile::tempdir()?;
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
-        let manager = test_manager(temp.path().join("runtime"))?;
+        let runtime_dir = temp.path().join("runtime");
+        let manager = test_manager(runtime_dir.clone())?;
         let thread = sample_thread("thr_lookup_scope");
         let turn = sample_turn(
             &thread.id,
@@ -3025,12 +3030,12 @@ mod turn_operation_lookup {
             write_json_atomic(&binding_path, &candidate_binding)?;
             write_json_atomic(&turn_path, &candidate_turn)?;
             write_json_atomic(&thread_path, &candidate_thread)?;
-            let before = directory_bytes(temp.path())?;
+            let before = directory_bytes(&runtime_dir)?;
             assert!(
                 manager.lookup_turn_operation(&thread.id, key)?.is_none(),
                 "{mismatch}"
             );
-            assert_eq!(directory_bytes(temp.path())?, before, "{mismatch}");
+            assert_eq!(directory_bytes(&runtime_dir)?, before, "{mismatch}");
         }
         manager.store.save_thread(&thread)?;
         manager.store.save_turn(&turn)?;

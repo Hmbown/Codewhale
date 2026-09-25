@@ -10540,6 +10540,11 @@ verbosity = "project-imported"
     #[test]
     fn cli_telemetry_acceptance_is_versioned_and_reuses_settings_persistence() {
         let _lock = env_lock();
+        let _telemetry_env = [
+            ScopedEnvVar::remove("CODEWHALE_TELEMETRY"),
+            ScopedEnvVar::remove("DEEPSEEK_TELEMETRY"),
+            ScopedEnvVar::remove(codewhale_config::TELEMETRY_FLOOR_ENV),
+        ];
         let temp = tempfile::tempdir().expect("tempdir");
         let _home = ScopedEnvVar::set("CODEWHALE_HOME", temp.path().to_str().unwrap());
         let path = temp.path().join("config.toml");

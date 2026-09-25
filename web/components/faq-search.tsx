@@ -2,6 +2,7 @@
 
 import { useState, useMemo, useRef, useCallback, useEffect } from "react";
 import { faqSourceHref } from "@/lib/faq-source";
+import { fill, getFaq } from "@/lib/i18n/dictionaries";
 import { extractText } from "@/lib/react-text";
 import { highlightSpan } from "@/lib/search-utils";
 
@@ -41,7 +42,7 @@ export function FaqSearch({
   items: FaqSearchItem[];
   locale: string;
 }) {
-  const isZh = locale === "zh";
+  const t = getFaq(locale);
   const [query, setQuery] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -94,19 +95,15 @@ export function FaqSearch({
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder={
-              isZh
-                ? "搜索常见问题…（按 / 快速聚焦）"
-                : "Search FAQ… (press / to focus)"
-            }
+            placeholder={t.searchPlaceholder}
             className="search-input w-full"
-            aria-label={isZh ? "搜索常见问题" : "Search FAQ"}
+            aria-label={t.searchLabel}
           />
           {hasQuery && (
             <button
               onClick={() => setQuery("")}
               className="absolute right-3 top-1/2 -translate-y-1/2 font-mono text-sm text-ink-mute hover:text-indigo transition-colors"
-              aria-label={isZh ? "清除" : "Clear"}
+              aria-label={t.searchClear}
             >
               ✕
             </button>
@@ -115,12 +112,8 @@ export function FaqSearch({
         {hasQuery && (
           <div className="mt-2 font-mono text-[0.7rem] text-ink-mute" aria-live="polite">
             {matched > 0
-              ? isZh
-                ? `${matched} / ${total} 个问题匹配 "${query.trim()}"`
-                : `${matched} of ${total} questions match "${query.trim()}"`
-              : isZh
-                ? `未找到匹配 "${query.trim()}" 的问题`
-                : `No questions match "${query.trim()}"`}
+              ? fill(t.searchMatches, { matched, total, query: query.trim() })
+              : fill(t.searchNoMatches, { query: query.trim() })}
           </div>
         )}
       </div>
@@ -140,13 +133,13 @@ export function FaqSearch({
                 <span className="font-mono text-ink-mute text-sm group-open:rotate-45 transition-transform shrink-0">+</span>
               </summary>
               <div className="pb-5 pl-10 pr-4">
-                <div className={`text-ink-soft leading-relaxed ${isZh ? "leading-[1.9] tracking-wide" : ""}`}>
+                <div className={`text-ink-soft leading-relaxed ${t.answerClassName}`}>
                   {item.a}
                 </div>
                 {item.sources && item.sources.length > 0 && (
                   <div className="mt-3 flex items-center gap-2 flex-wrap">
                     <span className="text-xs text-ink-mute">
-                      {isZh ? "来源" : "Sources"}:
+                      {t.sourcesLabel}:
                     </span>
                     {item.sources.map((s) => {
                       const href = faqSourceHref(s);
@@ -173,12 +166,10 @@ export function FaqSearch({
       ) : (
         <div className="text-center py-16 hairline-t hairline-b">
           <p className="font-display text-lg text-ink-mute mb-2">
-            {isZh ? "未找到结果" : "No results found"}
+            {t.noResultsTitle}
           </p>
           <p className="text-sm text-ink-mute">
-            {isZh
-              ? "尝试使用不同的关键字。"
-              : "Try a different keyword."}
+            {t.noResultsBody}
           </p>
         </div>
       )}

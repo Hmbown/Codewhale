@@ -2997,7 +2997,7 @@ mod tests {
     }
 
     #[test]
-    fn rust_fence_renders_multiple_syntax_foregrounds_without_reserved_rgb() {
+    fn rust_fence_respects_terminal_color_depth_without_reserved_rgb() {
         let rendered = render_markdown_tagged(
             "```rust\nfn main() {\n    let answer: u32 = 42; // comment\n}\n```",
             100,
@@ -3008,7 +3008,11 @@ mod tests {
             .flat_map(|line| line.line.spans.iter())
             .filter_map(|span| span.style.fg)
             .collect::<std::collections::HashSet<_>>();
-        assert!(colors.len() > 1, "expected syntax colors, got: {colors:?}");
+        if syntax_color_depth() == palette::ColorDepth::Monochrome {
+            assert_eq!(colors, [Color::Reset].into(), "NO_COLOR: {colors:?}");
+        } else {
+            assert!(colors.len() > 1, "expected syntax colors, got: {colors:?}");
+        }
         for color in colors {
             assert_ne!(color, palette::WHALE_HUMAN);
             assert_ne!(color, palette::WHALE_LIVE);
