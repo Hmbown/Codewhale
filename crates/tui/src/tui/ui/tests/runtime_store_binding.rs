@@ -42,7 +42,7 @@ async fn runtime_store_binding_persists_on_exit_without_a_model_turn() -> anyhow
     sessions.save_session(&original)?;
     sessions.save_checkpoint(&original)?;
     let mut app = Box::new(create_test_app());
-    apply_loaded_session_with_goal(&mut app, &mut config, &original, None)
+    apply_loaded_session_with_goal(&mut app, &mut config, original.clone(), None)
         .map_err(anyhow::Error::msg)?;
     let task_config = TaskManagerConfig::from_runtime(&config, root.path().into(), None, Some(1));
     let tasks = TaskManager::start(
@@ -226,7 +226,7 @@ fn runtime_store_binding_survives_launch_snapshot_and_resume() -> anyhow::Result
             let resumed_config = &mut resumed_config;
             boxed_phase(move || async move {
                 let mut resumed = Box::new(create_test_app());
-                apply_loaded_session_with_goal(&mut resumed, resumed_config, loaded, None)
+                apply_loaded_session_with_goal(&mut resumed, resumed_config, loaded.clone(), None)
                     .map_err(anyhow::Error::msg)?;
                 let tasks = TaskManager::start(
                     task_config.clone(),
@@ -325,9 +325,13 @@ fn runtime_store_binding_survives_launch_snapshot_and_resume() -> anyhow::Result
                 other_app.runtime_services.task_manager = Some(foreign.clone());
                 other_app.input = "preserve pending input".into();
                 let old_id = other_app.current_session_id.clone();
-                let error =
-                    apply_loaded_session_with_goal(&mut other_app, resumed_config, loaded, None)
-                        .unwrap_err();
+                let error = apply_loaded_session_with_goal(
+                    &mut other_app,
+                    resumed_config,
+                    loaded.clone(),
+                    None,
+                )
+                .unwrap_err();
                 // The refusal must name the route that actually works. "Resume
                 // it in a new Codewhale process" was true but unactionable:
                 // starting a new process and then picking the session from
@@ -579,7 +583,7 @@ async fn picker_recovers_missing_store_into_the_idle_host_and_persists_before_re
     let held = plan_state
         .try_lock()
         .expect("hold Work state during recovery");
-    assert!(apply_loaded_session_with_goal(&mut app, &mut config, &saved, None).is_err());
+    assert!(apply_loaded_session_with_goal(&mut app, &mut config, saved.clone(), None).is_err());
     assert_eq!(app.current_session_id.as_deref(), Some("picker-current"));
     assert_eq!(app.api_messages, current_messages);
     assert_eq!(
@@ -592,7 +596,7 @@ async fn picker_recovers_missing_store_into_the_idle_host_and_persists_before_re
         "binding repair survives a contended UI restore"
     );
     drop(held);
-    apply_loaded_session_with_goal(&mut app, &mut config, &saved, None)
+    apply_loaded_session_with_goal(&mut app, &mut config, saved.clone(), None)
         .map_err(anyhow::Error::msg)?;
     assert_eq!(
         app.current_session_id.as_deref(),
@@ -893,7 +897,7 @@ async fn picker_adopts_existing_empty_unheld_store() -> anyhow::Result<()> {
     app.runtime_services.task_manager = Some(tasks.clone());
     app.current_session_id = Some("picker-current".into());
 
-    apply_loaded_session_with_goal(&mut app, &mut config, &saved, None)
+    apply_loaded_session_with_goal(&mut app, &mut config, saved.clone(), None)
         .map_err(anyhow::Error::msg)?;
     assert_eq!(app.current_session_id.as_deref(), Some("picker-adoptable"));
     let durable = sessions.load_session("picker-adoptable")?;

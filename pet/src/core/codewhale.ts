@@ -75,26 +75,6 @@ function classify(name: string): Category {
   if (/tool/.test(n)) return 'tool';
   return CATEGORIES.includes(n as Category) ? n as Category : 'other';
 }
-/** Presentation vocabulary beside the canonical category classifier. Only the
- * witnessed tool name is used; command contents are never inferred. */
-export function toolActivity(name: string): { kind: string; label: string } {
-  const n = name.toLowerCase().replace(/-/g, '_');
-  if (/search|grep|glob|find_file/.test(n)) return { kind: 'searching', label: 'Searching' };
-  if (/read_file|list_dir|read_text|open_file/.test(n)) return { kind: 'reading', label: 'Reading files' };
-  if (/apply_patch|write_file|edit_file|replace_text/.test(n)) return { kind: 'editing', label: 'Editing files' };
-  if (/run_test|pytest|test_suite/.test(n)) return { kind: 'testing', label: 'Running tests' };
-  const category = toolCategory(name);
-  return ({ browser: { kind: 'browsing', label: 'Using the browser' },
-    filesystem: { kind: 'files', label: 'Working with files' },
-    code: { kind: 'executing', label: 'Running a command' },
-    network: { kind: 'network', label: 'Calling a service' },
-    agent: { kind: 'delegating', label: 'Coordinating agents' },
-    memory: { kind: 'memory', label: 'Retrieving context' },
-    reasoning: { kind: 'thinking', label: 'Thinking' },
-    communication: { kind: 'communicating', label: 'Communicating' },
-  } as Record<string, {kind: string; label: string}>)[category] ?? { kind: 'tool', label: 'Using a tool' };
-}
-
 export function toolCategory(name: string): Category {
   const category = classify(name);
   return category === 'other' ? 'tool' : category;

@@ -513,6 +513,26 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
                 },
             },
         },
+        Event::OperationActivityStarted {
+            span_id,
+            activity_kind,
+        } => wire::EventMsg::OperationActivityStarted {
+            thread_id,
+            session_id,
+            span_id: span_id.clone(),
+            activity_kind: *activity_kind,
+        },
+        Event::OperationActivityCompleted {
+            span_id,
+            activity_kind,
+            outcome,
+        } => wire::EventMsg::OperationActivityCompleted {
+            thread_id,
+            session_id,
+            span_id: span_id.clone(),
+            activity_kind: *activity_kind,
+            outcome: *outcome,
+        },
         Event::TurnStarted {
             turn_id,
             created_at,

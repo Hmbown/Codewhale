@@ -4555,6 +4555,16 @@ fn run_config_command(
                 }
                 return Ok(());
             }
+            // A settings.toml key is answered from settings.toml, even when a
+            // stale config.toml copy that nothing reads is still present.
+            if codewhale_tui::config_keys::config_key_home(&key)
+                == codewhale_tui::config_keys::ConfigKeyHome::SettingsToml
+            {
+                let value = settings_key_value(store, &key)?;
+                note_unread_config_copy(store, &key);
+                println!("{value}");
+                return Ok(());
+            }
             if let Some(value) = store.config.get_display_value(&key) {
                 if key == "telemetry" {
                     println!(
@@ -4583,6 +4593,31 @@ fn run_config_command(
                 store.reload()?;
                 println!("set notifications.{}", setting.key());
                 return Ok(());
+            }
+            // Refuse a key nothing reads, and send settings.toml keys to
+            // settings.toml, before config.toml is touched (#6563).
+            match codewhale_tui::config_keys::config_key_home(&key) {
+                codewhale_tui::config_keys::ConfigKeyHome::ConfigToml => {
+                    // A value typed or validated by its config.toml reader.
+                    if let Some(typed) =
+                        codewhale_tui::config_keys::config_toml_value(&key, &value)?
+                    {
+                        store.config.extras.insert(key.trim().to_string(), typed);
+                        store.save()?;
+                        println!("set {key}");
+                        return Ok(());
+                    }
+                }
+                codewhale_tui::config_keys::ConfigKeyHome::SettingsToml => {
+                    refuse_workspace_scoped_settings_key(store, &key)?;
+                    let path = codewhale_tui::config_keys::set_settings_value(&key, &value)?;
+                    println!("set {key} in {}", path.display());
+                    note_unread_config_copy(store, &key);
+                    return Ok(());
+                }
+                codewhale_tui::config_keys::ConfigKeyHome::Unknown => {
+                    bail!(codewhale_tui::config_keys::unknown_config_key_message(&key));
+                }
             }
             store.config.set_value(&key, &value)?;
             if key == "telemetry" {
@@ -4697,6 +4732,39 @@ fn run_config_command(
     }
 }
 
+/// settings.toml is user-global. A `config` command aimed at a workspace
+/// document (`--project`, or a workspace `--config`) must not write it, or
+/// report its value as the project's.
+fn refuse_workspace_scoped_settings_key(store: &ConfigStore, key: &str) -> Result<()> {
+    if codewhale_config::config_path_is_workspace_scoped(store.path()) {
+        bail!(
+            "`{key}` is a user setting stored in settings.toml and has no project scope; \
+             {} is a workspace config. Run the command without --project (or use /settings). \
+             No value was changed.",
+            store.path().display()
+        );
+    }
+    Ok(())
+}
+
+/// `config get` for a settings.toml key: the saved settings.toml value,
+/// never a config.toml copy that nothing reads.
+fn settings_key_value(store: &ConfigStore, key: &str) -> Result<String> {
+    refuse_workspace_scoped_settings_key(store, key)?;
+    codewhale_tui::config_keys::settings_value(key)?.ok_or_else(|| anyhow!("key not found: {key}"))
+}
+
+/// Point at a config.toml copy of a settings.toml key: nothing reads it.
+fn note_unread_config_copy(store: &ConfigStore, key: &str) {
+    if store.config.extras.contains_key(key.trim()) {
+        eprintln!(
+            "note: {} also has `{key}`, which nothing reads; remove it with \
+             `codewhale config unset {key}`",
+            store.path().display()
+        );
+    }
+}
+
 /// Apply per-run `--set KEY=VALUE` overlays to the loaded store in memory.
 /// Nothing is saved; callers that persist must refuse overrides first
 /// (see `run_config_command`).
@@ -4713,16 +4781,18 @@ fn apply_per_run_overrides(store: &mut ConfigStore, specs: &[String]) -> Result<
     Ok(())
 }
 
-/// Read-only credential and endpoint check. The dispatcher's extras also
-/// contain settings owned by runtime readers; they are not unknown keys.
-/// Never prints a credential — presence and shape only.
+/// Read-only credential and endpoint check, plus a report of config.toml
+/// keys nothing reads (#6563). Unread keys are warnings: they are preserved
+/// on save and never fail the check. Never prints a credential — presence
+/// and shape only.
 fn run_config_doctor(store: &ConfigStore) -> Result<()> {
     println!("# {}", store.path().display());
     let mut errors: Vec<String> = Vec::new();
-    if !store.config.extras.is_empty() {
-        println!(
-            "note: additional settings are preserved for runtime readers; this check does not classify their support"
-        );
+    let unread = codewhale_tui::config_keys::unread_config_keys(
+        store.config.extras.keys().map(String::as_str),
+    );
+    for finding in &unread {
+        println!("warning: {finding}");
     }
 
     let mut secrets: Vec<(String, Option<String>)> =
@@ -4757,7 +4827,14 @@ fn run_config_doctor(store: &ConfigStore) -> Result<()> {
         }
         bail!("doctor: {} error(s): {}", errors.len(), errors.join("; "));
     }
-    println!("doctor: credentials and endpoints clean");
+    if unread.is_empty() {
+        println!("doctor: credentials and endpoints clean");
+    } else {
+        println!(
+            "doctor: credentials and endpoints clean; {} config.toml key(s) nothing reads",
+            unread.len()
+        );
+    }
     Ok(())
 }
 
@@ -6001,13 +6078,159 @@ mod tests {
     }
 
     #[test]
-    fn config_doctor_preserves_keys_owned_by_other_readers() {
+    fn config_doctor_reports_unread_keys_without_failing() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("config.toml");
-        write_config_fixture(&path, "zzz_unknown = 1\n");
+        write_config_fixture(
+            &path,
+            "zzz_unknown = 1\ncalm_mode = \"false\"\nmax_subagents = 4\n",
+        );
         let store = ConfigStore::load(Some(path)).expect("load fixture");
-        assert!(!store.config.extras.is_empty());
-        run_config_doctor(&store).expect("extras do not establish unsupported settings");
+        let unread = codewhale_tui::config_keys::unread_config_keys(
+            store.config.extras.keys().map(String::as_str),
+        );
+        assert_eq!(unread.len(), 2, "{unread:#?}");
+        assert!(
+            unread
+                .iter()
+                .any(|line| line.contains("`calm_mode` belongs in settings.toml")),
+            "{unread:#?}"
+        );
+        assert!(
+            unread
+                .iter()
+                .any(|line| line.contains("`zzz_unknown` is not read by anything")),
+            "{unread:#?}"
+        );
+        // Warnings, not errors: the keys are preserved and the check passes.
+        run_config_doctor(&store).expect("unread keys warn, they do not fail");
+    }
+
+    #[test]
+    fn config_set_refuses_unknown_keys_and_routes_settings_to_settings_toml() {
+        let _env = env_lock();
+        let home = tempfile::tempdir().expect("isolated home");
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.path().to_string_lossy());
+        let _config_path = ScopedEnvVar::remove("CODEWHALE_CONFIG_PATH");
+        let _legacy_config_path = ScopedEnvVar::remove("DEEPSEEK_CONFIG_PATH");
+        let path = home.path().join("config.toml");
+        // A stale settings key left in config.toml by 0.10.0 (#6563).
+        let original = "verbosity = \"normal\"\ncalm_mode = \"flase\"\n";
+        write_config_fixture(&path, original);
+        let settings_path = home.path().join("settings.toml");
+        let mut store = ConfigStore::load(Some(path.clone())).expect("load fixture");
+        let set = |store: &mut ConfigStore, key: &str, value: &str| {
+            run_config_command(
+                store,
+                ConfigCommand::Set {
+                    key: key.into(),
+                    value: value.into(),
+                },
+                false,
+                &[],
+            )
+        };
+
+        let error = set(&mut store, "totally_bogus_key", "42").expect_err("unknown key");
+        assert!(
+            format!("{error:#}").contains("unknown config key `totally_bogus_key`"),
+            "{error:#}"
+        );
+        let error = set(&mut store, "calm_mod", "on").expect_err("typo");
+        assert!(
+            format!("{error:#}").contains("Did you mean `calm_mode`?"),
+            "{error:#}"
+        );
+        // A settings.toml key with a bad value is refused by its validator.
+        set(&mut store, "calm_mode", "flase").expect_err("invalid boolean");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!settings_path.exists(), "refusals write nothing");
+
+        set(&mut store, "calm_mode", "off").expect("settings key routes");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let settings = std::fs::read_to_string(&settings_path).expect("settings.toml written");
+        assert!(settings.contains("calm_mode = false"), "{settings}");
+        // `config get` answers from settings.toml, not the stale copy.
+        assert_eq!(settings_key_value(&store, "calm_mode").unwrap(), "false");
+        run_config_command(
+            &mut store,
+            ConfigCommand::Get {
+                key: "calm_mode".into(),
+            },
+            false,
+            &[],
+        )
+        .expect("get settings key");
+
+        // config.toml keys still land in config.toml.
+        set(&mut store, "skills_dir", "/tmp/skills").expect("config key");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("skills_dir"),
+        );
+
+        // Typed TUI fields keep their type, so the TUI's strict parse of the
+        // whole file still succeeds; values their reader refuses are refused.
+        set(&mut store, "yolo", "true").expect("typed bool");
+        set(&mut store, "max_subagents", "4").expect("typed integer");
+        set(&mut store, "reasoning_effort", "none").expect("reader alias");
+        let before_refusals = std::fs::read_to_string(&path).unwrap();
+        set(&mut store, "max_subagents", "lots").expect_err("not an integer");
+        set(&mut store, "reasoning_effort", "sideways").expect_err("unknown effort");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, before_refusals, "refusals write nothing");
+        let document: toml::Table = toml::from_str(&written).expect("config.toml parses");
+        assert_eq!(document["yolo"], toml::Value::Boolean(true), "{written}");
+        assert_eq!(
+            document["max_subagents"],
+            toml::Value::Integer(4),
+            "{written}"
+        );
+        assert_eq!(
+            document["reasoning_effort"],
+            toml::Value::String("off".into()),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn project_scoped_config_refuses_user_global_settings_keys() {
+        let _env = env_lock();
+        let home = tempfile::tempdir().expect("isolated home");
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.path().to_string_lossy());
+        let _config_path = ScopedEnvVar::remove("CODEWHALE_CONFIG_PATH");
+        let _legacy_config_path = ScopedEnvVar::remove("DEEPSEEK_CONFIG_PATH");
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join(".git")).expect("checkout marker");
+        let project_path = workspace.path().join(".codewhale/config.toml");
+        write_config_fixture(&project_path, "verbosity = \"normal\"\n");
+        let mut store = ConfigStore::load(Some(project_path.clone())).expect("load project");
+
+        for command in [
+            ConfigCommand::Set {
+                key: "calm_mode".into(),
+                value: "on".into(),
+            },
+            ConfigCommand::Get {
+                key: "calm_mode".into(),
+            },
+        ] {
+            let error = run_config_command(&mut store, command, true, &[])
+                .expect_err("settings keys have no project scope");
+            assert!(
+                format!("{error:#}").contains("has no project scope"),
+                "{error:#}"
+            );
+        }
+        assert!(
+            !home.path().join("settings.toml").exists(),
+            "the user-global settings.toml is untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&project_path).unwrap(),
+            "verbosity = \"normal\"\n"
+        );
     }
 
     #[test]

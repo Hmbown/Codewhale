@@ -20387,6 +20387,7 @@ async fn execute_tools_dispatches_through_common_executor() {
         tx_event,
         None,
         EXECUTE_TOOLS_TOOL_NAME.to_string(),
+        None,
         json!({"code": code}),
         tmp.path().to_path_buf(),
         Some(&registry),
@@ -20397,6 +20398,177 @@ async fn execute_tools_dispatches_through_common_executor() {
     .expect("execute_tools should dispatch");
     assert!(result.content.contains("\"nested_calls\":1"));
     assert!(result.content.contains("true"));
+}
+
+#[tokio::test]
+async fn dispatch_reports_typed_operation_activity_without_names_or_arguments() {
+    use crate::tools::file_tool::ReadTool;
+    use crate::tools::registry::ToolRegistryBuilder;
+    use crate::tools::spec::ToolContext;
+    use codewhale_protocol::engine_owner::{OwnerActivityKind, OwnerOperationOutcome};
+
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("private-note.txt"), "alpha\n").expect("write note");
+    let context = ToolContext::new(tmp.path());
+    let registry = ToolRegistryBuilder::new()
+        .with_tool(Arc::new(ReadTool))
+        .build(context.clone());
+
+    let run = |name: &'static str, span: Option<&'static str>, input: serde_json::Value| {
+        let registry = &registry;
+        let context = context.clone();
+        let workspace = tmp.path().to_path_buf();
+        async move {
+            let (tx_event, mut rx_event) = mpsc::channel(16);
+            let _ = Engine::execute_tool_with_lock(
+                Arc::new(RwLock::new(())),
+                false,
+                false,
+                tx_event,
+                None,
+                name.to_string(),
+                span.map(str::to_string),
+                input,
+                workspace,
+                Some(registry),
+                None,
+                Some(context),
+            )
+            .await;
+            let mut events = Vec::new();
+            while let Ok(event) = rx_event.try_recv() {
+                if matches!(
+                    event,
+                    Event::OperationActivityStarted { .. }
+                        | Event::OperationActivityCompleted { .. }
+                ) {
+                    events.push(event);
+                }
+            }
+            events
+        }
+    };
+
+    let events = run("read", Some("call-1"), json!({"path": "private-note.txt"})).await;
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                Event::OperationActivityStarted { span_id: started, activity_kind: OwnerActivityKind::Reading },
+                Event::OperationActivityCompleted {
+                    span_id: completed,
+                    activity_kind: OwnerActivityKind::Reading,
+                    outcome: OwnerOperationOutcome::Succeeded,
+                },
+            ] if started == completed && started.starts_with("call-1#")
+        ),
+        "unexpected activity: {events:?}"
+    );
+    // A repeated model call id (gateways that elide ids fall back to
+    // `call_{block_index}`) still gets a fresh span, so a consumer that
+    // deduplicates completed spans sees the second call.
+    let again = run("read", Some("call-1"), json!({"path": "private-note.txt"})).await;
+    let span_of = |events: &[Event]| match events.first() {
+        Some(Event::OperationActivityStarted { span_id, .. }) => span_id.clone(),
+        other => panic!("unexpected activity: {other:?}"),
+    };
+    assert_ne!(span_of(&events), span_of(&again));
+    let wire = format!("{events:?}");
+    assert!(!wire.contains("private-note"), "arguments leaked: {wire}");
+
+    // A failed read still reports its kind, with a typed outcome only.
+    let events = run("read", Some("call-2"), json!({"path": "missing.txt"})).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(Event::OperationActivityCompleted {
+                outcome: OwnerOperationOutcome::Failed,
+                ..
+            })
+        ),
+        "unexpected activity: {events:?}"
+    );
+
+    // No span id (internal/unattributed dispatch), an unregistered name, and
+    // the code-mode wrapper itself report nothing.
+    assert!(
+        run("read", None, json!({"path": "private-note.txt"}))
+            .await
+            .is_empty()
+    );
+    assert!(
+        run("not_a_tool", Some("call-3"), json!({}))
+            .await
+            .is_empty()
+    );
+    assert!(
+        run(
+            EXECUTE_TOOLS_TOOL_NAME,
+            Some("call-4"),
+            json!({"code": "return 1;"})
+        )
+        .await
+        .is_empty()
+    );
+
+    // A call refused by the cancel gate never ran, so it reports nothing.
+    let (tx_event, mut rx_event) = mpsc::channel(16);
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let refused = Engine::execute_tool_with_lock(
+        Arc::new(RwLock::new(())),
+        false,
+        false,
+        tx_event,
+        Some(cancelled),
+        "read".to_string(),
+        Some("call-5".to_string()),
+        json!({"path": "private-note.txt"}),
+        tmp.path().to_path_buf(),
+        Some(&registry),
+        None,
+        Some(context.clone()),
+    )
+    .await;
+    assert!(refused.is_err());
+    while let Ok(event) = rx_event.try_recv() {
+        assert!(
+            !matches!(
+                event,
+                Event::OperationActivityStarted { .. } | Event::OperationActivityCompleted { .. }
+            ),
+            "a refused call reported activity: {event:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dropped_operation_span_completes_as_cancelled() {
+    use codewhale_protocol::engine_owner::{OwnerActivityKind, OwnerOperationOutcome};
+
+    // The turn loop drops an in-flight tool future on cancel; the span it
+    // opened must still close, or every host leaks an active operation.
+    let (tx_event, mut rx_event) = mpsc::channel(16);
+    let span = super::tool_execution::OperationSpanGuard::start(
+        tx_event,
+        "call-x",
+        OwnerActivityKind::Editing,
+    )
+    .await;
+    drop(span);
+    let started = match rx_event.try_recv() {
+        Ok(Event::OperationActivityStarted { span_id, .. }) => span_id,
+        other => panic!("unexpected event: {other:?}"),
+    };
+    match rx_event.try_recv() {
+        Ok(Event::OperationActivityCompleted {
+            span_id,
+            activity_kind: OwnerActivityKind::Editing,
+            outcome: OwnerOperationOutcome::Cancelled,
+        }) => assert_eq!(span_id, started),
+        other => panic!("unexpected event: {other:?}"),
+    }
+    assert!(rx_event.try_recv().is_err(), "exactly one Completed");
 }
 
 #[tokio::test]
@@ -20425,6 +20597,7 @@ async fn code_execution_scenario() {
             tx_event,
             None,
             CODE_EXECUTION_TOOL_NAME.to_string(),
+            None,
             json!({"code":"print('common executor code exec')"}),
             tmp.path().to_path_buf(),
             None,

@@ -1364,11 +1364,13 @@ pub(crate) async fn apply_command_result(
                             return Ok(false);
                         }
                     };
+                let resumed_id = session.metadata.id.clone();
+                let title = crate::session_manager::sanitize_session_title(&session.metadata.title);
                 crate::runtime_threads::prepare_canonical_sessions_root().await;
                 let respawn = match apply_loaded_session_config_snapshot(
                     app,
                     config,
-                    &session,
+                    session,
                     fresh_config,
                     true,
                 ) {
@@ -1410,7 +1412,6 @@ pub(crate) async fn apply_command_result(
                         config: app.compaction_config(),
                     })
                     .await;
-                let title = crate::session_manager::sanitize_session_title(&session.metadata.title);
                 // Restore may have queued a legacy configuration notice.
                 // Admit it first so the confirmed resume remains the latest
                 // toast instead of being immediately covered on the next draw.
@@ -1422,7 +1423,7 @@ pub(crate) async fn apply_command_result(
                         StatusToastLevel::Success,
                         Some(4_000),
                     )
-                    .for_event(format!("session-resumed:{}", session.metadata.id)),
+                    .for_event(format!("session-resumed:{resumed_id}")),
                 );
                 // A loaded session is the working screen. The launch card's
                 // recent rows reach here through `/resume`-shaped dispatch;
@@ -3590,13 +3591,17 @@ pub(crate) fn apply_loaded_session(
     config: &mut Config,
     session: &SavedSession,
 ) -> Result<(), String> {
-    apply_loaded_session_with_goal(app, config, session, None)
+    apply_loaded_session_with_goal(app, config, session.clone(), None)
 }
 
+/// Install a loaded session as the live conversation. The session is taken
+/// by value because it is consumed: its journal, history, artifacts and
+/// metadata move into `app` instead of being cloned beside a copy the caller
+/// would drop right after (memory note M3). On `Err` nothing was installed.
 pub(crate) fn apply_loaded_session_with_goal(
     app: &mut App,
     config: &mut Config,
-    session: &SavedSession,
+    mut session: SavedSession,
     goal: Option<&crate::session_manager::SessionGoalState>,
 ) -> Result<(), String> {
     let mut recovered_binding = None;
@@ -3708,10 +3713,7 @@ pub(crate) fn apply_loaded_session_with_goal(
     let _settled_old_cost_scope = crate::cost_status::close_current_scope();
     *config = *restored_route.config;
     app.refresh_notification_settings(config);
-    app.restore_api_messages(
-        crate::runtime_handoff::project_messages_for_restore(&session.messages),
-        session,
-    );
+    app.restore_api_messages_from_owned(&mut session);
     app.clear_history();
     app.tool_cells.clear();
     app.tool_details_by_cell.clear();
@@ -3883,7 +3885,8 @@ pub(crate) fn apply_loaded_session_with_goal(
     app.cumulative_turn_duration =
         std::time::Duration::from_secs(session.metadata.cumulative_turn_secs);
     app.current_session_id = Some(session.metadata.id.clone());
-    app.current_session_metadata = Some(session.metadata.clone());
+    app.session_title = Some(session.metadata.title.clone());
+    app.current_session_metadata = Some(session.metadata);
     reset_approval_scope_for_new_conversation(app);
     if let Some(binding) = recovered_binding {
         if let Some(metadata) = app.current_session_metadata.as_mut() {
@@ -3895,17 +3898,12 @@ pub(crate) fn apply_loaded_session_with_goal(
             None,
         );
     }
-    app.session_artifacts = session.artifacts.clone();
-    app.session_title = Some(session.metadata.title.clone());
-    app.window_title = session.window_title.clone();
+    app.session_artifacts = session.artifacts;
+    app.window_title = session.window_title;
     app.workspace_context = None;
     app.workspace_is_linked_worktree = false;
     app.workspace_context_refreshed_at = None;
-    if let Some(sp) = session.system_prompt.as_ref() {
-        app.system_prompt = Some(SystemPrompt::Text(sp.clone()));
-    } else {
-        app.system_prompt = None;
-    }
+    app.system_prompt = session.system_prompt.map(SystemPrompt::Text);
     app.scroll_to_bottom();
     Ok(())
 }
@@ -3913,7 +3911,7 @@ pub(crate) fn apply_loaded_session_with_goal(
 pub(crate) fn apply_loaded_session_config_snapshot(
     app: &mut App,
     config: &mut Config,
-    session: &SavedSession,
+    session: SavedSession,
     mut next_config: Config,
     force_engine_respawn: bool,
 ) -> Result<bool, String> {

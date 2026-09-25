@@ -12,8 +12,6 @@ use crate::core::events::Event;
 use crate::tools::spec::ToolError;
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
 
-const USER_INPUT_TIMEOUT: Duration = Duration::from_secs(300);
-
 /// How often a parked wait says it is still parked.
 ///
 /// A wait with no deadline and no periodic line is indistinguishable from a
@@ -284,15 +282,17 @@ impl Engine {
             })
             .await;
 
-        // #6003: `[tools] user_input_timeout_seconds` — absent uses the
-        // built-in default; an explicit 0 waits indefinitely.
-        let wait = self.config.user_input_timeout.unwrap_or(USER_INPUT_TIMEOUT);
+        // #6003: `[tools] user_input_timeout_seconds`. Absent, or an explicit
+        // 0, waits until the person answers or cancels. A positive value is
+        // one absolute deadline for the whole wait: `select!` drops the
+        // losing branches whenever the heartbeat wins, so a relative
+        // `timeout(wait, ..)` rebuilt per iteration never fired.
+        let wait = self
+            .config
+            .user_input_timeout
+            .filter(|wait| !wait.is_zero());
         let started = std::time::Instant::now();
-        // One absolute deadline for the whole wait. `select!` drops the losing
-        // branches whenever the heartbeat wins, so a relative `timeout(wait,
-        // ..)` rebuilt per iteration restarted from zero at every tick and,
-        // with the tick shorter than the timeout, never fired at all.
-        let deadline = (!wait.is_zero()).then(|| tokio::time::Instant::now() + wait);
+        let deadline = wait.map(|wait| tokio::time::Instant::now() + wait);
         let mut heartbeat = tokio::time::interval(WAIT_HEARTBEAT);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat.tick().await;
@@ -344,18 +344,14 @@ impl Engine {
                             ));
                         }
                         Err(_) => {
+                            let seconds = wait.map(|wait| wait.as_secs()).unwrap_or(0);
                             let _ = self
                                 .tx_event
                                 .send(Event::Status {
-                                    message: format!(
-                                        "User input timed out after {}s",
-                                        wait.as_secs()
-                                    ),
+                                    message: format!("User input timed out after {seconds}s"),
                                 })
                                 .await;
-                            return Err(ToolError::Timeout {
-                                seconds: wait.as_secs(),
-                            });
+                            return Err(ToolError::Timeout { seconds });
                         }
                     }
                 }

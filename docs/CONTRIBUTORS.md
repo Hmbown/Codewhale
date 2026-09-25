@@ -28,6 +28,15 @@ notes, and relevant issue/PR comments.
 ## Contributors by time
 
 <details open>
+<summary><strong>v0.10.1 (unreleased)</strong></summary>
+
+**Merged or adapted contributions**
+
+- **[dajiaohuang](https://github.com/dajiaohuang)** — validated `config set` values against the settings schema ([#6568](https://github.com/Hmbown/Codewhale/pull/6568)).
+
+</details>
+
+<details>
 <summary><strong>v0.10.0 — redesigned workbench, session recovery, and runtime surfaces</strong></summary>
 
 **Merged or adapted contributions**

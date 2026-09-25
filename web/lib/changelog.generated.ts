@@ -83,8 +83,8 @@ export const CHANGELOG: ChangelogRelease[] = [
           "Codewhale no longer appends plugin recommendations to your messages to the model. Suggestions appear in one place, follow one switch and one budget, and never advertise built-in plugins, generic words or plugins for another operating system.",
           "/plugin dismissals lists the plugins suggestions skip, and /plugin dismissals reset [<name>] brings them back.",
           "Tools from reviewed plugins that declare themselves read-only no longer ask for approval on every call.",
-          "The bundled Computer Use plugin is 0.11.3, synced from upstream 0f54bf6 (#6303). app_script refuses shell escapes. Clicks on irreversible actions such as pay, send or delete need confirmation. Consent decisions cannot ride inside run_actions or trajectory replay, and trajectories redact secure fields. Also new: a shared-computer control lease that pauses agent input while a person drives, and a browser attach mode for a shared Chromium. The vendored README no longer claims…",
-          "The bundled first-party catalog pins marketplace revision 93b0e0e4e441384533ca586b59890c0d5942bc0a. It lists Computer Use 0.11.3 and the same five plugins as before. Chromewhale is not in the bundled catalog yet."
+          "The bundled Computer Use plugin is 0.12.0, the published upstream release 8435692 (#6303, #5856). On macOS the agent uses its own pointer and never drives your cursor. app_script refuses shell escapes. Clicks on irreversible actions such as pay, send or delete need confirmation. Consent decisions cannot ride inside run_actions or trajectory replay, and trajectories redact secure fields. Also new: a shared-computer control lease that pauses agent input while a person drives,…",
+          "The bundled first-party catalog pins marketplace revision ae3dd2255a9a266365c6125a084f511eb26bc04d. It lists Computer Use 0.12.0 and adds Codewhale for Chrome (Chromewhale) 0.3.0 as a developer preview: you load its Chrome extension unpacked, and like every catalog plugin it installs disabled and untrusted until you review it."
         ],
         "itemCount": 5
       },

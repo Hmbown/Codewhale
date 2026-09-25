@@ -8882,19 +8882,6 @@ base_url = "https://api.xiaomimimo.com/v1"
         }
     }
 
-    /// `/set` and the settings screen read one declaration. A key `/set`
-    /// accepts but the schema does not declare would be settable and
-    /// unplaceable — no kind, no label, no home.
-    #[test]
-    fn every_available_setting_is_declared_in_the_schema() {
-        for (key, _) in Settings::available_settings() {
-            assert!(
-                codewhale_config::setting(key).is_some(),
-                "`/set {key}` is accepted but undeclared in SETTINGS_SCHEMA"
-            );
-        }
-    }
-
     /// Every field `Settings` persists to settings.toml is declared in
     /// SETTINGS_SCHEMA — a row for editable values, a hidden def for picker
     /// memory and one-way flags. A persisted field without a declaration has

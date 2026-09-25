@@ -34,6 +34,7 @@ mod composer_history;
 mod composer_stash;
 pub mod computer_meter;
 mod config;
+pub mod config_keys;
 mod config_persistence;
 mod context_report;
 mod core;

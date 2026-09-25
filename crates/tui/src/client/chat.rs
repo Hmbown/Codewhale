@@ -6599,7 +6599,7 @@ mod image_block_wire_tests {
         assert_eq!(later_wire[6]["content"], "What happened next?");
 
         let restored = crate::compaction::restore_compaction_checkpoint(
-            crate::runtime_handoff::project_messages_for_restore(&messages),
+            crate::runtime_handoff::project_owned_messages_for_restore(messages.clone()),
             Some(&summary),
         );
         let restored_wire = build_chat_messages(None, &restored, "gpt-4o");
@@ -8205,8 +8205,9 @@ mod google_thought_signature_tests {
         let recovery = manager
             .recover_session_for_resume(&id)
             .expect("recover session for resume");
-        let restored =
-            crate::runtime_handoff::project_messages_for_restore(&recovery.session.messages);
+        let restored = crate::runtime_handoff::project_owned_messages_for_restore(
+            recovery.session.messages.clone(),
+        );
         (recovery, restored, on_disk)
     }
 

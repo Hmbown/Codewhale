@@ -1,6 +1,7 @@
 //! Live view transport replacing the app-local QuickJS Worker. Only immutable
 //! projections cross back to Ratatui; network, raster and encoding stay here.
 use super::{graphics, owner};
+use codewhale_protocol::engine_owner::EngineOwnerProjection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -26,13 +27,7 @@ pub struct Pose {
     pub style: Style,
     pub state: Value,
 }
-#[derive(Clone, Deserialize, Serialize)]
-pub struct Activity {
-    pub label: String,
-    pub tool: Option<String>,
-    pub observed: bool,
-    pub parallel: usize,
-}
+pub type Activity = EngineOwnerProjection;
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Scene {
@@ -56,10 +51,33 @@ pub struct Scene {
     pub still: Pose,
     #[serde(default)]
     pub appearance: super::appearance::Appearance,
-    #[serde(default)]
+    /// Owner activity is an overlay on the body, never a reason to drop the
+    /// frame. A long-lived `pet serve` owner can predate this binary (the
+    /// activity shape changed without a frame version bump), so an activity
+    /// this client cannot parse reads as none and the pet keeps rendering.
+    #[serde(default, deserialize_with = "lenient_activity")]
     pub activity: Option<Activity>,
 }
+fn lenient_activity<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Activity>, D::Error> {
+    Ok(Option::<Value>::deserialize(deserializer)?
+        .and_then(|value| serde_json::from_value(value).ok()))
+}
 impl Scene {
+    /// Drop an activity that is invalid or bound to another cursor or
+    /// session. Rejecting the whole frame instead would clear queued events,
+    /// drop the producer lease and loop every shared view on reconnect.
+    fn settle_activity(&mut self) {
+        let source = (self.source != "unattached").then_some(self.source.as_str());
+        if self.activity.as_ref().is_some_and(|activity| {
+            !activity.is_valid()
+                || activity.cursor != self.cursor
+                || activity.session_id.as_deref() != source
+        }) {
+            self.activity = None;
+        }
+    }
     fn valid(&self) -> bool {
         self.version == 1
             && self.time_ms.is_finite()
@@ -394,7 +412,10 @@ fn run(
             match client
                 .get("/v1/frame")
                 .and_then(|value| serde_json::from_value::<Scene>(value).map_err(io::Error::other))
-            {
+                .map(|mut next| {
+                    next.settle_activity();
+                    next
+                }) {
                 Ok(next) if next.valid() => {
                     if scene
                         .as_ref()

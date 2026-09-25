@@ -8,6 +8,7 @@
 #![deny(clippy::print_stdout)]
 #![deny(clippy::print_stderr)]
 
+pub(crate) mod activity;
 pub mod apply_patch;
 pub mod approval_cache;
 pub mod approval_summary;
