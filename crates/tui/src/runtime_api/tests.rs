@@ -5848,6 +5848,141 @@ async fn session_create_from_thread_returns_404_for_missing_thread() -> Result<(
     Ok(())
 }
 
+/// `PUT /v1/sessions` with no `session_id` persists the conversation's own id,
+/// not a fresh uuid.
+///
+/// The engine tags every `tool:` / `pre-turn:` workspace snapshot with its live
+/// conversation id, and `patch-undo` / `file-revert` select snapshots by the
+/// thread's `session_id`. Minting a third uuid at save time left those two
+/// disagreeing for every thread whose first save minted the document, so the
+/// toolbar's Undo forked the conversation and rolled no files back, and the
+/// Changes panel's Revert refused a snapshot that existed (reported against the
+/// VS Code client on engine 0.10.0, where no thread's binding matched any
+/// snapshot in the workspace).
+#[tokio::test]
+async fn session_save_without_an_id_keeps_the_conversation_that_owns_the_snapshots() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("deepseek-session-identity-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let created: serde_json::Value = client
+        .post(format!("http://{addr}/v1/threads"))
+        .json(&json!({
+            "model": "deepseek-v4-pro",
+            "mode": "agent",
+            "workspace": root.join("workspace")
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = created["id"]
+        .as_str()
+        .context("missing thread id")?
+        .to_string();
+
+    // A new conversation's id is generated inside the engine, so only a mock
+    // can state it. It stands in for the id the real engine stamps on every
+    // snapshot the conversation takes.
+    const CONVERSATION_ID: &str = "3f9c7b1e-58b4-4d2a-9f5a-8a1e0c6d2b70";
+    let harness = crate::core::engine::mock_engine_handle();
+    runtime_threads
+        .install_test_engine(&thread_id, harness.handle.clone())
+        .await?;
+    let mut rx_op = harness.rx_op;
+    tokio::spawn(async move {
+        while let Some(op) = rx_op.recv().await {
+            if let Op::GetSessionSnapshot { tx } = op {
+                let snapshot = crate::core::ops::SessionSnapshot {
+                    session_id: CONVERSATION_ID.to_string(),
+                    messages: vec![Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: "One conversation, one id".to_string(),
+                            cache_control: None,
+                        }],
+                    }],
+                    total_tokens: 7,
+                    model: "deepseek-v4-pro".to_string(),
+                    model_provider: "deepseek".to_string(),
+                    model_provider_id: None,
+                    workspace: root.clone(),
+                    system_prompt: None,
+                    mode: "agent".to_string(),
+                };
+                if let Some(tx) = tx.lock().ok().and_then(|mut guard| guard.take()) {
+                    let _ = tx.send(snapshot);
+                }
+            }
+        }
+    });
+
+    let saved: serde_json::Value = client
+        .put(format!("http://{addr}/v1/sessions"))
+        .json(&json!({ "thread_id": thread_id }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        saved["session_id"], CONVERSATION_ID,
+        "a save that names no session must persist the conversation's own id"
+    );
+
+    // That is the id `patch_undo_workspace_files` and `revert_file_from_snapshot`
+    // select snapshots by, so the binding and the snapshots must agree.
+    let detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{thread_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(detail["thread"]["session_id"], CONVERSATION_ID);
+
+    // Saving again keeps the one document instead of collecting a new one per
+    // visit — the drift above was also how one conversation came to hold
+    // several session files.
+    let documents = || -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&sessions_dir)? {
+            names.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        Ok(names)
+    };
+    let before = documents()?;
+    let resaved: serde_json::Value = client
+        .put(format!("http://{addr}/v1/sessions"))
+        .json(&json!({ "thread_id": thread_id }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(resaved["session_id"], CONVERSATION_ID);
+    assert_eq!(
+        documents()?,
+        before,
+        "a second save writes the session it already owns, not another one"
+    );
+    assert!(
+        sessions_dir
+            .join(format!("{CONVERSATION_ID}.json"))
+            .exists()
+    );
+
+    handle.abort();
+    Ok(())
+}
+
 /// Create a thread over HTTP and seed it with one user/assistant turn.
 /// Shared setup for the undo/patch-undo/retry endpoint tests.
 async fn create_seeded_thread(

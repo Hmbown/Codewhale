@@ -1142,7 +1142,6 @@
   "PendingApprovalInAgent": "Cal una aprovació a {agent} — /agents",
   "ApprovalTruncationHint": "  … truncat · prem {details} per a tots els detalls",
   "ApprovalFullAccessPolicyBlocked": "{tool} blocat: Full Access no pot evitar aquesta política",
-  "AutoReviewQuestionSkipped": "Auto-Review ha omès una pregunta de l'usuari i ha continuat autònomament",
   "ApprovalChooseHint": "Tria: ",
   "ApprovalChooseAction": "Enter per a l'opció seleccionada, o prem y/a/d directament",
   "ApprovalIntentLabel": "Intenció: ",

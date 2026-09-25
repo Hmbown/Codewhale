@@ -9597,3 +9597,90 @@ fn unsupported_nested_config_write_fails_without_mutation() {
     assert!(err.to_string().contains("user_input_timeout_seconds"));
     assert_eq!(toml::to_string(&config).unwrap(), before);
 }
+
+/// #6516: `output_mode` had no reader and was removed from the typed schema. A
+/// config that still carries it must keep loading, and a typed save must keep
+/// the user's line rather than silently dropping it or failing on it.
+#[test]
+fn retired_output_mode_key_still_loads_and_survives_a_typed_save() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join(CONFIG_FILE_NAME);
+    fs::write(
+        &config_path,
+        "output_mode = \"plain\"\nverbosity = \"quiet\"\n\n[providers.deepseek]\nmodel = \"deepseek-v4-flash\"\n",
+    )
+    .expect("write config");
+
+    let mut store = ConfigStore::load(Some(config_path.clone())).expect("load config store");
+    assert_eq!(store.config.verbosity.as_deref(), Some("quiet"));
+    assert_eq!(
+        store.config.extras.get("output_mode"),
+        Some(&toml::Value::String("plain".to_string()))
+    );
+
+    store.config.verbosity = Some("concise".to_string());
+    store.save().expect("typed save");
+    let saved = fs::read_to_string(&config_path).expect("read saved config");
+    let reparsed: ConfigToml = toml::from_str(&saved).expect("saved config parses");
+    assert_eq!(reparsed.verbosity.as_deref(), Some("concise"));
+    assert!(saved.contains("output_mode = \"plain\""), "{saved}");
+}
+
+#[test]
+fn declared_setting_writes_keep_schema_type_and_refuse_bad_values() {
+    let mut config = ConfigToml::default();
+    config.set_value("allow_shell", "off").unwrap();
+    assert_eq!(config.extras["allow_shell"], toml::Value::Boolean(false));
+    config.set_value("max_history", " 250 ").unwrap();
+    assert_eq!(config.extras["max_history"], toml::Value::Integer(250));
+    config
+        .set_value("auto_compact_threshold_percent", "72.5")
+        .unwrap();
+    assert_eq!(
+        config.extras["auto_compact_threshold_percent"],
+        toml::Value::Float(72.5)
+    );
+    config.set_value("tool_collapse", "Expanded").unwrap();
+    assert_eq!(
+        config.extras["tool_collapse"],
+        toml::Value::String("expanded".into())
+    );
+
+    let before = toml::to_string(&config).unwrap();
+    for (key, value, needle) in [
+        ("allow_shell", "flase", "invalid value for 'allow_shell'"),
+        ("max_history", "lots", "expected an integer"),
+        ("auto_compact_threshold_percent", "NaN", "expected a number"),
+        (
+            "tool_collapse",
+            "sideways",
+            "expected one of compact, expanded, calm",
+        ),
+    ] {
+        let err = config.set_value(key, value).unwrap_err();
+        assert!(format!("{err:#}").contains(needle), "{key}: {err:#}");
+    }
+    assert_eq!(
+        toml::to_string(&config).unwrap(),
+        before,
+        "refusals change nothing"
+    );
+
+    // `reasoning_effort` keeps its reader's aliases, which the schema's
+    // option list does not name; the TUI reader validates them.
+    for alias in ["none", "mid", "maximum", "minimum"] {
+        config.set_value("reasoning_effort", alias).unwrap();
+        assert_eq!(
+            config.extras["reasoning_effort"],
+            toml::Value::String(alias.into())
+        );
+    }
+
+    // Undeclared keys keep the string fallthrough; `config set` refuses the
+    // ones nothing reads before calling here.
+    config.set_value("skills_dir", "/tmp/skills").unwrap();
+    assert_eq!(
+        config.extras["skills_dir"],
+        toml::Value::String("/tmp/skills".into())
+    );
+}

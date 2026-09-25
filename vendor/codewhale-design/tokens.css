@@ -1,4 +1,4 @@
-/* Generated from Codewhale GPUI design 1.0.0; sha256 a0c23f8a235bbc61e42fb8a60795ae7d9825dbbd1730142acc9ffec9c0abb3af. Do not edit. */
+/* Generated from Codewhale GPUI design 1.1.1; sha256 c08d7d4b253afe340207658b1f233dd1a9dbe94fa57e925bde025a3db70543ee. Do not edit. */
 :root {
   --outside: #191a1c;
   --surface: #202123;
@@ -12,6 +12,9 @@
   --attention: #e8b077;
   --hover: #303134;
   --selected: #37393d;
+  --live: #9ec7b2;
+  --danger: #e39a90;
+  --border-strong: #828386;
   --selection: #90b9ff47;
   color-scheme: dark;
 }
@@ -28,6 +31,9 @@
   --attention: #86520d;
   --hover: #e8e5e0;
   --selected: #dfdcd6;
+  --live: #3a6352;
+  --danger: #9e3f36;
+  --border-strong: #807c76;
   --selection: #245bc747;
   color-scheme: light;
 }
@@ -40,6 +46,7 @@
   --spacing-page: 32px;
   --radius-control: 6px;
   --radius-panel: 10px;
+  --radius-sheet: 14px;
   --focus-width: 2px;
   --focus-offset: 3px;
   --icon-stroke: 1.7;
@@ -47,4 +54,8 @@
   --font-fallbacks: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC";
   --font-body-size: 14px;
   --font-code-size: 13px;
+  --font-caption-size: 12px;
+  --font-prose-size: 17px;
+  --font-heading-size: 17px;
+  --font-title-size: 22px;
 }

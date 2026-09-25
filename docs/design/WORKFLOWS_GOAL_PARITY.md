@@ -83,7 +83,7 @@ Arena Mode) — official docs at x.ai/cli returned 404 for the deep pages.
   launch policy, plan-approval cards, per-run token budgets, worktree write
   ownership, gates, per-event run journal `.codewhale/workflow-runs.jsonl`
   with restart reconciliation, live workflow panel + history card,
-  `codewhale workflow run <name|--source-path> --runtime tmux|inline|vm|ci`.
+  `codewhale workflow run <name|--source-path> --runtime tmux|inline`.
 
 ## Dogfood findings (before this lane)
 

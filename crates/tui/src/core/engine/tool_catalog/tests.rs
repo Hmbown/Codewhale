@@ -170,7 +170,6 @@ fn eager_workflow_still_respects_command_allow_and_deny_gates() {
                 allow.map(|name| vec![name.to_string()]),
                 deny.map(|name| vec![name.to_string()]),
                 None,
-                codewhale_execpolicy::ApprovalMode::Suggest,
                 ToolMode::Direct,
             );
             assert_eq!(policy.allows_tool("workflow"), expected);

@@ -7960,29 +7960,6 @@ fn app_auto_approval_helper_covers_bypass_only() {
     assert!(app_auto_approve_enabled(&app));
 }
 
-#[test]
-fn auto_review_suppresses_stale_question_prompts_while_other_postures_allow_them() {
-    let mut app = create_test_app();
-    for (posture, expected) in [
-        (ApprovalMode::Suggest, false),
-        (ApprovalMode::Auto, true),
-        (ApprovalMode::Bypass, false),
-        (ApprovalMode::Never, false),
-    ] {
-        app.approval_mode = posture;
-        assert_eq!(
-            should_suppress_user_input_prompt(&app),
-            expected,
-            "{posture:?}"
-        );
-    }
-
-    // Full Access keeps questions valid, same as Auto-Review suppresses
-    // them only for its own stale-prompt cleanup.
-    app.approval_mode = ApprovalMode::Bypass;
-    assert!(!should_suppress_user_input_prompt(&app));
-}
-
 fn create_test_options() -> TuiOptions {
     TuiOptions {
         // Keep UI tests independent from the developer's saved
@@ -21564,7 +21541,7 @@ fn missing_named_custom_provider_resume_leaves_current_session_wholly_unchanged(
     let err = apply_loaded_session_config_snapshot(
         &mut app,
         &mut config,
-        &session,
+        session.clone(),
         Config::default(),
         true,
     )
@@ -21733,7 +21710,7 @@ fn file_load_uses_one_fresh_config_snapshot_for_custom_route_and_app_state() {
     let respawn = apply_loaded_session_config_snapshot(
         &mut app,
         &mut stale_config,
-        &session,
+        session.clone(),
         fresh_config,
         true,
     )
@@ -21885,7 +21862,7 @@ fn file_load_respawns_engine_when_same_custom_identity_changes_endpoint() {
     let respawn = apply_loaded_session_config_snapshot(
         &mut app,
         &mut stale_config,
-        &session,
+        session.clone(),
         fresh_config,
         true,
     )
@@ -21952,7 +21929,7 @@ fn file_load_route_refresh_preserves_effective_permission_and_feature_overlays()
     let respawn = apply_loaded_session_config_snapshot(
         &mut app,
         &mut effective_config,
-        &session,
+        session.clone(),
         raw_disk_config,
         true,
     )

@@ -1142,7 +1142,6 @@
   "PendingApprovalInAgent": "{agent} में स्वीकृति चाहिए — /agents",
   "ApprovalTruncationHint": "  … छाँटा गया · पूरा विवरण के लिए {details} दबाएँ",
   "ApprovalFullAccessPolicyBlocked": "{tool} अवरुद्ध: Full Access इस नीति को दरकिनार नहीं कर सकता",
-  "AutoReviewQuestionSkipped": "Auto-Review ने उपयोगकर्ता प्रश्न छोड़कर स्वायत्त रूप से जारी रखा",
   "ApprovalChooseHint": "चुनें: ",
   "ApprovalChooseAction": "चुना विकल्प भेजें, या सीधे y/a/d दबाएँ",
   "ApprovalIntentLabel": "इरादा: ",

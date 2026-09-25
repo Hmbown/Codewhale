@@ -9,15 +9,14 @@ import {
   REPO_URL,
 } from "@/lib/i18n/links";
 import { SITE_CONTACT_EMAIL, SITE_SECURITY_EMAIL } from "@/lib/page-meta";
-import { Strata } from "./strata";
 import { USAGE_COUNTING_COPY } from "@/lib/content/usage-counting";
 import { pickText } from "@/lib/i18n/dictionaries";
+import { WhalePose } from "./whale-pose";
 
 /**
- * Site footer. One dictionary path for every routed locale — the previous
- * en / zh / dictionary triple branch is gone, and the Product column now
- * carries the full six-link set everywhere (footerGuide and footerFaq exist
- * in ChromeDict as of #4934).
+ * Site footer: the sea below the page's one horizon, in both appearances.
+ * One dictionary path for every routed locale; the Product column carries
+ * the full link set everywhere.
  */
 export function Footer({ locale = "en" }: { locale?: Locale }) {
   const chrome = getChrome(locale);
@@ -28,28 +27,29 @@ export function Footer({ locale = "en" }: { locale?: Locale }) {
 
   return (
     <footer className="site-footer">
-      {/* The waterline: every page still on paper descends here into the
-          seabed. The homepage is already under water by now, and the
-          stylesheet hides this band behind its ocean column. */}
-      <div className="site-footer-waterline" aria-hidden="true">
-        <Strata variant="band" />
-      </div>
+      <div className="horizon" aria-hidden="true" />
+      <div className="sea-texture" aria-hidden="true" />
       <div className="site-footer-main">
         <div className="site-footer-brand">
-          <Link href={homeHref} className="site-wordmark site-wordmark-footer">
-            <img src="/brand/wordmark-inverted.svg" alt="Codewhale" height={18} />
+          <Link href={homeHref} className="site-wordmark site-wordmark-footer" aria-label="Codewhale">
+            <WhalePose pose="rest" />
+            <span className="wordmark" aria-hidden="true" />
           </Link>
           <p>{chrome.footerTagline}</p>
         </div>
 
         <div className="site-footer-links">
-          <div>
-            <span>{chrome.footerProduct}</span>
-            {product.map((item) => <Link key={item.href} href={item.href}>{item.label}</Link>)}
+          <div className="site-footer-group">
+            <span className="site-footer-label">{chrome.footerProduct}</span>
+            <div className="site-footer-list">
+              {product.map((item) => <Link key={item.href} href={item.href}>{item.label}</Link>)}
+            </div>
           </div>
-          <div>
-            <span>{chrome.footerProject}</span>
-            {project.map((item) => <Link key={item.href} href={item.href}>{item.label}</Link>)}
+          <div className="site-footer-group">
+            <span className="site-footer-label">{chrome.footerProject}</span>
+            <div className="site-footer-list">
+              {project.map((item) => <Link key={item.href} href={item.href}>{item.label}</Link>)}
+            </div>
           </div>
         </div>
       </div>
@@ -61,7 +61,7 @@ export function Footer({ locale = "en" }: { locale?: Locale }) {
           {chrome.footerReleases}
           <a href={REPO_RELEASES_URL}>{chrome.footerReleasesLink}</a>
         </p>
-        <div>
+        <div className="site-footer-meta-links">
           {legal.map((item) => <Link key={item.href} href={item.href}>{item.label}</Link>)}
           {GITEE_ENABLED && <a href="https://gitee.com/Hmbown/CodeWhale">Gitee</a>}
           <a href="https://cnb.cool/codewhale.net/codewhale">CNB</a>

@@ -459,7 +459,7 @@ mod tests {
     fn runtime_handoffs() -> Vec<(&'static str, Message)> {
         let waiting = crate::runtime_handoff::waiting_for_subagents_runtime_message(2);
         let restored =
-            crate::runtime_handoff::project_messages_for_restore(std::slice::from_ref(&waiting));
+            crate::runtime_handoff::project_owned_messages_for_restore(vec![waiting.clone()]);
         vec![
             ("waiting_for_subagents", waiting),
             (

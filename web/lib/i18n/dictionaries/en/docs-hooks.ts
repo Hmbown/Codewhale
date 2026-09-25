@@ -1,41 +1,160 @@
 import type { DocsHooksDict } from "../types";
 
 /**
- * English reference dictionary for `app/[locale]/docs/hooks/page.tsx`.
- * Copy moved verbatim from the page's `isZh` ternaries — any wording change
- * belongs in its own commit, never mixed into a structural move.
+ * English reference dictionary for `app/[locale]/docs/hooks/page.tsx`
+ * ("Run commands on events"). Checked against docs/HOOKS.md — the
+ * authoritative event-by-event contract (15 events, steering events,
+ * conditions, environment variables, project-hook approval).
  */
 export const docsHooks: DocsHooksDict = {
-  metaTitle: "Hooks · Codewhale Docs",
+  metaTitle: "Run commands on events · Codewhale Docs",
   metaDescription:
-    "The shipped lifecycle hooks: mutable message_submit, tool_call_before decisions, turn_end, and sub-agent observer events.",
+    "Run your own scripts when a session starts, before a tool call, when a turn ends, or when Codewhale is waiting for you — to add context, enforce a rule, or get notified.",
   bodyClassName: "text-ink-soft leading-relaxed",
-  overviewTitle: "Hooks",
-  overviewLead:
-    "Hooks attach your own commands to Codewhale's lifecycle: inject context before a message is submitted, enforce policy before a tool call, and audit turns or sub-agent activity. This page describes what currently ships; docs/rfcs/1364-hooks-lifecycle.md is the design RFC for this surface, and docs/CONFIGURATION.md carries the full configuration schema.",
-  configIntro:
-    "Hooks are configured under {hooksTable} entries in config.toml; run {hooksCommand} in the TUI to see every configured hook grouped by event — name, command preview, timeout, and condition — plus the global {enabledKey} state.",
-  events: [
-    [
-      "message_submit (mutable)",
-      "Runs before a submitted message is added to history or sent to the model. The hook receives JSON on stdin; exit 0 with stdout JSON carrying a non-empty text field replaces the submitted text, and exit 2 blocks the submission before the turn starts. Multiple hooks run serially in config order, each receiving the previous hook's output. Hooks marked background = true are observer-only and cannot transform or block.",
-    ],
-    [
-      "tool_call_before (decision)",
-      "Runs before each tool call executes. Beyond the exit-2 hard deny (which always wins), a foreground hook may print a JSON decision on stdout with exit 0: allow / deny / ask, plus updatedInput to rewrite the tool input and additionalContext appended to the tool result the model sees. When several hooks match, precedence is deny > ask > allow; tool_name conditions support * globs (mcp__* matches every MCP tool). Full Access does not open tool-approval prompts, so ask does not downgrade that posture.",
-    ],
-    [
-      "turn_end (observer)",
-      "Fires after each model turn ends, once usage, cost, notifications, receipts, and queue-recovery state have settled. The stdin JSON carries fields such as status, duration_ms, usage, totals, and queued_message_count. Stdout is ignored and failures are warn-only — the hook cannot block input, mutate the transcript, or change the next queued follow-up.",
-    ],
-    [
-      "subagent_spawn / subagent_complete (observer)",
-      "Observe sub-agent start and completion with bounded JSON metadata on stdin (agent_id, status, truncated prompt/result previews). Failures are warn-only and never block scheduling or change prompts or results; use the transcript handle returned by agent when full detail is needed.",
-    ],
+  title: "Run commands on events",
+  lede:
+    "Hooks run a command of yours at set moments in a Codewhale session. Use them to block a risky command, add context to a message, log what happened, or get told when Codewhale is waiting for you.",
+  sections: [
+    {
+      id: "first-hook",
+      title: "Add your first hook",
+      blocks: [
+        { p: "Hooks live in `~/.codewhale/config.toml`. This one prints a line whenever a session starts:" },
+        {
+          code: `[hooks]
+enabled = true
+
+[[hooks.hooks]]
+name = "announce"
+event = "session_start"
+command = "echo 'Codewhale session started'"`,
+          lang: "config.toml",
+        },
+        {
+          p: "Start a session, then run `/hooks` to see every configured hook, whether hooks are on, and any entry that was rejected. `/hooks events` lists the event names.",
+        },
+      ],
+    },
+    {
+      id: "gate",
+      title: "Block a command before it runs",
+      blocks: [
+        {
+          p: "A `tool_call_before` hook sees each tool call before it executes and can allow it, deny it, or force an approval prompt. This one refuses force-pushes. Save the script and make it executable:",
+        },
+        {
+          code: `#!/bin/sh
+# ~/.codewhale/hooks/no-force-push.sh
+case "$DEEPSEEK_TOOL_ARGS" in
+  *"push --force"*|*"push -f"*)
+    echo '{"decision": "deny", "reason": "Force-push is blocked by a hook."}' ;;
+esac
+exit 0`,
+          lang: "no-force-push.sh",
+        },
+        {
+          code: `[[hooks.hooks]]
+name = "no-force-push"
+event = "tool_call_before"
+command = "~/.codewhale/hooks/no-force-push.sh"
+condition = { type = "tool_name", name = "bash" }`,
+          lang: "config.toml",
+        },
+        {
+          p: "The hook reads the call from environment variables and answers with JSON on standard output: `allow`, `deny`, or `ask`, plus an optional `reason`, a rewritten input (`updatedInput`), or extra context for the model (`additionalContext`). Exit code 2 always denies. When several hooks answer, deny beats ask, and ask beats allow.",
+        },
+        {
+          note: "`ask` forces a prompt in Ask and Auto-Review. Full Access never shows approval prompts, so there `ask` does not add one.",
+        },
+      ],
+    },
+    {
+      id: "events",
+      title: "Choose the moment",
+      blocks: [
+        {
+          p: "Three events can change what happens next. The rest only observe; their output is ignored and a failure is a warning.",
+        },
+        {
+          rows: [
+            ["message_submit", "Before your message reaches the model. Can replace the text or block it."],
+            ["tool_call_before", "Before each tool call. Can allow, deny, ask, rewrite the input, or add context."],
+            ["shell_env", "Before each shell command. Can add environment variables."],
+            ["session_start / session_end", "When a session opens or closes cleanly."],
+            ["turn_end", "After a turn finishes, with its status, duration, and token usage."],
+            ["tool_call_after", "After each tool result, with its exit code when there is one."],
+            ["waiting_for_user", "When Codewhale starts waiting for an approval, an answer, or a paused goal."],
+            ["session_idle / session_busy", "When the session settles or starts working again."],
+            ["session_error / on_error", "When a turn fails for good, or on any error or failed tool."],
+            ["mode_change", "When you switch between Plan, Work, and Operate."],
+            ["subagent_spawn / subagent_complete", "When a sub-agent starts or finishes."],
+          ],
+          codeTerms: true,
+        },
+        {
+          p: "A `condition` narrows when a hook fires: by tool name (with `*` globs), tool category, mode, or exit code, and combinations with `all` and `any`. A condition that can never match its event is rejected when the config loads, so a gate you think is armed never sits silently inert.",
+        },
+      ],
+    },
+    {
+      id: "options",
+      title: "Set timeouts and failure behavior",
+      blocks: [
+        {
+          rows: [
+            ["timeout_secs", "How long the hook may run. Default 30."],
+            ["continue_on_error", "`true` (default): a failing hook only warns. `false`: the failure blocks."],
+            ["background", "`true` runs the hook as an observer only; it cannot block or rewrite."],
+            ["working_dir", "Under `[hooks]`: where hooks run. Default: the session's workspace."],
+          ],
+          codeTerms: true,
+        },
+        {
+          note: "`[hooks] default_timeout_secs` replaces every hook's own `timeout_secs`, not just the missing ones. Leave it unset if you want per-hook timeouts.",
+        },
+      ],
+    },
+    {
+      id: "project",
+      title: "Use hooks a repository ships",
+      blocks: [
+        {
+          p: "A repository can include hooks in `.codewhale/hooks.toml`. Because they run commands on your machine, they load only after you trust the workspace and approve that exact file:",
+        },
+        { code: "/hooks review\n/hooks approve <digest>\n/hooks revoke", lang: "Codewhale" },
+        {
+          p: "`/hooks review` shows the commands and a digest of the file; approving that digest enables those exact bytes from the next session. Any change to the file needs a new approval. Review the scripts the commands call, too.",
+        },
+      ],
+    },
+    {
+      id: "headless",
+      title: "Use hooks in scripts and CI",
+      blocks: [
+        {
+          p: "Hooks run in the interactive session. `codewhale exec` fires none by default; add `--hooks` to fire `tool_call_before` and `shell_env`. With no one to answer, an `ask` becomes a deny.",
+        },
+        { code: 'codewhale exec --auto --hooks "run the test suite and fix the first failure"', lang: "Terminal" },
+      ],
+    },
   ],
-  projectTitle: "Project-local hooks",
-  projectLead:
-    'Repositories can ship policy in <workspace>/.codewhale/hooks.toml. Because project hooks are executable shell configuration, Codewhale loads them only after the workspace is trusted through the trust prompt or a trust_level = "trusted" entry in user-owned config — session /trust on and legacy .deepseek/trusted markers do not enable project hooks by themselves. Once trusted, project hooks are appended after the global hooks from config.toml, so they run last and win updatedInput ties. A malformed trusted project file logs a warning and startup falls back to global hooks only.',
+  next: [
+    {
+      href: "/docs/modes",
+      label: "Set modes and approvals",
+      note: "How hook decisions combine with Ask, Auto-Review, and Full Access.",
+    },
+    {
+      href: "/docs/mcp",
+      label: "Connect tools with MCP",
+      note: "Gate MCP tools with the same `tool_call_before` hooks.",
+    },
+    {
+      href: "/docs/configuration",
+      label: "Change settings",
+      note: "Where `config.toml` lives and what a project may override.",
+    },
+  ],
   sourceNote:
-    "Source documents: docs/rfcs/1364-hooks-lifecycle.md (design RFC), docs/CONFIGURATION.md (configuration schema) · Update docs-map.ts when changing.",
+    "Source documents: docs/HOOKS.md (authoritative), docs/CONFIGURATION.md · Update docs-map.ts when changing.",
 };

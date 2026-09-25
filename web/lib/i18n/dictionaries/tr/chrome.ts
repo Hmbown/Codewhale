@@ -35,24 +35,7 @@ export const chrome: ChromeDict = {
 
   authSignIn: "Giriş yap",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "istediğin model, senin makinen",
-
-  issueLabel: "{date} sayısı",
   dateLocale: "tr-TR",
-
-  tickerLiveLabel: "Canlı",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "birleştirildi",
-  tickerOpened: "açıldı",
-  tickerClosed: "kapatıldı",
-  tickerReleased: "yayımlandı",
-  tickerFirstContribution: "ilk katkı",
-  tickerBy: "{handle} tarafından",
-  tickerAria: "Depodaki son etkinlik",
-
-  traceLabel: "muhakeme izi",
-  traceTabsAria: "Oturum kesitleri",
 
   menuOpen: "Menüyü aç",
   menuClose: "Menüyü kapat",

@@ -26,11 +26,8 @@ export const home: HomeDict = {
   releaseUnavailable: "Status do lançamento indisponível",
   currentSource: "Código-fonte",
   sourceCandidate: "Não publicado",
-  providerRoutes: "{count} provedores",
   publishedRelease: "publicado",
   figcaptionSourceCandidate: "não publicado",
-  chapterTerminal: "Seu terminal",
-  chapterTerminalTitle: "Comece com algo que você queira criar",
   gainHeading:
     "O que você pode fazer com o Codewhale",
   gainLede:
@@ -49,7 +46,6 @@ export const home: HomeDict = {
       "Use modelos hospedados ou locais para seus agentes, com modelos e papéis diferentes cuidando das partes do trabalho às quais são adequados."
     ]
   ],
-  chapterModels: "Seus modelos",
   modelsHeading: "Opções de modelos para cada tarefa",
   modelsBody:
     "Conecte-se diretamente a um provedor de modelos hospedados, use um gateway para acessar vários provedores ou execute um modelo localmente, depois escolha qual modelo cada sessão usa enquanto trabalha.",
@@ -64,7 +60,6 @@ export const home: HomeDict = {
     "Depois de instalar o Codewhale e conectar um modelo, você pode descrever sua primeira tarefa no terminal e adicionar um Fleet quando quiser dividir o trabalho entre vários agentes.",
   startGuideLink: "Ler o guia de primeiros passos",
   startVocabularyLink: "Ver o vocabulário do produto",
-  chapterAccount: "Obter o Codewhale",
   availabilityHeading: "Onde você pode usar o Codewhale",
   availabilityLede:
     "Você já pode usar o Codewhale no seu terminal enquanto desenvolvemos o aplicativo web, o aplicativo desktop e os computadores na nuvem.",

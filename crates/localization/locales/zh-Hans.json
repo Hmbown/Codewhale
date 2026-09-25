@@ -1163,7 +1163,6 @@
   "PendingApprovalInAgent": "{agent} 需要批准 — /agents",
   "ApprovalTruncationHint": "  … 已截断 · 按 {details} 查看完整内容",
   "ApprovalFullAccessPolicyBlocked": "已阻止 {tool}：Full Access 无法绕过此策略",
-  "AutoReviewQuestionSkipped": "Auto-Review 已跳过用户问题并自主继续",
   "ApprovalChooseHint": "选择：",
   "ApprovalChooseAction": "Enter 执行选中项，或直接按 y/a/d",
   "ApprovalIntentLabel": "意图：",

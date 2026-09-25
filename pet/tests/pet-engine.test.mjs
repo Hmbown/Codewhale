@@ -7,29 +7,80 @@ import { compilePetTelemetry, encodePetJSONL } from '../dist/core/pet-telemetry.
 import { petDemoEvents } from '../dist/core/pet-demo.js';
 
 const points = JSON.stringify(readFileSync(new URL('../public/whale-points.tsv', import.meta.url), 'utf8').trim().split('\n').map(row => row.trim().split(/\s+/).map(Number)));
-test('action receipts distinguish tool names without inventing shell contents and expire', () => {
+test('typed operation activity carries a kind, never a tool name, and goes stale', () => {
   const e = new PetEngineTelemetry();
-  for (const [i, name, kind] of [[0,'read_file','reading'],[1,'search_files','searching'],[2,'apply_patch','editing'],[3,'exec_command','executing'],[4,'run_tests','testing'],[5,'browser_navigate','browsing']]) {
-    e.observe({event:'turn_started'},i*1000);
-    e.observe({event:'tool_call_started',tool_call_id:'private-id',tool_name:name},i*1000);
-    const activity=e.activity(i*1000+100);
-    assert.equal(activity.kind,kind); assert.equal(activity.tool,name);
-    assert.equal(JSON.stringify(activity).includes('private-id'),false);
-    assert.equal(e.activity(i*1000+801).observed,false);
+  for (const [i, kind] of ['reading','searching','editing','executing','testing','browsing','computer'].entries()) {
+    const at = i * 20_000;
+    e.observe({event:'turn_started',turn_id:'turn-'+i},at);
+    e.observe({event:'operation_activity_started',span_id:'private-span-'+i,activity_kind:kind},at);
+    const activity=e.activity(at+100);
+    assert.equal(activity.activityKind,kind); assert.equal(activity.authoritativePresence,'working');
+    assert.equal(activity.freshness,'fresh'); assert.equal(activity.turnId,'turn-'+i);
+    assert.deepEqual(Object.keys(activity).sort(),['activeSpans','activityKind','authoritativePresence','cursor','doneEffectId',
+      'failedToolAge','freshness','observed','observedAtMs','parallelAgentCount','schemaVersion','sessionId','turnId','turnOutcome']);
+    assert.equal(JSON.stringify(activity).includes('private-span'),false);
+    const stale=e.activity(at+12_001);
+    assert.equal(stale.freshness,'stale'); assert.equal(stale.activityKind,null); assert.deepEqual(stale.activeSpans,[]);
+  }
+  // The pre-contract events carried tool names; the boundary refuses them.
+  assert.throws(() => e.observe({event:'tool_call_started',tool_call_id:'a',tool_name:'read_file'},200_000),/Invalid Engine pet metadata fields/);
+  assert.throws(() => e.observe({event:'turn_started'},200_000),/Missing Engine turn_id/);
+  assert.throws(() => e.observe({event:'operation_activity_started',span_id:'a',activity_kind:'shell'},200_000));
+});
+test('only a completed turn is Done; interrupted and failed turns are idle', () => {
+  for (const [outcome, presence] of [['completed','done'],['interrupted','idle'],['failed','idle']]) {
+    const e = new PetEngineTelemetry();
+    e.observe({event:'turn_started',turn_id:'t'},0);
+    e.observe({event:'operation_activity_started',span_id:'s',activity_kind:'editing'},10);
+    e.observe({event:'turn_complete',turn_id:'t',turn_outcome:outcome},20);
+    const activity=e.activity(30);
+    assert.equal(activity.authoritativePresence,presence,outcome);
+    assert.equal(activity.doneEffectId,outcome==='completed'?'t':null);
+    assert.equal(activity.activityKind,null); assert.deepEqual(activity.activeSpans,[]);
+  }
+  const untracked = new PetEngineTelemetry();
+  untracked.observe({event:'turn_complete',turn_outcome:'completed'},0);
+  assert.equal(untracked.activity(10).authoritativePresence,'idle');
+  assert.throws(() => untracked.observe({event:'turn_complete',turn_id:null,turn_outcome:'completed'},20));
+  // `/purge`, an edit rejection or a mid-turn session switch complete with no
+  // turn id. An outcome with no turn would fail the Rust projection
+  // invariant (`turn_outcome` requires `turn_id`) and drop the shared frame.
+  for (const outcome of ['completed','interrupted','failed']) {
+    const e = new PetEngineTelemetry();
+    e.observe({event:'turn_started',turn_id:'t'},0);
+    e.observe({event:'turn_complete',turn_outcome:outcome},20);
+    const activity=e.activity(30);
+    assert.equal(activity.turnId,null,outcome); assert.equal(activity.turnOutcome,null,outcome);
+    assert.equal(activity.authoritativePresence,'idle',outcome); assert.equal(activity.doneEffectId,null,outcome);
   }
 });
-test('waiting and concurrent action receipts stay bounded and clear after disconnect', () => {
+test('a new turn drops spans left open by the previous turn', () => {
+  const e = new PetEngineTelemetry();
+  e.observe({event:'turn_started',turn_id:'t1'},0);
+  e.observe({event:'operation_activity_started',span_id:'orphan',activity_kind:'editing'},10);
+  e.observe({event:'turn_started',turn_id:'t2'},20);
+  const activity=e.activity(30);
+  assert.equal(activity.turnId,'t2'); assert.equal(activity.activityKind,null); assert.deepEqual(activity.activeSpans,[]);
+});
+test('waiting and concurrent activity stay bounded and clear after disconnect', () => {
   const pet=new PetNative(points,'','[]',true);
-  pet.observeEngineBatch(JSON.stringify([{event:'tool_call_started',tool_call_id:'a',tool_name:'read_file'},
+  pet.observeEngineBatch(JSON.stringify([{event:'turn_started',turn_id:'t'},{event:'operation_activity_started',span_id:'a',activity_kind:'computer'},
     ...Array.from({length:3},(_,i)=>({event:'agent_spawned',id:'private-'+i}))]),0);
   pet.advanceEngine(200,true,false);
   const frame=JSON.parse(pet.presentation());
-  assert.equal(frame.activity.kind,'reading');assert.equal(frame.activity.parallel,3);
+  assert.equal(frame.activity.activityKind,'computer');assert.equal(frame.activity.parallelAgentCount,3);
   assert.equal(JSON.stringify(frame.activity).includes('private-'),false);
   pet.observeEngine(JSON.stringify({event:'approval_required',id:'private'}),200);
-  pet.advanceEngine(600,true,true);assert.equal(JSON.parse(pet.presentation()).activity.kind,'waiting');
+  pet.advanceEngine(600,true,true);
+  const waiting=JSON.parse(pet.presentation()).activity;
+  assert.equal(waiting.authoritativePresence,'needs_you');assert.equal(waiting.activityKind,null);
+  pet.observeEngine(JSON.stringify({event:'approval_resolved',id:'private',outcome:'denied'}),700);
+  pet.advanceEngine(800,true,false);
+  assert.equal(JSON.parse(pet.presentation()).activity.authoritativePresence,'working');
   const before=pet.recording(true);pet.presentation();assert.equal(pet.recording(true),before);
-  pet.disconnectEngine();assert.equal(JSON.parse(pet.presentation()).activity.observed,false);
+  pet.disconnectEngine();
+  const gone=JSON.parse(pet.presentation()).activity;
+  assert.equal(gone.observed,false);assert.equal(gone.freshness,'missing');
 });
 test('the incremental bucket range uses the same measured projection as full replay', () => {
   const events = petDemoEvents(), full = compilePetTelemetry(events, 80_000);
@@ -37,12 +88,12 @@ test('the incremental bucket range uses the same measured projection as full rep
 });
 test('Engine pulses expire; a late failed completion tears at receipt time without rewriting history', () => {
   const engine = new PetEngineTelemetry();
-  engine.observe({ event: 'tool_call_started', tool_call_id: 'a', tool_name: 'exec_command' }, 0);
+  engine.observe({ event: 'operation_activity_started', span_id: 'a', activity_kind: 'executing' }, 0);
   engine.observe({ event: 'tool_call_heartbeat' }, 300);
   const first = engine.bucket(0);
   assert.equal(first.channel, 'code'); assert.equal(first.activeMs[3], 300);
   assert.equal(engine.bucket(3).observed, 0);
-  engine.observe({ event: 'tool_call_complete', tool_call_id: 'a', tool_name: 'exec_command', failed: true }, 5900);
+  engine.observe({ event: 'operation_activity_completed', span_id: 'a', activity_kind: 'executing', outcome: 'failed' }, 5900);
   assert.equal(engine.bucket(13).observed, 0);
   assert.equal(engine.bucket(14).channel, 'error'); assert.equal(engine.bucket(14).errors, 1);
   assert.deepEqual(engine.bucket(0), first);
@@ -57,7 +108,7 @@ test('an authoritative waiting request escalates, accepted tape replays, and sil
   for (let i = 0; i < 900; i++) replay.step(1 / 30, true);
   assert.deepEqual(JSON.parse(replay.snapshot()).state, JSON.parse(pet.snapshot()).state);
   assert.equal(JSON.parse(replay.snapshot()).digest, JSON.parse(pet.snapshot()).digest);
-  pet.observeEngine(JSON.stringify({ event: 'turn_complete' }), 30_100);
+  pet.observeEngine(JSON.stringify({ event: 'turn_complete', turn_outcome: 'interrupted' }), 30_100);
   pet.advanceEngine(32_000, true, false);
   assert.equal(JSON.parse(pet.snapshot()).state.observed, 0);
 });
@@ -85,10 +136,10 @@ test('successive shared batches preserve active and waiting coverage exactly', (
   let shared = new PetEngineTelemetry();
   const direct = new PetEngineTelemetry();
   for (const [at, event, waiting] of [
-    [0, {event:'tool_call_started', tool_call_id:'build', tool_name:'exec_command'}, false],
+    [0, {event:'operation_activity_started', span_id:'build', activity_kind:'executing'}, false],
     [300, {event:'tool_call_heartbeat'}, false],
     [600, {event:'tool_call_heartbeat'}, false],
-    [800, {event:'tool_call_complete', tool_call_id:'build'}, false],
+    [800, {event:'operation_activity_completed', span_id:'build', activity_kind:'executing', outcome:'succeeded'}, false],
     [900, {event:'approval_required', id:'permission'}, true],
     [1200, {event:'agent_spawned', id:'worker'}, true],
     [1500, {event:'agent_progress', id:'worker', worker_status:'running'}, true],

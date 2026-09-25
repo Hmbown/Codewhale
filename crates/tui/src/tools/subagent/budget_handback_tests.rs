@@ -19,7 +19,7 @@ struct Fixture {
 
 impl Fixture {
     async fn finish(&mut self) -> SubAgentResult {
-        tokio::time::timeout(Duration::from_secs(5), self.task.take().unwrap())
+        tokio::time::timeout(Duration::from_secs(30), self.task.take().unwrap())
             .await
             .expect("bounded worker")
             .expect("worker task");
@@ -41,6 +41,10 @@ impl Drop for Fixture {
 }
 
 async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixture {
+    // Only these cases exercise wall/API timeouts. The other cases exercise
+    // budget and report semantics, so leave room for full-suite scheduling.
+    let timeout_case = matches!(mode, "hold" | "timeout" | "work-timeout");
+    let wall_time_secs = if timeout_case { 5 } else { 30 };
     let workspace = tempdir().unwrap();
     fs::write(
         workspace.path().join("README.md"),
@@ -120,8 +124,8 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
     let mut spec = make_worker_spec("report-worker", workspace.path().to_path_buf());
     spec.max_steps = max_steps;
     spec.runtime_profile.max_steps = max_steps;
-    spec.runtime_profile.wall_time_secs = Some(5);
-    spec.runtime_profile.wall_deadline_ms = Some(epoch_millis_now() + 5_000);
+    spec.runtime_profile.wall_time_secs = Some(wall_time_secs);
+    spec.runtime_profile.wall_deadline_ms = Some(epoch_millis_now() + wall_time_secs * 1_000);
     if mode == "work-timeout" {
         // A partly consumed original deadline leaves time to persist the
         // missing-coverage receipt after the in-flight call is abandoned.
@@ -148,8 +152,10 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
     runtime.accept_edits = false;
     runtime.step_api_timeout = if mode == "timeout" {
         Duration::from_millis(100)
-    } else {
+    } else if timeout_case {
         Duration::from_secs(2)
+    } else {
+        Duration::from_secs(10)
     };
     let cancel = runtime.cancel_token.clone();
     let (parent_tx, completions) = mpsc::channel(16);
@@ -190,7 +196,7 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
         fork_context: false,
         started_at: Instant::now(),
         max_steps,
-        wall_time: Duration::from_secs(5),
+        wall_time: Duration::from_secs(wall_time_secs),
         input_rx,
         launch_gate: None,
         _foreground_child_registration: None,

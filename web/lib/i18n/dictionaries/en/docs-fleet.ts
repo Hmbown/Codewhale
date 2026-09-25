@@ -1,26 +1,157 @@
 import type { DocsFleetDict } from "../types";
 
+/**
+ * English reference dictionary for `app/[locale]/docs/fleet/page.tsx`
+ * ("Run a workflow"). Checked against `WorkflowCommand` and `LaneArgs` in
+ * crates/cli/src/lib.rs, the Lane runtime backends in
+ * crates/lane/src/runtime.rs, `FleetCommand` in crates/tui/src/lib.rs, and
+ * docs/FLEET_WORKFLOW_TUTORIAL.md / docs/WORKFLOW_AUTHORING.md.
+ */
 export const docsFleet: DocsFleetDict = {
-  metaTitle: "Fleet & Workflow · Codewhale Docs",
+  metaTitle: "Run a workflow · Codewhale Docs",
   metaDescription:
-    "The durable Agent roster and member-selection layer, plus the optional Workflow orchestration overlay.",
+    "Save roles and models in a Fleet, write a repeatable Workflow, run it as a Lane you can watch and stop, and run batches of tasks with durable workers.",
   bodyClassName: "text-ink-soft leading-relaxed",
-  overviewTitle: "Fleet & Workflow",
-  overviewLead:
-    "Fleet is the durable roster: who is available and which member is selected. It is not an execution or authority engine. Runtime launches and tracks the selected member as a headless codewhale exec run, owns retry and remote placement, and writes the durable receipts and ledger projection. The ledger file, saved rosters, config tables, and the workflow --fleet flag share the Fleet name.",
-  runTitle: "Run a fleet",
-  runLead:
-    "The Runtime's fleet-run projection lives in the workspace's .codewhale/fleet.jsonl ledger, with worker logs under .codewhale/fleet/. codewhale fleet resume <run-id> asks Runtime to replay the ledger and reconcile stale leases; it is idempotent after a manager exit, laptop sleep, or runtime restart.",
-  statusLead:
-    "The TUI command {fleetStatusTui} and the shell command {fleetStatusShell} read the same durable fleet ledger. Use {fleetWorkers} (or {subagents}) for the sub-agents attached only to the current interactive session.",
-  profilesTitle: "Saved fleets, roles, and /fleet setup",
-  profilesLead:
-    "{fleetSaved} opens the picker for named saved fleets; bare /fleet opens the selected fleet's member roster. In v0.9.11, /fleet setup edits the selected named fleet. With no named fleet selected, it opens profile setup: choose a role and model, adjust optional thinking settings, then review before saving. Profiles live in project scope (.codewhale/agents/<role>.toml) or personal scope ($CODEWHALE_HOME/agents/<role>.toml); a same-id project profile wins. Runtime separately owns trust, filesystem/network reach, secrets, approvals, sandboxing, and tools, so profile storage scope never widens execution authority.",
-  workflowTitle: "Workflow orchestration",
-  workflowLead:
-    "Ordinary multi-agent work does not need Workflow: send normal messages in Operate and let Codewhale prefer background workers when parallelism, isolation, or duration makes delegation useful. Use Workflow when ordered phases, gates, shared budgets, replay, or deterministic fan-in matter. A Workflow script coordinates only: it selects fleet members but has no filesystem or shell; Runtime launches the real workers under live authority policy. Scripts use a declarative compile-only JS subset that lowers to a typed WorkflowSpec validated and executed by Rust; import, fetch, process, eval, and async/await are rejected.",
-  workflowLimits:
-    "Default validation bounds: up to 1,000 worker agents per Workflow run, Workflow IR structural nesting no deeper than 5, loops must declare max_iterations, and dynamic expand nodes must declare max_children plus a template. Runtime child delegation is a separate execution budget: it defaults to 3 levels and has an opt-in hard ceiling of 8. These are population and shape limits, not launch concurrency: Runtime admits at most 16 live workers for one run and queues the rest. Omitted or zero max_steps stays unbounded; only a positive value adds a model-turn ceiling.",
+  title: "Run a workflow",
+  lede:
+    "For most multi-step work you only need to ask: in Operate, Codewhale plans the steps and runs independent ones in parallel. Write a Workflow when you want the same ordered plan every time — phases, parallel branches, and a summary — with a record of each run.",
+  sections: [
+    {
+      id: "fleet",
+      title: "Save roles in a Fleet",
+      blocks: [
+        {
+          p: "Your Fleet is the list of roles Codewhale can hand work to, and the model each role uses. Set it up once inside a session:",
+        },
+        { code: "/fleet setup\n/fleet\n/fleet saved", lang: "Codewhale" },
+        {
+          p: "`/fleet setup` walks you through a role, its model (or “use the session's model”), and where to save it: this project, or your personal profile for every repository. You review the exact file before it is written. `/fleet` shows the members of the selected Fleet, and `/fleet saved` switches between named Fleets.",
+        },
+        {
+          p: "A Fleet only chooses who does the work. What a worker may read, write, or run still comes from your workspace trust, [approval setting](/docs/modes), and sandbox.",
+        },
+      ],
+    },
+    {
+      id: "write",
+      title: "Write a workflow",
+      blocks: [
+        {
+          p: "A Workflow is a JavaScript file in your repository's `workflows/` folder. It describes steps; it does not do the work itself. This one reviews two areas in parallel, then combines the findings. Save it as `workflows/docs_readiness.workflow.js`:",
+        },
+        {
+          code: `export default workflow({
+  "id": "docs-readiness",
+  "goal": "Review the docs and code for gaps, then summarize the next edit",
+  "nodes": [
+    {
+      "branch": {
+        "id": "parallel-review",
+        "parallel": true,
+        "children": [
+          { "agent": { "id": "code-review", "prompt": "Inspect src/ for undocumented behavior.",
+                       "agent_type": "review", "mode": "read_only", "file_scope": ["src"] } },
+          { "agent": { "id": "docs-review", "prompt": "Inspect docs/ for stale or missing steps.",
+                       "agent_type": "review", "mode": "read_only", "file_scope": ["docs"] } }
+        ]
+      }
+    },
+    {
+      "reduce": {
+        "id": "summary",
+        "inputs": ["code-review", "docs-review"],
+        "prompt": "Combine the findings into the safest next edit."
+      }
+    }
+  ]
+});`,
+          lang: "workflows/docs_readiness.workflow.js",
+        },
+        {
+          p: "Steps can be `agent`, `branch`, `sequence`, `reduce`, `loop_until`, `cond`, `expand`, and `teacher_review`. A workflow file has no file, shell, or network access of its own, and `import`, `fetch`, `eval`, and `async` are rejected. The agents it starts do the real work, under your normal permissions.",
+        },
+        {
+          note: "One run can start up to 1,000 agents, with at most 16 working at once; the rest wait for a slot. Loops must declare `max_iterations`.",
+        },
+      ],
+    },
+    {
+      id: "run",
+      title: "Run it",
+      blocks: [
+        {
+          code: `codewhale workflow run docs-readiness --runtime inline
+codewhale workflow run docs-readiness --goal "prepare the 1.2 release" --verify`,
+          lang: "Terminal",
+        },
+        {
+          p: "Codewhale finds `workflows/docs_readiness.workflow.js` from the name, checks it, and starts it. `--runtime inline` runs it in this terminal. The default, `tmux`, runs it in a detached tmux session that keeps going after you close the terminal. `--verify` runs the verification gates after a successful finish, and `--fleet <name>` uses a named Fleet instead of the built-in roles.",
+        },
+        {
+          p: "To keep the work off your checkout, add `--worktree-repo . --branch <name>`: the run gets its own git worktree and branch.",
+        },
+        {
+          p: "Inside a session, `/workflow` starts a workflow and `/workflows` lists or cancels the runs in that session.",
+        },
+      ],
+    },
+    {
+      id: "watch",
+      title: "Watch and stop a run",
+      blocks: [
+        { p: "Each run is a Lane. Lanes are saved to disk, so you can check on them from any terminal:" },
+        {
+          code: `codewhale lane list
+codewhale lane status <lane-id>
+codewhale lane logs <lane-id>
+codewhale lane attach <lane-id>
+codewhale lane interrupt <lane-id>`,
+          lang: "Terminal",
+        },
+        {
+          p: "`lane list`, `lane status`, and `lane interrupt` accept `--json` and print a machine-readable receipt. In a session, `/lane` offers the same controls with the same results.",
+        },
+      ],
+    },
+    {
+      id: "batch",
+      title: "Run a batch of tasks",
+      blocks: [
+        {
+          p: "When you have a list of separate tasks rather than one plan, write them as a task file and run them as a Fleet run. Each task names its goal, its role, and the paths it may write. [The tutorial](https://github.com/Hmbown/CodeWhale/blob/main/docs/FLEET_WORKFLOW_TUTORIAL.md) has a complete `tasks.json`.",
+        },
+        {
+          code: `codewhale fleet init
+codewhale fleet run tasks.json --max-workers 4
+codewhale fleet status
+codewhale fleet logs <worker-id>
+codewhale fleet resume <run-id>
+codewhale fleet stop --all`,
+          lang: "Terminal",
+        },
+        {
+          p: "`fleet status` counts queued, running, finished, and failed work from this workspace's run record. `fleet resume` picks a run back up after the laptop slept or the manager exited, without starting a new one. For the agents attached to your current session only, use `/fleet workers` (or `/subagents`).",
+        },
+      ],
+    },
+  ],
+  next: [
+    {
+      href: "/docs/subagents",
+      label: "Run agents in parallel",
+      note: "Hand independent pieces of one task to sub-agents without writing a workflow.",
+    },
+    {
+      href: "/docs/review",
+      label: "Review what changed",
+      note: "Check the diff a run produced and get a review before you push.",
+    },
+    {
+      href: "/docs/vocabulary",
+      label: "Product terms",
+      note: "Fleet, Workflow, Lane, and Runtime, each in one sentence.",
+    },
+  ],
   sourceNote:
-    "Source documents: docs/FLEET.md, docs/WORKFLOW_AUTHORING.md · Update docs-map.ts when changing.",
+    "Source documents: docs/FLEET.md, docs/FLEET_WORKFLOW_TUTORIAL.md, docs/WORKFLOW_AUTHORING.md · Update docs-map.ts when changing.",
 };

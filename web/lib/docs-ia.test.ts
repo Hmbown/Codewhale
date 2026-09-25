@@ -47,7 +47,7 @@ describe("docs-map registration", () => {
     const vocabulary = getTopic("vocabulary");
     expect(guide?.hasPage).toBe(true);
     expect(vocabulary?.hasPage).toBe(true);
-    expect(vocabulary?.category).toBe("core-concepts");
+    expect(vocabulary?.category).toBe("reference");
     expect(docTopicHref(guide!, "en")).toBe("/en/docs/guide");
     expect(docTopicHref(vocabulary!, "zh")).toBe("/zh/docs/vocabulary");
     expect(docsTopicIsCurrent(vocabulary!, "en", "/en/docs/vocabulary")).toBe(true);
@@ -93,7 +93,7 @@ describe("sitemap and hreflang preservation", () => {
   it("keeps sitemap and hreflang output aligned with real translation coverage", () => {
     // 18 home locales + 10 guide locales + English-only install + (en, zh) for every other route
     // (including /product, /plugins, and /changelog, whose bodies ship en/zh only).
-    expect(sitemapEntries).toHaveLength(97);
+    expect(sitemapEntries).toHaveLength(99);
     expect(sitemapEntries.filter(entry => entry.url.endsWith("/install")).map(entry => entry.url))
       .toEqual([`${SITE_URL}/en/install`]);
     expect(sitemapEntries.some(entry => entry.url.endsWith("/pricing"))).toBe(false);
@@ -138,7 +138,7 @@ describe("sitemap and hreflang preservation", () => {
       expect(existsSync(new URL(`app/[locale]${path}/page.tsx`, webRoot)), path).toBe(true);
     }
     const entry = webText("components/public-account-entry.tsx");
-    expect(entry).toContain("CANONICAL_MARK_SRC");
+    expect(entry).toContain("<WhalePose");
     expect(entry).toContain("installLocally");
     expect(webText("app/[locale]/signin/page.tsx")).toContain('kind="sign-in"');
     expect(webText("app/[locale]/signup/page.tsx")).toContain('kind="sign-up"');

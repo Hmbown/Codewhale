@@ -1163,7 +1163,6 @@
   "PendingApprovalInAgent": "{agent} で承認が必要です — /agents",
   "ApprovalTruncationHint": "  … 省略 · {details} で詳細を表示",
   "ApprovalFullAccessPolicyBlocked": "{tool} をブロック: Full Access ではこのポリシーを回避できません",
-  "AutoReviewQuestionSkipped": "Auto-Review は質問をスキップし、自律的に続行しました",
   "ApprovalChooseHint": "選択：",
   "ApprovalChooseAction": "Enterで選択、または y/a/d を直接入力",
   "ApprovalIntentLabel": "意図：",

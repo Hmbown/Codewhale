@@ -511,9 +511,9 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
             .map(|config| prompt_suggestion_display(&config)),
         "notifications" => Some(notifications_summary_value(&app.notification_settings)),
         _ => {
-            let known = Settings::available_settings()
-                .iter()
-                .any(|(k, _)| k == &key);
+            // Any spelling `/set` accepts; internal flags, actions and
+            // receipts in the schema are not settings a user can look up.
+            let known = Settings::canonical_key(&key).is_some();
             if known {
                 Some("(see /settings for current value)".to_string())
             } else {
@@ -530,13 +530,9 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
 /// Error for `/config <key>` when `key` is not a known setting: name the
 /// closest real key when there is one, and point at the full list.
 fn unknown_setting_message(key: &str) -> String {
-    let nearest = Settings::available_settings()
-        .into_iter()
-        .filter_map(|(candidate, _)| {
-            crate::commands::best_suggestion_score(key, [candidate]).map(|score| (score, candidate))
-        })
-        .min_by_key(|(score, _)| *score)
-        .map(|(_, candidate)| candidate);
+    // Suggest only keys `/set` accepts, the same set `known` checks above
+    // (#6563).
+    let nearest = crate::config_keys::nearest_key(key, crate::config_keys::settings_toml_keys());
     match nearest {
         Some(candidate) => format!(
             "Unknown setting '{key}'. Did you mean `/config {candidate}`? Run `/settings text` to list every setting."
@@ -2971,10 +2967,7 @@ pub fn mode(app: &mut App, arg: Option<&str>) -> CommandResult {
     // The legacy YOLO spellings are a one-way permission shorthand, not a
     // mode: route them to the full-access compat path before parse folds
     // them to Act.
-    if matches!(
-        arg.trim().to_ascii_lowercase().as_str(),
-        "yolo" | "4" | "bypass" | "bypass-permissions" | "bypasspermissions"
-    ) {
+    if AppMode::is_legacy_bypass_alias(arg) {
         let (message, changed) = switch_yolo_compat_with_status(app);
         if changed {
             CommandResult::with_message_and_action(message, AppAction::ModeChanged(app.mode))
@@ -3573,6 +3566,15 @@ mod tests {
         let text = result.message.as_deref().unwrap_or_default();
         assert!(!text.contains("Did you mean"), "{text}");
         assert!(text.contains("/settings text"), "{text}");
+
+        // Internal flags, actions and retired schema defs are not settings a
+        // user can look up, and are never suggested.
+        for internal in ["feature_intro_shown", "mcp_open", "fast_model"] {
+            let result = config_command(&mut app, Some(internal));
+            assert!(result.is_error, "{internal}: {:?}", result.message);
+            let text = result.message.as_deref().unwrap_or_default();
+            assert!(!text.contains(&format!("`/config {internal}`")), "{text}");
+        }
     }
 
     #[test]

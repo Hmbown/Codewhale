@@ -22,18 +22,30 @@ and nested paths such as `tools.user_input_timeout_seconds`. Displayed tables
 and nested values apply the same recursive credential redaction as `config dump`.
 
 `config set` supports its named scalar keys and the provider, route, and
-notification commands. Other dotted writes fail before modifying the file and
-name the TOML table to edit. For example, set a tools timeout in the file as:
+notification commands. It refuses a key that nothing reads and suggests the
+nearest real key (`config set calm_mod on` names `calm_mode`). A settings.toml
+key such as `calm_mode` or `tool_collapse` is validated and written to the
+user-global settings.toml, not config.toml; `config get` reads it back from
+there even when an old config.toml copy (which nothing reads) is still present,
+and names that copy so you can `config unset` it. Settings keys have no project
+scope, so `--project` refuses them. A config.toml key is checked against the
+type its reader expects and stored as a TOML boolean or number where the
+reader needs one (`yolo = true`, `max_subagents = 4`); `reasoning_effort`
+accepts the same aliases as `/effort` (#6563). Other dotted writes fail before
+modifying the file and name the TOML table to edit. For example, set a tools
+timeout in the file as:
 
 ```toml
 [tools]
 user_input_timeout_seconds = 0
 ```
 
-`codewhale config doctor` checks credential presence and endpoint shape. Settings
-preserved for other runtime readers are not classified as unsupported merely
-because the CLI dispatcher does not own them. A clean result from this command
-does not validate every runtime setting (#6083).
+`codewhale config doctor` checks credential presence and endpoint shape, and
+warns about each config.toml root key that nothing reads: a settings.toml key
+left in config.toml is named as misplaced, and any other unread key gets a
+did-you-mean. Keys read by any runtime reader are not reported. The warnings do
+not fail the check, and a clean result does not validate every runtime setting's
+value (#6083, #6563).
 
 ## Constitution, project instructions, and repo authority
 
@@ -322,7 +334,9 @@ The consolidated `codewhale` runtime uses one config file for DeepSeek auth
 and model defaults. `codewhale auth set --provider deepseek` saves
 the key to `~/.codewhale/config.toml` (migrating legacy `~/.deepseek/config.toml`
 on first launch when needed), and `codewhale --model deepseek-v4-flash` is
-forwarded to the TUI as `DEEPSEEK_MODEL`.
+forwarded to the TUI as `CODEWHALE_MODEL`. The dispatcher no longer writes the
+`DEEPSEEK_*` twins of these variables; a `DEEPSEEK_*` value you set yourself is
+still read as a legacy alias when the `CODEWHALE_*` one is unset.
 
 `codewhale login` signs in to the Codewhale account — it is the same browser
 device flow as `codewhale account login`, not a provider-key command. Provider
@@ -871,10 +885,19 @@ instead of failing startup.
 
 ## Workshop output budgets
 
-`[workshop]` still routes oversized tool results through the synthesis
-path when they exceed `large_output_threshold_tokens`. Two optional
-byte ceilings (#5367) raise the model-visible floor after that routing
-and never lower it:
+By default an oversized tool result uses bounded spillover: a result
+under the byte threshold stays inline, a larger one gets a head/tail
+preview plus a session artifact the model can read back. There is no
+synthesis sub-agent and no per-call `raw = true` escape.
+
+`[workshop] large_output_threshold_tokens` and
+`[workshop.per_tool_thresholds]` (exact model-visible tool names such as
+`bash`) only take effect when the process opts in to adaptive evidence
+routing with `CODEWHALE_ADAPTIVE_OUTPUT_ROUTING=1`; they set where a result
+stops being inline and becomes handle-only evidence.
+
+Two optional byte ceilings (#5367) apply either way. They raise the
+model-visible floor and never lower it:
 
 - `read_result_max_bytes` — cap for a single `read` / `read_file`
   result. Absent keeps the compile-time defaults (100000 bytes for
@@ -2388,14 +2411,13 @@ reasoning contract, and all four membership ids omit generic sampling fields.
     `~/.deepseek/snapshots/...` fallback when only the legacy state exists, and
     never use the workspace's own `.git` directory
 - `context.*` (optional):
-  - `[context].enabled` (bool, default `false`)
   - `[context].project_pack` (bool, default `false`): include a deterministic
     project context pack (a large pretty-printed directory listing) in the
     stable prompt prefix (#4781). Useful for weak tool-calling models; the
     model can rebuild the same information with one `File` call.
-  - The former seam-manager keys (`verbatim_window_turns`, `l1_threshold`,
-    `l2_threshold`, `l3_threshold`, `seam_model`) are **ignored** — parsed
-    for backward compatibility but read nowhere since 2026-07-23.
+  - The removed seam-manager keys (`enabled`, `verbatim_window_turns`,
+    `l1_threshold`, `l2_threshold`, `l3_threshold`, `seam_model`) are
+    ignored if an older config still carries them; they no longer load.
 - `compaction.*` (optional, config.toml): how a compaction pass behaves once
   it fires. `auto_compact` / `auto_compact_threshold_percent` (settings.toml)
   still decide *when* it fires. Both keys are absent by default, and absent
@@ -2466,7 +2488,6 @@ reasoning contract, and all four membership ids omit generic sampling fields.
   selections and the Linux PRIMARY auto-copy are unchanged; PRIMARY always
   carries rendered text.
 
-- `tui.terminal_probe_timeout_ms` (int, optional): legacy setting, accepted for configuration compatibility but no longer used. Startup sets raw mode directly after checking terminal ownership; worker scheduling delays do not abort startup.
 - `tui.stream_chunk_timeout_secs` (int, optional, default `900`): per-SSE-chunk idle timeout for streamed model responses. Slow local or compatible servers can raise this with `/config stream_chunk_timeout_secs <seconds>`; `0` maps to the default and explicit values must be `1..=3600`. The legacy `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` env var is still honored when this key is omitted.
 - `tui.osc8_links` (bool, optional, default on for macOS/Linux, off for Windows): emit OSC 8 escape sequences around URLs in transcript output so supporting terminals (iTerm2, Terminal.app 13+, Ghostty, Kitty, WezTerm, Alacritty, recent gnome-terminal/konsole) can open them with the terminal's link gesture—usually Cmd-click on macOS and Ctrl-click on Linux/Windows. Terminals without OSC 8 support render the plain label and ignore the escape. The escapes are emitted out-of-band (not inside buffer cells), so column corruption is not a concern; set `false` only for terminals that misrender the OSC 8 terminator itself. Windows legacy consoles default off; opt in with `true`.
 - `tui.max_model_steps` (int, optional, default uncapped): optional model-step ceiling for one ordinary turn. Omission or `0` leaves model steps uncapped; explicit positive values are clamped to `1..=100000`. Headless `exec` and Fleet workers also have no implicit model-step ceiling; `exec --max-turns N` and positive worker budgets still apply. At ~80% of an explicit step budget the model gets one soft-landing notice; at exhaustion the turn ends `Failed` with `Maximum model steps reached before completion (limit: N)` after one bounded final-report response when needed. Cumulative wall-clock and per-stream limits remain independent. Active interactive goal turns use `goal.max_steps` instead (default `1000`); see the Goal loop section below.
@@ -2879,8 +2900,7 @@ write one request line, read one response line, close.
 ```json
 {"id":"1","method":"message","params":{"text":"hello"}}
 {"id":"2","method":"interrupt","params":{}}
-{"id":"3","method":"relaunch","params":{}}
-{"id":"4","method":"status","params":{}}
+{"id":"3","method":"status","params":{}}
 ```
 
 - `message` — delivers `text` as a structured user message through the
@@ -2889,8 +2909,6 @@ write one request line, read one response line, close.
   which).
 - `interrupt` — the Esc-shaped cancel of the active turn; `cancelled`
   reports whether active work was in flight.
-- `relaunch` — routed through the `/relaunch` slash-command path (same
-  save-and-resume handoff, no separate mechanics).
 - `status` — answers `turn_state` (`idle` / `in_progress` / `waiting`) and
   `goal` (`objective`, `status`, `paused`).
 

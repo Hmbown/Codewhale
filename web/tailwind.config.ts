@@ -5,25 +5,46 @@ export default {
   theme: {
     extend: {
       colors: {
-        // The surface, ink, and accent tokens all resolve through CSS custom
-        // properties (app/styles/tokens-roles.css) so the dark subtrees can
-        // re-theme themselves; the values are the generated GPUI set_theme
-        // tokens. Hover is the primary at 0.9 opacity, as in set_theme.
-        paper: "rgb(var(--c-paper) / <alpha-value>)",
-        "paper-deep": "rgb(var(--c-paper-deep) / <alpha-value>)",
-        "paper-edge": "rgb(var(--c-paper-edge) / <alpha-value>)",
-        "paper-card": "var(--paper-card)",
-        "paper-line": "var(--paper-line)",
-        "paper-line-soft": "var(--paper-line-soft)",
-        ink: "rgb(var(--c-ink) / <alpha-value>)",
-        "ink-soft": "rgb(var(--c-ink-soft) / <alpha-value>)",
-        "ink-mute": "rgb(var(--c-ink-mute) / <alpha-value>)",
-        indigo: "rgb(var(--c-indigo) / <alpha-value>)",
-        "indigo-deep": "var(--indigo-deep)",
-        "indigo-pale": "var(--indigo-pale)",
-        ochre: "var(--ochre)",
-        jade: "var(--jade)",
-        cobalt: "var(--cobalt)",
+        // Every colour resolves through the role tokens
+        // (app/styles/tokens-roles.css), so the stage and both appearances
+        // re-ink it. Alpha modifiers mix the role toward transparent.
+        ...Object.fromEntries(
+          Object.entries({
+            canvas: "--bg",
+            surface: "--surface",
+            panel: "--panel",
+            fg: "--text",
+            muted: "--muted",
+            line: "--line",
+            accent: "--accent",
+            "on-accent": "--on-accent",
+            hover: "--hover",
+            selected: "--selected",
+            attention: "--attention",
+            live: "--live",
+            success: "--success",
+            danger: "--danger",
+            // Legacy names still used by the docs pages (post-renovation sweep).
+            paper: "--paper",
+            "paper-deep": "--paper-deep",
+            "paper-edge": "--paper-edge",
+            "paper-card": "--paper-card",
+            "paper-line": "--paper-line",
+            "paper-line-soft": "--paper-line-soft",
+            ink: "--ink",
+            "ink-soft": "--ink-soft",
+            "ink-mute": "--ink-mute",
+            indigo: "--indigo",
+            "indigo-deep": "--indigo-deep",
+            "indigo-pale": "--indigo-pale",
+            ochre: "--ochre",
+            jade: "--jade",
+            cobalt: "--cobalt",
+          }).map(([name, role]) => [
+            name,
+            `color-mix(in srgb, var(${role}) calc(<alpha-value> * 100%), transparent)`,
+          ]),
+        ),
       },
       fontFamily: {
         // One face, as GPUI set_theme: every family resolves through the

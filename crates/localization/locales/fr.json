@@ -1142,7 +1142,6 @@
   "PendingApprovalInAgent": "Approbation requise dans {agent} — /agents",
   "ApprovalTruncationHint": "  … tronqué · appuyez sur {details} pour tous les détails",
   "ApprovalFullAccessPolicyBlocked": "{tool} bloqué : Full Access ne peut pas contourner cette politique",
-  "AutoReviewQuestionSkipped": "Auto-Review a ignoré une question de l'utilisateur et a continué de façon autonome",
   "ApprovalChooseHint": "Choix : ",
   "ApprovalChooseAction": "Enter pour l'option sélectionnée, ou appuyez directement sur y/a/d",
   "ApprovalIntentLabel": "Intention : ",

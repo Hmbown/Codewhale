@@ -1779,9 +1779,6 @@ pub struct TuiConfig {
     /// `/copy` use. Set `false` to restore the rendered-text payload (#6156).
     /// PRIMARY selection on Linux always keeps rendered text.
     pub selection_copy_markdown: Option<bool>,
-    /// Legacy setting retained for config compatibility. Raw mode is set
-    /// directly on the terminal-owning thread; this value has no effect.
-    pub terminal_probe_timeout_ms: Option<u64>,
     /// Per-SSE-chunk idle timeout in seconds. Defaults to 900 seconds when
     /// omitted. `0` maps to the default; values clamp to `1..=3600`.
     pub stream_chunk_timeout_secs: Option<u64>,
@@ -1821,7 +1818,7 @@ pub struct TuiConfig {
     pub posture_bar: Option<ChromeRowPreset>,
     /// The same three settings for the metrics line under the posture bar.
     /// `compact` is the default: it keeps the route, the context reading, the cost and the
-    /// balance and drops the telemetry and the help hint (#5950).
+    /// balance, the cache rate, and drops the other telemetry and the help hint (#5950, #6565).
     #[serde(default)]
     pub metrics_line: Option<ChromeRowPreset>,
     /// Emit OSC 8 hyperlink escape sequences around URLs in the transcript so
@@ -2034,11 +2031,11 @@ pub struct ToolsConfig {
     #[serde(default)]
     pub user_input_max_options: Option<u32>,
 
-    /// Seconds Codewhale waits for a user-input answer or an approval
-    /// decision before cancelling it (#6003). `None` uses the built-in
-    /// default (300). An explicit `0` disables the timeout entirely, so
-    /// long human review or overnight automation can wait indefinitely.
-    /// Values above 86,400 (24h) are clamped with a warning.
+    /// Seconds Codewhale waits for a `request_user_input` answer before
+    /// cancelling it (#6003). Absent, or an explicit `0`, waits until the
+    /// person answers or cancels — the same as an approval. A positive
+    /// value bounds that one wait. Values above 86,400 (24h) are clamped
+    /// with a warning.
     #[serde(default)]
     pub user_input_timeout_seconds: Option<u64>,
 }
@@ -2325,15 +2322,13 @@ pub struct RetryPolicy {
 
 /// Context management configuration.
 ///
-/// The append-only "Flash seam" layered-context system (#159) was removed on
-/// 2026-07-23 — it never left its opt-in default and compaction owns context
-/// reduction now. Its keys remain parsed-but-ignored so existing config files
-/// keep loading; `project_pack` is the only live setting.
+/// `project_pack` is the only setting. The removed "Flash seam" layered-context
+/// keys (`enabled`, `verbatim_window_turns`, `l1/l2/l3_threshold`,
+/// `seam_model`, #159) are no longer fields: this table does not deny unknown
+/// fields, so an older config that still carries them keeps loading and they
+/// are simply ignored (#6516).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ContextConfig {
-    /// Ignored (was: master enable for the removed layered-context system).
-    #[serde(default)]
-    pub enabled: Option<bool>,
     /// Include a deterministic project context pack in the stable prompt
     /// prefix. Default: false — the pack is a large pretty-printed directory
     /// listing the model can rebuild with one `File` call (#4781). Set
@@ -2341,19 +2336,6 @@ pub struct ContextConfig {
     /// models).
     #[serde(default)]
     pub project_pack: Option<bool>,
-    /// Ignored (was: seam verbatim window).
-    #[serde(default)]
-    pub verbatim_window_turns: Option<usize>,
-    /// Ignored (was: seam thresholds).
-    #[serde(default)]
-    pub l1_threshold: Option<usize>,
-    #[serde(default)]
-    pub l2_threshold: Option<usize>,
-    #[serde(default)]
-    pub l3_threshold: Option<usize>,
-    /// Ignored (was: seam model).
-    #[serde(default)]
-    pub seam_model: Option<String>,
 }
 
 /// Maximum characters of `[compaction] summary_instructions` that are
@@ -4208,7 +4190,9 @@ impl ApprovalPolicyControl {
             Self::Unset => "saved TUI posture",
             Self::RootConfig => "the root config.toml approval_policy",
             Self::Profile => "the active config profile",
-            Self::Environment => "DEEPSEEK_APPROVAL_POLICY",
+            Self::Environment => {
+                set_env_var_name(APPROVAL_POLICY_ENV).unwrap_or(APPROVAL_POLICY_ENV[0])
+            }
             Self::ManagedConfig => "managed configuration",
             Self::ProjectConfig => "project configuration",
             Self::Requirements => "managed approval requirements",
@@ -4243,7 +4227,7 @@ impl ShellAccessControl {
             Self::Unset => "the session default",
             Self::RootConfig => "the root config.toml allow_shell",
             Self::Profile => "the active config profile",
-            Self::Environment => "DEEPSEEK_ALLOW_SHELL",
+            Self::Environment => set_env_var_name(ALLOW_SHELL_ENV).unwrap_or(ALLOW_SHELL_ENV[0]),
             Self::ManagedConfig => "managed configuration",
             Self::ProjectConfig => "project configuration",
             Self::Ambiguous => "an unresolved configuration source",
@@ -4251,10 +4235,19 @@ impl ShellAccessControl {
     }
 }
 
-fn approval_policy_env_is_set() -> bool {
+const APPROVAL_POLICY_ENV: [&str; 2] = ["CODEWHALE_APPROVAL_POLICY", "DEEPSEEK_APPROVAL_POLICY"];
+const ALLOW_SHELL_ENV: [&str; 2] = ["CODEWHALE_ALLOW_SHELL", "DEEPSEEK_ALLOW_SHELL"];
+
+/// The variable of a `[CODEWHALE_*, legacy DEEPSEEK_*]` pair that is set,
+/// in the precedence the config readers use (the `CODEWHALE_*` name wins).
+/// The dispatcher only exports `CODEWHALE_*` (#6516), so a `DEEPSEEK_*` hit
+/// means the user set the legacy name themselves; naming it keeps the
+/// settings editor pointing at the variable that actually owns the value.
+fn set_env_var_name(names: [&'static str; 2]) -> Option<&'static str> {
     let read = || {
-        std::env::var_os("CODEWHALE_APPROVAL_POLICY").is_some()
-            || std::env::var_os("DEEPSEEK_APPROVAL_POLICY").is_some()
+        names
+            .into_iter()
+            .find(|name| std::env::var_os(name).is_some())
     };
     #[cfg(test)]
     {
@@ -4266,19 +4259,12 @@ fn approval_policy_env_is_set() -> bool {
     }
 }
 
+fn approval_policy_env_is_set() -> bool {
+    set_env_var_name(APPROVAL_POLICY_ENV).is_some()
+}
+
 fn allow_shell_env_is_set() -> bool {
-    let read = || {
-        std::env::var_os("CODEWHALE_ALLOW_SHELL").is_some()
-            || std::env::var_os("DEEPSEEK_ALLOW_SHELL").is_some()
-    };
-    #[cfg(test)]
-    {
-        crate::test_support::with_test_env_lock(read)
-    }
-    #[cfg(not(test))]
-    {
-        read()
-    }
+    set_env_var_name(ALLOW_SHELL_ENV).is_some()
 }
 
 fn project_config_root_bool(workspace: &Path, key: &str) -> Option<bool> {
@@ -4888,8 +4874,8 @@ impl Config {
     }
 
     /// Effective wait for a user-input answer or an approval decision
-    /// (#6003). `None` means the built-in default (300s). An explicit `0`
-    /// disables the timeout; values above 24h clamp with a warning.
+    /// (#6003). `None` or `0` waits until the person answers or cancels.
+    /// A positive value bounds that one wait; values above 24h clamp.
     #[must_use]
     pub fn user_input_timeout(&self) -> Option<std::time::Duration> {
         const MAX_SECONDS: u64 = 86_400;
@@ -8758,8 +8744,8 @@ check_for_updates = true
 
 // === Environment Overrides ===
 
-/// Read the `DEEPSEEK_BASE_URL` / `CODEWHALE_BASE_URL` env var that the CLI
-/// dispatcher forwards from `--base-url`.  Returns `None` when the var is
+/// Read the `CODEWHALE_BASE_URL` env var that the CLI dispatcher forwards from
+/// `--base-url`, or the user-set legacy `DEEPSEEK_BASE_URL` alias.  Returns `None` when the var is
 /// absent or empty so that provider-specific defaults still apply.
 fn env_base_url_override() -> Option<String> {
     codewhale_env_var("CODEWHALE_BASE_URL", "DEEPSEEK_BASE_URL")
@@ -11469,28 +11455,10 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         cloud_facts: override_cfg.cloud_facts.or(base.cloud_facts),
         lsp: override_cfg.lsp.or(base.lsp),
         context: ContextConfig {
-            enabled: override_cfg.context.enabled.or(base.context.enabled),
             project_pack: override_cfg
                 .context
                 .project_pack
                 .or(base.context.project_pack),
-            verbatim_window_turns: override_cfg
-                .context
-                .verbatim_window_turns
-                .or(base.context.verbatim_window_turns),
-            l1_threshold: override_cfg
-                .context
-                .l1_threshold
-                .or(base.context.l1_threshold),
-            l2_threshold: override_cfg
-                .context
-                .l2_threshold
-                .or(base.context.l2_threshold),
-            l3_threshold: override_cfg
-                .context
-                .l3_threshold
-                .or(base.context.l3_threshold),
-            seam_model: override_cfg.context.seam_model.or(base.context.seam_model),
         },
         compaction: override_cfg.compaction.or(base.compaction),
         fleet: override_cfg.fleet.or(base.fleet),

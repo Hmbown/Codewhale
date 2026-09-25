@@ -24,6 +24,77 @@ fn inherited_interactive_shell_refusal(tool_name: &str, interactive: bool) -> Op
         .map(|message| ToolError::execution_failed(message.to_string()))
 }
 
+/// Pairs one `OperationActivityStarted` with exactly one
+/// `OperationActivityCompleted`.
+///
+/// The turn loop drops an in-flight tool future when the user cancels
+/// (`tokio::select!` on the cancel token, or `drop(tool_tasks)` for a parallel
+/// batch), so a Completed sent inline after the await would never be sent.
+/// Dropping an unfinished span sends `Completed { Cancelled }` with
+/// `try_send`: best effort, like the other guards here, because `Drop` cannot
+/// await a full channel.
+pub(super) struct OperationSpanGuard {
+    tx: mpsc::Sender<Event>,
+    span: Option<(String, codewhale_protocol::engine_owner::OwnerActivityKind)>,
+}
+
+impl OperationSpanGuard {
+    /// A process-unique span id. The model's tool-call id is not unique:
+    /// gateways that elide ids fall back to `call_{block_index}`, which
+    /// repeats every step, and a consumer deduplicates completed spans.
+    fn span_id(call_id: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{call_id}#{seq}")
+    }
+
+    pub(super) async fn start(
+        tx: mpsc::Sender<Event>,
+        call_id: &str,
+        activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
+    ) -> Self {
+        let span_id = Self::span_id(call_id);
+        // `Sender::send` is cancel safe: if this future is dropped the event
+        // was either sent or not, and the guard is armed only once it was.
+        let sent = tx
+            .send(Event::OperationActivityStarted {
+                span_id: span_id.clone(),
+                activity_kind,
+            })
+            .await
+            .is_ok();
+        Self {
+            tx,
+            span: sent.then_some((span_id, activity_kind)),
+        }
+    }
+
+    async fn complete(mut self, outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome) {
+        if let Some((span_id, activity_kind)) = self.span.take() {
+            let _ = self
+                .tx
+                .send(Event::OperationActivityCompleted {
+                    span_id,
+                    activity_kind,
+                    outcome,
+                })
+                .await;
+        }
+    }
+}
+
+impl Drop for OperationSpanGuard {
+    fn drop(&mut self) {
+        if let Some((span_id, activity_kind)) = self.span.take() {
+            let _ = self.tx.try_send(Event::OperationActivityCompleted {
+                span_id,
+                activity_kind,
+                outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome::Cancelled,
+            });
+        }
+    }
+}
+
 /// Emits delayed, best-effort liveness pulses for one running tool.
 ///
 /// Keep the ticker in its own task instead of embedding `tokio::time::Interval`
@@ -393,6 +464,7 @@ impl Engine {
                     tx_event,
                     Some(cancel_token),
                     tool_name.clone(),
+                    Some(format!("parallel:{}:{index}", uuid::Uuid::new_v4())),
                     tool_input.clone(),
                     workspace,
                     Some(registry_ref),
@@ -455,6 +527,7 @@ impl Engine {
         tx_event: mpsc::Sender<Event>,
         cancel_token: Option<CancellationToken>,
         tool_name: String,
+        activity_call_id: Option<String>,
         tool_input: serde_json::Value,
         workspace: PathBuf,
         registry: Option<&crate::tools::ToolRegistry>,
@@ -557,6 +630,44 @@ impl Engine {
             }
         }
 
+        // Typed owner activity: classified only after every gate above has
+        // passed, from the same authority that dispatches the call (the MCP
+        // pool's resolved server map, the interpreter, or the registry plus
+        // the canonical action alias). Names and arguments never leave here.
+        let activity_kind = match activity_call_id.as_ref() {
+            None => None,
+            Some(_) if McpPool::is_mcp_tool(&tool_name) => match mcp_pool.as_ref() {
+                Some(pool) => pool
+                    .lock()
+                    .await
+                    .resolved_tool_servers()
+                    .get(&tool_name)
+                    .map(|server| crate::tools::activity::mcp_activity_kind(server)),
+                None => None,
+            },
+            Some(_)
+                if matches!(
+                    tool_name.as_str(),
+                    CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME
+                ) =>
+            {
+                Some(codewhale_protocol::engine_owner::OwnerActivityKind::Executing)
+            }
+            // The code-mode wrapper is not itself an operation.
+            Some(_) if tool_name == EXECUTE_TOOLS_TOOL_NAME => None,
+            Some(_) => registry
+                .filter(|registry| registry.get(&tool_name).is_some())
+                .and_then(|_| {
+                    crate::tools::activity::registry_activity_kind(&tool_name, &tool_input)
+                }),
+        };
+        let operation_span = match (activity_call_id.as_deref(), activity_kind) {
+            (Some(call_id), Some(activity_kind)) => {
+                Some(OperationSpanGuard::start(tx_event.clone(), call_id, activity_kind).await)
+            }
+            _ => None,
+        };
+
         let outcome: Result<RichToolResult, ToolError> = if McpPool::is_mcp_tool(&tool_name) {
             if let Some(pool) = mcp_pool {
                 let disallowed_tools = context_override
@@ -608,6 +719,17 @@ impl Engine {
                 "tool '{tool_name}' is not registered"
             )))
         };
+
+        if let Some(operation_span) = operation_span {
+            let cancelled = cancel_token
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled);
+            operation_span
+                .complete(crate::tools::activity::operation_outcome(
+                    &outcome, cancelled,
+                ))
+                .await;
+        }
 
         let duration_ms = started_at.elapsed().as_millis() as u64;
         // The surface-agnostic choke point for every tool call, so this one

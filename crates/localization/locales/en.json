@@ -1165,7 +1165,6 @@
   "PendingApprovalInAgent": "Approval needed in {agent} — /agents",
   "ApprovalTruncationHint": "  … truncated · press {details} for full details",
   "ApprovalFullAccessPolicyBlocked": "Blocked {tool}: Full Access cannot bypass this policy",
-  "AutoReviewQuestionSkipped": "Auto-Review skipped a user question and continued autonomously",
   "ApprovalChooseHint": "Choose: ",
   "ApprovalChooseAction": "Enter selected option, or press y/a/d directly",
   "ApprovalIntentLabel": "Intent: ",

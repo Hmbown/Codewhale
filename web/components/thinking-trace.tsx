@@ -1,3 +1,4 @@
+import { Icon } from "./icon";
 /**
  * "See how it decides" — a terminal-styled pane that surfaces REAL reasoning
  * traces from a Codewhale session, paired with the decision each produced.
@@ -68,53 +69,27 @@ export const SCENES: Scene[] = [
 export function ThinkingTrace({ locale = "en" }: { locale?: string }) {
   const isZh = locale === "zh";
   return (
-    <div className="grid gap-6 md:grid-cols-3">
+    <div className="grid-3">
       {SCENES.map((s, i) => (
-        <div
-          key={i}
-          className="hairline-t hairline-b hairline-l hairline-r bg-paper flex flex-col overflow-hidden"
-        >
-          {/* terminal title bar */}
-          <div className="bg-paper-deep text-ink px-4 py-2.5 flex items-center justify-between">
-            <div className="flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-jade inline-block" />
-              <span className="w-2.5 h-2.5 rounded-full bg-ochre inline-block" />
-              <span className="w-2.5 h-2.5 rounded-full bg-indigo inline-block" />
-              <span className="ml-2.5 text-xs text-ink-mute">
-                codewhale — thinking
-              </span>
-            </div>
-            <span className="font-cjk text-[0.6rem] text-ink-mute">
-              {isZh ? "推理痕迹" : "reasoning trace"}
+        <figure key={i} className="trace">
+          <figcaption className="trace-head">
+            <span className="status status-accent">
+              <span className="status-dot" aria-hidden="true" />
+              {isZh ? "推理痕迹" : "Reasoning trace"}
             </span>
-          </div>
-
-          {/* context */}
-          <div className="px-4 pt-4 text-xs text-ink-mute">
-            {isZh ? s.context.zh : s.context.en}
-          </div>
-
-          {/* the trace */}
-          <pre className="px-4 py-3 font-mono text-[0.82rem] text-ink leading-relaxed whitespace-pre-wrap flex-1">
-            <span className="text-indigo">›</span>{" "}
-            <span className="text-ink-soft">{s.trace}</span>
-          </pre>
-
-          {/* cited authority */}
-          <div className="px-4 pb-3 flex flex-wrap gap-1.5">
+            <span className="trace-context">{isZh ? s.context.zh : s.context.en}</span>
+          </figcaption>
+          <pre className="trace-body">{s.trace}</pre>
+          <p className="trace-cites">
             {s.cites.map((c) => (
-              <span key={c} className="pill text-[0.58rem]">
-                {c}
-              </span>
+              <span key={c} className="pill">{c}</span>
             ))}
-          </div>
-
-          {/* the decision it produced */}
-          <div className="bg-indigo-pale px-4 py-3 hairline-t text-[0.8rem] leading-relaxed text-ink-soft">
-            <span className="font-display text-indigo font-semibold mr-1">→</span>
-            {isZh ? s.decision.zh : s.decision.en}
-          </div>
-        </div>
+          </p>
+          <p className="trace-decision">
+            <Icon name="arrow-right" className="icon icon-flip" />
+            <span>{isZh ? s.decision.zh : s.decision.en}</span>
+          </p>
+        </figure>
       ))}
     </div>
   );

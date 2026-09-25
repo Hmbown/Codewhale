@@ -1,211 +1,132 @@
-/* ---------- site tokens — the folio ---------- */
+/* ------------------------------------------------------------------ */
+/*  Tokens and roles — the whale-road                                  */
+/* ------------------------------------------------------------------ */
 /*
- * The site follows the OS appearance, exactly as the GPUI client follows its
- * `set_theme` pair: the GPUI light theme (warm paper) by default, the GPUI
- * dark theme (warm charcoal) under `prefers-color-scheme: dark` unless the
- * page pins `data-theme="light"`, and dark whenever it pins
- * `data-theme="dark"`. The pin comes from the theme toggle (every page), and
- * the inline boot script in the locale layout applies it before paint.
+ * Direction: codewhale-design/DIRECTION.md. Token authority:
+ * vendor/codewhale-design/tokens.json (1.1.x), generated into ../tokens.css
+ * as `--gpui-light-*` / `--gpui-dark-*`. This file names the roles every
+ * page paints with.
  *
- * The homepage water column (`.ocean-column`) and the footer seabed
- * (`.site-footer`) are the stage: a fixed dark material in both schemes, like
- * a terminal plate, because the waterline strata that descend into them are
- * drawn in the stage's own tokens. They share the one dark block below.
+ *   The ocean. Dark is the preferred look: deep navy grounds that rise into
+ *   the logo's gradient (#1E8FD8 -> #0B48BB). Light is warm paper above one
+ *   calm horizon. Below the horizon (the footer, the home sea) is always
+ *   the deep water, in both appearances (`.stage`).
  *
- * The token NAMES keep their historical shape (`--paper`, `--ink`,
- * `--indigo`) so every component rule stays diffable; the VALUES resolve
- * through the `--gpui-*` aliases below, which reference the generated GPUI
- * tokens from vendor/codewhale-design/tokens.json. Only the warm state hues (tan, moss, rust and their AA-adapted
- * inks) stay literal: `set_theme` has no slot for them.
+ *   Depth is elevation. --panel is raised (nearer the surface, lighter);
+ *   --bg is the floor; --surface is recessed (code, rails, fields).
+ *
+ *   Light means something. Focus, live work and "needs you" carry a small
+ *   point of light (--glow). Nothing else glows.
+ *
+ *   State is a mark and a word: --live (working, done, ready), --attention
+ *   (needs you), --danger (failed), --muted (idle). Never colour alone.
+ *
+ * Text, accent and state inks are the generated GPUI tokens in both
+ * appearances. The navy grounds are this site's reach for the ombre; they
+ * are measured against every ink here (gpui-role-tokens.test.ts checks
+ * WCAG AA on every ground).
+ *
+ * NAMING TRAP: tokens.json `surface` is the RAISED colour (web --panel);
+ * tokens.json `sidebar` is the RECESSED one (web --surface).
  */
+
+/* ---------- scheme-independent tokens ---------- */
 :root {
-  /* --- GPUI light (above the waterline) --- */
-  --gpui-paper: var(--gpui-light-bg);                /* background — warm paper */
-  --gpui-paper-raised: var(--gpui-light-panel);      /* muted — card/popover */
-  --gpui-paper-muted: var(--gpui-light-sidebar);     /* sidebar — recessed */
-  --gpui-ink: var(--gpui-light-text);                /* foreground */
-  --gpui-ink-soft: var(--gpui-light-text-muted);     /* muted_foreground */
-  --gpui-ink-mute: var(--gpui-light-text-muted);     /* muted_foreground */
-  --gpui-edge: var(--gpui-light-border);             /* border */
-  --gpui-primary: var(--gpui-light-primary);         /* primary */
-  --gpui-primary-hover: rgb(var(--gpui-light-primary-rgb) / var(--gpui-primary-hover-opacity)); /* button_primary_hover */
+  /* The ocean: the navy grounds and the logo gradient. */
+  --ocean-abyss: #030a1c;
+  --ocean-floor: #061431;
+  --ocean-raised: #0c2152;
+  --ocean-hover: #11295e;
+  --ocean-selected: #16316b;
+  --ocean-line: #1f3a78;
+  --ocean-line-strong: #6f86b8;
+  --ocean-sky: #0a1d48;
+  --brand-light: #1e8fd8;
+  --brand-deep: #0b48bb;
+  /* The primary fill: the logo gradient, started where white text on it
+     still clears 4.5:1 (#1877c9 is 4.65:1; #1e8fd8 itself is 3.5:1). */
+  --brand-fill: linear-gradient(135deg, #1877c9, var(--brand-deep));
+  --brand-fill-hover: linear-gradient(135deg, #1670c2, #0a3fa6);
+  --on-brand: #ffffff;
+  /* The sea below the horizon: bright at the waterline, settling into navy
+     within a few rows (never near-black), so text from 3rem down sits on
+     >= 4.5:1 muted contrast. */
+  --sea: linear-gradient(180deg, #0b48bb 0, #0a3a94 2.5rem, #06205a 9rem, #051a4a 18rem, var(--ocean-floor) 36rem);
+  --horizon-glow: rgb(144 185 255 / 0.9);
 
-  /* --- GPUI dark (below the waterline) --- */
-  --gpui-stage: var(--gpui-dark-bg);                 /* background — warm charcoal */
-  --gpui-stage-deep: var(--gpui-dark-sidebar);       /* sidebar — deepest dark */
-  --gpui-stage-muted: var(--gpui-dark-panel);        /* muted — raised input plate */
-  --gpui-stage-raised: var(--gpui-dark-list-active); /* list_active — top plate */
-  --gpui-stage-ink: var(--gpui-dark-text);           /* foreground */
-  --gpui-stage-ink-soft: var(--gpui-dark-text-muted); /* muted_foreground */
-  --gpui-stage-ink-dim: var(--gpui-dark-text-muted); /* muted_foreground (AA, UX-05) */
-  --gpui-stage-edge: var(--gpui-dark-border);        /* border */
-  --gpui-primary-dark: var(--gpui-dark-primary);     /* primary */
-  --gpui-primary-hover-dark: rgb(var(--gpui-dark-primary-rgb) / var(--gpui-primary-hover-opacity)); /* button_primary_hover */
-  --gpui-accent-dark: var(--gpui-dark-accent);       /* accent — hover wash */
-  --gpui-selection-dark: rgb(var(--gpui-dark-primary-rgb) / var(--gpui-selection-opacity)); /* selection */
-
-  /* Warm-muted state hues from the GPUI mockups, darkened or lifted per
-     side of the waterline so text uses of them still clear AA. No
-     set_theme slots: these are site-specific adaptations. */
-  --gpui-tan: #b1a17a;              /* human mark */
-  --gpui-moss: #739686;             /* outcome */
-  --gpui-rust: #aa6f6c;             /* attention */
-
-  /* RGB channel triples backing the Tailwind surface/ink tokens (see
-     tailwind.config.ts). The dark block below re-points them. */
-  --c-paper: var(--gpui-light-bg-rgb);
-  --c-paper-deep: var(--gpui-light-sidebar-rgb);
-  --c-paper-edge: var(--gpui-light-border-rgb);
-  --c-ink: var(--gpui-light-text-rgb);
-  --c-ink-soft: var(--gpui-light-text-muted-rgb);
-  --c-ink-mute: var(--gpui-light-text-muted-rgb);
-  --c-indigo: var(--gpui-light-primary-rgb);
-  --c-stage-soft: var(--gpui-dark-text-muted-rgb);
-  --c-stage-deep: var(--gpui-dark-sidebar-rgb);
-  --c-primary-dark: var(--gpui-dark-primary-rgb);
-
-  /* The sheet. */
-  --paper: var(--gpui-paper);
-  --paper-deep: var(--gpui-paper-muted);
-  --paper-edge: var(--gpui-edge);
-  --paper-card: var(--gpui-paper-raised);
-  --paper-line: var(--gpui-edge);
-  --paper-line-soft: var(--gpui-edge);
-  --ink: var(--gpui-ink);
-  --ink-soft: var(--gpui-ink-soft);
-  --ink-mute: var(--gpui-ink-mute);
-  /* Action on paper is the GPUI light primary; hover sinks to its hover. */
-  --indigo: var(--gpui-primary);
-  --indigo-deep: var(--gpui-primary-hover);
-  --indigo-pale: rgb(var(--c-indigo) / 0.1);
-  --action-on-dark: var(--gpui-primary-dark);
-  /* State inks darkened from the mockup hues so they clear AA on paper:
-     moss is outcome, rust is attention, tan is the human mark. */
-  --ochre: #7d6a3f;
-  --jade: #4e6f61;
-  --seafoam: var(--gpui-moss);
-  --cobalt: var(--gpui-primary);
-  --cyan: var(--gpui-primary); /* reserved for the composer prompt glyph and the release line */
-  --ocean-deep: var(--gpui-stage-deep);
-  --ocean-mid: var(--gpui-stage-muted);
-  --ocean-current: var(--gpui-primary-dark);
-  --ocean-mist: var(--gpui-stage-ink-soft);
-  --ocean-coral: #8f5a56;
-  --signal-gold: #7d6a3f;
-  /* The whale mark is ink on paper; below the waterline it is the light
-     stage foreground. The warm tan stays reserved for human moments. */
-  --mark-ink: var(--gpui-ink);
-  /* Docs sheet inks: the sidebar's current link and the secondary button. */
-  --docs-accent: var(--gpui-primary);
-  --docs-button-bg: var(--gpui-paper-raised);
-  --docs-button-border: var(--gpui-edge);
-  --docs-button-text: var(--gpui-ink);
-  --stage-text: var(--gpui-stage-ink);
-  --stage-soft: var(--gpui-stage-ink-soft);
-  --stage-muted: var(--gpui-stage-ink-dim);
-
-  /* The water column, re-inked in the GPUI dark ramp. */
-  --stage-field-top: var(--gpui-stage-muted); /* surface */
-  --stage-field-mid: var(--gpui-stage); /* the authored 42% break */
-  --stage-field-deep: var(--gpui-stage-deep); /* deep field, and the footer seabed */
-  --stage-ambient: var(--gpui-accent-dark);
-  --stage-composer: var(--gpui-stage-muted); /* the raised input plate */
-  --stage-elevated: var(--gpui-stage-raised);
-  --stage-line: var(--gpui-stage-edge); /* the charcoal border on stage */
-  --stage-hint: var(--gpui-stage-ink-dim);
-  --stage-dim: var(--gpui-stage-ink-soft);
-  --violet: var(--gpui-selection-dark); /* 1px rules only, never text */
-
-  /* Type, as GPUI set_theme: Shannon Sans for every role (the Latin and
-     extended subsets load in app/[locale]/layout.tsx), the system monospace
-     stack at 13px for code, prose at 15/23. Han, kana and
-     Hangul fall through to the platform's sans. No serif anywhere. */
+  /* Type: Shannon Sans for every role, the system monospace stack for
+     things a person could type or paste. No serif, no third family. */
   --font-body: var(--font-shannon-latin), var(--font-shannon-ext), var(--gpui-font-fallbacks),
     ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-display: var(--font-body);
   --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco, Consolas,
     "Liberation Mono", monospace;
   --font-cjk: var(--gpui-font-fallbacks), sans-serif;
-  --text-mono: var(--gpui-mono-size);
-  --text-prose: 0.9375rem;
-  --leading-prose: 1.5334;
 
-  /* Hairline + code surfaces routed through vars so the dark subtrees can
-     re-ink them without touching every rule. Code plates are always the
-     stage's own deepest field, on either side of the waterline. */
-  --hairline: rgb(var(--c-ink) / 0.16);
-  --code-bg: var(--gpui-stage-deep);
-  --code-fg: var(--gpui-stage-ink);
+  /* Type scale. 12px is the floor. Display sizes are one per page. */
+  --text-caption: 0.75rem;   /* 12 meta, timestamps, labels */
+  --text-mono: var(--gpui-mono-size); /* 13 code, commands */
+  --text-ui: 0.875rem;       /* 14 controls, rows, panel body */
+  --text-body: 1rem;         /* 16 short copy, form inputs (no iOS zoom) */
+  --text-prose: 1.0625rem;   /* 17 reading: docs, legal, answers */
+  --leading-prose: 1.6;
+  --text-heading: 1.0625rem; /* 17 600 group heading */
+  --text-title: 1.375rem;    /* 22 600 section title */
+  --text-display: clamp(2rem, 1.3rem + 2.6vw, 3rem);         /* inner-page title */
+  --text-display-lg: clamp(2.5rem, 1.4rem + 4.4vw, 4.5rem);  /* the home hero */
+  --text-xs: var(--text-caption);
+  --text-sm: var(--text-ui);
+  --text-base: var(--text-body);
 
-  /* One site container and one vertical rhythm. Every page gutter aligns
-     with the nav; every hero and section shares a single padding token. */
+  /* Space: a 4px program. */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+  --space-8: 4rem;
+  --section-gap: clamp(var(--space-7), 7vw, 5.5rem);
+
+  /* One container, one reading measure. */
   --container: min(100% - var(--gpui-spacing-page), 76rem);
-  --hero-pad: clamp(3rem, 6vw, 4.75rem);
+  --measure-prose: 46rem;
+  --measure-text: 68ch;
+  --hero-pad: clamp(3rem, 7vw, 5.5rem);
   --section-pad: clamp(2.75rem, 5vw, 4rem);
 
-  /* Radius grammar, as the GPUI client (codewhale-app/docs/DESIGN.md):
-     6px for rows, chips and small controls; 10px for code and menu
-     surfaces; 14px for the largest raised sheets; 999px for pills. No other
-     radius appears in app/styles/ or the Tailwind scale. */
+  /* Radius: 6 controls, 10 surfaces, 14 sheets, pill for dots. */
   --radius-control: var(--gpui-radius-control);
   --radius-surface: var(--gpui-radius-panel);
-  --radius-sheet: 14px;
+  --radius-sheet: var(--gpui-radius-sheet);
   --radius-pill: 999px;
 
-  /* Motion. The GPUI panel spring is PANEL_SPRING (stiffness 420, damping
-     42, mass 1; codewhale-app/src/workspace/motion.rs): damping ratio 1.02,
-     so it never overshoots and reaches 99% at ~340ms. --ease-spring is
-     that response fitted as one cubic-bezier (max error 1.3%). State
-     changes (hover, colour, border) use the same curve at --dur-state;
-     entrances run the full --dur-spring; exits accelerate away. */
+  /* Motion. Nothing bounces: every curve stays inside [0, 1]. */
+  --dur-state: 120ms;   /* colour, border, opacity on hover and press */
+  --dur-arrive: 180ms;  /* something new arrives, rise <= 4px */
+  --dur-exit: 120ms;    /* something closes or leaves */
+  --dur-spring: 340ms;  /* panes and sheets */
+  --dur-spin: 1.2s;     /* a working spinner: motion that shows work */
+  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
   --ease-spring: cubic-bezier(0.2, 0.1, 0.16, 1);
-  --ease-exit: cubic-bezier(0.4, 0, 0.8, 0.4);
-  --dur-state: 150ms;
-  --dur-spring: 340ms;
-  color-scheme: light;
+  --ease-exit: var(--ease-in);
 }
 
-/* Reduced motion is a still pose, as the GPUI whale under the same setting:
-   state changes step instead of blending, and every looping or entrance
-   animation is gated behind `prefers-reduced-motion: no-preference` where
-   it is declared. */
+/* Reduced motion is a still pose: every duration steps. Keyframed motion is
+   additionally declared only inside `prefers-reduced-motion:
+   no-preference`, so it never starts. */
 @media (prefers-reduced-motion: reduce) {
   :root {
     --dur-state: 0ms;
     --dur-spring: 0ms;
+    --dur-arrive: 0ms;
+    --dur-exit: 0ms;
   }
 }
 
-
-/* ---------- role tokens — GPUI set_theme ---------- */
-/*
- * One token authority: the GPUI desktop client's `set_theme`
- * versioned design artifact (vendor/codewhale-design/tokens.json), generated into
- * ./tokens.css as `--gpui-dark-*` / `--gpui-light-*`. Nothing below repeats a
- * hex for a role: every role value is a generated token, or the primary at
- * the opacity `set_theme` derives (hover 0.9, selection 0.28).
- *
- * The role layer follows the OS: light by default, dark under
- * `prefers-color-scheme: dark` unless the page pins `data-theme="light"`,
- * and dark whenever it pins `data-theme="dark"`.
- *
- *   --bg         background        the reading canvas
- *   --surface    sidebar           recessed navigation and chrome
- *   --panel      muted             raised inputs, cards, popovers
- *   --text       foreground
- *   --muted      muted_foreground  secondary text (AA on --bg and --panel)
- *   --line       border
- *   --accent     primary           action, links, whale blue
- *   --on-accent  primary_foreground
- *   --hover      accent            hover wash, distinct from --panel
- *   --selected   list_active       the current row
- *   --selection  primary @ 0.28    text selection
- *   --ring       primary           focus ring
- *
- * Shoreline (`--shoreline-*`) is the TUI's charcoal theme and is not the
- * GPUI palette; `--whale-*`/`--light-*` remain available to anything that
- * genuinely wants the terminal palette.
- */
+/* ---------- light — warm paper above the horizon ---------- */
 :root {
   --bg: var(--gpui-light-bg);
   --surface: var(--gpui-light-sidebar);
@@ -213,114 +134,182 @@
   --text: var(--gpui-light-text);
   --muted: var(--gpui-light-text-muted);
   --line: var(--gpui-light-border);
+  --line-strong: var(--gpui-light-border-strong);
   --accent: var(--gpui-light-primary);
+  --accent-hover: rgb(var(--gpui-light-primary-rgb) / var(--gpui-primary-hover-opacity));
   --on-accent: var(--gpui-light-on-primary);
   --hover: var(--gpui-light-accent);
   --selected: var(--gpui-light-list-active);
   --selection: rgb(var(--gpui-light-primary-rgb) / var(--gpui-selection-opacity));
   --ring: var(--gpui-light-primary);
+  --live: var(--gpui-light-live);
+  --success: var(--gpui-light-live);
+  --attention: var(--gpui-light-attention);
+  --danger: var(--gpui-light-danger);
+  --mark-ink: var(--gpui-light-text);
+  --diff-add: rgb(104 152 119 / 0.14);
+  --diff-del: rgb(189 119 116 / 0.11);
+  /* The sky: paper that brightens toward blue at the top of the page. */
+  --ground: linear-gradient(180deg, #e9f1fb 0, var(--gpui-light-bg) 26rem);
+  /* The home sky brightens toward the horizon; the home sea is shallow water
+     that settles back to paper. */
+  --sky-rise: rgb(30 143 216 / 0.1);
+  --home-sea: linear-gradient(180deg, #cfe2f6 0, #e2ecf8 5rem, var(--gpui-light-bg) 24rem), var(--gpui-light-bg);
+  /* On paper, light is a quiet ring. */
+  --glow: 0 0 0 3px color-mix(in srgb, currentColor 16%, transparent);
+  --glow-focus: 0 0 0 6px rgb(var(--gpui-light-primary-rgb) / 0.12);
+  --shadow-popover: 0 4px 8px rgb(0 0 0 / 0.16);
+  color-scheme: light;
 }
 
+/* ---------- dark — the navy ocean; the OS-dark and pinned blocks match ---------- */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: var(--gpui-dark-bg);
-    --surface: var(--gpui-dark-sidebar);
-    --panel: var(--gpui-dark-panel);
+    --bg: var(--ocean-floor);
+    --surface: var(--ocean-abyss);
+    --panel: var(--ocean-raised);
     --text: var(--gpui-dark-text);
     --muted: var(--gpui-dark-text-muted);
-    --line: var(--gpui-dark-border);
+    --line: var(--ocean-line);
+    --line-strong: var(--ocean-line-strong);
     --accent: var(--gpui-dark-primary);
+    --accent-hover: rgb(var(--gpui-dark-primary-rgb) / var(--gpui-primary-hover-opacity));
     --on-accent: var(--gpui-dark-on-primary);
-    --hover: var(--gpui-dark-accent);
-    --selected: var(--gpui-dark-list-active);
+    --hover: var(--ocean-hover);
+    --selected: var(--ocean-selected);
     --selection: rgb(var(--gpui-dark-primary-rgb) / var(--gpui-selection-opacity));
     --ring: var(--gpui-dark-primary);
-
-    /* The folio names, re-inked in the GPUI charcoal ramp. */
-    --c-paper: var(--gpui-dark-bg-rgb);
-    --c-paper-deep: var(--gpui-dark-panel-rgb);
-    --c-paper-edge: var(--gpui-dark-border-rgb);
-    --c-ink: var(--gpui-dark-text-rgb);
-    --c-ink-soft: var(--gpui-dark-text-muted-rgb);
-    --c-ink-mute: var(--gpui-dark-text-muted-rgb);
-    --c-indigo: var(--gpui-dark-primary-rgb);
-    --paper: var(--gpui-stage);
-    --paper-deep: var(--gpui-stage-muted);
-    --paper-edge: var(--gpui-stage-edge);
-    --paper-card: var(--gpui-stage-muted);
-    --paper-line: var(--gpui-stage-edge);
-    --paper-line-soft: var(--gpui-stage-edge);
-    --ink: var(--gpui-stage-ink);
-    --ink-soft: var(--gpui-stage-ink-soft);
-    --ink-mute: var(--gpui-stage-ink-dim);
-    --indigo: var(--gpui-primary-dark);
-    --indigo-deep: var(--gpui-primary-hover-dark);
-    --indigo-pale: rgb(var(--c-primary-dark) / 0.14);
-    --ochre: #d6c78f;
-    --jade: #9ec7b2;
-    --cyan: var(--gpui-primary-dark);
-    --ocean-coral: #d08a80;
-    --signal-gold: #d6c78f;
-    --mark-ink: var(--gpui-stage-ink);
-    --docs-accent: var(--gpui-primary-dark);
-    --docs-button-bg: var(--gpui-stage-muted);
-    --docs-button-border: var(--gpui-stage-edge);
-    --docs-button-text: var(--gpui-stage-ink);
-    --hairline: rgb(var(--c-stage-soft) / 0.2);
+    --live: var(--gpui-dark-live);
+    --success: var(--gpui-dark-live);
+    --attention: var(--gpui-dark-attention);
+    --danger: var(--gpui-dark-danger);
+    --mark-ink: var(--gpui-dark-text);
+    --diff-add: rgb(80 170 140 / 0.16);
+    --diff-del: rgb(227 154 144 / 0.12);
+    --ground: radial-gradient(90rem 38rem at 50% -14rem, rgb(30 143 216 / 0.3), transparent 70%), linear-gradient(180deg, var(--ocean-sky) 0, var(--ocean-floor) 34rem);
+    --sky-rise: rgb(30 143 216 / 0.24);
+    --home-sea: var(--sea), var(--ocean-floor);
+    --glow: 0 0 0 3px color-mix(in srgb, currentColor 20%, transparent), 0 0 12px 1px color-mix(in srgb, currentColor 45%, transparent);
+    --glow-focus: 0 0 14px 2px rgb(var(--gpui-dark-primary-rgb) / 0.35);
+    --shadow-popover: 0 4px 8px rgb(0 0 0 / 0.4);
     color-scheme: dark;
   }
 }
 
-/* The pinned dark scheme repeats the OS-dark block exactly. The stage
-   subtrees (the water column and the footer seabed) take the same block in
-   either scheme, so a component never needs to know which side of the
-   waterline it is on. */
-.ocean-column,
-.site-footer,
 :root[data-theme="dark"] {
-  --bg: var(--gpui-dark-bg);
-  --surface: var(--gpui-dark-sidebar);
-  --panel: var(--gpui-dark-panel);
+  --bg: var(--ocean-floor);
+  --surface: var(--ocean-abyss);
+  --panel: var(--ocean-raised);
   --text: var(--gpui-dark-text);
   --muted: var(--gpui-dark-text-muted);
-  --line: var(--gpui-dark-border);
+  --line: var(--ocean-line);
+  --line-strong: var(--ocean-line-strong);
   --accent: var(--gpui-dark-primary);
+  --accent-hover: rgb(var(--gpui-dark-primary-rgb) / var(--gpui-primary-hover-opacity));
   --on-accent: var(--gpui-dark-on-primary);
-  --hover: var(--gpui-dark-accent);
-  --selected: var(--gpui-dark-list-active);
+  --hover: var(--ocean-hover);
+  --selected: var(--ocean-selected);
   --selection: rgb(var(--gpui-dark-primary-rgb) / var(--gpui-selection-opacity));
   --ring: var(--gpui-dark-primary);
-
-  /* The folio names, re-inked in the GPUI charcoal ramp. */
-  --c-paper: var(--gpui-dark-bg-rgb);
-  --c-paper-deep: var(--gpui-dark-panel-rgb);
-  --c-paper-edge: var(--gpui-dark-border-rgb);
-  --c-ink: var(--gpui-dark-text-rgb);
-  --c-ink-soft: var(--gpui-dark-text-muted-rgb);
-  --c-ink-mute: var(--gpui-dark-text-muted-rgb);
-  --c-indigo: var(--gpui-dark-primary-rgb);
-  --paper: var(--gpui-stage);
-  --paper-deep: var(--gpui-stage-muted);
-  --paper-edge: var(--gpui-stage-edge);
-  --paper-card: var(--gpui-stage-muted);
-  --paper-line: var(--gpui-stage-edge);
-  --paper-line-soft: var(--gpui-stage-edge);
-  --ink: var(--gpui-stage-ink);
-  --ink-soft: var(--gpui-stage-ink-soft);
-  --ink-mute: var(--gpui-stage-ink-dim);
-  --indigo: var(--gpui-primary-dark);
-  --indigo-deep: var(--gpui-primary-hover-dark);
-  --indigo-pale: rgb(var(--c-primary-dark) / 0.14);
-  --ochre: #d6c78f;
-  --jade: #9ec7b2;
-  --cyan: var(--gpui-primary-dark);
-  --ocean-coral: #d08a80;
-  --signal-gold: #d6c78f;
-  --mark-ink: var(--gpui-stage-ink);
-  --docs-accent: var(--gpui-primary-dark);
-  --docs-button-bg: var(--gpui-stage-muted);
-  --docs-button-border: var(--gpui-stage-edge);
-  --docs-button-text: var(--gpui-stage-ink);
-  --hairline: rgb(var(--c-stage-soft) / 0.2);
+  --live: var(--gpui-dark-live);
+  --success: var(--gpui-dark-live);
+  --attention: var(--gpui-dark-attention);
+  --danger: var(--gpui-dark-danger);
+  --mark-ink: var(--gpui-dark-text);
+  --diff-add: rgb(80 170 140 / 0.16);
+  --diff-del: rgb(227 154 144 / 0.12);
+  --ground: radial-gradient(90rem 38rem at 50% -14rem, rgb(30 143 216 / 0.3), transparent 70%), linear-gradient(180deg, var(--ocean-sky) 0, var(--ocean-floor) 34rem);
+  --sky-rise: rgb(30 143 216 / 0.24);
+  --home-sea: var(--sea), var(--ocean-floor);
+  --glow: 0 0 0 3px color-mix(in srgb, currentColor 20%, transparent), 0 0 12px 1px color-mix(in srgb, currentColor 45%, transparent);
+  --glow-focus: 0 0 14px 2px rgb(var(--gpui-dark-primary-rgb) / 0.35);
+  --shadow-popover: 0 4px 8px rgb(0 0 0 / 0.4);
   color-scheme: dark;
+}
+
+/* ---------- the stage — below the horizon, in both appearances ---------- */
+/* The footer and the home sea. The ground is the deep water; raised and
+   recessed plates step up and down from it. Legacy aliases are repeated
+   here because a custom property that references another is computed where
+   it is declared. */
+.stage,
+.site-footer {
+  --bg: var(--ocean-floor);
+  --surface: var(--ocean-abyss);
+  --panel: var(--ocean-raised);
+  --text: var(--gpui-dark-text);
+  --muted: var(--gpui-dark-text-muted);
+  --line: var(--ocean-line);
+  --line-strong: var(--ocean-line-strong);
+  --accent: var(--gpui-dark-primary);
+  --accent-hover: rgb(var(--gpui-dark-primary-rgb) / var(--gpui-primary-hover-opacity));
+  --on-accent: var(--gpui-dark-on-primary);
+  --hover: var(--ocean-hover);
+  --selected: var(--ocean-selected);
+  --selection: rgb(var(--gpui-dark-primary-rgb) / var(--gpui-selection-opacity));
+  --ring: var(--gpui-dark-primary);
+  --live: var(--gpui-dark-live);
+  --success: var(--gpui-dark-live);
+  --attention: var(--gpui-dark-attention);
+  --danger: var(--gpui-dark-danger);
+  --mark-ink: var(--gpui-dark-text);
+  --diff-add: rgb(80 170 140 / 0.16);
+  --diff-del: rgb(227 154 144 / 0.12);
+  --glow: 0 0 0 3px color-mix(in srgb, currentColor 20%, transparent), 0 0 12px 1px color-mix(in srgb, currentColor 45%, transparent);
+  --glow-focus: 0 0 14px 2px rgb(var(--gpui-dark-primary-rgb) / 0.35);
+  --shadow-popover: 0 4px 8px rgb(0 0 0 / 0.4);
+
+  --paper: var(--bg);
+  --paper-deep: var(--surface);
+  --paper-card: var(--panel);
+  --paper-edge: var(--line);
+  --paper-line: var(--line);
+  --paper-line-soft: var(--line);
+  --hairline: var(--line);
+  --ink: var(--text);
+  --ink-soft: var(--muted);
+  --ink-mute: var(--muted);
+  --indigo: var(--accent);
+  --indigo-deep: var(--accent-hover);
+  --indigo-pale: color-mix(in srgb, var(--accent) 14%, transparent);
+  --docs-accent: var(--accent);
+  --code-bg: var(--surface);
+  --code-fg: var(--text);
+  color-scheme: dark;
+  color: var(--text);
+}
+
+/* ---------- legacy names ---------- */
+/* Pages and partials that have not moved to the roles (the docs) read these.
+   Declared once on :root, they resolve against whichever scheme block wins
+   there; `.stage` repeats them. Removed in the post-renovation sweep. */
+:root {
+  --paper: var(--bg);
+  --paper-deep: var(--surface);
+  --paper-card: var(--panel);
+  --paper-edge: var(--line);
+  --paper-line: var(--line);
+  --paper-line-soft: var(--line);
+  --hairline: var(--line);
+  --ink: var(--text);
+  --ink-soft: var(--muted);
+  --ink-mute: var(--muted);
+  --indigo: var(--accent);
+  --indigo-deep: var(--accent-hover);
+  --indigo-pale: color-mix(in srgb, var(--accent) 12%, transparent);
+  --cobalt: var(--accent);
+  --cyan: var(--accent);
+  --ochre: var(--attention);
+  --signal-gold: var(--attention);
+  --jade: var(--live);
+  --seafoam: var(--live);
+  --ocean-coral: var(--danger);
+  --docs-accent: var(--accent);
+  --docs-button-bg: var(--panel);
+  --docs-button-border: var(--line);
+  --docs-button-text: var(--text);
+  --code-bg: var(--surface);
+  --code-fg: var(--text);
+  --stage-line: var(--line);
+  --stage-dim: var(--muted);
 }

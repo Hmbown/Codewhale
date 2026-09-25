@@ -2559,7 +2559,7 @@ mod tests {
         );
         assert!(!builtin.trusted());
         assert!(!builtin.enabled);
-        assert_eq!(group.items.iter().filter(|row| matches!(&row.action, Some(ExtensionAction::Command { command, .. }) if command.starts_with("/plugin marketplace install "))).count(), 4);
+        assert_eq!(group.items.iter().filter(|row| matches!(&row.action, Some(ExtensionAction::Command { command, .. }) if command.starts_with("/plugin marketplace install "))).count(), 5);
     }
 
     #[test]

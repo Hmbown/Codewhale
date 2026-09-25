@@ -48,7 +48,12 @@ export function checkBrowserUrl(url) {
   let parsed;
   try { parsed = new URL(trimmed); } catch { throw badArgs(`"${trimmed}" is not a URL`); }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw badArgs(`only http(s):// and about:blank URLs can be opened (got "${parsed.protocol}//")`);
+    // A person asking to "open" a local file wants to see it, not to have
+    // this self-owned browser read the disk: point at the route that shows it.
+    const hint = parsed.protocol === "file:"
+      ? "; to show a workspace file to the person use open_in_app when the Codewhale app offers it, or serve it over http://127.0.0.1"
+      : "";
+    throw badArgs(`only http(s):// and about:blank URLs can be opened (got "${parsed.protocol}//")${hint}`);
   }
   return parsed.href;
 }

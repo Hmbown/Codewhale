@@ -18,10 +18,6 @@ import { EmptyState } from "./surface-state";
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
 
-function topicSources(topic: DocTopic): string[] {
-  return Array.isArray(topic.repoSource) ? topic.repoSource : [topic.repoSource];
-}
-
 function highlight(text: string, query: string): React.ReactNode {
   // Index arithmetic lives in search-utils: lowercasing can change a
   // string's length, so `text` cannot be sliced with indices taken from
@@ -48,7 +44,6 @@ function TaskRow({ task, locale, query }: { task: DocTask; locale: string; query
         <div className="docs-topic-title">{highlight(pickText(task.label, locale), query)}</div>
         <p>{highlight(pickText(task.description, locale), query)}</p>
       </div>
-      <div className="docs-topic-source">{task.href}</div>
       <span className="docs-topic-arrow" aria-hidden="true">→</span>
     </Link>
   );
@@ -68,7 +63,6 @@ function TopicRow({
   sourceDocTag: string;
 }) {
   const href = docTopicHref(topic, locale);
-  const sources = topicSources(topic);
   const isExternal = docTopicIsExternal(topic);
 
   return (
@@ -84,14 +78,6 @@ function TopicRow({
           <span>{isExternal ? sourceDocTag : webGuideTag}</span>
         </div>
         <p>{highlight(pickText(topic.description, locale), query)}</p>
-      </div>
-      <div className="docs-topic-source">
-        {sources.map((s, i) => (
-          <span key={s}>
-            {i > 0 && ", "}
-            {highlight(s, query)}
-          </span>
-        ))}
       </div>
       <span className="docs-topic-arrow" aria-hidden="true">{isExternal ? "↗" : "→"}</span>
     </Link>

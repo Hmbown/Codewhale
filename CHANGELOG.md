@@ -16,6 +16,13 @@ Planned for Codewhale v0.10.1: a reliability and first-run release. Turns that
 stall now say so, approvals keep what you approved, plugin suggestions are
 quieter, and Fleet runs can be checked before they spend anything.
 
+### Contributors
+
+- **[@gaord](https://github.com/gaord)** — let undo roll back files for the turn it is undoing ([#6483](https://github.com/Hmbown/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/Hmbown/Codewhale/pull/6406)), and exposed user-defined provider routes to native clients ([#6404](https://github.com/Hmbown/Codewhale/pull/6404)).
+- **[@Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)).
+- **[@aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test ([#6581](https://github.com/Hmbown/Codewhale/pull/6581)).
+- **[@dajiaohuang](https://github.com/dajiaohuang)** — `codewhale config set` checks a known setting's value against its schema type before saving it ([#6568](https://github.com/Hmbown/Codewhale/pull/6568)).
+
 ### Added
 
 - Official model routing: `/router` (also `/model router`) sets up the Auto
@@ -55,6 +62,13 @@ quieter, and Fleet runs can be checked before they spend anything.
   real one.
 - Auto-Review verdicts now reach `audit.log`, as `/permissions` said they
   did. They were written only when `CODEWHALE_TOOL_AUDIT_LOG` was set.
+- The installation page is generated from `docs/INSTALL.md`, so the website
+  and the guide can no longer disagree; broken anchors and unsafe links fail
+  the build ([#6450](https://github.com/Hmbown/Codewhale/pull/6450)).
+- `codewhale config set` refuses a value of the wrong type for a known setting
+  (a word for an on/off switch, text for a number, a choice outside the list)
+  instead of saving it ([#6568](https://github.com/Hmbown/Codewhale/pull/6568),
+  thanks @dajiaohuang).
 - A turn that stops producing output now reports itself: the turn loop records
   its phase and last progress, and an overdue phase surfaces instead of
   hanging silently until the stream idle timeout. A delegated agent's final result is
@@ -102,6 +116,31 @@ quieter, and Fleet runs can be checked before they spend anything.
   honours `NO_COLOR` ([#5846](https://github.com/Hmbown/Codewhale/issues/5846)).
 - `/cache`, `/stash`, `/config`, session prune, `metrics --since` and the
   `lane start`/`lane stop --json` flags handle their edge cases.
+
+### Removed
+
+- Flags, settings and tool parameters that did nothing are gone
+  ([#6516](https://github.com/Hmbown/Codewhale/issues/6516)). `--output-mode`
+  is hidden. It is still accepted, prints a warning, and is ignored.
+- The dispatcher no longer exports `DEEPSEEK_*` copies of its `CODEWHALE_*`
+  variables. A `DEEPSEEK_*` variable you set yourself is still read.
+- `lane start` and `workflow run --runtime vm|ci` are rejected before a lane
+  is created. Older lane records for those runtimes still load.
+- The control socket's `relaunch` verb is removed; it always returned an
+  error.
+- The `speech` tool drops `stream`. `stream=true` used to fail; it is now
+  ignored, a complete audio file is written, and the result no longer carries
+  `"stream": false`. The `finance` tool drops `market`, and a call that still
+  passes it has it ignored.
+- `[context].enabled`, the seam-manager keys and
+  `tui.terminal_probe_timeout_ms` no longer load; old configs that carry
+  them still start. The `[workshop]` docs now describe bounded spillover
+  instead of a synthesis sub-agent.
+- About 2,650 lines of workflow code that nothing ran are deleted: the replay
+  executor, the review-repair loop and experimental search. The
+  `replay_diverged` status they produced goes with them. The isolated
+  Runtime Chat prompt and the legacy YOLO alias list each have one owner now
+  ([#6517](https://github.com/Hmbown/Codewhale/issues/6517)).
 
 ### Experience
 
@@ -153,9 +192,11 @@ quieter, and Fleet runs can be checked before they spend anything.
   `/plugin dismissals reset [<name>]` brings them back.
 - Tools from reviewed plugins that declare themselves read-only no longer ask
   for approval on every call.
-- The bundled Computer Use plugin is 0.11.3, synced from upstream `0f54bf6`
-  ([#6303](https://github.com/Hmbown/Codewhale/issues/6303)).
-  `app_script` refuses shell escapes. Clicks on irreversible actions such as
+- The bundled Computer Use plugin is 0.12.0, the published upstream release
+  `8435692` ([#6303](https://github.com/Hmbown/Codewhale/issues/6303),
+  [#5856](https://github.com/Hmbown/Codewhale/issues/5856)). On macOS the agent
+  uses its own pointer and never drives your cursor. `app_script` refuses shell
+  escapes. Clicks on irreversible actions such as
   pay, send or delete need confirmation. Consent decisions cannot ride inside
   `run_actions` or trajectory replay, and trajectories redact secure fields.
   Also new: a shared-computer control lease that pauses agent input while a
@@ -163,9 +204,10 @@ quieter, and Fleet runs can be checked before they spend anything.
   README no longer claims delegated agents share the Computer Use session; they
   never receive its tools.
 - The bundled first-party catalog pins marketplace revision
-  `93b0e0e4e441384533ca586b59890c0d5942bc0a`. It lists Computer Use 0.11.3 and
-  the same five plugins as before. Chromewhale is not in the bundled catalog
-  yet.
+  `ae3dd2255a9a266365c6125a084f511eb26bc04d`. It lists Computer Use 0.12.0 and
+  adds Codewhale for Chrome (Chromewhale) 0.3.0 as a developer preview: you
+  load its Chrome extension unpacked, and like every catalog plugin it installs
+  disabled and untrusted until you review it.
 
 ### CI
 

@@ -35,6 +35,18 @@ export const RELEASE_CONTRIBUTORS: string[] = [
 ];
 
 /**
+ * Contributors whose work landed after the latest release and before the next
+ * one. scripts/check-contributor-credit.py requires them here now; the release
+ * cut moves them into RELEASE_CONTRIBUTORS with that release's changelog block.
+ */
+export const UNRELEASED_CONTRIBUTORS: string[] = [
+  "@gaord",
+  "@Lstarsky0",
+  "@aboimpinto",
+  "@dajiaohuang",
+];
+
+/**
  * Contributors who helped with reports, reproductions, and verification.
  * Credit covers the 0.10.0 reports recorded in docs/CONTRIBUTORS.md.
  */

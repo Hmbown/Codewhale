@@ -77,6 +77,9 @@
   "crates/release/src/check.rs": {
     "std_fs": 4
   },
+  "crates/release/src/install.rs": {
+    "std_fs": 1
+  },
   "crates/release/src/launch.rs": {
     "std_fs": 2
   },
@@ -158,7 +161,7 @@
   },
   "crates/tui/src/config.rs": {
     "path_canonicalize": 4,
-    "std_fs": 4
+    "std_fs": 5
   },
   "crates/tui/src/context_report.rs": {
     "std_fs": 1

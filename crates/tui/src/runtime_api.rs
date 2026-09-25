@@ -1867,7 +1867,11 @@ async fn create_thread(
 
     let thread = state
         .runtime_threads
-        .create_thread(req)
+        .create_thread_with_shell_policy(
+            req,
+            state.config_path.as_deref(),
+            state.config_profile.as_deref(),
+        )
         .await
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     Ok((StatusCode::CREATED, Json(thread)))
@@ -5979,6 +5983,12 @@ struct RetryTurnRequest {
     /// from the dropped turn is re-used.
     #[serde(default)]
     prompt: Option<String>,
+    /// Client-executed tools the retried turn offers, as on a fresh turn.
+    /// Dynamic tools are per-turn and answered by the client that sent
+    /// them, so a retry the client starts must re-send them; without it the
+    /// retried turn silently lost tools such as the desktop's `open_in_app`.
+    #[serde(default)]
+    dynamic_tools: Vec<codewhale_protocol::runtime::DynamicToolSpec>,
 }
 
 #[derive(Debug, Serialize)]
@@ -6026,7 +6036,7 @@ async fn retry_thread_turn(
                 allow_shell: None,
                 trust_mode: None,
                 auto_approve: None,
-                dynamic_tools: Vec::new(),
+                dynamic_tools: req.dynamic_tools,
                 environment_id: None,
             },
         )

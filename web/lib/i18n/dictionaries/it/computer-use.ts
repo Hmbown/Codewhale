@@ -38,7 +38,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Guarda il test in background",
   source: "Codice sorgente e altre piattaforme",
   platforms: "Questo download è per Mac. Windows e Linux usano al momento il plugin da sorgente e la configurazione lato host.",
-  installTitle: "Computer Use per Mac",
-  installLead: "Aggiungi il controllo delle app in background con l’helper Computer Use. Configura i permessi del Mac, esegui un test in background e metti in pausa o ferma l’input dell’helper dalla barra dei menu.",
-  installLink: "Download e configurazione di Computer Use",
 };

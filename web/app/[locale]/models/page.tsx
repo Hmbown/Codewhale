@@ -2,7 +2,9 @@ import Link from "next/link";
 import { getFacts } from "@/lib/facts";
 import { buildPageMetadata } from "@/lib/page-meta";
 import { MODELS_COPY } from "@/lib/content/models";
+import { Icon, type IconName } from "@/components/icon";
 import { ModelsTable } from "@/components/models-table";
+import { PageHeader, Section } from "@/components/page-header";
 import type { LocalizedText } from "@/lib/content/vocabulary";
 import { fill, pickText } from "@/lib/i18n/dictionaries";
 
@@ -15,6 +17,12 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
     description: pickText(MODELS_COPY.metaDescription, locale) });
 }
 
+const PATTERN_ICONS: IconName[] = ["key", "cpu", "layers"];
+
+/**
+ * /models — connect a provider, then the source's own model and provider
+ * lists (facts layer), never a hand-typed catalogue.
+ */
 export default async function ModelsPage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
   const facts = await getFacts();
@@ -22,86 +30,79 @@ export default async function ModelsPage({ params }: { params: Promise<{ locale:
     version: facts.version ?? "—", model: facts.defaultModel ?? "—",
   });
   const providerDocs = "https://github.com/Hmbown/CodeWhale/blob/main/docs/PROVIDERS.md";
+  const docsLink = (
+    <Link href={providerDocs} className="section-link">
+      {t(MODELS_COPY.providerDocs)}
+      <Icon name="external" className="icon" />
+    </Link>
+  );
 
   return (
-    <div className="models-page">
-      <section className="hero">
-        <div className="portal-current" aria-hidden="true" />
-        <div className="portal-container community-welcome-inner">
-          <div className="eyebrow">{t(MODELS_COPY.kicker)}</div>
-          <h1>{t(MODELS_COPY.title)}</h1>
-          <p>{t(MODELS_COPY.lead)}</p>
-          <div className="portal-actions">
-            <Link href={providerDocs} className="portal-button portal-button-primary">{t(MODELS_COPY.providerDocs)}</Link>
-            <Link href={`/${locale}/install`} className="portal-button portal-button-secondary">{t(MODELS_COPY.install)}</Link>
-          </div>
-        </div>
-      </section>
+    <>
+      <PageHeader
+        kicker={t(MODELS_COPY.kicker)}
+        title={t(MODELS_COPY.title)}
+        lede={t(MODELS_COPY.lead)}
+        pose="think"
+        actions={
+          <>
+            <Link href={providerDocs} className="btn btn-primary btn-lg">{t(MODELS_COPY.providerDocs)}</Link>
+            <Link href={`/${locale}/install`} className="btn btn-secondary btn-lg">{t(MODELS_COPY.install)}</Link>
+          </>
+        }
+      />
 
-      <section className="portal-section">
-        <div className="portal-container portal-section-grid">
-          <div className="portal-section-copy">
-            <span>{t(MODELS_COPY.setupLabel)}</span>
-            <h2>{t(MODELS_COPY.setupTitle)}</h2>
-            <p>{t(MODELS_COPY.setupLead)}</p>
-          </div>
-          <div className="portal-topic-list">
-            {MODELS_COPY.patterns.map((pattern) => (
-              <Link key={pattern.reference} href={providerDocs}>
-                <strong>{t(pattern.title)}</strong>
-                <span>{t(pattern.detail)}</span>
-                <span className="font-mono break-all">{pattern.reference}</span>
-              </Link>
+      <div className="page-body">
+        <Section id="models-setup" title={t(MODELS_COPY.setupTitle)} scope={t(MODELS_COPY.setupLead)}>
+          <ul className="dir-list dir-list-card" role="list">
+            {MODELS_COPY.patterns.map((pattern, index) => (
+              <li key={pattern.reference}>
+                <Link href={providerDocs} className="dir-row">
+                  <span className="dir-mark" aria-hidden="true"><Icon name={PATTERN_ICONS[index] ?? "key"} /></span>
+                  <span className="dir-text">
+                    <span className="dir-title">{t(pattern.title)}</span>
+                    <span className="dir-purpose">{t(pattern.detail)}</span>
+                    <span className="dir-meta">{pattern.reference}</span>
+                  </span>
+                  <span className="dir-action" aria-hidden="true"><Icon name="external" /></span>
+                </Link>
+              </li>
             ))}
-          </div>
-        </div>
-      </section>
+          </ul>
+        </Section>
 
-      <section className="portal-section portal-section-muted" aria-labelledby="models-title">
-        <div className="portal-container">
-          <div className="portal-docs-heading">
-            <h2 id="models-title">{t(MODELS_COPY.modelsTitle)}</h2>
-            <Link href={providerDocs}>{t(MODELS_COPY.providerDocs)}</Link>
-          </div>
-          <p className="mb-6 max-w-3xl text-ink-soft leading-relaxed">{t(MODELS_COPY.modelsLead)}</p>
+        <Section id="models-title" title={t(MODELS_COPY.modelsTitle)} scope={t(MODELS_COPY.modelsLead)} link={docsLink}>
           <ModelsTable models={facts.models} locale={locale} />
-        </div>
-      </section>
+        </Section>
 
-      <section className="portal-section" aria-labelledby="providers-title">
-        <div className="portal-container">
-          <div className="portal-docs-heading">
-            <h2 id="providers-title">{t(MODELS_COPY.listTitle)}</h2>
-            <Link href={providerDocs}>{t(MODELS_COPY.providerDocs)}</Link>
-          </div>
-          <p className="mb-6 max-w-3xl text-ink-soft leading-relaxed">{t(MODELS_COPY.listLead)}</p>
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm">
+        <Section id="providers-title" title={t(MODELS_COPY.listTitle)} scope={t(MODELS_COPY.listLead)} link={docsLink}>
+          <div className="data-table-wrap">
+            <table className="data-table">
               <caption className="sr-only">{t(MODELS_COPY.listTitle)}</caption>
               <thead>
-                <tr className="hairline-b">
-                  <th scope="col" className="py-3 pr-4">{t(MODELS_COPY.provider)}</th>
-                  <th scope="col" className="py-3 pr-4">{t(MODELS_COPY.id)}</th>
-                  <th scope="col" className="py-3">{t(MODELS_COPY.credential)}</th>
+                <tr>
+                  <th scope="col">{t(MODELS_COPY.provider)}</th>
+                  <th scope="col">{t(MODELS_COPY.id)}</th>
+                  <th scope="col">{t(MODELS_COPY.credential)}</th>
                 </tr>
               </thead>
               <tbody>
                 {facts.providers.map((provider) => (
-                  <tr key={provider.id} className="hairline-b">
-                    <th scope="row" className="py-3 pr-4 font-medium">{provider.label}</th>
-                    <td className="py-3 pr-4"><code className="break-all">{provider.id}</code></td>
-                    <td className="py-3"><code className="break-all">{provider.env}</code></td>
+                  <tr key={provider.id}>
+                    <th scope="row">{provider.label}</th>
+                    <td><code>{provider.id}</code></td>
+                    <td><code>{provider.env}</code></td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
-          <p className="mt-6 text-ink-soft">
+          <p className="section-scope mt-5">
             {t(MODELS_COPY.missing)}{" "}
-            <Link href="https://github.com/Hmbown/CodeWhale/issues/new/choose" className="body-link">{t(MODELS_COPY.request)}</Link>
+            <Link href="https://github.com/Hmbown/CodeWhale/issues/new/choose" className="link">{t(MODELS_COPY.request)}</Link>
           </p>
-        </div>
-      </section>
-    </div>
+        </Section>
+      </div>
+    </>
   );
 }

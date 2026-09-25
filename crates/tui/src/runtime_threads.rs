@@ -772,27 +772,92 @@ fn session_messages_sha256(messages: &[Message]) -> Result<String> {
         .collect())
 }
 
-/// Compare only fields represented by legacy seeding. A match identifies a
-/// prefix boundary; the saved messages themselves retain every raw block.
+/// The prompt text a user-role message contributes to a history comparison,
+/// or `None` when it carries none.
+///
+/// Tool results are user-role messages with no text. The per-turn
+/// `<turn_meta>` preamble is rebuilt from runtime facts when a turn is
+/// installed and never recorded on the turn's items, so it is not part of the
+/// conversation a reconstruction can identify — both sides of every comparison
+/// drop it, and `extract_user_prompt` is the repository's one rule for what a
+/// user's prompt is once that envelope is removed (it trims the block's edges
+/// too, and applies the same way on both sides).
+fn projected_user_text(message: &Message) -> Option<String> {
+    if message.role.as_str() != "user" {
+        return None;
+    }
+    let text = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
+            _ => None,
+        })
+        .map(crate::session_manager::extract_user_prompt)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn projected_user_texts(messages: &[Message]) -> Vec<String> {
+    messages.iter().filter_map(projected_user_text).collect()
+}
+
+/// The message index in a saved transcript where the undone turn begins.
+///
+/// A backtrack may only keep the messages that belong to the turns before the
+/// undone one, and the transcript alone cannot say where that is: it is the
+/// model-visible history, carrying the per-turn `<turn_meta>` preamble and tool
+/// results as the route's compaction left them, while the turn records keep the
+/// prompt and the raw output. The prompts *are* recorded verbatim, and a turn
+/// begins with its user message, so walking the transcript's user text
+/// messages — the kept turns' prompts in order, then the undone turn's —
+/// locates the boundary exactly.
+///
+/// `None` refuses: the caller must not cut a history it cannot account for, and
+/// a transcript that drifted from the records (edited, purged, or belonging to
+/// another conversation) fails the prompt sequence rather than matching by
+/// coincidence.
+fn saved_history_boundary(
+    messages: &[Message],
+    kept_prompts: &[String],
+    target_prompt: &str,
+) -> Option<usize> {
+    let mut kept = kept_prompts.iter();
+    let mut expected = kept.next();
+    for (index, message) in messages.iter().enumerate() {
+        let Some(text) = projected_user_text(message) else {
+            continue;
+        };
+        match expected {
+            Some(next) if next == &text => expected = kept.next(),
+            // A kept prompt is still unaccounted for, so this transcript has
+            // drifted from the records; even the undone turn's prompt here
+            // would cut away a turn the backtrack must keep.
+            Some(_) => return None,
+            // The first user text after the whole kept prefix is where the
+            // undone turn begins — and it has to be that turn's own prompt.
+            None => return (text == target_prompt).then_some(index),
+        }
+    }
+    None
+}
+
+/// The conversation identity two histories are compared by: user prompts (their
+/// `<turn_meta>` envelope removed), assistant text, thinking and tool calls,
+/// and tool results.
+///
+/// Everything a turn record cannot reproduce stays out — that preamble, image
+/// blocks, and the bytes the route's compaction left in a tool result — so a
+/// match identifies a prefix boundary rather than a byte-for-byte replay. The
+/// saved messages themselves retain every raw block.
 fn session_recovery_projection(messages: &[Message]) -> Vec<Value> {
     let mut projection = Vec::new();
     for message in messages {
         let role = message.role.as_str();
-        if role == "user" {
-            let text = message
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
-                        Some(text.as_str())
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !text.is_empty() {
-                projection.push(json!(["user", text]));
-            }
+        if let Some(text) = projected_user_text(message) {
+            projection.push(json!(["user", text]));
         }
         for block in &message.content {
             match block {
@@ -7557,6 +7622,27 @@ impl RuntimeThreadManager {
     }
 
     pub async fn create_thread(&self, req: CreateThreadRequest) -> Result<ThreadRecord> {
+        self.create_thread_with_shell_policy(req, None, None).await
+    }
+
+    /// Create a thread, resolving an unset `allow_shell` against the config
+    /// source the host actually loaded (`config_path`/`config_profile`).
+    ///
+    /// An unset `allow_shell` takes the interactive default
+    /// (`Config::interactive_allow_shell`, on unless configured off): a
+    /// conversation opened from an app is attended, and every shell command
+    /// still passes the thread's approval posture. The default is then checked
+    /// with the same `validate_shell_access_policy` a PATCH opt-in runs, so a
+    /// shell restriction from a project, profile, environment or managed
+    /// source still wins at creation: an unset value falls back to no shell,
+    /// and an explicit `allow_shell: true` is refused, as PATCH refuses it.
+    /// An explicit `false` is never checked.
+    pub(crate) async fn create_thread_with_shell_policy(
+        &self,
+        req: CreateThreadRequest,
+        config_path: Option<&Path>,
+        config_profile: Option<&str>,
+    ) -> Result<ThreadRecord> {
         let now = Utc::now();
         let reasoning_effort = canonical_runtime_reasoning_effort(req.reasoning_effort.as_deref())?;
         let (model_provider, model_provider_id, default_model) = {
@@ -7612,9 +7698,24 @@ impl RuntimeThreadManager {
         )?;
         let mode = policy.mode_setting().to_string();
         let permission_posture = Some(policy.permission_wire().to_string());
-        let allow_shell = req
-            .allow_shell
-            .unwrap_or_else(|| self.read_config().allow_shell());
+        let allow_shell = match req.allow_shell {
+            // An explicit opt-in passes the same policy check a PATCH opt-in
+            // runs, and is refused (not silently downgraded) on denial.
+            Some(true) => {
+                self.validate_shell_access_policy(&workspace, config_path, config_profile)
+                    .await?;
+                true
+            }
+            Some(false) => false,
+            None => {
+                let interactive_default = self.read_config().interactive_allow_shell();
+                interactive_default
+                    && self
+                        .validate_shell_access_policy(&workspace, config_path, config_profile)
+                        .await
+                        .is_ok()
+            }
+        };
         let trust_mode = req.trust_mode.unwrap_or(false);
         let auto_approve = policy.auto_approve();
 
@@ -8944,12 +9045,43 @@ impl RuntimeThreadManager {
             let retained_messages = if covered <= target_turn_idx {
                 messages.len()
             } else {
-                let expected = session_recovery_projection(
-                    &self.reconstruct_messages_from_turns(&source_turns[..target_turn_idx])?,
-                );
-                (0..=messages.len())
-                    .find(|count| session_recovery_projection(&messages[..*count]) == expected)
+                let kept_messages =
+                    self.reconstruct_messages_from_turns(&source_turns[..target_turn_idx])?;
+                let kept_projection = session_recovery_projection(&kept_messages);
+                // An exact projection match is the strongest proof: message for
+                // message, this prefix *is* the kept history. It holds for a
+                // transcript the records reproduce, and is tried first so those
+                // shapes keep their exact boundary.
+                if let Some(count) = (0..=messages.len()).find(|count| {
+                    session_recovery_projection(&messages[..*count]) == kept_projection
+                }) {
+                    count
+                } else {
+                    // It cannot hold for a real conversation: the model-visible
+                    // transcript carries the per-turn `<turn_meta>` preamble and
+                    // tool results as the route's compaction left them, neither
+                    // of which the records keep. The prompt is recorded
+                    // verbatim, so it still names the message the undone turn
+                    // begins at — see `saved_history_boundary`.
+                    let target_prompt = projected_user_texts(
+                        &self.reconstruct_messages_from_turns(
+                            &source_turns[target_turn_idx..=target_turn_idx],
+                        )?,
+                    )
+                    .into_iter()
+                    .next()
+                    .with_context(|| {
+                        format!(
+                            "Turn {target_turn_id} records no user prompt to align the saved history with; the source thread was preserved"
+                        )
+                    })?;
+                    saved_history_boundary(
+                        &messages,
+                        &projected_user_texts(&kept_messages),
+                        &target_prompt,
+                    )
                     .context("Cannot identify an exact saved-history boundary for this backtrack; the source thread was preserved")?
+                }
             };
             forked.saved_session_checkpoint = Some(SavedSessionCheckpoint {
                 covered_turn_id: kept_turns
@@ -12029,6 +12161,57 @@ impl RuntimeThreadManager {
         );
     }
 
+    /// Persist an engine status line as a completed `status` item.
+    ///
+    /// Model-facing hints (deferred-tool retry) already reach the model in the
+    /// tool result; they are not user items. Scheduler, continuation and
+    /// approval-wait rows keep a receipt tagged so clients collapse them.
+    /// An approval-wait heartbeat naming a call in `settled_approval_calls`
+    /// is stale (its approval was already answered) and is dropped, whichever
+    /// path dequeued it.
+    async fn publish_status_item(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        message: String,
+        settled_approval_calls: &HashSet<String>,
+    ) -> Result<()> {
+        if crate::core::events::approval_wait_tool_call(&message)
+            .is_some_and(|call| settled_approval_calls.contains(call))
+        {
+            return Ok(());
+        }
+        let visibility = crate::core::events::status_visibility(&message);
+        if visibility == crate::core::events::StatusVisibility::ModelOnly {
+            return Ok(());
+        }
+        let item = TurnItemRecord {
+            schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+            id: format!("item_{}", &Uuid::new_v4().to_string()[..8]),
+            turn_id: turn_id.to_string(),
+            kind: TurnItemKind::Status,
+            status: TurnItemLifecycleStatus::Completed,
+            summary: summarize_text(&message, SUMMARY_LIMIT),
+            detail: Some(message),
+            metadata: (visibility == crate::core::events::StatusVisibility::Internal)
+                .then(|| json!({ "visibility": visibility.as_str() })),
+            artifact_refs: Vec::new(),
+            started_at: Some(Utc::now()),
+            ended_at: Some(Utc::now()),
+        };
+        self.store.save_item(&item)?;
+        self.attach_item_to_turn(turn_id, &item.id)?;
+        self.emit_event(
+            thread_id,
+            Some(turn_id),
+            Some(&item.id),
+            "item.completed",
+            json!({ "item": item }),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn monitor_turn(
         &self,
         thread_id: String,
@@ -12054,6 +12237,10 @@ impl RuntimeThreadManager {
         let mut engine_turn_id: Option<String> = None;
         let mut pending_event: Option<EngineEvent> = None;
         let mut event_channel_closed = false;
+        // Raw tool call IDs whose external approval this turn already settled.
+        // An approval-wait heartbeat naming one of them is stale by the time
+        // it is dequeued and must not be published as a live claim.
+        let mut settled_approval_calls: HashSet<String> = HashSet::new();
         // Latest engine-side goal snapshot observed during this turn. The
         // model's `update_goal` decision (complete/blocked/paused) lands here
         // before TurnComplete, so terminal settlement can mirror it into the
@@ -13102,10 +13289,51 @@ impl RuntimeThreadManager {
                     }
                     drop(projection);
                     let approval_timeout = self.approval_decision_timeout();
-                    let decision = match approval_timeout {
-                        Some(wait) => tokio::time::timeout(wait, rx).await,
-                        None => Ok(rx.await),
+                    let wait_for_decision = async {
+                        match approval_timeout {
+                            Some(wait) => tokio::time::timeout(wait, rx).await,
+                            None => Ok(rx.await),
+                        }
                     };
+                    let mut wait_for_decision = std::pin::pin!(wait_for_decision);
+                    // Keep draining engine status while the card is open. The
+                    // engine's approval-wait heartbeat fires during this wait;
+                    // parking the pump here used to sequence it after
+                    // `approval.decided`, where it read as a live claim that
+                    // the answered call was still waiting (DESKTOP-QA-20260923).
+                    // Anything else is held for the main loop, in order.
+                    let decision = loop {
+                        tokio::select! {
+                            biased;
+                            decision = &mut wait_for_decision => break decision,
+                            event = async { engine.rx_event.write().await.recv().await },
+                                if pending_event.is_none() && !event_channel_closed =>
+                            {
+                                match event {
+                                    Some(EngineEvent::Status { message }) => {
+                                        if let Err(err) = self
+                                            .publish_status_item(
+                                                &thread_id,
+                                                &turn_id,
+                                                message,
+                                                &settled_approval_calls,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                thread_id = %thread_id,
+                                                turn_id = %turn_id,
+                                                "failed to persist status during approval wait: {err:#}"
+                                            );
+                                        }
+                                    }
+                                    Some(other) => pending_event = Some(other),
+                                    None => event_channel_closed = true,
+                                }
+                            }
+                        }
+                    };
+                    settled_approval_calls.insert(id.clone());
                     // A decision may already have consumed the sender when
                     // Stop wins. Never remember or dispatch that late allow.
                     let cancelled = {
@@ -13323,36 +13551,13 @@ impl RuntimeThreadManager {
                     drop(projection);
                 }
                 EngineEvent::Status { message } => {
-                    // Model-facing hints (deferred-tool retry) already reach
-                    // the model in the tool result; they are not user items.
-                    // Scheduler/continuation rows keep a receipt tagged so
-                    // clients collapse them by default.
-                    let visibility = crate::core::events::status_visibility(&message);
-                    if visibility == crate::core::events::StatusVisibility::ModelOnly {
-                        continue;
-                    }
-                    let item = TurnItemRecord {
-                        schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-                        id: format!("item_{}", &Uuid::new_v4().to_string()[..8]),
-                        turn_id: turn_id.clone(),
-                        kind: TurnItemKind::Status,
-                        status: TurnItemLifecycleStatus::Completed,
-                        summary: summarize_text(&message, SUMMARY_LIMIT),
-                        detail: Some(message.clone()),
-                        metadata: (visibility == crate::core::events::StatusVisibility::Internal)
-                            .then(|| json!({ "visibility": visibility.as_str() })),
-                        artifact_refs: Vec::new(),
-                        started_at: Some(Utc::now()),
-                        ended_at: Some(Utc::now()),
-                    };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
+                    // A heartbeat queued behind another event while its
+                    // approval was answered is dropped inside the helper.
+                    self.publish_status_item(
                         &thread_id,
-                        Some(&turn_id),
-                        Some(&item.id),
-                        "item.completed",
-                        json!({ "item": item }),
+                        &turn_id,
+                        message,
+                        &settled_approval_calls,
                     )
                     .await?;
                 }
@@ -14273,12 +14478,7 @@ fn runtime_policy_with_overrides(
     auto_approve: Option<bool>,
 ) -> Result<RuntimePolicyProjection> {
     let requested_mode = mode.unwrap_or(&thread.mode);
-    let legacy_bypass_mode = mode.is_some_and(|mode| {
-        matches!(
-            mode.trim().to_ascii_lowercase().as_str(),
-            "yolo" | "4" | "bypass" | "bypass-permissions" | "bypasspermissions"
-        )
-    });
+    let legacy_bypass_mode = mode.is_some_and(codewhale_config::AppMode::is_legacy_bypass_alias);
     let inherited = RuntimePolicyProjection::from_persisted(
         &thread.mode,
         thread.permission_posture.as_deref(),

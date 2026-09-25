@@ -232,15 +232,3 @@ pub(super) async fn resolve_stale_parent_request(
         _ => false,
     }
 }
-
-pub(super) fn should_suppress_user_input_prompt(app: &App) -> bool {
-    // Legacy hosts may still report Yolo/auto-approve with a stale `Auto`
-    // enum. Canonicalize that shape to Full Access before applying the one
-    // posture that suppresses questions: genuine Auto-Review.
-    let effective_posture = if app_auto_approve_enabled(app) {
-        ApprovalMode::Bypass
-    } else {
-        app.approval_mode
-    };
-    !crate::core::authority::permission_posture_allows_questions(effective_posture)
-}

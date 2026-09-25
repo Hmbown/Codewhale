@@ -39,7 +39,4 @@ export const computerUse: ComputerUseDict = {
   demo: "백그라운드 검사 보기",
   source: "소스 및 다른 플랫폼",
   platforms: "이 다운로드는 Mac용입니다. Windows와 Linux는 현재 소스 플러그인과 호스트 측 설정을 사용합니다.",
-  installTitle: "Mac용 Computer Use",
-  installLead: "Computer Use 도우미로 백그라운드 앱 제어를 추가하세요. Mac 권한을 설정하고 백그라운드 검사를 실행한 뒤, 메뉴 막대에서 도우미 입력을 일시 정지하거나 중지할 수 있습니다.",
-  installLink: "Computer Use 다운로드 및 설정",
 };

@@ -1,24 +1,23 @@
 import Link from "next/link";
 import { GETTING_STARTED_STEPS } from "@/lib/content/getting-started";
-import { Seal } from "@/components/seal";
+import { PageHeader } from "@/components/page-header";
 import { FaqSearch } from "@/components/faq-search";
 import { buildFaqPageJsonLd } from "@/lib/faq-schema";
 import { FACTS } from "@/lib/facts.generated";
 import { canonicalLocaleForPath } from "@/lib/i18n/content-locales";
+import { getFaq, pickTextLocale } from "@/lib/i18n/dictionaries";
 import { serializeJsonLd } from "@/lib/json-ld";
 import { buildPageMetadata } from "@/lib/page-meta";
 import { SITE_URL } from "@/lib/page-meta";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
+  const t = getFaq(locale);
   return buildPageMetadata({
     path: "/faq",
     locale,
-    title: isZh ? "常见问题 · Codewhale" : "FAQ · Codewhale",
-    description: isZh
-      ? "Codewhale 常见问题：安装、配置、提供商、模型、模式、安全与隐私。答案来自实际代码、文档和 GitHub 议题。"
-      : "Codewhale frequently asked questions: install, config, providers, models, modes, security, and privacy. Answers sourced from real code, docs, and GitHub issues.",
+    title: t.metaTitle,
+    description: t.metaDescription,
   });
 }
 
@@ -43,7 +42,7 @@ const faqEn: FaqItem[] = [
     a: (
       <>
         <p className="mb-2">Published channels differ in timing and platform support:</p>
-        <pre className="code-block mb-2">
+        <pre tabIndex={0} className="code-block mb-2">
 {`# GitHub release binaries (recommended on macOS / Linux)
 ${GETTING_STARTED_STEPS[0].commands[0]}
 
@@ -53,8 +52,8 @@ npm install -g codewhale
 # Cargo (needs Rust 1.88+; installs the codewhale command)
 cargo install codewhale-cli --locked
 
-# Homebrew (macOS)
-brew tap Hmbown/deepseek-tui && brew install codewhale
+# Homebrew on Linux (tap; tested on Ubuntu)
+brew install Hmbown/deepseek-tui/codewhale
 
 # Direct download
 # https://github.com/Hmbown/CodeWhale/releases`}
@@ -96,23 +95,20 @@ brew tap Hmbown/deepseek-tui && brew install codewhale
     q: "How do I set my API key?",
     a: (
       <>
-        <pre className="code-block mb-2">
+        <pre tabIndex={0} className="code-block mb-2">
 {`# Method 1: Environment variable
 export DEEPSEEK_API_KEY=sk-...
 
-# Method 2: Saved config (recommended — survives shell restarts)
-codewhale auth set --provider deepseek --api-key sk-...
-
-# Method 3: config.toml
-# Add to ~/.codewhale/config.toml:
-api_key = "sk-..."
+# Method 2: Saved key (recommended — survives shell restarts)
+codewhale auth set --provider deepseek     # prompts for the key
+# scripted: pipe it in with --api-key-stdin
 
 # Check what's active:
 codewhale auth status    # shows config, keyring, and env-var state
 codewhale doctor         # full connectivity check`}
         </pre>
         <p>
-          Saved config keys take precedence over environment variables.
+          Saved keys take precedence over environment variables. Avoid putting a key directly on the command line, where it lands in shell history.
           Use <code className="inline">codewhale auth clear --provider deepseek</code> to remove a saved key.
         </p>
       </>
@@ -141,7 +137,7 @@ codewhale doctor         # full connectivity check`}
     q: "How do I use OpenRouter with Codewhale?",
     a: (
       <>
-        <pre className="code-block mb-2">
+        <pre tabIndex={0} className="code-block mb-2">
 {`# 1. Set your OpenRouter key
 export OPENROUTER_API_KEY=sk-or-v1-...
 
@@ -228,15 +224,12 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
     a: (
       <>
         The Codewhale runtime, workspace state, and audit log stay on your machine.
-        Codewhale 0.9.12 counts anonymous usage by default and says so at first launch
-        (the earlier 0.9.11 release asked first). Turning it off is a saved choice that
-        later versions keep, and an opt-out recorded under the earlier opt-in policy stays
-        off; showing the notice never records any acceptance on your behalf. While on, a
+        Codewhale counts anonymous usage by default and says so at first launch.
+        Turning it off is a saved choice that later versions keep; showing the notice
+        never records any acceptance on your behalf. While on, a
         session posts aggregate session, feature, and error counts
-        and closed enums to the first-party endpoint{" "}
-        <code className="inline">https://telemetry.codewhale.net/v1/telemetry</code>,
-        a Cloudflare Worker whose full source is in the repo under{" "}
-        <code className="inline">telemetry-ingest/</code>. Its storage has no IP,
+        and closed enums to a first-party endpoint at telemetry.codewhale.net,
+        a Cloudflare Worker whose full source is in the repository. Its storage has no IP,
         country, or geo column, records no request logs,
         and retains records for three months. Optional PostHog forwarding requires
         separate operator configuration and verified IP-safe egress; its retention
@@ -244,8 +237,8 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
         <code className="inline">telemetry_endpoint = &quot;&quot;</code> to stay
         enabled and contact nobody. It never carries conversations, code, prompts,
         files, file/repo/branch names, model content, credentials, or a per-turn or
-        per-tool timeline (schema:{" "}
-        <code className="inline">docs/TELEMETRY.md</code>;
+        per-tool timeline (see the{" "}
+        <a href="https://github.com/Hmbown/CodeWhale/blob/main/docs/TELEMETRY.md" className="body-link">telemetry schema</a>;
         off with <code className="inline">codewhale config set telemetry false</code>
         or <code className="inline">CODEWHALE_TELEMETRY=0</code>). There is no
         mandatory hosted relay. The hosted
@@ -286,7 +279,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
     a: (
       <>
         Use mirror registries:
-        <pre className="code-block my-2">
+        <pre tabIndex={0} className="code-block my-2">
 {`# npm mirror
 npm config set registry https://registry.npmmirror.com
 npm install -g codewhale
@@ -378,21 +371,21 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
     q: "How do I update Codewhale?",
     a: (
       <>
-        <pre className="code-block mb-2">
-{`# Release-binary updater (works for npm/release-binary installs)
+        <pre tabIndex={0} className="code-block mb-2">
+{`# Installer or release-binary installs
 codewhale update
 
-# npm
+# npm (codewhale update refuses npm installs)
 npm install -g codewhale@latest
 
 # Cargo
 cargo install codewhale-cli --locked --force
 
-# Homebrew
+# Homebrew tap
 brew update && brew upgrade codewhale`}
         </pre>
         <p>
-          If you installed via npm, <code className="inline">codewhale update</code> downloads the latest release binaries.
+          If you installed with npm or Homebrew, update through that package manager; <code className="inline">codewhale update</code> leaves package-managed installs unchanged.
           If a mirror is lagging, download directly from <a href="https://github.com/Hmbown/CodeWhale/releases" className="body-link">GitHub Releases</a>.
         </p>
       </>
@@ -416,7 +409,7 @@ const faqZh: FaqItem[] = [
     a: (
       <>
         <p className="mb-2">已发布渠道的更新时间与平台覆盖各不相同：</p>
-        <pre className="code-block mb-2">
+        <pre tabIndex={0} className="code-block mb-2">
 {`# GitHub Releases 二进制（macOS / Linux 推荐方式）
 ${GETTING_STARTED_STEPS[0].commands[0]}
 
@@ -426,8 +419,8 @@ npm install -g codewhale
 # Cargo（需要 Rust 1.88+；安装 codewhale 命令）
 cargo install codewhale-cli --locked
 
-# Homebrew（macOS）
-brew tap Hmbown/deepseek-tui && brew install codewhale
+# Linux 上的 Homebrew（tap；已在 Ubuntu 上测试）
+brew install Hmbown/deepseek-tui/codewhale
 
 # 直接下载
 # https://github.com/Hmbown/CodeWhale/releases`}
@@ -467,23 +460,20 @@ brew tap Hmbown/deepseek-tui && brew install codewhale
     q: "如何设置 API 密钥？",
     a: (
       <>
-        <pre className="code-block mb-2">
+        <pre tabIndex={0} className="code-block mb-2">
 {`# 方法 1：环境变量
 export DEEPSEEK_API_KEY=sk-...
 
-# 方法 2：保存在配置中（推荐 — 重启 Shell 后仍然有效）
-codewhale auth set --provider deepseek --api-key sk-...
-
-# 方法 3：config.toml
-# 在 ~/.codewhale/config.toml 中添加：
-api_key = "sk-..."
+# 方法 2：保存密钥（推荐 — 重启 Shell 后仍然有效）
+codewhale auth set --provider deepseek     # 会提示输入密钥
+# 脚本中：用 --api-key-stdin 通过管道传入
 
 # 查看当前状态：
 codewhale auth status    # 显示配置、密钥环和环境变量状态
 codewhale doctor         # 完整连接检查`}
         </pre>
         <p>
-          配置中保存的密钥优先于环境变量。
+          已保存的密钥优先于环境变量。不要把密钥直接写在命令行里，否则会留在 Shell 历史中。
           使用 <code className="inline">codewhale auth clear --provider deepseek</code> 移除已保存的密钥。
         </p>
       </>
@@ -512,7 +502,7 @@ codewhale doctor         # 完整连接检查`}
     q: "如何使用 OpenRouter？",
     a: (
       <>
-        <pre className="code-block mb-2">
+        <pre tabIndex={0} className="code-block mb-2">
 {`# 1. 设置 OpenRouter 密钥
 export OPENROUTER_API_KEY=sk-or-v1-...
 
@@ -597,14 +587,13 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
     q: "我的代码安全吗？Codewhale 使用什么沙箱机制？",
     a: (
       <>
-        Codewhale 运行时、工作区状态与审计日志保留在你的机器上。Codewhale 0.9.12 默认统计匿名使用量，并在首次启动时告知你（早先的 0.9.11 版本会先询问）。
-        关闭是会被后续版本保留的选择，在早先的自愿开启政策下记录的关闭也始终有效；显示告知绝不会代你记录任何同意。开启时，会话只会把聚合的会话、功能与错误计数以及封闭枚举 POST 到第一方端点{" "}
-        <code className="inline">https://telemetry.codewhale.net/v1/telemetry</code>，
-        那是一个 Cloudflare Worker，完整源码就在仓库的 <code className="inline">telemetry-ingest/</code> 目录里。
+        Codewhale 运行时、工作区状态与审计日志保留在你的机器上。Codewhale 默认统计匿名使用量，并在首次启动时告知你。
+        关闭是会被后续版本保留的选择；显示告知绝不会代你记录任何同意。开启时，会话只会把聚合的会话、功能与错误计数以及封闭枚举 POST 到 telemetry.codewhale.net 上的第一方端点，
+        那是一个 Cloudflare Worker，完整源码就在仓库里。
         它的存储中没有 IP、国家或地理位置列，不记录请求日志，保留期固定为三个月。
         可选的 PostHog 转发需要运营方单独配置，并验证出口不会转发客户端 IP；其保留期由项目另行设置。源码支持不代表已启用。
         若想保持启用但不联系任何服务器，设置 <code className="inline">telemetry_endpoint = &quot;&quot;</code>。
-        它永远不会携带对话、代码、prompt、文件、文件/仓库/分支名、模型内容、凭据，也不发送逐轮或逐工具时间线（schema 见 <code className="inline">docs/TELEMETRY.md</code>；
+        它永远不会携带对话、代码、prompt、文件、文件/仓库/分支名、模型内容、凭据，也不发送逐轮或逐工具时间线（见<a href="https://github.com/Hmbown/CodeWhale/blob/main/docs/TELEMETRY.md" className="body-link">遥测 schema</a>；
         可用 <code className="inline">codewhale config set telemetry false</code> 或
         <code className="inline">CODEWHALE_TELEMETRY=0</code> 关闭）。也不要求经过托管中继。你选择的托管 provider 会收到本轮所需的
         prompt、项目上下文、工具定义与工具结果。若要让模型推理也保持本地，请使用回环地址上的本地模型路由。
@@ -642,7 +631,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
     a: (
       <>
         使用镜像源：
-        <pre className="code-block my-2">
+        <pre tabIndex={0} className="code-block my-2">
 {`# npm 镜像
 npm config set registry https://registry.npmmirror.com
 npm install -g codewhale
@@ -733,21 +722,21 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
     q: "如何更新 Codewhale？",
     a: (
       <>
-        <pre className="code-block mb-2">
-{`# 发布二进制更新器（适用于 npm/二进制安装）
+        <pre tabIndex={0} className="code-block mb-2">
+{`# 安装器或发布二进制安装
 codewhale update
 
-# npm
+# npm（codewhale update 不会更新 npm 安装）
 npm install -g codewhale@latest
 
 # Cargo
 cargo install codewhale-cli --locked --force
 
-# Homebrew
+# Homebrew tap
 brew update && brew upgrade codewhale`}
         </pre>
         <p>
-          如果通过 npm 安装，<code className="inline">codewhale update</code> 会下载最新发布二进制。
+          如果通过 npm 或 Homebrew 安装，请用对应的包管理器更新；<code className="inline">codewhale update</code> 不会改动包管理器安装的版本。
           如果镜像延迟，请从 <a href="https://github.com/Hmbown/CodeWhale/releases" className="body-link">GitHub Releases</a> 直接下载。
         </p>
       </>
@@ -758,8 +747,8 @@ brew update && brew upgrade codewhale`}
 
 export default async function FaqPage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
-  const items = isZh ? faqZh : faqEn;
+  const t = getFaq(locale);
+  const items = { en: faqEn, zh: faqZh }[pickTextLocale(locale)];
   const canonicalLocale = canonicalLocaleForPath("/faq", locale);
   const jsonLd = buildFaqPageJsonLd({
     items,
@@ -773,42 +762,27 @@ export default async function FaqPage({ params }: { params: Promise<{ locale: st
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: serializeJsonLd(jsonLd) }}
       />
-      <section className="site-container section">
-        <div className="flex items-baseline gap-4 mb-3">
-          <Seal char="问" />
-          <div className="eyebrow">{isZh ? "常见问题" : "FAQ"}</div>
-        </div>
-        <h1 className="font-display tracking-crisp">
-          {isZh ? (
-            <>常见问题 <span className="font-cjk text-indigo text-5xl ml-2">FAQ</span></>
-          ) : (
-            <>FAQ <span className="font-cjk text-indigo text-5xl ml-2">常见问题</span></>
-          )}
-        </h1>
-        <p className="mt-5 max-w-3xl text-ink-soft text-lg leading-[1.9] tracking-wide">
-          {isZh
-            ? "答案来自实际代码、文档、发布说明和 GitHub 议题。每个回答下方标注了信息来源。如有未覆盖的问题，请在 GitHub 上提交 Issue。"
-            : "Answers sourced from real code, docs, release notes, and GitHub issues. Sources are cited below each answer. If your question isn't covered, open an issue on GitHub."}
-        </p>
-      </section>
+      <PageHeader
+        kicker={t.eyebrow}
+        title={t.title}
+        lede={t.lead}
+        pose="talk"
+      />
 
-      <section className="site-container pb-20">
-        <FaqSearch items={items} locale={locale} />
+      <div className="page-body">
+        <div className="page-body-narrow">
+          <FaqSearch items={items} locale={locale} />
 
-        <div className="mt-12 text-center">
-          <p className="text-ink-soft text-sm mb-4">
-            {isZh
-              ? "没找到你的问题？"
-              : "Didn't find your question?"}
-          </p>
-          <a
-            href="https://github.com/Hmbown/CodeWhale/issues/new/choose"
-            className="portal-button portal-button-primary gap-2"
-          >
-            {isZh ? "提交 Issue →" : "Open an issue →"}
-          </a>
+          <div className="empty-state empty-state-compact faq-more">
+            <p className="empty-state-title">{t.notCovered}</p>
+            <div className="empty-state-actions">
+              <a href="https://github.com/Hmbown/CodeWhale/issues/new/choose" className="btn btn-secondary">
+                {t.openIssue}
+              </a>
+            </div>
+          </div>
         </div>
-      </section>
+      </div>
     </>
   );
 }

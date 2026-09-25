@@ -4,7 +4,7 @@ import { SITE_URL } from "@/lib/page-meta";
 
 // Public, indexable routes (locale-prefixed). /admin and /api are
 // intentionally excluded; see app/robots.ts.
-const PATHS = ["", "/product", "/install", "/constitution", "/models", "/plugins", "/runtime", "/docs", "/docs/auth", "/docs/computers", "/docs/configuration", "/docs/guide", "/docs/hooks", "/docs/mcp", "/docs/modes", "/docs/fleet", "/docs/runtime-api", "/docs/sandbox", "/docs/subagents", "/docs/tools", "/docs/troubleshooting", "/docs/trust", "/docs/vocabulary", "/docs/web", "/docs/work", "/faq", "/roadmap", "/feed", "/digest", "/changelog", "/contribute", "/community", "/signin", "/signup", "/legal/terms", "/legal/privacy"];
+const PATHS = ["", "/product", "/install", "/constitution", "/models", "/plugins", "/runtime", "/docs", "/docs/auth", "/docs/computers", "/docs/configuration", "/docs/guide", "/docs/hooks", "/docs/mcp", "/docs/modes", "/docs/review", "/docs/fleet", "/docs/runtime-api", "/docs/sandbox", "/docs/subagents", "/docs/tools", "/docs/troubleshooting", "/docs/trust", "/docs/vocabulary", "/docs/web", "/docs/work", "/faq", "/roadmap", "/feed", "/digest", "/changelog", "/contribute", "/community", "/signin", "/signup", "/legal/terms", "/legal/privacy"];
 
 export default function sitemap(): MetadataRoute.Sitemap {
   return [...PATHS, "/computer-use"].flatMap((path) =>

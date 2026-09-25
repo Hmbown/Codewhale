@@ -39,7 +39,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Hintergrundprüfung ansehen",
   source: "Quellcode und weitere Plattformen",
   platforms: "Dieser Download ist für den Mac. Windows und Linux nutzen derzeit das Quellcode-Plugin und die Einrichtung auf dem Host.",
-  installTitle: "Computer Use für den Mac",
-  installLead: "Füge App-Steuerung im Hintergrund mit dem Computer-Use-Helfer hinzu. Richte Mac-Berechtigungen ein, führe eine Hintergrundprüfung aus und pausiere oder stoppe die Eingaben des Helfers aus deiner Menüleiste.",
-  installLink: "Computer Use herunterladen und einrichten",
 };

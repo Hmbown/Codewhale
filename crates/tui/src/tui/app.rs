@@ -4886,13 +4886,48 @@ impl App {
         messages: Vec<Message>,
         session: &crate::session_manager::SavedSession,
     ) {
-        self.session_journal = session.journal.clone().unwrap_or_else(|| {
+        let journal = session.journal.clone().unwrap_or_else(|| {
             crate::session_tree::SessionJournal::from_messages(
                 session.messages.clone(),
                 session.metadata.spawn_depth,
             )
         });
-        self.api_message_stamps = session.journal_message_stamps();
+        self.install_restored_api_messages(messages, journal, session.journal_message_stamps());
+    }
+
+    /// [`Self::restore_api_messages`] for a caller that owns the loaded
+    /// session: the journal and the message history are *moved* out of it,
+    /// not cloned, and the history goes through the owned restore projection,
+    /// so a resume holds one copy of the transcript instead of three (memory
+    /// note M3). `session.journal` and `session.messages` are left empty.
+    pub fn restore_api_messages_from_owned(
+        &mut self,
+        session: &mut crate::session_manager::SavedSession,
+    ) {
+        let stamps = session.journal_message_stamps();
+        let journal = match session.journal.take() {
+            Some(journal) => journal,
+            // Legacy session without a journal: rebuild it from the saved
+            // history, as the borrowing path does.
+            None => crate::session_tree::SessionJournal::from_messages(
+                session.messages.clone(),
+                session.metadata.spawn_depth,
+            ),
+        };
+        let messages = crate::runtime_handoff::project_owned_messages_for_restore(std::mem::take(
+            &mut session.messages,
+        ));
+        self.install_restored_api_messages(messages, journal, stamps);
+    }
+
+    fn install_restored_api_messages(
+        &mut self,
+        messages: Vec<Message>,
+        journal: crate::session_tree::SessionJournal,
+        stamps: Vec<DateTime<Utc>>,
+    ) {
+        self.session_journal = journal;
+        self.api_message_stamps = stamps;
         self.api_message_stamps
             .resize_with(messages.len(), Utc::now);
         self.api_messages = Arc::new(messages);

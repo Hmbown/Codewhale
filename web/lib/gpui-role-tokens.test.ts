@@ -3,9 +3,17 @@ import { describe, expect, it } from "vitest";
 import { resolveWhale } from "./whale-tokens";
 import { siteCss } from "./site-css";
 
+// The role layer (app/styles/tokens-roles.css): every role in every scheme,
+// inks from the versioned GPUI artifact, the navy ocean grounds measured
+// against every ink at WCAG AA.
 const CSS = siteCss();
 const DESIGN = JSON.parse(readFileSync(new URL("../../vendor/codewhale-design/tokens.json", import.meta.url), "utf8"));
-const ROLES = ["bg", "surface", "panel", "text", "muted", "line", "accent", "on-accent", "hover", "selected", "selection", "ring"];
+const ROLES = [
+  "bg", "surface", "panel", "text", "muted", "line", "line-strong", "accent", "on-accent",
+  "hover", "selected", "selection", "ring", "live", "attention", "danger",
+];
+const GROUNDS = ["bg", "surface", "panel", "hover", "selected"];
+const TEXT_INKS = ["text", "muted", "accent", "live", "attention", "danger"];
 
 function declarations(block: string): Record<string, string> {
   const vars: Record<string, string> = {};
@@ -46,11 +54,12 @@ function contrast(a: string, b: string): number {
 const light = () => roleBlock(":root");
 const osDark = () => roleBlock(':root:not([data-theme="light"])');
 const pinnedDark = () => roleBlock(':root[data-theme="dark"]');
+const stage = () => roleBlock(".stage,\n.site-footer");
 
-describe("GPUI role tokens", () => {
-  it("defines every role in light, OS-dark, and pinned-dark schemes", () => {
-    for (const scheme of [light(), osDark(), pinnedDark()]) {
-      for (const role of ROLES) expect(scheme, role).toHaveProperty(role);
+describe("role tokens", () => {
+  it("defines every role in light, OS-dark, pinned-dark and the stage", () => {
+    for (const [name, scheme] of [["light", light()], ["os-dark", osDark()], ["pinned", pinnedDark()], ["stage", stage()]] as const) {
+      for (const role of ROLES) expect(scheme, `${name}.${role}`).toHaveProperty(role);
     }
     // The OS-dark scheme is guarded so a pinned light page stays light, and
     // the pinned dark block repeats it exactly.
@@ -58,39 +67,55 @@ describe("GPUI role tokens", () => {
     expect(pinnedDark()).toEqual(osDark());
   });
 
-  it("uses generated GPUI tokens only, never a literal hex, in role positions", () => {
-    for (const scheme of [light(), osDark()]) {
-      for (const role of ROLES) {
-        expect(scheme[role], role).not.toMatch(/#[0-9a-f]{3,8}\b/i);
-        expect(scheme[role], role).toMatch(/var\(--gpui-(light|dark)-[\w-]+\)/);
-      }
-    }
-  });
-
-  it("paints the versioned GPUI artifact without a second palette", () => {
-    const roles: Record<string, string> = {
-      bg: "background", surface: "sidebar", panel: "surface", text: "foreground",
-      muted: "muted_foreground", line: "border", accent: "primary",
-      "on-accent": "primary_foreground", hover: "hover", selected: "selected", ring: "primary",
+  it("inks with the versioned GPUI artifact in both appearances", () => {
+    const inks: Record<string, string> = {
+      text: "foreground", muted: "muted_foreground", accent: "primary", "on-accent": "primary_foreground",
+      ring: "primary", live: "live", attention: "attention", danger: "danger",
     };
-    for (const [mode, scheme] of [["light", light()], ["dark", osDark()]] as const) {
-      for (const [role, key] of Object.entries(roles)) {
+    for (const [mode, scheme] of [["light", light()], ["dark", osDark()], ["dark", stage()]] as const) {
+      for (const [role, key] of Object.entries(inks)) {
+        expect(scheme[role], `${mode}.${role}`).toMatch(/^var\(--gpui-(light|dark)-[\w-]+\)$/);
         expect(hex(scheme[role]), `${mode}.${role}`).toBe(`#${DESIGN.colors[mode][key]}`);
       }
       expect(scheme.selection).toBe(`rgb(var(--gpui-${mode}-primary-rgb) / var(--gpui-selection-opacity))`);
     }
-    expect(Number(resolveWhale("var(--gpui-selection-opacity)"))).toBe(DESIGN.selection_opacity);
-    expect(Number(resolveWhale("var(--gpui-primary-hover-opacity)"))).toBe(DESIGN.primary_hover_opacity);
+    // Light keeps the artifact's paper grounds; dark reaches for the ocean.
+    expect(hex(light().bg)).toBe(`#${DESIGN.colors.light.background}`);
+    expect(hex(light().panel)).toBe(`#${DESIGN.colors.light.surface}`);
+    for (const role of GROUNDS) expect(osDark()[role], role).toMatch(/^var\(--ocean-[\w-]+\)$/);
   });
 
-  it("keeps text, muted text, links, and button text at WCAG AA in both schemes", () => {
-    for (const scheme of [light(), osDark()]) {
-      const bg = hex(scheme.bg);
-      expect(contrast(hex(scheme.muted), bg)).toBeGreaterThanOrEqual(4.5);
-      expect(contrast(hex(scheme.muted), hex(scheme.panel))).toBeGreaterThanOrEqual(4.5);
-      expect(contrast(hex(scheme.text), bg)).toBeGreaterThanOrEqual(4.5);
-      expect(contrast(hex(scheme.accent), bg)).toBeGreaterThanOrEqual(4.5);
-      expect(contrast(hex(scheme["on-accent"]), hex(scheme.accent))).toBeGreaterThanOrEqual(4.5);
+  it("keeps every text ink at WCAG AA on every ground, in every scheme", () => {
+    for (const [name, scheme] of [["light", light()], ["dark", osDark()], ["stage", stage()]] as const) {
+      for (const ground of GROUNDS) {
+        for (const ink of TEXT_INKS) {
+          expect(contrast(hex(scheme[ink]), hex(scheme[ground])), `${name}: ${ink} on ${ground}`).toBeGreaterThanOrEqual(4.5);
+        }
+      }
+      // Control edges and state marks clear the 3:1 non-text floor.
+      for (const ground of ["bg", "panel"]) {
+        expect(contrast(hex(scheme["line-strong"]), hex(scheme[ground])), `${name}: line-strong on ${ground}`).toBeGreaterThanOrEqual(3);
+      }
+      expect(contrast(hex(scheme["on-accent"]), hex(scheme.accent)), `${name}: on-accent`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  it("puts white text on the logo gradient only where it clears 4.5:1", () => {
+    const fill = CSS.match(/--brand-fill:\s*linear-gradient\(([^;]+)\);/)?.[1] ?? "";
+    const stops = [...fill.matchAll(/#[0-9a-f]{6}|var\(--brand-[\w-]+\)/gi)].map((m) => hex(m[0]));
+    expect(stops.length).toBeGreaterThanOrEqual(2);
+    for (const stop of stops) expect(contrast("#ffffff", stop), stop).toBeGreaterThanOrEqual(4.5);
+    expect(hex("var(--brand-deep)")).toBe("#0b48bb");
+    expect(hex("var(--brand-light)")).toBe("#1e8fd8");
+  });
+
+  it("keeps footer text readable on the sea below its waterline", () => {
+    const sea = CSS.match(/--sea:\s*linear-gradient\(([^;]+)\);/)?.[1] ?? "";
+    const stops = [...sea.matchAll(/#[0-9a-f]{6}/gi)].map((m) => m[0].toLowerCase());
+    // The first stop is the bright waterline; content starts below it.
+    for (const stop of stops.slice(1)) {
+      expect(contrast(hex(stage().muted), stop), `muted on ${stop}`).toBeGreaterThanOrEqual(4.5);
+      expect(contrast(hex(stage().text), stop), `text on ${stop}`).toBeGreaterThanOrEqual(4.5);
     }
   });
 });

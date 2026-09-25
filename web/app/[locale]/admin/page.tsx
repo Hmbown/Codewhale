@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { cookies } from "next/headers";
 import { ConnectionBanner } from "@/components/connection-banner";
 import { EmptyState, ErrorState } from "@/components/surface-state";
+import { WhalePose } from "@/components/whale-pose";
 import { getAgentEnv, listDrafts, validateSession, type AgentDraft } from "@/lib/community-agent";
 import { AdminClient } from "./admin-client";
 
@@ -26,15 +27,16 @@ const TYPE_LABELS: Record<string, { en: string; zh: string }> = {
 function LoginForm({ locale, error }: { locale: string; error: boolean }) {
   const isZh = locale === "zh";
   return (
-    <div className="mx-auto max-w-md px-6 py-20">
+    <div className="account-entry">
       <ConnectionBanner locale={locale} />
-      <h1 className="font-display text-3xl mb-6 mt-6">
+      <WhalePose pose="listen" className="account-entry-pose" />
+      <h1 className="page-title">
         {isZh ? "维护者登录" : "Maintainer login"}
       </h1>
-      <form method="POST" action={`/api/admin/login?locale=${locale}`} autoComplete="off" className="space-y-4">
+      <form method="POST" action={`/api/admin/login?locale=${locale}`} autoComplete="off" className="account-form">
         <input type="hidden" name="locale" value={locale} />
-        <label className="block">
-          <span className="eyebrow block mb-2">{isZh ? "令牌" : "Token"}</span>
+        <label className="field">
+          <span className="field-label">{isZh ? "令牌" : "Token"}</span>
           <input
             type="password"
             name="token"
@@ -42,17 +44,19 @@ function LoginForm({ locale, error }: { locale: string; error: boolean }) {
             autoFocus
             autoComplete="off"
             spellCheck={false}
-            className="w-full px-3 py-2 hairline-t hairline-b hairline-l hairline-r bg-paper font-mono text-sm focus:border-indigo"
+            aria-invalid={error || undefined}
+            aria-describedby={error ? "admin-token-error" : undefined}
+            className="field-input font-mono"
           />
         </label>
         <button
           type="submit"
-          className="w-full portal-button portal-button-primary"
+          className="btn btn-primary btn-lg"
         >
-          {isZh ? "登录 →" : "Sign in →"}
+          {isZh ? "登录" : "Sign in"}
         </button>
         {error && (
-          <p className="text-sm text-indigo font-mono">
+          <p id="admin-token-error" className="field-hint field-hint-error" role="alert">
             {isZh ? "令牌错误。" : "Invalid token."}
           </p>
         )}
@@ -112,25 +116,25 @@ export default async function AdminPage({
   const posted = drafts.filter((d) => d.posted);
 
   return (
-    <section className="mx-auto max-w-[1400px] px-6 pt-4 pb-20">
+    <section className="page-body admin-page">
       {/* The signed-in shell: typed offline / reconnect state with a real
           server probe, so a paused action is never mistaken for a posted one. */}
       <ConnectionBanner locale={locale} />
-      <div className="flex items-baseline justify-between mb-8 mt-8 hairline-b pb-4">
+      <div className="admin-head">
         <div>
-          <h1 className="font-display tracking-crisp text-3xl">
+          <h1 className="page-title">
             {isZh ? "社区助理草稿" : "Community Assistant Drafts"}
           </h1>
-          <p className="mt-2 text-sm text-ink-mute font-mono">
+          <p className="page-meta tabular">
             {pending.length} pending · {posted.length} posted
           </p>
         </div>
         <form method="POST" action={`/api/admin/logout?locale=${locale}`}>
           <button
             type="submit"
-            className="text-xs text-ink-mute hover:text-indigo transition-colors"
+            className="btn btn-ghost btn-sm"
           >
-            {isZh ? "退出 →" : "Sign out →"}
+            {isZh ? "退出" : "Sign out"}
           </button>
         </form>
       </div>

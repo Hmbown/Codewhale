@@ -1,43 +1,105 @@
 import type { DocsSandboxDict } from "../types";
 
 /**
- * English reference dictionary for `app/[locale]/docs/sandbox/page.tsx`.
- * Copy moved verbatim from the page's `isZh` ternaries — any wording change
- * belongs in its own commit, never mixed into a structural move.
+ * English reference dictionary for `app/[locale]/docs/sandbox/page.tsx`
+ * ("Limit what commands can touch"). Checked against docs/SANDBOX.md — which
+ * describes only behavior wired into the command execution path — and
+ * docs/CONFIGURATION.md (`sandbox_mode`, `prefer_bwrap`).
  */
 export const docsSandbox: DocsSandboxDict = {
-  metaTitle: "Sandbox & Approval · Codewhale Docs",
+  metaTitle: "Limit what commands can touch · Codewhale Docs",
   metaDescription:
-    "The honest boundary: macOS Seatbelt, opt-in Linux bubblewrap, platform gaps, and approval policy.",
+    "See which operating-system sandbox wraps shell commands on macOS, Linux, and Windows, turn it on where it is optional, and choose how much a command may write.",
   bodyClassName: "text-ink-soft leading-relaxed",
-  overviewTitle: "Sandbox & Approval",
-  overviewLead:
-    "Codewhale can launch shell commands proposed by a model. Approval policy, workspace-aware tools, and an operating-system command wrapper are separate controls: an approval is not a sandbox, and selecting workspace-write does not prove the current platform has an OS wrapper available. This page describes only behavior wired into the command execution path.",
-  platforms: [
-    [
-      "macOS · Seatbelt",
-      "Codewhale probes /usr/bin/sandbox-exec; when the probe succeeds and the policy requests a sandbox, the child command is wrapped in a generated Seatbelt profile: broad filesystem reads, policy-limited writes, and network only when the policy enables it. A failed probe is reported honestly as no OS sandbox.",
-    ],
-    [
-      "Linux · opt-in bubblewrap",
-      "Linux command sandboxing is opt-in: set prefer_bwrap = true and keep /usr/bin/bwrap executable. The child gets a read-only root view with writable mounts derived from the resolved policy; the network namespace is isolated by default and --share-net is added only when the policy enables network access. Without the opt-in, Codewhale reports none.",
-    ],
-    [
-      "Windows · no OS sandbox",
-      "The Windows command path currently reports no OS sandbox. Host permissions and approval policy still apply, but they are not a Codewhale OS command sandbox.",
-    ],
-    [
-      "External OpenSandbox execution",
-      'With sandbox_backend = "opensandbox", shell execution is sent to the configured OpenSandbox-compatible HTTP endpoint instead of starting a local child. Isolation guarantees belong to the configured service and its operator.',
-    ],
+  title: "Limit what commands can touch",
+  lede:
+    "Approving a command decides whether it runs. A sandbox decides what it can reach once it does. Codewhale uses the operating system's sandbox where one is available and tells you plainly when there is none.",
+  sections: [
+    {
+      id: "platforms",
+      title: "Check what your platform provides",
+      blocks: [
+        {
+          rows: [
+            ["macOS", "Seatbelt, automatically, when its startup check succeeds. Commands get broad read access, writes limited by the sandbox mode, and network only when the mode allows it."],
+            ["Linux", "Bubblewrap, but only if you turn it on (below). Without it, commands run with no OS sandbox."],
+            ["Windows", "No OS sandbox today. Your approval setting and Windows permissions still apply."],
+            ["External service", "With `sandbox_backend = \"opensandbox\"`, shell commands run on an OpenSandbox-compatible service you configure; its isolation is that service's to guarantee."],
+          ],
+        },
+        { p: "Ask Codewhale which one it found:" },
+        { code: "codewhale doctor\ncodewhale setup --status", lang: "Terminal" },
+        {
+          p: "Both report the sandbox that is actually available after your settings are applied. Codewhale never counts source code that is not wired in as a sandbox.",
+        },
+      ],
+    },
+    {
+      id: "linux",
+      title: "Turn on the Linux sandbox",
+      blocks: [
+        { p: "Install bubblewrap, then opt in with one line in `~/.codewhale/config.toml`:" },
+        {
+          code: `sudo apt install bubblewrap      # Fedora: dnf install bubblewrap · Arch: pacman -S bubblewrap
+
+# ~/.codewhale/config.toml
+prefer_bwrap = true`,
+          lang: "Terminal / config.toml",
+        },
+        {
+          p: "Codewhale uses `/usr/bin/bwrap` only when that file exists and is executable. Commands then see a read-only view of the system, write only where the sandbox mode allows, and have no network unless the mode enables it.",
+        },
+      ],
+    },
+    {
+      id: "mode",
+      title: "Choose how much a command may write",
+      blocks: [
+        { code: 'sandbox_mode = "workspace-write"', lang: "config.toml" },
+        {
+          rows: [
+            ["read-only", "Commands can read but not write."],
+            ["workspace-write", "Commands can write inside the workspace and temporary folders, and nowhere else."],
+            ["danger-full-access", "No OS sandbox. Use only on a machine or container you are prepared to lose."],
+            ["external-sandbox", "You are already running inside isolation, so Codewhale adds none of its own."],
+          ],
+          codeTerms: true,
+        },
+        {
+          p: "The first two are enforced only where a sandbox is available — on Linux without bubblewrap, and on Windows, they are settings without an OS wrapper behind them. A repository's own config can make the mode stricter, never looser. For one headless run, pass `--sandbox <mode>` to `codewhale exec`; `--auto` approves tools but never widens the sandbox.",
+        },
+      ],
+    },
+    {
+      id: "limits",
+      title: "Know the limits",
+      blocks: [
+        {
+          list: [
+            "Availability is checked before a command starts, but the sandbox can still fail at launch because of host policy or container restrictions.",
+            "A “Permission denied” from a command is not proof that the sandbox blocked it. Codewhale labels a denial as the sandbox's only when the sandbox itself reported it.",
+            "No sandbox protects against kernel vulnerabilities or every kind of resource exhaustion.",
+          ],
+        },
+      ],
+    },
   ],
-  policiesTitle: "Policies and fallbacks",
-  policiesLead:
-    "The local {sandboxMode} values are {readOnly}, {workspaceWrite}, {dangerFullAccess}, and {externalSandbox}. The first two are enforced by Seatbelt or bubblewrap only when that wrapper is selected and available; {dangerFullAccess} deliberately bypasses the local OS wrapper; {externalSandbox} declares that execution is already externally isolated. When no wrapper is selected, the shell command runs without Codewhale OS isolation — approval rules and workspace-aware native file tools remain separate controls.",
-  diagnosticsTitle: "Diagnostics and limits",
-  diagnosticsLead:
-    "codewhale setup --status, codewhale doctor, codewhale doctor --json, and the diagnostics tool report the locally available wrapper after applying the resolved bubblewrap preference. Denial attribution is intentionally conservative: a child command's generic Permission denied is not by itself proof that Codewhale's sandbox blocked it, and unsandboxed command failures are never labeled sandbox denials.",
-  diagnosticsLimits:
-    "The limitations are stated just as plainly: availability is checked before launch, yet the selected wrapper can still fail because of host policy, container restrictions, or a race after the probe; bubblewrap ignores a configured writable root that is missing or not a directory; and no sandbox protects against kernel vulnerabilities or all resource-exhaustion and side-channel attacks.",
-  sourceNote: "Source document: docs/SANDBOX.md · Update docs-map.ts when changing.",
+  next: [
+    {
+      href: "/docs/modes",
+      label: "Set modes and approvals",
+      note: "Decide which commands stop for your approval.",
+    },
+    {
+      href: "/docs/trust",
+      label: "See what leaves your machine",
+      note: "What a provider receives, what stays local, and what telemetry sends.",
+    },
+    {
+      href: "/docs/configuration",
+      label: "Change settings",
+      note: "Where these keys live and what a repository may override.",
+    },
+  ],
+  sourceNote: "Source documents: docs/SANDBOX.md, docs/CONFIGURATION.md · Update docs-map.ts when changing.",
 };

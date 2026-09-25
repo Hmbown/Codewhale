@@ -39,7 +39,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Voir la vérification en arrière-plan",
   source: "Code source et autres plateformes",
   platforms: "Ce téléchargement est destiné au Mac. Sous Windows et Linux, on utilise pour l’instant le plugin depuis les sources et la configuration côté hôte.",
-  installTitle: "Computer Use pour Mac",
-  installLead: "Ajoutez le contrôle des apps en arrière-plan avec l’assistant Computer Use. Configurez les autorisations du Mac, lancez une vérification en arrière-plan, puis mettez en pause ou arrêtez la saisie de l’assistant depuis votre barre des menus.",
-  installLink: "Téléchargement et configuration de Computer Use",
 };

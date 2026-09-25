@@ -38,7 +38,4 @@ export const computerUse: ComputerUseDict = {
   demo: "See the background check",
   source: "Source and other platforms",
   platforms: "This download is for Mac. Windows and Linux currently use the source plugin and host-side setup.",
-  installTitle: "Computer Use for Mac",
-  installLead: "Add background app control with the Computer Use helper. Set up Mac permissions, run a background check, and pause or stop helper input from your menu bar.",
-  installLink: "Computer Use download and setup",
 };

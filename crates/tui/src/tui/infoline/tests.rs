@@ -274,6 +274,51 @@ fn infoline_compact_keeps_performance_readings_without_extra_rows() {
     }
     // The full row at the same width is the row the user had before.
     assert!(render_row(&UI_THEME, 160, &segments).contains("tok/s"));
+
+    // Cache survives compact and is the first performance reading to shed
+    // when the row is narrow (#6565).
+    let mut with_cache = segments.clone();
+    with_cache.insert(
+        3,
+        InfoSegment::new(
+            InfoSegmentId::Cache,
+            "cache",
+            "85%",
+            ChromeInk::MetadataValue,
+        ),
+    );
+    let wide_cache = render_row_compact(160, &with_cache);
+    assert!(wide_cache.contains("cache 85%"), "{wide_cache:?}");
+    assert!(
+        !wide_cache.contains("1.2K") && !wide_cache.contains("help"),
+        "{wide_cache:?}"
+    );
+    let narrow_cache = render_row_compact(40, &with_cache);
+    assert!(!narrow_cache.contains("cache"), "{narrow_cache:?}");
+    assert!(
+        narrow_cache.contains("deepseek-v4") && narrow_cache.contains("ctx 61%"),
+        "{narrow_cache:?}"
+    );
+}
+
+fn render_row_compact(width: u16, segments: &[InfoSegment]) -> String {
+    let backend = TestBackend::new(width, 1);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let hint = help_hint();
+            let info = InfoLine::new(&UI_THEME, &hint, segments).compact(true);
+            use ratatui::widgets::Widget;
+            Widget::render(info, frame.area(), frame.buffer_mut());
+        })
+        .expect("draw");
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol().to_string())
+        .collect()
 }
 
 /// At the 80% cap the context reading takes the error token — the caller

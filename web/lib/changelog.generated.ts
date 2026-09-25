@@ -28,29 +28,53 @@ export const CHANGELOG: ChangelogRelease[] = [
     "compareUrl": "https://github.com/Hmbown/CodeWhale/compare/v0.10.0...HEAD",
     "sections": [
       {
+        "heading": "Contributors",
+        "items": [
+          "@gaord — let undo roll back files for the turn it is undoing (#6483), stopped resume and fork from duplicating threads and sessions (#6406), and exposed user-defined provider routes to native clients (#6404).",
+          "@Lstarsky0 — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine (#6405, #6417, #6499, #6574), tightened the Chinese-branching ceiling to 18 (#6403), and made Fleet publish without a two-link window (#6431).",
+          "@aboimpinto — restored a green Linux full-workspace test gate without loosening any test (#6581).",
+          "@dajiaohuang — codewhale config set checks a known setting's value against its schema type before saving it (#6568)."
+        ],
+        "itemCount": 4
+      },
+      {
         "heading": "Added",
         "items": [
-          "Official model routing: /router (also /model router) sets up the Auto router with presets: Jev (TypeSafe's decision model, via OpenRouter or a TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes one test call before it saves, /status shows the router's choice, cost and latency, and a failing router is shown as failing (#6525)."
+          "Official model routing: /router (also /model router) sets up the Auto router with presets: Jev (TypeSafe's decision model, via OpenRouter or a TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes one test call before it saves, /status shows the router's choice, cost and latency, and a failing router is shown as failing (#6525).",
+          "Receipts: /receipts, codewhale receipts [ID|--last] [--format md|json], and GET /v1/threads/{id}/receipt (plus a per-turn form) list what a session did, one line per action: files changed with line counts, commands with exit codes, web and MCP calls, agents, approvals and who gave them, and failures. They also count what ran without asking and name the posture each turn ran under, read from the turn's own record. A call Codewhale blocked before it started (Auto-Review or…"
         ],
-        "itemCount": 1
+        "itemCount": 2
       },
       {
         "heading": "Fixed",
         "items": [
+          "Approvals now record who decided: you, a session rule, or the posture. An automatic approval used to be saved exactly like one you gave, and an app approval that expired was saved as your denial. GET /v1/approvals now returns decided_by.",
+          "Network audit lines now go to the same audit.log as every other audit event ($CODEWHALE_HOME included), and test runs no longer append to your real one.",
+          "Auto-Review verdicts now reach audit.log, as /permissions said they did. They were written only when CODEWHALE_TOOL_AUDIT_LOG was set.",
+          "The installation page is generated from docs/INSTALL.md, so the website and the guide can no longer disagree; broken anchors and unsafe links fail the build (#6450).",
+          "codewhale config set refuses a value of the wrong type for a known setting (a word for an on/off switch, text for a number, a choice outside the list) instead of saving it (#6568, thanks @dajiaohuang).",
           "A turn that stops producing output now reports itself: the turn loop records its phase and last progress, and an overdue phase surfaces instead of hanging silently until the stream idle timeout. A delegated agent's final result is never dropped when the host is busy, so a finished child no longer leaves a ghost Running row behind (#6184).",
           "Git commands run by tools never stop to ask for a password, passphrase or host-key confirmation inside the terminal, and git_fetch has a timeout (#6184).",
           "A provider response that ends cleanly with no text and no tool call is retried before the turn fails, and the failure names how many retries ran (#6310).",
           "The context meter, the point where Codewhale makes room, preflight, /context and turn receipts show one pressure number instead of disagreeing (#6407).",
           "Continuing a conversation that is already open no longer adds a second thread, and a fork keeps its own session file, so autosave on one side no longer leaves the other unloadable (#6406, thanks @gaord).",
           "Upgrading Codewhale no longer turns off the built-in Computer Use. Each build writes the built-in bundle to its own directory, so an upgrade used to present it as never reviewed and disabled. Now the review and enablement carry to the new build when its capabilities are unchanged. Changed capabilities show capabilities-changed and wait for review, and a revoked trust never carries (#6303).",
-          "\"Allow for this conversation\" records a grant for that tool and argument class instead of switching the whole thread to Full Access, so the call you just approved is no longer failed by a Permissions change. An approval also survives a Permissions change that only widens what is allowed, grants end when a thread is archived or deleted, and web.run open grants are scoped by host. Full Access covers MCP tools that declare themselves destructive in every host, including…",
-          "web.run retries a refused page once with a browser user agent, and one site's failure no longer fails the whole call or drops its search results.",
-          "Hooks treat bash, Bash and exec_shell as one tool in tool_name conditions, so the documented example fires.",
-          "macOS no longer reports Codewhale's ordinary heap as GPU (IOAccelerator) memory.",
-          "Code highlighting uses less memory, and long transcripts, the pager and the session picker do less work on the event loop; session previews load in the background (#6014).",
-          "The composer's send cue follows the draft, not a paste in progress (#6397)."
+          "\"Allow for this conversation\" records a grant for that tool and argument class instead of switching the whole thread to Full Access, so the call you just approved is no longer failed by a Permissions change. An approval also survives a Permissions change that only widens what is allowed, grants end when a thread is archived or deleted, and web.run open grants are scoped by host. Full Access covers MCP tools that declare themselves destructive in every host, including…"
         ],
-        "itemCount": 14
+        "itemCount": 19
+      },
+      {
+        "heading": "Removed",
+        "items": [
+          "Flags, settings and tool parameters that did nothing are gone (#6516). --output-mode is hidden. It is still accepted, prints a warning, and is ignored.",
+          "The dispatcher no longer exports DEEPSEEK_* copies of its CODEWHALE_* variables. A DEEPSEEK_* variable you set yourself is still read.",
+          "lane start and workflow run --runtime vm|ci are rejected before a lane is created. Older lane records for those runtimes still load.",
+          "The control socket's relaunch verb is removed; it always returned an error.",
+          "The speech tool drops stream. stream=true used to fail; it is now ignored, a complete audio file is written, and the result no longer carries \"stream\": false. The finance tool drops market, and a call that still passes it has it ignored.",
+          "[context].enabled, the seam-manager keys and tui.terminal_probe_timeout_ms no longer load; old configs that carry them still start. The [workshop] docs now describe bounded spillover instead of a synthesis sub-agent.",
+          "About 2,650 lines of workflow code that nothing ran are deleted: the replay executor, the review-repair loop and experimental search. The replay_diverged status they produced goes with them. The isolated Runtime Chat prompt and the legacy YOLO alias list each have one owner now (#6517)."
+        ],
+        "itemCount": 7
       },
       {
         "heading": "Experience",
@@ -83,8 +107,8 @@ export const CHANGELOG: ChangelogRelease[] = [
           "Codewhale no longer appends plugin recommendations to your messages to the model. Suggestions appear in one place, follow one switch and one budget, and never advertise built-in plugins, generic words or plugins for another operating system.",
           "/plugin dismissals lists the plugins suggestions skip, and /plugin dismissals reset [<name>] brings them back.",
           "Tools from reviewed plugins that declare themselves read-only no longer ask for approval on every call.",
-          "The bundled Computer Use plugin is 0.11.3, synced from upstream 0f54bf6 (#6303). app_script refuses shell escapes. Clicks on irreversible actions such as pay, send or delete need confirmation. Consent decisions cannot ride inside run_actions or trajectory replay, and trajectories redact secure fields. Also new: a shared-computer control lease that pauses agent input while a person drives, and a browser attach mode for a shared Chromium. The vendored README no longer claims…",
-          "The bundled first-party catalog pins marketplace revision 93b0e0e4e441384533ca586b59890c0d5942bc0a. It lists Computer Use 0.11.3 and the same five plugins as before. Chromewhale is not in the bundled catalog yet."
+          "The bundled Computer Use plugin is 0.12.0, the published upstream release 8435692 (#6303, #5856). On macOS the agent uses its own pointer and never drives your cursor. app_script refuses shell escapes. Clicks on irreversible actions such as pay, send or delete need confirmation. Consent decisions cannot ride inside run_actions or trajectory replay, and trajectories redact secure fields. Also new: a shared-computer control lease that pauses agent input while a person drives,…",
+          "The bundled first-party catalog pins marketplace revision ae3dd2255a9a266365c6125a084f511eb26bc04d. It lists Computer Use 0.12.0 and adds Codewhale for Chrome (Chromewhale) 0.3.0 as a developer preview: you load its Chrome extension unpacked, and like every catalog plugin it installs disabled and untrusted until you review it."
         ],
         "itemCount": 5
       },

@@ -1142,7 +1142,6 @@
   "PendingApprovalInAgent": "Потрібне схвалення в {agent} — /agents",
   "ApprovalTruncationHint": "  … обрізано · натисніть {details} для повних деталей",
   "ApprovalFullAccessPolicyBlocked": "Заблоковано {tool}: Full Access не може обійти цю політику",
-  "AutoReviewQuestionSkipped": "Auto-Review пропустив запитання користувача й продовжив автономно",
   "ApprovalChooseHint": "Виберіть: ",
   "ApprovalChooseAction": "Enter — вибрати опцію, або натисніть y/a/d напряму",
   "ApprovalIntentLabel": "Намір: ",

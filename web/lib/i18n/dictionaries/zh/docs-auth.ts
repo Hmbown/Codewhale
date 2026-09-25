@@ -1,41 +1,119 @@
 import type { DocsAuthDict } from "../types";
 
-/**
- * Simplified-Chinese dictionary for `app/[locale]/docs/auth/page.tsx`.
- * Statements trace to docs/CONFIGURATION.md, docs/CODEWHALE_AGENT.md, docs/PROVIDERS.md.
- */
+/** 「连接模型提供商」页的简体中文词典；与 `en/docs-auth.ts` 逐段对应。 */
 export const docsAuth: DocsAuthDict = {
-  metaTitle: "账户与密钥 · Codewhale 文档",
-  metaDescription: "提供商密钥与可选的 Codewhale 账户：各自如何设置、存放在哪里，以及哪些操作完全不需要账户。",
+  metaTitle: "连接模型提供商 · Codewhale 文档",
+  metaDescription:
+    "为 Codewhale 接上模型：保存提供商密钥、查看当前使用的是哪把密钥，或者不用密钥直接运行本地模型。Codewhale 账户是可选的。",
   bodyClassName: "text-ink-soft leading-[1.9] tracking-wide",
-  overviewTitle: "账户与密钥",
-  overviewLead:
-    "Codewhale 持有两种互不相关的凭证，把它们分开会更清楚。提供商密钥让模型能够回答。Codewhale 账户是可选的，它决定能否使用托管界面——云端 Agent 和聊天渠道。安装和运行本地 Runtime 既不需要账户，也不需要密钥。",
-  credentials: [
-    ["提供商密钥（BYOK）", "你自己的 DeepSeek、OpenAI、Anthropic、OpenRouter、本地运行时或任何其他路由的密钥。用 {authSet} 设置。模型回复需要它。"],
-    ["Codewhale 账户", "由 {login} 发起的浏览器设备授权会话。可选。决定能否使用云端 Agent 与 Codewhale Agent 界面；本地从不需要。"],
+  title: "连接模型提供商",
+  lede:
+    "Codewhale 需要一个模型来回答问题。你可以为云端提供商保存一把密钥，也可以让它连接你本机运行的模型。费用由你直接付给提供商，不经过 Codewhale 账户。",
+  sections: [
+    {
+      id: "save-key",
+      title: "保存提供商密钥",
+      blocks: [
+        {
+          p: "先在提供商那里申请 API 密钥，然后保存。Codewhale 会提示你输入密钥，输入内容不会回显。DeepSeek 是默认提供商，下面以它为例。",
+        },
+        {
+          code: `codewhale auth set --provider deepseek
+codewhale auth status --provider deepseek`,
+          lang: "终端",
+        },
+        {
+          p: "`auth status` 会说明当前密钥来自哪里——配置文件、密钥存储还是环境变量——并且只显示最后四位。在脚本里可以用 `--api-key-stdin` 通过管道传入密钥，不必手动输入。",
+        },
+        {
+          p: "也可以在 Codewhale 里连接：按 F3（或输入 `/provider`），选择提供商，粘贴密钥，再选一个模型。",
+        },
+        {
+          note: "在 v0.10.0 中，`auth set --provider deepseek` 还会把默认模型切换为 DeepSeek Pro。想换回更快、更便宜的模型，运行 `/model` 即可。通过 F3 连接则会保留你当前的模型。",
+        },
+      ],
+    },
+    {
+      id: "which-key",
+      title: "弄清用的是哪把密钥",
+      blocks: [
+        { p: "同一个提供商的密钥如果设在多处，按下面的顺序取第一个找到的：" },
+        {
+          steps: [
+            "命令行上的 `--api-key`，只对这一次运行生效。",
+            "`~/.codewhale/config.toml` 中的 `api_key`。",
+            "`codewhale auth set` 写入的密钥存储。",
+            "提供商自己的环境变量，例如 `DEEPSEEK_API_KEY`。",
+          ],
+        },
+        {
+          p: "因此，导出一个新的环境变量并不会替换你之前保存的密钥。如果换过的密钥一直报错，先用 `auth status` 看看生效的是哪个来源，再保存新密钥，或清除已存的旧密钥：",
+        },
+        { code: "codewhale auth clear --provider deepseek", lang: "终端" },
+        {
+          p: "在 Linux 上，密钥存储是 `~/.codewhale/secrets/` 下的一个私有文件（权限 0600），而不是系统钥匙串。`codewhale doctor --probe-api` 会发起一次测试调用，确认密钥和网络都正常。",
+        },
+      ],
+    },
+    {
+      id: "other-providers",
+      title: "使用其他提供商或本地模型",
+      blocks: [
+        {
+          p: "`codewhale auth list` 会列出 Codewhale 支持的所有提供商，以及每个提供商是否已有密钥。所有提供商的用法都一样：`codewhale auth set --provider <名称>`，或者设置该提供商的环境变量。",
+        },
+        {
+          p: "本地运行器——Ollama、vLLM 和 SGLang——默认不需要密钥，你的提示词也不会离开本机。先启动运行器，再选择它：",
+        },
+        {
+          code: `codewhale auth list
+codewhale --provider ollama --model <model-tag>`,
+          lang: "终端",
+        },
+        {
+          p: "[模型页面](/models) 列出了各家提供商、本地部署方式，以及如何在会话中切换模型。",
+        },
+      ],
+    },
+    {
+      id: "account",
+      title: "登录 Codewhale 账户（可选）",
+      blocks: [
+        {
+          p: "提供商密钥和 Codewhale 账户是两回事。账户只用于账户相关的功能，比如云端 Agent、在网页应用里接着使用某个会话。安装 Codewhale 和在本地工作都不需要账户。",
+        },
+        {
+          rows: [
+            ["codewhale login", "在浏览器中用一次性验证码登录。"],
+            ["codewhale account status", "查看当前配置档登录的是哪个账户。"],
+            ["codewhale account logout", "移除当前配置档的登录会话。"],
+            ["codewhale account keys list", "列出保存在账户里的提供商密钥，永远不会显示密钥内容。"],
+          ],
+          codeTerms: true,
+        },
+        {
+          p: "`codewhale login` 不接收提供商密钥，提供商密钥一律通过 `codewhale auth set` 保存。登录会话优先保存在操作系统的凭据管理器中；没有凭据管理器时（例如通过 SSH 或在容器里），则保存在 Codewhale 的私有密钥文件中。",
+        },
+      ],
+    },
   ],
-  providerTitle: "提供商密钥",
-  providerLead:
-    "{authSet} 保存某一个提供商的密钥。进程级的 {apiKeyFlag} 仍然在单次运行中优先。{login} 不是提供商密钥命令：提供商凭证只能通过 {authSet} 配置。",
-  accountTitle: "账户会话",
-  accountLead: "{login} 与 {accountLogin} 是同一个浏览器设备授权流程。会话按所选的 {profile} 区分，旧的 {cloud} 写法仍然是别名。",
-  accountCommands: [
-    ["codewhale login", "通过浏览器设备授权流程登录。"],
-    ["codewhale account status", "显示所选 profile 的会话。"],
-    ["codewhale account logout", "移除该会话。"],
+  next: [
+    {
+      href: "/docs/guide",
+      label: "开始第一个任务",
+      note: "在项目里打开 Codewhale，交给它一件具体的事。",
+    },
+    {
+      href: "/docs/modes",
+      label: "设置模式与审批",
+      note: "决定 Codewhale 运行命令之前是否先问你。",
+    },
+    {
+      href: "/docs/trust",
+      label: "了解哪些数据会离开本机",
+      note: "提供商会收到什么、哪些留在本地，以及如何关闭用量统计。",
+    },
   ],
-  storageTitle: "会话存放在哪里",
-  storageLead:
-    "账户会话优先使用操作系统的凭证管理器；在没有凭证管理器的环境（无头主机、SSH、容器）中自动回退到权限为 0600 的私有 Codewhale 密钥文件。",
-  vaultTitle: "账户自己的密钥库",
-  vaultLead: "{keys} 管理已登录账户的自带密钥（BYOK）库，且永远不会显示密钥内容。",
-  portableTitle: "迁移到另一台机器",
-  portableLead:
-    "{portable} 输出一个不含密钥的配置包：凭证和机器相关的键会被直接删除，而不是用打码占位符替代，因此这个文件可以安全携带，里面没有任何内容能以你的身份登录。",
-  appTitle: "在网页上登录",
-  appLead: "托管的 Codewhale 应用使用同一个账户。可以在那里登录或注册；本地 Runtime 没有它也照常工作。",
-  appSignIn: "登录 →",
-  appRegister: "注册 →",
-  sourceNote: "源文档：docs/CONFIGURATION.md、docs/CODEWHALE_AGENT.md、docs/PROVIDERS.md · 修改时请同步更新 docs-map.ts。",
+  sourceNote:
+    "来源文档：docs/INSTALL.md §8、docs/PROVIDERS.md、docs/CODEWHALE_AGENT.md · 修改时同步更新 docs-map.ts。",
 };

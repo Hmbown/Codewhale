@@ -177,7 +177,7 @@ describe("bounded optional PostHog delivery", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
     const [url, init] = fetch.mock.calls[0];
     expect(url).toBe(`${host}/batch/`);
-    expect(init).toMatchObject({ method: "POST", headers: { "content-type": "application/json" }, redirect: "error", credentials: "omit" });
+    expect(init).toMatchObject({ method: "POST", headers: { "content-type": "application/json" }, redirect: "manual", credentials: "omit" });
     expect(init.signal).toBeInstanceOf(AbortSignal);
     expect(init.body).not.toContain("private-");
     const captured = JSON.parse(init.body).batch;

@@ -1,5 +1,6 @@
 import Link from "next/link";
-import { Seal } from "@/components/seal";
+import { Icon, type IconName } from "@/components/icon";
+import { PageHeader } from "@/components/page-header";
 import { FeedCard } from "@/components/feed-card";
 import { FeedRetry } from "@/components/feed-retry";
 import { EmptyState, ErrorState, UnavailableState } from "@/components/surface-state";
@@ -50,7 +51,6 @@ export default async function FeedPage({ params }: { params: Promise<{ locale: s
 
   const issues = feed.filter((f) => f.kind === "issue");
   const pulls = feed.filter((f) => f.kind === "pull");
-  const eyebrow = isZh ? "动态" : "Activity";
   const states = getStates(locale);
   // FeedRetry first busts this route's ISR entry, because a bare server
   // re-render would serve the same cached `skipped`/`unavailable` record for
@@ -65,145 +65,83 @@ export default async function FeedPage({ params }: { params: Promise<{ locale: s
       <UnavailableState locale={locale} compact action={retry} />
     );
 
+  const copy = isZh
+    ? {
+        title: "动态",
+        lede: (
+          <>
+            来自{" "}
+            <Link href="https://github.com/Hmbown/CodeWhale" className="link">Hmbown/CodeWhale</Link>
+            {" "}的议题与合并请求镜像，每十分钟刷新一次。点击任意条目跳转至 GitHub。
+          </>
+        ),
+        pulls: "合并请求",
+        issues: "议题",
+        shown: (n: number) => `${n} 条`,
+        actions: ["提交议题", "提交合并请求", "发起讨论"],
+      }
+    : {
+        title: "Activity",
+        lede: (
+          <>
+            Follow issues and pull requests from{" "}
+            <Link href="https://github.com/Hmbown/CodeWhale" className="link">Hmbown/CodeWhale</Link>,
+            mirrored here and refreshed every ten minutes. Select any item to open it on GitHub.
+          </>
+        ),
+        pulls: "Pull requests",
+        issues: "Issues",
+        shown: (n: number) => `${n} shown`,
+        actions: ["Open an issue", "Open a pull request", "Start a discussion"],
+      };
+  const actionLinks: { href: string; icon: IconName }[] = [
+    { href: "https://github.com/Hmbown/CodeWhale/issues/new/choose", icon: "alert" },
+    { href: "https://github.com/Hmbown/CodeWhale/compare", icon: "git-pull-request" },
+    { href: "https://github.com/Hmbown/CodeWhale/discussions/new", icon: "message" },
+  ];
+  const columns = [
+    { id: "feed-pulls", title: copy.pulls, items: pulls, status: pullsStatus },
+    { id: "feed-issues", title: copy.issues, items: issues, status: issuesStatus },
+  ];
+
   return (
     <>
-      {isZh ? (
-        <>
-          <section className="site-container section">
-            <div className="flex items-baseline gap-4 mb-3">
-              <Seal char="动" />
-              <div className="eyebrow">{eyebrow}</div>
-            </div>
-            <h1 className="font-display tracking-crisp">
-              动态 <span className="font-cjk text-indigo text-5xl ml-2">Activity</span>
-            </h1>
-            <p className="mt-5 max-w-3xl text-ink-soft text-lg leading-[1.9] tracking-wide">
-              来自{" "}
-              <Link href="https://github.com/Hmbown/CodeWhale" className="body-link">Hmbown/CodeWhale</Link>
-              {" "}的议题与合并请求实时镜像。每十分钟刷新一次。点击任意条目跳转至 GitHub。
-            </p>
-          </section>
-
-          <section className="site-container pb-16 grid lg:grid-cols-12 gap-10">
-            <div className="lg:col-span-6">
-              <div className="hairline-t hairline-b hairline-l hairline-r bg-paper">
-                <div className="bg-indigo text-paper px-4 py-3 flex items-baseline justify-between">
-                  <h2 className="font-cjk text-base">合并请求 · Pull Requests</h2>
-                  <span className="text-xs tabular">{pulls.length} 条</span>
-                </div>
-                <div className="px-4">
-                  {pulls.length > 0 ? (
-                    pulls.map((p) => <FeedCard key={p.url} item={p} />)
-                  ) : (
-                    <div className="py-4">{columnState(pullsStatus)}</div>
-                  )}
-                </div>
+      <PageHeader title={copy.title} lede={copy.lede} pose="browse" />
+      <div className="page-body">
+        <div className="grid-2 feed-columns">
+          {columns.map((column) => (
+            <section key={column.id} className="feed-column" aria-labelledby={column.id}>
+              <div className="feed-column-head">
+                <h2 id={column.id}>{column.title}</h2>
+                <span className="page-meta tabular">{copy.shown(column.items.length)}</span>
               </div>
-            </div>
+              {column.items.length > 0 ? (
+                <ul className="feed-items" role="list">
+                  {column.items.map((item) => (
+                    <li key={item.url}><FeedCard item={item} /></li>
+                  ))}
+                </ul>
+              ) : (
+                <div className="feed-empty">{columnState(column.status)}</div>
+              )}
+            </section>
+          ))}
+        </div>
 
-            <div className="lg:col-span-6">
-              <div className="hairline-t hairline-b hairline-l hairline-r bg-paper">
-                <div className="bg-paper-deep text-ink px-4 py-3 flex items-baseline justify-between">
-                  <h2 className="font-cjk text-base">议题 · Issues</h2>
-                  <span className="text-xs tabular">{issues.length} 条</span>
-                </div>
-                <div className="px-4">
-                  {issues.length > 0 ? (
-                    issues.map((i) => <FeedCard key={i.url} item={i} />)
-                  ) : (
-                    <div className="py-4">{columnState(issuesStatus)}</div>
-                  )}
-                </div>
-              </div>
-            </div>
-          </section>
-
-          <section className="bg-paper-deep hairline-t hairline-b">
-            <div className="site-container py-10 grid md:grid-cols-3 gap-6 text-center">
-              <Link href="https://github.com/Hmbown/CodeWhale/issues/new/choose" className="hairline-t hairline-b hairline-l hairline-r bg-paper p-6 hover:bg-indigo hover:text-paper transition-colors">
-                <div className="font-display text-xl mb-1">提交议题</div>
-                <div className="font-cjk text-sm text-ink-mute">Open an issue</div>
-              </Link>
-              <Link href="https://github.com/Hmbown/CodeWhale/compare" className="hairline-t hairline-b hairline-l hairline-r bg-paper p-6 hover:bg-indigo hover:text-paper transition-colors">
-                <div className="font-display text-xl mb-1">提交合并请求</div>
-                <div className="font-cjk text-sm text-ink-mute">Open a PR</div>
-              </Link>
-              <Link href="https://github.com/Hmbown/CodeWhale/discussions/new" className="hairline-t hairline-b hairline-l hairline-r bg-paper p-6 hover:bg-indigo hover:text-paper transition-colors">
-                <div className="font-display text-xl mb-1">发起讨论</div>
-                <div className="font-cjk text-sm text-ink-mute">Start a discussion</div>
-              </Link>
-            </div>
-          </section>
-        </>
-      ) : (
-        <>
-          <section className="site-container section">
-            <div className="flex items-baseline gap-4 mb-3">
-              <Seal char="动" />
-              <div className="eyebrow">{eyebrow}</div>
-            </div>
-            <h1 className="font-display tracking-crisp">
-              Activity <span className="font-cjk text-indigo text-5xl ml-2">动态</span>
-            </h1>
-            <p className="mt-5 max-w-3xl text-ink-soft text-lg leading-relaxed">
-              A live mirror of issues and pull requests from{" "}
-              <Link href="https://github.com/Hmbown/CodeWhale" className="body-link">Hmbown/CodeWhale</Link>.
-              Refreshed every ten minutes. Click any item to jump to GitHub.
-            </p>
-          </section>
-
-          <section className="site-container pb-16 grid lg:grid-cols-12 gap-10">
-            <div className="lg:col-span-6">
-              <div className="hairline-t hairline-b hairline-l hairline-r bg-paper">
-                <div className="bg-indigo text-paper px-4 py-3 flex items-baseline justify-between">
-                  <h2 className="font-cjk text-base">合并 · Pull Requests</h2>
-                  <span className="text-xs tabular">{pulls.length} shown</span>
-                </div>
-                <div className="px-4">
-                  {pulls.length > 0 ? (
-                    pulls.map((p) => <FeedCard key={p.url} item={p} />)
-                  ) : (
-                    <div className="py-4">{columnState(pullsStatus)}</div>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            <div className="lg:col-span-6">
-              <div className="hairline-t hairline-b hairline-l hairline-r bg-paper">
-                <div className="bg-paper-deep text-ink px-4 py-3 flex items-baseline justify-between">
-                  <h2 className="font-cjk text-base">议题 · Issues</h2>
-                  <span className="text-xs tabular">{issues.length} shown</span>
-                </div>
-                <div className="px-4">
-                  {issues.length > 0 ? (
-                    issues.map((i) => <FeedCard key={i.url} item={i} />)
-                  ) : (
-                    <div className="py-4">{columnState(issuesStatus)}</div>
-                  )}
-                </div>
-              </div>
-            </div>
-          </section>
-
-          <section className="bg-paper-deep hairline-t hairline-b">
-            <div className="site-container py-10 grid md:grid-cols-3 gap-6 text-center">
-              <Link href="https://github.com/Hmbown/CodeWhale/issues/new/choose" className="hairline-t hairline-b hairline-l hairline-r bg-paper p-6 hover:bg-indigo hover:text-paper transition-colors">
-                <div className="font-display text-xl mb-1">Open an issue</div>
-                <div className="font-cjk text-sm text-ink-mute">提交议题</div>
-              </Link>
-              <Link href="https://github.com/Hmbown/CodeWhale/compare" className="hairline-t hairline-b hairline-l hairline-r bg-paper p-6 hover:bg-indigo hover:text-paper transition-colors">
-                <div className="font-display text-xl mb-1">Open a PR</div>
-                <div className="font-cjk text-sm text-ink-mute">提交合并</div>
-              </Link>
-              <Link href="https://github.com/Hmbown/CodeWhale/discussions/new" className="hairline-t hairline-b hairline-l hairline-r bg-paper p-6 hover:bg-indigo hover:text-paper transition-colors">
-                <div className="font-display text-xl mb-1">Start a discussion</div>
-                <div className="font-cjk text-sm text-ink-mute">发起讨论</div>
-              </Link>
-            </div>
-          </section>
-        </>
-      )}
+        <section className="page-section">
+          <ul className="grid-3" role="list">
+            {actionLinks.map((link, index) => (
+              <li key={link.href}>
+                <Link href={link.href} className="dir-row feed-action">
+                  <span className="dir-mark" aria-hidden="true"><Icon name={link.icon} /></span>
+                  <span className="dir-text"><span className="dir-title">{copy.actions[index]}</span></span>
+                  <span className="dir-action" aria-hidden="true"><Icon name="external" /></span>
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </section>
+      </div>
     </>
   );
 }

@@ -5,10 +5,11 @@ import { INSTALL_COMMANDS } from "@/lib/content/install";
 import { InstallCodeBlock } from "./install-code-block";
 
 /**
- * The hero's copyable install: one segmented choice between the checked
- * shell installer (macOS and Linux) and npm (any platform with Node 18+),
- * above the same copy block the install page uses. The option labels are
- * code-owned proper nouns; only the group's accessible name is translated.
+ * The hero's copyable install plate: one segmented choice between the
+ * checked shell installer (macOS and Linux) and npm (any platform with
+ * Node 18+), above the same copy block the install page uses. The option
+ * labels are code-owned proper nouns; only the group's accessible name is
+ * translated.
  */
 const OPTIONS = [
   { id: "shell", label: "macOS · Linux", cmd: INSTALL_COMMANDS.shell },
@@ -28,8 +29,8 @@ export function HeroInstall({
   const option = OPTIONS.find((o) => o.id === selected) ?? OPTIONS[0];
 
   return (
-    <div className="hero-install">
-      <div className="hero-install-switch" role="group" aria-label={ariaLabel}>
+    <div className="hero-install plate">
+      <div className="segmented" role="group" aria-label={ariaLabel}>
         {OPTIONS.map((o) => (
           <button
             key={o.id}

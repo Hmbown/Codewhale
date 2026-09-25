@@ -896,7 +896,6 @@ pub struct ConfigToml {
     pub selected_provider_id: Option<String>,
     pub model: Option<String>,
     pub auth_mode: Option<String>,
-    pub output_mode: Option<String>,
     pub verbosity: Option<String>,
     pub log_level: Option<String>,
     pub telemetry: Option<bool>,
@@ -1681,7 +1680,7 @@ pub struct LifecycleOutboxToml {
 /// Opt-in per-session control surface: when `enabled`, the interactive TUI
 /// binds a unix domain socket at `<sessions-dir>/<session-id>/control.sock`
 /// for the running session. The socket speaks newline-framed JSON-RPC with
-/// the verbs `message`, `interrupt`, `relaunch`, and `status`. An absent
+/// the verbs `message`, `interrupt`, and `status`. An absent
 /// table, or `enabled = false` (the default), disables the feature entirely —
 /// behavior is unchanged from a release without the table.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2803,7 +2802,6 @@ impl ConfigToml {
             "default_text_model" => self.default_text_model.clone(),
             "model" => self.model.clone(),
             "auth.mode" => self.auth_mode.clone(),
-            "output_mode" => self.output_mode.clone(),
             "verbosity" => self.verbosity.clone(),
             "log_level" => self.log_level.clone(),
             "telemetry" => self.telemetry.map(|v| v.to_string()),
@@ -2969,7 +2967,6 @@ impl ConfigToml {
             "default_text_model" => self.default_text_model = Some(value.to_string()),
             "model" => self.model = Some(value.to_string()),
             "auth.mode" => self.auth_mode = Some(value.to_string()),
-            "output_mode" => self.output_mode = Some(value.to_string()),
             "verbosity" => self.verbosity = Some(value.to_string()),
             "log_level" => self.log_level = Some(value.to_string()),
             "telemetry" => {
@@ -2981,6 +2978,15 @@ impl ConfigToml {
             "telemetry_endpoint" => self.telemetry_endpoint = Some(value.to_string()),
             "approval_policy" => self.approval_policy = Some(value.to_string()),
             "sandbox_mode" => self.sandbox_mode = Some(value.to_string()),
+            // The TUI reader (`ReasoningEffort::parse_strict`) owns this
+            // vocabulary and accepts aliases the schema's option list does
+            // not name (`none`, `mid`, `maximum`, ...), so the schema check
+            // below would refuse values that take effect. `codewhale config
+            // set` validates against that reader before calling here.
+            "reasoning_effort" => {
+                self.extras
+                    .insert(key.to_string(), toml::Value::String(value.to_string()));
+            }
             "hook_sinks.unix_socket_path" => {
                 self.hook_sinks
                     .get_or_insert_with(HookSinksToml::default)
@@ -2995,8 +3001,16 @@ impl ConfigToml {
                 );
             }
             _ => {
-                self.extras
-                    .insert(key.to_string(), toml::Value::String(value.to_string()));
+                // A declared setting keeps its declared type (#6563): refuse a
+                // value the schema cannot hold, and store booleans and numbers
+                // as TOML values so typed readers deserialize them. Whether an
+                // undeclared key is read by anything is the caller's question;
+                // `codewhale config set` refuses those before reaching here.
+                let stored = match setting(key) {
+                    Some(def) => schema_toml_value(key, def, value)?,
+                    None => toml::Value::String(value.to_string()),
+                };
+                self.extras.insert(key.to_string(), stored);
             }
         }
         Ok(())
@@ -3031,7 +3045,6 @@ impl ConfigToml {
             "default_text_model" => self.default_text_model = None,
             "model" => self.model = None,
             "auth.mode" => self.auth_mode = None,
-            "output_mode" => self.output_mode = None,
             "verbosity" => self.verbosity = None,
             "log_level" => self.log_level = None,
             "telemetry" => self.telemetry = None,
@@ -3072,9 +3085,6 @@ impl ConfigToml {
         }
         if let Some(v) = self.auth_mode.as_ref() {
             out.insert("auth.mode".to_string(), v.clone());
-        }
-        if let Some(v) = self.output_mode.as_ref() {
-            out.insert("output_mode".to_string(), v.clone());
         }
         if let Some(v) = self.verbosity.as_ref() {
             out.insert("verbosity".to_string(), v.clone());
@@ -3439,11 +3449,6 @@ impl ConfigToml {
             http_headers.retain(|name, _| !is_upstream_auth_header(name));
         }
 
-        let output_mode = cli
-            .output_mode
-            .clone()
-            .or_else(|| env.output_mode.clone())
-            .or_else(|| self.output_mode.clone());
         let log_level = cli
             .log_level
             .clone()
@@ -3530,7 +3535,6 @@ impl ConfigToml {
             base_url,
             auth_mode,
             insecure_skip_tls_verify: provider_cfg.insecure_skip_tls_verify.unwrap_or(false),
-            output_mode,
             log_level,
             telemetry,
             telemetry_source,
@@ -5055,7 +5059,6 @@ pub struct CliRuntimeOverrides {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub auth_mode: Option<String>,
-    pub output_mode: Option<String>,
     pub log_level: Option<String>,
     pub telemetry: Option<bool>,
     pub approval_policy: Option<String>,
@@ -5145,7 +5148,6 @@ pub struct ResolvedRuntimeOptions {
     pub base_url: String,
     pub auth_mode: Option<String>,
     pub insecure_skip_tls_verify: bool,
-    pub output_mode: Option<String>,
     pub log_level: Option<String>,
     pub telemetry: bool,
     /// Where the resolved telemetry consent came from (cli | env | config |
@@ -6586,6 +6588,43 @@ pub fn migrate_config_if_needed() -> Result<Option<ConfigMigration>> {
     }))
 }
 
+/// `value` as the TOML value a [`SettingDef`] declares, or an error naming
+/// the key and what it accepts. No partial write happens on error.
+fn schema_toml_value(key: &str, def: &SettingDef, value: &str) -> Result<toml::Value> {
+    let trimmed = value.trim();
+    Ok(match def.kind {
+        SettingKind::Bool(_) => toml::Value::Boolean(
+            parse_bool(value).with_context(|| format!("invalid value for '{key}'"))?,
+        ),
+        SettingKind::Int => toml::Value::Integer(trimmed.parse().map_err(|_| {
+            anyhow::anyhow!("invalid value '{value}' for '{key}': expected an integer")
+        })?),
+        SettingKind::Float => toml::Value::Float(
+            trimmed
+                .parse::<f64>()
+                .ok()
+                .filter(|number| number.is_finite())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("invalid value '{value}' for '{key}': expected a number")
+                })?,
+        ),
+        SettingKind::Enum(options) => {
+            let Some(option) = options
+                .iter()
+                .find(|option| option.value.eq_ignore_ascii_case(trimmed))
+            else {
+                let expected: Vec<&str> = options.iter().map(|option| option.value).collect();
+                bail!(
+                    "invalid value '{value}' for '{key}': expected one of {}",
+                    expected.join(", ")
+                );
+            };
+            toml::Value::String(option.value.to_string())
+        }
+        SettingKind::String => toml::Value::String(value.to_string()),
+    })
+}
+
 fn parse_bool(raw: &str) -> Result<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" | "enabled" => Ok(true),
@@ -6956,7 +6995,6 @@ struct EnvRuntimeOverrides {
     novita_model: Option<String>,
     fireworks_model: Option<String>,
     arcee_model: Option<String>,
-    output_mode: Option<String>,
     auth_mode: Option<String>,
     log_level: Option<String>,
     telemetry: Option<bool>,
@@ -7109,9 +7147,6 @@ impl EnvRuntimeOverrides {
                 .filter(|v| !v.trim().is_empty()),
             verbosity: std::env::var("CODEWHALE_VERBOSITY")
                 .or_else(|_| std::env::var("DEEPSEEK_VERBOSITY"))
-                .ok(),
-            output_mode: std::env::var("CODEWHALE_OUTPUT_MODE")
-                .or_else(|_| std::env::var("DEEPSEEK_OUTPUT_MODE"))
                 .ok(),
             auth_mode: std::env::var("CODEWHALE_AUTH_MODE")
                 .or_else(|_| std::env::var("DEEPSEEK_AUTH_MODE"))

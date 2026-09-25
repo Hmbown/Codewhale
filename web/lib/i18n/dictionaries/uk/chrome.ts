@@ -29,24 +29,7 @@ export const chrome: ChromeDict = {
 
   authSignIn: "Увійти",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "будь-яка модель, на вашій машині",
-
-  issueLabel: "Випуск {date}",
   dateLocale: "uk-UA",
-
-  tickerLiveLabel: "Наживо",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "влито",
-  tickerOpened: "відкрито",
-  tickerClosed: "закрито",
-  tickerReleased: "реліз",
-  tickerFirstContribution: "перший внесок",
-  tickerBy: "автор {handle}",
-  tickerAria: "Нещодавня активність репозиторію",
-
-  traceLabel: "хід міркувань",
-  traceTabsAria: "Фрагменти сеансу",
 
   menuOpen: "Відкрити меню",
   menuClose: "Закрити меню",

@@ -358,20 +358,24 @@ pub(super) async fn resume_session_thread(
 
     let thread = state
         .runtime_threads
-        .create_thread(CreateThreadRequest {
-            model: Some(model),
-            model_provider: Some(session.metadata.model_provider.clone()),
-            model_provider_id: session.metadata.model_provider_id.clone(),
-            workspace: Some(session.metadata.workspace.clone()),
-            mode: Some(mode),
-            allow_shell: None,
-            trust_mode: None,
-            auto_approve: None,
-            archived: false,
-            system_prompt: session.system_prompt.clone(),
-            task_id: None,
-            ..Default::default()
-        })
+        .create_thread_with_shell_policy(
+            CreateThreadRequest {
+                model: Some(model),
+                model_provider: Some(session.metadata.model_provider.clone()),
+                model_provider_id: session.metadata.model_provider_id.clone(),
+                workspace: Some(session.metadata.workspace.clone()),
+                mode: Some(mode),
+                allow_shell: None,
+                trust_mode: None,
+                auto_approve: None,
+                archived: false,
+                system_prompt: session.system_prompt.clone(),
+                task_id: None,
+                ..Default::default()
+            },
+            state.config_path.as_deref(),
+            state.config_profile.as_deref(),
+        )
         .await
         .map_err(map_resume_thread_create_err)?;
 
@@ -759,6 +763,11 @@ async fn persist_thread_cost(
 /// Unlike `POST /v1/sessions` (which reconstructs messages from stored turn
 /// items), this endpoint asks the engine for its live session snapshot so
 /// token counts and message ordering are authoritative.
+///
+/// `session_id` names the document to write. Omitted, the document is the
+/// conversation's own id (the one its workspace snapshots are tagged with),
+/// so a thread never ends up bound to a session that owns none of them — see
+/// [`crate::core::ops::SessionSnapshot::session_id`].
 pub(super) async fn save_current_session(
     State(state): State<RuntimeApiState>,
     Json(req): Json<SaveSessionRequest>,
@@ -845,7 +854,16 @@ pub(super) async fn save_current_session(
             }
         }
     } else {
-        let mut session = crate::session_manager::create_saved_session_with_mode(
+        // No session was named, so the conversation the thread is running
+        // answers it — and the engine's live conversation id *is* that
+        // conversation's identity: every `tool:` / `pre-turn:` workspace
+        // snapshot it took is tagged with it, and `patch-undo` /
+        // `file-revert` select snapshots by the thread's binding. Minting a
+        // third uuid here (what this used to do) left the thread bound to a
+        // document whose id owned none of those snapshots, so an undo forked
+        // the conversation and left every file on disk untouched.
+        let mut session = crate::session_manager::create_saved_session_with_id_and_mode(
+            snapshot.session_id.clone(),
             &snapshot.messages,
             &snapshot.model,
             &snapshot.workspace,

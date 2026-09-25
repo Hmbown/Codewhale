@@ -1254,33 +1254,10 @@ fn parse_task_options(opts_json: &str) -> Result<TaskRequest, String> {
     {
         return Err("task(): read-only roles cannot declare write-capable authority".to_string());
     }
-    if write_authority
-        .as_deref()
-        .is_some_and(|authority| authority != "read_only")
-        && options.write_roots.is_empty()
-        && options.exact_files.is_empty()
-        && options.coordination_contracts.is_empty()
-    {
-        return Err(
-            "task(): write-capable authority requires writeRoots, exactFiles, or coordinationContracts"
-                .to_string(),
-        );
-    }
-    let explicit_write_identity = declared_kind == Some(TaskRoleKind::Implementer)
-        || (declared_kind == Some(TaskRoleKind::General)
-            && (role.is_some() || options.subagent_type.is_some()))
-        || (profile.is_some() && declared_kind.is_none());
-    if explicit_write_identity
-        && write_authority.as_deref() != Some("read_only")
-        && options.write_roots.is_empty()
-        && options.exact_files.is_empty()
-        && options.coordination_contracts.is_empty()
-    {
-        return Err(
-            "task(): explicit write-capable identities require writeRoots, exactFiles, or coordinationContracts"
-                .to_string(),
-        );
-    }
+    // A write-capable task with no declared scope is not refused here: the
+    // spawn boundary (`validate_spawn_write_contract`) claims the workspace
+    // root, or the task's deliverables, exactly as it does for a plain Agent
+    // spawn, and the coordination ledger arbitrates contention with live peers.
     if let Some(attempts) = options.schema_repair_attempts
         && attempts > SCHEMA_REPAIR_MAX_ATTEMPTS
     {

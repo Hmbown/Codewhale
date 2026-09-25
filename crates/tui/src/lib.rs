@@ -34,6 +34,7 @@ mod composer_history;
 mod composer_stash;
 pub mod computer_meter;
 mod config;
+pub mod config_keys;
 mod config_persistence;
 mod context_budget;
 mod context_report;
@@ -2382,8 +2383,8 @@ async fn run_async_main_dispatch(
                     let _ = parse_sandbox_policy(sandbox, true, Vec::new(), false, false)?;
                     config.sandbox_mode = Some(sandbox.to_ascii_lowercase());
                 }
-                // Honour CODEWHALE_BASE_URL / DEEPSEEK_BASE_URL forwarded by
-                // the CLI dispatcher from --base-url.
+                // Honour CODEWHALE_BASE_URL (forwarded by the CLI dispatcher
+                // from --base-url) or the user-set legacy DEEPSEEK_BASE_URL.
                 if let Ok(env_url) = std::env::var("CODEWHALE_BASE_URL")
                     .or_else(|_| std::env::var("DEEPSEEK_BASE_URL"))
                 {
@@ -15344,8 +15345,6 @@ mod terminal_mode_tests {
         let workspace = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
         let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home);
-        crate::provider_catalog_live::reset_cache_for_test();
-
         let fleets = home.join("fleets");
         std::fs::create_dir_all(&fleets).expect("fleets dir");
         std::fs::write(
@@ -15358,6 +15357,9 @@ mod terminal_mode_tests {
 
         let config = Config {
             provider: Some("deepseek".to_string()),
+            // A fresh one-row roster must not replace the normal DeepSeek
+            // endpoint's process-wide catalog for unrelated route tests.
+            base_url: Some("https://api.deepseek.com/v1/doctor-roster-fixture".to_string()),
             ..Default::default()
         };
         let kind = crate::config::ApiProvider::Deepseek;
@@ -18885,7 +18887,6 @@ api_key = "test-only-key"
                 alternate_screen: Some("never".to_string()),
                 mouse_capture: None,
                 selection_copy_markdown: None,
-                terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
                 turn_wall_clock_secs: None,
@@ -18986,7 +18987,6 @@ api_key = "test-only-key"
                 alternate_screen: None,
                 mouse_capture: Some(false),
                 selection_copy_markdown: None,
-                terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
                 turn_wall_clock_secs: None,
@@ -19025,7 +19025,6 @@ api_key = "test-only-key"
                 alternate_screen: None,
                 mouse_capture: Some(true),
                 selection_copy_markdown: None,
-                terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
                 turn_wall_clock_secs: None,
@@ -19118,7 +19117,6 @@ api_key = "test-only-key"
                 alternate_screen: None,
                 mouse_capture: Some(true),
                 selection_copy_markdown: None,
-                terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
                 turn_wall_clock_secs: None,

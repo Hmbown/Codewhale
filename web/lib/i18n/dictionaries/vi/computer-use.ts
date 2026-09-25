@@ -39,7 +39,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Xem kiểm tra nền",
   source: "Mã nguồn và các nền tảng khác",
   platforms: "Bản tải này dành cho Mac. Windows và Linux hiện dùng plugin từ mã nguồn cùng thiết lập phía máy chủ.",
-  installTitle: "Computer Use cho Mac",
-  installLead: "Thêm khả năng điều khiển ứng dụng trong nền với trợ lý Computer Use. Thiết lập quyền trên Mac, chạy kiểm tra nền, rồi tạm dừng hoặc dừng thao tác nhập của trợ lý từ thanh menu.",
-  installLink: "Tải và thiết lập Computer Use",
 };

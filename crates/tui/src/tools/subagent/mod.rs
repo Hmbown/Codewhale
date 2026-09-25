@@ -3627,8 +3627,9 @@ pub struct SubAgentManager {
     max_steps: Option<u32>,
     /// Configured default per-child wall-clock budget (`[subagents]
     /// default_wall_time_secs`, #5324). `None` keeps
-    /// `DEFAULT_CHILD_WALL_TIME`; an explicit spawn `wall_time_secs` still
-    /// wins.
+    /// `DEFAULT_CHILD_WALL_TIME`, which an explicit spawn `wall_time_secs`
+    /// may raise up to `MAX_CHILD_WALL_TIME`; a configured value is also a
+    /// ceiling on explicit requests.
     wall_time: Option<Duration>,
     max_agents: usize,
     max_admitted_agents: usize,
@@ -7482,10 +7483,14 @@ impl SubAgentManager {
                 runtime.max_spawn_depth
             ));
         }
+        // The built-in 30-minute clock is a default, not a ceiling: an explicit
+        // `wall_time_secs` may raise it up to MAX_CHILD_WALL_TIME. An operator
+        // `[subagents] default_wall_time_secs` stays a ceiling, and inherited
+        // profiles and deadlines still only narrow.
         let wall_time = options
             .wall_time
-            .unwrap_or(MAX_CHILD_WALL_TIME)
-            .min(self.wall_time.unwrap_or(DEFAULT_CHILD_WALL_TIME))
+            .unwrap_or_else(|| self.wall_time.unwrap_or(DEFAULT_CHILD_WALL_TIME))
+            .min(self.wall_time.unwrap_or(MAX_CHILD_WALL_TIME))
             .min(
                 runtime
                     .worker_profile
@@ -10129,7 +10134,7 @@ impl ToolSpec for AgentTool {
                 },
                 "wall_time_secs": {
                     "type": "integer", "minimum": 1, "maximum": MAX_CHILD_WALL_TIME.as_secs(),
-                    "description": "Whole-run wall time including queue, model and tools. Only narrows inherited/operator deadlines; continuation does not restart the clock."
+                    "description": "Whole-run wall time (queue, model, tools); default 1800, may exceed that but never inherited or operator limits. Continuation keeps the clock."
                 },
                 "deliverables": {
                     "type": "array", "maxItems": 16,
@@ -10152,9 +10157,13 @@ impl ToolSpec for AgentTool {
                     "type": "array", "items": {"type": "string", "minLength": 1},
                     "description": "Named coordination contracts claimed by the child or added by action=claim. Peer contention is refused."
                 },
+                "fork_context": {
+                    "type": "boolean",
+                    "description": "For start: true = child starts from your conversation prefix (cache-shared); default fresh. Never grants permissions."
+                },
                 "resume_from": {
                     "type": "string",
-                    "description": "Settled child agent_id or session name to fork into a separate new worker. Repeating start with resume_from creates another independent worker; use action=followup to continue parked work without an accidental duplicate. The source must not be running. Its full transcript is loaded and prepended as the new child's context (fork_context=true), continuing the transcript lineage under a new role or profile (e.g. explore → implementer → verifier). Mutually exclusive with fork_context=false. Cross-workspace or missing sources are rejected with a clear error."
+                    "description": "Settled child agent_id or session name to fork into a new independent worker; each start makes another, so use action=followup to continue parked work. Its full transcript becomes the new child's context, continuing the lineage under a new role or profile (e.g. explore → implementer → verifier). Refused with fork_context=false, or for cross-workspace or missing sources."
                 }
             },
             "dependentSchemas": {
@@ -11035,10 +11044,10 @@ async fn spawn_subagent_from_input(
         }
         None => resolve_spawn_route_profile(&runtime, &mut spawn_request, &spawn_roster(&runtime))?,
     };
-    // Role resolution runs before classification so the bounded-write contract
-    // sees the effective role: read-only roles stay ergonomic while a
-    // manager/builder role can never acquire an implicit repository-wide
-    // write claim.
+    // Role resolution runs before classification so the write contract sees
+    // the effective role: read-only roles stay ergonomic, and a write-capable
+    // role with no declared scope claims the workspace root ('.'), which the
+    // coordination ledger then arbitrates against live peers.
     validate_spawn_write_contract(&mut spawn_request, false)?;
 
     if runtime.would_exceed_depth() {
@@ -15193,8 +15202,7 @@ fn parse_optional_u64(input: &Value, keys: &[&str]) -> Result<Option<u64>, ToolE
     let Some((key, value)) = aliased_value(input, keys) else {
         return Ok(None);
     };
-    value
-        .as_u64()
+    codewhale_tools::json_nonnegative_integer(value)
         .map(Some)
         .ok_or_else(|| codewhale_tools::type_mismatch(key, value, "a non-negative integer"))
 }
@@ -16933,8 +16941,9 @@ fn parse_optional_bounded_limit(
     let mut limit = None;
     for name in names {
         if let Some(value) = input.get(*name) {
-            let parsed = value
-                .as_u64()
+            // Whole-number floats (`900.0`) are integers too: some providers
+            // serialize every JSON number as a float.
+            let parsed = codewhale_tools::json_nonnegative_integer(value)
                 .filter(|value| *value > 0 && *value <= maximum)
                 .ok_or_else(|| {
                     ToolError::invalid_input(if maximum == u64::MAX {
@@ -19348,7 +19357,7 @@ impl SubAgentToolRegistry {
 /// (`mcp_<server>_<tool>`): the two shipped computer-use surfaces plus the
 /// generic `computer-use` / `computer_use` markers a third-party desktop
 /// server carries in its server id.
-fn is_machine_control_tool(name: &str) -> bool {
+pub(crate) fn is_machine_control_tool(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let Some(rest) = lower.strip_prefix("mcp_") else {
         return false;

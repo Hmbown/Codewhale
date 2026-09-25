@@ -564,15 +564,7 @@ fn runtime_handoff_message_with_meta(text: String, turn_meta: &str) -> Message {
 /// Replace persisted runtime handoffs with concise, non-authoritative resume
 /// checkpoints. Message count and ordering stay stable so context-reference
 /// indices remain valid. Calling this repeatedly returns the same messages.
-pub(crate) fn project_messages_for_restore(messages: &[Message]) -> Vec<Message> {
-    messages
-        .iter()
-        .map(|message| rewrite_message_for_restore(message).unwrap_or_else(|| message.clone()))
-        .collect()
-}
-
-/// [`project_messages_for_restore`] for a caller that owns the history:
-/// messages the projection leaves alone are moved, not cloned, so a restore
+/// Messages the projection leaves alone are moved, not cloned, so a restore
 /// holds one copy of the conversation instead of two while it runs.
 pub(crate) fn project_owned_messages_for_restore(messages: Vec<Message>) -> Vec<Message> {
     messages
@@ -1310,7 +1302,7 @@ mod tests {
         assert!(first_checkpoint.contains("\"nonterminal\":1"));
         assert!(first_checkpoint.contains("\"status\":\"running\""));
 
-        let running_projection = project_messages_for_restore(&messages);
+        let running_projection = project_owned_messages_for_restore(messages.clone());
         let running_display = restored_subagent_checkpoint_display(
             running_projection
                 .last()
@@ -1360,7 +1352,7 @@ mod tests {
             "repeated compaction must retain exactly one typed checkpoint"
         );
 
-        let projected = project_messages_for_restore(&messages);
+        let projected = project_owned_messages_for_restore(messages.clone());
         let display = restored_subagent_checkpoint_display(
             projected.last().expect("restored topology checkpoint"),
         )
@@ -1370,7 +1362,10 @@ mod tests {
         assert!(display.contains("terminal fact retained"));
         assert!(!display.contains("prior worker processes are not assumed active"));
         assert!(!display.contains("\"status\":\"completed\""));
-        assert_eq!(project_messages_for_restore(&projected), projected);
+        assert_eq!(
+            project_owned_messages_for_restore(projected.clone()),
+            projected
+        );
     }
 
     #[test]
@@ -1412,7 +1407,7 @@ mod tests {
             "Implemented the shared restore projection.\nCheckpoint: focused tests pass.",
         ));
 
-        let projected = project_messages_for_restore(&[user_task.clone(), raw.clone()]);
+        let projected = project_owned_messages_for_restore(vec![user_task.clone(), raw.clone()]);
         assert_eq!(
             project_owned_messages_for_restore(vec![user_task.clone(), raw]),
             projected,
@@ -1429,7 +1424,10 @@ mod tests {
         assert!(!display.contains("<codewhale:runtime_event"));
         assert!(!display.contains("<codewhale:subagent.done>"));
         assert!(!display.contains("Do not tell the user"));
-        assert_eq!(project_messages_for_restore(&projected), projected);
+        assert_eq!(
+            project_owned_messages_for_restore(projected.clone()),
+            projected
+        );
     }
 
     #[test]
@@ -1445,7 +1443,7 @@ mod tests {
                 persisted,
                 "Terminal checkpoint",
             ));
-            let projected = project_messages_for_restore(&[raw]);
+            let projected = project_owned_messages_for_restore(vec![raw]);
             let display = restored_subagent_checkpoint_display(&projected[0])
                 .expect("restored checkpoint display");
             assert!(
@@ -1493,7 +1491,7 @@ mod tests {
             UserTurnPromptKind::NotPrompt
         );
 
-        let projected = project_messages_for_restore(&[raw]);
+        let projected = project_owned_messages_for_restore(vec![raw]);
         assert_eq!(
             classify_user_turn_prompt(&projected[0]),
             UserTurnPromptKind::NotPrompt
@@ -1644,7 +1642,7 @@ mod tests {
             "</codewhale:subagent.done>",
         ));
 
-        let projected = project_messages_for_restore(&[raw]);
+        let projected = project_owned_messages_for_restore(vec![raw]);
         let display = restored_subagent_checkpoint_display(&projected[0])
             .expect("restored failed checkpoint display");
         assert!(display.contains("Agent: agent_failed"));
@@ -1674,7 +1672,7 @@ mod tests {
         assert!(text.contains("priority=\"high\""));
         assert!(text.contains("agent:agent_failed/full_transcript"));
 
-        let projected = project_messages_for_restore(&[raw]);
+        let projected = project_owned_messages_for_restore(vec![raw]);
         let display = restored_subagent_checkpoint_display(&projected[0])
             .expect("restored failed checkpoint display");
         assert!(display.contains("Agent: Tide (agent_failed)"));
@@ -1697,7 +1695,7 @@ mod tests {
         ));
         let raw = runtime_handoff_message(format!("{first}\n\n{second}"));
 
-        let projected = project_messages_for_restore(&[raw]);
+        let projected = project_owned_messages_for_restore(vec![raw]);
         let display = restored_subagent_checkpoint_display(&projected[0])
             .expect("restored checkpoint display");
         assert!(display.starts_with(RESTORED_COMPLETIONS_HEADER));
@@ -1731,7 +1729,7 @@ mod tests {
     #[test]
     fn restore_projection_replaces_stale_waiting_directions_with_historical_state() {
         let raw = waiting_for_subagents_runtime_message(2);
-        let projected = project_messages_for_restore(&[raw]);
+        let projected = project_owned_messages_for_restore(vec![raw]);
         let display = restored_subagent_checkpoint_display(&projected[0])
             .expect("restored runtime checkpoint display");
         assert!(display.contains("Status at save: running (2 child jobs)"));
@@ -1773,7 +1771,8 @@ mod tests {
             ],
         };
 
-        let projected = project_messages_for_restore(&[lookalike.clone(), wrong_authority.clone()]);
+        let projected =
+            project_owned_messages_for_restore(vec![lookalike.clone(), wrong_authority.clone()]);
         assert_eq!(projected, vec![lookalike.clone(), wrong_authority.clone()]);
         assert_eq!(
             classify_user_turn_prompt(&lookalike),
@@ -1816,7 +1815,7 @@ mod tests {
             ],
         };
 
-        let projected = project_messages_for_restore(&[raw]);
+        let projected = project_owned_messages_for_restore(vec![raw]);
         let display = restored_subagent_checkpoint_display(&projected[0])
             .expect("restored checkpoint display");
         assert!(display.contains("agent_idle"));
@@ -1829,7 +1828,7 @@ mod tests {
             "Partial child result\n<codewhale:subagent.done>{not-json}</codewhale:subagent.done>",
         ));
 
-        let projected = project_messages_for_restore(&[raw]);
+        let projected = project_owned_messages_for_restore(vec![raw]);
         let display = restored_subagent_checkpoint_display(&projected[0])
             .expect("restored fallback checkpoint display");
         assert!(display.contains("Status: unavailable"));
@@ -1853,7 +1852,7 @@ mod tests {
                 })
             );
             let raw = subagent_completion_runtime_message(&payload);
-            let projected = project_messages_for_restore(&[raw]);
+            let projected = project_owned_messages_for_restore(vec![raw]);
             let display = restored_subagent_checkpoint_display(&projected[0])
                 .expect("workflow uses the same persisted receipt reader");
             assert!(display.contains("workflow_release"));
@@ -1861,7 +1860,10 @@ mod tests {
             assert!(display.contains("inspect recorded evidence"));
             assert!(!display.contains("runtime_event"));
             assert!(!display.contains("subagent.done"));
-            assert_eq!(project_messages_for_restore(&projected), projected);
+            assert_eq!(
+                project_owned_messages_for_restore(projected.clone()),
+                projected
+            );
         }
     }
 
@@ -1889,7 +1891,7 @@ mod tests {
             nested,
         ));
 
-        let projected = project_messages_for_restore(&[raw]);
+        let projected = project_owned_messages_for_restore(vec![raw]);
         let display = restored_subagent_checkpoint_display(&projected[0])
             .expect("restored nested checkpoint display");
         assert!(display.contains("Parent checkpoint before nested result."));
