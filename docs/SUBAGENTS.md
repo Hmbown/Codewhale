@@ -586,7 +586,8 @@ finite budget.
 
 `max_steps` and `wall_time_secs` are optional per-call limits.
 Each can only narrow the applicable role, operator, parent, and saved-run
-limits. Omission inherits those limits; explicit zero, null, negative, or
+limits; the one exception is that `wall_time_secs` may raise the built-in
+1800-second default (see below). Omission inherits those limits; explicit zero, null, negative, or
 out-of-range values are rejected by the tool parser (schema minimum is 1).
 Fleet file task-specs use a different convention — there, omitted-or-zero
 means unbounded; see `docs/FLEET.md`.
@@ -594,9 +595,12 @@ means unbounded; see `docs/FLEET.md`.
 `max_steps` counts model turns and accepts 1 through 2000. All roles default
 to no model-turn cap unless an operator or ancestor supplies one; the internal
 zero representation for that default never cancels a finite inherited cap.
-`wall_time_secs` accepts 1 through 86400, with an operator-configurable
-1800-second default. It includes admission queue time, model requests, and
-tools. The effective absolute deadline is persisted.
+`wall_time_secs` accepts 1 through 86400. Omitted, it defaults to 1800
+seconds. An explicit value may go above that built-in default, for long
+unattended work; an operator-configured `default_wall_time_secs` is both the
+default and a ceiling, and role, parent, and saved-run deadlines still only
+narrow. It includes admission queue time, model requests, and tools. The
+effective absolute deadline is persisted.
 
 The wall clock starts when the agent is started, not when it gets a launch
 slot. This is deliberate. The queue wait and the run share one deadline, so a

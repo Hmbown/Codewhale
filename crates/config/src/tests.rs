@@ -9598,6 +9598,34 @@ fn unsupported_nested_config_write_fails_without_mutation() {
     assert_eq!(toml::to_string(&config).unwrap(), before);
 }
 
+/// #6516: `output_mode` had no reader and was removed from the typed schema. A
+/// config that still carries it must keep loading, and a typed save must keep
+/// the user's line rather than silently dropping it or failing on it.
+#[test]
+fn retired_output_mode_key_still_loads_and_survives_a_typed_save() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join(CONFIG_FILE_NAME);
+    fs::write(
+        &config_path,
+        "output_mode = \"plain\"\nverbosity = \"quiet\"\n\n[providers.deepseek]\nmodel = \"deepseek-v4-flash\"\n",
+    )
+    .expect("write config");
+
+    let mut store = ConfigStore::load(Some(config_path.clone())).expect("load config store");
+    assert_eq!(store.config.verbosity.as_deref(), Some("quiet"));
+    assert_eq!(
+        store.config.extras.get("output_mode"),
+        Some(&toml::Value::String("plain".to_string()))
+    );
+
+    store.config.verbosity = Some("concise".to_string());
+    store.save().expect("typed save");
+    let saved = fs::read_to_string(&config_path).expect("read saved config");
+    let reparsed: ConfigToml = toml::from_str(&saved).expect("saved config parses");
+    assert_eq!(reparsed.verbosity.as_deref(), Some("concise"));
+    assert!(saved.contains("output_mode = \"plain\""), "{saved}");
+}
+
 #[test]
 fn declared_setting_writes_keep_schema_type_and_refuse_bad_values() {
     let mut config = ConfigToml::default();

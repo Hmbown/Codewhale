@@ -101,24 +101,17 @@ describe("shared getting-started path", () => {
   });
 
   it("points every step and next link at a real on-site route", () => {
-    const knownRoutes = [
-      "/install",
-      "/models",
-      "/docs",
-      "/docs/guide",
-      "/docs/vocabulary",
-      "/docs/fleet",
-      "/docs/hooks",
-      "/docs/modes",
-    ];
+    // A link is real when its locale-relative route has an app-router page.
+    const routeExists = (href: string) =>
+      existsSync(new URL(`../../app/[locale]${href}/page.tsx`, import.meta.url));
     for (const step of GETTING_STARTED_STEPS) {
-      expect(knownRoutes, step.link.href).toContain(step.link.href);
+      expect(routeExists(step.link.href), step.link.href).toBe(true);
       expect(step.title.en.trim().length).toBeGreaterThan(0);
       expect(step.title.zh.trim().length).toBeGreaterThan(0);
       expect(`${step.body.en}\n${step.body.zh}`).not.toMatch(BANNED_COPY);
     }
     for (const link of GUIDE_NEXT_LINKS) {
-      expect(knownRoutes, link.href).toContain(link.href);
+      expect(routeExists(link.href), link.href).toBe(true);
     }
     // Hooks discovery is a first-class next step, not buried prose.
     expect(GUIDE_NEXT_LINKS.some((l) => l.href === "/docs/hooks")).toBe(true);

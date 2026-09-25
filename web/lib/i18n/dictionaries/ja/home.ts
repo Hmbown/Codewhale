@@ -26,11 +26,8 @@ export const home: HomeDict = {
   releaseUnavailable: "リリース情報を取得できません",
   currentSource: "ソース",
   sourceCandidate: "未リリース",
-  providerRoutes: "{count} プロバイダー",
   publishedRelease: "リリース済み",
   figcaptionSourceCandidate: "未リリース",
-  chapterTerminal: "あなたのターミナル",
-  chapterTerminalTitle: "作りたいものから始める",
   gainHeading: "Codewhale でできること",
   gainLede: "プロジェクトや質問、自動化したい作業から始めて、ひとつのエージェントと一緒に進めることも、大きな仕事を複数のエージェントに分担させることもできます。",
   gain: [
@@ -47,7 +44,6 @@ export const home: HomeDict = {
       "エージェントにホスト型またはローカルのモデルを使い、モデルや役割に合った仕事をそれぞれに任せられます。"
     ]
   ],
-  chapterModels: "あなたのモデル",
   modelsHeading: "作業に合わせて選べるモデル",
   modelsBody:
     "ホスト型のプロバイダーに直接接続することも、ゲートウェイを通じて複数のプロバイダーを利用することも、モデルをローカルで実行することもでき、作業中にセッションごとに使うモデルを選べます。",
@@ -61,7 +57,6 @@ export const home: HomeDict = {
   startLede: "Codewhale をインストールしてモデルを接続したら、ターミナルで最初の作業を伝え、複数のエージェントに分担してほしくなったときに Fleet を追加できます。",
   startGuideLink: "はじめかたガイドを読む",
   startVocabularyLink: "製品用語を見る",
-  chapterAccount: "Codewhale を入手",
   availabilityHeading: "Codewhale を使える場所",
   availabilityLede: "Codewhale は今すぐターミナルで使え、Web アプリ、デスクトップアプリ、クラウドコンピューターも現在開発しています。",
   availability: [

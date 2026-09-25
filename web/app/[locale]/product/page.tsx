@@ -1,4 +1,7 @@
 import Link from "next/link";
+import { Icon, type IconName } from "@/components/icon";
+import { PageHeader, Section } from "@/components/page-header";
+import { Status, type StatusTone } from "@/components/status-badge";
 import { getFacts } from "@/lib/facts";
 import { PRODUCT_COPY } from "@/lib/content/product";
 import { fill, getHome, pickText } from "@/lib/i18n/dictionaries";
@@ -16,6 +19,14 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   });
 }
 
+// Row order is fixed by PRODUCT_COPY and the home dictionary, so marks and
+// states follow the row, not a translated word.
+const GAIN_ICONS: IconName[] = ["layers", "users", "shield"];
+const SURFACE_ICONS: IconName[] = ["terminal", "plug", "monitor", "folder", "users"];
+// Terminal released · local browser ships with it · hosted web preview ·
+// desktop development build · cloud computers in development.
+const AVAILABILITY_TONES: StatusTone[] = ["ready", "ready", "attention", "idle", "idle"];
+
 /**
  * /product — what Codewhale is and what a person gains, with availability
  * stated per surface. Copy is the `PRODUCT_COPY` content module; counts come
@@ -30,101 +41,112 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
   const providerCount = facts.providers.length;
 
   return (
-    <div className="portal-home product-page">
-      <section className="hero">
-        <div className="portal-container community-welcome-inner">
-          <h1>{t(PRODUCT_COPY.title)}</h1>
-          <p>{t(PRODUCT_COPY.lede)}</p>
-          <div className="portal-actions">
-            <Link href={`/${locale}/install`} className="portal-button portal-button-primary">
+    <>
+      <PageHeader
+        title={t(PRODUCT_COPY.title)}
+        lede={t(PRODUCT_COPY.lede)}
+        pose="think"
+        actions={
+          <>
+            <Link href={`/${locale}/install`} className="btn btn-primary btn-lg">
               {t(PRODUCT_COPY.actions.install)}
             </Link>
-            <Link href={`/${locale}/docs`} className="portal-button portal-button-secondary">
+            <Link href={`/${locale}/docs`} className="btn btn-secondary btn-lg">
               {t(PRODUCT_COPY.actions.docs)}
             </Link>
-          </div>
-        </div>
-      </section>
+          </>
+        }
+      />
 
-      <section className="folio-section">
-        <div className="product-container">
-          <h2>{t(PRODUCT_COPY.gainHeading)}</h2>
-          <div className="folio-gain-grid">
-            {PRODUCT_COPY.gain.map((row) => (
-              <div key={row.title.en}>
+      <div className="page-body">
+        <Section
+          id="product-gain"
+          title={t(PRODUCT_COPY.gainHeading)}
+          link={
+            <Link href={`/${locale}/models`} className="section-link">
+              {t(PRODUCT_COPY.actions.models)}
+              <Icon name="arrow-right" className="icon icon-flip" />
+            </Link>
+          }
+        >
+          <div className="grid-3">
+            {PRODUCT_COPY.gain.map((row, index) => (
+              <div key={row.title.en} className="tile">
+                <span className="tile-icon" aria-hidden="true">
+                  <Icon name={GAIN_ICONS[index] ?? "layers"} />
+                </span>
                 <h3>{t(row.title)}</h3>
                 <p>{fill(t(row.body), { count: providerCount })}</p>
               </div>
             ))}
           </div>
-          <Link href={`/${locale}/models`} className="folio-link">
-            {t(PRODUCT_COPY.actions.models)}
-          </Link>
-        </div>
-      </section>
+        </Section>
 
-      <section className="folio-section product-page-surfaces">
-        <div className="product-container folio-chapter-grid">
-          <div>
-            <h2>{t(PRODUCT_COPY.surfacesHeading)}</h2>
-            <p className="folio-section-lede">{t(PRODUCT_COPY.surfacesLede)}</p>
-            <Link href={`/${locale}/runtime`} className="folio-link">
+        <Section
+          id="product-surfaces"
+          title={t(PRODUCT_COPY.surfacesHeading)}
+          scope={t(PRODUCT_COPY.surfacesLede)}
+          link={
+            <Link href={`/${locale}/runtime`} className="section-link">
               {t(PRODUCT_COPY.surfacesLink)}
+              <Icon name="arrow-right" className="icon icon-flip" />
             </Link>
-          </div>
-          <dl className="folio-fact-list">
-            {home.surfaces.map(([name, description]) => (
-              <div key={name}>
-                <dt>{name}</dt>
-                <dd>{description}</dd>
-              </div>
+          }
+        >
+          <ul className="dir-list dir-list-card" role="list">
+            {home.surfaces.map(([name, description], index) => (
+              <li key={name}>
+                <div className="dir-row">
+                  <span className="dir-mark" aria-hidden="true">
+                    <Icon name={SURFACE_ICONS[index] ?? "terminal"} />
+                  </span>
+                  <span className="dir-text">
+                    <span className="dir-title">{name}</span>
+                    <span className="dir-purpose">{description}</span>
+                  </span>
+                </div>
+              </li>
             ))}
-          </dl>
-        </div>
-      </section>
+          </ul>
+        </Section>
 
-      <section className="folio-section">
-        <div className="product-container folio-chapter-grid">
-          <div>
-            <h2>{t(PRODUCT_COPY.controlHeading)}</h2>
-            <p className="folio-section-lede">{t(PRODUCT_COPY.controlLede)}</p>
-          </div>
-          <div>
-            <dl className="folio-fact-list">
+        <Section id="product-control" title={t(PRODUCT_COPY.controlHeading)} scope={t(PRODUCT_COPY.controlLede)}>
+          <div className="grid-2">
+            <dl className="def-rows">
               {PRODUCT_COPY.modes.map((row) => (
-                <div key={row.title.en}>
+                <div key={row.title.en} className="def-row">
                   <dt>{t(row.title)}</dt>
                   <dd>{t(row.body)}</dd>
                 </div>
               ))}
             </dl>
-            <dl className="folio-fact-list mt-8">
+            <dl className="def-rows">
               {PRODUCT_COPY.permissions.map((row) => (
-                <div key={row.title.en}>
+                <div key={row.title.en} className="def-row">
                   <dt>{t(row.title)}</dt>
                   <dd>{t(row.body)}</dd>
                 </div>
               ))}
             </dl>
           </div>
-        </div>
-      </section>
+        </Section>
 
-      <section className="folio-section">
-        <div className="product-container">
-          <h2>{t(PRODUCT_COPY.availabilityHeading)}</h2>
-          <p className="folio-section-lede">{t(PRODUCT_COPY.availabilityLede)}</p>
-          <dl className="folio-availability-list product-availability-paper">
-            {PRODUCT_COPY.availability.map((row) => (
-              <div key={row.surface.en}>
+        <Section
+          id="product-availability"
+          title={t(PRODUCT_COPY.availabilityHeading)}
+          scope={t(PRODUCT_COPY.availabilityLede)}
+        >
+          <dl className="def-rows">
+            {PRODUCT_COPY.availability.map((row, index) => (
+              <div key={row.surface.en} className="def-row">
                 <dt>{t(row.surface)}</dt>
                 <dd>
-                  <strong>{t(row.status)}</strong>
+                  <Status tone={AVAILABILITY_TONES[index] ?? "idle"}>{t(row.status)}</Status>
                   {t(row.detail)}
                   {row.href && row.linkLabel && (
                     <>
                       {" "}
-                      <Link href={`/${locale}${row.href}`} className="body-link">
+                      <Link href={`/${locale}${row.href}`} className="link">
                         {t(row.linkLabel)}
                       </Link>
                     </>
@@ -133,8 +155,8 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
               </div>
             ))}
           </dl>
-        </div>
-      </section>
-    </div>
+        </Section>
+      </div>
+    </>
   );
 }

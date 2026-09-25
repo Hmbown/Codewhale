@@ -19,7 +19,6 @@ import type {
   DocsAuthDict,
   DocsComputersDict,
   DocsConfigurationDict,
-  DocsConstitutionDict,
   DocsFleetDict,
   DocsGuideDict,
   DocsHooksDict,
@@ -28,6 +27,7 @@ import type {
   DocsSandboxDict,
   DocsShellDict,
   DocsModesDict,
+  DocsReviewDict,
   DocsSubagentsDict,
   DocsTroubleshootingDict,
   DocsTrustDict,
@@ -52,8 +52,6 @@ import { docsTroubleshooting as enDocsTroubleshooting } from "./en/docs-troubles
 import { docsTroubleshooting as zhDocsTroubleshooting } from "./zh/docs-troubleshooting";
 import { docsConfiguration as enDocsConfiguration } from "./en/docs-configuration";
 import { docsConfiguration as zhDocsConfiguration } from "./zh/docs-configuration";
-import { docsConstitution as enDocsConstitution } from "./en/docs-constitution";
-import { docsConstitution as zhDocsConstitution } from "./zh/docs-constitution";
 import { docsFleet as enDocsFleet } from "./en/docs-fleet";
 import { docsFleet as zhDocsFleet } from "./zh/docs-fleet";
 import { docsMcp as enDocsMcp } from "./en/docs-mcp";
@@ -76,6 +74,8 @@ import { docsAuth as enDocsAuth } from "./en/docs-auth";
 import { docsAuth as zhDocsAuth } from "./zh/docs-auth";
 import { docsTrust as enDocsTrust } from "./en/docs-trust";
 import { docsTrust as zhDocsTrust } from "./zh/docs-trust";
+import { docsReview as enDocsReview } from "./en/docs-review";
+import { docsReview as zhDocsReview } from "./zh/docs-review";
 import { computerUse as enComputerUse } from "./en/computer-use";
 import { computerUse as zhComputerUse } from "./zh/computer-use";
 import { computerUse as jaComputerUse } from "./ja/computer-use";
@@ -227,10 +227,6 @@ const DOCS_CONFIGURATION: Record<string, DocsConfigurationDict> = {
   zh: zhDocsConfiguration,
 };
 
-const DOCS_CONSTITUTION: Record<string, DocsConstitutionDict> = {
-  zh: zhDocsConstitution,
-};
-
 const DOCS_FLEET: Record<string, DocsFleetDict> = {
   zh: zhDocsFleet,
 };
@@ -295,6 +291,10 @@ const DOCS_TRUST: Record<string, DocsTrustDict> = {
   zh: zhDocsTrust,
 };
 
+const DOCS_REVIEW: Record<string, DocsReviewDict> = {
+  zh: zhDocsReview,
+};
+
 /**
  * Shared surface states, the changelog page, the two legal pages, the digest
  * page and the FAQ follow the same optional per-locale rule as the docs page
@@ -353,10 +353,6 @@ export function getDocsConfiguration(locale: string): DocsConfigurationDict {
   return DOCS_CONFIGURATION[locale] ?? enDocsConfiguration;
 }
 
-export function getDocsConstitution(locale: string): DocsConstitutionDict {
-  return DOCS_CONSTITUTION[locale] ?? enDocsConstitution;
-}
-
 export function getDocsFleet(locale: string): DocsFleetDict {
   return DOCS_FLEET[locale] ?? enDocsFleet;
 }
@@ -399,6 +395,10 @@ export function getDocsAuth(locale: string): DocsAuthDict {
 
 export function getDocsTrust(locale: string): DocsTrustDict {
   return DOCS_TRUST[locale] ?? enDocsTrust;
+}
+
+export function getDocsReview(locale: string): DocsReviewDict {
+  return DOCS_REVIEW[locale] ?? enDocsReview;
 }
 
 export function getComputerUse(locale: string): ComputerUseDict {
@@ -453,7 +453,6 @@ export const EN_DOCS_SHELL = enDocsShell;
 export const EN_DOCS_HOOKS = enDocsHooks;
 export const EN_DOCS_TROUBLESHOOTING = enDocsTroubleshooting;
 export const EN_DOCS_CONFIGURATION = enDocsConfiguration;
-export const EN_DOCS_CONSTITUTION = enDocsConstitution;
 export const EN_DOCS_FLEET = enDocsFleet;
 export const EN_DOCS_MCP = enDocsMcp;
 export const EN_DOCS_MODES = enDocsModes;
@@ -465,6 +464,7 @@ export const EN_DOCS_WORK = enDocsWork;
 export const EN_DOCS_COMPUTERS = enDocsComputers;
 export const EN_DOCS_AUTH = enDocsAuth;
 export const EN_DOCS_TRUST = enDocsTrust;
+export const EN_DOCS_REVIEW = enDocsReview;
 export const EN_COMPUTER_USE = enComputerUse;
 export const EN_STATES = enStates;
 export const EN_CHANGELOG = enChangelog;
@@ -492,16 +492,3 @@ export function splitToken(template: string, token: string): string[] {
   return template.split(`{${token}}`);
 }
 
-/**
- * Split a template on every `{token}` it carries, for a sentence with more
- * than one substituted node. Returns literal text and token names
- * interleaved in template order, so a locale that reorders the tokens still
- * renders correctly and no translated fragment is concatenated by the
- * call site.
- */
-export function splitTokens(template: string): Array<{ text: string } | { token: string }> {
-  return template
-    .split(/\{(\w+)\}/g)
-    .map((part, i) => (i % 2 === 1 ? { token: part } : { text: part }))
-    .filter((part) => "token" in part || part.text !== "");
-}

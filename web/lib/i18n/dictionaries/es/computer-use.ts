@@ -40,7 +40,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Ver la comprobación en segundo plano",
   source: "Código fuente y otras plataformas",
   platforms: "Esta descarga es para Mac. En Windows y Linux, por ahora, se usa el plugin desde el código fuente y la configuración del lado del host.",
-  installTitle: "Computer Use para Mac",
-  installLead: "Añade el control de aplicaciones en segundo plano con el asistente de Computer Use. Configura los permisos de tu Mac, ejecuta una comprobación en segundo plano y pausa o detén la entrada del asistente desde la barra de menús.",
-  installLink: "Descarga y configuración de Computer Use",
 };

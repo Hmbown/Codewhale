@@ -5,6 +5,8 @@ import { faqSourceHref } from "@/lib/faq-source";
 import { fill, getFaq } from "@/lib/i18n/dictionaries";
 import { extractText } from "@/lib/react-text";
 import { highlightSpan } from "@/lib/search-utils";
+import { Icon } from "./icon";
+import { WhalePose } from "./whale-pose";
 
 export interface FaqSearchItem {
   q: string;
@@ -87,90 +89,77 @@ export function FaqSearch({
 
   return (
     <>
-      {/* Search bar */}
-      <div className="mb-6">
-        <div className="relative">
+      <div className="faq-search">
+        <div className="search-field">
+          <Icon name="search" className="search-field-icon" />
           <input
             ref={inputRef}
-            type="text"
+            type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder={t.searchPlaceholder}
-            className="search-input w-full"
+            className="search-input"
             aria-label={t.searchLabel}
+            aria-keyshortcuts="/"
           />
-          {hasQuery && (
+          {hasQuery ? (
             <button
+              type="button"
               onClick={() => setQuery("")}
-              className="absolute right-3 top-1/2 -translate-y-1/2 font-mono text-sm text-ink-mute hover:text-indigo transition-colors"
+              className="nav-icon-button nav-icon-button-sm search-field-clear"
               aria-label={t.searchClear}
+              title={t.searchClear}
             >
-              ✕
+              <Icon name="x" className="nav-icon" />
             </button>
+          ) : (
+            <kbd className="search-field-kbd" aria-hidden="true">/</kbd>
           )}
         </div>
-        {hasQuery && (
-          <div className="mt-2 font-mono text-[0.7rem] text-ink-mute" aria-live="polite">
-            {matched > 0
+        <p className="faq-search-count" aria-live="polite">
+          {hasQuery
+            ? matched > 0
               ? fill(t.searchMatches, { matched, total, query: query.trim() })
-              : fill(t.searchNoMatches, { query: query.trim() })}
-          </div>
-        )}
+              : fill(t.searchNoMatches, { query: query.trim() })
+            : ""}
+        </p>
       </div>
 
-      {/* FAQ list */}
       {matched > 0 ? (
-        <div className="space-y-0 hairline-t hairline-b">
+        <div className="group-card">
           {filtered.map(({ item, i }) => (
-            <details key={i} className="group hairline-b last:border-b-0">
-              <summary className="px-0 py-5 cursor-pointer flex items-start gap-4 hover:text-indigo transition-colors">
-                <span className="font-mono text-indigo tabular text-sm pt-0.5 shrink-0">
-                  {String(i + 1).padStart(2, "0")}
-                </span>
-                <span className="font-display text-lg leading-snug flex-1">
-                  {highlight(item.q, query)}
-                </span>
-                <span className="font-mono text-ink-mute text-sm group-open:rotate-45 transition-transform shrink-0">+</span>
+            <details key={i} className="disclosure-row">
+              <summary>
+                <span className="faq-index tabular" aria-hidden="true">{i + 1}</span>
+                <span className="faq-question">{highlight(item.q, query)}</span>
+                <Icon name="chevron-down" className="disclosure-chevron" />
               </summary>
-              <div className="pb-5 pl-10 pr-4">
-                <div className={`text-ink-soft leading-relaxed ${t.answerClassName}`}>
-                  {item.a}
-                </div>
+              <div className={`disclosure-body prose faq-answer ${t.answerClassName}`.trimEnd()}>
+                <div>{item.a}</div>
                 {item.sources && item.sources.length > 0 && (
-                  <div className="mt-3 flex items-center gap-2 flex-wrap">
-                    <span className="text-xs text-ink-mute">
-                      {t.sourcesLabel}:
-                    </span>
+                  <p className="faq-sources">
+                    <span>{t.sourcesLabel}:</span>
                     {item.sources.map((s) => {
                       const href = faqSourceHref(s);
                       return href ? (
-                        <a
-                          key={s}
-                          href={href}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="font-mono text-[0.7rem] text-indigo hover:underline"
-                        >
+                        <a key={s} href={href} target="_blank" rel="noreferrer">
                           {s}
                         </a>
                       ) : (
-                        <span key={s} className="font-mono text-[0.7rem] text-indigo">{s}</span>
+                        <code key={s}>{s}</code>
                       );
                     })}
-                  </div>
+                  </p>
                 )}
               </div>
             </details>
           ))}
         </div>
       ) : (
-        <div className="text-center py-16 hairline-t hairline-b">
-          <p className="font-display text-lg text-ink-mute mb-2">
-            {t.noResultsTitle}
-          </p>
-          <p className="text-sm text-ink-mute">
-            {t.noResultsBody}
-          </p>
+        <div className="empty-state" role="status">
+          <WhalePose pose="search" />
+          <p className="empty-state-title">{t.noResultsTitle}</p>
+          <p className="empty-state-reason">{t.noResultsBody}</p>
         </div>
       )}
     </>

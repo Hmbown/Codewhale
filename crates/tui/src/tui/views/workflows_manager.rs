@@ -51,9 +51,7 @@ fn status_style(status: &str) -> Style {
         }
         "completed" | "succeeded" => Style::default().fg(palette::STATUS_SUCCESS),
         "degraded" => Style::default().fg(palette::STATUS_WARNING),
-        "failed" | "budget_exceeded" | "replay_diverged" => {
-            Style::default().fg(palette::STATUS_ERROR)
-        }
+        "failed" | "budget_exceeded" => Style::default().fg(palette::STATUS_ERROR),
         _ => Style::default().fg(palette::TEXT_MUTED),
     }
 }

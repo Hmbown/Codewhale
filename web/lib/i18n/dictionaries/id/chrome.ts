@@ -32,24 +32,7 @@ export const chrome: ChromeDict = {
 
   authSignIn: "Masuk",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "model apa pun, di mesin Anda",
-
-  issueLabel: "Edisi {date}",
   dateLocale: "id-ID",
-
-  tickerLiveLabel: "Langsung",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "digabungkan",
-  tickerOpened: "dibuka",
-  tickerClosed: "ditutup",
-  tickerReleased: "dirilis",
-  tickerFirstContribution: "kontribusi pertama",
-  tickerBy: "oleh {handle}",
-  tickerAria: "Aktivitas terbaru repositori",
-
-  traceLabel: "jejak penalaran",
-  traceTabsAria: "Cuplikan sesi",
 
   menuOpen: "Buka menu",
   menuClose: "Tutup menu",

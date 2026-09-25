@@ -38,7 +38,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Arka plan kontrolünü izle",
   source: "Kaynak kodu ve diğer platformlar",
   platforms: "Bu indirme Mac içindir. Windows ve Linux şu anda kaynak eklentisini ve ana makine tarafındaki kurulumu kullanır.",
-  installTitle: "Mac için Computer Use",
-  installLead: "Computer Use yardımcısıyla arka planda uygulama denetimi ekle. Mac izinlerini ayarla, bir arka plan kontrolü çalıştır ve yardımcının girişini menü çubuğundan duraklat ya da durdur.",
-  installLink: "Computer Use indirme ve kurulum",
 };

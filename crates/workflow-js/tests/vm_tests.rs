@@ -231,23 +231,54 @@ async fn task_round_trip_carries_all_options_and_normalizes_profile() {
 }
 
 #[tokio::test]
-async fn task_write_authority_requires_bounded_coordination_scope() {
+async fn scopeless_write_tasks_dispatch_and_leave_scope_to_the_spawn_boundary() {
+    // A Workflow script starts a writing child the same way the Agent tool
+    // does: no declared scope, so the spawn boundary claims the workspace
+    // root. The VM must not refuse it before dispatch.
     let driver = Arc::new(FakeDriver::new());
-    let error = run(
+    run(
         &driver,
         r#"
+        await task({ prompt: "implement it", type: "implementer" });
+        await task({ prompt: "build it", type: "builder" });
+        await task({ prompt: "do it", type: "general" });
+        await task({ prompt: "lead it", profile: "release-lead" });
         return await task({
             prompt: "edit without a claim",
-            type: "implementer",
             writeAuthority: "workspace_write",
         });
         "#,
         json!(null),
     )
     .await
-    .expect_err("unscoped Workflow writer must fail before driver dispatch")
+    .expect("scopeless write tasks dispatch");
+    let requests = driver.requests();
+    assert_eq!(requests.len(), 5);
+    for request in &requests {
+        assert!(request.write_roots.is_empty());
+        assert!(request.exact_files.is_empty());
+        assert!(request.coordination_contracts.is_empty());
+    }
+    assert_eq!(requests[0].subagent_type.as_deref(), Some("implementer"));
+    assert_eq!(
+        requests[4].write_authority.as_deref(),
+        Some("workspace_write")
+    );
+
+    // A read-only role still cannot claim write authority.
+    let driver = Arc::new(FakeDriver::new());
+    let error = run(
+        &driver,
+        r#"return await task({ prompt: "x", type: "reviewer", writeAuthority: "workspace_write" });"#,
+        json!(null),
+    )
+    .await
+    .expect_err("read-only role with write authority")
     .to_string();
-    assert!(error.contains("requires writeRoots"), "{error}");
+    assert!(
+        error.contains("read-only roles cannot declare write-capable authority"),
+        "{error}"
+    );
     assert!(driver.requests().is_empty());
 }
 
@@ -316,12 +347,12 @@ async fn task_write_paths_normalize_and_reject_escape_spellings() {
 }
 
 #[tokio::test]
-async fn task_explicit_write_roles_fail_closed_without_scope_and_reject_write_escalation() {
+async fn task_read_only_roles_reject_write_escalation() {
+    // Scopeless write-capable tasks dispatch (see
+    // scopeless_write_tasks_dispatch_and_leave_scope_to_the_spawn_boundary);
+    // a read-only role still cannot claim write authority, and contradictory
+    // identities are still refused.
     for source in [
-        r#"return await task({prompt: "no scope", type: "implementer"});"#,
-        r#"return await task({prompt: "no scope", type: "builder"});"#,
-        r#"return await task({prompt: "no scope", type: "general"});"#,
-        r#"return await task({prompt: "no scope", profile: "release-lead"});"#,
         r#"return await task({prompt: "wrong authority", type: "reviewer", writeAuthority: "workspace_write", writeRoots: ["src"]});"#,
         r#"return await task({prompt: "wrong authority", type: "scout", writeAuthority: "workspace_write", writeRoots: ["src"]});"#,
         r#"return await task({prompt: "role conflict", type: "implementer", role: "reviewer", writeRoots: ["src"]});"#,

@@ -1,10 +1,10 @@
 import type { LocalizedText } from "./vocabulary";
 
 export const TOOLS_COPY = {
-  metaTitle: { en: "Tools · Codewhale Docs", zh: "工具 · Codewhale 文档" },
+  metaTitle: { en: "Built-in tools · Codewhale Docs", zh: "内置工具 · Codewhale 文档" },
   metaDescription: { en: "Core work tools, on-demand discovery, and exact replay compatibility.", zh: "核心工作工具、按需发现与精确回放兼容。" },
-  title: { en: "Tools", zh: "工具" },
-  lead: { en: "Core work controls are available without discovery; specialized tools are loaded when needed. Mode and permission rules still apply.", zh: "核心工作工具无需搜索即可使用，专用工具按需加载。模式与权限规则始终生效。" },
+  title: { en: "Built-in tools", zh: "内置工具" },
+  lead: { en: "Every session starts with a small set of tools for reading, editing, running commands, and delegating. Codewhale loads specialized tools only when a task needs them, and your mode and approval setting still apply to all of them.", zh: "每个会话一开始就带着一小组工具，用于阅读、修改、运行命令和委派任务。专用工具只在任务需要时才加载，而你的模式和审批设置对所有工具都同样有效。" },
   reference: { en: "Tool contract and design rationale", zh: "工具约定与设计说明" },
   rows: [
     { name: "read", detail: { en: "path · offset? · limit?", zh: "path · offset? · limit?" } },

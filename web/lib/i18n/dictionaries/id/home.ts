@@ -26,11 +26,8 @@ export const home: HomeDict = {
   releaseUnavailable: "Status rilis tidak tersedia",
   currentSource: "Sumber",
   sourceCandidate: "Belum dirilis",
-  providerRoutes: "{count} penyedia",
   publishedRelease: "dirilis",
   figcaptionSourceCandidate: "belum dirilis",
-  chapterTerminal: "Terminal Anda",
-  chapterTerminalTitle: "Mulai dengan sesuatu yang ingin Anda buat",
   gainHeading:
     "Yang dapat Anda lakukan dengan Codewhale",
   gainLede:
@@ -49,7 +46,6 @@ export const home: HomeDict = {
       "Gunakan model yang dihosting atau dijalankan secara lokal untuk agen Anda, dengan model dan peran yang berbeda menangani bagian pekerjaan yang sesuai."
     ]
   ],
-  chapterModels: "Model Anda",
   modelsHeading: "Pilihan model untuk setiap tugas",
   modelsBody:
     "Hubungkan langsung ke penyedia model yang dihosting, gunakan gateway untuk mengakses beberapa penyedia, atau jalankan model secara lokal, lalu pilih model yang digunakan setiap sesi selama Anda bekerja.",
@@ -64,7 +60,6 @@ export const home: HomeDict = {
     "Setelah menginstal Codewhale dan menghubungkan model, Anda dapat menjelaskan tugas pertama di terminal dan menambahkan Fleet saat ingin beberapa agen berbagi pekerjaan.",
   startGuideLink: "Baca panduan memulai",
   startVocabularyLink: "Lihat kosakata produk",
-  chapterAccount: "Dapatkan Codewhale",
   availabilityHeading:
     "Tempat Anda dapat menggunakan Codewhale",
   availabilityLede:

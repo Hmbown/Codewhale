@@ -39,7 +39,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Mira la comprovació en segon pla",
   source: "Codi font i altres plataformes",
   platforms: "Aquesta baixada és per a Mac. Windows i Linux fan servir de moment el connector des del codi font i la configuració a l’equip amfitrió.",
-  installTitle: "Computer Use per a Mac",
-  installLead: "Afegeix el control d’aplicacions en segon pla amb l’ajudant Computer Use. Configura els permisos del Mac, executa una comprovació en segon pla i pausa o atura l’entrada de l’ajudant des de la barra de menús.",
-  installLink: "Baixada i configuració de Computer Use",
 };

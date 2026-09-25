@@ -33,24 +33,7 @@ export const chrome: ChromeDict = {
 
   authSignIn: "تسجيل الدخول",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "أي نموذج، على جهازك",
-
-  issueLabel: "عدد {date}",
   dateLocale: "ar",
-
-  tickerLiveLabel: "مباشر",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "دُمج",
-  tickerOpened: "فُتح",
-  tickerClosed: "أُغلق",
-  tickerReleased: "أُصدر",
-  tickerFirstContribution: "أول مساهمة",
-  tickerBy: "بواسطة {handle}",
-  tickerAria: "آخر نشاط في المستودع",
-
-  traceLabel: "أثر الاستدلال",
-  traceTabsAria: "مقتطفات الجلسات",
 
   menuOpen: "افتح القائمة",
   menuClose: "أغلق القائمة",

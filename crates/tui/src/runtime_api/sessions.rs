@@ -358,20 +358,24 @@ pub(super) async fn resume_session_thread(
 
     let thread = state
         .runtime_threads
-        .create_thread(CreateThreadRequest {
-            model: Some(model),
-            model_provider: Some(session.metadata.model_provider.clone()),
-            model_provider_id: session.metadata.model_provider_id.clone(),
-            workspace: Some(session.metadata.workspace.clone()),
-            mode: Some(mode),
-            allow_shell: None,
-            trust_mode: None,
-            auto_approve: None,
-            archived: false,
-            system_prompt: session.system_prompt.clone(),
-            task_id: None,
-            ..Default::default()
-        })
+        .create_thread_with_shell_policy(
+            CreateThreadRequest {
+                model: Some(model),
+                model_provider: Some(session.metadata.model_provider.clone()),
+                model_provider_id: session.metadata.model_provider_id.clone(),
+                workspace: Some(session.metadata.workspace.clone()),
+                mode: Some(mode),
+                allow_shell: None,
+                trust_mode: None,
+                auto_approve: None,
+                archived: false,
+                system_prompt: session.system_prompt.clone(),
+                task_id: None,
+                ..Default::default()
+            },
+            state.config_path.as_deref(),
+            state.config_profile.as_deref(),
+        )
         .await
         .map_err(map_resume_thread_create_err)?;
 

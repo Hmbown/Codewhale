@@ -1458,8 +1458,7 @@ fn profile_without_scenario() {
         let config = ConfigFile {
             base: Box::new(Config {
                 context: ContextConfig {
-                    enabled: Some(true),
-                    ..Default::default()
+                    project_pack: Some(true),
                 },
                 ..Default::default()
             }),
@@ -1467,7 +1466,7 @@ fn profile_without_scenario() {
         };
 
         let merged = apply_profile(config, Some("work")).expect("profile");
-        assert_eq!(merged.context.enabled, Some(true));
+        assert_eq!(merged.context.project_pack, Some(true));
     }
 }
 
@@ -4014,6 +4013,33 @@ fn policy_control_waits_for_foreign_test_env_overrides_to_restore() {
     reader.join().expect("reader thread");
     assert_eq!(shell, ShellAccessControl::Unset);
     assert_eq!(approval, ApprovalPolicyControl::Unset);
+}
+
+/// #6516: the dispatcher exports only `CODEWHALE_*`, so the settings editor
+/// must name whichever variable actually owns the posture instead of a
+/// hard-coded `DEEPSEEK_*` twin the process no longer sets.
+#[test]
+fn environment_policy_labels_name_the_variable_that_is_set() {
+    let _lock = lock_test_env();
+    let _legacy_approval = EnvVarGuard::remove("DEEPSEEK_APPROVAL_POLICY");
+    let _approval = EnvVarGuard::set("CODEWHALE_APPROVAL_POLICY", "never");
+    let _shell = EnvVarGuard::remove("CODEWHALE_ALLOW_SHELL");
+    let _legacy_shell = EnvVarGuard::set("DEEPSEEK_ALLOW_SHELL", "false");
+    assert_eq!(
+        ApprovalPolicyControl::Environment.label(),
+        "CODEWHALE_APPROVAL_POLICY"
+    );
+    assert_eq!(
+        ShellAccessControl::Environment.label(),
+        "DEEPSEEK_ALLOW_SHELL"
+    );
+
+    let _both_shell = EnvVarGuard::set("CODEWHALE_ALLOW_SHELL", "true");
+    assert_eq!(
+        ShellAccessControl::Environment.label(),
+        "CODEWHALE_ALLOW_SHELL",
+        "the CODEWHALE_* name wins when both are set, matching the readers"
+    );
 }
 
 #[test]
@@ -8015,19 +8041,45 @@ model = "opencode-go/glm-5.2"
     Ok(())
 }
 
+/// #6516: the removed seam-manager keys and `tui.terminal_probe_timeout_ms`
+/// are no longer fields. A config that still carries them must keep loading,
+/// with the live `[context] project_pack` key intact.
 #[test]
-fn default_context_seams_are_opt_in() {
-    let config = Config::default();
-    assert!(!config.context.enabled.unwrap_or(false));
-    assert_eq!(config.context.l1_threshold.unwrap_or(192_000), 192_000);
-    assert_eq!(
-        config
-            .context
-            .seam_model
-            .as_deref()
-            .unwrap_or("deepseek-v4-flash"),
-        "deepseek-v4-flash"
-    );
+fn removed_context_seam_and_terminal_probe_keys_still_load() -> Result<()> {
+    let parsed: ConfigFile = toml::from_str(
+        r#"
+        [tui]
+        terminal_probe_timeout_ms = 500
+
+        [context]
+        enabled = true
+        project_pack = true
+        verbatim_window_turns = 4
+        l1_threshold = 1
+        l2_threshold = 2
+        l3_threshold = 3
+        seam_model = "deepseek-v4-flash"
+        "#,
+    )?;
+
+    assert_eq!(parsed.base.context.project_pack, Some(true));
+    // #6516: the retired keys still load but are no longer typed fields, so
+    // nothing can read or merge them again. The derived Debug lists every
+    // field, which makes a reintroduced field visible here.
+    let context = format!("{:?}", parsed.base.context);
+    for retired in [
+        "enabled",
+        "verbatim_window_turns",
+        "l1_threshold",
+        "l2_threshold",
+        "l3_threshold",
+        "seam_model",
+    ] {
+        assert!(!context.contains(retired), "{retired} in {context}");
+    }
+    let tui = format!("{:?}", parsed.base.tui.expect("[tui] table loads"));
+    assert!(!tui.contains("terminal_probe_timeout_ms"), "{tui}");
+    Ok(())
 }
 
 #[test]
@@ -8070,7 +8122,7 @@ fn removed_context_per_model_table_is_ignored_for_compatibility() -> Result<()> 
     let parsed: ConfigFile = toml::from_str(
         r#"
         [context]
-        enabled = true
+        project_pack = true
 
         [context.per_model.deepseek-v4-pro]
         l1_threshold = 111
@@ -8079,7 +8131,7 @@ fn removed_context_per_model_table_is_ignored_for_compatibility() -> Result<()> 
         "#,
     )?;
 
-    assert_eq!(parsed.base.context.enabled, Some(true));
+    assert_eq!(parsed.base.context.project_pack, Some(true));
     Ok(())
 }
 

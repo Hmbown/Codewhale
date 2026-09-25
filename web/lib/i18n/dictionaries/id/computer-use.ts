@@ -38,7 +38,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Lihat pemeriksaan latar belakang",
   source: "Kode sumber dan platform lain",
   platforms: "Unduhan ini untuk Mac. Windows dan Linux saat ini menggunakan plugin dari kode sumber dan penyiapan di sisi host.",
-  installTitle: "Computer Use untuk Mac",
-  installLead: "Tambahkan kendali aplikasi di latar belakang dengan pembantu Computer Use. Siapkan izin Mac, jalankan pemeriksaan latar belakang, dan jeda atau hentikan input pembantu dari bar menu Anda.",
-  installLink: "Unduh dan siapkan Computer Use",
 };

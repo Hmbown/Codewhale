@@ -64,12 +64,16 @@ impl Repaired {
 }
 
 pub fn repair(raw: &str) -> Result<Repaired, ArgRepairError> {
-    if raw.len() > MAX_ARG_LEN {
-        return Err(ArgRepairError::TooLarge(raw.len()));
-    }
-    // Stage 1: strict parse
+    // Stage 1: strict parse. Valid JSON is returned intact at any size: the
+    // size bound exists to cap the cost of the repair stages below, and a
+    // strict serde parse is what callers already fall back to on oversize
+    // input. Checking size first made every valid argument over the bound
+    // (a large `write`, a generated fixture) fail as malformed.
     if let Ok(v) = serde_json::from_str(raw) {
         return Ok(Repaired::intact(v));
+    }
+    if raw.len() > MAX_ARG_LEN {
+        return Err(ArgRepairError::TooLarge(raw.len()));
     }
     // Stage 2: strip control chars inside strings
     let mut s = strip_control_chars_in_strings(raw);
@@ -314,6 +318,27 @@ mod tests {
     fn oversize_input_rejected() {
         let big = "x".repeat(MAX_ARG_LEN + 1);
         assert!(repair(&big).is_err());
+    }
+
+    #[test]
+    fn oversize_valid_json_parses_intact() {
+        // A valid argument over the repair bound whose string content holds
+        // an unbalanced brace must come back exactly as written, not be
+        // refused as too large or "repaired".
+        let content = format!("fn main() {{{}", "x".repeat(MAX_ARG_LEN));
+        let raw = serde_json::json!({"path": "big.rs", "content": content}).to_string();
+        assert!(raw.len() > MAX_ARG_LEN);
+        let r = repair(&raw).expect("valid oversize JSON parses");
+        assert!(!r.structure_synthesized);
+        assert_eq!(r.value["content"].as_str(), Some(content.as_str()));
+
+        // Oversize text that is not valid JSON is still refused before any
+        // repair stage runs.
+        let truncated = &raw[..raw.len() - 2];
+        assert!(matches!(
+            repair(truncated),
+            Err(ArgRepairError::TooLarge(_))
+        ));
     }
 
     #[test]
