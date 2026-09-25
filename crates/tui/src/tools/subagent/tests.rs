@@ -11723,6 +11723,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
     let tmp = tempdir().expect("tempdir");
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("home"));
     let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
     let native_skill = workspace.join(".agents/skills/native-review");
     let plugin_root = workspace.join(".codewhale/plugins/demo");
     std::fs::create_dir_all(&native_skill).expect("native Skill dir");

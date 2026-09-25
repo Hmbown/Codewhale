@@ -1384,6 +1384,7 @@ mod tests {
         // #3912: both surfaces executed and autocompleted but were absent
         // from the surface that teaches the product.
         let tmp = tempfile::TempDir::new().unwrap();
+        crate::test_support::trust_workspace(tmp.path());
         let commands_dir = tmp.path().join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
@@ -2056,6 +2057,7 @@ mod tests {
     #[test]
     fn a_workspace_command_states_its_declared_usage() {
         let tmp = tempfile::TempDir::new().unwrap();
+        crate::test_support::trust_workspace(tmp.path());
         let commands_dir = tmp.path().join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(

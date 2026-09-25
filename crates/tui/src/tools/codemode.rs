@@ -629,15 +629,19 @@ mod tests {
         // Skills-as-tools composes with code mode: `load_skill` is
         // read-only and auto-approved, so a program can list and load
         // skills at runtime without widening its authority.
+        // A configured skills dir, not a project root: project skills load
+        // only in a trusted workspace, which this composition test is not
+        // about.
         let dir = tempfile::tempdir().unwrap();
-        let skill_dir = dir.path().join(".agents/skills/greet");
+        let skills_root = dir.path().join("configured-skills");
+        let skill_dir = skills_root.join("greet");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
             "---\nname: greet\ndescription: Say hello\n---\n# Greet\nSay hello warmly.\n",
         )
         .unwrap();
-        let context = ToolContext::new(dir.path());
+        let context = ToolContext::new(dir.path()).with_skills_config(&skills_root, false);
         let registry = ToolRegistryBuilder::new()
             .with_tool(Arc::new(crate::tools::skill::LoadSkillTool))
             .build(context.clone());

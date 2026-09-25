@@ -772,6 +772,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("ws");
         let home = tmp.path().join("home");
+        crate::test_support::trust_workspace(&workspace);
         write_dir(&workspace.join(".agents").join("skills"));
         write_dir(&workspace.join("skills"));
         write_dir(&workspace.join(".claude").join("skills"));
@@ -831,6 +832,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("ws");
         let home = tmp.path().join("home");
+        crate::test_support::trust_workspace(&workspace);
         write_dir(&workspace.join(".agents").join("skills"));
         write_dir(&workspace.join(".codewhale").join("skills"));
         write_dir(&home.join(".codewhale").join("skills"));

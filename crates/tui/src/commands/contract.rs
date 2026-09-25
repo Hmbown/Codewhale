@@ -5478,6 +5478,7 @@ mod tests {
     fn skill_group_projection_maps_native_skills_and_dirs() {
         let tmp = TempDir::new().unwrap();
         let _home = scoped_home(&tmp);
+        crate::test_support::trust_workspace(tmp.path());
         let skills_dir = tmp.path().join("skills");
         write_skill(&skills_dir, "demo");
         let mut app = skill_test_app(&tmp, &skills_dir);

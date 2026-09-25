@@ -5722,6 +5722,7 @@ mod tests {
     fn slash_completion_hints_use_user_command_frontmatter_description() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".deepseek").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("git-scan.md"),
@@ -5747,6 +5748,7 @@ mod tests {
     #[test]
     fn slash_completion_hints_use_user_command_argument_hint() {
         let tmp = tempfile::TempDir::new().unwrap();
+        crate::test_support::trust_workspace(tmp.path());
         let commands_dir = tmp.path().join(".deepseek").join("commands");
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
@@ -5774,6 +5776,7 @@ mod tests {
     fn slash_completion_uses_frontmatter_name_and_usage() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("workflow-file.md"),
@@ -5802,6 +5805,7 @@ mod tests {
     fn slash_completion_uses_arguments_when_usage_and_legacy_hint_are_absent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("deploy.md"),
@@ -5949,6 +5953,7 @@ mod tests {
     fn slash_completion_hints_exclude_hidden_user_commands() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("secret.md"),
@@ -5972,6 +5977,7 @@ mod tests {
     fn hidden_name_override_filters_shadowed_builtin_from_slash_completion() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("private-help.md"),
@@ -5995,6 +6001,7 @@ mod tests {
     fn slash_completion_hints_match_user_command_aliases() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("deploy-target.md"),
@@ -6039,6 +6046,7 @@ mod tests {
     fn slash_completion_omits_rejected_user_alias_collisions() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("alpha.md"),
@@ -6071,6 +6079,7 @@ mod tests {
     fn slash_completion_hints_keep_builtin_canonical_when_only_builtin_alias_is_shadowed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("attach-review.md"),
@@ -6124,6 +6133,7 @@ mod tests {
         // suggestion is absent and the user command appears for the alias.
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("assistant.md"),
@@ -6154,6 +6164,7 @@ mod tests {
     fn slash_completion_hints_prefer_user_metadata_for_shadowed_builtin() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("help.md"),

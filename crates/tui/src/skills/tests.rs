@@ -162,6 +162,7 @@ fn workspace_prompt_omits_disabled_skills_without_configured_directory() {
     let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", &home);
     let _codewhale_home =
         crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.join(".codewhale"));
+    crate::test_support::trust_workspace(&workspace);
 
     let mut state = crate::skill_state::SkillStateStore::load_default().unwrap();
     state.set_enabled("disabled-skill", false).unwrap();
@@ -708,6 +709,7 @@ fn create_dir_symlink(target: &std::path::Path, link: &std::path::Path) -> std::
 fn skills_directories_returns_existing_dirs_in_precedence_order() {
     let tmpdir = TempDir::new().unwrap();
     let workspace = tmpdir.path();
+    crate::test_support::trust_workspace(workspace);
 
     // Create four of the five workspace candidate dirs (skip `.opencode`).
     std::fs::create_dir_all(workspace.join(".agents").join("skills")).unwrap();
@@ -790,6 +792,7 @@ fn existing_skill_dirs_keeps_agents_global_before_deepseek_global() {
 fn discover_in_workspace_merges_with_first_wins_precedence() {
     let tmpdir = TempDir::new().unwrap();
     let workspace = tmpdir.path();
+    crate::test_support::trust_workspace(workspace);
 
     // Same skill name `shared` in two locations — the higher-precedence
     // dir's version should win.
@@ -878,6 +881,7 @@ fn same_root_slug_collision_warns_and_keeps_one() {
 fn discover_in_workspace_pulls_skills_from_opencode_dir() {
     let tmpdir = TempDir::new().unwrap();
     let workspace = tmpdir.path();
+    crate::test_support::trust_workspace(workspace);
     write_skill(
         &workspace.join(".opencode").join("skills"),
         "opencode-only",
@@ -896,6 +900,7 @@ fn discover_in_workspace_pulls_skills_from_opencode_dir() {
 fn discover_in_workspace_pulls_skills_from_cursor_dir() {
     let tmpdir = TempDir::new().unwrap();
     let workspace = tmpdir.path();
+    crate::test_support::trust_workspace(workspace);
     write_skill(
         &workspace.join(".cursor").join("skills"),
         "cursor-only",
@@ -989,6 +994,7 @@ fn discover_warns_for_plain_markdown_without_heading() {
 fn render_available_skills_context_for_workspace_picks_up_cross_tool_dirs() {
     let tmpdir = TempDir::new().unwrap();
     let workspace = tmpdir.path();
+    crate::test_support::trust_workspace(workspace);
     write_skill(
         &workspace.join(".claude").join("skills"),
         "from-claude",
@@ -1007,6 +1013,7 @@ fn codewhale_only_mode_ignores_cross_tool_skill_dirs() {
     let home = tmpdir.path().join("home");
     let configured_dir = home.join(".codewhale").join("skills");
     std::fs::create_dir_all(&workspace).unwrap();
+    crate::test_support::trust_workspace(&workspace);
     write_skill(
         &workspace.join(".claude").join("skills"),
         "from-claude",
@@ -1108,6 +1115,7 @@ fn discover_for_workspace_and_dir_merges_workspace_and_configured_sources() {
     let home = tmpdir.path().join("home");
     let configured_dir = tmpdir.path().join("configured-skills");
     std::fs::create_dir_all(&workspace).unwrap();
+    crate::test_support::trust_workspace(&workspace);
     write_skill(
         &workspace.join(".claude").join("skills"),
         "workspace-skill",
@@ -1872,6 +1880,7 @@ fn configured_skill_prompt_uses_a_stable_root_in_entries_and_warnings() {
     let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", &home);
     let _codewhale_home =
         crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.join(".codewhale"));
+    crate::test_support::trust_workspace(&workspace);
 
     let rendered =
         super::render_available_skills_context_for_workspace_and_dir_with_mode_and_plugins(
