@@ -380,6 +380,12 @@ struct ToolStep {
 /// A turn and the permission posture its own record names, if any.
 type TurnPosture = (String, Option<&'static str>);
 
+/// A turn and the user's prompt text, if it had any.
+type TurnPrompt = (String, Option<String>);
+
+/// Each matched turn's workspace change, and how many turns had no pair.
+type TurnChanges = (Vec<(String, TurnWorkspaceChange)>, usize);
+
 /// Files a turn changed, from its before/after workspace snapshots.
 #[derive(Debug, Clone, Default)]
 struct TurnWorkspaceChange {
@@ -458,11 +464,11 @@ pub(crate) fn session_receipt(
     let workspace_changes = match snapshot_changes {
         Ok(Some((changes, unmatched))) => {
             notes.insert(
-                "Files changed outside file tools come from the workspace snapshots taken before and after each turn, so they include anything that wrote to the workspace during the turn, not only Codewhale.".to_string(),
+                "Files changed outside file tools come from the workspace snapshots taken before and after each turn, so they include anything that wrote to the workspace during the turn, not only Codewhale. They leave out what snapshots do not track: ignored and skipped paths (.gitignore entries, .env, node_modules, target, and the like) and anything outside the workspace.".to_string(),
             );
             if unmatched > 0 {
                 notes.insert(format!(
-                    "Shell file changes: {} without a before/after snapshot (snapshots off, or pruned; the newest {} are kept), so files a command changed there are not itemized.",
+                    "Shell file changes: {} without a before/after snapshot (snapshots off, or pruned: the newest {} are kept; or a repeated prompt whose snapshots could not be told apart), so files a command changed there are not itemized.",
                     plural(unmatched, "turn", "turns"),
                     crate::snapshot::DEFAULT_MAX_SNAPSHOTS
                 ));
@@ -705,17 +711,11 @@ pub(crate) fn run_receipts_command(
 /// messages and tool results do not start one.
 /// Each turn's prompt text (the user's words, without the `<turn_meta>`
 /// block) comes back too: it labels the turn's workspace snapshots.
-fn steps_from_messages(
-    messages: &[Message],
-) -> (
-    Vec<ToolStep>,
-    Vec<TurnPosture>,
-    Vec<(String, Option<String>)>,
-) {
+fn steps_from_messages(messages: &[Message]) -> (Vec<ToolStep>, Vec<TurnPosture>, Vec<TurnPrompt>) {
     let mut steps: Vec<ToolStep> = Vec::new();
     let mut by_id: HashMap<String, usize> = HashMap::new();
     let mut turn_postures: Vec<TurnPosture> = Vec::new();
-    let mut turn_prompts: Vec<(String, Option<String>)> = Vec::new();
+    let mut turn_prompts: Vec<TurnPrompt> = Vec::new();
     let mut turn = 0usize;
     for message in messages {
         if crate::runtime_handoff::classify_user_turn_prompt(message)
@@ -785,14 +785,18 @@ fn prompt_text(message: &Message) -> Option<String> {
 /// the engine takes around a turn in this session (`core::turn`). A turn is
 /// matched to its pair by the prompt snippet the labels carry, in order, the
 /// same way `/restore` listings are read ([`crate::core::turn::
-/// snapshot_label_prompt_snippet`]). Turns with no pair are returned in the
-/// second list. `None` when this workspace has no snapshot repo.
+/// snapshot_label_prompt_snippet`]). When another turn has the same snippet
+/// ("continue", "yes", or none), the snippet cannot say whose pair it is, so
+/// the pair's turn number `N` must agree too ([`seq_fits`]); otherwise the
+/// turn counts as unmatched rather than taking a later turn's files. The
+/// count of unmatched turns is returned beside the changes. `None` when this
+/// workspace has no snapshot repo.
 fn snapshot_turn_changes(
     workspace: &std::path::Path,
     session_id: &str,
-    turn_prompts: &[(String, Option<String>)],
+    turn_prompts: &[TurnPrompt],
     wanted: Option<&str>,
-) -> Result<Option<(Vec<(String, TurnWorkspaceChange)>, usize)>, String> {
+) -> Result<Option<TurnChanges>, String> {
     use crate::core::turn::{parse_snapshot_label, snapshot_label_prompt_snippet};
     let Some(repo) = crate::snapshot::SnapshotRepo::open_existing(workspace)
         .map_err(|error| error.to_string())?
@@ -818,21 +822,43 @@ fn snapshot_turn_changes(
             }
             "post-turn" => {
                 if let Some((pre, snippet)) = open.remove(&seq) {
-                    pairs.push((pre, snapshot.id, snippet));
+                    pairs.push((pre, snapshot.id, snippet, seq));
                 }
             }
             _ => {}
         }
     }
+    let snippets: Vec<Option<String>> = turn_prompts
+        .iter()
+        .map(|(_, prompt)| prompt.as_deref().and_then(snapshot_label_prompt_snippet))
+        .collect();
     let mut changes = Vec::new();
     let mut unmatched = 0usize;
     let mut next_pair = 0usize;
-    for (turn, prompt) in turn_prompts {
-        let snippet = prompt.as_deref().and_then(snapshot_label_prompt_snippet);
+    // The last turn given a pair: its place in the transcript (1-based) and
+    // the pair's turn number.
+    let mut last: Option<(u64, u64)> = None;
+    let mut last_position = 0u64;
+    for (position, ((turn, _), snippet)) in turn_prompts.iter().zip(&snippets).enumerate() {
+        let position = position as u64 + 1;
+        let repeated = snippets
+            .iter()
+            .enumerate()
+            .any(|(other, label)| other as u64 + 1 != position && label == snippet);
         let found = pairs[next_pair..]
             .iter()
-            .position(|(_, _, label)| *label == snippet)
-            .map(|offset| next_pair + offset);
+            .position(|(_, _, label, _)| label == snippet)
+            .map(|offset| next_pair + offset)
+            .filter(|&index| {
+                // Engine turns with no transcript prompt (a `!` shell
+                // command) number a pair too; count the ones still listed.
+                let extra = pairs[next_pair..index]
+                    .iter()
+                    .filter(|(_, _, label, _)| !snippets.contains(label))
+                    .count() as u64;
+                let since = position - last_position + extra;
+                !repeated || seq_fits(pairs[index].3, since, last.map(|(_, seq)| seq))
+            });
         let Some(index) = found else {
             if wanted.is_none_or(|wanted| wanted == turn) {
                 unmatched += 1;
@@ -840,10 +866,12 @@ fn snapshot_turn_changes(
             continue;
         };
         next_pair = index + 1;
+        last = Some((position, pairs[index].3));
+        last_position = position;
         if wanted.is_some_and(|wanted| wanted != turn) {
             continue;
         }
-        let (pre, post, _) = &pairs[index];
+        let (pre, post, _, _) = &pairs[index];
         let (paths, truncated) = repo
             .changed_paths_between(pre, post, MAX_FILES_PER_ACTION)
             .map_err(|error| error.to_string())?;
@@ -863,6 +891,20 @@ fn snapshot_turn_changes(
         changes.push((turn.clone(), TurnWorkspaceChange { files, truncated }));
     }
     Ok(Some((changes, unmatched)))
+}
+
+/// Whether a snapshot pair numbered `seq` can belong to a turn that comes
+/// `since` engine turns after the last matched pair (numbered `last_seq`),
+/// or `since` turns after the session started when none matched yet. The
+/// engine numbers turns from 1 each time it starts, so within one run the
+/// number moves in step with the turns; after a resume it restarts, and can
+/// be at most `since`.
+fn seq_fits(seq: u64, since: u64, last_seq: Option<u64>) -> bool {
+    let restarted = (1..=since).contains(&seq);
+    match last_seq {
+        Some(last_seq) => seq == last_seq + since || restarted,
+        None => restarted,
+    }
 }
 
 /// `path` relative to `workspace` when it is inside it, without a leading
@@ -1235,8 +1277,13 @@ fn classify(step: &ToolStep, notes: &mut BTreeSet<String>) -> Classified {
 /// The host-owned JSON a tool returned as its text result (agent, code,
 /// execute_tools), when the persisted record has no structured metadata. A
 /// leading approval note is skipped. Anything that is not a JSON object is
-/// ignored rather than read as prose.
+/// ignored rather than read as prose, and so is JSON another party wrote
+/// ([`result_is_outside_text`]): an MCP server's reply cannot claim a file
+/// change or an exit code.
 fn structured_output(step: &ToolStep) -> Option<Value> {
+    if result_is_outside_text(step) {
+        return None;
+    }
     let output = step.output.as_deref()?.trim_start();
     let body = if output.starts_with("[approval] ") {
         output.split_once("\n\n").map(|(_, rest)| rest)?
@@ -1655,6 +1702,10 @@ enum FailureEvidence {
     Ran,
     /// Codewhale refused the call before it started.
     Refused,
+    /// Stopped at an approval prompt. The text says `denied by user` for any
+    /// decider (a host with nobody to ask writes it too), so without an
+    /// approval-log record it proves the call did not run, not who stopped it.
+    DeniedAtApproval,
     /// Neither.
     Unclear,
 }
@@ -1670,23 +1721,74 @@ const SHELL_RAN_LINES: [&str; 5] = [
     "Command aborted",
 ];
 
+/// The shell tools, by semantic name. Only these write `BLOCKED:` (their
+/// policy and safety blocks) and [`SHELL_RAN_LINES`].
+const SHELL_TOOLS: [&str; 5] = [
+    "exec_shell",
+    "task_shell_start",
+    "task_gate_run",
+    "run_tests",
+    "run_verifiers",
+];
+
+/// Tools whose result text is someone else's words: an MCP server's or
+/// GitHub's reply, or a fetched page. Nothing in it is read as a fact about
+/// the call, not even JSON; only metadata Codewhale wrote is.
+fn result_is_outside_text(step: &ToolStep) -> bool {
+    let semantic = crate::tools::canonical_action::canonical_action_alias(&step.name, &step.input);
+    step.name.starts_with("mcp_")
+        || semantic.starts_with("mcp_")
+        || semantic.starts_with("github_")
+        || matches!(
+            semantic,
+            "web_search" | "fetch_url" | "web.run" | "rlm_open" | "git_fetch"
+        )
+}
+
+/// Tools whose failed result can open with text nobody at Codewhale framed:
+/// [`result_is_outside_text`], plus a program's own output (code tools) and a
+/// sub-agent's words. Their failure text never proves a refusal.
+fn failure_text_is_outside(step: &ToolStep) -> bool {
+    let semantic = crate::tools::canonical_action::canonical_action_alias(&step.name, &step.input);
+    result_is_outside_text(step)
+        || matches!(
+            semantic,
+            "code_execution" | "js_execution" | "execute_tools" | "rlm_eval" | "agent"
+        )
+}
+
 /// Whether a failed call's result shows it started. The record keeps no
-/// "blocked" flag, so two fixed shapes the engine writes are read, never
-/// model prose:
+/// "blocked" flag, so only shapes Codewhale itself writes are read, never
+/// model prose or another program's text:
 ///
+/// - `side_effect_status: not_started` in the call's metadata (the engine
+///   writes it), or on the `Tool validation feedback:` line
+///   `dispatch::format_tool_error_with_schema` appends as the result's last
+///   line.
 /// - a call refused before it runs gets its error as the result. A terminal
 ///   session saves `Error: ` plus `dispatch::format_tool_error_with_schema`;
-///   a Runtime thread saves the `ToolError`'s own text. `exec_shell`'s policy
+///   a Runtime thread saves the `ToolError`'s own text. A shell tool's policy
 ///   and safety blocks start with `BLOCKED:`.
 /// - a process that ran leaves an exit code or one of [`SHELL_RAN_LINES`].
+///
+/// A tool whose failure text can come from outside Codewhale
+/// ([`failure_text_is_outside`]) is judged by metadata alone: an MCP server
+/// that answers `BLOCKED:` or `{"side_effect_status":"not_started"}` must not
+/// hide a call that ran. Such a call reads as failed, which over-counts what
+/// ran rather than under-counting it.
 fn failure_evidence(step: &ToolStep) -> FailureEvidence {
     let structured = structured_output(step);
     let facts = step.metadata.as_ref().or(structured.as_ref());
     if number(facts, &["exit_code", "return_code"]).is_some() {
         return FailureEvidence::Ran;
     }
-    if string_field(facts, &["side_effect_status"]).as_deref() == Some("not_started") {
+    if string_field(step.metadata.as_ref(), &["side_effect_status"]).as_deref()
+        == Some("not_started")
+    {
         return FailureEvidence::Refused;
+    }
+    if failure_text_is_outside(step) {
+        return FailureEvidence::Unclear;
     }
     let Some(output) = step.output.as_deref() else {
         return FailureEvidence::Unclear;
@@ -1699,7 +1801,14 @@ fn failure_evidence(step: &ToolStep) -> FailureEvidence {
     }) {
         return FailureEvidence::Ran;
     }
-    if lines().any(|line| line.contains("\"side_effect_status\":\"not_started\"")) {
+    let not_started = lines()
+        .rfind(|line| !line.is_empty())
+        .and_then(|last| last.strip_prefix("Tool validation feedback: "))
+        .and_then(|feedback| serde_json::from_str::<Value>(feedback).ok())
+        .is_some_and(|feedback| {
+            feedback.get("side_effect_status").and_then(Value::as_str) == Some("not_started")
+        });
+    if not_started {
         return FailureEvidence::Refused;
     }
     let Some(first) = lines().find(|line| !line.is_empty() && !line.starts_with("[approval]"))
@@ -1707,8 +1816,19 @@ fn failure_evidence(step: &ToolStep) -> FailureEvidence {
         return FailureEvidence::Unclear;
     };
     let first = first.strip_prefix("Error: ").unwrap_or(first);
-    const REFUSED_PREFIXES: [&str; 7] = [
-        "BLOCKED:",
+    if first.starts_with("BLOCKED:") {
+        let semantic =
+            crate::tools::canonical_action::canonical_action_alias(&step.name, &step.input);
+        return if SHELL_TOOLS.contains(&semantic) {
+            FailureEvidence::Refused
+        } else {
+            FailureEvidence::Unclear
+        };
+    }
+    if first.starts_with("Tool '") && first.contains("' denied by user") {
+        return FailureEvidence::DeniedAtApproval;
+    }
+    const REFUSED_PREFIXES: [&str; 6] = [
         "Invalid input for tool '",
         "Path escapes workspace:",
         // `ToolError` text, as a Runtime thread saves it.
@@ -1717,9 +1837,8 @@ fn failure_evidence(step: &ToolStep) -> FailureEvidence {
         "Failed to locate tool:",
         "Failed to resolve path '",
     ];
-    const REFUSED_MARKERS: [&str; 4] = [
+    const REFUSED_MARKERS: [&str; 3] = [
         "' was denied: ",
-        "' denied by user",
         "' is not available",
         "' is missing required field ",
     ];
@@ -1865,6 +1984,7 @@ fn assemble(
             StepOutcome::Failed => match failure_evidence(step) {
                 FailureEvidence::Ran => ActionStatus::Failed,
                 FailureEvidence::Refused => ActionStatus::Blocked,
+                FailureEvidence::DeniedAtApproval => ActionStatus::NotRun,
                 FailureEvidence::Unclear if is_command => ActionStatus::Unknown,
                 FailureEvidence::Unclear => ActionStatus::Failed,
             },
@@ -2377,7 +2497,35 @@ fn file_phrase(file: &FileTouch) -> String {
     } else {
         counts(file.lines_added, file.lines_removed)
     };
-    format!("{verb} {}{counts}", file.path)
+    format!("{verb} {}{counts}", code_span(&file.path))
+}
+
+/// `text` on one line with nothing a terminal acts on: control characters
+/// (newline, carriage return, escape), Unicode line separators, and bidi
+/// overrides show as `\u{…}`-style escapes. Paths, commands, and error text
+/// come from the workspace and from tools, so a file a command named
+/// `x\n- Ran …` cannot forge a receipt line, and one holding `ESC ]` cannot
+/// drive the terminal that prints the receipt.
+fn one_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        let hidden = ch.is_control()
+            || matches!(
+                ch,
+                '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            );
+        if hidden {
+            out.extend(ch.escape_default());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Inline code that survives backticks in the text: the fence is one
@@ -2410,7 +2558,7 @@ fn action_phrase(action: &ReceiptAction) -> String {
                 files.len(),
                 files
                     .iter()
-                    .map(|file| file.path.as_str())
+                    .map(|file| code_span(&file.path))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -2540,7 +2688,8 @@ fn duration_label(ms: u64) -> String {
     }
 }
 
-/// One line per action. Plain text that also reads as Markdown.
+/// One line per action. Plain text that also reads as Markdown; whatever
+/// the record holds cannot break it onto a second line ([`one_line`]).
 #[must_use]
 pub fn action_line(action: &ReceiptAction) -> String {
     let mut line = action_phrase(action);
@@ -2582,7 +2731,7 @@ pub fn action_line(action: &ReceiptAction) -> String {
     if let Some(fact) = &action.approval {
         line.push_str(&format!(" · {}", approval_phrase(fact)));
     }
-    line
+    one_line(&line)
 }
 
 /// The readable receipt: header, totals, one line per action, then what the
@@ -2601,8 +2750,8 @@ pub fn render_markdown(receipt: &Receipt) -> String {
         .map(|title| bounded(title.trim(), 80))
         .filter(|title| !title.is_empty());
     match title {
-        Some(title) => out.push_str(&format!("# Receipt: {title}\n\n")),
-        None => out.push_str(&format!("# Receipt: {noun} {}\n\n", source.id)),
+        Some(title) => out.push_str(&format!("# Receipt: {}\n\n", one_line(&title))),
+        None => out.push_str(&format!("# Receipt: {noun} {}\n\n", one_line(&source.id))),
     }
     let mut facts = vec![format!("{noun} {}", source.id)];
     if let Some(turn) = &receipt.turn {
@@ -2624,9 +2773,9 @@ pub fn render_markdown(receipt: &Receipt) -> String {
             end.format("%Y-%m-%d %H:%M UTC")
         ));
     }
-    out.push_str(&facts.join(" · "));
+    out.push_str(&one_line(&facts.join(" · ")));
     out.push_str("\n\n");
-    out.push_str(&totals_line(receipt));
+    out.push_str(&one_line(&totals_line(receipt)));
     out.push_str("\n\n");
     let width = receipt.actions.len().to_string().len();
     for action in &receipt.actions {
@@ -2646,7 +2795,7 @@ pub fn render_markdown(receipt: &Receipt) -> String {
     if !receipt.not_recorded.is_empty() {
         out.push_str("\nNot recorded:\n");
         for note in &receipt.not_recorded {
-            out.push_str(&format!("- {note}\n"));
+            out.push_str(&format!("- {}\n", one_line(note)));
         }
     }
     out

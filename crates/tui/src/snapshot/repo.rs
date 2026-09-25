@@ -984,10 +984,11 @@ impl SnapshotRepo {
         git_diff_matches(diff)
     }
 
-    /// Paths that differ between snapshots `from` and `to`, oldest change
-    /// kind first as git reports it: `(path, status, added, removed)` where
-    /// `status` is git's `A`/`M`/`D`/`T` letter and the counts are `None` for
-    /// a binary file. Both trees are read from the side repo; neither the
+    /// Paths that differ between snapshots `from` and `to`, in git's order,
+    /// one [`SnapshotPathChange`] each: its `status` is git's `A`/`M`/`D`/`T`
+    /// letter and its line counts are `None` for a binary file. Paths come
+    /// back as git stores them (`-z`), control characters included, so a
+    /// caller that prints one must escape it. Both trees are read from the side repo; neither the
     /// work tree nor the index is touched. At most `limit` paths are
     /// returned; the flag says whether more differed.
     pub fn changed_paths_between(

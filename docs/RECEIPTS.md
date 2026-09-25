@@ -12,7 +12,7 @@ thread thr_19a0141a · /work/repo · deepseek-flash · Ask · 2026-09-24 10:00 U
 
 Changed 1 file (+2 −1) · ran 1 command · made 1 MCP call · 1 approved by you · 1 approved by session rule · 1 ran without asking under Ask · 1 denied by you · 1 other failure
 
-1. edited src/parse.rs (+2 −1) · 1.0s
+1. edited `src/parse.rs` (+2 −1) · 1.0s
 2. ran `cargo test -p parser` in /work/repo — exit 0 · 2.5s · approved by you
 3. did not run `rm -rf build` · denied by you
 4. called linear · list_issues · 1.0s · approved by session rule
@@ -28,7 +28,7 @@ the turn's own workspace snapshots:
 
 ```text
 3. ran `./tidy.sh`
-4. changed outside file tools (a command or another process): edited b.txt (+0 −1), created c.txt (+1 −0)
+4. changed outside file tools (a command or another process): edited `b.txt` (+0 −1), created `c.txt` (+1 −0)
 ```
 
 ## Surfaces
@@ -102,6 +102,18 @@ approval, so a receipt reads the result itself:
   writes keeps the `Tool 'x' was denied:` lead, including ones that name
   their own fix (Plan mode, `allow_shell`); sessions saved before 0.10.1
   wrote some of those without it, and such a call reads as a failure.
+- **Only Codewhale's own words count.** An MCP server's or GitHub's reply,
+  a fetched page, a program's output (code tools), and a sub-agent's words
+  can say anything, so a failed call to one of those is judged by the
+  metadata Codewhale wrote for it, never its text: an MCP server that
+  answers `BLOCKED: …` or `{"side_effect_status":"not_started"}` is listed
+  as a failed call that ran. `BLOCKED:` counts only from the shell tools,
+  and the validation feedback line only as the result's last line.
+- **Stopped at an approval prompt with no approval record** (a sub-agent,
+  or a session older than the approval log): the result says
+  `Tool 'x' denied by user`, which the engine also writes when nobody could
+  be asked. Listed as `did not run …` with no decider, since the text does
+  not prove who said no.
 - **Ran and failed:** the result holds an exit code or a line the shell
   writes only after a process ran (`Command exited with code N`,
   `Command failed (exit code N)`, a timeout or cancel line). Counted as a
@@ -126,7 +138,16 @@ The receipt says so instead of guessing:
   terminal turn with no snapshot pair (snapshots off, the workspace too large
   for them, or pruned: the newest 50 are kept) says so. A snapshot
   difference covers anything that wrote to the workspace during the turn,
-  including you or another program, not only the command.
+  including you or another program, not only the command. It leaves out
+  what snapshots do not track: ignored and skipped paths (`.gitignore`
+  entries, `.env`, `node_modules`, `target`, and the like) and anything
+  outside the workspace (`~/.ssh`, `/tmp`), so an empty list does not mean
+  a command wrote nothing. A turn is matched to its snapshots by its prompt;
+  when another turn has the same prompt ("continue"), the snapshots' turn
+  number must agree too, or the turn is counted as having no pair rather
+  than given another turn's files. Paths print with control characters
+  escaped (`\n`, `\u{1b}`), so a file name cannot add a line to the
+  receipt or send the terminal an escape sequence.
 - **Terminal-session exit codes, durations, and timestamps.** A terminal
   session saves each call and its result text, not the structured result. A
   failed shell call's exit code is read from the shell tool's own closing

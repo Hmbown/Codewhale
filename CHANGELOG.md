@@ -32,9 +32,13 @@ quieter, and Fleet runs can be checked before they spend anything.
   under, read from the turn's own record. A call Codewhale blocked before it
   started (Auto-Review or guardian, a tool policy, a refused sandbox
   escalation, invalid input, a missing tool) is listed as blocked, with the
-  reason, and is not counted as run or as ran without asking. A terminal
+  reason, and is not counted as run or as ran without asking. Only
+  Codewhale's own refusal text counts: an MCP server, a fetched page, or a
+  program cannot make a call that ran read as blocked. A terminal
   session's receipt also lists the files a command changed in each turn,
-  from the workspace snapshots taken before and after it. All three read the
+  from the workspace snapshots taken before and after it (not ignored files
+  or anything outside the workspace), with control characters in paths
+  escaped so a file name cannot forge a receipt line. All three read the
   records Codewhale already keeps and say what those records do not hold
   ([docs/RECEIPTS.md](docs/RECEIPTS.md)). `audit.log` is not that record: it
   logs security events, and it logs an approval only when one is requested,

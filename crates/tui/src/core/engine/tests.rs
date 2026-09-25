@@ -10861,6 +10861,15 @@ fn tool_error_messages_include_actionable_hints() {
         "Tool 'bash' was denied: 'bash' is not available in Plan mode — switch to Work mode (`/mode work`) to run commands and code."
     );
 
+    // The same for an `allow_shell` denial, which names its own fix.
+    let shell_off = ToolError::permission_denied(
+        "Shell commands are off (allow_shell = false). Run `/config allow_shell true` to turn them on.",
+    );
+    assert_eq!(
+        format_tool_error(&shell_off, "exec_shell"),
+        "Tool 'exec_shell' was denied: Shell commands are off (allow_shell = false). Run `/config allow_shell true` to turn them on."
+    );
+
     // Bare denials still get the actionable suffix.
     let bare_denied = ToolError::permission_denied("nope");
     let formatted = format_tool_error(&bare_denied, "exec_shell");
