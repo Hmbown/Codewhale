@@ -1219,16 +1219,9 @@ pub(crate) fn build_session_snapshot(
     Ok(session)
 }
 
-/// Strip ANSI control codes / non-printable bytes from a streaming
-/// text chunk. `pub(super)` because `tui::notifications` consumes it
-/// from `crate::tui::ui` for its per-turn message composition.
-pub(crate) fn sanitize_stream_chunk(chunk: &str) -> String {
-    // Keep printable characters and common whitespace; drop control bytes.
-    chunk
-        .chars()
-        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
-        .collect()
-}
+/// The stream sanitizer lives with the other output sanitizers in
+/// `codewhale-secrets`; the event loop reaches it through this module.
+pub(crate) use codewhale_secrets::sanitize::sanitize_stream_chunk;
 
 /// Ensure an in-flight streaming Assistant cell exists in history and return
 /// its index. Thinking cells go through `streaming_thinking::ensure_active_entry`

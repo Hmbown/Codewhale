@@ -67,6 +67,7 @@ mod model_relevance;
 mod model_routing;
 mod models_dev_live;
 mod network_policy;
+mod notify;
 mod oauth;
 mod operate;
 mod plugins;

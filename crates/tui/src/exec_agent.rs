@@ -317,8 +317,9 @@ pub(crate) async fn run_exec_agent(
     // and explicit `always` are truthful outside the interactive TUI. With no
     // focus-reporting channel, fail closed to focused; only explicit `always`
     // may authorize a headless desktop notification.
-    crate::tui::notifications::set_terminal_focused(true);
-    let _ = crate::tui::notifications::settings(config);
+    let terminal = crate::host_terminal::host();
+    terminal.set_terminal_focused(true);
+    terminal.apply_notification_settings(&config.notifications_config());
 
     validate_exec_tool_authority_resume(tool_authority_json.as_deref(), resume_session.is_some())?;
     let fleet_authority = tool_authority_json

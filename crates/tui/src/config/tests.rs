@@ -15040,7 +15040,7 @@ fn notifications_canonical_condition_overrides_and_unsets_to_legacy() {
         Some(CompletionSound::Off)
     );
     assert_eq!(
-        crate::tui::notifications::settings_projection(&config)
+        crate::notify::settings_projection(&config.notifications_config())
             .unwrap()
             .1,
         std::time::Duration::ZERO

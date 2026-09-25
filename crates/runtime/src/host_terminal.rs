@@ -18,6 +18,8 @@
 
 use std::sync::OnceLock;
 
+use codewhale_config::notifications::NotificationsConfig;
+
 /// Terminal side effects the runtime may request from its host.
 pub trait HostTerminal: Send + Sync {
     /// Leave raw mode if it is on, so an interactive child process sees a
@@ -27,6 +29,18 @@ pub trait HostTerminal: Send + Sync {
     /// Re-enter raw mode after [`HostTerminal::suspend_raw_mode`] returned
     /// `true`.
     fn resume_raw_mode(&self);
+
+    /// Deliver a model-authored notification (the `notify` tool) now,
+    /// honoring the installed notification settings. Returns the delivery
+    /// receipt the tool reports to the model.
+    fn notify_model(&self, title: &str, body: Option<&str>) -> &'static str;
+
+    /// Record whether the terminal has focus; attention policy reads it.
+    fn set_terminal_focused(&self, focused: bool);
+
+    /// Install the process-wide notification method, category gate, sound
+    /// policy and attention condition from `[notifications]`.
+    fn apply_notification_settings(&self, config: &NotificationsConfig);
 }
 
 struct NoHostTerminal;
@@ -37,6 +51,14 @@ impl HostTerminal for NoHostTerminal {
     }
 
     fn resume_raw_mode(&self) {}
+
+    fn notify_model(&self, _title: &str, _body: Option<&str>) -> &'static str {
+        "notification not sent: no terminal host"
+    }
+
+    fn set_terminal_focused(&self, _focused: bool) {}
+
+    fn apply_notification_settings(&self, _config: &NotificationsConfig) {}
 }
 
 static HOST: OnceLock<Box<dyn HostTerminal>> = OnceLock::new();

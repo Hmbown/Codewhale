@@ -2,7 +2,7 @@
 //! attention, duration, method, quiet and category gates. This policy selects
 //! one cue and preserves per-category repeat history across settings updates.
 
-use super::notification_payload::NotificationKind;
+use super::payload::NotificationKind;
 use crate::config::{CompletionSound, NotificationsConfig};
 pub use codewhale_config::notifications::NotificationEvent as SoundEvent;
 use std::path::PathBuf;

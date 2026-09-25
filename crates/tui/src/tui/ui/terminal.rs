@@ -1046,6 +1046,18 @@ impl crate::host_terminal::HostTerminal for TuiHostTerminal {
     fn resume_raw_mode(&self) {
         let _ = enable_raw_mode();
     }
+
+    fn notify_model(&self, title: &str, body: Option<&str>) -> &'static str {
+        crate::tui::notifications::notify_model(title, body)
+    }
+
+    fn set_terminal_focused(&self, focused: bool) {
+        crate::tui::notifications::set_terminal_focused(focused);
+    }
+
+    fn apply_notification_settings(&self, config: &crate::config::NotificationsConfig) {
+        let _ = crate::tui::notifications::apply_settings(config);
+    }
 }
 
 /// Install the TUI as the process's terminal host. Idempotent: the first

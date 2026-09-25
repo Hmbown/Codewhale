@@ -13,7 +13,7 @@
 //!
 //! Every mechanism is fed a [`NotificationPayload`] — a typed, bounded,
 //! redaction-aware value — rather than a free-form `String` (#4834). See
-//! [`crate::tui::notification_payload`] for the per-kind disclosure
+//! [`crate::notify::payload`] for the per-kind disclosure
 //! policy.
 //!
 //! Delivery is governed by one [`NotificationGate`] (#5041):
@@ -27,101 +27,12 @@ use std::sync::atomic::{AtomicU8, AtomicU64};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use super::notification_payload::NotificationKind;
-pub use super::notification_payload::NotificationPayload;
-
-/// Notification delivery method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Method {
-    /// Automatically pick the best protocol for the current terminal.
-    /// See [`resolve_method`] for the canonical resolution table.
-    #[default]
-    Auto,
-    /// OSC 9 escape: `\x1b]9;<msg>\x07`
-    Osc9,
-    /// Plain BEL character: `\x07`
-    Bel,
-    /// macOS Notification Center via `osascript`.
-    ///
-    /// Only reachable through [`Method::Auto`], and only on the macOS
-    /// terminals that expose no notification escape of their own (Apple
-    /// Terminal, the VS Code and JetBrains embedded terminals, plain tmux
-    /// without `LC_TERMINAL`). iTerm2, WezTerm, Ghostty, and kitty are
-    /// matched earlier in [`resolve_method`] and never get here.
-    ///
-    /// Known limitation (#4834): `display notification` is a Standard
-    /// Additions command, so the banner is attributed to the *bundled*
-    /// host process. `/usr/bin/osascript` is unbundled, so macOS credits
-    /// `com.apple.ScriptEditor2` — which is what supplies the Script
-    /// Editor icon and owns the System Settings → Notifications entry
-    /// (alert style, previews, Do Not Disturb). `display notification`
-    /// takes no icon parameter; fixing the attribution requires shipping
-    /// a real `.app` bundle, not a change in this file.
-    MacOS,
-    /// Kitty notification protocol (OSC 99) with ST terminator.
-    /// Uses `ESC ] 99 ; params ST` — no audible beep, unlike BEL.
-    Kitty,
-    /// Ghostty notification protocol (OSC 777).
-    /// Uses `ESC ] 777 ; notify ; title ; message BEL`.
-    Ghostty,
-    /// Suppress all notifications.
-    Off,
-}
-
-/// Truthful result from one notification delivery attempt.
-///
-/// Callers that surface a receipt (notably the model-facing `notify` tool)
-/// use this instead of claiming a notification was sent when user policy,
-/// focus, or the configured delivery method suppressed it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliveryOutcome {
-    /// The notification was handed to the resolved transport.
-    Delivered(Method),
-    /// A background OS/audio worker was started; acceptance is unverified.
-    Dispatched(Method),
-    /// Banner bytes were sent, but the selected audio could not be dispatched.
-    DeliveredWithoutSound(Method),
-    /// A native dispatch was attempted, but selected audio was unavailable.
-    DispatchedWithoutSound(Method),
-    /// The bell-only transport has no authorized cue (off or rate limited).
-    SuppressedBySound,
-    /// The terminal is still in the foreground, or has only just lost focus.
-    SuppressedByAttention,
-    /// The event completed before the configured duration threshold.
-    SuppressedByThreshold,
-    /// Notification delivery is explicitly disabled.
-    SuppressedByMethod,
-    /// Quiet mode or the per-event allow-list suppressed this category.
-    SuppressedByGate,
-    /// The selected terminal protocol produced no transport bytes.
-    UnsupportedTransport,
-    /// The terminal transport could not be written.
-    DeliveryFailed,
-}
-
-impl DeliveryOutcome {
-    /// Short, stable receipt text for command/tool surfaces.
-    #[must_use]
-    pub fn receipt(self) -> &'static str {
-        match self {
-            Self::Delivered(_) => "notification sent",
-            Self::Dispatched(_) => "notification dispatch attempted",
-            Self::DeliveredWithoutSound(_) => "notification sent; sound unavailable",
-            Self::DispatchedWithoutSound(_) => "notification dispatch attempted; sound unavailable",
-            Self::SuppressedBySound => "notification not sent: sound is off or rate limited",
-            Self::SuppressedByAttention => "notification not sent: attention policy blocked it",
-            Self::SuppressedByThreshold => "notification not sent: below the duration threshold",
-            Self::SuppressedByMethod => "notification not sent: notifications are off",
-            Self::SuppressedByGate => {
-                "notification not sent: quiet mode or event settings blocked it"
-            }
-            Self::UnsupportedTransport => {
-                "notification not sent: terminal transport is unsupported"
-            }
-            Self::DeliveryFailed => "notification not sent: terminal delivery failed",
-        }
-    }
-}
+use crate::notify::payload::NotificationKind;
+pub use crate::notify::payload::NotificationPayload;
+use crate::notify::{
+    AttentionCondition, DeliveryOutcome, Method, NotificationGate, attention_delivery_allowed_at,
+    settings_projection,
+};
 
 /// Process-wide configured delivery method. Installed before the event loop
 /// starts and updated by live Settings, so producers such as the model-facing
@@ -263,107 +174,6 @@ fn build_escape(method: Method, in_tmux: bool, msg: &str) -> Vec<u8> {
     }
 }
 
-// ── Notification gate (#5041) ────────────────────────────────────────
-//
-// One policy switchboard between "an event happened" and "the user's
-// desktop is interrupted". `[notifications].quiet` silences every
-// category; `[notifications.events]` disables individual categories. The
-// gate is installed from config by [`settings`] and consulted by
-// [`notify_done`] ahead of every delivery mechanism, so a disabled
-// category can never leak through one specific protocol.
-
-/// Which notification categories may reach the user's desktop.
-///
-/// The category set mirrors [`NotificationKind`] one-to-one. Default:
-/// everything enabled, quiet off — matching the pre-#5041 behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NotificationGate {
-    /// Suppress every category when `true` (`[notifications].quiet`).
-    pub quiet: bool,
-    pub turn_complete: bool,
-    pub subagent_terminal: bool,
-    pub approval_needed: bool,
-    pub input_needed: bool,
-    pub elevation_needed: bool,
-    pub model_notify: bool,
-}
-
-impl Default for NotificationGate {
-    fn default() -> Self {
-        Self {
-            quiet: false,
-            turn_complete: true,
-            subagent_terminal: true,
-            approval_needed: true,
-            input_needed: true,
-            elevation_needed: true,
-            model_notify: true,
-        }
-    }
-}
-
-impl NotificationGate {
-    /// Project the `[notifications]` config block onto a gate.
-    #[must_use]
-    pub fn from_config(notif: &crate::config::NotificationsConfig) -> Self {
-        Self {
-            quiet: notif.quiet,
-            turn_complete: notif.events.turn_complete,
-            subagent_terminal: notif.events.subagent_terminal,
-            approval_needed: notif.events.approval_needed,
-            input_needed: notif.events.input_needed,
-            elevation_needed: notif.events.elevation_needed,
-            model_notify: notif.events.model_notify,
-        }
-    }
-
-    /// Whether an event of `kind` may be delivered under this gate.
-    #[must_use]
-    pub fn allows(self, kind: NotificationKind) -> bool {
-        if self.quiet {
-            return false;
-        }
-        match kind {
-            NotificationKind::TurnComplete => self.turn_complete,
-            NotificationKind::SubagentTerminal => self.subagent_terminal,
-            NotificationKind::ApprovalNeeded => self.approval_needed,
-            NotificationKind::InputNeeded => self.input_needed,
-            NotificationKind::ElevationNeeded => self.elevation_needed,
-            NotificationKind::ModelNotify => self.model_notify,
-        }
-    }
-
-    const QUIET_BIT: u8 = 1 << 0;
-    const TURN_COMPLETE_BIT: u8 = 1 << 1;
-    const SUBAGENT_TERMINAL_BIT: u8 = 1 << 2;
-    const APPROVAL_NEEDED_BIT: u8 = 1 << 3;
-    const INPUT_NEEDED_BIT: u8 = 1 << 4;
-    const ELEVATION_NEEDED_BIT: u8 = 1 << 5;
-    const MODEL_NOTIFY_BIT: u8 = 1 << 6;
-
-    const fn to_bits(self) -> u8 {
-        (self.quiet as u8 * Self::QUIET_BIT)
-            | (self.turn_complete as u8 * Self::TURN_COMPLETE_BIT)
-            | (self.subagent_terminal as u8 * Self::SUBAGENT_TERMINAL_BIT)
-            | (self.approval_needed as u8 * Self::APPROVAL_NEEDED_BIT)
-            | (self.input_needed as u8 * Self::INPUT_NEEDED_BIT)
-            | (self.elevation_needed as u8 * Self::ELEVATION_NEEDED_BIT)
-            | (self.model_notify as u8 * Self::MODEL_NOTIFY_BIT)
-    }
-
-    const fn from_bits(bits: u8) -> Self {
-        Self {
-            quiet: bits & Self::QUIET_BIT != 0,
-            turn_complete: bits & Self::TURN_COMPLETE_BIT != 0,
-            subagent_terminal: bits & Self::SUBAGENT_TERMINAL_BIT != 0,
-            approval_needed: bits & Self::APPROVAL_NEEDED_BIT != 0,
-            input_needed: bits & Self::INPUT_NEEDED_BIT != 0,
-            elevation_needed: bits & Self::ELEVATION_NEEDED_BIT != 0,
-            model_notify: bits & Self::MODEL_NOTIFY_BIT != 0,
-        }
-    }
-}
-
 /// Everything on, quiet off — the pre-#5041 behavior, and the effective
 /// policy until the first [`settings`] call installs the configured gate.
 const GATE_DEFAULT_BITS: u8 = 0b0111_1110;
@@ -372,19 +182,6 @@ const GATE_DEFAULT_BITS: u8 = 0b0111_1110;
 /// a single atomic load.
 static NOTIFICATION_GATE: AtomicU8 = AtomicU8::new(GATE_DEFAULT_BITS);
 
-/// Attention delivery policy installed from the resolved notification config.
-///
-/// The default is background-only. A newly started TUI is treated as focused
-/// until the terminal explicitly reports `FocusLost`, so the safe startup
-/// behavior is silence rather than an unexpected banner or bell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttentionCondition {
-    Always = 0,
-    Unfocused = 1,
-    Never = 2,
-}
-
-const DEFAULT_UNFOCUSED_GRACE: Duration = Duration::from_secs(2);
 static ATTENTION_CONDITION: AtomicU8 = AtomicU8::new(AttentionCondition::Unfocused as u8);
 static UNFOCUSED_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -411,25 +208,6 @@ fn current_attention_condition() -> AttentionCondition {
 }
 
 #[must_use]
-fn attention_delivery_allowed_at(
-    condition: AttentionCondition,
-    focused: bool,
-    unfocused_since_ms: u64,
-    now_ms: u64,
-) -> bool {
-    match condition {
-        AttentionCondition::Always => true,
-        AttentionCondition::Never => false,
-        AttentionCondition::Unfocused => {
-            !focused
-                && unfocused_since_ms > 0
-                && now_ms.saturating_sub(unfocused_since_ms)
-                    >= DEFAULT_UNFOCUSED_GRACE.as_millis() as u64
-        }
-    }
-}
-
-#[must_use]
 fn attention_delivery_allowed() -> bool {
     attention_delivery_allowed_at(
         current_attention_condition(),
@@ -437,25 +215,6 @@ fn attention_delivery_allowed() -> bool {
         UNFOCUSED_SINCE_MS.load(Ordering::SeqCst),
         attention_clock_ms(),
     )
-}
-
-/// Native hosts provide focus observations; the same grace/condition rule
-/// applies before either native sound or banner preparation.
-pub(crate) fn native_attention_allowed(
-    config: &crate::config::NotificationsConfig,
-    focused: bool,
-    unfocused_for: Duration,
-) -> bool {
-    let condition = match config
-        .condition
-        .unwrap_or(crate::config::NotificationCondition::Unfocused)
-    {
-        crate::config::NotificationCondition::Always => AttentionCondition::Always,
-        crate::config::NotificationCondition::Unfocused => AttentionCondition::Unfocused,
-        crate::config::NotificationCondition::Never => AttentionCondition::Never,
-    };
-    let elapsed = unfocused_for.as_millis().min(u128::from(u64::MAX - 1)) as u64;
-    attention_delivery_allowed_at(condition, focused, 1, elapsed + 1)
 }
 
 /// Install `gate` as the process-wide notification policy.
@@ -486,7 +245,7 @@ pub fn notify_done_to<W: Write>(
     gate: NotificationGate,
     sink: &mut W,
 ) -> DeliveryOutcome {
-    let mut policy = super::sound_policy::EventSoundPolicy::default();
+    let mut policy = crate::notify::sound_policy::EventSoundPolicy::default();
     notify_with_sinks(
         method,
         in_tmux,
@@ -496,8 +255,8 @@ pub fn notify_done_to<W: Write>(
         gate,
         true,
         sink,
-        &mut |kind, bell| policy.decide(super::sound_policy::event_for_kind(kind), 0, bell),
-        &mut super::notification_audio::emit_terminal,
+        &mut |kind, bell| policy.decide(crate::notify::sound_policy::event_for_kind(kind), 0, bell),
+        &mut crate::notify::audio::emit_terminal,
         &mut |_| DeliveryOutcome::UnsupportedTransport,
     )
 }
@@ -513,15 +272,18 @@ pub(crate) fn notify_with_sinks(
     gate: NotificationGate,
     attention_allowed: bool,
     sink: &mut dyn Write,
-    decide_sound: &mut dyn FnMut(NotificationKind, bool) -> super::sound_policy::SoundDecision,
+    decide_sound: &mut dyn FnMut(
+        NotificationKind,
+        bool,
+    ) -> crate::notify::sound_policy::SoundDecision,
     audio: &mut dyn FnMut(
-        &super::sound_policy::SoundCue,
+        &crate::notify::sound_policy::SoundCue,
         &mut dyn Write,
-    ) -> super::notification_audio::AudioOutcome,
+    ) -> crate::notify::audio::AudioOutcome,
     native: &mut dyn FnMut(&NotificationPayload) -> DeliveryOutcome,
 ) -> DeliveryOutcome {
-    use super::notification_audio::AudioOutcome;
-    use super::sound_policy::SoundDecision;
+    use crate::notify::audio::AudioOutcome;
+    use crate::notify::sound_policy::SoundDecision;
     if !attention_allowed {
         return DeliveryOutcome::SuppressedByAttention;
     }
@@ -617,11 +379,34 @@ pub fn notify_done(
         attention_delivery_allowed(),
         &mut io::stdout(),
         &mut |kind, bell| {
-            super::sound_policy::decide(kind, super::sound_policy::epoch_millis_now(), bell)
+            crate::notify::sound_policy::decide(
+                kind,
+                crate::notify::sound_policy::epoch_millis_now(),
+                bell,
+            )
         },
-        &mut super::notification_audio::dispatch,
+        &mut crate::notify::audio::dispatch,
         &mut dispatch_native,
     )
+}
+
+/// The `notify` tool's delivery: a typed model-notify payload through the
+/// configured method, installed gate and attention policy, threshold zero.
+pub(crate) fn notify_model(title: &str, body: Option<&str>) -> &'static str {
+    // #4834: model-authored text is the least trusted input that can reach
+    // Notification Center, so it goes through the typed payload like every
+    // other event kind: bounded, control-byte-stripped, and redacted for
+    // credentials, absolute paths, and raw tool JSON.
+    let payload = NotificationPayload::model_notify(title, body);
+    let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
+    notify_done(
+        configured_method(),
+        in_tmux,
+        &payload,
+        Duration::ZERO,
+        Duration::from_secs(1),
+    )
+    .receipt()
 }
 
 /// Set the terminal taskbar progress state via OSC 9 ; 4.
@@ -1123,48 +908,22 @@ use crate::tui::app::App;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_models::{ContentBlock, Message};
 
-/// Resolve the effective notification method/threshold/include-summary tuple
-/// for a completed turn, taking the high-level
-/// `[tui].notification_condition` override into account on top of the
-/// lower-level `[notifications]` block.
-///
-/// Returns `None` only when the high-level attention policy is `never`.
-/// `Method::Off` remains a valid projection so the event gate can report
-/// that both banner and sound are disabled.
-#[must_use]
-pub fn settings_projection(config: &crate::config::Config) -> Option<(Method, Duration, bool)> {
-    let notif = config.notifications_config();
-    let method = match notif.method {
-        crate::config::NotificationMethod::Auto => Method::Auto,
-        crate::config::NotificationMethod::Osc9 => Method::Osc9,
-        crate::config::NotificationMethod::Bel => Method::Bel,
-        crate::config::NotificationMethod::Kitty => Method::Kitty,
-        crate::config::NotificationMethod::Ghostty => Method::Ghostty,
-        crate::config::NotificationMethod::Off => Method::Off,
-    };
-    match notif
-        .condition
-        .unwrap_or(crate::config::NotificationCondition::Unfocused)
-    {
-        crate::config::NotificationCondition::Always => {
-            Some((method, Duration::ZERO, notif.include_summary))
-        }
-        crate::config::NotificationCondition::Unfocused => Some((
-            method,
-            Duration::from_secs(notif.threshold_secs),
-            notif.include_summary,
-        )),
-        crate::config::NotificationCondition::Never => None,
-    }
+pub fn settings(config: &crate::config::Config) -> Option<(Method, Duration, bool)> {
+    apply_settings(&config.notifications_config())
 }
 
-pub fn settings(config: &crate::config::Config) -> Option<(Method, Duration, bool)> {
-    let notif = config.notifications_config();
+/// Install the process-wide method, gate, sound policy and attention
+/// condition from `[notifications]`; returns the resolved projection.
+pub(crate) fn apply_settings(
+    notif: &crate::config::NotificationsConfig,
+) -> Option<(Method, Duration, bool)> {
     // Install the category/quiet gate (#5041) so `notify_done` honors
     // `[notifications].quiet` and `[notifications.events]`.
-    install_notification_gate(NotificationGate::from_config(&notif));
-    super::sound_policy::reconfigure(super::sound_policy::EventSoundPolicy::from_config(&notif));
-    let projection = settings_projection(config);
+    install_notification_gate(NotificationGate::from_config(notif));
+    crate::notify::sound_policy::reconfigure(
+        crate::notify::sound_policy::EventSoundPolicy::from_config(notif),
+    );
+    let projection = settings_projection(notif);
     let method = projection.map_or(Method::Off, |(method, _, _)| method);
     install_configured_method(method);
 
@@ -1341,7 +1100,7 @@ pub fn latest_assistant_text(messages: &[Message]) -> Option<String> {
 pub fn text_summary(text: &str) -> Option<String> {
     const MAX_CHARS: usize = 360;
 
-    let sanitized = super::ui::sanitize_stream_chunk(text);
+    let sanitized = codewhale_secrets::sanitize::sanitize_stream_chunk(text);
     let collapsed = sanitized
         .lines()
         .map(str::trim)
@@ -1367,6 +1126,34 @@ pub fn text_summary(text: &str) -> Option<String> {
 mod tests {
 
     use super::*;
+    use crate::notify::DEFAULT_UNFOCUSED_GRACE;
+
+    /// Moved from `tools::notify`: the `notify` tool's emission chain, where
+    /// the installed method decides suppression before any sink write.
+    #[test]
+    fn configured_method_off_silences_the_tool_emission() {
+        let _restore = ConfiguredMethodRestore::capture();
+        install_configured_method(Method::Off);
+
+        // The emission chain `execute` drives: the installed method decides
+        // suppression before any sink write, with the gate loaded from the
+        // process-wide state.
+        let payload = NotificationPayload::model_notify("done", None);
+        let mut sink = Vec::new();
+        notify_done_to(
+            configured_method(),
+            false,
+            &payload,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(1),
+            current_notification_gate(),
+            &mut sink,
+        );
+        assert!(
+            sink.is_empty(),
+            "configured method=off must silence the notify tool path"
+        );
+    }
 
     #[test]
     fn title_whale_is_static_when_focused_or_motion_disabled() {
@@ -2062,7 +1849,7 @@ mod tests {
         assert!(body.ends_with("..."));
         assert_eq!(
             body.chars().count(),
-            super::super::notification_payload::PREVIEW_MAX_CHARS
+            crate::notify::payload::PREVIEW_MAX_CHARS
         );
     }
 
@@ -2656,10 +2443,10 @@ mod tideline_tests;
 
 #[cfg(test)]
 mod unified_audio_tests {
-    use super::super::notification_audio::AudioOutcome;
-    use super::super::sound_policy::{self, EventSoundPolicy, SoundCue, SoundDecision};
     use super::*;
     use crate::config::{CompletionSound, NotificationConfigUpdate, NotificationsConfig};
+    use crate::notify::audio::AudioOutcome;
+    use crate::notify::sound_policy::{self, EventSoundPolicy, SoundCue, SoundDecision};
 
     fn payloads() -> [NotificationPayload; 6] {
         [

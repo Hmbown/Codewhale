@@ -27141,9 +27141,9 @@ fn notification_settings_tui_always_keeps_configured_method_no_threshold() {
     };
 
     let (method, threshold, include_summary) =
-        crate::tui::notifications::settings_projection(&config)
+        crate::notify::settings_projection(&config.notifications_config())
             .expect("notification should be enabled");
-    assert_eq!(method, crate::tui::notifications::Method::Bel);
+    assert_eq!(method, crate::notify::Method::Bel);
     assert_eq!(threshold, Duration::ZERO);
     assert!(include_summary);
 }
@@ -27158,7 +27158,7 @@ fn notification_settings_tui_never_disables_notifications() {
         ..Config::default()
     };
 
-    assert!(crate::tui::notifications::settings_projection(&config).is_none());
+    assert!(crate::notify::settings_projection(&config.notifications_config()).is_none());
 }
 
 #[test]
@@ -27181,9 +27181,9 @@ fn notification_settings_no_tui_override_uses_notifications_block() {
     };
 
     let (method, threshold, include_summary) =
-        crate::tui::notifications::settings_projection(&config)
+        crate::notify::settings_projection(&config.notifications_config())
             .expect("notification should be enabled");
-    assert_eq!(method, crate::tui::notifications::Method::Osc9);
+    assert_eq!(method, crate::notify::Method::Osc9);
     assert_eq!(threshold, Duration::from_secs(45));
     assert!(!include_summary);
 }
@@ -27279,7 +27279,7 @@ fn completed_turn_notification_truncates_long_text() {
     // so the bound the type promises is the bound the OS receives.
     assert_eq!(
         preview.chars().count(),
-        crate::tui::notification_payload::PREVIEW_MAX_CHARS
+        crate::notify::payload::PREVIEW_MAX_CHARS
     );
 }
 
