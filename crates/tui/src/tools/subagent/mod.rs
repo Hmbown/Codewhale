@@ -19348,7 +19348,7 @@ impl SubAgentToolRegistry {
 /// (`mcp_<server>_<tool>`): the two shipped computer-use surfaces plus the
 /// generic `computer-use` / `computer_use` markers a third-party desktop
 /// server carries in its server id.
-fn is_machine_control_tool(name: &str) -> bool {
+pub(crate) fn is_machine_control_tool(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let Some(rest) = lower.strip_prefix("mcp_") else {
         return false;

@@ -2813,6 +2813,9 @@ mod turn_operation_lookup {
         })
     }
 
+    // Callers snapshot the manager-owned runtime directory. CODEWHALE_HOME is
+    // process-wide, so unrelated parallel tests can write elsewhere beneath
+    // the temporary root while a read-only operation is being checked.
     fn directory_bytes(
         root: &Path,
     ) -> Result<std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>> {
@@ -2876,13 +2879,13 @@ mod turn_operation_lookup {
             }
             assert_eq!(manager.store.owner_id, owner_id);
             assert!(manager.active.lock().await.engines.is_empty());
-            let before = directory_bytes(temp.path())?;
+            let before = directory_bytes(&runtime_dir)?;
             let observed = manager
                 .lookup_turn_operation(&thread.id, key)?
                 .context("accepted operation must remain available")?;
             assert_eq!(serde_json::to_value(observed)?, expected);
             assert!(manager.active.lock().await.engines.is_empty());
-            assert_eq!(directory_bytes(temp.path())?, before);
+            assert_eq!(directory_bytes(&runtime_dir)?, before);
         }
         Ok(())
     }
@@ -2893,7 +2896,8 @@ mod turn_operation_lookup {
         let _env = crate::test_support::lock_test_env();
         let temp = tempfile::tempdir()?;
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
-        let manager = test_manager(temp.path().join("runtime"))?;
+        let runtime_dir = temp.path().join("runtime");
+        let manager = test_manager(runtime_dir.clone())?;
         let thread = sample_thread("thr_lookup_incomplete");
         let turn = sample_turn(
             &thread.id,
@@ -2905,9 +2909,9 @@ mod turn_operation_lookup {
         let lock_path = manager
             .store
             .turn_operation_lock_path(&binding.operation_key_fingerprint)?;
-        let before = directory_bytes(temp.path())?;
+        let before = directory_bytes(&runtime_dir)?;
         assert!(manager.lookup_turn_operation(&thread.id, key)?.is_none());
-        assert_eq!(directory_bytes(temp.path())?, before);
+        assert_eq!(directory_bytes(&runtime_dir)?, before);
 
         drop(
             manager
@@ -2919,13 +2923,13 @@ mod turn_operation_lookup {
         manager.store.save_thread(&thread)?;
         manager.store.save_turn(&turn)?;
         manager.store.save_turn_operation_binding(&binding)?;
-        let before = directory_bytes(temp.path())?;
+        let before = directory_bytes(&runtime_dir)?;
         assert!(matches!(
             manager.lookup_turn_operation(&thread.id, key),
             Err(Incomplete)
         ));
         assert_eq!(
-            directory_bytes(temp.path())?,
+            directory_bytes(&runtime_dir)?,
             before,
             "lookup cannot recreate a missing lock"
         );
@@ -2936,13 +2940,13 @@ mod turn_operation_lookup {
                 .open_turn_operation_claim_lock(&binding.operation_key_fingerprint)?,
         );
         manager.store.remove_turn(&turn.id)?;
-        let before = directory_bytes(temp.path())?;
+        let before = directory_bytes(&runtime_dir)?;
         assert!(matches!(
             manager.lookup_turn_operation(&thread.id, key),
             Err(Incomplete)
         ));
         assert_eq!(
-            directory_bytes(temp.path())?,
+            directory_bytes(&runtime_dir)?,
             before,
             "lookup cannot recover a torn binding"
         );
@@ -2954,12 +2958,12 @@ mod turn_operation_lookup {
                 .open_turn_operation_claim_lock(&binding.operation_key_fingerprint)?,
         );
         let guard = claim.try_write()?;
-        let before = directory_bytes(temp.path())?;
+        let before = directory_bytes(&runtime_dir)?;
         assert!(matches!(
             manager.lookup_turn_operation(&thread.id, key),
             Err(Incomplete)
         ));
-        assert_eq!(directory_bytes(temp.path())?, before);
+        assert_eq!(directory_bytes(&runtime_dir)?, before);
         drop(guard);
         assert_eq!(
             manager.lookup_turn_operation(&thread.id, key)?.unwrap().id,
@@ -2976,7 +2980,8 @@ mod turn_operation_lookup {
         let _env = crate::test_support::lock_test_env();
         let temp = tempfile::tempdir()?;
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
-        let manager = test_manager(temp.path().join("runtime"))?;
+        let runtime_dir = temp.path().join("runtime");
+        let manager = test_manager(runtime_dir.clone())?;
         let thread = sample_thread("thr_lookup_scope");
         let turn = sample_turn(
             &thread.id,
@@ -3025,12 +3030,12 @@ mod turn_operation_lookup {
             write_json_atomic(&binding_path, &candidate_binding)?;
             write_json_atomic(&turn_path, &candidate_turn)?;
             write_json_atomic(&thread_path, &candidate_thread)?;
-            let before = directory_bytes(temp.path())?;
+            let before = directory_bytes(&runtime_dir)?;
             assert!(
                 manager.lookup_turn_operation(&thread.id, key)?.is_none(),
                 "{mismatch}"
             );
-            assert_eq!(directory_bytes(temp.path())?, before, "{mismatch}");
+            assert_eq!(directory_bytes(&runtime_dir)?, before, "{mismatch}");
         }
         manager.store.save_thread(&thread)?;
         manager.store.save_turn(&turn)?;
@@ -13304,6 +13309,114 @@ async fn terminal_turn_cancels_pending_dynamic_tool_exactly_once() -> Result<()>
             .await?
             .latest_turn_id
             .unwrap()
+    );
+    Ok(())
+}
+
+/// DESKTOP-QA-20260923 bug 1: the engine's 60s "Still waiting for tool
+/// approval" heartbeat is queued while the relay is parked on the external
+/// decision. It must never be sequenced after `approval.decided`, where it
+/// reads as a live claim that the (already answered) call is still waiting.
+#[tokio::test]
+async fn approval_wait_heartbeat_is_never_sequenced_after_the_decision() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "needs approval".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
+
+    harness
+        .tx_event
+        .send(EngineEvent::TurnStarted {
+            turn_id: "engine_turn_wait".to_string(),
+            created_at: Utc::now(),
+            route: None,
+        })
+        .await?;
+    // The Responses client joins call and item ids with `|`.
+    let call_id = "call_00_wait|fc_99765c30";
+    harness
+        .tx_event
+        .send(EngineEvent::ApprovalRequired {
+            approval_key: "wait-key".to_string(),
+            approval_grouping_key: "wait-key".to_string(),
+            id: call_id.to_string(),
+            tool_name: "run_verifiers".to_string(),
+            description: "verifiers".to_string(),
+            input: serde_json::json!({}),
+            intent_summary: None,
+            approval_force_prompt: false,
+        })
+        .await?;
+    let approval_id = await_approval_identity(&manager, &thread.id, call_id).await?;
+
+    // The engine's heartbeat fires while the card is still unanswered.
+    harness
+        .tx_event
+        .send(EngineEvent::Status {
+            message: format!(
+                "Still waiting for tool approval on `{call_id}` after 60s — the turn is parked here until it is answered"
+            ),
+        })
+        .await?;
+    sleep(Duration::from_millis(100)).await;
+
+    assert!(manager.deliver_external_approval(
+        &approval_id,
+        ExternalApprovalDecision::Allow { remember: false },
+    ));
+    assert_eq!(
+        harness.recv_approval_event().await,
+        Some(MockApprovalEvent::Approved {
+            id: call_id.to_string(),
+        })
+    );
+
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    wait_for_terminal_turn(&manager, &turn.id).await?;
+
+    let events = manager.events_since(&thread.id, None)?;
+    let decided_at = events
+        .iter()
+        .position(|event| event.event == "approval.decided")
+        .context("approval.decided was not emitted")?;
+    let stale: Vec<_> = events[decided_at..]
+        .iter()
+        .filter(|event| {
+            event.payload["item"]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.starts_with("Still waiting for tool approval"))
+        })
+        .map(|event| (event.seq, event.payload["item"]["detail"].clone()))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "approval-wait heartbeat sequenced after approval.decided: {stale:?}"
     );
     Ok(())
 }

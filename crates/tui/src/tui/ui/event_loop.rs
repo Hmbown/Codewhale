@@ -813,11 +813,12 @@ pub async fn run_tui(
         match load_result {
             Ok(Some(saved)) => match manager.load_session_goal(&saved.metadata.id) {
                 Ok(goal) => {
-                    match apply_loaded_session_with_goal(&mut app, config, &saved, goal.as_ref()) {
+                    let saved_id = saved.metadata.id.clone();
+                    match apply_loaded_session_with_goal(&mut app, config, saved, goal.as_ref()) {
                         Ok(()) => {
                             app.status_message = Some(format!(
                                 "Resumed session: {}",
-                                crate::session_manager::truncate_id(&saved.metadata.id)
+                                crate::session_manager::truncate_id(&saved_id)
                             ));
                         }
                         Err(err) => {
@@ -2333,6 +2334,11 @@ pub(crate) async fn run_event_loop(
                     // Liveness only. `record_turn_activity` above consumes the
                     // pulse; it must not alter transcript or status copy.
                     EngineEvent::ToolCallHeartbeat => {}
+                    // Typed owner activity is a pet-facing projection;
+                    // `pet_watch::observe` above already consumed it, and the
+                    // transcript renders from the ToolCall* events.
+                    EngineEvent::OperationActivityStarted { .. }
+                    | EngineEvent::OperationActivityCompleted { .. } => {}
                     EngineEvent::ToolCallComplete { id, name, result } => {
                         if crate::tui::tool_routing::evidence_completion_should_be_ignored(
                             app, &id, &result,
@@ -3510,8 +3516,11 @@ pub(crate) async fn run_event_loop(
                         }
                         // #3030: progress can arrive before AgentSpawned is
                         // observed — assign the stable label on first sight.
-                        let label = app.ensure_agent_label(&id);
-                        app.status_message = Some(format!("{label}: {display}"));
+                        // The label and the step stay on the agent row. They
+                        // used to overwrite the parent status line, so every
+                        // child tool call looked like the turn being watched
+                        // (#6565).
+                        let _ = app.ensure_agent_label(&id);
                         // A progress-first agent (its AgentSpawned was dropped
                         // under channel pressure) exists only in agent_progress
                         // until a ListSubAgents refresh promotes it into

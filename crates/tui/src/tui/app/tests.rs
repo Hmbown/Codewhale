@@ -7513,3 +7513,80 @@ fn launch_onboarding_scenario() {
         assert_eq!(ready, OnboardingState::None);
     }
 }
+
+/// Memory note M3: a resume owns the loaded session, so its journal and
+/// history move into the App instead of being cloned beside a copy that is
+/// dropped right after. The journal's entry buffer is the *same allocation*
+/// afterwards, and the result matches the borrowing path exactly.
+#[test]
+fn owned_restore_moves_the_journal_and_matches_the_borrowing_restore() {
+    let message = |text: &str| Message {
+        role: codewhale_models::Role::User,
+        content: vec![codewhale_models::ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+    };
+    let messages = vec![message("first"), message("second")];
+    let t0 = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+    let t1 = t0 + chrono::Duration::seconds(12);
+    let saved = crate::session_manager::create_saved_session_with_id_mode_and_stamps(
+        "owned-restore".to_string(),
+        &messages,
+        &[t0, t1],
+        "test-model",
+        Path::new("."),
+        0,
+        None,
+        None,
+    );
+
+    let mut borrowed = App::new(test_options(false), &Config::default());
+    borrowed.restore_api_messages(
+        crate::runtime_handoff::project_owned_messages_for_restore(saved.messages.clone()),
+        &saved,
+    );
+
+    let mut owned_session = saved.clone();
+    let entries_buffer = owned_session
+        .journal
+        .as_ref()
+        .expect("journal")
+        .entries
+        .as_ptr();
+    let mut owned = App::new(test_options(false), &Config::default());
+    owned.restore_api_messages_from_owned(&mut owned_session);
+
+    assert_eq!(
+        owned.session_journal.entries.as_ptr(),
+        entries_buffer,
+        "the journal must be moved into the App, not cloned"
+    );
+    assert!(owned_session.journal.is_none());
+    assert!(owned_session.messages.is_empty());
+    assert_eq!(
+        owned.session_journal.entries,
+        borrowed.session_journal.entries
+    );
+    assert_eq!(owned.api_messages, borrowed.api_messages);
+    assert_eq!(owned.api_message_stamps, vec![t0, t1]);
+    assert_eq!(owned.api_message_stamps, borrowed.api_message_stamps);
+
+    // A legacy session without a journal rebuilds it from the history, on
+    // both paths alike.
+    let mut legacy = saved.clone();
+    legacy.journal = None;
+    let mut legacy_borrowed = App::new(test_options(false), &Config::default());
+    legacy_borrowed.restore_api_messages(
+        crate::runtime_handoff::project_owned_messages_for_restore(legacy.messages.clone()),
+        &legacy,
+    );
+    let mut legacy_owned = App::new(test_options(false), &Config::default());
+    legacy_owned.restore_api_messages_from_owned(&mut legacy);
+    assert_eq!(legacy_owned.api_messages, legacy_borrowed.api_messages);
+    assert_eq!(
+        legacy_owned.session_journal.entries.len(),
+        legacy_borrowed.session_journal.entries.len()
+    );
+    assert_eq!(legacy_owned.api_message_stamps.len(), 2);
+}

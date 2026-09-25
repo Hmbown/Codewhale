@@ -1821,7 +1821,7 @@ pub struct TuiConfig {
     pub posture_bar: Option<ChromeRowPreset>,
     /// The same three settings for the metrics line under the posture bar.
     /// `compact` is the default: it keeps the route, the context reading, the cost and the
-    /// balance and drops the telemetry and the help hint (#5950).
+    /// balance, the cache rate, and drops the other telemetry and the help hint (#5950, #6565).
     #[serde(default)]
     pub metrics_line: Option<ChromeRowPreset>,
     /// Emit OSC 8 hyperlink escape sequences around URLs in the transcript so
@@ -2034,11 +2034,11 @@ pub struct ToolsConfig {
     #[serde(default)]
     pub user_input_max_options: Option<u32>,
 
-    /// Seconds Codewhale waits for a user-input answer or an approval
-    /// decision before cancelling it (#6003). `None` uses the built-in
-    /// default (300). An explicit `0` disables the timeout entirely, so
-    /// long human review or overnight automation can wait indefinitely.
-    /// Values above 86,400 (24h) are clamped with a warning.
+    /// Seconds Codewhale waits for a `request_user_input` answer before
+    /// cancelling it (#6003). Absent, or an explicit `0`, waits until the
+    /// person answers or cancels — the same as an approval. A positive
+    /// value bounds that one wait. Values above 86,400 (24h) are clamped
+    /// with a warning.
     #[serde(default)]
     pub user_input_timeout_seconds: Option<u64>,
 }
@@ -4888,8 +4888,8 @@ impl Config {
     }
 
     /// Effective wait for a user-input answer or an approval decision
-    /// (#6003). `None` means the built-in default (300s). An explicit `0`
-    /// disables the timeout; values above 24h clamp with a warning.
+    /// (#6003). `None` or `0` waits until the person answers or cancels.
+    /// A positive value bounds that one wait; values above 24h clamp.
     #[must_use]
     pub fn user_input_timeout(&self) -> Option<std::time::Duration> {
         const MAX_SECONDS: u64 = 86_400;

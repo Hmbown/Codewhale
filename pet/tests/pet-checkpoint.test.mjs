@@ -62,7 +62,7 @@ test('native rotation retains a bounded active history and does not retrigger ol
   let archived = 0, largest = 0;
   for (let step = 0; step < 180; step++) {
     const at = step * 5000;
-    live.observeEngine(JSON.stringify({ event: 'tool_call_started', tool_call_id: String(step), tool_name: 'exec_command' }), at);
+    live.observeEngine(JSON.stringify({ event: 'operation_activity_started', span_id: String(step), activity_kind: 'executing' }), at);
     live.advanceEngine(at + 5000, false, false);
     largest = Math.max(largest, JSON.parse(live.recording()).tape.length);
     if (live.needsSegment()) {

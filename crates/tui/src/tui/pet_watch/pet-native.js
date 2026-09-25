@@ -1653,75 +1653,197 @@ function renderPetPCM(voices, startSample, length, sampleRate = 48_000) {
 factories["pet-engine"]=function(exports,require){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PetEngineTelemetry = void 0;
+exports.PetEngineTelemetry = exports.ENGINE_OWNER_STALE_MS = void 0;
 const pet_sim_js_1 = require("./pet-sim.js");
-const codewhale_js_1 = require("./codewhale.js");
 const pet_telemetry_js_1 = require("./pet-telemetry.js");
-/** Read-only adapter for codewhale_protocol::EventMsg metadata. The foreground
- * Engine is the event owner. This replaces no turn loop: it only translates
- * lifecycle observations to event-v1 for the same pet bucketer used by imports.
- * Text, inputs and results are neither accepted nor retained. */
+// Engine emits a liveness pulse every 10 seconds for a running operation.
+// Keep a small scheduling margin so one delayed pulse does not erase a valid
+// long operation from the owner projection; after that, it becomes generic.
+// The physics tape keeps its own, shorter coverage rule (see `pulse`).
+exports.ENGINE_OWNER_STALE_MS = 12_000;
+const ACTIVITY_KINDS = [
+    'reading', 'editing', 'searching', 'testing', 'executing', 'browsing', 'computer',
+    'memory', 'tool', 'thinking', 'responding', 'delegating',
+];
+const TURN_OUTCOMES = ['completed', 'interrupted', 'failed'];
+const OPERATION_OUTCOMES = ['succeeded', 'failed', 'cancelled', 'denied'];
+const APPROVAL_OUTCOMES = ['approved', 'denied', 'cancelled'];
+function categoryFor(kind) {
+    switch (kind) {
+        case 'reading':
+        case 'editing':
+        case 'searching': return 'filesystem';
+        case 'testing':
+        case 'executing': return 'code';
+        case 'browsing': return 'browser';
+        case 'computer':
+        case 'tool': return 'tool';
+        case 'memory': return 'memory';
+        case 'thinking': return 'reasoning';
+        case 'responding': return 'communication';
+        case 'delegating': return 'agent';
+    }
+}
+/** Read-only reducer for the Engine owner's typed metadata. It keeps using the
+ * existing pet telemetry tape and physics owner; it neither recognizes tool
+ * names nor accepts transcript text, arguments, commands, or results. */
 class PetEngineTelemetry {
     events = [];
     active = new Map();
     waiting;
     sequence = 0;
     lastTime = 0;
-    /** Ephemeral receipts. Replay tapes retain measured categories, not tool
-     * names. Restoring/disconnecting clears these captions. Never mutates world. */
+    lastObservedAt;
+    turnId;
+    turnOutcome;
+    terminalAt;
+    lastFailedTool;
+    completedSpans = new Set();
+    completedTurns = new Set();
+    /** Ephemeral safe read projection. Span ids are retained only in this
+     * reducer to correlate trusted lifecycle events and never leave the owner. */
     activity(at) {
-        const fresh = (e) => at >= e.startTime && at - e.endTime <= pet_telemetry_js_1.PET_BIN_MS * 2;
-        const spans = [...this.active].filter(([, e]) => fresh(e));
-        const parallel = spans.filter(([key]) => key.startsWith('agent:')).length;
-        const cue = ([key, e]) => ({
-            ...(key.startsWith('tool:') ? (0, codewhale_js_1.toolActivity)(e.name) : key.startsWith('thinking:')
-                ? { kind: 'thinking', label: 'Thinking' } : key.startsWith('agent:')
-                ? { kind: 'delegating', label: 'Coordinating agents' } : { kind: 'responding', label: 'Writing the response' }),
-            tool: key.startsWith('tool:') ? e.name.replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, 96) : null,
-            sinceMs: e.startTime,
-        });
-        const active = spans.filter(([key]) => !key.startsWith('agent:')).slice(-4).reverse().map(cue);
-        const error = [...this.events].reverse().find(e => e.category === 'error' && fresh(e));
-        const primary = this.waiting && fresh(this.waiting)
-            ? { kind: 'waiting', label: 'Waiting for you', tool: null, sinceMs: this.waiting.startTime }
-            : error ? { kind: 'error', label: 'An operation failed', tool: null, sinceMs: error.startTime }
-                : active[0] ?? (parallel ? cue(spans.find(([key]) => key.startsWith('agent:')))
-                    : { kind: 'unknown', label: 'Activity unobserved', tool: null, sinceMs: at });
-        return { ...primary, observed: primary.kind !== 'unknown', parallel, active };
+        const observed = this.lastObservedAt !== undefined;
+        const freshness = !observed ? 'missing'
+            : at - this.lastObservedAt <= exports.ENGINE_OWNER_STALE_MS ? 'fresh' : 'stale';
+        const fresh = freshness === 'fresh';
+        const active = fresh
+            ? [...this.active.values()]
+                .filter(span => at >= span.startedAtMs && at - span.event.endTime <= exports.ENGINE_OWNER_STALE_MS)
+                // The parent's own work leads; delegated agents are counted in
+                // `parallelAgentCount` and only lead when nothing else is active.
+                .sort((a, b) => Number(a.group === 'agent') - Number(b.group === 'agent')
+                || b.startedAtMs - a.startedAtMs || a.key.localeCompare(b.key))
+            : [];
+        const agents = active.filter(span => span.group === 'agent').length;
+        const terminalFresh = fresh && this.terminalAt !== undefined
+            && at >= this.terminalAt && at - this.terminalAt <= exports.ENGINE_OWNER_STALE_MS;
+        let authoritativePresence = 'unknown';
+        if (fresh) {
+            if (this.waiting)
+                authoritativePresence = 'needs_you';
+            else if (terminalFresh && this.turnOutcome === 'completed' && this.turnId)
+                authoritativePresence = 'done';
+            else if (terminalFresh)
+                authoritativePresence = 'idle';
+            else if (active.length > 0 || this.turnId)
+                authoritativePresence = 'working';
+        }
+        const activityKind = fresh && authoritativePresence !== 'needs_you'
+            && authoritativePresence !== 'done' && authoritativePresence !== 'idle'
+            ? active[0]?.activityKind
+                ?? (this.lastFailedTool && at >= this.lastFailedTool.failedAtMs
+                    && at - this.lastFailedTool.failedAtMs <= exports.ENGINE_OWNER_STALE_MS
+                    ? this.lastFailedTool.activityKind : null)
+            : null;
+        const failedAge = fresh && this.lastFailedTool
+            && at >= this.lastFailedTool.failedAtMs
+            && at - this.lastFailedTool.failedAtMs <= exports.ENGINE_OWNER_STALE_MS
+            ? { activityKind: this.lastFailedTool.activityKind, ageMs: at - this.lastFailedTool.failedAtMs }
+            : null;
+        const doneEffectId = authoritativePresence === 'done' && terminalFresh
+            && this.turnOutcome === 'completed' && this.turnId ? this.turnId : null;
+        return {
+            schemaVersion: 1,
+            sessionId: null,
+            cursor: 0,
+            observed,
+            freshness,
+            authoritativePresence,
+            activityKind: activityKind ?? null,
+            observedAtMs: this.lastObservedAt ?? null,
+            parallelAgentCount: fresh ? agents : 0,
+            activeSpans: active.slice(0, 4).map(span => ({
+                activityKind: span.activityKind,
+                startedAtMs: span.startedAtMs,
+            })),
+            turnId: this.turnId ?? null,
+            turnOutcome: this.turnOutcome ?? null,
+            doneEffectId,
+            failedToolAge: failedAge,
+        };
     }
     add(name, category, at, agentId = 'parent', continuation = false) {
         if (this.events.length >= 8192)
             throw new Error('Pet Engine observation window is full.');
-        const e = { schemaVersion: 1, id: `engine:${this.sequence++}`, traceId: 'foreground',
-            startTime: at, endTime: at, name, category, agentId, status: 'running',
-            attributes: continuation ? { 'whalesong.continuation': true } : {} };
-        this.events.push(e);
-        return e;
+        const event = {
+            schemaVersion: 1,
+            id: `engine:${this.sequence++}`,
+            traceId: 'foreground',
+            startTime: at,
+            endTime: at,
+            name,
+            category,
+            agentId,
+            status: 'running',
+            attributes: continuation ? { 'whalesong.continuation': true } : {},
+        };
+        this.events.push(event);
+        return event;
+    }
+    start(key, kind, group, at, agentId = 'parent') {
+        if (this.active.has(key))
+            return;
+        if (this.active.size >= 256)
+            throw new Error('Too many active Engine pet spans.');
+        const event = this.add(group === 'agent' ? 'agent' : group === 'thinking' ? 'thinking'
+            : group === 'responding' ? 'assistant_message' : 'operation', categoryFor(kind), at, agentId);
+        this.active.set(key, { key, activityKind: kind, startedAtMs: at, event, group });
     }
     pulse(key, at) {
-        const e = this.active.get(key);
-        if (!e)
+        const span = this.active.get(key);
+        if (!span)
             return;
-        // A resumed stream does not assert coverage across its silent interval.
-        if (at - e.endTime > pet_telemetry_js_1.PET_BIN_MS * 2) {
-            this.active.set(key, this.add(e.name, e.category, at, e.agentId, true));
+        // A resumed stream does not assert tape coverage across its silent
+        // interval; the span itself (and its start) stays active.
+        if (at - span.event.endTime > pet_telemetry_js_1.PET_BIN_MS * 2) {
+            const event = this.add(span.event.name, span.event.category, at, span.event.agentId, true);
+            this.active.set(key, { ...span, event });
         }
-        else
-            e.endTime = at;
+        else {
+            span.event.endTime = at;
+        }
     }
-    /** Transactional batch copy; failed validation cannot accept half a packet. */
+    finish(key, at, status = 'success') {
+        if (!this.active.has(key))
+            return undefined;
+        this.pulse(key, at);
+        const span = this.active.get(key);
+        if (!span)
+            return undefined;
+        span.event.endTime = at;
+        span.event.status = status;
+        this.active.delete(key);
+        return span;
+    }
+    addOnce(set, id, maximum) {
+        if (set.has(id))
+            return false;
+        set.add(id);
+        while (set.size > maximum)
+            set.delete(set.values().next().value);
+        return true;
+    }
+    /** Transactional batch copy; validation errors cannot accept half a batch. */
     clone() {
         const next = new PetEngineTelemetry();
         const copy = (value) => JSON.parse(JSON.stringify(value));
         next.events = copy(this.events);
         const spans = new Map(next.events.map(event => [event.id, event]));
-        // Active and waiting spans must still reference their journal entry so a
-        // later heartbeat extends the coverage consumed by bucket().
-        const span = (event) => spans.get(event.id) ?? copy(event);
-        next.active = new Map(Array.from(this.active, ([key, event]) => [key, span(event)]));
-        next.waiting = this.waiting ? span(this.waiting) : undefined;
+        next.active = new Map(Array.from(this.active, ([key, span]) => [key, {
+                ...span,
+                event: spans.get(span.event.id) ?? copy(span.event),
+            }]));
+        next.waiting = this.waiting ? spans.get(this.waiting.id) ?? copy(this.waiting) : undefined;
         next.sequence = this.sequence;
         next.lastTime = this.lastTime;
+        next.lastObservedAt = this.lastObservedAt;
+        next.turnId = this.turnId;
+        next.turnOutcome = this.turnOutcome;
+        next.terminalAt = this.terminalAt;
+        next.lastFailedTool = this.lastFailedTool ? { ...this.lastFailedTool } : undefined;
+        next.completedSpans = new Set(this.completedSpans);
+        next.completedTurns = new Set(this.completedTurns);
         return next;
     }
     observe(value, at) {
@@ -1729,804 +1851,192 @@ class PetEngineTelemetry {
             throw new Error('Invalid Engine pet clock.');
         if (!value || typeof value !== 'object' || Array.isArray(value))
             throw new Error('Invalid Engine pet metadata.');
-        const e = value;
-        const allowed = ['event', 'index', 'channel', 'tool_call_id', 'tool_name', 'id', 'worker_status', 'failed'];
-        if (Object.keys(e).some(k => !allowed.includes(k)) || typeof e.event !== 'string'
-            || Object.values(e).some(v => typeof v === 'string' && v.length > 4096)
-            || e.channel !== undefined && !['text', 'reasoning'].includes(e.channel)
-            || ['tool_call_id', 'tool_name', 'id', 'worker_status'].some(k => e[k] !== undefined && typeof e[k] !== 'string')
-            || e.failed !== undefined && typeof e.failed !== 'boolean'
-            || e.index !== undefined && (!Number.isSafeInteger(e.index) || e.index < 0))
+        const event = value;
+        const allowed = ['event', 'index', 'channel', 'span_id', 'activity_kind', 'outcome', 'id', 'worker_status', 'turn_id', 'turn_outcome'];
+        const stringFields = ['event', 'span_id', 'id', 'worker_status', 'turn_id', 'turn_outcome'];
+        if (Object.keys(event).some(key => !allowed.includes(key)) || typeof event.event !== 'string'
+            || Object.values(event).some(v => typeof v === 'string' && v.length > 256)
+            || stringFields.some(key => event[key] !== undefined && typeof event[key] !== 'string')
+            || event.channel !== undefined && !['text', 'reasoning'].includes(event.channel)
+            || event.activity_kind !== undefined && !ACTIVITY_KINDS.includes(event.activity_kind)
+            || event.outcome !== undefined && (typeof event.outcome !== 'string'
+                || (event.event === 'approval_resolved'
+                    ? !APPROVAL_OUTCOMES.includes(event.outcome)
+                    : event.event === 'operation_activity_completed'
+                        ? !OPERATION_OUTCOMES.includes(event.outcome)
+                        : true))
+            || event.turn_outcome !== undefined && !TURN_OUTCOMES.includes(event.turn_outcome)
+            || event.index !== undefined && (!Number.isSafeInteger(event.index) || event.index < 0))
             throw new Error('Invalid Engine pet metadata fields.');
         this.lastTime = at;
-        this.events = this.events.filter(span => span.endTime >= at - 12_800);
-        const id = (field) => { const s = e[field]; if (typeof s !== 'string' || !s)
-            throw new Error(`Missing Engine ${field}.`); return s; };
-        const index = () => { if (!Number.isSafeInteger(e.index))
-            throw new Error('Missing Engine index.'); return String(e.index); };
-        const start = (key, name, category, agentId) => {
-            if (this.active.size >= 256 && !this.active.has(key))
-                throw new Error('Too many active Engine pet spans.');
-            this.active.set(key, this.add(name, category, at, agentId));
+        this.lastObservedAt = at;
+        this.events = this.events.filter(item => item.endTime >= at - 12_800);
+        const required = (key) => {
+            const value = event[key];
+            if (typeof value !== 'string' || !value)
+                throw new Error(`Missing Engine ${key}.`);
+            return value;
         };
-        const finish = (key) => { this.pulse(key, at); this.active.delete(key); };
-        switch (e.event) {
-            case 'turn_started':
-                this.active.clear();
-                this.waiting = undefined;
+        const index = () => {
+            if (!Number.isSafeInteger(event.index))
+                throw new Error('Missing Engine index.');
+            return String(event.index);
+        };
+        const activityKind = () => {
+            if (!ACTIVITY_KINDS.includes(event.activity_kind))
+                throw new Error('Missing Engine activity kind.');
+            return event.activity_kind;
+        };
+        const startMessage = (key, kind, group) => {
+            this.start(key, kind, group, at);
+            this.waiting = undefined;
+        };
+        switch (event.event) {
+            case 'turn_started': {
+                const id = required('turn_id');
+                if (this.turnId !== id) {
+                    this.active.clear();
+                    this.waiting = undefined;
+                    this.lastFailedTool = undefined;
+                    this.turnId = id;
+                    this.turnOutcome = undefined;
+                    this.terminalAt = undefined;
+                }
                 break;
+            }
             case 'message_started':
-                start(`message:${index()}`, 'assistant_message', 'communication');
-                this.waiting = undefined;
+                startMessage(`message:${index()}`, 'responding', 'responding');
                 break;
             case 'thinking_started':
-                start(`thinking:${index()}`, 'thinking', 'reasoning');
-                this.waiting = undefined;
+                startMessage(`thinking:${index()}`, 'thinking', 'thinking');
                 break;
             case 'response_delta': {
-                const reasoning = e.channel === 'reasoning';
+                const reasoning = event.channel === 'reasoning';
                 const key = `${reasoning ? 'thinking' : 'message'}:${index()}`;
                 if (!this.active.has(key))
-                    start(key, reasoning ? 'thinking' : 'assistant_message', reasoning ? 'reasoning' : 'communication');
+                    this.start(key, reasoning ? 'thinking' : 'responding', reasoning ? 'thinking' : 'responding', at);
                 else
                     this.pulse(key, at);
                 this.waiting = undefined;
                 break;
             }
             case 'message_complete':
-                finish(`message:${index()}`);
+                this.finish(`message:${index()}`, at);
                 break;
             case 'thinking_complete':
-                finish(`thinking:${index()}`);
+                this.finish(`thinking:${index()}`, at);
                 break;
-            case 'tool_call_started':
-                start(`tool:${id('tool_call_id')}`, id('tool_name'), (0, codewhale_js_1.toolCategory)(id('tool_name')));
+            case 'operation_activity_started': {
+                const spanId = required('span_id');
+                const kind = activityKind();
+                if (!this.completedSpans.has(spanId))
+                    this.start(`operation:${spanId}`, kind, 'operation', at);
                 this.waiting = undefined;
                 break;
+            }
+            case 'operation_activity_completed': {
+                const spanId = required('span_id');
+                const kind = activityKind();
+                if (!OPERATION_OUTCOMES.includes(event.outcome))
+                    throw new Error('Missing Engine operation outcome.');
+                const outcome = event.outcome;
+                // A failure is recorded once, as its own onset event below; marking
+                // the span `error` too would count it twice on the tape.
+                const completed = this.finish(`operation:${spanId}`, at, outcome === 'succeeded' ? 'success' : 'unknown');
+                if (completed && this.addOnce(this.completedSpans, spanId, 4096)) {
+                    if (outcome === 'failed') {
+                        this.add('operation_failed', 'error', at).status = 'error';
+                        this.lastFailedTool = { activityKind: kind, failedAtMs: at };
+                    }
+                    if (outcome === 'denied' || outcome === 'cancelled')
+                        this.waiting = undefined;
+                }
+                break;
+            }
             case 'tool_call_heartbeat':
-                for (const key of this.active.keys())
-                    if (key.startsWith('tool:'))
+                for (const [key, span] of this.active)
+                    if (span.group === 'operation')
                         this.pulse(key, at);
                 break;
-            case 'tool_call_complete':
-                finish(`tool:${id('tool_call_id')}`);
+            case 'approval_resolved': {
+                required('id');
+                if (!APPROVAL_OUTCOMES.includes(event.outcome))
+                    throw new Error('Invalid Engine approval outcome.');
                 this.waiting = undefined;
                 break;
-            case 'agent_spawned':
-                start(`agent:${id('id')}`, 'agent', 'agent', id('id'));
+            }
+            case 'agent_spawned': {
+                const id = required('id');
+                this.start(`agent:${id}`, 'delegating', 'agent', at, id);
                 break;
+            }
             case 'agent_progress': {
-                const key = `agent:${id('id')}`;
-                if (['completed', 'failed', 'cancelled', 'interrupted', 'budget_exhausted'].includes(e.worker_status)) {
-                    finish(key);
+                const id = required('id');
+                const key = `agent:${id}`;
+                if (['completed', 'failed', 'cancelled', 'interrupted', 'budget_exhausted'].includes(event.worker_status)) {
+                    this.finish(key, at);
                     break;
                 }
                 if (!this.active.has(key))
-                    start(key, 'agent', 'agent', id('id'));
+                    this.start(key, 'delegating', 'agent', at, id);
                 else
                     this.pulse(key, at);
                 break;
             }
             case 'agent_complete':
-                finish(`agent:${id('id')}`);
+                this.finish(`agent:${required('id')}`, at);
                 break;
             case 'approval_required':
-            case 'user_input_required':
-                this.waiting = this.add('human', 'human', at);
-                this.waiting.status = 'pending';
+            case 'user_input_required': {
+                required('id');
+                if (!this.waiting) {
+                    this.waiting = this.add('human_request', 'human', at);
+                    this.waiting.status = 'pending';
+                }
                 break;
-            case 'turn_complete':
+            }
+            case 'turn_complete': {
+                const outcome = event.turn_outcome;
+                if (!TURN_OUTCOMES.includes(outcome))
+                    throw new Error('Missing Engine turn outcome.');
+                const id = typeof event.turn_id === 'string' && event.turn_id.length ? event.turn_id : undefined;
                 this.active.clear();
                 this.waiting = undefined;
+                this.turnId = id;
+                // An outcome belongs to a turn. `/purge`, an edit rejection or a
+                // session switch mid-turn completes with no turn id; recording the
+                // outcome alone would break the projection invariant the Rust
+                // contract checks (`turn_outcome` requires `turn_id`).
+                this.turnOutcome = id ? outcome : undefined;
+                this.terminalAt = at;
+                if (outcome === 'completed' && id && this.addOnce(this.completedTurns, id, 256))
+                    this.add('turn_completed', 'communication', at).status = 'success';
                 break;
-            case 'error': break;
+            }
             default: throw new Error('Unsupported Engine pet event.');
         }
-        // Receipt time is the error onset; never rewrite the operation's old start.
-        if (e.event === 'error' || e.failed === true)
-            this.add('error', 'error', at).status = 'error';
     }
-    /** Waiting coverage comes from the existing typed shell's current request.
-     * It can extend a witnessed request, never invent one on a mid-turn attach. */
+    /** The typed shell may extend a request already witnessed in Engine events,
+     * but a mid-turn attach cannot invent a NeedsYou state. */
     confirmWaiting(at, waiting) {
         if (!waiting) {
             this.waiting = undefined;
             return;
         }
-        if (this.waiting && at >= this.waiting.endTime)
+        if (this.waiting && at >= this.waiting.endTime) {
             this.waiting.endTime = at;
+            this.lastObservedAt = at;
+            this.lastTime = Math.max(this.lastTime, at);
+        }
     }
     bucket(sequence) {
         const end = (sequence + 1) * pet_telemetry_js_1.PET_BIN_MS;
-        const input = this.events.filter(e => e.startTime < end && e.endTime >= end - 12_400)
-            .map(e => ({ ...e, endTime: Math.min(e.endTime, end) }));
+        const input = this.events.filter(event => event.startTime < end && event.endTime >= end - 12_400)
+            .map(event => ({ ...event, endTime: Math.min(event.endTime, end) }));
         return (0, pet_telemetry_js_1.compilePetTelemetry)(input, end, sequence)[0];
     }
 }
 exports.PetEngineTelemetry = PetEngineTelemetry;
-
-};
-factories["codewhale"]=function(exports,require){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.CodewhaleRuntimeTrace = void 0;
-exports.isCodewhaleSession = isCodewhaleSession;
-exports.isCodewhaleRuntimeRecord = isCodewhaleRuntimeRecord;
-exports.isCodewhaleRuntimeDocument = isCodewhaleRuntimeDocument;
-exports.toolActivity = toolActivity;
-exports.toolCategory = toolCategory;
-exports.fromCodewhaleSession = fromCodewhaleSession;
-exports.fromCodewhaleRuntime = fromCodewhaleRuntime;
-exports.observeRuntimeRequests = observeRuntimeRequests;
-/** Read-only Codewhale session/runtime adapter. Does not record, mutate, or own receipts. */
-const model_js_1 = require("./model.js");
-const PAYLOAD_LIMIT = 2000;
-const COLLAPSED_SPAN_MS = 1000;
-const ENVELOPE_MIN_MS = 60_000;
-const obj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v) ? v : {};
-const str = (v) => typeof v === 'string' && v.length ? v : undefined;
-const num = (v) => typeof v === 'number' && Number.isFinite(v) ? v : undefined;
-function isCodewhaleSession(value) {
-    const root = obj(value);
-    const metadata = obj(root.metadata);
-    if (!str(metadata.id))
-        return false;
-    if (root.format === 'whalesong.evidence/v1' || Array.isArray(root.resourceSpans) || root.schemaVersion === 1)
-        return false;
-    const journal = obj(root.journal);
-    return Array.isArray(root.messages) || Array.isArray(journal.entries);
-}
-function isCodewhaleRuntimeRecord(value) {
-    const rec = obj(value);
-    return Number.isSafeInteger(rec.seq) && rec.seq >= 0 && typeof rec.event === 'string' && !!rec.event
-        && typeof rec.thread_id === 'string' && !!rec.thread_id && rec.timestamp != null;
-}
-function isCodewhaleRuntimeDocument(value) {
-    if (!Array.isArray(value) || !value.length)
-        return false;
-    const n = Math.min(value.length, 8);
-    let hits = 0;
-    for (let i = 0; i < n; i++)
-        if (isCodewhaleRuntimeRecord(value[i]))
-            hits++;
-    return hits === n;
-}
-function clip(value) {
-    if (value == null)
-        return value;
-    const text = typeof value === 'string' ? value : JSON.stringify(value);
-    if (text.length <= PAYLOAD_LIMIT)
-        return typeof value === 'string' ? value : JSON.parse(text);
-    return `${text.slice(0, PAYLOAD_LIMIT)}…[truncated ${text.length - PAYLOAD_LIMIT} source bytes]`;
-}
-function parseTime(value) {
-    if (typeof value === 'number' && Number.isFinite(value))
-        return value;
-    if (typeof value !== 'string' || !value)
-        return undefined;
-    const ms = Date.parse(value);
-    return Number.isFinite(ms) ? ms : undefined;
-}
-function statusOf(value, isError) {
-    if (isError === true)
-        return 'error';
-    if (isError === false)
-        return 'success';
-    const s = String(value ?? '').toLowerCase();
-    if (s === 'completed' || s === 'success' || s === 'ok')
-        return 'success';
-    if (s === 'failed' || s === 'error' || s === 'errored')
-        return 'error';
-    if (s === 'canceled' || s === 'cancelled' || s === 'interrupted')
-        return 'error';
-    if (s === 'in_progress' || s === 'running')
-        return 'running';
-    if (s === 'pending')
-        return 'pending';
-    return 'unknown';
-}
-function classify(name) {
-    const n = name.toLowerCase();
-    if (/exception|^error\b/.test(n))
-        return 'error';
-    if (/spawn|fork|subagent|^agent$/.test(n))
-        return 'agent';
-    if (/message\.send|handoff|agent\.message|assistant_message/.test(n))
-        return 'communication';
-    if (/retrieve|retrieval|context|embedding|vector|memory|rag/.test(n))
-        return 'memory';
-    if (/browser|navigate|screenshot|click|playwright/.test(n))
-        return 'browser';
-    if (/read_file|write_file|list_dir|^read$|^write$|^edit$|glob|grep|file\.|filesystem/.test(n))
-        return 'filesystem';
-    if (/bash|exec|shell|run_test|cargo|pytest|compile/.test(n))
-        return 'code';
-    if (/reason|thinking|completion|generate|chat|llm/.test(n))
-        return 'reasoning';
-    if (/http|request|api|fetch|network|mcp_/.test(n))
-        return 'network';
-    if (/user_message|human|approval/.test(n))
-        return 'human';
-    if (/orchestrat|workflow|phase|join|session|thread|turn|todo|plan|operate_contract|status/.test(n))
-        return 'orchestration';
-    if (/tool/.test(n))
-        return 'tool';
-    return model_js_1.CATEGORIES.includes(n) ? n : 'other';
-}
-/** Presentation vocabulary beside the canonical category classifier. Only the
- * witnessed tool name is used; command contents are never inferred. */
-function toolActivity(name) {
-    const n = name.toLowerCase().replace(/-/g, '_');
-    if (/search|grep|glob|find_file/.test(n))
-        return { kind: 'searching', label: 'Searching' };
-    if (/read_file|list_dir|read_text|open_file/.test(n))
-        return { kind: 'reading', label: 'Reading files' };
-    if (/apply_patch|write_file|edit_file|replace_text/.test(n))
-        return { kind: 'editing', label: 'Editing files' };
-    if (/run_test|pytest|test_suite/.test(n))
-        return { kind: 'testing', label: 'Running tests' };
-    const category = toolCategory(name);
-    return { browser: { kind: 'browsing', label: 'Using the browser' },
-        filesystem: { kind: 'files', label: 'Working with files' },
-        code: { kind: 'executing', label: 'Running a command' },
-        network: { kind: 'network', label: 'Calling a service' },
-        agent: { kind: 'delegating', label: 'Coordinating agents' },
-        memory: { kind: 'memory', label: 'Retrieving context' },
-        reasoning: { kind: 'thinking', label: 'Thinking' },
-        communication: { kind: 'communicating', label: 'Communicating' },
-    }[category] ?? { kind: 'tool', label: 'Using a tool' };
-}
-function toolCategory(name) {
-    const category = classify(name);
-    return category === 'other' ? 'tool' : category;
-}
-function pointer(source, ids) {
-    return { format: source, ...ids };
-}
-function titleOfSession(metadata, filename) {
-    const title = str(metadata.title)?.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-    if (title && !title.startsWith('codewhale:runtime_event'))
-        return title.slice(0, 120);
-    return `Codewhale session · ${(str(metadata.id) ?? filename).slice(0, 8)}`;
-}
-function activeJournalEntries(journal) {
-    const entries = Array.isArray(journal.entries) ? journal.entries.map(obj) : [];
-    const leaf = str(journal.leaf_id);
-    if (!leaf || !entries.length)
-        return { entries, warnings: [] };
-    const byId = new Map(entries.filter(e => str(e.id)).map(e => [e.id, e]));
-    const chain = [];
-    const seen = new Set();
-    let id = leaf;
-    while (id && !seen.has(id)) {
-        seen.add(id);
-        const entry = byId.get(id);
-        if (!entry)
-            break;
-        chain.push(entry);
-        id = str(entry.parent_id);
-    }
-    if (!chain.length)
-        return { entries, warnings: ['Journal leaf_id did not resolve; using append order instead of the active branch.'] };
-    if (chain.length < entries.length) {
-        return {
-            entries: chain.reverse(),
-            warnings: [`Active journal branch has ${chain.length} of ${entries.length} entries. Forked history was not invented into the timeline.`],
-        };
-    }
-    return { entries: chain.reverse(), warnings: [] };
-}
-function collapsedTimestamps(entries, created, updated) {
-    const times = entries.map(e => parseTime(e.created_at)).filter((n) => n !== undefined);
-    if (times.length < 2)
-        return false;
-    const span = Math.max(...times) - Math.min(...times);
-    const envelope = created !== undefined && updated !== undefined ? updated - created : 0;
-    return envelope >= ENVELOPE_MIN_MS && span < COLLAPSED_SPAN_MS;
-}
-function pushEvent(events, event) {
-    events.push(event);
-}
-function fromCodewhaleSession(document, filename = 'Codewhale session', maxEvents = 250_000) {
-    const root = obj(document);
-    const metadata = obj(root.metadata);
-    const sessionId = str(metadata.id) ?? filename;
-    const journal = obj(root.journal);
-    const { entries, warnings } = activeJournalEntries(journal);
-    const sourceEntries = entries.length ? entries : (Array.isArray(root.messages) ? root.messages.map((message, i) => ({ id: `${sessionId}/message/${i}`, kind: 'message', message })) : []);
-    if (!sourceEntries.length)
-        throw new Error('Codewhale session contains no journal entries or messages.');
-    const created = parseTime(metadata.created_at);
-    const updated = parseTime(metadata.updated_at);
-    const orderOnly = collapsedTimestamps(sourceEntries, created, updated);
-    if (orderOnly) {
-        warnings.push('Journal created_at values are collapsed to last-save time, not execution time. The time axis is journal order (1 ms per emitted event), not wall-clock duration. Gap, burst, and cycle-period findings are not execution-time claims.');
-    }
-    else {
-        const times = sourceEntries.map(e => parseTime(e.created_at)).filter((n) => n !== undefined);
-        if (!times.length)
-            warnings.push('Journal entries have no usable timestamps. The time axis is journal order.');
-    }
-    const events = [];
-    const pending = new Map();
-    let seq = 0;
-    const originWall = orderOnly ? undefined : sourceEntries.map(e => parseTime(e.created_at)).find((n) => n !== undefined);
-    const agentId = 'parent';
-    const model = str(metadata.model);
-    const provider = str(metadata.model_provider);
-    const when = (entry, fallback) => {
-        if (orderOnly || originWall === undefined)
-            return { start: fallback, open: false };
-        const t = parseTime(entry.created_at);
-        if (t === undefined)
-            return { start: fallback, open: true };
-        return { start: t - originWall, open: false };
-    };
-    for (const entry of sourceEntries) {
-        if (events.length >= maxEvents)
-            throw new Error(`Import exceeds the ${maxEvents.toLocaleString()} event limit.`);
-        const entryId = str(entry.id) ?? `${sessionId}/entry/${seq}`;
-        const message = obj(entry.message ?? (entry.kind === 'message' ? entry : {}));
-        const role = str(message.role) ?? (str(entry.kind) === 'user' ? 'user' : str(entry.kind) === 'assistant' ? 'assistant' : undefined);
-        const blocks = Array.isArray(message.content) ? message.content.map(obj) : [];
-        if (!blocks.length) {
-            const text = str(entry.text) ?? str(message.text);
-            if (text)
-                blocks.push({ type: role === 'user' ? 'text' : 'text', text });
-        }
-        if (!blocks.length)
-            continue;
-        const parentEventId = events.length ? events[events.length - 1].id : undefined;
-        for (const block of blocks) {
-            const t = when(entry, seq);
-            const idBase = `${entryId}/${seq}`;
-            const type = str(block.type) ?? 'text';
-            const raw = pointer('codewhale.session/v1', { sessionId, entryId, seq, blockType: type, toolUseId: block.id ?? block.tool_use_id });
-            if (type === 'tool_use' || type === 'server_tool_use') {
-                const tool = str(block.name) ?? 'tool';
-                const callId = str(block.id) ?? idBase;
-                const started = tool === 'agent' && obj(block.input).action === 'start';
-                const event = {
-                    schemaVersion: 1, id: callId, traceId: sessionId, parentId: parentEventId,
-                    startTime: t.start, endTime: t.start, openEnded: true,
-                    agentId, name: started ? 'agent.spawn' : tool, tool, category: toolCategory(tool),
-                    subtype: started ? 'fork' : undefined, model, provider,
-                    status: 'running', attributes: { 'codewhale.entry_id': entryId, 'codewhale.seq': seq, 'tool.name': tool },
-                    payload: { arguments: clip(block.input) }, raw,
-                };
-                pending.set(callId, events.length);
-                pushEvent(events, event);
-            }
-            else if (type === 'tool_result') {
-                const callId = str(block.tool_use_id);
-                const isError = block.is_error === true;
-                const target = callId !== undefined ? pending.get(callId) : undefined;
-                if (target !== undefined) {
-                    const prior = events[target];
-                    prior.endTime = t.start;
-                    prior.openEnded = false;
-                    prior.status = statusOf('completed', isError);
-                    prior.payload = { ...(obj(prior.payload)), result: clip(block.content) };
-                    prior.attributes = { ...prior.attributes, 'codewhale.result_entry_id': entryId };
-                    pending.delete(callId);
-                }
-                else {
-                    pushEvent(events, {
-                        schemaVersion: 1, id: idBase, traceId: sessionId, parentId: callId ?? parentEventId,
-                        startTime: t.start, endTime: t.start, agentId,
-                        name: 'tool_result', category: 'tool', model, provider,
-                        status: statusOf(undefined, isError),
-                        attributes: { 'codewhale.entry_id': entryId, 'codewhale.seq': seq, tool_use_id: callId },
-                        payload: { result: clip(block.content) }, raw,
-                    });
-                }
-            }
-            else if (type === 'thinking') {
-                pushEvent(events, {
-                    schemaVersion: 1, id: idBase, traceId: sessionId, parentId: parentEventId,
-                    startTime: t.start, endTime: t.start, agentId, name: 'thinking', category: 'reasoning',
-                    model, provider, status: 'success',
-                    attributes: { 'codewhale.entry_id': entryId, 'codewhale.seq': seq },
-                    payload: { thinking: clip(block.thinking ?? block.text) }, raw,
-                });
-            }
-            else {
-                const text = str(block.text) ?? '';
-                const operate = text.includes('codewhale:runtime_event');
-                const user = role === 'user' || role === 'User';
-                pushEvent(events, {
-                    schemaVersion: 1, id: idBase, traceId: sessionId, parentId: parentEventId,
-                    startTime: t.start, endTime: t.start, agentId,
-                    name: operate ? 'operate_contract' : user ? 'user_message' : 'assistant_message',
-                    category: operate ? 'orchestration' : user ? 'human' : 'communication',
-                    model, provider, status: 'success',
-                    attributes: { 'codewhale.entry_id': entryId, 'codewhale.seq': seq, role: role ?? 'unknown' },
-                    payload: { text: clip(text) }, raw,
-                });
-            }
-            seq += 1;
-        }
-    }
-    if (!events.length)
-        throw new Error('Codewhale session produced no inspectable events.');
-    for (const event of events) {
-        if (event.openEnded && event.tool)
-            warnings.push(`Tool ${event.id} has no matching tool_result in this snapshot; duration remains unknown.`);
-    }
-    const base = events.reduce((m, e) => Math.min(m, e.startTime), events[0].startTime);
-    for (const event of events) {
-        event.startTime -= base;
-        event.endTime -= base;
-    }
-    const cost = obj(metadata.cost);
-    const sessionCost = num(cost.session_cost_usd);
-    const duration = Math.max(1, events.reduce((m, e) => Math.max(m, e.endTime, e.startTime), 0));
-    const uniqueWarnings = [...new Set(warnings)];
-    return {
-        id: sessionId,
-        name: titleOfSession(metadata, filename),
-        events,
-        duration,
-        originTime: orderOnly ? 'journal-order' : (str(metadata.created_at) ?? `${base} ms`),
-        source: 'codewhale',
-        privacy: 'redact',
-        warnings: uniqueWarnings,
-        metadata: {
-            sourceFormat: 'codewhale.session/v1',
-            timeBasis: orderOnly || originWall === undefined ? 'journal-order' : 'wall-clock',
-            sourceFilename: filename,
-            sessionId,
-            model,
-            provider,
-            workspace: metadata.workspace,
-            mode: metadata.mode,
-            envelopeCreatedAt: metadata.created_at,
-            envelopeUpdatedAt: metadata.updated_at,
-            cumulativeTurnSecs: metadata.cumulative_turn_secs,
-            messageCount: metadata.message_count,
-            journalEntries: sourceEntries.length,
-            totalTokens: metadata.total_tokens,
-            sessionCostUsd: sessionCost,
-            pricedTurns: cost.priced_turns,
-            unpricedTurns: cost.unpriced_turns,
-            runtimeStore: metadata.runtime_store,
-            timeUnit: 'ms',
-        },
-    };
-}
-function itemToolName(item, payload) {
-    const named = str(payload.tool) ?? str(item.tool) ?? str(item.name);
-    if (named)
-        return named;
-    if (str(item.kind) !== 'tool_call')
-        return undefined;
-    const head = str(item.summary)?.split(':')[0]?.trim();
-    if (head && head.length < 80 && !/\s/.test(head))
-        return head;
-    return undefined;
-}
-function itemCategory(kind, tool) {
-    if (kind === 'user_message')
-        return 'human';
-    if (kind === 'agent_reasoning')
-        return 'reasoning';
-    if (kind === 'agent_message')
-        return 'communication';
-    if (kind === 'status')
-        return 'orchestration';
-    if (kind === 'tool_call' && tool)
-        return toolCategory(tool);
-    if (kind === 'tool_call')
-        return 'tool';
-    return classify(kind);
-}
-/** Incremental form of the existing Runtime importer. File imports and live
- * recording share this exact lifecycle parser; only a live driver retires old
- * completed events after it has recorded their projection. */
-class CodewhaleRuntimeTrace {
-    filename;
-    maxEvents;
-    project;
-    maxBytes;
-    events = [];
-    open = new Map();
-    requests = new Map();
-    sizes = new Map();
-    bytes = 0;
-    recordCount = 0;
-    skippedDeltas = 0;
-    origin;
-    model;
-    threadId;
-    threadName;
-    constructor(filename = 'Codewhale runtime', maxEvents = 250_000, project = event => event, maxBytes = Infinity) {
-        this.filename = filename;
-        this.maxEvents = maxEvents;
-        this.project = project;
-        this.maxBytes = maxBytes;
-    }
-    get retainedEvents() { return this.events.length; }
-    get retainedBytes() { return this.bytes; }
-    measure(event, proposed = event) {
-        const safe = this.project(proposed);
-        if (this.maxBytes !== Infinity) {
-            const size = new TextEncoder().encode(JSON.stringify(safe)).length;
-            const total = this.bytes - (this.sizes.get(event) ?? 0) + size;
-            if (total > this.maxBytes)
-                throw new Error('Runtime observation exceeds its retained input limit.');
-            this.bytes = total;
-            this.sizes.set(event, size);
-        }
-        for (const key of Object.keys(event))
-            if (!Object.hasOwn(safe, key))
-                delete event[key];
-        Object.assign(event, safe);
-    }
-    push(event) {
-        if (this.events.length >= this.maxEvents)
-            throw new Error(`Import exceeds the ${this.maxEvents.toLocaleString()} event limit.`);
-        this.measure(event);
-        pushEvent(this.events, event);
-    }
-    /** Keep unfinished lifetimes plus the recent window needed by the bucketer's
-     * 12-second recurrence measure. A completion may still arrive for any open item. */
-    prune(beforeWall) {
-        if (!Number.isFinite(beforeWall))
-            throw new Error('Invalid Runtime retention horizon.');
-        if (this.origin === undefined)
-            return;
-        const cutoff = beforeWall - this.origin;
-        let keep = 0;
-        for (const event of this.events) {
-            if (event.openEnded || Math.max(event.endTime, (0, model_js_1.errorOnsetOf)(event)) >= cutoff)
-                this.events[keep++] = event;
-            else {
-                this.bytes -= this.sizes.get(event) ?? 0;
-                this.sizes.delete(event);
-                if (this.open.get(event.id) === event)
-                    this.open.delete(event.id);
-            }
-        }
-        this.events.length = keep;
-    }
-    append(records) {
-        if (!records.length)
-            return;
-        const { events, open, requests } = this;
-        const threadId = this.threadId ?? str(obj(records[0]).thread_id) ?? this.filename;
-        this.threadId = threadId;
-        let { origin, model, skippedDeltas } = this;
-        let threadName = this.threadName ?? threadId;
-        const stamp = (rec) => {
-            const t = parseTime(rec.timestamp);
-            if (t === undefined)
-                throw new Error(`Runtime event seq ${rec.seq} is missing a usable timestamp.`);
-            if (origin === undefined)
-                origin = t;
-            return t - origin;
-        };
-        for (const raw of records) {
-            if (!isCodewhaleRuntimeRecord(raw))
-                throw new Error('Runtime import cancelled: a line is not a Codewhale runtime event record. No rows were skipped.');
-            this.recordCount++;
-            const rec = obj(raw);
-            if (rec.thread_id !== threadId)
-                throw new Error('Runtime import contains multiple threads. Export one thread before importing.');
-            const eventName = rec.event;
-            if (eventName === 'item.delta') {
-                skippedDeltas++;
-                continue;
-            }
-            const payload = obj(rec.payload);
-            const item = obj(payload.item);
-            const turn = obj(payload.turn);
-            const thread = obj(payload.thread);
-            const relative = stamp(rec);
-            const turnId = str(rec.turn_id) ?? str(payload.turn_id);
-            const itemId = str(rec.item_id) ?? str(item.id);
-            const agentId = 'parent';
-            if (str(thread.model))
-                model = str(thread.model);
-            if (str(turn.model))
-                model = str(turn.model) ?? model;
-            if (eventName === 'thread.started') {
-                model = str(thread.model) ?? model;
-                threadName = str(thread.id) ?? threadId;
-                this.push({
-                    schemaVersion: 1, id: `thread:${threadId}`, traceId: threadId,
-                    startTime: relative, endTime: relative, openEnded: true,
-                    agentId, name: 'thread', category: 'orchestration', model, status: 'running',
-                    attributes: { 'codewhale.seq': rec.seq, 'whalesong.container': true }, raw: rec,
-                });
-                continue;
-            }
-            if (eventName === 'turn.started' || eventName === 'turn.completed') {
-                const id = `turn:${turnId ?? rec.seq}`;
-                if (eventName === 'turn.completed')
-                    for (const [key, request] of requests) {
-                        if (request.parentId !== id)
-                            continue;
-                        this.measure(request, { ...request, endTime: Math.max(request.startTime, relative), openEnded: false, status: 'unknown' });
-                        requests.delete(key);
-                    }
-                const startWall = parseTime(turn.started_at) ?? parseTime(turn.created_at);
-                const endWall = parseTime(turn.ended_at);
-                const start = startWall !== undefined && origin !== undefined ? startWall - origin : relative;
-                const end = eventName === 'turn.completed' && endWall !== undefined && origin !== undefined ? endWall - origin : relative;
-                const usage = obj(turn.usage);
-                const existing = events.findIndex(e => e.id === id);
-                const next = {
-                    schemaVersion: 1, id, traceId: threadId, parentId: `thread:${threadId}`,
-                    startTime: start, endTime: Math.max(start, end), openEnded: eventName !== 'turn.completed',
-                    agentId, name: 'turn', category: 'orchestration', model,
-                    inputTokens: num(usage.input_tokens), outputTokens: num(usage.output_tokens),
-                    status: statusOf(turn.status ?? payload.status), latency: num(turn.duration_ms),
-                    attributes: { 'codewhale.seq': rec.seq, 'codewhale.turn_id': turnId, 'whalesong.container': true,
-                        ...(statusOf(turn.status ?? payload.status) === 'error' ? { 'whalesong.error_onset_ms': relative } : {}) },
-                    payload: { input_summary: clip(turn.input_summary) }, raw: rec,
-                };
-                if (existing >= 0) {
-                    const prior = events[existing];
-                    this.measure(prior, { ...next, startTime: prior.startTime });
-                }
-                else
-                    this.push(next);
-                continue;
-            }
-            if (eventName === 'turn.lifecycle')
-                continue;
-            if (['approval.required', 'approval.decided', 'approval.timeout', 'user_input.required', 'user_input.answered', 'user_input.canceled'].includes(eventName)) {
-                const kind = eventName.startsWith('approval.') ? 'approval' : 'user_input';
-                const requestId = str(payload[kind === 'approval' ? 'approval_id' : 'input_id']) ?? str(payload.id);
-                if (!requestId)
-                    throw new Error(`Runtime ${eventName} is missing its request identity.`);
-                const key = JSON.stringify([turnId ?? '', kind, requestId]);
-                const prior = requests.get(key), required = eventName.endsWith('.required');
-                if (required && prior)
-                    continue;
-                if (!required && prior) {
-                    const next = { ...prior, attributes: { ...prior.attributes },
-                        endTime: Math.max(prior.startTime, relative), openEnded: false,
-                        status: eventName === 'approval.decided' || eventName === 'user_input.answered' ? 'success' : 'unknown' };
-                    if (payload.auto === true) {
-                        // Automatic consent has a receipt, but never asked the human to wait.
-                        next.category = 'orchestration';
-                        delete next.attributes['whalesong.waiting'];
-                        next.attributes['whalesong.container'] = true;
-                    }
-                    this.measure(prior, next);
-                    requests.delete(key);
-                    continue;
-                }
-                const automatic = payload.auto === true;
-                const event = {
-                    schemaVersion: 1, id: `request:${key}:${rec.seq}`, traceId: threadId,
-                    parentId: turnId ? `turn:${turnId}` : undefined, startTime: relative, endTime: relative,
-                    openEnded: required, agentId, name: eventName, category: automatic ? 'orchestration' : 'human',
-                    status: required ? 'pending' : 'success', model,
-                    attributes: { 'codewhale.seq': rec.seq, 'whalesong.waiting': required, 'whalesong.container': automatic }, raw: rec,
-                };
-                this.push(event);
-                if (required)
-                    requests.set(key, event);
-                continue;
-            }
-            if (eventName === 'tool_call.requested' || eventName === 'tool_call.canceled') {
-                const callId = str(payload.call_id) ?? `call:${rec.seq}`;
-                const tool = str(payload.tool);
-                const canceled = eventName === 'tool_call.canceled';
-                this.push({
-                    schemaVersion: 1, id: `${eventName}:${callId}`, traceId: threadId, parentId: turnId ? `turn:${turnId}` : undefined,
-                    startTime: relative, endTime: relative, agentId, name: tool ?? eventName, tool,
-                    category: tool ? toolCategory(tool) : 'tool', model, status: canceled ? 'error' : 'pending',
-                    attributes: { 'codewhale.seq': rec.seq, 'codewhale.turn_id': turnId, 'codewhale.call_id': callId, reason: payload.reason },
-                    payload: { arguments: clip(payload.arguments) }, raw: rec,
-                });
-                continue;
-            }
-            if (eventName === 'item.started' || eventName === 'item.completed') {
-                const kind = str(item.kind) ?? 'item';
-                const tool = itemToolName(item, payload);
-                const id = itemId ?? `item:${rec.seq}`;
-                const startWall = parseTime(item.started_at);
-                const endWall = parseTime(item.ended_at);
-                const start = startWall !== undefined && origin !== undefined ? startWall - origin : relative;
-                const end = eventName === 'item.completed' && endWall !== undefined && origin !== undefined ? endWall - origin : relative;
-                const openEnded = eventName === 'item.started' && endWall === undefined;
-                const existing = open.get(id);
-                if (existing && eventName === 'item.completed') {
-                    const prior = existing;
-                    const status = statusOf(item.status);
-                    this.measure(prior, { ...prior, endTime: Math.max(prior.startTime, end), openEnded: false, status,
-                        attributes: { ...prior.attributes, ...(status === 'error' ? { 'whalesong.error_onset_ms': relative } : {}) },
-                        payload: { summary: clip(item.summary), detail: clip(item.detail) } });
-                    open.delete(id);
-                    continue;
-                }
-                const event = {
-                    schemaVersion: 1, id, traceId: threadId, parentId: turnId ? `turn:${turnId}` : undefined,
-                    startTime: start, endTime: Math.max(start, end), openEnded,
-                    agentId, name: tool ?? kind, tool, category: itemCategory(kind, tool), model,
-                    status: statusOf(item.status ?? (eventName === 'item.started' ? 'running' : undefined)),
-                    attributes: { 'codewhale.seq': rec.seq, 'codewhale.turn_id': turnId, 'codewhale.item_kind': kind,
-                        ...(statusOf(item.status) === 'error' ? { 'whalesong.error_onset_ms': relative } : {}) },
-                    payload: { summary: clip(item.summary), detail: clip(item.detail) }, raw: rec,
-                };
-                this.push(event);
-                if (eventName === 'item.started')
-                    open.set(id, event);
-                continue;
-            }
-            this.push({
-                schemaVersion: 1, id: `${eventName}:${rec.seq}`, traceId: threadId, parentId: turnId ? `turn:${turnId}` : undefined,
-                startTime: relative, endTime: relative, agentId, name: eventName, category: classify(eventName),
-                model, status: 'unknown', attributes: { 'codewhale.seq': rec.seq }, raw: rec,
-            });
-        }
-        this.origin = origin;
-        this.model = model;
-        this.threadName = threadName;
-        this.skippedDeltas = skippedDeltas;
-    }
-    snapshot() {
-        const { events, open, requests, origin, model, skippedDeltas, filename } = this;
-        const threadId = this.threadId ?? filename, threadName = this.threadName ?? threadId;
-        const warnings = [];
-        if (skippedDeltas)
-            warnings.push(`Dropped ${skippedDeltas.toLocaleString()} item.delta records; they are token stream fragments, not spans. Item start/end remain the source of duration.`);
-        for (const [id] of open)
-            warnings.push(`Item ${id} started and never completed in this file; duration remains unknown.`);
-        for (const request of requests.values())
-            warnings.push(`Request ${request.id} has no terminal receipt; its duration remains unknown in this file.`);
-        if (!events.length)
-            throw new Error('Codewhale runtime file contained only stream deltas or unreadable records.');
-        const base = events.reduce((m, e) => Math.min(m, e.startTime), events[0].startTime);
-        const normalized = events.map(event => ({ ...event, startTime: event.startTime - base, endTime: event.endTime - base,
-            attributes: { ...event.attributes, ...(event.attributes['whalesong.error_onset_ms'] !== undefined
-                    ? { 'whalesong.error_onset_ms': (0, model_js_1.errorOnsetOf)(event) - base } : {}) } }));
-        return {
-            id: threadId,
-            name: `Codewhale runtime · ${threadName}`,
-            events: normalized,
-            duration: Math.max(1, normalized.reduce((m, e) => Math.max(m, e.endTime, e.startTime, e.status === 'error' ? (0, model_js_1.errorOnsetOf)(e) : 0), 0)),
-            originTime: origin !== undefined ? new Date(origin + base).toISOString() : '0 ms',
-            source: 'codewhale',
-            privacy: 'redact',
-            warnings: [...new Set(warnings)],
-            metadata: {
-                sourceFormat: 'codewhale.runtime-events/v2',
-                timeBasis: 'wall-clock',
-                sourceFilename: filename,
-                threadId,
-                model,
-                skippedDeltas,
-                recordCount: this.recordCount,
-                timeUnit: 'ms',
-            },
-        };
-    }
-}
-exports.CodewhaleRuntimeTrace = CodewhaleRuntimeTrace;
-function fromCodewhaleRuntime(records, filename = 'Codewhale runtime', maxEvents = 250_000) {
-    if (!records.length)
-        throw new Error('Codewhale runtime event file is empty.');
-    const trace = new CodewhaleRuntimeTrace(filename, maxEvents);
-    trace.append(records);
-    return trace.snapshot();
-}
-/** The journal owns request state until a matching terminal receipt. A live
- * driver may confirm that state only while its cursor-checked stream is healthy.
- * Ordinary open tool spans remain unknown-duration; no execution is inferred. */
-function observeRuntimeRequests(trace, observedThrough) {
-    const origin = Date.parse(trace.originTime ?? '');
-    if (trace.metadata.sourceFormat !== 'codewhale.runtime-events/v2' || !Number.isFinite(origin)
-        || !Number.isFinite(observedThrough))
-        throw new Error('Invalid Runtime observation horizon.');
-    const at = observedThrough - origin;
-    const events = trace.events.map(e => e.openEnded && e.attributes['whalesong.waiting'] === true && at >= e.startTime
-        ? { ...e, endTime: at, openEnded: false } : e);
-    return { ...trace, events, duration: Math.max(trace.duration, at) };
-}
 
 };
 function load(id){id=id.replace(/^\.\//,'').replace(/\.js$/,'');if(cache[id])return cache[id];if(!factories[id])throw Error('Missing core module');const e=cache[id]={};factories[id](e,load);return e;}

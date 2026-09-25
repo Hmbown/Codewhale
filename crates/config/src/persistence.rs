@@ -235,7 +235,7 @@ fn rollback(snapshots: &[Snapshot]) {
 // implementation without depending on this crate. Re-exported here to keep
 // the existing `codewhale_config::persistence::*` public API stable.
 pub use codewhale_secrets::redact::{
-    REDACTED, RedactionPolicy, redact_json_secrets, redact_model_bound_json_secrets,
+    REDACTED, RedactionPolicy, redact_json_model_bound_secrets, redact_json_secrets,
     redact_model_bound_secrets, redact_secrets, redact_secrets_with,
 };
 
@@ -395,10 +395,11 @@ mod tests {
             "api_key": "short",
             "access_token": jwt,
         });
-        let masked = redact_model_bound_json_secrets(&json);
+        let masked = redact_json_model_bound_secrets(&json);
         assert!(!masked.to_string().contains(jwt), "{masked}");
         assert_eq!(masked["stdout_summary"], "token = make_token()");
-        assert_eq!(masked["api_key"], "short");
+        // A sensitive key's value is masked wholesale, credential-shaped or not.
+        assert_eq!(masked["api_key"], REDACTED);
     }
 
     #[test]

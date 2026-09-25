@@ -113,9 +113,13 @@ impl InfoSegmentId {
     #[must_use]
     pub fn shed_priority(self) -> u8 {
         match self {
-            Self::Cache => 8,
+            // Compact drops priorities at or above SHED_BEFORE_HELP (7).
+            // Cache is a performance reading, so it stays on the compact
+            // row and is the first of those readings to shed when the row
+            // is narrow (#6565).
+            Self::Cache => 6,
             // Performance readings outlive help and secondary counts.
-            Self::Rate | Self::Ttft => 6,
+            Self::Rate | Self::Ttft => 5,
             Self::OutputTokens => 7,
             // The tier is a reading about the cost, not the cost: it sheds
             // with the telemetry, ahead of the number it annotates.

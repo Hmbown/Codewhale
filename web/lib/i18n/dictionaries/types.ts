@@ -554,6 +554,31 @@ export interface DigestDict {
   lead: string;
 }
 
+/** `app/[locale]/faq/page.tsx` and its `components/faq-search.tsx`. */
+export interface FaqDict {
+  metaTitle: string;
+  metaDescription: string;
+  eyebrow: string;
+  /** H1 word, followed by `titleAside` in the other script. */
+  title: string;
+  titleAside: string;
+  lead: string;
+  notCovered: string;
+  openIssue: string;
+  searchPlaceholder: string;
+  searchLabel: string;
+  searchClear: string;
+  /** `{matched}`, `{total}` and `{query}` are filled at render time. */
+  searchMatches: string;
+  /** `{query}` is filled at render time. */
+  searchNoMatches: string;
+  /** Extra classes on each answer; zh loosens leading and tracking. */
+  answerClassName: string;
+  sourcesLabel: string;
+  noResultsTitle: string;
+  noResultsBody: string;
+}
+
 /**
  * `app/[locale]/docs/hooks/page.tsx`.
  *

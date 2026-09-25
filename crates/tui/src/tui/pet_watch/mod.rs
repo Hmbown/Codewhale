@@ -1,9 +1,6 @@
 //! Views of one durable local pet. Engine events are projected here once;
 //! the companion owns simulation, persistence and the sole audio output.
-use crate::core::{
-    events::Event,
-    protocol_parity::{ProtocolIds, event_to_protocol},
-};
+use crate::core::events::{Event, TurnOutcomeStatus};
 use crate::tui::{
     app::{App, StatusToastLevel},
     underwater::ShellPhase,
@@ -17,7 +14,7 @@ use ratatui::{
     style::{Color, Style},
     widgets::{Block, Paragraph},
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{
     io::{self, Write},
     sync::{Arc, Mutex},
@@ -46,6 +43,7 @@ pub enum Control {
 pub struct PetWatch {
     worker: Option<Worker>,
     session: Option<String>,
+    active_turn_id: Option<String>,
     last_tick: Option<Instant>,
     failed: bool,
     /// The companion said it cannot be reached. Cleared by the next frame.
@@ -88,6 +86,7 @@ impl PetWatch {
     fn reset(&mut self, session: Option<String>) {
         self.worker = None;
         self.session = session;
+        self.active_turn_id = None;
         self.raster = None;
         self.failed = false;
         self.unavailable = false;
@@ -123,11 +122,24 @@ impl PetWatch {
     }
     pub fn observe(&mut self, event: &Event, session: Option<&str>, _now: Instant) {
         if self.session.as_deref() != session {
+            // A live view follows the session switch: restart it for the new
+            // session and forward the event that switched, so the reducer
+            // sees the turn that opened it. Without a live view, the next
+            // render starts one; turn tracking below still records the turn.
+            let had_worker = self.worker.is_some();
             self.reset(session.map(str::to_owned));
-            return;
+            if had_worker {
+                self.ensure(self.session.clone());
+            }
         }
-        if let Some(text) = metadata(event) {
+        if let Event::TurnStarted { turn_id, .. } = event {
+            self.active_turn_id = Some(turn_id.clone());
+        }
+        if let Some(text) = metadata(event, self.active_turn_id.as_deref()) {
             self.send(Command::Observe(text));
+        }
+        if matches!(event, Event::TurnComplete { .. }) {
+            self.active_turn_id = None;
         }
     }
     fn send(&mut self, command: Command) {
@@ -207,61 +219,87 @@ impl PetWatch {
 }
 /// Existing protocol projection defines the variant names. This allowlist
 /// removes payloads before the bounded worker queue; no model text escapes.
-fn metadata(event: &Event) -> Option<String> {
-    if !matches!(
-        event,
-        Event::TurnStarted { .. }
-            | Event::TurnComplete { .. }
-            | Event::MessageStarted { .. }
-            | Event::MessageDelta { .. }
-            | Event::MessageComplete { .. }
-            | Event::ThinkingStarted { .. }
-            | Event::ThinkingDelta { .. }
-            | Event::ThinkingComplete { .. }
-            | Event::ToolCallStarted { .. }
-            | Event::ToolCallHeartbeat
-            | Event::ToolCallComplete { .. }
-            | Event::AgentSpawned { .. }
-            | Event::AgentProgress { .. }
-            | Event::AgentComplete { .. }
-            | Event::ApprovalRequired { .. }
-            | Event::UserInputRequired { .. }
-            | Event::Error { .. }
-    ) {
-        return None;
-    }
-    let ids = ProtocolIds {
-        thread_id: "foreground".to_owned().into(),
-        session_id: "foreground".to_owned().into(),
-    };
-    let projected = serde_json::to_value(event_to_protocol(event, &ids)).ok()?;
-    let mut out = serde_json::Map::new();
-    for key in [
-        "event",
-        "index",
-        "channel",
-        "tool_call_id",
-        "tool_name",
-        "id",
-        "worker_status",
-    ] {
-        if let Some(value) = projected.get(key) {
-            out.insert(key.to_owned(), value.clone());
+fn metadata(event: &Event, turn_id: Option<&str>) -> Option<String> {
+    let value = match event {
+        Event::TurnStarted { turn_id, .. } => json!({"event":"turn_started","turn_id":turn_id}),
+        Event::TurnComplete { status, .. } => {
+            let mut value = json!({
+                "event":"turn_complete",
+                "turn_outcome":match status {
+                    TurnOutcomeStatus::Completed => "completed",
+                    TurnOutcomeStatus::Interrupted => "interrupted",
+                    TurnOutcomeStatus::Failed => "failed",
+                }
+            });
+            // An untracked turn omits the id; the reducer rejects `null`, and
+            // without an id a completed turn cannot claim Done.
+            if let Some(turn_id) = turn_id {
+                value["turn_id"] = json!(turn_id);
+            }
+            value
         }
-    }
-    if let Some(status) = projected.pointer("/activity/worker_status") {
-        out.insert("worker_status".into(), status.clone());
-    }
-    let failed = projected.get("status") == Some(&json!("failed"))
-        || projected.get("worker_status") == Some(&json!("failed"))
-        || projected.pointer("/activity/worker_status") == Some(&json!("failed"))
-        || projected.pointer("/result/outcome") == Some(&json!("err"))
-        || projected.pointer("/result/success") == Some(&Value::Bool(false));
-    if failed {
-        out.insert("failed".into(), Value::Bool(true));
-    }
-    let json = serde_json::to_string(&out).ok()?;
-    // Producer data is bounded before crossing the queue, including tool names.
+        Event::MessageStarted { index } => json!({"event":"message_started","index":index}),
+        Event::MessageDelta { index, .. } => {
+            json!({"event":"response_delta","index":index,"channel":"text"})
+        }
+        Event::MessageComplete { index } => json!({"event":"message_complete","index":index}),
+        Event::ThinkingStarted { index } => json!({"event":"thinking_started","index":index}),
+        Event::ThinkingDelta { index, .. } => {
+            json!({"event":"response_delta","index":index,"channel":"reasoning"})
+        }
+        Event::ThinkingComplete { index } => json!({"event":"thinking_complete","index":index}),
+        Event::OperationActivityStarted {
+            span_id,
+            activity_kind,
+        } => json!({
+            "event":"operation_activity_started",
+            "span_id":span_id,
+            "activity_kind":activity_kind
+        }),
+        Event::OperationActivityCompleted {
+            span_id,
+            activity_kind,
+            outcome,
+        } => json!({
+            "event":"operation_activity_completed",
+            "span_id":span_id,
+            "activity_kind":activity_kind,
+            "outcome":outcome
+        }),
+        Event::ToolCallHeartbeat => json!({"event":"tool_call_heartbeat"}),
+        // A denied (by a human or by policy) or cancelled call ends any wait
+        // on it. Only the Engine call id and typed outcome cross; the tool
+        // name and error text stay in the transcript. Approvals that run are
+        // cleared by their operation start and by the shell's typed
+        // `waiting` flag on every tick.
+        Event::ToolCallComplete {
+            id,
+            result: Err(crate::tools::spec::ToolError::PermissionDenied { .. }),
+            ..
+        } => json!({
+            "event":"approval_resolved","id":id,"outcome":"denied"
+        }),
+        Event::ToolCallComplete {
+            id,
+            result: Err(crate::tools::spec::ToolError::Cancelled { .. }),
+            ..
+        } => json!({
+            "event":"approval_resolved","id":id,"outcome":"cancelled"
+        }),
+        Event::AgentSpawned { id, .. } => json!({"event":"agent_spawned","id":id}),
+        Event::AgentProgress { id, activity, .. } => json!({
+            "event":"agent_progress",
+            "id":id,
+            "worker_status":crate::core::protocol_parity::worker_status_str(activity.worker_status)
+        }),
+        Event::AgentComplete { id, .. } => json!({"event":"agent_complete","id":id}),
+        Event::ApprovalRequired { id, .. } | Event::UserInputRequired { id, .. } => json!({
+            "event":if matches!(event, Event::ApprovalRequired { .. }) {"approval_required"} else {"user_input_required"},
+            "id":id
+        }),
+        _ => return None,
+    };
+    let json = serde_json::to_string(&value).ok()?;
     (json.len() <= 16_384).then_some(json)
 }
 
@@ -321,9 +359,10 @@ pub fn observe(app: &mut App, event: &Event, now: Instant) {
         app.pet_watch.work_complete = false;
         app.pet_watch.result_scroll = 0;
         app.pet_watch.work_enter_pending = app.pet_watch.enabled;
-    } else if matches!(event, Event::TurnComplete { .. }) {
+    } else if let Event::TurnComplete { status, .. } = event {
         app.pet_watch.work_enter_pending = false;
-        app.pet_watch.work_complete = app.view_stack.top_kind() == Some(ModalKind::PetHabitat);
+        app.pet_watch.work_complete = *status == TurnOutcomeStatus::Completed
+            && app.view_stack.top_kind() == Some(ModalKind::PetHabitat);
         app.needs_redraw = true;
     }
 }
@@ -482,15 +521,14 @@ fn render_tank(frame: &mut Frame, area: Rect, app: &mut App) {
             );
             if let Some(activity) = &r.scene.activity
                 && activity.observed
+                && activity.freshness == codewhale_protocol::engine_owner::OwnerFreshness::Fresh
                 && r.frame_changed.elapsed().as_millis() < 800
             {
-                text = format!(
-                    "{} · {}",
-                    activity.tool.as_deref().unwrap_or(&activity.label),
-                    text
-                );
-                if activity.parallel > 0 {
-                    text.push_str(&format!(" · ×{}", activity.parallel));
+                if let Some(kind) = activity.activity_kind {
+                    text = format!("{} · {}", kind.as_str(), text);
+                }
+                if activity.parallel_agent_count > 0 {
+                    text.push_str(&format!(" · ×{}", activity.parallel_agent_count));
                 }
             }
             text
@@ -683,6 +721,7 @@ pub(crate) fn clear_images(output: &mut impl Write) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn work_completion_reveals_existing_answer_without_sending_text_to_owner() {
@@ -860,36 +899,200 @@ mod tests {
     }
 
     #[test]
-    fn foreground_projection_keeps_lifecycle_and_excludes_private_payloads() {
-        let call = metadata(&Event::ToolCallStarted {
-            id: "call-a".into(),
-            name: "exec_command".into(),
-            input: json!({"command":"PRIVATE TOOL INPUT"}),
-        })
+    fn only_completed_turns_set_the_pet_done_state() {
+        let mut app =
+            crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        app.onboarding = crate::tui::app::OnboardingState::None;
+        app.redaction_gate = false;
+        app.pet_watch.detach_for_test();
+        open_habitat(&mut app);
+
+        let finish = |status| Event::TurnComplete {
+            usage: Default::default(),
+            parent_route_usage: Default::default(),
+            routed_usage_dropped_records: 0,
+            status,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        };
+        for status in [TurnOutcomeStatus::Interrupted, TurnOutcomeStatus::Failed] {
+            observe(
+                &mut app,
+                &Event::TurnStarted {
+                    turn_id: format!("turn-{:?}", status),
+                    created_at: chrono::Utc::now(),
+                    route: None,
+                },
+                Instant::now(),
+            );
+            observe(&mut app, &finish(status), Instant::now());
+            assert!(!app.pet_watch.work_complete, "{status:?} cannot mark Done");
+        }
+
+        observe(
+            &mut app,
+            &Event::TurnStarted {
+                turn_id: "turn-completed".into(),
+                created_at: chrono::Utc::now(),
+                route: None,
+            },
+            Instant::now(),
+        );
+        observe(
+            &mut app,
+            &finish(TurnOutcomeStatus::Completed),
+            Instant::now(),
+        );
+        assert!(app.pet_watch.work_complete);
+        assert!(app.pet_watch.worker.is_none());
+    }
+
+    #[test]
+    fn session_switch_resets_the_view_and_tracks_the_switching_turn() {
+        let mut watch = PetWatch::default();
+        watch.detach_for_test();
+        watch.session = Some("session-a".into());
+        watch.active_turn_id = Some("turn-a".into());
+        watch.work_complete = true;
+
+        watch.observe(
+            &Event::TurnStarted {
+                turn_id: "turn-b".into(),
+                created_at: chrono::Utc::now(),
+                route: None,
+            },
+            Some("session-b"),
+            Instant::now(),
+        );
+        assert_eq!(watch.session.as_deref(), Some("session-b"));
+        // The event that switched sessions is not dropped: its turn is the
+        // one a later `turn_complete` must carry to claim Done.
+        assert_eq!(watch.active_turn_id.as_deref(), Some("turn-b"));
+        assert!(!watch.work_complete, "Done never survives a session switch");
+        assert!(!watch.failed, "a switch clears a prior failure");
+        assert!(
+            watch.worker.is_none(),
+            "with no live view running, an Engine event never starts one"
+        );
+
+        let done = metadata(
+            &Event::TurnComplete {
+                usage: Default::default(),
+                parent_route_usage: Default::default(),
+                routed_usage_dropped_records: 0,
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            },
+            watch.active_turn_id.as_deref(),
+        )
         .unwrap();
         assert_eq!(
-            serde_json::from_str::<Value>(&call).unwrap(),
-            json!({
-                "event":"tool_call_started", "tool_call_id":"call-a", "tool_name":"exec_command",
-            })
+            serde_json::from_str::<Value>(&done).unwrap(),
+            json!({"event":"turn_complete","turn_id":"turn-b","turn_outcome":"completed"})
         );
-        let thought = metadata(&Event::ThinkingDelta {
-            index: 2,
-            content: "PRIVATE REASONING".into(),
-        })
+    }
+
+    #[test]
+    fn foreground_projection_forwards_only_typed_owner_metadata() {
+        let call = metadata(
+            &Event::ToolCallStarted {
+                id: "call-a".into(),
+                name: "exec_command".into(),
+                input: json!({"command":"PRIVATE TOOL INPUT"}),
+            },
+            Some("turn-a"),
+        );
+        assert!(
+            call.is_none(),
+            "tool names and inputs are not activity facts"
+        );
+
+        let thought = metadata(
+            &Event::ThinkingDelta {
+                index: 2,
+                content: "PRIVATE REASONING".into(),
+            },
+            None,
+        )
         .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&thought).unwrap(),
             json!({"event":"response_delta","index":2,"channel":"reasoning"})
         );
-        let message = metadata(&Event::MessageDelta {
-            index: 3,
-            content: "PRIVATE MESSAGE".into(),
-        })
+        let message = metadata(
+            &Event::MessageDelta {
+                index: 3,
+                content: "PRIVATE MESSAGE".into(),
+            },
+            None,
+        )
         .unwrap();
+
+        let operation = metadata(
+            &Event::OperationActivityStarted {
+                span_id: "private-internal-span".into(),
+                activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind::Computer,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&operation).unwrap(),
+            json!({
+                "event":"operation_activity_started",
+                "span_id":"private-internal-span",
+                "activity_kind":"computer"
+            })
+        );
+        let completed = metadata(
+            &Event::OperationActivityCompleted {
+                span_id: "private-internal-span".into(),
+                activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind::Editing,
+                outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome::Denied,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&completed).unwrap(),
+            json!({
+                "event":"operation_activity_completed",
+                "span_id":"private-internal-span",
+                "activity_kind":"editing",
+                "outcome":"denied"
+            })
+        );
+
+        let turn = metadata(
+            &Event::TurnComplete {
+                usage: Default::default(),
+                parent_route_usage: Default::default(),
+                routed_usage_dropped_records: 0,
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            },
+            Some("stable-turn-a"),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&turn).unwrap(),
+            json!({
+                "event":"turn_complete",
+                "turn_id":"stable-turn-a",
+                "turn_outcome":"completed"
+            })
+        );
+
         assert!(!message.contains("PRIVATE"));
-        assert!(!call.contains("PRIVATE"));
+        assert!(call.is_none());
         assert!(!thought.contains("PRIVATE"));
+        assert!(!operation.contains("tool_name"));
+        assert!(!operation.contains("PRIVATE"));
     }
 
     /// The pet's multi-agent count is derived on the JS side from
@@ -904,57 +1107,67 @@ mod tests {
         use crate::core::events::AgentProgressEventMeta;
         use crate::tools::subagent::{AgentWorkerStatus, SubAgentStatus};
 
-        let spawned = metadata(&Event::AgentSpawned {
-            owner_session_id: "session-a".into(),
-            id: "agent-1".into(),
-            prompt: "PRIVATE CHILD PROMPT".into(),
-            worker_status: Some(AgentWorkerStatus::Running),
-            parent_run_id: Some("run-9".into()),
-            spawn_depth: 2,
-            model: "PRIVATE CHILD MODEL".into(),
-            route_source: Some("task.model".into()),
-        })
+        let spawned = metadata(
+            &Event::AgentSpawned {
+                owner_session_id: "session-a".into(),
+                id: "agent-1".into(),
+                prompt: "PRIVATE CHILD PROMPT".into(),
+                worker_status: Some(AgentWorkerStatus::Running),
+                parent_run_id: Some("run-9".into()),
+                spawn_depth: 2,
+                model: "PRIVATE CHILD MODEL".into(),
+                route_source: Some("task.model".into()),
+            },
+            None,
+        )
         .expect("agent spawns are observed");
         assert_eq!(
             serde_json::from_str::<Value>(&spawned).unwrap(),
-            json!({"event":"agent_spawned","id":"agent-1","worker_status":"running"})
+            // A spawn opens the span; the reducer reads no status from it.
+            json!({"event":"agent_spawned","id":"agent-1"})
         );
 
         // The JS finishes a span when progress reports a terminal status.
-        let progress = metadata(&Event::AgentProgress {
-            owner_session_id: "session-a".into(),
-            id: "agent-1".into(),
-            status: "PRIVATE PROGRESS TEXT".into(),
-            activity: AgentProgressEventMeta {
-                worker_status: AgentWorkerStatus::Completed,
-                step: Some(3),
-                tool_name: Some("exec_command".into()),
-                routine_wait: false,
-                approval_id: None,
+        let progress = metadata(
+            &Event::AgentProgress {
+                owner_session_id: "session-a".into(),
+                id: "agent-1".into(),
+                status: "PRIVATE PROGRESS TEXT".into(),
+                activity: AgentProgressEventMeta {
+                    worker_status: AgentWorkerStatus::Completed,
+                    step: Some(3),
+                    tool_name: Some("exec_command".into()),
+                    routine_wait: false,
+                    approval_id: None,
+                },
+                parent_run_id: Some("run-9".into()),
+                spawn_depth: 2,
             },
-            parent_run_id: Some("run-9".into()),
-            spawn_depth: 2,
-        })
+            None,
+        )
         .expect("agent progress is observed");
         assert_eq!(
             serde_json::from_str::<Value>(&progress).unwrap(),
             json!({"event":"agent_progress","id":"agent-1","worker_status":"completed"})
         );
 
-        let complete = metadata(&Event::AgentComplete {
-            owner_session_id: "session-a".into(),
-            id: "agent-1".into(),
-            result: "PRIVATE CHILD RESULT".into(),
-            outcome: Some(SubAgentStatus::Completed),
-            parent_run_id: Some("run-9".into()),
-            spawn_depth: Some(2),
-            continuable: Some(false),
-            usage: None,
-        })
+        let complete = metadata(
+            &Event::AgentComplete {
+                owner_session_id: "session-a".into(),
+                id: "agent-1".into(),
+                result: "PRIVATE CHILD RESULT".into(),
+                outcome: Some(SubAgentStatus::Completed),
+                parent_run_id: Some("run-9".into()),
+                spawn_depth: Some(2),
+                continuable: Some(false),
+                usage: None,
+            },
+            None,
+        )
         .expect("agent completions are observed");
         assert_eq!(
             serde_json::from_str::<Value>(&complete).unwrap(),
-            json!({"event":"agent_complete","id":"agent-1","worker_status":"completed"})
+            json!({"event":"agent_complete","id":"agent-1"})
         );
 
         for (label, payload) in [

@@ -2,8 +2,9 @@
 
 Codewhale includes an offline snapshot of the `codewhale` catalog in the same
 marketplace store consumed by the terminal, Extensions, recommendations, and
-Runtime API. It lists Computer Use, WhaleWiki, Whalesong, Cloudflare Docs, and the
-Codewhale skill bundle. Browsing does not fetch or execute anything.
+Runtime API. It lists Computer Use, WhaleWiki, Whalesong, Cloudflare Docs, the
+Codewhale skill bundle, and Codewhale for Chrome (Chromewhale). Browsing does
+not fetch or execute anything.
 
 ```text
 /plugin marketplace list
@@ -45,11 +46,13 @@ always need review.
 
 ## Chromewhale
 
-Chromewhale (Codewhale in your own Chrome) is in the marketplace repository
-but not in the catalog bundled with Core yet. It will be listed as a developer
-preview, loaded unpacked, once its inclusion checks pass on the published
-marketplace revision. Until then it is not offered in Extensions or
-`/plugin marketplace list`.
+Chromewhale (listed as "Codewhale for Chrome") is in the catalog bundled with
+Core from marketplace revision `ae3dd22` on, where its checks pass on macOS,
+Linux and Windows. It is a developer preview: installing the plugin does not
+install the browser side, so you load its bundled Chrome extension unpacked
+yourself. It then reads and acts on the tab you are looking at, one granted
+site at a time. Like every catalog entry, it installs disabled and untrusted
+until you review it.
 
 ## Keeping the repositories current
 

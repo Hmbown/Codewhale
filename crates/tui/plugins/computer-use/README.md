@@ -27,7 +27,7 @@ Use `request_access` to inspect readiness; a loaded plugin alone does not prove
 its OS permissions work.
 
 When the standalone Computer Use helper is registered, it owns local input
-even when Codewhale carries an embedded native helper. Version 0.11.3 keeps its
+even when Codewhale carries an embedded native helper. Version 0.12.0 keeps its
 whale menu, permission setup, disposable background check and human
 Pause/Stop controls, and retires the daemon when its native owner disappears. A registered helper that cannot start causes a clear
 error; the client does not silently bypass its controls. Without a registered

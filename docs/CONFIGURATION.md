@@ -22,18 +22,30 @@ and nested paths such as `tools.user_input_timeout_seconds`. Displayed tables
 and nested values apply the same recursive credential redaction as `config dump`.
 
 `config set` supports its named scalar keys and the provider, route, and
-notification commands. Other dotted writes fail before modifying the file and
-name the TOML table to edit. For example, set a tools timeout in the file as:
+notification commands. It refuses a key that nothing reads and suggests the
+nearest real key (`config set calm_mod on` names `calm_mode`). A settings.toml
+key such as `calm_mode` or `tool_collapse` is validated and written to the
+user-global settings.toml, not config.toml; `config get` reads it back from
+there even when an old config.toml copy (which nothing reads) is still present,
+and names that copy so you can `config unset` it. Settings keys have no project
+scope, so `--project` refuses them. A config.toml key is checked against the
+type its reader expects and stored as a TOML boolean or number where the
+reader needs one (`yolo = true`, `max_subagents = 4`); `reasoning_effort`
+accepts the same aliases as `/effort` (#6563). Other dotted writes fail before
+modifying the file and name the TOML table to edit. For example, set a tools
+timeout in the file as:
 
 ```toml
 [tools]
 user_input_timeout_seconds = 0
 ```
 
-`codewhale config doctor` checks credential presence and endpoint shape. Settings
-preserved for other runtime readers are not classified as unsupported merely
-because the CLI dispatcher does not own them. A clean result from this command
-does not validate every runtime setting (#6083).
+`codewhale config doctor` checks credential presence and endpoint shape, and
+warns about each config.toml root key that nothing reads: a settings.toml key
+left in config.toml is named as misplaced, and any other unread key gets a
+did-you-mean. Keys read by any runtime reader are not reported. The warnings do
+not fail the check, and a clean result does not validate every runtime setting's
+value (#6083, #6563).
 
 ## Constitution, project instructions, and repo authority
 

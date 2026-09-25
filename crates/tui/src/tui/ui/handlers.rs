@@ -1614,13 +1614,14 @@ pub(crate) async fn handle_view_events(
                     Ok(recovery) => {
                         let session = recovery.session;
                         let next_config = config.clone();
+                        let message_count = session.metadata.message_count;
                         // Keep the saved-store confinement check a pure
                         // comparison on this runtime (#6522).
                         crate::runtime_threads::prepare_canonical_sessions_root().await;
                         let respawn = match apply_loaded_session_config_snapshot(
                             app,
                             config,
-                            &session,
+                            session,
                             next_config,
                             false,
                         ) {
@@ -1674,7 +1675,7 @@ pub(crate) async fn handle_view_events(
                         let loaded_message = format!(
                             "Session loaded (ID: {}, {} messages)",
                             crate::session_manager::truncate_id(&session_id),
-                            session.metadata.message_count
+                            message_count
                         );
                         app.add_message(HistoryCell::System {
                             content: loaded_message.clone(),

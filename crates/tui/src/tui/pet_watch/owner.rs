@@ -556,6 +556,7 @@ fn run_world(
             frame["cursor"] = json!(saved.cursor);
             frame["source"] = json!(saved.source);
             frame["sourceRevision"] = json!(saved.source_revision);
+            bind_activity(&mut frame, &saved.source, saved.cursor);
             // Presentation material keeps missing coverage legible. The core
             // pigment, score, particle digest and recording are unchanged.
             for key in ["", "still"] {
@@ -836,4 +837,109 @@ fn save(context: &Context, saved: &mut Saved, store: &mut Store) -> anyhow::Resu
         context.with(|ctx| ctx.eval::<(), _>("pet.commitSegment()"))?;
     }
     Ok(())
+}
+
+/// Bind the reducer's account-neutral owner projection to the session and
+/// cursor this owner serves. The reducer never knows either; `Scene::valid`
+/// rejects a frame whose projection disagrees with them.
+fn bind_activity(frame: &mut Value, source: &str, cursor: u64) {
+    if let Some(activity) = frame["activity"].as_object_mut() {
+        let session = if source == "unattached" {
+            Value::Null
+        } else {
+            json!(source)
+        };
+        activity.insert("sessionId".into(), session);
+        activity.insert("cursor".into(), json!(cursor));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codewhale_protocol::engine_owner::{
+        EngineOwnerProjection, OwnerActivityKind, OwnerFreshness, OwnerPresence,
+    };
+
+    /// Drive the committed `pet-native.js` bundle (the one the owner and the
+    /// worker actually evaluate) and read back its projection the way the
+    /// live client does: strict schema, then the contract's invariants.
+    fn projection(ctx: &rquickjs::Ctx<'_>, source: &str, cursor: u64) -> EngineOwnerProjection {
+        let text: String = ctx.eval("pet.presentation()").unwrap();
+        let mut frame: Value = serde_json::from_str(&text).unwrap();
+        bind_activity(&mut frame, source, cursor);
+        let activity: EngineOwnerProjection =
+            serde_json::from_value(frame["activity"].clone()).expect("bundle matches the contract");
+        assert!(activity.is_valid(), "invalid projection: {activity:?}");
+        assert_eq!(activity.cursor, cursor);
+        activity
+    }
+
+    #[test]
+    fn committed_bundle_projection_satisfies_the_owner_contract() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        context.with(|ctx| {
+            let points: Vec<Vec<f64>> = include_str!("../ambient_life/whale-points.tsv")
+                .lines()
+                .map(|line| line.split_whitespace().filter_map(|n| n.parse().ok()).collect())
+                .collect();
+            ctx.globals()
+                .set("points", serde_json::to_string(&points).unwrap())
+                .unwrap();
+            ctx.eval::<(), _>(include_bytes!("pet-native.js").as_slice())
+                .unwrap();
+            ctx.eval::<(), _>("globalThis.pet = new PetNative(points, '', '[]', true)")
+                .unwrap();
+
+            let unattached = projection(&ctx, "unattached", 0);
+            assert_eq!(unattached.freshness, OwnerFreshness::Missing);
+            assert_eq!(unattached.session_id, None);
+
+            let feed = |events: &str, at: f64| {
+                ctx.globals().set("events", events).unwrap();
+                ctx.globals().set("at", at).unwrap();
+                ctx.eval::<(), _>("pet.observeEngineBatch(events, at); pet.advanceEngine(at + 50, true, false)")
+                    .unwrap();
+            };
+            feed(
+                r#"[{"event":"turn_started","turn_id":"turn-1"},
+                    {"event":"operation_activity_started","span_id":"call-1","activity_kind":"computer"}]"#,
+                0.0,
+            );
+            let working = projection(&ctx, "session-a", 3);
+            assert_eq!(working.session_id.as_deref(), Some("session-a"));
+            assert_eq!(working.freshness, OwnerFreshness::Fresh);
+            assert_eq!(working.authoritative_presence, OwnerPresence::Working);
+            assert_eq!(working.activity_kind, Some(OwnerActivityKind::Computer));
+
+            // The old tool-name feed is refused at the boundary.
+            ctx.globals()
+                .set(
+                    "events",
+                    r#"[{"event":"tool_call_started","tool_call_id":"a","tool_name":"exec_shell"}]"#,
+                )
+                .unwrap();
+            assert!(ctx.eval::<(), _>("pet.observeEngineBatch(events, 100)").is_err());
+            let _ = ctx.catch();
+
+            feed(
+                r#"[{"event":"operation_activity_completed","span_id":"call-1","activity_kind":"computer","outcome":"succeeded"},
+                    {"event":"turn_complete","turn_id":"turn-1","turn_outcome":"completed"}]"#,
+                200.0,
+            );
+            let done = projection(&ctx, "session-a", 4);
+            assert_eq!(done.authoritative_presence, OwnerPresence::Done);
+            assert_eq!(done.done_effect_id.as_deref(), Some("turn-1"));
+
+            feed(
+                r#"[{"event":"turn_started","turn_id":"turn-2"},
+                    {"event":"turn_complete","turn_id":"turn-2","turn_outcome":"interrupted"}]"#,
+                400.0,
+            );
+            let interrupted = projection(&ctx, "session-a", 5);
+            assert_ne!(interrupted.authoritative_presence, OwnerPresence::Done);
+            assert_eq!(interrupted.done_effect_id, None);
+        });
+    }
 }

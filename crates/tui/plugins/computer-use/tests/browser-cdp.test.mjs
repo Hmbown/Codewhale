@@ -251,6 +251,8 @@ test("checkBrowserUrl allows http(s) and about:blank only; findBrowserApp honors
   assert.equal(checkBrowserUrl("http://127.0.0.1:8080/"), "http://127.0.0.1:8080/");
   assert.equal(checkBrowserUrl("about:blank"), "about:blank");
   assert.throws(() => checkBrowserUrl("file:///etc/passwd"), /only http/);
+  assert.throws(() => checkBrowserUrl("file:///w/field-guide.html"), /use open_in_app/);
+  assert.throws(() => checkBrowserUrl("ftp://a.test/x"), (error) => !/open_in_app/.test(error.message));
   assert.throws(() => checkBrowserUrl("example.com"), /not a URL/);
   assert.throws(() => checkBrowserUrl(""), /need a url/);
   assert.equal(findBrowserApp("darwin", {}, (p) => p === "/Applications/Google Chrome.app"), "/Applications/Google Chrome.app");

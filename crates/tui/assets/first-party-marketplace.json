@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/Hmbown/codewhale-plugin-marketplace",
-  "revision": "93b0e0e4e441384533ca586b59890c0d5942bc0a",
+  "revision": "ae3dd2255a9a266365c6125a084f511eb26bc04d",
   "catalog": {
     "name": "codewhale",
     "description": "First-party Codewhale extensions: the plugins and skills Codewhale ships, maintained in the open so anyone can propose a change.",
@@ -8,8 +8,8 @@
     "plugins": [
       {
         "name": "computer-use",
-        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/93b0e0e4e441384533ca586b59890c0d5942bc0a#path=plugins/computer-use",
-        "version": "0.11.3",
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/ae3dd2255a9a266365c6125a084f511eb26bc04d#path=plugins/computer-use",
+        "version": "0.12.0",
         "description": "Control apps with Codewhale. macOS beta; unsigned Windows preview and experimental Linux/Docker support.",
         "homepage": "https://codewhale.net/computer-use",
         "display_name": "Computer Use",
@@ -21,7 +21,7 @@
       },
       {
         "name": "whalesong",
-        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/93b0e0e4e441384533ca586b59890c0d5942bc0a#path=plugins/whalesong",
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/ae3dd2255a9a266365c6125a084f511eb26bc04d#path=plugins/whalesong",
         "version": "0.2.0",
         "description": "Review agent traces and failures, compare runs, and turn session timing into audio. Requires the local Whalesong platform.",
         "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace",
@@ -30,7 +30,7 @@
       },
       {
         "name": "whalewiki",
-        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/93b0e0e4e441384533ca586b59890c0d5942bc0a#path=plugins/whalewiki",
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/ae3dd2255a9a266365c6125a084f511eb26bc04d#path=plugins/whalewiki",
         "version": "0.2.0",
         "description": "Understand a repo, find where to change it, and see which docs depend on a file. Source citations, freshness checks and a searchable offline reader.",
         "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace",
@@ -39,7 +39,7 @@
       },
       {
         "name": "cloudflare-docs",
-        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/93b0e0e4e441384533ca586b59890c0d5942bc0a#path=plugins/cloudflare-docs",
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/ae3dd2255a9a266365c6125a084f511eb26bc04d#path=plugins/cloudflare-docs",
         "version": "0.1.0",
         "description": "Search current Cloudflare documentation through its official remote MCP. No account or credential required.",
         "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace",
@@ -48,11 +48,20 @@
       },
       {
         "name": "codewhale-skills",
-        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/93b0e0e4e441384533ca586b59890c0d5942bc0a#path=skills",
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/ae3dd2255a9a266365c6125a084f511eb26bc04d#path=skills",
         "version": "1.1.0",
         "description": "47 workflows for coding, research, documents, email, calendar, travel, shopping and local audio. Account and tool setup is separate; see the skill directory.",
         "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace",
         "display_name": "Codewhale Skills",
+        "author": "Codewhale"
+      },
+      {
+        "name": "chromewhale",
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/ae3dd2255a9a266365c6125a084f511eb26bc04d#path=plugins/chromewhale",
+        "version": "0.3.0",
+        "description": "Let Codewhale read and act on the Chrome tab you are looking at, one granted site at a time. Needs the bundled Chrome extension loaded.",
+        "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace/tree/main/plugins/chromewhale",
+        "display_name": "Codewhale for Chrome",
         "author": "Codewhale"
       }
     ]

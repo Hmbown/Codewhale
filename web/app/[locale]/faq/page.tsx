@@ -5,20 +5,19 @@ import { FaqSearch } from "@/components/faq-search";
 import { buildFaqPageJsonLd } from "@/lib/faq-schema";
 import { FACTS } from "@/lib/facts.generated";
 import { canonicalLocaleForPath } from "@/lib/i18n/content-locales";
+import { getFaq, pickTextLocale } from "@/lib/i18n/dictionaries";
 import { serializeJsonLd } from "@/lib/json-ld";
 import { buildPageMetadata } from "@/lib/page-meta";
 import { SITE_URL } from "@/lib/page-meta";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
+  const t = getFaq(locale);
   return buildPageMetadata({
     path: "/faq",
     locale,
-    title: isZh ? "常见问题 · Codewhale" : "FAQ · Codewhale",
-    description: isZh
-      ? "Codewhale 常见问题：安装、配置、提供商、模型、模式、安全与隐私。答案来自实际代码、文档和 GitHub 议题。"
-      : "Codewhale frequently asked questions: install, config, providers, models, modes, security, and privacy. Answers sourced from real code, docs, and GitHub issues.",
+    title: t.metaTitle,
+    description: t.metaDescription,
   });
 }
 
@@ -758,8 +757,8 @@ brew update && brew upgrade codewhale`}
 
 export default async function FaqPage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
-  const items = isZh ? faqZh : faqEn;
+  const t = getFaq(locale);
+  const items = { en: faqEn, zh: faqZh }[pickTextLocale(locale)];
   const canonicalLocale = canonicalLocaleForPath("/faq", locale);
   const jsonLd = buildFaqPageJsonLd({
     items,
@@ -776,19 +775,13 @@ export default async function FaqPage({ params }: { params: Promise<{ locale: st
       <section className="site-container section">
         <div className="flex items-baseline gap-4 mb-3">
           <Seal char="问" />
-          <div className="eyebrow">{isZh ? "常见问题" : "FAQ"}</div>
+          <div className="eyebrow">{t.eyebrow}</div>
         </div>
         <h1 className="font-display tracking-crisp">
-          {isZh ? (
-            <>常见问题 <span className="font-cjk text-indigo text-5xl ml-2">FAQ</span></>
-          ) : (
-            <>FAQ <span className="font-cjk text-indigo text-5xl ml-2">常见问题</span></>
-          )}
+          {t.title} <span className="font-cjk text-indigo text-5xl ml-2">{t.titleAside}</span>
         </h1>
         <p className="mt-5 max-w-3xl text-ink-soft text-lg leading-[1.9] tracking-wide">
-          {isZh
-            ? "答案来自实际代码、文档、发布说明和 GitHub 议题。每个回答下方标注了信息来源。如有未覆盖的问题，请在 GitHub 上提交 Issue。"
-            : "Answers sourced from real code, docs, release notes, and GitHub issues. Sources are cited below each answer. If your question isn't covered, open an issue on GitHub."}
+          {t.lead}
         </p>
       </section>
 
@@ -797,15 +790,13 @@ export default async function FaqPage({ params }: { params: Promise<{ locale: st
 
         <div className="mt-12 text-center">
           <p className="text-ink-soft text-sm mb-4">
-            {isZh
-              ? "没找到你的问题？"
-              : "Didn't find your question?"}
+            {t.notCovered}
           </p>
           <a
             href="https://github.com/Hmbown/CodeWhale/issues/new/choose"
             className="portal-button portal-button-primary gap-2"
           >
-            {isZh ? "提交 Issue →" : "Open an issue →"}
+            {t.openIssue}
           </a>
         </div>
       </section>

@@ -2981,6 +2981,15 @@ impl ConfigToml {
             "telemetry_endpoint" => self.telemetry_endpoint = Some(value.to_string()),
             "approval_policy" => self.approval_policy = Some(value.to_string()),
             "sandbox_mode" => self.sandbox_mode = Some(value.to_string()),
+            // The TUI reader (`ReasoningEffort::parse_strict`) owns this
+            // vocabulary and accepts aliases the schema's option list does
+            // not name (`none`, `mid`, `maximum`, ...), so the schema check
+            // below would refuse values that take effect. `codewhale config
+            // set` validates against that reader before calling here.
+            "reasoning_effort" => {
+                self.extras
+                    .insert(key.to_string(), toml::Value::String(value.to_string()));
+            }
             "hook_sinks.unix_socket_path" => {
                 self.hook_sinks
                     .get_or_insert_with(HookSinksToml::default)
@@ -2995,8 +3004,16 @@ impl ConfigToml {
                 );
             }
             _ => {
-                self.extras
-                    .insert(key.to_string(), toml::Value::String(value.to_string()));
+                // A declared setting keeps its declared type (#6563): refuse a
+                // value the schema cannot hold, and store booleans and numbers
+                // as TOML values so typed readers deserialize them. Whether an
+                // undeclared key is read by anything is the caller's question;
+                // `codewhale config set` refuses those before reaching here.
+                let stored = match setting(key) {
+                    Some(def) => schema_toml_value(key, def, value)?,
+                    None => toml::Value::String(value.to_string()),
+                };
+                self.extras.insert(key.to_string(), stored);
             }
         }
         Ok(())
@@ -6584,6 +6601,43 @@ pub fn migrate_config_if_needed() -> Result<Option<ConfigMigration>> {
         legacy_path: legacy,
         primary_path: primary,
     }))
+}
+
+/// `value` as the TOML value a [`SettingDef`] declares, or an error naming
+/// the key and what it accepts. No partial write happens on error.
+fn schema_toml_value(key: &str, def: &SettingDef, value: &str) -> Result<toml::Value> {
+    let trimmed = value.trim();
+    Ok(match def.kind {
+        SettingKind::Bool(_) => toml::Value::Boolean(
+            parse_bool(value).with_context(|| format!("invalid value for '{key}'"))?,
+        ),
+        SettingKind::Int => toml::Value::Integer(trimmed.parse().map_err(|_| {
+            anyhow::anyhow!("invalid value '{value}' for '{key}': expected an integer")
+        })?),
+        SettingKind::Float => toml::Value::Float(
+            trimmed
+                .parse::<f64>()
+                .ok()
+                .filter(|number| number.is_finite())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("invalid value '{value}' for '{key}': expected a number")
+                })?,
+        ),
+        SettingKind::Enum(options) => {
+            let Some(option) = options
+                .iter()
+                .find(|option| option.value.eq_ignore_ascii_case(trimmed))
+            else {
+                let expected: Vec<&str> = options.iter().map(|option| option.value).collect();
+                bail!(
+                    "invalid value '{value}' for '{key}': expected one of {}",
+                    expected.join(", ")
+                );
+            };
+            toml::Value::String(option.value.to_string())
+        }
+        SettingKind::String => toml::Value::String(value.to_string()),
+    })
 }
 
 fn parse_bool(raw: &str) -> Result<bool> {

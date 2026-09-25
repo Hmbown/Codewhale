@@ -12092,6 +12092,57 @@ impl RuntimeThreadManager {
         );
     }
 
+    /// Persist an engine status line as a completed `status` item.
+    ///
+    /// Model-facing hints (deferred-tool retry) already reach the model in the
+    /// tool result; they are not user items. Scheduler, continuation and
+    /// approval-wait rows keep a receipt tagged so clients collapse them.
+    /// An approval-wait heartbeat naming a call in `settled_approval_calls`
+    /// is stale (its approval was already answered) and is dropped, whichever
+    /// path dequeued it.
+    async fn publish_status_item(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        message: String,
+        settled_approval_calls: &HashSet<String>,
+    ) -> Result<()> {
+        if crate::core::events::approval_wait_tool_call(&message)
+            .is_some_and(|call| settled_approval_calls.contains(call))
+        {
+            return Ok(());
+        }
+        let visibility = crate::core::events::status_visibility(&message);
+        if visibility == crate::core::events::StatusVisibility::ModelOnly {
+            return Ok(());
+        }
+        let item = TurnItemRecord {
+            schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+            id: format!("item_{}", &Uuid::new_v4().to_string()[..8]),
+            turn_id: turn_id.to_string(),
+            kind: TurnItemKind::Status,
+            status: TurnItemLifecycleStatus::Completed,
+            summary: summarize_text(&message, SUMMARY_LIMIT),
+            detail: Some(message),
+            metadata: (visibility == crate::core::events::StatusVisibility::Internal)
+                .then(|| json!({ "visibility": visibility.as_str() })),
+            artifact_refs: Vec::new(),
+            started_at: Some(Utc::now()),
+            ended_at: Some(Utc::now()),
+        };
+        self.store.save_item(&item)?;
+        self.attach_item_to_turn(turn_id, &item.id)?;
+        self.emit_event(
+            thread_id,
+            Some(turn_id),
+            Some(&item.id),
+            "item.completed",
+            json!({ "item": item }),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn monitor_turn(
         &self,
         thread_id: String,
@@ -12117,6 +12168,10 @@ impl RuntimeThreadManager {
         let mut engine_turn_id: Option<String> = None;
         let mut pending_event: Option<EngineEvent> = None;
         let mut event_channel_closed = false;
+        // Raw tool call IDs whose external approval this turn already settled.
+        // An approval-wait heartbeat naming one of them is stale by the time
+        // it is dequeued and must not be published as a live claim.
+        let mut settled_approval_calls: HashSet<String> = HashSet::new();
         // Latest engine-side goal snapshot observed during this turn. The
         // model's `update_goal` decision (complete/blocked/paused) lands here
         // before TurnComplete, so terminal settlement can mirror it into the
@@ -12553,7 +12608,7 @@ impl RuntimeThreadManager {
                                     // (`exec_shell` keeps stdout/stderr
                                     // summaries), so it is masked the same way.
                                     let mut meta = match output.metadata.as_ref().map(
-                                        codewhale_config::persistence::redact_model_bound_json_secrets,
+                                        codewhale_config::persistence::redact_json_model_bound_secrets,
                                     ) {
                                         Some(Value::Object(map)) => Value::Object(map),
                                         _ => json!({}),
@@ -13157,10 +13212,51 @@ impl RuntimeThreadManager {
                     }
                     drop(projection);
                     let approval_timeout = self.approval_decision_timeout();
-                    let decision = match approval_timeout {
-                        Some(wait) => tokio::time::timeout(wait, rx).await,
-                        None => Ok(rx.await),
+                    let wait_for_decision = async {
+                        match approval_timeout {
+                            Some(wait) => tokio::time::timeout(wait, rx).await,
+                            None => Ok(rx.await),
+                        }
                     };
+                    let mut wait_for_decision = std::pin::pin!(wait_for_decision);
+                    // Keep draining engine status while the card is open. The
+                    // engine's approval-wait heartbeat fires during this wait;
+                    // parking the pump here used to sequence it after
+                    // `approval.decided`, where it read as a live claim that
+                    // the answered call was still waiting (DESKTOP-QA-20260923).
+                    // Anything else is held for the main loop, in order.
+                    let decision = loop {
+                        tokio::select! {
+                            biased;
+                            decision = &mut wait_for_decision => break decision,
+                            event = async { engine.rx_event.write().await.recv().await },
+                                if pending_event.is_none() && !event_channel_closed =>
+                            {
+                                match event {
+                                    Some(EngineEvent::Status { message }) => {
+                                        if let Err(err) = self
+                                            .publish_status_item(
+                                                &thread_id,
+                                                &turn_id,
+                                                message,
+                                                &settled_approval_calls,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                thread_id = %thread_id,
+                                                turn_id = %turn_id,
+                                                "failed to persist status during approval wait: {err:#}"
+                                            );
+                                        }
+                                    }
+                                    Some(other) => pending_event = Some(other),
+                                    None => event_channel_closed = true,
+                                }
+                            }
+                        }
+                    };
+                    settled_approval_calls.insert(id.clone());
                     // A decision may already have consumed the sender when
                     // Stop wins. Never remember or dispatch that late allow.
                     let cancelled = {
@@ -13370,36 +13466,13 @@ impl RuntimeThreadManager {
                     drop(projection);
                 }
                 EngineEvent::Status { message } => {
-                    // Model-facing hints (deferred-tool retry) already reach
-                    // the model in the tool result; they are not user items.
-                    // Scheduler/continuation rows keep a receipt tagged so
-                    // clients collapse them by default.
-                    let visibility = crate::core::events::status_visibility(&message);
-                    if visibility == crate::core::events::StatusVisibility::ModelOnly {
-                        continue;
-                    }
-                    let item = TurnItemRecord {
-                        schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-                        id: format!("item_{}", &Uuid::new_v4().to_string()[..8]),
-                        turn_id: turn_id.clone(),
-                        kind: TurnItemKind::Status,
-                        status: TurnItemLifecycleStatus::Completed,
-                        summary: summarize_text(&message, SUMMARY_LIMIT),
-                        detail: Some(message.clone()),
-                        metadata: (visibility == crate::core::events::StatusVisibility::Internal)
-                            .then(|| json!({ "visibility": visibility.as_str() })),
-                        artifact_refs: Vec::new(),
-                        started_at: Some(Utc::now()),
-                        ended_at: Some(Utc::now()),
-                    };
-                    self.store.save_item(&item)?;
-                    self.attach_item_to_turn(&turn_id, &item.id)?;
-                    self.emit_event(
+                    // A heartbeat queued behind another event while its
+                    // approval was answered is dropped inside the helper.
+                    self.publish_status_item(
                         &thread_id,
-                        Some(&turn_id),
-                        Some(&item.id),
-                        "item.completed",
-                        json!({ "item": item }),
+                        &turn_id,
+                        message,
+                        &settled_approval_calls,
                     )
                     .await?;
                 }

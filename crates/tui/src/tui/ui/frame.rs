@@ -298,14 +298,10 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
         ));
     }
     if let Some(tokens) = output_tokens(app) {
-        let hit = u64::from(app.session.displayed_total_cache_hit_tokens());
-        let miss = u64::from(app.session.displayed_total_cache_miss_tokens());
-        let cache_total = hit + miss;
-        if shows(StatusItem::Cache) && cache_total > 0 {
-            let cache_pct = (hit * 100 + cache_total / 2)
-                .checked_div(cache_total)
-                .and_then(|pct| u8::try_from(pct).ok())
-                .unwrap_or(100);
+        if shows(StatusItem::Cache)
+            && let Some(cache_pct) =
+                crate::tui::session_metrics::snapshot_from_app(app).cache_hit_percent
+        {
             segments.push(InfoSegment::new(
                 InfoSegmentId::Cache,
                 "cache",
@@ -322,14 +318,10 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
             ));
         }
     } else {
-        let hit = u64::from(app.session.displayed_total_cache_hit_tokens());
-        let miss = u64::from(app.session.displayed_total_cache_miss_tokens());
-        let cache_total = hit + miss;
-        if shows(StatusItem::Cache) && cache_total > 0 {
-            let cache_pct = (hit * 100 + cache_total / 2)
-                .checked_div(cache_total)
-                .and_then(|pct| u8::try_from(pct).ok())
-                .unwrap_or(100);
+        if shows(StatusItem::Cache)
+            && let Some(cache_pct) =
+                crate::tui::session_metrics::snapshot_from_app(app).cache_hit_percent
+        {
             segments.push(InfoSegment::new(
                 InfoSegmentId::Cache,
                 "cache",

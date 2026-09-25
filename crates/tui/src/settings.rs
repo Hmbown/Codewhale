@@ -1428,7 +1428,7 @@ impl Settings {
     /// match arm below. `None` means `set()` rejects the spelling, so the
     /// ledger never learns it. Keep in sync with the arms — the
     /// `set_marks_session_provenance` test enforces it per spelling.
-    fn canonical_key(key: &str) -> Option<&'static str> {
+    pub(crate) fn canonical_key(key: &str) -> Option<&'static str> {
         Some(match key {
             "auto_compact" | "compact" => "auto_compact",
             "auto_compact_threshold" | "auto_compact_threshold_percent" => {
@@ -1927,164 +1927,6 @@ impl Settings {
             }
         }
         lines.join("\n")
-    }
-
-    /// Get available setting keys and their descriptions
-    pub fn available_settings() -> Vec<(&'static str, &'static str)> {
-        vec![
-            (
-                "auto_compact",
-                "Auto-compact near the hard context limit: on/off (model-aware default)",
-            ),
-            (
-                "auto_compact_threshold_percent",
-                "Auto-compact trigger threshold percent: 10-100 (default 80; setting it enables auto-compaction unless auto_compact=false is explicit)",
-            ),
-            ("calm_mode", "Calmer UI defaults: on/off"),
-            (
-                "tool_collapse",
-                "Dense tool-run collapse mode: collapsed (alias compact), expanded, calm",
-            ),
-            (
-                "low_motion",
-                "Reduce decorative motion without changing model text delivery: on/off",
-            ),
-            ("fancy_animations", "Expressive live-state motion: on/off"),
-            (
-                "focus_texture",
-                "Modal focus-context texture prototype: off/scrim/grain (default off)",
-            ),
-            (
-                "work_surface_placement",
-                "Ocean Tasks/To-do/Workers rail placement: bottom (default)/top/left/right",
-            ),
-            (
-                "work_surface_top_height",
-                "Resizable To-do/Sub-agent top bar height: 2-16 rows",
-            ),
-            (
-                "work_surface_side_width",
-                "Resizable To-do/Sub-agent side bar width: 26-80 columns",
-            ),
-            (
-                "rail_panel",
-                "Which panel the rail shows: tasks/agents/context/pinned",
-            ),
-            (
-                "bracketed_paste",
-                "Terminal bracketed-paste mode: on/off (rare to disable)",
-            ),
-            (
-                "paste_burst_detection",
-                "Fallback rapid-key paste detection: on/off",
-            ),
-            (
-                "mention_menu_limit",
-                "Maximum @-mention popup candidates retained before rendering (default 128)",
-            ),
-            (
-                "mention_walk_depth",
-                "Maximum @-mention workspace walk depth; 0 means unlimited (default 10)",
-            ),
-            (
-                "mention_menu_behavior",
-                "@-mention completion behavior: fuzzy/browser (default fuzzy)",
-            ),
-            ("show_thinking", "Show model thinking: on/off"),
-            ("contextual_tips", ""), // Localized guidance comes from the schema.
-            (
-                "thinking_default_expanded",
-                "Expand model thinking by default; Space still toggles: on/off",
-            ),
-            (
-                "thinking_preview_lines",
-                "Collapsed completed-thought preview rows (default 2, 0=header-only, 10=older dump)",
-            ),
-            (
-                "thinking_highlight",
-                "Fill the thinking/reasoning background: on/off",
-            ),
-            (
-                "help_expand_groups",
-                "Start Help/shortcuts with every group expanded: on/off (default off)",
-            ),
-            (
-                "pin_last_prompt",
-                "Pin the last user prompt at the top when it scrolls off: on/off (default on)",
-            ),
-            ("show_tool_details", "Show detailed tool output: on/off"),
-            (
-                "inline_diffs",
-                "Successful File mutation evidence: full/summary/off (exact detail is always retained)",
-            ),
-            (
-                "base_url",
-                "HTTP base URL for DeepSeek-compatible endpoints.",
-            ),
-            (
-                "locale",
-                "UI locale and default model language: auto, en, ja, zh-Hans, zh-Hant, pt-BR, es-419, vi, ko, ca, de, fr, id, hi, ru, uk; every shipped pack holds full English parity",
-            ),
-            (
-                "theme",
-                "UI theme: a compiled name or custom:<name> from the Codewhale themes directory",
-            ),
-            (
-                "background_color",
-                "Main TUI background color: #RRGGBB or default",
-            ),
-            (
-                "composer_density",
-                "Composer density: compact, comfortable, spacious",
-            ),
-            (
-                "composer_border",
-                "Show a border around the composer input area: on/off",
-            ),
-            (
-                "composer_multiline_mode",
-                "Enter inserts a newline and Shift+Enter sends: on/off",
-            ),
-            ("composer_vim_mode", "Composer editing mode: normal, vim"),
-            (
-                "transcript_spacing",
-                "Transcript spacing: compact, comfortable, spacious",
-            ),
-            (
-                "status_indicator",
-                "Header status mark, shown before the route: cw, whale, dots, off",
-            ),
-            (
-                "synchronized_output",
-                "DEC 2026 synchronized output: auto, on, off (set off if your terminal flickers)",
-            ),
-            (
-                "workspace_follow_symlinks",
-                "Follow symbolic links during workspace file discovery walks: on/off (default off). Enable for symlink-based multi-project workspaces. Has built-in cycle detection but may increase latency on large symlinked trees.",
-            ),
-            (
-                "default_mode",
-                "Default mode: act (agent), plan, or operate",
-            ),
-            (
-                "context_panel",
-                "Show the session context workbar panel: on/off",
-            ),
-            (
-                "sessions_rail",
-                "Show the persistent Sessions workbar: on/off (default off)",
-            ),
-            (
-                "session_auto_resume",
-                "Reattach to this workspace's most recent session on startup: on/off (default off). --resume/--continue still win; archived, unreadable, or other-workspace sessions are never auto-resumed.",
-            ),
-            ("cost_currency", "Cost display currency: usd, cny"),
-            ("max_history", "Max input history entries"),
-            (
-                "reasoning_effort",
-                "Default thinking effort: auto, off, low, medium, high, max, or default",
-            ),
-        ]
     }
 
     /// Toggle one exact provider/model pin without touching credentials or
@@ -2770,7 +2612,7 @@ fn normalize_reasoning_effort_setting(value: &str) -> Result<Option<String>> {
 }
 
 /// Parse a boolean value from various formats
-fn parse_bool(value: &str) -> Result<bool> {
+pub(crate) fn parse_bool(value: &str) -> Result<bool> {
     match value.to_lowercase().as_str() {
         "on" | "true" | "yes" | "1" | "enabled" => Ok(true),
         "off" | "false" | "no" | "0" | "disabled" => Ok(false),
@@ -3985,16 +3827,6 @@ mod tests {
         assert_eq!(settings.mention_menu_limit, 128);
         assert_eq!(settings.mention_walk_depth, 10);
         assert_eq!(settings.mention_menu_behavior, "fuzzy");
-        let mention_help = Settings::available_settings()
-            .into_iter()
-            .find(|(key, _)| *key == "mention_walk_depth")
-            .map(|(_, desc)| desc)
-            .expect("mention_walk_depth help");
-        assert!(
-            mention_help.contains("default 10"),
-            "help text still lists the pre-v0.8.50 default: {mention_help}"
-        );
-
         settings
             .set("mention_menu_limit", "256")
             .expect("set mention menu limit");
@@ -5798,7 +5630,19 @@ zai = ["GLM-5.2", "GLM-5.3"]
         ];
         for (spellings, value) in cases {
             let canonical = spellings[0];
+            // `config set`, `/config` and `config doctor` route and suggest
+            // from the schema by this canonical key; a `/set` spelling with
+            // no declaration would be settable but unplaceable.
+            assert!(
+                codewhale_config::setting(canonical).is_some(),
+                "`/set {canonical}` is accepted but undeclared in SETTINGS_SCHEMA"
+            );
             for spelling in *spellings {
+                assert_eq!(
+                    Settings::canonical_key(spelling),
+                    Some(canonical),
+                    "{spelling}"
+                );
                 let mut settings = Settings::default();
                 assert_eq!(settings.provenance(canonical), Layer::Default);
                 settings
@@ -5815,6 +5659,11 @@ zai = ["GLM-5.2", "GLM-5.3"]
                     "{spelling} does not resolve to its own layer"
                 );
             }
+        }
+        // `default_model` has no provenance case above; check its spellings too.
+        for spelling in ["default_model", "model"] {
+            let canonical = Settings::canonical_key(spelling).expect("model spelling");
+            assert!(codewhale_config::setting(canonical).is_some(), "{spelling}");
         }
     }
 
