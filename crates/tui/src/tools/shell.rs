@@ -6598,6 +6598,49 @@ fn shell_delta_with_accumulated_output(
     }
 }
 
+/// Refuse a notes target this auto-approved tool must not append to.
+///
+/// The file itself must not be a symlink (a committed `notes.md -> ~/.zshrc`
+/// would redirect the append), and a target placed inside the workspace must
+/// resolve inside it after symlinked parent directories are followed.
+async fn ensure_notes_target_is_safe(
+    notes_path: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Result<(), ToolError> {
+    if let Ok(meta) = tokio::fs::symlink_metadata(notes_path).await
+        && (meta.file_type().is_symlink() || !meta.is_file())
+    {
+        return Err(ToolError::permission_denied(format!(
+            "Refusing to append a note to {}: the notes path is a symlink or not a regular file.",
+            notes_path.display()
+        )));
+    }
+    if notes_path.starts_with(workspace)
+        && let (Some(parent), Ok(root)) = (
+            notes_path.parent(),
+            tokio::fs::canonicalize(workspace).await,
+        )
+    {
+        // Walk up to the nearest existing ancestor: the rest is created
+        // below as real directories, so only existing links can redirect.
+        let mut existing = parent.to_path_buf();
+        while !tokio::fs::try_exists(&existing).await.unwrap_or(false) {
+            if !existing.pop() {
+                break;
+            }
+        }
+        if let Ok(resolved) = tokio::fs::canonicalize(&existing).await
+            && !resolved.starts_with(&root)
+        {
+            return Err(ToolError::permission_denied(format!(
+                "Refusing to append a note to {}: its directory resolves outside the workspace.",
+                notes_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Tool for appending notes to a notes file.
 pub struct NoteTool;
 
@@ -6638,6 +6681,7 @@ impl ToolSpec for NoteTool {
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let note_content = required_str(&input, "content")?;
+        ensure_notes_target_is_safe(&context.notes_path, &context.workspace).await?;
 
         // Ensure parent directory exists. Tool handlers run on the Tokio
         // runtime, so filesystem calls use tokio::fs (blocking-call

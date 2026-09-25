@@ -11025,6 +11025,24 @@ fn preserve_interrupted_checkpoint_for_explicit_resume(launch_workspace: &Path) 
     }
 }
 
+/// Resolve a project-scope `notes_path` against the workspace, or `None` when
+/// it could leave it: absolute, rooted, `~`-prefixed, or containing `..`.
+fn project_notes_path_inside_workspace(workspace: &Path, value: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let value = value.trim();
+    if value.is_empty() || value.starts_with('~') || value.contains('$') {
+        return None;
+    }
+    let relative = Path::new(value);
+    let contained = relative
+        .components()
+        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+        && relative
+            .components()
+            .any(|component| matches!(component, Component::Normal(_)));
+    contained.then(|| workspace.join(relative))
+}
+
 /// Load project-level config from `$WORKSPACE/.codewhale/config.toml`, with
 /// legacy `$WORKSPACE/.deepseek/config.toml` fallback, then apply its fields as
 /// overrides on top of the global config (#485).
@@ -11140,14 +11158,25 @@ fn merge_project_config_with_approval_baseline(
         config.set_provider_model_override(config.api_provider(), Some(model.to_string()));
         config.remembered_selection_scope = Some(false);
     }
-    for (key, field) in [
-        ("reasoning_effort", &mut config.reasoning_effort),
-        ("notes_path", &mut config.notes_path),
-    ] {
-        if let Some(v) = table.get(key).and_then(toml::Value::as_str)
-            && !v.is_empty()
-        {
-            *field = Some(v.to_string());
+    if let Some(v) = table.get("reasoning_effort").and_then(toml::Value::as_str)
+        && !v.is_empty()
+    {
+        config.reasoning_effort = Some(v.to_string());
+    }
+    // The `note` tool is auto-approved and appends to `notes_path`, so a
+    // project value is a write target the user never reviewed. Only a
+    // relative path that stays inside the workspace is honoured; `~`,
+    // absolute and `..` paths (e.g. `~/.zshrc`) are ignored.
+    if let Some(v) = table.get("notes_path").and_then(toml::Value::as_str)
+        && !v.is_empty()
+    {
+        match project_notes_path_inside_workspace(workspace, v) {
+            Some(path) => config.notes_path = Some(path.to_string_lossy().into_owned()),
+            None => eprintln!(
+                "warning: project-scope `notes_path = \"{v}\"` is ignored — \
+                 a project may only point notes at a relative path inside the workspace. \
+                 Set it in `~/.codewhale/config.toml` to write elsewhere."
+            ),
         }
     }
 
@@ -19381,6 +19410,37 @@ sandbox_mode = "read-only"
         merge_project_config(&mut config, tmp.path());
         assert_eq!(config.approval_policy.as_deref(), Some("never"));
         assert_eq!(config.sandbox_mode.as_deref(), Some("read-only"));
+    }
+
+    #[test]
+    fn project_overlay_keeps_notes_path_inside_the_workspace() {
+        // The auto-approved `note` tool appends to `notes_path`; a project
+        // must not aim it at `~/.zshrc` or any file outside the workspace.
+        for escape in [
+            "~/.zshrc",
+            "/etc/profile",
+            "../../.bashrc",
+            "notes/../../outside.md",
+            "$HOME/.zshrc",
+            "..",
+        ] {
+            let tmp = workspace_with_project_config(&format!("notes_path = {escape:?}\n"));
+            let mut config = Config::default();
+            merge_project_config(&mut config, tmp.path());
+            assert_eq!(
+                config.notes_path, None,
+                "project notes_path {escape:?} must be ignored"
+            );
+        }
+
+        let tmp = workspace_with_project_config("notes_path = \"docs/agent-notes.md\"\n");
+        let mut config = Config::default();
+        merge_project_config(&mut config, tmp.path());
+        assert_eq!(
+            config.notes_path(),
+            tmp.path().join("docs/agent-notes.md"),
+            "a relative project notes_path resolves inside the workspace"
+        );
     }
 
     #[test]
