@@ -128,6 +128,7 @@ mod session_manager;
 mod session_peek;
 mod session_projection;
 mod session_resume;
+mod session_secret_scrub;
 pub mod session_tree;
 mod settings;
 mod shell_dispatcher;
@@ -398,6 +399,14 @@ enum SessionsCommand {
         /// Search sessions by title
         #[arg(short, long)]
         search: Option<String>,
+    },
+    /// Mask credentials that older builds stored in saved sessions' tool
+    /// output. Reports what it would change unless `--apply` is given. Run it
+    /// while no Codewhale session is open.
+    ScrubSecrets {
+        /// Rewrite the affected session files (default: report only)
+        #[arg(long, default_value_t = false)]
+        apply: bool,
     },
     /// Export a session as a full-fidelity tar.xz archive (complete context:
     /// system prompt, messages, tool calls and results, plus artifacts)
@@ -2303,6 +2312,7 @@ async fn run_async_main_dispatch(
             } => match command {
                 None => list_sessions(limit, search),
                 Some(SessionsCommand::List { limit, search }) => list_sessions(limit, search),
+                Some(SessionsCommand::ScrubSecrets { apply }) => run_sessions_scrub_secrets(apply),
                 Some(SessionsCommand::Export {
                     id,
                     output,
@@ -4611,6 +4621,7 @@ async fn run_doctor(
         (aqua_r, aqua_g, aqua_b),
         (sky_r, sky_g, sky_b),
     );
+    print_doctor_stored_secrets_report().await;
 
     let (setup_state, setup_source) = doctor_setup_state(config, workspace);
     print_doctor_setup_report(
@@ -8105,6 +8116,88 @@ fn rustc_version() -> String {
 /// List saved sessions
 fn sessions_resume_command() -> &'static str {
     "codewhale resume"
+}
+
+/// Newest session files `codewhale doctor` inspects for stored credentials;
+/// `codewhale sessions scrub-secrets` covers every file.
+const DOCTOR_SECRET_SCAN_FILES: usize = 50;
+
+/// B1 finding: sessions written before tool output was redacted at the
+/// transcript boundary can still hold live credentials. Report, never
+/// rewrite — scrubbing is the explicit `scrub-secrets` command.
+async fn print_doctor_stored_secrets_report() {
+    use colored::Colorize;
+
+    let scan = tokio::task::spawn_blocking(|| {
+        let manager = session_manager::SessionManager::default_location().ok()?;
+        let files = session_secret_scrub::session_files(manager.sessions_dir());
+        let total = files.len();
+        let checked: Vec<PathBuf> = files.into_iter().take(DOCTOR_SECRET_SCAN_FILES).collect();
+        session_secret_scrub::scrub_files(&checked, false)
+            .ok()
+            .map(|report| (report, total))
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some((report, total)) = scan else {
+        return;
+    };
+    println!();
+    println!("{}", "Stored Sessions:".bold());
+    let scope = if total > report.files_scanned {
+        format!("newest {} of {total}", report.files_scanned)
+    } else {
+        format!("{total}")
+    };
+    if report.files_with_secrets.is_empty() {
+        println!("  ✓ no credentials found in stored tool output ({scope} session files)");
+        return;
+    }
+    println!(
+        "  ✗ {} session files hold credentials in stored tool output ({scope} checked)",
+        report.files_with_secrets.len()
+    );
+    println!(
+        "    fix: `{}` to review, then `--apply` to mask them; rotate any exposed credential",
+        session_secret_scrub::SCRUB_COMMAND
+    );
+}
+
+fn run_sessions_scrub_secrets(apply: bool) -> Result<()> {
+    let manager = session_manager::SessionManager::default_location()?;
+    let files = session_secret_scrub::session_files(manager.sessions_dir());
+    let report = session_secret_scrub::scrub_files(&files, apply)?;
+    let affected = report.files_with_secrets.len();
+    if affected == 0 {
+        println!(
+            "No stored credentials found in tool output across {} session files.",
+            report.files_scanned
+        );
+    } else {
+        let verb = if apply { "Scrubbed" } else { "Found" };
+        println!(
+            "{verb} {} credential-bearing tool results in {affected} of {} session files:",
+            report.tool_results_with_secrets, report.files_scanned
+        );
+        for path in &report.files_with_secrets {
+            println!("  {}", path.display());
+        }
+        if !apply {
+            println!(
+                "Re-run with `{} --apply` to mask them (close open Codewhale sessions first). \
+                 Rotate any credential that was exposed: redaction cannot un-leak it.",
+                session_secret_scrub::SCRUB_COMMAND
+            );
+        }
+    }
+    if !report.unreadable.is_empty() {
+        println!(
+            "{} files could not be read or parsed and were left untouched.",
+            report.unreadable.len()
+        );
+    }
+    Ok(())
 }
 
 fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {

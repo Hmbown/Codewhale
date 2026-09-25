@@ -12531,11 +12531,18 @@ impl RuntimeThreadManager {
                                         "response_redacted": true,
                                     }));
                                 } else {
+                                    // Durable receipt: credentials a tool
+                                    // printed are masked before they reach
+                                    // the item store or the event log (B1).
+                                    let content =
+                                        codewhale_config::persistence::redact_model_bound_secrets(
+                                            &output.content,
+                                        );
                                     item.summary = summarize_text(
-                                        &format!("{name}: {}", output.content),
+                                        &format!("{name}: {content}"),
                                         SUMMARY_LIMIT,
                                     );
-                                    item.detail = Some(output.content.clone());
+                                    item.detail = Some(content);
                                     // `detail` is now the tool output, so the
                                     // call identity persisted at start must be
                                     // carried through metadata. Mark the
@@ -12580,9 +12587,12 @@ impl RuntimeThreadManager {
                             }
                             Err(err) => {
                                 item.status = TurnItemLifecycleStatus::Failed;
+                                let err = codewhale_config::persistence::redact_model_bound_secrets(
+                                    &err.to_string(),
+                                );
                                 item.summary =
                                     summarize_text(&format!("{name} failed: {err}"), SUMMARY_LIMIT);
-                                item.detail = Some(err.to_string());
+                                item.detail = Some(err);
                             }
                         }
                         self.store.save_item(&item)?;

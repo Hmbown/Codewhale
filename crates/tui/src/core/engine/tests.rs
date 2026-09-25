@@ -5631,6 +5631,56 @@ async fn run_budgeted_read_turn(
     (status, error, completions)
 }
 
+/// B1: tool output is redacted once, as it enters the transcript, so the
+/// session messages (and the session JSON built from them) never hold a live
+/// credential a tool printed.
+#[tokio::test]
+async fn tool_output_credentials_are_redacted_when_they_enter_the_transcript() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+
+    const TOKEN: &str = "sk-ant-oat01-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefghij";
+    let workspace = tempdir().expect("tempdir");
+    fs::write(
+        workspace.path().join("auth.json"),
+        format!("{{\n  \"access_token\": \"{TOKEN}\",\n  \"note\": \"keep me\"\n}}\n"),
+    )
+    .expect("write fixture");
+    let mock = std::sync::Arc::new(MockLlmClient::new(vec![
+        canned::tool_call_turn("call-read", "read_file", r#"{"path":"auth.json"}"#),
+        canned::simple_text_turn("done"),
+    ]));
+    let client: crate::core::model_client::SharedModelClient = mock;
+    let (mut engine, _handle) = Engine::new_with_model_client(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+        client,
+    );
+    let context = crate::tools::ToolContext::new(workspace.path().to_path_buf());
+    let mut registry = crate::tools::ToolRegistry::new(context);
+    registry.register(std::sync::Arc::new(crate::tools::file::ReadFileTool));
+    let tools = Some(registry.to_api_tools_with_cache(true));
+    let surface = test_tool_surface(&engine, registry, tools, AppMode::Agent);
+    let mut turn = crate::core::turn::TurnContext::new(4);
+    let (status, error) = engine.run_turn(&mut turn, surface, None, None).await;
+    assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+
+    let stored = engine
+        .session
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .find_map(|block| match block {
+            ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .expect("the read result is in the transcript");
+    assert!(!stored.contains(TOKEN), "{stored}");
+    assert!(stored.contains("keep me"), "ordinary bytes stay: {stored}");
+    let serialized = serde_json::to_string(&engine.session.messages.iter().collect::<Vec<_>>())
+        .expect("serialize");
+    assert!(!serialized.contains(TOKEN));
+}
+
 /// #4415 AC(a): an 8-call cap admits exactly 8 calls; the 9th is rejected
 /// with the typed reason carrying `remaining=0` and is never executed.
 #[tokio::test]

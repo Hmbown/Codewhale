@@ -3308,6 +3308,26 @@ Until a confirmation exists, the effective mode is always `"enabled"`:
   always-on redaction regardless of this switch; the opt-out exists so the
   model can quote file bytes for exact edits, not to relax stored state.
 
+### Stored sessions
+
+The masking runs once, when tool output enters the transcript, so saved
+session files (`~/.codewhale/sessions/*.json` and their checkpoints) never
+store a live credential from tool output. With the confirmed opt-out above,
+tool output is stored as the model saw it.
+
+Sessions saved by builds before this change may still hold credentials in
+their tool output; nothing rewrites them automatically. `codewhale doctor`
+reports them under **Stored Sessions** (it checks the newest 50 files), and
+this command finds and masks them across every saved session:
+
+```sh
+codewhale sessions scrub-secrets          # report only
+codewhale sessions scrub-secrets --apply  # rewrite the affected files
+```
+
+Close open Codewhale sessions before `--apply`, and rotate any credential that
+was exposed — masking a stored copy cannot un-leak it.
+
 The config value itself is forgiving: `true`/`false`, `"on"`/`"off"`, and
 `"enabled"`/`"disabled"` (any casing) all parse, with `false`/`"off"` meaning
 `"disabled"`.
