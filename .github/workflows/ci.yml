@@ -462,6 +462,7 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         # The runtime -> UI ratchet baseline is compared with the one at the
         # PR base too, so a hand-edited JSON cannot raise it.
+        shell: bash
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
