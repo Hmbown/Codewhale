@@ -385,8 +385,8 @@ pub(crate) fn content_hash(text: &str) -> String {
     sha256_label(text.as_bytes())
 }
 
-/// `sha256:<hex>` over arbitrary bytes. Mirrors the hex helper in `replay.rs`
-/// rather than relying on a digest `LowerHex` impl.
+/// `sha256:<hex>` over arbitrary bytes, written out by hand rather than
+/// relying on a digest `LowerHex` impl.
 pub(crate) fn sha256_label(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 

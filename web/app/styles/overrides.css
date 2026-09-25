@@ -1,55 +1,6 @@
-/* ---------- /product: the availability table on paper ---------- */
-/* The same list the homepage sets in the water, re-inked for the sheet. */
-.product-availability-paper,
-.product-availability-paper > div {
-  border-color: var(--hairline);
-}
-.product-availability-paper dt,
-.product-availability-paper dd strong {
-  color: var(--ink);
-}
-.product-availability-paper dd {
-  color: var(--ink-soft);
-}
-
-/* ---------- usage counting: the consent sheet and its footer control ---------- */
-/* A quiet sheet at the foot of the viewport, on paper, with the site's own
-   inks. It is not a modal: the page stays usable, and the choice is one
-   click either way. */
-.usage-counting {
-  display: grid;
-  gap: 0.75rem;
-  margin-top: 0.5rem;
-}
-
-.usage-counting-status {
-  color: var(--ink);
-  font-weight: 500;
-}
-
-.usage-counting-elsewhere {
-  color: var(--ink-mute);
-  font-size: 0.9rem;
-}
-
-.usage-counting-button {
-  display: inline-flex;
-  justify-self: start;
-  min-height: 2.75rem;
-  align-items: center;
-  padding: 0.5rem 1.1rem;
-  border: 1px solid var(--indigo);
-  border-radius: var(--radius-control);
-  color: var(--indigo);
-  font-size: 0.95rem;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background-color var(--dur-state) var(--ease-spring), color var(--dur-state) var(--ease-spring);
-}
-
-.usage-counting-button:hover {
-  background: var(--hover);
-}
+/* ------------------------------------------------------------------ */
+/*  Docs overrides (owned with the docs pages; kept last in cascade)   */
+/* ------------------------------------------------------------------ */
 
 /* ---------- docs: the reading sheet ---------- */
 /* Read mode: comprehension first. The article gets a book measure, the
@@ -84,6 +35,10 @@
   font-size: var(--text-prose);
   line-height: var(--leading-prose);
 }
+
+/* A step card is a panel, not a line of prose: its rows span the card so
+   the dividers meet both edges. */
+.docs-content .gs-steps li { max-width: none; }
 
 .docs-content > section + section {
   padding-top: 0.5rem;
@@ -130,17 +85,20 @@
   font-weight: 600;
 }
 
+/* The link is a flex row (label, then an optional external arrow); the
+   current-page tick is its first item, and the label grows so the tick stays
+   beside it instead of being pushed to the far edge. */
 .docs-sidebar-link-current::before {
   content: "";
-  display: inline-block;
+  flex: none;
   width: 0.4rem;
   height: 1px;
-  margin-right: 0.45rem;
-  vertical-align: middle;
+  margin-inline-end: -0.35rem;
   background: var(--indigo);
 }
+.docs-sidebar-link > span:first-child { flex: 1 1 auto; min-width: 0; }
 
-/* Topic rows on the hub: a title with room to breathe, the source path quiet. */
+/* Topic rows on the hub: a title with room to breathe. */
 .docs-topic-title {
   font-size: 0.98rem;
 }
@@ -183,20 +141,4 @@
   font-family: var(--font-display);
   font-weight: 600;
   font-size: 1.4rem;
-}
-
-/* Keep the terminal centered and compact beneath the introductory copy. */
-.folio-hero-grid { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto auto; row-gap: 2rem; }
-.folio-hero-copy { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: clamp(2rem, 5vw, 5rem); max-width: none; grid-column: 1; grid-row: 1; padding-bottom: 0; }
-.folio-hero-copy h1 { grid-column: 1; grid-row: 1 / 3; max-width: none; font-size: clamp(2.75rem, 5vw, 4.5rem); line-height: 1.06; text-wrap: balance; }
-.folio-hero-copy .folio-lede { grid-column: 2; grid-row: 1; margin-top: 0; align-self: end; }
-.folio-hero-copy .folio-actions { grid-column: 2; grid-row: 2; align-self: start; margin-top: 1.25rem; }
-.folio-hero-copy .hero-install { grid-column: 2; grid-row: 3; }
-.folio-shot { grid-column: 1; grid-row: 2; width: min(100%, 56rem); justify-self: center; margin-top: 0; }
-.folio-chapter { grid-column: 1; grid-row: 3; justify-self: start; }
-.product-install-grid > div, .product-composer, .product-composer > div { min-width: 0; }
-@media (max-width: 760px) {
-  .folio-hero-copy { display: block; }
-  .folio-hero-copy .folio-lede { margin-top: 1.25rem; }
-  .folio-shot { width: 100%; }
 }

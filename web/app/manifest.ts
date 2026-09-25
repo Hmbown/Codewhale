@@ -2,11 +2,10 @@ import type { MetadataRoute } from "next";
 import { SITE_NAME } from "@/lib/page-meta";
 
 /**
- * Web app manifest. Icons are the founder's whale mark in white on the
- * #142352 navy tile, rasterised from app/icon.svg by
- * scripts/brand/trace-brand.py. Static rasters live in public/ next to the
- * other shipped assets; the field naming follows the Next.js metadata-file
- * convention already used by app/icon.svg and app/opengraph-image.tsx.
+ * Web app manifest. Icons are the brand mark itself — the C-shaped whale in
+ * the logo gradient (#1E8FD8 -> #0B48BB) on a transparent ground, the
+ * resting pose from public/whale/rest.svg rasterised to the sizes below
+ * (app/icon.svg is the same drawing). No tile.
  */
 export default function manifest(): MetadataRoute.Manifest {
   return {
@@ -24,10 +23,10 @@ export default function manifest(): MetadataRoute.Manifest {
         type: "image/png",
       },
     ],
-    // Brand navy: the icon tile, so the installed shell's splash and chrome
-    // are one surface with the mark.
-    theme_color: "#142352",
-    background_color: "#142352",
+    // The ocean floor (tokens-roles.css --ocean-floor): the dark ground the
+    // site prefers, so the splash and chrome sit in the same water.
+    theme_color: "#061431",
+    background_color: "#061431",
     display: "standalone",
   };
 }

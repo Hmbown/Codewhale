@@ -1162,7 +1162,6 @@
   "PendingApprovalInAgent": "Cần phê duyệt trong {agent} — /agents",
   "ApprovalTruncationHint": "  … đã rút gọn · nhấn {details} để xem đầy đủ",
   "ApprovalFullAccessPolicyBlocked": "Đã chặn {tool}: Full Access không thể bỏ qua chính sách này",
-  "AutoReviewQuestionSkipped": "Auto-Review đã bỏ qua một câu hỏi và tiếp tục tự động",
   "ApprovalChooseHint": "Chọn: ",
   "ApprovalChooseAction": "Enter để chọn, hoặc nhấn y/a/d trực tiếp",
   "ApprovalIntentLabel": "Ý định: ",

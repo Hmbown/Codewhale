@@ -1851,12 +1851,18 @@ fn bind_exact_fleet_task_request(
             }),
     );
 
-    // Everything the spawn boundary will reject *predictably* is rejected here,
-    // while the task has still cost nothing. The write-scope contract is the
-    // one that bites: a write-capable member launched with no declared scope
-    // fails at `validate_spawn_write_contract`, which runs long after the
-    // Router has been paid for a decision about a task that could never run.
-    validate_exact_write_scope(&fleet, &binding, request)?;
+    // A member that resolves read-only under the live posture cannot hold a
+    // write claim, so any scope the script declared is dropped here rather
+    // than refused: the script cannot predict every member's resolved
+    // posture, and `validate_spawn_write_contract` would otherwise refuse the
+    // task after the Router had been paid. A write-capable member with no
+    // declared scope is left alone; the spawn boundary defaults it to the
+    // workspace root exactly as it does for a plain Agent spawn.
+    if binding.authority.write_authority == "read_only" {
+        request.write_roots.clear();
+        request.exact_files.clear();
+        request.coordination_contracts.clear();
+    }
     Ok(binding)
 }
 
@@ -1894,44 +1900,6 @@ fn orphaned_fleet_receipt_line(
         receipt.line(),
         error.replace('\n', " ")
     )
-}
-
-/// The write-scope half of the spawn contract, checked before anything costs.
-///
-/// Deliberately a mirror of the spawn-boundary rule rather than a replacement
-/// for it: the boundary stays authoritative (it is reachable by other callers),
-/// and this exists so an exact-Fleet task fails on the same terms *before* the
-/// Router call rather than after it.
-fn validate_exact_write_scope(
-    fleet: &str,
-    binding: &crate::fleet::exact::ExactMemberBinding,
-    request: &TaskRequest,
-) -> Result<(), DriverError> {
-    let declares_scope = !request.write_roots.is_empty()
-        || !request.exact_files.is_empty()
-        || !request.coordination_contracts.is_empty();
-
-    if binding.authority.write_authority == "read_only" {
-        if declares_scope {
-            return Err(DriverError::Rejected(format!(
-                "fleet `{fleet}`: member `{}` is read-only under the effective Runtime posture, so this \
-                 task may not declare write_roots, exact_files, or coordination_contracts.",
-                binding.member_id
-            )));
-        }
-        return Ok(());
-    }
-
-    if !declares_scope {
-        return Err(DriverError::Rejected(format!(
-            "fleet `{fleet}`: member `{}` is write-capable, so this task must declare \
-             write_roots, exact_files, or coordination_contracts before it can start. An \
-             unbounded write claim is refused at the spawn boundary, and this task would spend a \
-             reasoning-router call on its way to that refusal.",
-            binding.member_id
-        )));
-    }
-    Ok(())
 }
 
 /// **Phase two**: route an already admitted task.
@@ -3731,16 +3699,13 @@ impl RuntimeTaskRecord {
     ///
     /// `BudgetExceeded` is the named gap this exists to close: a child that
     /// dies of budget exhaustion is a failed task for the all-failed rule,
-    /// not an invisible one. `ReplayDiverged` means the leaf's replay did
-    /// not reproduce its recorded result — no output either. `Cancelled` is
+    /// not an invisible one. `Cancelled` is
     /// deliberately excluded: it is the run's own stop, not lost work, and
     /// run-level cancellation is finalized before this ledger is consulted.
     fn failed_for_ledger(&self) -> bool {
         matches!(
             self.status,
-            IrWorkflowRunStatus::Failed
-                | IrWorkflowRunStatus::BudgetExceeded
-                | IrWorkflowRunStatus::ReplayDiverged
+            IrWorkflowRunStatus::Failed | IrWorkflowRunStatus::BudgetExceeded
         )
     }
 }
@@ -5172,9 +5137,7 @@ fn aggregate_ir_status(
         match status {
             IrWorkflowRunStatus::BudgetExceeded => return IrWorkflowRunStatus::BudgetExceeded,
             IrWorkflowRunStatus::Cancelled => return IrWorkflowRunStatus::Cancelled,
-            IrWorkflowRunStatus::Failed | IrWorkflowRunStatus::ReplayDiverged => {
-                return IrWorkflowRunStatus::Failed;
-            }
+            IrWorkflowRunStatus::Failed => return IrWorkflowRunStatus::Failed,
             IrWorkflowRunStatus::Running => saw_running = true,
             IrWorkflowRunStatus::Pending => saw_pending = true,
             IrWorkflowRunStatus::Succeeded => {}
@@ -5191,9 +5154,7 @@ fn aggregate_ir_status(
 
 fn mark_ir_status(execution: &mut IrWorkflowExecution, status: IrWorkflowRunStatus) {
     match status {
-        IrWorkflowRunStatus::Failed | IrWorkflowRunStatus::ReplayDiverged => {
-            execution.mark_failed()
-        }
+        IrWorkflowRunStatus::Failed => execution.mark_failed(),
         IrWorkflowRunStatus::Cancelled => execution.mark_cancelled(),
         IrWorkflowRunStatus::BudgetExceeded => execution.mark_budget_exceeded(),
         IrWorkflowRunStatus::Running => {
@@ -5659,7 +5620,6 @@ fn host_task_state(status: IrWorkflowRunStatus) -> &'static str {
         IrWorkflowRunStatus::Failed => "failed",
         IrWorkflowRunStatus::Cancelled => "cancelled",
         IrWorkflowRunStatus::BudgetExceeded => "budget_exceeded",
-        IrWorkflowRunStatus::ReplayDiverged => "replay_diverged",
     }
 }
 
@@ -7079,8 +7039,8 @@ permissions = "read_only"
         let operation = exact_workflow_with(AUDIT_FLEET, None);
         // The member declares `permissions = "read_only"`, and an undeclared
         // role name no longer hands the child a write-capable posture (#5575),
-        // so a declared write scope is now correctly refused at bind time.
-        // Ask for no write scope, which is what this member actually has.
+        // so a declared write scope would be dropped at bind time. Ask for no
+        // write scope, which is what this member actually has.
         let mut request = exact_task_request("auditor");
         let binding =
             bind_exact_fleet_task_request(&operation, exact_session(), &mut request).expect("bind");
@@ -7113,41 +7073,51 @@ permissions = "read_only"
         );
     }
 
-    /// The spawn boundary refuses an unbounded write claim. A task that will
-    /// hit that refusal must be stopped while it is still free — before the
-    /// Router is asked anything — or the operator pays for a routing decision
-    /// about work that could never have started.
+    /// Binding never refuses a task over write scope. A write-capable member
+    /// with no declared scope binds unchanged, and the spawn boundary defaults
+    /// it to the workspace root just as it does for a plain Agent spawn; a
+    /// member that resolves read-only has any declared scope dropped, because
+    /// it could never hold that claim and the script cannot predict every
+    /// member's resolved posture.
     #[test]
-    fn a_predictably_invalid_write_scope_is_rejected_before_the_router_runs() {
+    fn exact_fleet_binding_defers_write_scope_to_the_spawn_boundary() {
         let router = crate::fleet::exact::StaticFleetRouter::new(r#"{"reasoning":"max"}"#);
         let operation = exact_workflow_with(EXACT_GLM_FLEET, Some(router.clone()));
 
-        // Write-capable member, no declared scope: refused at the spawn
-        // boundary, so refused here first.
+        // (a) Write-capable member, no declared scope: binds, scope untouched.
         let mut unbounded = exact_task_request("builder");
-        let err = bind_exact_fleet_task_request(&operation, exact_session(), &mut unbounded)
-            .expect_err("an unbounded write claim never reaches a spawn");
-        let message = format!("{err:?}");
-        assert!(message.contains("write_roots"), "{message}");
+        bind_exact_fleet_task_request(&operation, exact_session(), &mut unbounded)
+            .expect("an unscoped writer binds; the spawn boundary supplies '.'");
+        assert_ne!(unbounded.write_authority.as_deref(), Some("read_only"));
+        assert!(unbounded.write_roots.is_empty());
+        assert!(unbounded.exact_files.is_empty());
+        assert!(unbounded.coordination_contracts.is_empty());
 
-        // Read-only member declaring a write scope is the mirror error.
+        // (b) Read-only member declaring a write scope: the scope is dropped,
+        // not refused, so the spawn contract cannot trip over it later.
         let mut scoped_read_only = exact_task_request("reviewer");
+        scoped_read_only.write_roots = vec!["crates/tui".to_string()];
         scoped_read_only.exact_files = vec!["crates/tui/src/main.rs".to_string()];
-        let err = bind_exact_fleet_task_request(&operation, exact_session(), &mut scoped_read_only)
-            .expect_err("a read-only member may not claim files");
-        assert!(format!("{err:?}").contains("read-only"), "{err:?}");
-
-        // Neither spent a routing request.
+        scoped_read_only.coordination_contracts = vec!["api".to_string()];
+        bind_exact_fleet_task_request(&operation, exact_session(), &mut scoped_read_only)
+            .expect("a read-only member's declared scope is dropped, not refused");
         assert_eq!(
-            router.call_count(),
-            0,
-            "validation that the spawn will fail must precede the router call"
+            scoped_read_only.write_authority.as_deref(),
+            Some("read_only")
         );
+        assert!(scoped_read_only.write_roots.is_empty());
+        assert!(scoped_read_only.exact_files.is_empty());
+        assert!(scoped_read_only.coordination_contracts.is_empty());
 
-        // The same task with a declared scope binds cleanly.
+        // A declared scope on a writer is kept as written.
         let mut bounded = exact_write_task_request("builder");
+        let declared = bounded.write_roots.clone();
         bind_exact_fleet_task_request(&operation, exact_session(), &mut bounded)
             .expect("a bounded write claim is valid");
+        assert_eq!(bounded.write_roots, declared);
+
+        // Binding never contacts the router.
+        assert_eq!(router.call_count(), 0);
     }
 
     /// The parent posture wins over the saved Fleet, in the request the child

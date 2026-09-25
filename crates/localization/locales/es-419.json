@@ -1162,7 +1162,6 @@
   "PendingApprovalInAgent": "Se necesita aprobación en {agent} — /agents",
   "ApprovalTruncationHint": "  … truncado · presiona {details} para ver todos los detalles",
   "ApprovalFullAccessPolicyBlocked": "Bloqueado {tool}: Full Access no puede omitir esta política",
-  "AutoReviewQuestionSkipped": "Auto-Review omitió una pregunta y continuó de forma autónoma",
   "ApprovalChooseHint": "Elegir: ",
   "ApprovalChooseAction": "Enter para seleccionar, o presione y/a/d directamente",
   "ApprovalIntentLabel": "Intención: ",

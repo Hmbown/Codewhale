@@ -1,964 +1,162 @@
 /* ------------------------------------------------------------------ */
-/*  Product home — the Tidal Folio: a sheet read under the sea.        */
-/*                                                                    */
-/*  The hero is one illustrated plate: paper at the top left, the      */
-/*  whale's water rising from the bottom right, and the real terminal  */
-/*  capture floating at the waterline. The reading sections that       */
-/*  follow are plain paper; the page descends for good at the          */
-/*  waterline band, and the footer is the seabed.                      */
+/*  Home — the whale on the horizon                                     */
 /* ------------------------------------------------------------------ */
+/*
+ * The sky holds the promise, the actions and the install plate. The whale
+ * rests on one straight horizon. Everything below is the sea (`.stage`), in
+ * both appearances, and it continues into the footer with no second edge.
+ */
 
-.product-home {
-  background: var(--paper);
-  color: var(--ink);
+.home-hero { position: relative; }
+
+.home-sky {
+  position: relative;
+  padding-block: clamp(2.5rem, 7vw, 5.5rem) 0;
+  /* The sky rises into the logo's blue at the horizon, not away from it. */
+  background: linear-gradient(180deg, transparent 0, transparent 30%, var(--sky-rise) 100%);
 }
 
-.product-container {
+.home-hero-inner {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+  align-items: end;
+  gap: var(--space-6) clamp(2rem, 5vw, 4rem);
   width: var(--container);
   margin-inline: auto;
 }
 
-/* ---------- the hero plate ---------- */
-
-.folio-hero {
-  position: relative;
-  isolation: isolate;
-  overflow: hidden;
-  padding-block: clamp(3rem, 7vh, 5.5rem) 0;
-  /* The plate ends on the deep field so the drawing can run to the edge. */
-  background: var(--paper);
-}
-
-/* The strata: geometry, not a picture. Anchored to the bottom edge so the
-   water always fills the plate's floor whatever the copy height. */
-.folio-strata {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
-}
-
-/* Copy on the paper at the left; the terminal and its running head on the
-   water at the right, so the plate reads as a page with a marginal figure
-   rather than a screenshot with a caption. */
-.folio-hero-grid {
-  position: relative;
-  z-index: 1;
+.home-hero-copy {
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(18rem, 0.85fr);
-  grid-template-rows: auto auto;
-  column-gap: clamp(2rem, 5vw, 5rem);
-  row-gap: clamp(1.25rem, 2.5vw, 2rem);
-  align-items: end;
-  padding-bottom: clamp(3rem, 7vw, 6rem);
+  gap: var(--space-5);
+  padding-bottom: clamp(2rem, 5vw, 3.5rem);
+  min-width: 0;
 }
 
-.folio-hero-copy {
-  position: relative;
-  isolation: isolate;
-  grid-column: 1;
-  grid-row: 1 / 3;
-  align-self: start;
-  max-width: 40rem;
-  padding-bottom: clamp(0.5rem, 2vw, 1.5rem);
-}
-.folio-hero-copy::before { content: ""; position: absolute; inset: -2rem -3rem; z-index: -1; background: var(--paper); filter: blur(24px); pointer-events: none; }
-
-.folio-hero-copy h1 {
-  max-width: 14ch;
-  font-size: clamp(2.75rem, 6.4vw, 5.75rem);
-  line-height: 0.98;
+.home-title {
+  max-width: 16ch;
+  font-size: var(--text-display-lg);
+  line-height: 1.02;
+  letter-spacing: -0.03em;
 }
 
-.folio-lede {
-  max-width: 34rem;
-  margin: 1.6rem 0 0;
-  color: var(--ink-soft);
-  font-size: clamp(1.02rem, 1.5vw, 1.2rem);
+.home-lede {
+  max-width: 38rem;
+  color: var(--muted);
+  font-size: clamp(1.0625rem, 1rem + 0.3vw, 1.1875rem);
   line-height: 1.6;
 }
+.home-lede strong { color: var(--text); font-weight: 600; }
 
-/* The hero install: a segmented choice over the shared copy block. The
-   selected segment takes the neutral selected fill, not the accent: the one
-   primary action on the plate stays the Get Codewhale button. */
-.hero-install {
-  max-width: 34rem;
-  margin-top: 1.6rem;
-}
+.home-hero-copy .hero-install { max-width: 34rem; }
 
-.hero-install-switch {
-  display: inline-flex;
-  gap: 2px;
-  margin-bottom: 0.5rem;
-  padding: 2px;
-  border: 1px solid var(--hairline);
-  border-radius: var(--radius-control);
-  background: var(--paper-card);
-}
-
-.hero-install-switch button {
-  min-height: 2rem;
-  padding: 0.25rem 0.75rem;
-  color: var(--ink-soft);
-  font-size: 0.8125rem;
-  font-weight: 500;
-  border-radius: var(--radius-control);
-  transition: background-color var(--dur-state) var(--ease-spring), color var(--dur-state) var(--ease-spring);
-}
-
-.hero-install-switch button:hover { background: var(--hover); color: var(--ink); }
-.hero-install-switch button[aria-pressed="true"] { background: var(--selected); color: var(--ink); }
-
-/* The hero column is narrow; the command wraps rather than scrolling under
-   the Copy button. Copy still writes the exact one-line command. */
-.hero-install pre.code-block {
-  margin: 0;
-  padding-right: 5rem;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.folio-actions {
+/* The whale rests on the horizon: its lowest point sits on the line. */
+.home-whale {
+  position: relative;
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-  margin-top: 1.9rem;
-}
-
-/* Buttons on paper: brand navy fills the primary; the secondary is an
-   outlined sheet. Sentence case in the body face — this is a title page,
-   not a status bar. */
-.folio-button {
-  display: inline-flex;
-  min-height: 3rem;
-  align-items: center;
   justify-content: center;
-  gap: 0.5rem;
-  padding: 0.7rem 1.35rem;
-  border: 1px solid var(--indigo-deep);
-  border-radius: var(--radius-control);
-  color: var(--indigo-deep);
-  font-family: var(--font-body);
-  font-size: 0.95rem;
-  font-weight: 500;
-  line-height: 1;
-  transition: background-color var(--dur-state) var(--ease-spring), border-color var(--dur-state) var(--ease-spring), color var(--dur-state) var(--ease-spring);
-}
-
-.folio-button:hover {
-  background: var(--hover);
-}
-
-.folio-button-primary {
-  border-color: var(--indigo);
-  background: var(--indigo);
-  color: var(--paper);
-}
-
-.folio-button-primary:hover {
-  background: var(--indigo-deep);
-  border-color: var(--indigo-deep);
-  color: var(--paper);
-}
-
-/* ---------- the terminal at the waterline ---------- */
-
-.folio-shot {
-  grid-column: 2;
-  grid-row: 1;
   align-self: end;
+}
+.home-whale .whale-pose {
+  --pose-size: clamp(12rem, 32vw, 26rem);
+  /* The pose's square has air below the body; drop it onto the line. */
+  margin-bottom: calc(var(--pose-size) * -0.16);
   position: relative;
-  width: min(100%, 40rem);
-  margin-top: clamp(4rem, 12vw, 11rem);
-  margin: 0;
-  border: 1px solid rgb(var(--c-stage-soft) / 0.2);
-  border-radius: var(--radius-surface);
+  z-index: 2;
+}
+
+/* ---------- the sea ---------- */
+.home-sea {
+  position: relative;
   overflow: hidden;
-  background: var(--gpui-stage-deep);
-  /* The one shadow on the site: the plate is lifted off the water, so the
-     shadow is soft and offset downward the way light through water would
-     cast it. */
-  box-shadow: 0 30px 60px -24px rgb(var(--c-stage-deep) / 0.75);
+  background: var(--home-sea);
+  background-size: 100% 70rem, auto;
+  background-repeat: no-repeat;
 }
 
-.folio-shot img {
-  display: block;
-  width: 100%;
-  height: auto;
-  background: var(--gpui-stage-deep);
+/* The resting whale breathes: a slow rise of a few pixels, and its
+   reflection answers. Still under reduced motion. */
+@keyframes whale-breathe { from { translate: 0 0; } to { translate: 0 -4px; } }
+@keyframes whale-breathe-reflect { from { translate: 0 0; } to { translate: 0 4px; } }
+@media (prefers-reduced-motion: no-preference) {
+  .home-whale .whale-pose { animation: whale-breathe 4.5s ease-in-out infinite alternate; }
+  .home-reflection .whale-pose { animation: whale-breathe-reflect 4.5s ease-in-out infinite alternate; }
 }
 
-.folio-shot figcaption {
-  display: grid;
-  gap: 0.35rem;
-  padding: 0.7rem 0.95rem 0.8rem;
-  border-top: 1px solid rgb(var(--c-stage-soft) / 0.14);
-  background: var(--gpui-stage);
-  color: var(--stage-soft);
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
-  line-height: 1.5;
-}
-
-/* The status line under the capture is the TUI header, typeset as facts:
-   a `cw` chip and a dot chain. Spacing comes from `.dotline`; the
-   separators are CSS punctuation. */
-.folio-shot .paper-facts {
-  color: var(--stage-muted);
-}
-
-.folio-shot .paper-facts .dotline-chip {
-  padding: 0.08rem 0.36rem;
-  border-radius: var(--radius-control);
-  background: var(--gpui-stage-muted);
-  color: var(--stage-text);
-  font-weight: 600;
-}
-
-.folio-shot .paper-facts > *:not(:last-child)::after {
-  color: var(--stage-hint);
-}
-
-/* The chapter marker on the water: the plate's running head. */
-.folio-chapter {
-  grid-column: 2;
-  grid-row: 2;
-  align-self: start;
-  justify-self: start;
-  width: min(100%, 22rem);
-  color: var(--stage-text);
-}
-
-.folio-chapter-num {
-  display: block;
-  padding-bottom: 0.7rem;
-  border-bottom: 1px solid rgb(var(--c-stage-soft) / 0.3);
-  color: var(--action-on-dark);
-  font-family: var(--font-body);
-  font-size: 0.75rem;
-}
-
-.folio-chapter-title {
-  margin: 0.9rem 0 0;
-  font-family: var(--font-display);
-  font-size: clamp(1.35rem, 1.9vw, 1.7rem);
-  line-height: 1.25;
-}
-
-/* ---------- reading sections on paper ---------- */
-
-.folio-section {
-  padding-block: clamp(3.5rem, 7vw, 6rem);
-  border-bottom: 1px solid var(--hairline);
-}
-
-.folio-section h2 {
-  max-width: 24ch;
-}
-
-.folio-section-lede {
-  max-width: 40rem;
-  margin: 1.1rem 0 0;
-  color: var(--ink-soft);
-  font-size: 1.05rem;
-  line-height: 1.65;
-}
-
-/* What you gain: three ruled columns, no cards, no icons. */
-.folio-gain-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  margin-top: clamp(2rem, 4vw, 3rem);
-  border-top: 1px solid var(--hairline);
-}
-
-.folio-gain-grid > div {
-  padding: 1.5rem 1.75rem 1.75rem 0;
-}
-
-.folio-gain-grid > div + div {
-  padding-left: 1.75rem;
-  border-left: 1px solid var(--hairline);
-}
-
-.folio-gain-grid h3 {
-  font-family: var(--font-display);
-  font-size: 1.45rem;
-  font-weight: 600;
-  letter-spacing: -0.015em;
-  line-height: 1.2;
-}
-
-.folio-gain-grid p {
-  margin-top: 0.75rem;
-  color: var(--ink-soft);
-  font-size: 0.95rem;
-  line-height: 1.65;
-}
-
-/* A two-column chapter: the argument on the left, the facts on the right. */
-.folio-chapter-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(16rem, 0.8fr);
-  gap: clamp(2rem, 6vw, 6rem);
-  align-items: start;
-}
-
-.folio-running-head {
-  display: block;
-  margin-bottom: 1.1rem;
-  color: var(--indigo);
-  font-family: var(--font-body);
-  font-size: 0.75rem;
-}
-
-.folio-fact-list {
-  border-top: 1px solid var(--hairline);
-}
-
-.folio-fact-list > div {
-  display: grid;
-  grid-template-columns: minmax(8rem, 0.5fr) minmax(0, 1fr);
-  gap: 1rem;
-  padding: 0.95rem 0;
-  border-bottom: 1px solid var(--hairline);
-}
-
-.folio-fact-list dt {
-  color: var(--ink);
-  font-family: var(--font-mono);
-  font-size: 0.8rem;
-  font-weight: 500;
-}
-
-.folio-fact-list dd {
-  color: var(--ink-soft);
-  font-size: 0.92rem;
-  line-height: 1.55;
-}
-
-.folio-link {
-  display: inline-block;
-  margin-top: 1.4rem;
-  color: var(--indigo);
-  font-size: 0.95rem;
-  font-weight: 500;
-  text-decoration: underline;
-  text-decoration-color: rgb(var(--c-indigo) / 0.35);
-  text-underline-offset: 0.25em;
-  transition: text-decoration-color var(--dur-state) var(--ease-spring);
-}
-
-.folio-link:hover {
-  text-decoration-color: currentColor;
-}
-
-/* ---------- the waterline band ---------- */
-
-.folio-waterline {
-  position: relative;
-  height: clamp(11rem, 24vw, 20rem);
-  overflow: hidden;
-  background: var(--paper);
-}
-
-.folio-waterline > svg {
+/* The whale's reflection: the same pose, flipped and fading into the water. */
+.home-reflection {
   position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-}
-
-
-/* ---------- product: start-here band + shared getting-started steps ---------- */
-
-.product-start {
-  padding-block: clamp(3.5rem, 7vw, 6rem);
-  border-bottom: 1px solid var(--hairline);
-}
-
-.product-start h2 {
-  max-width: 24ch;
-}
-
-.product-start-lede {
-  margin-top: 1.1rem;
-  max-width: 40rem;
-  color: var(--ink-soft);
-  font-size: 1.05rem;
-  line-height: 1.65;
-}
-
-.product-start-links {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 1.5rem;
-  margin-top: 2rem;
-}
-
-.product-start-links a {
-  color: var(--indigo);
-  font-size: 0.95rem;
-  font-weight: 500;
-}
-
-.product-start-links a:hover {
-  color: var(--indigo-deep);
-}
-
-/* Shared step list rendered by <GettingStartedSteps> (homepage band and the
-   /docs/guide page). Light tokens; the docs dark theme re-themes it through
-   the same --hairline/--ink-* vars as the rest of the docs subtree. */
-.gs-steps {
+  top: 0;
+  inset-inline: 0;
+  width: var(--container);
+  margin-inline: auto;
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  margin-top: clamp(2rem, 4vw, 3rem);
-  padding: 0;
-  border-top: 1px solid var(--hairline);
-  list-style: none;
-}
-
-.gs-steps li {
-  padding: 1.35rem 1.5rem 1.5rem 0;
-  border-bottom: 1px solid var(--hairline);
-}
-
-.gs-steps li + li {
-  padding-left: 1.5rem;
-  border-left: 1px solid var(--hairline);
-}
-.docs-content .gs-steps { grid-template-columns: minmax(0, 1fr); }
-.docs-content .gs-steps li + li { padding-left: 0; border-left: 0; }
-
-.gs-step-index {
-  color: var(--indigo);
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
-}
-
-.gs-steps h3 {
-  margin-top: 1.1rem;
-  font-size: 1.05rem;
-}
-
-.gs-steps p {
-  margin-top: 0.6rem;
-  color: var(--ink-soft);
-  font-size: 0.86rem;
-  line-height: 1.7;
-}
-
-.gs-step-commands {
-  margin-top: 0.9rem;
-  font-size: 0.75rem;
-}
-
-pre.gs-step-commands {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.gs-step-link {
-  display: inline-block;
-  margin-top: 0.9rem;
-  color: var(--indigo);
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
-}
-
-.gs-step-link:hover {
-  color: var(--indigo-deep);
-}
-
-/* ---------- a11y: skip link ---------- */
-
-.skip-link {
-  position: absolute;
-  left: 1rem;
-  top: -3.5rem;
-  z-index: 60;
-  padding: 0.55rem 0.9rem;
-  background: var(--ink);
-  color: var(--paper);
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
-}
-
-.skip-link:focus-visible {
-  top: 0.5rem;
-}
-
-/* ---------- honest status badges ---------- */
-
-.status-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  padding: 0.2rem 0.55rem;
-  border: 1px solid var(--hairline);
-  font-family: var(--font-body);
-  font-size: 0.75rem;
-  color: var(--ink-soft);
-}
-
-.status-badge-dot {
-  width: 0.45rem;
-  height: 0.45rem;
-  border-radius: var(--radius-pill);
-}
-
-.status-badge-experimental .status-badge-dot { background: var(--ochre); }
-.status-badge-preview .status-badge-dot { background: var(--indigo); }
-.status-badge-pending .status-badge-dot { background: var(--ochre); }
-.status-badge-unavailable .status-badge-dot { background: var(--ink-mute); }
-
-/* ---------- session media (real-session surface) ---------- */
-
-.session-media {
-  border: 1px solid var(--hairline);
-}
-
-.session-media video {
-  display: block;
-  width: 100%;
-  height: auto;
-  background: var(--ocean-deep);
-}
-
-.session-media-stage {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 0.9rem;
-  padding: clamp(1.5rem, 4vw, 2.5rem);
-  border-bottom: 1px solid var(--hairline);
-  background: var(--paper-deep);
-}
-
-.session-media-pending-note {
-  max-width: 44rem;
-  margin: 0;
-  color: var(--ink-soft);
-  font-size: 0.88rem;
-  line-height: 1.7;
-}
-
-.session-media-caption {
-  display: grid;
-  gap: 0.5rem;
-  padding: 1rem 1.25rem;
-  color: var(--ink-soft);
-  font-size: 0.84rem;
-  line-height: 1.6;
-}
-
-.session-media-caption strong {
-  color: var(--ink);
-  font-size: 0.95rem;
-}
-
-.session-media-caption a {
-  color: var(--indigo);
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
-}
-
-.session-media-caption a:hover {
-  color: var(--indigo-deep);
-}
-
-/* The boundaries band carries no field of its own — the water is the page. */
-.product-boundaries {
-  padding-block: clamp(4rem, 8vw, 7rem);
-}
-
-.product-boundaries-grid {
-  display: grid;
-  grid-template-columns: minmax(16rem, 0.8fr) minmax(0, 1.2fr);
-  gap: clamp(3rem, 8vw, 8rem);
-}
-
-.product-boundaries h2 {
-  font-size: clamp(2.5rem, 5vw, 4.7rem);
-}
-
-.product-boundaries h2 span {
-  color: var(--indigo);
-}
-
-.product-boundaries-grid > div > p {
-  max-width: 31rem;
-  margin-top: 1.25rem;
-  color: var(--ink-soft);
-  line-height: 1.75;
-}
-
-.product-boundary-list {
-  display: grid;
-  gap: 0.75rem;
-}
-
-.product-boundary-list > div {
-  display: grid;
-  grid-template-columns: minmax(12rem, 0.85fr) minmax(0, 1.15fr);
-  align-items: baseline;
-  gap: 1.5rem;
-  padding: 1.25rem 1.4rem;
-  border: 1px solid var(--stage-line);
-  border-radius: var(--radius-control);
-  background: var(--paper-card);
-}
-
-.product-boundary-list dt {
-  font-weight: 700;
-}
-
-.product-boundary-list dd {
-  color: var(--ink-soft);
-  font-size: 0.88rem;
-}
-
-/* ---------- below the waterline ---------- */
-/*                                                                            */
-/*  The water column. Its tokens are the dark whale palette (see the shared    */
-/*  rule beside :root), so every component inside reads correctly without     */
-/*  knowing it is under water. The field starts at the panel surface just     */
-/*  under the waterline band and sinks to the deep stop the footer continues, */
-/*  so the seabed arrives without a seam.                                     */
-/* -------------------------------------------------------------------------- */
-.ocean-column {
-  position: relative;
-  isolation: isolate;
-  background: linear-gradient(180deg, var(--gpui-stage) 0%, var(--gpui-stage-deep) 38rem);
-  color: var(--ink);
-}
-
-/* Bands inside the column carry no field of their own. */
-.ocean-column > section {
-  position: relative;
-  background: transparent;
-}
-
-/* One line weight on the field. */
-.ocean-column .hairline,
-.ocean-column .hairline-t,
-.ocean-column .hairline-b,
-.ocean-column .hairline-l {
-  border-color: var(--stage-line);
-}
-
-.ocean-column h2 {
-  max-width: 24ch;
-  color: var(--stage-text);
-}
-
-/* Where Codewhale runs today: one honest table, no badges. */
-.folio-availability {
-  padding-block: clamp(3.5rem, 7vw, 6rem);
-  border-bottom: 1px solid var(--stage-line);
-}
-
-.folio-availability-list {
-  margin-top: clamp(2rem, 4vw, 3rem);
-  border-top: 1px solid var(--stage-line);
-}
-
-.folio-availability-list > div {
-  display: grid;
-  grid-template-columns: minmax(9rem, 0.35fr) minmax(0, 1fr);
-  gap: 1.25rem;
-  padding: 1.15rem 0;
-  border-bottom: 1px solid var(--stage-line);
-}
-
-.folio-availability-list dt {
-  color: var(--stage-text);
-  font-family: var(--font-display);
-  font-size: 1.3rem;
-  font-weight: 600;
-  line-height: 1.2;
-}
-
-.folio-availability-list dd {
-  color: var(--stage-soft);
-  font-size: 0.95rem;
-  line-height: 1.6;
-}
-
-.folio-availability-list dd strong {
-  display: block;
-  margin-bottom: 0.2rem;
-  color: var(--stage-text);
-  font-weight: 600;
-}
-
-.folio-availability-note {
-  max-width: 40rem;
-  margin-top: 1.4rem;
-  color: var(--stage-muted);
-  font-size: 0.88rem;
-  line-height: 1.6;
-}
-
-.product-surfaces {
-  padding-block: clamp(3.5rem, 7vw, 6rem);
-  border-bottom: 1px solid var(--stage-line);
-}
-
-.product-surface-list {
-  margin-top: 2.5rem;
-  border-top: 1px solid var(--stage-line);
-}
-
-.product-surface-list > div {
-  display: grid;
-  grid-template-columns: minmax(13rem, 0.7fr) minmax(0, 1.3fr);
-  gap: 2rem;
-  padding: 1.2rem 0;
-  border-bottom: 1px solid var(--stage-line);
-}
-
-.product-surface-list strong {
-  color: var(--stage-text);
-  font-family: var(--font-mono);
-  font-size: 1rem;
-}
-
-.product-surface-list span {
-  color: var(--stage-soft);
-}
-
-.product-surfaces > .product-container > a {
-  display: inline-block;
-  margin-top: 1.5rem;
-  color: var(--action-on-dark);
-  font-size: 0.95rem;
-}
-
-/* The install band is the TUI composer: a raised plate on the column,
-   bracketed above by Signal Gold and below by Operate violet — the
-   product's exact composer framing, and the one place gold is legitimate
-   here, because what it brackets is the point of human intent. The
-   descendant selector out-ranks `.ocean-column > section { transparent }`. */
-.ocean-column .product-install-band {
-  padding-block: clamp(3rem, 6vw, 5rem);
-  border-top: 1px solid color-mix(in srgb, var(--signal-gold) 40%, transparent);
-  border-bottom: 1px solid color-mix(in srgb, var(--violet) 40%, transparent);
-  background: var(--stage-composer);
-  color: var(--stage-text);
-}
-
-.product-install-grid {
-  display: grid;
-  grid-template-columns: minmax(15rem, 0.65fr) minmax(0, 1.35fr);
-  gap: clamp(2rem, 7vw, 7rem);
-  align-items: start;
-}
-
-/* `❯` sits inside the plate, where the TUI puts it — a code-owned literal in
-   the same class as `Codewhale` and `npm install -g codewhale`. */
-.product-composer {
-  position: relative;
-}
-
-.product-composer pre.code-block {
-  padding-left: 2.6rem;
-}
-
-.product-composer button {
-  color: var(--ink);
-}
-
-.product-composer-prompt {
-  position: absolute;
-  top: 1rem;
-  left: 1.1rem;
-  z-index: 1;
-  color: var(--cyan);
-  font-family: var(--font-mono);
-  font-size: var(--text-mono);
-  line-height: 1.55;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+  gap: clamp(2rem, 5vw, 4rem);
   pointer-events: none;
 }
-
-@media (max-width: 640px) {
-  .product-composer pre.code-block {
-    padding-left: 2.3rem;
-  }
-
-  .product-composer-prompt {
-    top: 0.85rem;
-    left: 0.95rem;
-    font-size: 0.76rem;
-  }
+.home-reflection .whale-pose {
+  --pose-size: clamp(12rem, 32vw, 26rem);
+  grid-column: 2;
+  justify-self: center;
+  margin-top: calc(var(--pose-size) * -0.16);
+  transform: scaleY(-1);
+  opacity: 0.2;
+  -webkit-mask-image: linear-gradient(0deg, #000, transparent 70%);
+  mask-image: linear-gradient(0deg, #000, transparent 70%);
 }
 
-.product-install-band pre.code-block {
-  margin: 0;
-  border-color: var(--stage-line);
+.home-sea-body {
+  position: relative;
+  width: var(--container);
+  margin-inline: auto;
+  padding-block: clamp(5rem, 10vw, 8rem) var(--section-gap);
 }
 
-.product-install-band .dotline {
-  margin-top: 1rem;
-  color: var(--stage-hint);
-}
+.home-section + .home-section { padding-top: var(--section-gap); }
 
-.product-install-band a {
-  display: inline-block;
-  margin-top: 1.2rem;
-  padding-bottom: 0.2rem;
-  border-bottom: 1px solid var(--stage-line);
-  color: var(--action-on-dark);
-  font-size: 0.95rem;
-  transition: border-color var(--dur-state) var(--ease-spring);
-}
-
-.product-install-band a:hover {
-  border-color: var(--action-on-dark);
-}
-
-.product-community {
-  padding-block: clamp(3.5rem, 7vw, 6rem);
-}
-
-.product-community-grid {
+/* The real terminal, floating just under the surface. */
+.home-shot {
   display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(16rem, 0.75fr);
-  gap: clamp(2rem, 5vw, 5rem);
-  align-items: end;
+  gap: var(--space-3);
+  width: min(100%, 60rem);
+  margin-inline: auto;
+}
+.home-shot .figure-frame {
+  box-shadow: 0 24px 60px -24px rgb(0 0 0 / 0.6), 0 0 0 1px var(--line);
+  border: 0;
+}
+.home-shot figcaption {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
 }
 
-.product-community p {
-  max-width: 42rem;
-  margin-top: 1rem;
-  color: var(--stage-soft);
-  font-size: 1rem;
-  line-height: 1.75;
-}
+.home-modes { font-family: var(--font-body); }
 
-.product-community nav {
+.home-install {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1rem;
-  padding-top: 1.25rem;
-  border-top: 1px solid var(--stage-line);
+  gap: var(--space-5);
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  padding: clamp(1.5rem, 4vw, 2.5rem);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sheet);
+  background: color-mix(in srgb, var(--panel) 60%, transparent);
 }
-
-.product-community nav a {
-  color: var(--ocean-current);
-  font-size: 0.95rem;
-  font-weight: 500;
+@media (min-width: 900px) {
+  .home-install { grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr); }
 }
+.home-install-channels { color: var(--muted); font-size: var(--text-ui); line-height: 1.6; }
 
-.product-community nav a:hover {
-  color: var(--stage-text);
-}
+.product-start-links { display: flex; flex-wrap: wrap; gap: var(--space-3) var(--space-5); margin-top: var(--space-5); }
 
-@media (max-width: 1050px) {
-  .folio-hero-grid {
-    grid-template-columns: 1fr;
-    grid-template-rows: auto auto auto;
-  }
-
-  .folio-hero-copy {
-    max-width: 44rem;
-  }
-
-  .folio-hero-copy {
-    grid-row: 1;
-  }
-
-  .folio-shot {
-    grid-column: 1;
-    grid-row: 2;
-    width: min(100%, 44rem);
-    margin-top: clamp(1.5rem, 6vw, 3rem);
-  }
-
-  .folio-chapter {
-    grid-column: 1;
-    grid-row: 3;
-    justify-self: start;
-  }
-}
-
-@media (max-width: 760px) {
-  .folio-gain-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .folio-gain-grid > div,
-  .folio-gain-grid > div + div {
-    padding: 1.35rem 0;
-    border-left: 0;
-    border-bottom: 1px solid var(--hairline);
-  }
-
-  .folio-chapter-grid,
-  .product-install-grid,
-  .product-community-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .gs-steps {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .gs-steps li:nth-child(3) {
-    padding-left: 0;
-    border-left: 0;
-  }
-
-  .folio-availability-list > div,
-  .product-surface-list > div {
-    grid-template-columns: 1fr;
-    gap: 0.45rem;
-  }
-}
-
-@media (max-width: 520px) {
-  .site-nav-inner {
-    gap: 0.5rem;
-  }
-
-  .site-nav-actions {
-    min-width: 0;
-  }
-
-  .paper-wordmark {
-    max-width: 9.75rem;
-  }
-
-  .folio-hero-copy h1 {
-    max-width: 100%;
-    font-size: clamp(2.3rem, 11vw, 3.2rem);
-    word-break: normal;
-    overflow-wrap: break-word;
-  }
-
-  .folio-actions {
-    display: grid;
-    grid-template-columns: 1fr;
-  }
-
-  .folio-button {
-    width: 100%;
-  }
-
-  .gs-steps {
-    grid-template-columns: 1fr;
-  }
-
-  .gs-steps li,
-  .gs-steps li + li,
-  .gs-steps li:nth-child(3) {
-    padding: 1.25rem 0;
-    border-left: 0;
-  }
-
-  .product-community nav {
-    grid-template-columns: 1fr;
-  }
+@media (max-width: 900px) {
+  .home-hero-inner,
+  .home-reflection { grid-template-columns: minmax(0, 1fr); }
+  .home-whale { justify-content: flex-end; }
+  .home-whale .whale-pose,
+  .home-reflection .whale-pose { --pose-size: clamp(8rem, 36vw, 12rem); }
+  .home-reflection .whale-pose { grid-column: 1; justify-self: end; }
+  .home-hero-copy { padding-bottom: 0; }
 }

@@ -98,8 +98,8 @@ export const PRODUCT_COPY = {
       surface: { en: "Hosted web app", zh: "托管网页应用" },
       status: { en: "Development preview", zh: "开发预览" },
       detail: {
-        en: "Sign in with a Codewhale account and pair a computer in the development preview. Hosted task execution is still being qualified.",
-        zh: "开发预览版支持使用 Codewhale 账户登录并配对计算机。托管任务执行仍在验证中。",
+        en: "Sign in with a Codewhale account, then type /rc in a running terminal session to continue it from the web app. Hosted task execution is still being qualified.",
+        zh: "使用 Codewhale 账户登录后，在正在运行的终端会话中输入 /rc，即可在网页应用中继续。托管任务执行仍在验证中。",
       },
       href: "/signin",
       linkLabel: { en: "Sign in", zh: "登录" },

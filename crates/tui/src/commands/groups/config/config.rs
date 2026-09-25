@@ -2967,10 +2967,7 @@ pub fn mode(app: &mut App, arg: Option<&str>) -> CommandResult {
     // The legacy YOLO spellings are a one-way permission shorthand, not a
     // mode: route them to the full-access compat path before parse folds
     // them to Act.
-    if matches!(
-        arg.trim().to_ascii_lowercase().as_str(),
-        "yolo" | "4" | "bypass" | "bypass-permissions" | "bypasspermissions"
-    ) {
+    if AppMode::is_legacy_bypass_alias(arg) {
         let (message, changed) = switch_yolo_compat_with_status(app);
         if changed {
             CommandResult::with_message_and_action(message, AppAction::ModeChanged(app.mode))

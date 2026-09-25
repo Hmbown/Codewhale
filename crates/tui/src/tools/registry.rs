@@ -143,9 +143,8 @@ impl ToolRegistry {
             && let Some(router) = ctx.large_output_router.as_ref()
         {
             use crate::tools::large_output_router::EvidenceRouting;
-            let raw_bypass = input.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
             let (estimated_routing, estimated_tokens, threshold) =
-                router.evidence_routing(name, result, raw_bypass);
+                router.evidence_routing(name, result);
             let metadata = result.metadata.get_or_insert_with(|| serde_json::json!({}));
             if let Some(object) = metadata.as_object_mut() {
                 // A tool that self-bounds its output behind its own

@@ -1,4 +1,6 @@
 import Link from "next/link";
+import { Icon } from "@/components/icon";
+import { PageHeader, Section } from "@/components/page-header";
 import { buildPageMetadata } from "@/lib/page-meta";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
@@ -142,103 +144,93 @@ export default async function ContributePage({ params }: { params: Promise<{ loc
       ];
 
   return (
-    <div className="contribute-page">
-      <section className="hero">
-        <div className="portal-current" aria-hidden="true" />
-        <div className="portal-container community-welcome-inner">
-          <div className="eyebrow">{isZh ? "参与国际开源社区" : "Contribute to an international open-source project"}</div>
-          <h1>{isZh ? "从一个具体的改进开始。" : "Start with one concrete improvement."}</h1>
-          <p>
-            {isZh
-              ? "Codewhale 欢迎来自不同国家、语言、平台和经验水平的贡献者。清楚的 bug 报告、复现结果、文档修正、翻译和小而完整的代码补丁都会直接帮助项目。"
-              : "Codewhale welcomes contributors across countries, languages, platforms, and experience levels. Clear bug reports, reproduction results, documentation corrections, translations, and small complete patches all move the project forward."}
-          </p>
-          <div className="portal-actions">
-            <Link href="https://github.com/Hmbown/CodeWhale/issues/new/choose" className="portal-button portal-button-primary">
+    <>
+      <PageHeader
+        kicker={isZh ? "参与国际开源社区" : "Contribute to an international open-source project"}
+        title={isZh ? "从一个具体的改进开始。" : "Start with one concrete improvement."}
+        lede={
+          isZh
+            ? "Codewhale 欢迎来自不同国家、语言、平台和经验水平的贡献者。清楚的 bug 报告、复现结果、文档修正、翻译和小而完整的代码补丁都会直接帮助项目。"
+            : "Codewhale welcomes contributors across countries, languages, platforms, and experience levels. Clear bug reports, reproduction results, documentation corrections, translations, and small complete patches all move the project forward."
+        }
+        pose="write"
+        actions={
+          <>
+            <Link href="https://github.com/Hmbown/CodeWhale/issues/new/choose" className="btn btn-primary btn-lg">
               {isZh ? "提交 issue" : "File an issue"}
             </Link>
-            <Link href="https://github.com/Hmbown/CodeWhale/pulls" className="portal-button portal-button-secondary">
+            <Link href="https://github.com/Hmbown/CodeWhale/pulls" className="btn btn-secondary btn-lg">
               {isZh ? "查看 pull requests" : "Browse pull requests"}
             </Link>
-            <Link href="https://github.com/Hmbown/CodeWhale/blob/main/CONTRIBUTING.md" className="portal-button portal-button-secondary">
+            <Link href="https://github.com/Hmbown/CodeWhale/blob/main/CONTRIBUTING.md" className="btn btn-ghost btn-lg">
               {isZh ? "打开完整贡献指南" : "Open the full contributor guide"}
+              <Icon name="external" className="icon" />
             </Link>
-          </div>
-        </div>
-      </section>
+          </>
+        }
+      />
 
-      <section className="portal-section">
-        <div className="portal-container">
-          <div className="portal-docs-heading">
-            <div>
-              <span>{isZh ? "现在就可以参与" : "Ways to help now"}</span>
-              <h2>{isZh ? "选择适合你的贡献方式。" : "Choose the contribution that fits."}</h2>
-            </div>
-          </div>
-          <div className="contribute-path-grid">
+      <div className="page-body">
+        <Section id="contribute-paths" title={isZh ? "选择适合你的贡献方式。" : "Choose the contribution that fits."}>
+          <div className="grid-2">
             {paths.map((path) => (
-              <article key={path.title}>
+              <Link key={path.title} href={path.href} className="tile">
                 <h3>{path.title}</h3>
                 <p>{path.body}</p>
-                <Link href={path.href}>{path.label} →</Link>
-              </article>
+                <span className="section-link">
+                  {path.label}
+                  <Icon name="arrow-right" className="icon icon-flip" />
+                </span>
+              </Link>
             ))}
           </div>
-        </div>
-      </section>
+        </Section>
 
-      <section className="portal-section portal-section-muted">
-        <div className="portal-container">
-          <div className="portal-docs-heading">
-            <div>
-              <span>{isZh ? "Pull request 流程" : "Pull request workflow"}</span>
-              <h2>{isZh ? "从问题到可审查的补丁。" : "From a problem to a reviewable patch."}</h2>
-            </div>
-          </div>
-          <ol className="contribute-steps">
-            {steps.map((step) => (
+        <Section id="contribute-workflow" title={isZh ? "从问题到可审查的补丁。" : "From a problem to a reviewable patch."}>
+          <ol className="steps">
+            {steps.map((step, index) => (
               <li key={step.n}>
-                <span>{step.n}</span>
-                <div>
-                  <h3>{step.title}</h3>
-                  <p>{step.body}</p>
-                  <Link href={step.cta.href}>{step.cta.label} →</Link>
-                </div>
+                <span className="gs-step-index" aria-hidden="true">{index + 1}</span>
+                <h3>{step.title}</h3>
+                <p>{step.body}</p>
+                <Link href={step.cta.href} className="section-link">
+                  {step.cta.label}
+                  <Icon name="arrow-right" className="icon icon-flip" />
+                </Link>
               </li>
             ))}
           </ol>
-        </div>
-      </section>
+        </Section>
 
-      <section className="portal-section">
-        <div className="portal-container portal-section-grid">
-          <div className="portal-section-copy">
-            <span>{isZh ? "审查准备" : "Prepare for review"}</span>
-            <h2>{isZh ? "让修改容易验证。" : "Make the change easy to verify."}</h2>
-            <p>
-              {isZh
-                ? "审查者需要看到问题、修改理由、测试证据和剩余风险。范围越清楚，反馈通常越快。"
-                : "A reviewer needs the problem, the reason for the change, test evidence, and remaining risk. Clear scope usually leads to clearer feedback."}
-            </p>
-          </div>
-          <ul className="contribute-review-list">
-            {reviewNotes.map((note) => <li key={note}>{note}</li>)}
+        <Section
+          id="contribute-review"
+          title={isZh ? "让修改容易验证。" : "Make the change easy to verify."}
+          scope={
+            isZh
+              ? "审查者需要看到问题、修改理由、测试证据和剩余风险。范围越清楚，反馈通常越快。"
+              : "A reviewer needs the problem, the reason for the change, test evidence, and remaining risk. Clear scope usually leads to clearer feedback."
+          }
+        >
+          <ul className="group-card" role="list">
+            {reviewNotes.map((note) => (
+              <li key={note} className="group-row check-row">
+                <Icon name="check" className="icon" />
+                <span>{note}</span>
+              </li>
+            ))}
           </ul>
-        </div>
-      </section>
+        </Section>
 
-      <section className="contribute-dev-loop">
-        <div className="portal-container portal-section-grid min-w-0">
-          <div className="portal-section-copy">
-            <span>{isZh ? "本地开发" : "Local development"}</span>
-            <h2>{isZh ? "构建并运行相关检查。" : "Build and run the relevant checks."}</h2>
-            <p>
-              {isZh
-                ? "仓库使用 stable Rust。先运行你所修改部分的测试，再运行格式检查、Clippy 和完整工作区测试。"
-                : "The repository uses stable Rust. Run the focused test for your change first, followed by formatting, Clippy, and the workspace suite."}
-            </p>
-          </div>
-          <pre className="code-block">
+        <Section
+          id="contribute-dev"
+          title={isZh ? "构建并运行相关检查。" : "Build and run the relevant checks."}
+          scope={
+            isZh
+              ? "仓库使用 stable Rust。先运行你所修改部分的测试，再运行格式检查、Clippy 和完整工作区测试。"
+              : "The repository uses stable Rust. Run the focused test for your change first, followed by formatting, Clippy, and the workspace suite."
+          }
+        >
+          <pre tabIndex={0} className="code-block">
 {`git clone https://github.com/YOUR_USERNAME/CodeWhale.git
 cd CodeWhale
 git checkout -b fix/your-change
@@ -249,8 +241,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked`}
           </pre>
-        </div>
-      </section>
-    </div>
+        </Section>
+      </div>
+    </>
   );
 }

@@ -1,37 +1,154 @@
 import type { DocsHooksDict } from "../types";
 
-/** Simplified Chinese dictionary for `app/[locale]/docs/hooks/page.tsx`. */
+/** 「在事件发生时运行命令」页的简体中文词典；与 `en/docs-hooks.ts` 逐段对应。 */
 export const docsHooks: DocsHooksDict = {
-  metaTitle: "钩子 · Codewhale 文档",
+  metaTitle: "在事件发生时运行命令 · Codewhale 文档",
   metaDescription:
-    "已发布的生命周期钩子：可变 message_submit、tool_call_before 决策、turn_end 与子 Agent 观察事件。",
+    "在会话开始、工具调用之前、回合结束或 Codewhale 等你回应时运行你自己的脚本——用来补充上下文、执行规则或接收通知。",
   bodyClassName: "text-ink-soft leading-[1.9] tracking-wide",
-  overviewTitle: "钩子",
-  overviewLead:
-    "钩子让你把自己的命令挂进 Codewhale 的生命周期：在消息提交前注入上下文、在工具调用前执行策略、在回合结束或子 Agent 启停时做审计。本页描述当前已发布的行为；docs/rfcs/1364-hooks-lifecycle.md 是这组能力的设计 RFC，完整配置 schema 见 docs/CONFIGURATION.md。",
-  configIntro:
-    "钩子配置在 config.toml 的 {hooksTable} 条目下；TUI 里运行 {hooksCommand} 可以按事件分组查看每个钩子的名称、命令预览、超时和条件，以及 {enabledKey} 的全局开关状态。",
-  events: [
-    [
-      "message_submit（可变）",
-      "在用户消息进入历史或发给模型之前运行。钩子从 stdin 收到 JSON；exit 0 且 stdout 打印含非空 text 字段的 JSON 时替换提交文本；exit 2 在回合开始前阻止提交。多个钩子按配置顺序串行执行，每个钩子收到上一个钩子的输出文本。标记 background = true 的钩子只能观察，不能改写或阻止。",
-    ],
-    [
-      "tool_call_before（决策）",
-      "在每次工具调用执行前运行。除 exit 2 硬拒绝（始终生效）外，前台钩子可在 exit 0 时用 stdout JSON 给出决策：allow / deny / ask，并可附带 updatedInput 改写工具输入、additionalContext 追加进给模型的工具结果。多个钩子命中时优先级为 deny > ask > allow；tool_name 条件支持 * 通配（如 mcp__* 匹配所有 MCP 工具）。Full Access 不打开工具审批提示，因此 ask 不会降低该姿态。",
-    ],
-    [
-      "turn_end（观察）",
-      "在每个模型回合结束后触发，此时用量、成本、通知、收据和队列恢复状态都已更新。stdin 收到包含 status、duration_ms、usage、totals、queued_message_count 等字段的 JSON。stdout 被忽略，失败只记警告——不能阻止输入、改写 transcript 或改变下一个排队消息。",
-    ],
-    [
-      "subagent_spawn / subagent_complete（观察）",
-      "观察子 Agent 的启动与完成，stdin 收到有界的 JSON 元数据（agent_id、状态、截断后的 prompt/result 预览）。失败只记警告，不阻塞调度、不改 prompt 或结果；需要完整细节时使用 agent 返回的 transcript 句柄。",
-    ],
+  title: "在事件发生时运行命令",
+  lede:
+    "钩子会在 Codewhale 会话的特定时刻运行你指定的命令。可以用它拦下危险的命令、给消息补充上下文、记录发生了什么，或者在 Codewhale 等你回应时提醒你。",
+  sections: [
+    {
+      id: "first-hook",
+      title: "添加第一个钩子",
+      blocks: [
+        { p: "钩子写在 `~/.codewhale/config.toml` 中。下面这个钩子会在每次会话开始时打印一行文字：" },
+        {
+          code: `[hooks]
+enabled = true
+
+[[hooks.hooks]]
+name = "announce"
+event = "session_start"
+command = "echo 'Codewhale session started'"`,
+          lang: "config.toml",
+        },
+        {
+          p: "启动一个会话，运行 `/hooks`，就能看到所有已配置的钩子、钩子总开关是否打开，以及被拒绝加载的条目。`/hooks events` 会列出所有事件名称。",
+        },
+      ],
+    },
+    {
+      id: "gate",
+      title: "在命令执行前拦下它",
+      blocks: [
+        {
+          p: "`tool_call_before` 钩子会在每次工具调用执行之前看到它，并可以放行、拒绝，或强制弹出审批提示。下面这个钩子会拒绝强制推送。保存脚本并赋予可执行权限：",
+        },
+        {
+          code: `#!/bin/sh
+# ~/.codewhale/hooks/no-force-push.sh
+case "$DEEPSEEK_TOOL_ARGS" in
+  *"push --force"*|*"push -f"*)
+    echo '{"decision": "deny", "reason": "Force-push is blocked by a hook."}' ;;
+esac
+exit 0`,
+          lang: "no-force-push.sh",
+        },
+        {
+          code: `[[hooks.hooks]]
+name = "no-force-push"
+event = "tool_call_before"
+command = "~/.codewhale/hooks/no-force-push.sh"
+condition = { type = "tool_name", name = "bash" }`,
+          lang: "config.toml",
+        },
+        {
+          p: "钩子从环境变量中读取这次调用，并在标准输出上用 JSON 作答：`allow`、`deny` 或 `ask`，还可以附带 `reason`、改写后的输入（`updatedInput`）或给模型的补充上下文（`additionalContext`）。退出码 2 一律表示拒绝。多个钩子同时作答时，拒绝优先于询问，询问优先于放行。",
+        },
+        {
+          note: "在 Ask 和 Auto-Review 下，`ask` 会强制弹出提示。Full Access 从不显示审批提示，因此在那里 `ask` 不会新增提示。",
+        },
+      ],
+    },
+    {
+      id: "events",
+      title: "选择触发时机",
+      blocks: [
+        {
+          p: "有三个事件能改变接下来发生的事，其余事件只做观察：它们的输出会被忽略，失败也只会产生警告。",
+        },
+        {
+          rows: [
+            ["message_submit", "在你的消息发给模型之前。可以替换文本，或阻止发送。"],
+            ["tool_call_before", "在每次工具调用之前。可以放行、拒绝、询问、改写输入或补充上下文。"],
+            ["shell_env", "在每条 shell 命令运行之前。可以添加环境变量。"],
+            ["session_start / session_end", "会话打开时，或正常关闭时。"],
+            ["turn_end", "回合结束后，附带状态、耗时和 token 用量。"],
+            ["tool_call_after", "每个工具结果返回之后，有退出码时会附带退出码。"],
+            ["waiting_for_user", "Codewhale 开始等待你的审批、回答或暂停中的目标时。"],
+            ["session_idle / session_busy", "会话闲下来，或重新开始工作时。"],
+            ["session_error / on_error", "回合最终失败时，或发生任何错误、工具失败时。"],
+            ["mode_change", "在 Plan、Work、Operate 之间切换时。"],
+            ["subagent_spawn / subagent_complete", "子 Agent 启动或结束时。"],
+          ],
+          codeTerms: true,
+        },
+        {
+          p: "`condition` 可以缩小钩子的触发范围：按工具名（支持 `*` 通配）、工具类别、模式或退出码，也可以用 `all` 和 `any` 组合。永远不可能与所属事件匹配的条件，会在加载配置时直接被拒绝——这样你以为已经生效的拦截规则，不会悄无声息地失效。",
+        },
+      ],
+    },
+    {
+      id: "options",
+      title: "设置超时与失败行为",
+      blocks: [
+        {
+          rows: [
+            ["timeout_secs", "钩子最长可运行多久。默认 30 秒。"],
+            ["continue_on_error", "`true`（默认）：钩子失败只发出警告。`false`：失败即阻止。"],
+            ["background", "`true` 表示只作为观察者运行，不能阻止或改写。"],
+            ["working_dir", "写在 `[hooks]` 下：钩子的运行目录。默认是会话的工作区。"],
+          ],
+          codeTerms: true,
+        },
+        {
+          note: "`[hooks] default_timeout_secs` 会替换每个钩子自己的 `timeout_secs`，而不只是补上未设置的那些。如果想让各钩子使用各自的超时，请不要设置它。",
+        },
+      ],
+    },
+    {
+      id: "project",
+      title: "使用仓库自带的钩子",
+      blocks: [
+        {
+          p: "仓库可以在 `.codewhale/hooks.toml` 中附带钩子。由于它们会在你的机器上运行命令，只有在你信任该工作区，并且批准了这份文件的确切内容之后，才会加载：",
+        },
+        { code: "/hooks review\n/hooks approve <digest>\n/hooks revoke", lang: "Codewhale" },
+        {
+          p: "`/hooks review` 会显示其中的命令以及文件摘要；批准该摘要后，从下一次会话起启用这份确切的内容。文件有任何改动都需要重新批准。命令调用的脚本也请一并审阅。",
+        },
+      ],
+    },
+    {
+      id: "headless",
+      title: "在脚本和 CI 中使用钩子",
+      blocks: [
+        {
+          p: "钩子在交互式会话中运行。`codewhale exec` 默认不触发任何钩子；加上 `--hooks` 后会触发 `tool_call_before` 和 `shell_env`。由于没有人可以回应，`ask` 会被当作拒绝。",
+        },
+        { code: 'codewhale exec --auto --hooks "run the test suite and fix the first failure"', lang: "终端" },
+      ],
+    },
   ],
-  projectTitle: "项目级钩子",
-  projectLead:
-    '仓库可以在 <workspace>/.codewhale/hooks.toml 中携带策略。因为项目钩子是可执行的 shell 配置，Codewhale 只有在工作区通过信任提示或用户配置中的 trust_level = "trusted" 被信任后才加载它们——会话内的 /trust on 和旧版 .deepseek/trusted 标记都不会单独启用项目钩子。受信任后，项目钩子追加在 config.toml 的全局钩子之后运行，因此对 updatedInput 而言最后生效。格式错误但已受信任的项目文件会记警告并回退到只用全局钩子。',
-  sourceNote:
-    "来源文档：docs/rfcs/1364-hooks-lifecycle.md（设计 RFC）, docs/CONFIGURATION.md（配置 schema）· 更新时请同步修改 docs-map.ts。",
+  next: [
+    {
+      href: "/docs/modes",
+      label: "设置模式与审批",
+      note: "钩子的决定如何与 Ask、Auto-Review 和 Full Access 共同起作用。",
+    },
+    {
+      href: "/docs/mcp",
+      label: "用 MCP 连接工具",
+      note: "用同样的 `tool_call_before` 钩子管控 MCP 工具。",
+    },
+    {
+      href: "/docs/configuration",
+      label: "修改设置",
+      note: "`config.toml` 在哪里，以及项目可以覆盖哪些设置。",
+    },
+  ],
+  sourceNote: "来源文档：docs/HOOKS.md（权威）、docs/CONFIGURATION.md · 修改时同步更新 docs-map.ts。",
 };

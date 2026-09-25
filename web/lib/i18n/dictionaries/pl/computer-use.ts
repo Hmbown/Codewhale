@@ -38,7 +38,4 @@ export const computerUse: ComputerUseDict = {
   demo: "Zobacz test w tle",
   source: "Kod źródłowy i inne platformy",
   platforms: "Ten plik jest przeznaczony na Maca. Windows i Linux korzystają obecnie z wtyczki źródłowej i konfiguracji po stronie hosta.",
-  installTitle: "Computer Use na Maca",
-  installLead: "Dodaj sterowanie aplikacjami w tle dzięki pomocnikowi Computer Use. Skonfiguruj uprawnienia na Macu, uruchom test w tle i wstrzymuj lub zatrzymuj wprowadzanie danych przez pomocnika z paska menu.",
-  installLink: "Pobieranie i konfiguracja Computer Use",
 };

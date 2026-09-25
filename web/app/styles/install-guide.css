@@ -1,38 +1,40 @@
-/* The verified Markdown guide owns the content; this surface owns its layout. */
+/* The verified Markdown guide owns the content; this surface owns its
+   layout, on the shared prose measure. */
 .install-guide {
-  max-width: 76ch;
+  width: var(--container);
+  max-width: var(--measure-prose);
   margin-inline: auto;
-  padding: 3rem 1rem 5rem;
-  color: var(--ink-soft);
-  line-height: 1.7;
+  padding-bottom: var(--section-gap);
+  color: var(--text);
+  font-size: var(--text-prose);
+  line-height: var(--leading-prose);
   overflow-wrap: anywhere;
 }
-.install-guide :is(h1, h2, h3, h4) {
-  color: var(--ink);
-  line-height: 1.3;
-  scroll-margin-top: 6rem;
-}
-.install-guide h1 { font-size: clamp(1.8rem, 4vw, 2.5rem); margin-bottom: 1.5rem; }
-.install-guide h2 { font-size: 1.5rem; margin-top: 3rem; margin-bottom: 1rem; }
-.install-guide h3 { font-size: 1.2rem; margin-top: 2rem; margin-bottom: 0.75rem; }
-.install-guide h4 { font-size: 1rem; margin-top: 1.5rem; margin-bottom: 0.75rem; }
-.install-guide :is(p, ul, ol, blockquote, .install-guide-table, pre) { margin-block: 1rem; }
-.install-guide > .relative { margin-block: 1.5rem; }
+.install-guide :is(h1, h2, h3, h4) { color: var(--text); line-height: 1.25; scroll-margin-top: 6rem; }
+.install-guide h1 { font-size: var(--text-display); margin-bottom: var(--space-5); }
+.install-guide h2 { font-size: var(--text-title); margin-top: var(--space-7); margin-bottom: var(--space-3); }
+.install-guide h3 { font-size: var(--text-heading); margin-top: var(--space-6); margin-bottom: var(--space-2); }
+.install-guide h4 { font-size: var(--text-body); margin-top: var(--space-5); margin-bottom: var(--space-2); }
+.install-guide :is(p, ul, ol, blockquote, .install-guide-table, pre) { margin-block: var(--space-4); }
+.install-guide p,
+.install-guide li { color: var(--text); max-width: var(--measure-text); }
+.install-guide > .code { margin-block: var(--space-5); }
 .install-guide :is(ul, ol) { padding-inline-start: 1.5rem; }
 .install-guide ul { list-style: disc; }
 .install-guide ol { list-style: decimal; }
-.install-guide li { margin-block: 0.35rem; }
-.install-guide a { color: var(--indigo); text-decoration: underline; text-underline-offset: 0.2em; }
+.install-guide li { margin-block: var(--space-1); }
+.install-guide ::marker { color: var(--muted); }
+.install-guide a { color: var(--accent); text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent); text-underline-offset: 0.2em; }
+.install-guide a:hover { text-decoration-color: var(--accent); }
 .install-guide a[id] { scroll-margin-top: 6rem; }
-.install-guide strong { color: var(--ink); font-weight: 600; }
-.install-guide blockquote { padding-inline-start: 1rem; border-inline-start: 2px solid var(--indigo); }
-.install-guide hr { margin-block: 2.5rem; border-color: var(--line); }
-.install-guide code { font-family: var(--font-mono); font-size: 0.88em; }
+.install-guide strong { font-weight: 600; }
+.install-guide blockquote { padding-inline-start: var(--space-4); border-inline-start: 2px solid var(--line-strong); color: var(--muted); }
+.install-guide hr { margin-block: var(--space-7); border: 0; border-top: 1px solid var(--line); }
+.install-guide :not(pre) > code { font-family: var(--font-mono); font-size: 0.875em; background: var(--surface); padding: 0.0625rem 0.3125rem; border-radius: var(--radius-control); }
 .install-guide pre { max-width: 100%; overflow-x: auto; white-space: pre; overflow-wrap: normal; }
-.install-guide pre:not(.code-block) { padding: 1rem; background: var(--paper-card); border: 1px solid var(--line); border-radius: var(--radius-surface); }
+.install-guide pre:not(.code-block) { padding: var(--space-4); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-surface); font-size: var(--text-mono); }
 .install-guide-table { max-width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius-surface); }
-.install-guide table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
-.install-guide :is(th, td) { padding: 0.75rem; min-width: 8rem; text-align: start; vertical-align: top; border-bottom: 1px solid var(--line); }
-.install-guide th { color: var(--ink); background: var(--paper-card); font-weight: 600; }
+.install-guide table { width: 100%; border-collapse: collapse; font-size: var(--text-ui); }
+.install-guide :is(th, td) { padding: var(--space-3); min-width: 8rem; text-align: start; vertical-align: top; border-bottom: 1px solid var(--line); }
+.install-guide th { background: var(--panel); font-weight: 600; }
 .install-guide tr:last-child td { border-bottom: 0; }
-.install-guide-source { font-size: 0.85rem; margin-bottom: 2rem; }

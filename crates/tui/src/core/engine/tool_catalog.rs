@@ -16,7 +16,6 @@ use crate::mcp::McpPool;
 use crate::model_profile::ToolSurfaceBudget;
 use crate::tools::spec::{ToolError, ToolResult, optional_str, optional_u64, required_str};
 use codewhale_config::AppMode;
-use codewhale_execpolicy::ApprovalMode;
 use codewhale_models::Tool;
 
 use crate::core::session::ToolActivationCache;
@@ -525,7 +524,6 @@ pub(super) struct ToolSurfacePolicy {
     /// this limit into its own admission counter at turn start; `None` means
     /// unlimited (the default), which keeps the admission gate inert.
     pub(super) max_tool_calls: Option<u32>,
-    questions_allowed: bool,
 }
 
 impl ToolSurfacePolicy {
@@ -540,7 +538,6 @@ impl ToolSurfacePolicy {
         allowed_tools: Option<Vec<String>>,
         disallowed_tools: Option<Vec<String>>,
         max_tool_calls: Option<u32>,
-        approval_mode: ApprovalMode,
         tool_mode: ToolMode,
     ) -> Self {
         let mut catalog = tools.unwrap_or_default();
@@ -576,12 +573,6 @@ impl ToolSurfacePolicy {
                 .and_then(Value::as_array)
                 .is_none_or(|actions| !actions.is_empty())
         });
-        let questions_allowed =
-            super::super::authority::permission_posture_allows_questions(approval_mode);
-        if !questions_allowed {
-            catalog.retain(|tool| tool.name != REQUEST_USER_INPUT_NAME);
-        }
-
         let mut active_names = initial_active_tools(&catalog);
         active_names.extend(dynamic_active_tools.iter().map(|name| (*name).to_string()));
         active_names.retain(|name| catalog.iter().any(|tool| tool.name == *name));
@@ -597,7 +588,6 @@ impl ToolSurfacePolicy {
             allowed_tools,
             disallowed_tools,
             max_tool_calls,
-            questions_allowed,
         }
     }
 
@@ -616,10 +606,6 @@ impl ToolSurfacePolicy {
 
     pub(super) fn denies_call(&self, name: &str, input: &Value) -> bool {
         tool_call_denied(self.disallowed_tools.as_deref(), name, input)
-    }
-
-    pub(super) fn allows_questions(&self) -> bool {
-        self.questions_allowed
     }
 }
 

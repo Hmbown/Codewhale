@@ -6,14 +6,22 @@
  * later partials override earlier ones at equal specificity, and
  * overrides.css must stay last. Add rules to the partial for their
  * surface rather than to this file.
+ *
+ *   tokens-roles  the ocean, the roles, legacy aliases
+ *   base          ground, type, code, legacy structures the docs use
+ *   primitives    the components every page composes
+ *   shell         header, mobile sheet, footer sea
+ *   home / pages  page layouts
+ *   docs*         the docs (owned with the docs pages)
  */
 @import "./styles/tailwind.css";
 @import "./styles/tokens-roles.css";
 @import "./styles/base.css";
+@import "./styles/primitives.css";
 @import "./styles/shell.css";
 @import "./styles/utilities.css";
-@import "./styles/portal.css";
 @import "./styles/home.css";
+@import "./styles/pages.css";
 @import "./styles/docs.css";
 @import "./styles/install-guide.css";
 @import "./styles/states.css";

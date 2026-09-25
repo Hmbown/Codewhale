@@ -16,7 +16,7 @@ describe("public website copy contracts", () => {
     expect(layout).toContain("docs-portal-band");
     // The hero copy is dictionary-driven now (#5337), so assert it where the
     // string actually lives rather than in the TSX.
-    expect(EN_DOCS_SHELL.heroTitle).toBe("Find the guidance you need.");
+    expect(EN_DOCS_SHELL.heroTitle).toBe("Get something done with Codewhale.");
     expect(layout).not.toContain("Section 02");
     expect(layout).not.toContain("How Codewhale works: ego");
     expect(layout).not.toContain("<Seal");
@@ -62,7 +62,7 @@ describe("public website copy contracts", () => {
 
     expect(runtime).toContain("ACP (Agent Client Protocol)");
     expect(runtime).toContain("Baseline JSON-RPC adapter over stdio");
-    expect(runtime).toContain("Phase 0 companion for the local runtime");
+    expect(runtime).toContain("Early companion for the local runtime");
     expect(runtime).not.toContain("Agent Communication Protocol");
     expect(runtime).not.toContain("IETF-standard");
     expect(runtime).not.toContain("embeds Codewhale as a side-panel agent");

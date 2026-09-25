@@ -32,24 +32,7 @@ export const chrome: ChromeDict = {
 
   authSignIn: "Войти",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "любая модель, на вашей машине",
-
-  issueLabel: "Выпуск {date}",
   dateLocale: "ru-RU",
-
-  tickerLiveLabel: "Эфир",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "влит",
-  tickerOpened: "открыт",
-  tickerClosed: "закрыт",
-  tickerReleased: "выпуск",
-  tickerFirstContribution: "первый вклад",
-  tickerBy: "автор {handle}",
-  tickerAria: "Недавняя активность репозитория",
-
-  traceLabel: "ход рассуждений",
-  traceTabsAria: "Фрагменты сеанса",
 
   menuOpen: "Открыть меню",
   menuClose: "Закрыть меню",

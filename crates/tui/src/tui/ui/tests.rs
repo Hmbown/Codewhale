@@ -7960,29 +7960,6 @@ fn app_auto_approval_helper_covers_bypass_only() {
     assert!(app_auto_approve_enabled(&app));
 }
 
-#[test]
-fn auto_review_suppresses_stale_question_prompts_while_other_postures_allow_them() {
-    let mut app = create_test_app();
-    for (posture, expected) in [
-        (ApprovalMode::Suggest, false),
-        (ApprovalMode::Auto, true),
-        (ApprovalMode::Bypass, false),
-        (ApprovalMode::Never, false),
-    ] {
-        app.approval_mode = posture;
-        assert_eq!(
-            should_suppress_user_input_prompt(&app),
-            expected,
-            "{posture:?}"
-        );
-    }
-
-    // Full Access keeps questions valid, same as Auto-Review suppresses
-    // them only for its own stale-prompt cleanup.
-    app.approval_mode = ApprovalMode::Bypass;
-    assert!(!should_suppress_user_input_prompt(&app));
-}
-
 fn create_test_options() -> TuiOptions {
     TuiOptions {
         // Keep UI tests independent from the developer's saved

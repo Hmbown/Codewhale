@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { Icon } from "./icon";
 import type { ModelFact } from "@/lib/facts";
 import { MODELS_COPY } from "@/lib/content/models";
 import { pickText } from "@/lib/i18n/dictionaries";
@@ -101,11 +102,11 @@ export function ModelsTable({
   ];
 
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-left text-sm">
+    <div className="data-table-wrap">
+      <table className="data-table">
         <caption className="sr-only">{t(MODELS_COPY.modelsTitle)}</caption>
         <thead>
-          <tr className="hairline-b">
+          <tr>
             {headers.map((h) => {
               const active = key === h.key;
               const ascending = active && !desc;
@@ -113,19 +114,17 @@ export function ModelsTable({
                 <th
                   key={h.key}
                   scope="col"
-                  className="py-3 pr-4"
                   aria-sort={active ? (ascending ? "ascending" : "descending") : "none"}
                 >
                   <button
                     type="button"
-                    className={`models-sort${active ? " is-active" : ""}`}
+                    className="data-table-sort"
+                    data-dir={active ? (ascending ? "asc" : "desc") : "none"}
                     onClick={() => setSort(h.key)}
                     title={t(ascending ? MODELS_COPY.sortDesc : MODELS_COPY.sortAsc)}
                   >
                     {h.label}
-                    <span aria-hidden="true" className="models-sort-mark">
-                      {active ? (ascending ? "↑" : "↓") : "↕"}
-                    </span>
+                    <Icon name="chevron-down" />
                   </button>
                 </th>
               );
@@ -134,16 +133,16 @@ export function ModelsTable({
         </thead>
         <tbody>
           {rows.map((model) => (
-            <tr key={model.id} className="hairline-b">
-              <th scope="row" className="py-3 pr-4 font-medium">
-                <code className="break-all">{model.id}</code>
+            <tr key={model.id}>
+              <th scope="row">
+                <code>{model.id}</code>
                 {model.reasoning ? (
                   <span className="models-reasoning">{t(MODELS_COPY.reasoning)}</span>
                 ) : null}
               </th>
-              <td className="py-3 pr-4 text-ink-soft">{model.provider ?? "—"}</td>
-              <td className="py-3 pr-4 tabular-nums">{formatTokens(model.contextWindow)}</td>
-              <td className="py-3 tabular-nums">{formatDate(model.addedAt, locale)}</td>
+              <td>{model.provider ?? "—"}</td>
+              <td className="tabular">{formatTokens(model.contextWindow)}</td>
+              <td className="tabular">{formatDate(model.addedAt, locale)}</td>
             </tr>
           ))}
         </tbody>

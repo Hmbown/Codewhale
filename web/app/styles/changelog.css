@@ -1,138 +1,92 @@
 /* ------------------------------------------------------------------ */
-/*  Changelog                                                          */
+/*  Changelog — each release is a receipt                               */
 /* ------------------------------------------------------------------ */
-.changelog-facts {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1rem;
-  margin-top: 1.75rem;
-}
 
-.changelog-facts > div {
-  padding: 1.1rem 1.25rem;
-  border: 1px solid var(--stage-line);
-  border-radius: var(--radius-control);
-  background: var(--paper-card);
-}
-
-.changelog-facts span {
-  display: block;
-  color: var(--ink-mute);
-  font-family: var(--font-body);
-  font-size: 0.75rem;
-}
-
-.changelog-facts > div { min-width: 0; }
-
-.changelog-facts strong {
-  display: block;
-  overflow-wrap: anywhere;
-  margin-top: 0.45rem;
-  color: var(--ink);
-  font-size: 1.05rem;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-
-.changelog-facts a {
-  display: inline-block;
-  margin-top: 0.55rem;
-  color: var(--indigo);
-  font-size: 0.76rem;
-}
-
-.changelog-facts a:hover { text-decoration: underline; text-underline-offset: 0.2rem; }
-
-.changelog-facts [data-published="true"] strong { color: var(--jade); }
-.changelog-facts [data-candidate="unreleased"] strong { color: var(--ochre); }
+.changelog-list { display: grid; gap: var(--space-5); }
 
 .changelog-release {
-  padding-block: 2.25rem;
-  border-top: 1px solid var(--hairline);
+  padding: clamp(1.25rem, 3vw, 1.75rem);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-surface);
+  background: color-mix(in srgb, var(--panel) 72%, transparent);
 }
 
 .changelog-release-head {
-  min-width: 0;
-  overflow-wrap: anywhere;
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
   justify-content: space-between;
-  gap: 0.75rem 1.5rem;
+  gap: var(--space-2) var(--space-5);
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
-
 .changelog-release-head h2 {
-  font-size: clamp(1.4rem, 2.6vw, 1.9rem);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: var(--text-title);
   font-variant-numeric: tabular-nums;
 }
+.changelog-release-head h2 svg { width: 1.25rem; height: 1.25rem; color: var(--accent); }
 
-.changelog-release-head .dotline {
-  color: var(--ink-mute);
+.changelog-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-4);
+  color: var(--muted);
+  font-size: var(--text-caption);
 }
-
-.changelog-release-head .dotline a { color: var(--indigo); }
-.changelog-release-head .dotline a:hover { text-decoration: underline; text-underline-offset: 0.2rem; }
+.changelog-links a { color: var(--accent); }
+.changelog-links a:hover { text-decoration: underline; text-underline-offset: 0.2em; }
 
 .changelog-unreleased-note {
   max-width: 44rem;
-  margin-top: 0.6rem;
-  color: var(--ink-soft);
-  font-size: 0.86rem;
+  margin-top: var(--space-2);
+  color: var(--muted);
+  font-size: var(--text-ui);
   line-height: 1.6;
 }
 
-.changelog-sections {
-  display: grid;
-  gap: 1.35rem;
-  margin-top: 1.4rem;
-}
+.changelog-sections { display: grid; gap: var(--space-5); margin-top: var(--space-5); }
 
 .changelog-sections h3 {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: 0.6rem;
-  font-size: 0.75rem;
+  gap: var(--space-3);
+  color: var(--muted);
+  font-size: var(--text-caption);
   font-weight: 600;
-  color: var(--ink-mute);
 }
+.changelog-sections h3 a { color: var(--muted); font-weight: 500; }
+.changelog-sections h3 a:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 0.2em; }
 
-.changelog-sections h3 a {
-  color: var(--ink-mute);
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
-  letter-spacing: 0.04em;
-  text-transform: none;
-}
-
-.changelog-sections h3 a:hover {
-  color: var(--indigo);
-  text-decoration: underline;
-  text-underline-offset: 0.2rem;
-}
-
-.changelog-sections ul {
-  margin-top: 0.55rem;
-  border-top: 1px solid var(--hairline);
-}
-
+.changelog-sections ul { display: grid; margin-top: var(--space-2); }
 .changelog-sections li {
+  position: relative;
   min-width: 0;
-  padding: 0.6rem 0;
-  border-bottom: 1px solid var(--hairline);
-  color: var(--ink-soft);
-  font-size: 0.86rem;
+  padding: var(--space-2) 0 var(--space-2) var(--space-5);
+  color: var(--text);
+  font-size: var(--text-ui);
   line-height: 1.6;
-  /* Release notes quote commands, env names, and URLs verbatim; a long
-     unbroken token must wrap inside the column, never widen the page. */
+  /* Release notes quote commands, env names and URLs verbatim; a long
+     unbroken token wraps inside the column, never widens the page. */
   overflow-wrap: anywhere;
 }
-
+.changelog-sections li + li { border-top: 1px solid var(--line); }
 .changelog-sections li::before {
-  content: "·";
-  margin-right: 0.6rem;
-  color: var(--stage-dim);
+  content: "";
+  position: absolute;
+  inset-inline-start: 0.375rem;
+  top: 1.05em;
+  width: 0.375rem;
+  height: 0.375rem;
+  border-radius: var(--radius-pill);
+  background: var(--line-strong);
 }
 
-@media (max-width: 640px) {
-  .changelog-facts { grid-template-columns: 1fr; }
-}
+.changelog-facts { max-width: 44rem; }
+.changelog-facts dd { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-4); }
+.changelog-facts dd > .status:first-child { display: inline-flex; margin: 0; font-size: var(--text-ui); }
+.changelog-links a { display: inline-flex; align-items: center; gap: 0.25rem; }

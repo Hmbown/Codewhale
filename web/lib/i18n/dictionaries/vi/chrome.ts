@@ -33,24 +33,7 @@ export const chrome: ChromeDict = {
 
   authSignIn: "Đăng nhập",
 
-  wordmarkSeal: "深",
-  wordmarkTag: "mọi mô hình, trên máy của bạn",
-
-  issueLabel: "Số ra {date}",
   dateLocale: "vi-VN",
-
-  tickerLiveLabel: "Trực tiếp",
-  tickerLiveTag: "LIVE",
-  tickerMerged: "đã hợp nhất",
-  tickerOpened: "đã mở",
-  tickerClosed: "đã đóng",
-  tickerReleased: "đã phát hành",
-  tickerFirstContribution: "đóng góp đầu tiên",
-  tickerBy: "bởi {handle}",
-  tickerAria: "Hoạt động gần đây của kho mã",
-
-  traceLabel: "mạch suy luận",
-  traceTabsAria: "Trích đoạn phiên làm việc",
 
   menuOpen: "Mở menu",
   menuClose: "Đóng menu",

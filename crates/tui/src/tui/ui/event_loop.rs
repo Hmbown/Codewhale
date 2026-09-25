@@ -1654,12 +1654,11 @@ pub(crate) async fn run_event_loop(
 
         // Per-session control socket: rebind when the owned session id
         // changes, republish the `status` snapshot, and execute queued
-        // verbs on the UI thread. A verb that asks for quit (the `relaunch`
-        // seam) exits the loop through the ordinary `/exit` teardown.
+        // verbs on the UI thread.
         session_control.reconcile(app.current_session_id.as_deref());
         session_control.update_status(app);
         execute_session_state_transition_hooks(app, &mut previous_turn_state);
-        if session_control
+        session_control
             .drain(
                 app,
                 config,
@@ -1667,10 +1666,7 @@ pub(crate) async fn run_event_loop(
                 &mut current_streaming_text,
                 &mut stream_display_clock,
             )
-            .await
-        {
-            return Ok(());
-        }
+            .await;
 
         while let Some(completion) = app.clipboard.poll_write_completion() {
             if let Err(err) = completion {
@@ -2028,9 +2024,6 @@ pub(crate) async fn run_event_loop(
                     | EngineEvent::AgentComplete {
                         owner_session_id, ..
                     } => event_owner_is_active(app.current_session_id.as_deref(), owner_session_id),
-                    EngineEvent::UserInputRequired { .. } => {
-                        !should_suppress_user_input_prompt(app)
-                    }
                     EngineEvent::ApprovalRequired {
                         tool_name,
                         approval_grouping_key,
@@ -3796,48 +3789,27 @@ pub(crate) async fn run_event_loop(
                         .await;
                     }
                     EngineEvent::UserInputRequired { id, request } => {
-                        if should_suppress_user_input_prompt(app) {
-                            // A question may have been planned just before the
-                            // user switched to Auto-Review. Cancel the stale
-                            // request instead of opening a modal under an Auto
-                            // header; the tool result tells the model to keep
-                            // moving without inventing a user choice.
-                            log_sensitive_event(
-                                "tool.user_input.auto_cancelled_auto_review",
-                                serde_json::json!({
-                                    "tool_id": id.clone(),
-                                    "session_id": app.current_session_id,
-                                }),
-                            );
-                            let _ = engine_handle.cancel_user_input(id).await;
-                            app.pending_user_input_prompt = None;
-                            let notice = app.tr(MessageId::AutoReviewQuestionSkipped).into_owned();
-                            app.push_status_toast(notice, StatusToastLevel::Info, Some(6_000));
-                        } else {
-                            app.pending_user_input_prompt = Some((id.clone(), request.clone()));
-                            app.view_stack.push(UserInputView::new(id.clone(), request));
-                            let payload = notifications::input_needed_payload(app.ui_locale);
-                            if let Some((method, _, _)) =
-                                crate::tui::notifications::settings(config)
-                            {
-                                let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
-                                crate::tui::notifications::notify_done(
-                                    method,
-                                    in_tmux,
-                                    &payload,
-                                    Duration::ZERO,
-                                    Duration::ZERO,
-                                );
-                            }
-                            app.push_status_toast_record(
-                                StatusToast::new(
-                                    payload.headline(),
-                                    StatusToastLevel::Warning,
-                                    Some(12_000),
-                                )
-                                .for_action(id.clone()),
+                        app.pending_user_input_prompt = Some((id.clone(), request.clone()));
+                        app.view_stack.push(UserInputView::new(id.clone(), request));
+                        let payload = notifications::input_needed_payload(app.ui_locale);
+                        if let Some((method, _, _)) = crate::tui::notifications::settings(config) {
+                            let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
+                            crate::tui::notifications::notify_done(
+                                method,
+                                in_tmux,
+                                &payload,
+                                Duration::ZERO,
+                                Duration::ZERO,
                             );
                         }
+                        app.push_status_toast_record(
+                            StatusToast::new(
+                                payload.headline(),
+                                StatusToastLevel::Warning,
+                                Some(12_000),
+                            )
+                            .for_action(id.clone()),
+                        );
                     }
                     EngineEvent::ElevationRequired {
                         tool_id,

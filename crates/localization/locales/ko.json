@@ -1164,7 +1164,6 @@
   "PendingApprovalInAgent": "{agent}에서 승인이 필요합니다 — /agents",
   "ApprovalTruncationHint": "  … 잘림 · 전체 상세는 {details}",
   "ApprovalFullAccessPolicyBlocked": "{tool} 차단됨: Full Access는 이 정책을 우회할 수 없습니다",
-  "AutoReviewQuestionSkipped": "Auto-Review가 사용자 질문을 건너뛰고 자율적으로 계속했습니다",
   "ApprovalChooseHint": "선택: ",
   "ApprovalChooseAction": "Enter로 선택 항목 적용, 또는 y/a/d를 바로 누르세요",
   "ApprovalIntentLabel": "의도: ",

@@ -1,67 +1,109 @@
 import type { DocsComputersDict } from "../types";
 
 /**
- * English reference dictionary for `app/[locale]/docs/computers/page.tsx`.
- * Every statement is taken from docs/DAYTONA_CLOUD_DISPATCH.md and
- * docs/CODEWHALE_AGENT.md; the commands, env names, and job states are
- * code-owned literals typeset by the page.
+ * English reference dictionary for `app/[locale]/docs/computers/page.tsx`
+ * ("Send a task to the cloud"). Checked against docs/DAYTONA_CLOUD_DISPATCH.md
+ * and `DispatchArgs` / `run_with` in crates/cli/src/dispatch.rs. The sandbox
+ * vendor is Codewhale-operated infrastructure and is deliberately not named
+ * in user copy (DAYTONA_CLOUD_DISPATCH.md: no provider brand on any surface).
+ * The live network path is not yet smoke-tested, so the page says preview.
  */
 export const docsComputers: DocsComputersDict = {
-  metaTitle: "Cloud computers · Codewhale Docs",
+  metaTitle: "Send a task to the cloud · Codewhale Docs",
   metaDescription:
-    "How a local Codewhale session proposes, confirms, and tracks a cloud agent on a Daytona computer — explicit forges, fail-closed credentials, and what is not built yet.",
+    "Hand a coding task to a Codewhale cloud agent that works on a branch and opens a pull request — proposed first, started only when you confirm.",
   bodyClassName: "text-ink-soft leading-relaxed",
-  overviewTitle: "Cloud computers",
-  overviewLead:
-    "A local session can offload a coding task to a cloud computer the way an editor sends a cloud agent: the remote job raises a branch and is meant to open a pull request against an explicit forge. Local stays responsive. Spend and push never happen silently — a proposal is written first, and nothing creates a sandbox or pushes a branch until you confirm it.",
-  proposeTitle: "Propose, then confirm",
-  proposeLead:
-    "The first command writes a proposal and exits. The second confirms it by id. The TUI has the same two steps as slash commands, and the {cloudAgent} spelling is an alias of {dispatch}.",
-  jobsLead:
-    "Cloud jobs are first-class on the existing jobs surface as {kind}. List, show, and cancel them from the TUI or the CLI:",
-  remotesTitle: "Explicit forges",
-  remotesLead:
-    "A remote is never assumed to be GitHub. A remote named after a forge is that forge; any other remote is classified by its URL host. If more than one forge is present, pass {remoteFlag}.",
-  remotes: [
-    ["github · cnb · gitee (by remote name)", "that forge, whatever the URL"],
-    ["origin or other → github.com", "github"],
-    ["origin or other → cnb.cool", "cnb"],
-    ["origin or other → gitee.com", "gitee"],
+  title: "Send a task to the cloud",
+  lede:
+    "A cloud agent takes a task off your machine: it works in a fresh cloud sandbox, pushes a branch, and opens a pull request while you keep working locally. Nothing starts, costs money, or pushes until you confirm it.",
+  sections: [
+    {
+      id: "status",
+      title: "Know what is ready",
+      blocks: [
+        {
+          note: "Cloud agents are a preview. The full lifecycle is covered by offline tests, but the live path — a real sandbox and a real pull request on each forge — has not been verified end to end yet. Private repositories are not supported yet.",
+        },
+      ],
+    },
+    {
+      id: "before",
+      title: "Before you start",
+      blocks: [
+        {
+          list: [
+            "Sign in to your Codewhale account with `codewhale login`. Without it, a task can be proposed but not confirmed.",
+            "Make an account API key available as `CODEWHALE_API_KEY`, so the agent in the sandbox runs as your account. Without it, confirming is refused before anything is spent.",
+            "For GitHub, be signed in to the `gh` command-line tool; Codewhale uses that login to open the pull request.",
+          ],
+        },
+        { code: "codewhale dispatch --status", lang: "Terminal" },
+        {
+          p: "`--status` shows the forges found in your git remotes and whether the required credentials are present. It never prints a secret.",
+        },
+      ],
+    },
+    {
+      id: "send",
+      title: "Propose, then confirm",
+      blocks: [
+        {
+          code: `codewhale dispatch "fix the flaky login test and open a PR" --remote github
+codewhale dispatch --confirm cloud_<id>`,
+          lang: "Terminal",
+        },
+        {
+          p: "The first command only writes a proposal and prints its id. The second starts it. Codewhale may propose a cloud task on its own, but it never confirms one. In a session, use `/dispatch <task>` and `/dispatch confirm <id>`.",
+        },
+        {
+          p: "Once confirmed, the agent clones the repository into a new sandbox, does the work, pushes a new branch (never a force-push), and opens the pull request. The sandbox is deleted when the job finishes, fails, or is cancelled.",
+        },
+      ],
+    },
+    {
+      id: "track",
+      title: "Track or cancel a job",
+      blocks: [
+        {
+          code: `codewhale dispatch --list
+codewhale dispatch --show cloud_<id>
+codewhale dispatch --cancel cloud_<id>`,
+          lang: "Terminal",
+        },
+        {
+          p: "Cloud jobs also appear in `/jobs`. A job shows its progress, the branch, the pull request link once one exists, and how many minutes it ran — a runtime figure, not a bill. Cancelling tears the sandbox down right away.",
+        },
+      ],
+    },
+    {
+      id: "forge",
+      title: "Choose where the pull request goes",
+      blocks: [
+        {
+          p: "Codewhale supports GitHub, CNB, and Gitee, and never assumes `origin` is GitHub. A remote named `github`, `cnb`, or `gitee` is that forge; any other remote is identified by its host. If your repository has more than one forge, pass `--remote`.",
+        },
+        {
+          p: "If a pull request cannot be opened — for example, a forge token is missing — the job is marked failed after the push and says that no pull request was opened. It never reports a link it does not have.",
+        },
+      ],
+    },
   ],
-  enableTitle: "Enable a Daytona computer",
-  enableLead:
-    "Credentials live in the process environment or in the Codewhale secret store — never in config.toml or models.toml, and never committed.",
-  enableSteps: [
-    ["Create an API key", "In the Daytona dashboard under API keys."],
-    [
-      "Export it for the session",
-      "{apiKey}, optionally {apiUrl} for a non-default endpoint.",
-    ],
-    [
-      "Or store it once",
-      "In the Codewhale secret slot {slot} (OS keyring or the $CODEWHALE_HOME secrets file). The {alias} alias is also accepted.",
-    ],
-  ],
-  cliNote:
-    "An installed daytona CLI is not a credential. {status} and a bare {bare} report CLI presence separately from credential presence.",
-  rulesTitle: "Fail-closed rules",
-  rules: [
-    ["No confirm", "A {proposed} job is written; the command exits success; Daytona is not called; nothing is pushed."],
-    ["Confirm, no credentials", "A {refused} job is written; the command exits failure; no sandbox exists."],
-    [
-      "Confirm with credentials",
-      "A Daytona sandbox is created, labelled with the job id and forge. This slice does not claim a GitHub, CNB, or Gitee PR URL, and a missing forge token fails closed the same way.",
-    ],
-  ],
-  membershipTitle: "Who can dispatch",
-  membershipLead:
-    "Managed Agent surfaces authenticate to the same Codewhale membership — the {login} account session. Membership gates cloud agents, not local dispatch: `codewhale dispatch` with Daytona and forge credentials needs no account. Managed cloud agents do not name the infrastructure behind them; local dispatch names Daytona only because you bring your own Daytona key. Installing or running the local runtime needs no account at all.",
-  leftoverTitle: "Not built yet",
-  leftover: [
-    ["Live watch", "A log tail of a running sandbox."],
-    ["Cancel that tears down", "Cancelling a paid Daytona sandbox from the job surface."],
-    ["Auto-decide", "Codewhale may propose a dispatch; it must not confirm its own proposal."],
-    ["The remote runner", "The agent that actually raises the branch and opens the pull request."],
+  next: [
+    {
+      href: "/docs/auth",
+      label: "Connect a provider",
+      note: "Sign in to your Codewhale account and manage keys.",
+    },
+    {
+      href: "/docs/review",
+      label: "Review what changed",
+      note: "Review the agent's pull request before you merge it.",
+    },
+    {
+      href: "/docs/fleet",
+      label: "Run a workflow",
+      note: "Run longer, multi-step work on your own machine instead.",
+    },
   ],
   sourceNote:
     "Source documents: docs/DAYTONA_CLOUD_DISPATCH.md, docs/CODEWHALE_AGENT.md · Update docs-map.ts when changing.",

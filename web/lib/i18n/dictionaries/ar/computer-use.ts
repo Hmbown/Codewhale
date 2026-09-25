@@ -38,7 +38,4 @@ export const computerUse: ComputerUseDict = {
   demo: "شاهد فحص الخلفية",
   source: "المصدر والمنصات الأخرى",
   platforms: "هذا التنزيل مخصص لنظام Mac. يعتمد Windows وLinux حاليًا على إضافة المصدر والإعداد من جهة المضيف.",
-  installTitle: "Computer Use لنظام Mac",
-  installLead: "أضف التحكم في التطبيقات في الخلفية عبر مساعد Computer Use. جهّز أذونات Mac، وشغّل فحص الخلفية، وأوقف إدخال المساعد مؤقتًا أو أنهِه من شريط القوائم.",
-  installLink: "تنزيل Computer Use وإعداده",
 };

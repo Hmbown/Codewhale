@@ -39,7 +39,4 @@ export const computerUse: ComputerUseDict = {
   demo: "バックグラウンドチェックを見る",
   source: "ソースコードとその他のプラットフォーム",
   platforms: "このダウンロードは Mac 用です。Windows と Linux では現在、ソースプラグインとホスト側のセットアップを使用します。",
-  installTitle: "Mac 版 Computer Use",
-  installLead: "Computer Use ヘルパーでアプリのバックグラウンド操作を追加します。Mac の権限を設定し、バックグラウンドチェックを実行して、メニューバーからヘルパーの入力を一時停止または停止できます。",
-  installLink: "Computer Use のダウンロードと設定",
 };

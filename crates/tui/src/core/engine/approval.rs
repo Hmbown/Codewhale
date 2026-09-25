@@ -541,7 +541,6 @@ mod tests {
             None,
             None,
             Some(4),
-            engine.session.approval_mode,
             crate::core::engine::tool_catalog::ToolMode::Direct,
         );
 
@@ -709,7 +708,6 @@ mod tests {
             None,
             None,
             Some(4),
-            engine.session.approval_mode,
             crate::core::engine::tool_catalog::ToolMode::Direct,
         );
         let events = handle.rx_event.clone();

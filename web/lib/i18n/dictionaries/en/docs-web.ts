@@ -1,33 +1,103 @@
 import type { DocsWebDict } from "../types";
 
 /**
- * English reference dictionary for `app/[locale]/docs/web/page.tsx`.
- * Copy moved verbatim from the page's `isZh` ternaries — any wording change
- * belongs in its own commit, never mixed into a structural move.
+ * English reference dictionary for `app/[locale]/docs/web/page.tsx`
+ * ("Open the browser client"). Checked against docs/WEB.md, `WebArgs` in
+ * crates/cli/src/lib.rs (`--port`, default 7878), and the `/rc` command in
+ * crates/tui/src/commands/groups/session/remote_control.rs.
  */
 export const docsWeb: DocsWebDict = {
-  metaTitle: "Browser Client · Codewhale Docs",
+  metaTitle: "Open the browser client · Codewhale Docs",
   metaDescription:
-    "The loopback-only embedded browser client — one-time bootstrap, session cookie, the local trust boundary — and remote control of a running local session from the signed-in web app with /rc.",
+    "Work with Codewhale in a browser tab on your own machine, or continue a running terminal session from the Codewhale web app with /rc.",
   bodyClassName: "text-ink-soft leading-relaxed",
-  overviewTitle: "Browser Client",
-  overviewLead:
-    "{webCommand} opens Codewhale's embedded browser client over the canonical Runtime API. It is a local surface: the server always binds to {loopbackHost}, cannot be rebound to a LAN address, and cannot run with Runtime authentication disabled. The default address is {defaultUrl}; on a port collision, pick another loopback port with {portExample}. Stop the process with Ctrl+C and the browser session ends with it.",
-  overviewBody:
-    "The current client provides a responsive thread and search rail, Runtime-owned session facts, transcript and tool receipts, and a composer. It can create, select, rename, and archive threads; start or steer turns; interrupt work; resolve approvals; and answer Runtime user-input requests. The browser is another view of the same local Runtime — it does not create a second cloud account, copy provider credentials into browser storage, or weaken the configured approval and sandbox policies.",
-  authTitle: "Authentication boundary",
-  authLead:
-    "The browser-launch URL carries a random, short-lived, one-time bootstrap capability — never the Runtime bearer token. A loopback request exchanges it for an HttpOnly, SameSite=Strict, process-local session cookie and immediately invalidates the capability. Reused, expired, malformed, and non-loopback bootstrap attempts fail closed. The Runtime token is never placed in rendered HTML, browser storage, URL queries or fragments, or browser-launch arguments. Cookie-authenticated state-changing requests must also present the exact local web origin; cross-origin browser requests are rejected.",
-  localTitle: "Local means local",
-  localLead:
-    "{webCommand} accepts only {portFlag} — there is no {hostFlag} and no insecure-auth option on this command. Do not treat it as a public website or expose its port through router forwarding, a public reverse proxy, or a tunnel. The separate {mobileCommand} and {httpFlag} modes carry different deployment and authentication contracts; read the Runtime API documentation before operating either one, especially before selecting a non-loopback bind.",
-  remoteTitle: "Remote control from the web app",
-  remoteLead:
-    "Available now. To continue the exact running local session from the signed-in Codewhale web app, type /rc in that session or launch with codewhale rc, then approve the one-time code in your browser. While the lease is active the browser owns new prompts and approvals and the terminal stays a readable safety surface; interrupt remains available from both.",
-  remoteBody:
-    "Once connected, the banner and a transcript note show the live session link. /rc open opens it in your browser, /rc link prints it, /rc status shows who owns the session, and /rc stop returns it to the terminal. A dropped connection keeps local input locked until the last web lease expires, so two controllers never race. Every folder you enroll from one terminal shares a single stable device id, so the web app lists one computer per machine, not one per session. This is different from the loopback browser client above: /rc pairs a local session with your account; codewhale web serves a local page with no account at all.",
-  troubleshootingTitle: "Troubleshooting",
-  troubleshootingLead:
-    "If port 7878 is occupied, pass an unused --port. If the browser cannot be opened, the command exits with an error rather than leaving a reusable bootstrap capability behind; check the OS default-browser setup and start again. If the page loads but a provider is unavailable, inspect codewhale doctor and /provider — the web command does not configure or move provider credentials. If a session expired, restart codewhale web to mint a new process-local session; reusing an old bootstrap URL is expected to fail.",
+  title: "Open the browser client",
+  lede:
+    "Prefer a browser window to a terminal? Codewhale can serve its own client on your machine. It is another view of the same local session — same approvals, same sandbox, no account.",
+  sections: [
+    {
+      id: "start",
+      title: "Start it",
+      blocks: [
+        { p: "Run this from the folder you want Codewhale to work in:" },
+        { code: "codewhale web\ncodewhale web --port 8788   # if 7878 is taken", lang: "Terminal" },
+        {
+          p: "Codewhale starts a local server at `http://127.0.0.1:7878`, prints a one-time link, and opens it in your default browser. If the browser does not open, use the printed link within ten minutes. Press Ctrl+C in the terminal to stop; the browser session ends with it.",
+        },
+      ],
+    },
+    {
+      id: "use",
+      title: "Work in the browser",
+      blocks: [
+        {
+          p: "The browser client lists and searches your threads, shows the transcript with each tool's result, and has a composer. You can start, steer, or interrupt a turn, answer approvals, and rename or archive threads. Your provider keys stay in Codewhale; nothing is copied into browser storage.",
+        },
+      ],
+    },
+    {
+      id: "local",
+      title: "Keep it local",
+      blocks: [
+        {
+          list: [
+            "The server only listens on `127.0.0.1`. There is no option to open it to your network, and it cannot run without authentication.",
+            "The link carries a single-use code, not your access token. Opening it swaps the code for a cookie tied to this process, and the code stops working.",
+            "Do not forward the port through a router, a public proxy, or a tunnel. For a phone or another machine, see the [Runtime API](/docs/runtime-api) and read its authentication rules first.",
+          ],
+        },
+      ],
+    },
+    {
+      id: "remote",
+      title: "Continue a session from the web app",
+      blocks: [
+        {
+          p: "This is different: it hands a session already running in your terminal to the signed-in Codewhale web app, so you can keep going from another device. It needs a [Codewhale account](/docs/auth#account).",
+        },
+        {
+          code: `/rc          # in the running session; approve the one-time code in your browser
+/rc status   # who controls the session now
+/rc link     # print the session link
+/rc stop     # hand control back to the terminal`,
+          lang: "Codewhale",
+        },
+        {
+          p: "While the web app holds the session, new prompts and approvals come from the browser, and the terminal stays readable. Either side can interrupt. You can also start a session this way with `codewhale rc`.",
+        },
+      ],
+    },
+    {
+      id: "fix",
+      title: "If something goes wrong",
+      blocks: [
+        {
+          rows: [
+            ["Port in use", "Pass a free port with `--port`."],
+            ["Browser did not open", "Copy the printed link into a browser on the same machine within ten minutes."],
+            ["Link expired or already used", "That is expected. Run `codewhale web` again for a new one."],
+            ["No model answers", "The web command does not set up providers. Check `codewhale doctor` and `/provider`."],
+          ],
+        },
+      ],
+    },
+  ],
+  next: [
+    {
+      href: "/docs/runtime-api",
+      label: "Automate with the Runtime API",
+      note: "The local API the browser client is built on.",
+    },
+    {
+      href: "/docs/auth",
+      label: "Connect a provider",
+      note: "Give the browser client a model to talk to.",
+    },
+    {
+      href: "/docs/modes",
+      label: "Set modes and approvals",
+      note: "The same approvals apply in the browser.",
+    },
+  ],
   sourceNote: "Source document: docs/WEB.md · Update docs-map.ts when changing.",
 };

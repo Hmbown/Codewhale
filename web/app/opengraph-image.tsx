@@ -14,10 +14,10 @@ export const contentType = "image/png";
 // regeneration on the site fail with a 500 and serve its build snapshot forever.
 async function brandSvgs(): Promise<[string, string]> {
   const [mark, wordmark] = await Promise.all([
-    readFile(join(process.cwd(), "public/brand/mark-reversed.svg")),
+    readFile(join(process.cwd(), "public/whale/rest.svg")),
     readFile(join(process.cwd(), "public/brand/wordmark-inverted.svg")),
   ]);
-  return [mark.toString().replace("currentColor", "#ffffff"), wordmark.toString()];
+  return [mark.toString(), wordmark.toString()];
 }
 
 export default async function OpengraphImage() {
@@ -25,8 +25,9 @@ export default async function OpengraphImage() {
   const markDataUrl = `data:image/svg+xml;base64,${Buffer.from(markSvg).toString("base64")}`;
   const wordmarkDataUrl = `data:image/svg+xml;base64,${Buffer.from(wordmarkSvg).toString("base64")}`;
 
-  // Brand navy ground, the white mark and inverted wordmark, and the identity
-  // phrase once — the wordmark is the name, so no second "Codewhale" heading.
+  // The ocean: navy rising into the logo's blue, the whale in the logo
+  // gradient, the inverted wordmark, and the identity phrase once — the
+  // wordmark is the name, so no second "Codewhale" heading.
   return new ImageResponse(
     (
       <div
@@ -38,14 +39,14 @@ export default async function OpengraphImage() {
           alignItems: "center",
           justifyContent: "center",
           gap: 34,
-          background: "#142352",
+          backgroundImage: "linear-gradient(180deg, #0a1d48 0%, #061431 55%, #0b48bb 100%)",
           fontFamily: "sans-serif",
         }}
       >
-        <img src={markDataUrl} width={200} height={200} alt="" />
+        <img src={markDataUrl} width={240} height={240} alt="" />
         {/* The family wordmark is 1024x160 (6.4:1). */}
         <img src={wordmarkDataUrl} width={532} height={83} alt="Codewhale" />
-        <div style={{ display: "flex", fontSize: 30, color: "#F6F2E8", marginTop: 14 }}>
+        <div style={{ display: "flex", fontSize: 30, color: "#efeeeb", marginTop: 14 }}>
           {IDENTITY_PHRASE}
         </div>
       </div>
