@@ -7540,15 +7540,14 @@ async fn isolated_runtime_chat_provider_request_contains_no_host_context_or_tool
         "isolated Chat must expose no provider tools"
     );
     // #6517: the engine and the Runtime Chat relay once carried two different
-    // isolated-chat prompts. The engine must send exactly what the relay does.
+    // isolated-chat prompts. The engine sends the one shared constant; the
+    // relay's own test pins `dedicated_chat_system_prompt(None)` to the same
+    // constant, so core tests need no edge into the relay (runtime ratchet).
     let system = match request.system.as_ref() {
         Some(SystemPrompt::Text(text)) => text.clone(),
         other => panic!("isolated Chat should send one text system prompt: {other:?}"),
     };
-    assert_eq!(
-        system,
-        crate::runtime_chat_relay::dedicated_chat_system_prompt(None)
-    );
+    assert_eq!(system, ISOLATED_CHAT_SYSTEM_PROMPT);
     let serialized = serde_json::to_string(&request).expect("serialize captured request");
     assert!(serialized.contains("Say hello."), "{serialized}");
     assert!(serialized.contains("Attachment omitted"), "{serialized}");
@@ -12363,10 +12362,12 @@ fn question_tool_survives_the_tool_surface_in_every_posture() {
             .any(|tool| tool.name == REQUEST_USER_INPUT_NAME)
     );
 
+    // Headless exec's default deny list; `exec_agent` tests pin that
+    // `exec_disallowed_tools(None)` produces it.
     let headless = policy_for_catalog(
         vec![api_tool("read_file"), api_tool(REQUEST_USER_INPUT_NAME)],
         None,
-        crate::exec_agent::exec_disallowed_tools(None),
+        Some(vec![REQUEST_USER_INPUT_NAME.to_string()]),
     );
     assert!(
         !headless
