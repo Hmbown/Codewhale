@@ -133,10 +133,19 @@ boundary has held since v0.9.1):
 - **`crates/models`** - Provider request/response models and the offline model
   metadata catalog.
 - **`crates/palette`** - Colour tokens, themes, and contrast math for the
-  terminal UI.
+  terminal UI. Its `ratatui` feature (on by default) gates everything that
+  renders; theme ids, setting normalizers and hex parsing compile without it,
+  which is how the runtime links it.
 - **`crates/paths`** - User-scoped runtime path authority (`CODEWHALE_HOME`
   and platform home resolution).
 - **`crates/protocol`** - Request/response framing and protocol types.
+- **`crates/runtime`** - `codewhale-runtime`, the headless runtime being
+  split out of `crates/tui` (`docs/design/TUI_DECONSTRUCTION.md`). Today it
+  holds the leaf modules that moved first (retry status, safe labels, sleep
+  guard, session tree, ...) and `host_terminal`, the one port through which
+  runtime code asks the terminal UI for a terminal effect. It never depends on
+  the TUI, `ratatui` or `crossterm`; `scripts/check-command-crate-boundaries.py`
+  enforces that and ratchets the runtime -> UI references still in `crates/tui`.
 - **`crates/secrets`** - OS keyring integration for API key storage, plus the
   shared output sanitizer (`sanitize`) and redaction (`redact`) that UI and
   runtime code both call.

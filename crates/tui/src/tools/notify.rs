@@ -177,9 +177,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_method_off_still_reports_success_to_the_model() {
+    async fn the_model_sees_success_whatever_the_host_did() {
         // The description promises a *silent* no-op: whatever the host did
         // with the notification, the model sees success (nothing to retry).
+        // No host is installed in this test binary, so this is the no-host
+        // receipt; `method = "off"` through the TUI host is covered by
+        // `tui::notifications` (`notify_model_honors_the_installed_off_method`)
+        // and `tui::ui::terminal` (`tui_host_routes_the_notify_tool_through_the_installed_method`).
 
         let result = NotifyTool
             .execute(json!({"title": "done"}), &ctx())

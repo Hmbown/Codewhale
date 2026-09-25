@@ -376,10 +376,12 @@ jobs:
           RUST_MIN_STACK: "8388608"
         # nextest fails when the filter selects no test (`--no-tests=fail`),
         # so moving these modules to another crate cannot turn this step into
-        # a silent 0-test pass. Name every package that owns safety tests
-        # explicitly; add `-p codewhale-runtime` when those modules move there.
+        # a silent 0-test pass. It does not catch a step that merely shrinks,
+        # so name every package that owns safety tests explicitly:
+        # codewhale-runtime owns `safe_label` (its hostile-authority test)
+        # since RS-2; add the next package when another safety module moves.
         run: |
-          sh scripts/with-hermetic-test-home.sh cargo nextest run -p codewhale-tui --lib --locked --no-tests=fail -E 'test(auto_review) | test(authority) | test(sandbox)'
+          sh scripts/with-hermetic-test-home.sh cargo nextest run -p codewhale-tui -p codewhale-runtime --lib --locked --no-tests=fail -E 'test(auto_review) | test(authority) | test(sandbox)'
           sh scripts/with-hermetic-test-home.sh cargo test -p codewhale-execpolicy --locked
 
   lint:
@@ -458,9 +460,20 @@ jobs:
         run: python3 scripts/check-provider-registry.py
       - name: Check command-contract prototype boundary
         if: needs.changes.outputs.heavy == 'true'
+        # The runtime -> UI ratchet baseline is compared with the one at the
+        # PR base too, so a hand-edited JSON cannot raise it.
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           python3 scripts/test_check_command_crate_boundaries.py
-          python3 scripts/check-command-crate-boundaries.py
+          baseline="${PR_BASE_SHA:-${PUSH_BEFORE_SHA:-}}"
+          if [[ -n "${baseline}" && ! "${baseline}" =~ ^0+$ ]]; then
+            git fetch --no-tags origin "${baseline}"
+            python3 scripts/check-command-crate-boundaries.py --baseline-ref "${baseline}"
+          else
+            python3 scripts/check-command-crate-boundaries.py
+          fi
       - name: Check command migration manifest
         if: needs.changes.outputs.heavy == 'true'
         env:

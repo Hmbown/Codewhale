@@ -1132,6 +1132,7 @@ mod tests {
     /// the installed method decides suppression before any sink write.
     #[test]
     fn configured_method_off_silences_the_tool_emission() {
+        let _lock = env_lock();
         let _restore = ConfiguredMethodRestore::capture();
         install_configured_method(Method::Off);
 
@@ -1153,6 +1154,34 @@ mod tests {
             sink.is_empty(),
             "configured method=off must silence the notify tool path"
         );
+    }
+
+    /// The function the host port calls for the `notify` tool must read the
+    /// installed method: `[notifications] method = "off"` silences the tool
+    /// and the receipt says so. A `notify_model` that ignored
+    /// `configured_method()` would pass the test above but fail this one.
+    #[test]
+    fn notify_model_honors_the_installed_off_method() {
+        let _lock = env_lock();
+        let _method_restore = ConfiguredMethodRestore::capture();
+        let _gate_restore = NotificationGateRestore::capture();
+        let previous_condition = current_attention_condition();
+        // `condition = "always"` so the attention policy (checked first) lets
+        // the call reach the method check whatever the test runner's focus.
+        let off: crate::config::Config = toml::from_str(
+            r#"
+            [notifications]
+            method = "off"
+            condition = "always"
+            "#,
+        )
+        .expect("method=off config should parse");
+        let _ = settings(&off);
+
+        let receipt = notify_model("done", Some("all tests pass"));
+
+        install_attention_condition(previous_condition);
+        assert_eq!(receipt, DeliveryOutcome::SuppressedByMethod.receipt());
     }
 
     #[test]
@@ -1592,6 +1621,8 @@ mod tests {
     /// pair can never silently fall back to `Auto`.
     #[test]
     fn configured_method_round_trips_every_variant() {
+        // Serialized with the tests that deliver through the installed method.
+        let _lock = env_lock();
         let _restore = ConfiguredMethodRestore::capture();
         for method in [
             Method::Auto,

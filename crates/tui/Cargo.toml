@@ -142,6 +142,7 @@ codewhale-build-support = { path = "../build-support", version = "0.10.0" }
 [dev-dependencies]
 codewhale-runtime = { path = "../runtime", version = "0.10.0", features = [
     "test-support",
+    "test-thread-scoped-state",
 ] }
 codewhale-models = { path = "../models", version = "0.10.0", features = [
     "test-support",

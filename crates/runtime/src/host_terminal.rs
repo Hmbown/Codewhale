@@ -84,21 +84,28 @@ pub fn host() -> &'static dyn HostTerminal {
 /// was on when the guard was created.
 #[must_use = "raw mode is resumed when the guard drops"]
 pub struct RawModeSuspension {
+    /// The host that suspended raw mode resumes it.
+    host: &'static dyn HostTerminal,
     resume: bool,
 }
 
 /// Leave raw mode around an interactive child; resume it when the returned
 /// guard drops, only if it was on to begin with.
 pub fn suspend_raw_mode() -> RawModeSuspension {
+    suspend_raw_mode_on(host())
+}
+
+fn suspend_raw_mode_on(host: &'static dyn HostTerminal) -> RawModeSuspension {
     RawModeSuspension {
-        resume: host().suspend_raw_mode(),
+        host,
+        resume: host.suspend_raw_mode(),
     }
 }
 
 impl Drop for RawModeSuspension {
     fn drop(&mut self) {
         if self.resume {
-            host().resume_raw_mode();
+            self.host.resume_raw_mode();
         }
     }
 }
@@ -106,6 +113,45 @@ impl Drop for RawModeSuspension {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Records raw-mode calls. Each test owns its own `static` instance, so
+    /// they never share counters.
+    struct CountingHost {
+        raw: AtomicBool,
+        suspends: AtomicUsize,
+        resumes: AtomicUsize,
+    }
+
+    impl CountingHost {
+        const fn new(raw: bool) -> Self {
+            Self {
+                raw: AtomicBool::new(raw),
+                suspends: AtomicUsize::new(0),
+                resumes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl HostTerminal for CountingHost {
+        fn suspend_raw_mode(&self) -> bool {
+            self.suspends.fetch_add(1, Ordering::SeqCst);
+            self.raw.swap(false, Ordering::SeqCst)
+        }
+
+        fn resume_raw_mode(&self) {
+            self.resumes.fetch_add(1, Ordering::SeqCst);
+            self.raw.store(true, Ordering::SeqCst);
+        }
+
+        fn notify_model(&self, _title: &str, _body: Option<&str>) -> &'static str {
+            "unused"
+        }
+
+        fn set_terminal_focused(&self, _focused: bool) {}
+
+        fn apply_notification_settings(&self, _config: &NotificationsConfig) {}
+    }
 
     #[test]
     fn no_host_suspension_is_a_no_op() {
@@ -113,5 +159,32 @@ mod tests {
         // mode off, so the guard never asks to resume it.
         let guard = suspend_raw_mode();
         assert!(!guard.resume);
+    }
+
+    #[test]
+    fn raw_mode_that_was_on_is_resumed_exactly_once_when_the_guard_drops() {
+        static HOST: CountingHost = CountingHost::new(true);
+        let guard = suspend_raw_mode_on(&HOST);
+        assert!(
+            !HOST.raw.load(Ordering::SeqCst),
+            "raw mode is off while suspended"
+        );
+        assert_eq!(HOST.resumes.load(Ordering::SeqCst), 0);
+        drop(guard);
+        assert!(
+            HOST.raw.load(Ordering::SeqCst),
+            "raw mode is back on after the guard"
+        );
+        assert_eq!(HOST.suspends.load(Ordering::SeqCst), 1);
+        assert_eq!(HOST.resumes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn raw_mode_that_was_off_is_never_turned_on_by_the_guard() {
+        static HOST: CountingHost = CountingHost::new(false);
+        drop(suspend_raw_mode_on(&HOST));
+        assert_eq!(HOST.suspends.load(Ordering::SeqCst), 1);
+        assert_eq!(HOST.resumes.load(Ordering::SeqCst), 0);
+        assert!(!HOST.raw.load(Ordering::SeqCst));
     }
 }

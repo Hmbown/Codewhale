@@ -213,6 +213,37 @@ class RatchetTests(unittest.TestCase):
         rises, drops = self.graph.compare({"counts": {"prod": {"core|tui": 3}}}, report)
         self.assertEqual((rises, drops), ([], ["prod core|tui: 3 -> 2"]))
 
+    def test_super_chains_that_reach_the_root_count(self) -> None:
+        report = self.report({
+            "lib.rs": "mod core; mod tui;\n",
+            "core/mod.rs": (
+                "mod inner;\n"
+                "fn f() { super::tui::a(); }\n"
+                "pub(in super::super) fn g() {}\n"
+                "#[cfg(test)]\nmod tests { use super::super::{tui::B, x}; use super::*; }\n"
+            ),
+            # Depth 2: two `super`s reach the root, one stays inside `core`.
+            "core/inner.rs": "use super::super::tui as ui;\nfn f() { super::tui::local(); }\n",
+            "tui.rs": "",
+        })
+        self.assertEqual(report.counts["prod"], {"core|tui": 2})
+        self.assertEqual(report.counts["test"], {"core|tui": 1})
+
+    def test_hand_raised_baseline_fails_against_the_base(self) -> None:
+        previous = {"counts": {"prod": {"tools|tui": 8}}}
+        self.assertEqual(self.graph.baseline_raises(previous, previous), [])
+        self.assertEqual(
+            self.graph.baseline_raises(previous, {"counts": {"prod": {"tools|tui": 7}}}), []
+        )
+        self.assertEqual(
+            self.graph.baseline_raises(previous, {"counts": {"prod": {"tools|tui": 9}}}),
+            ["prod tools|tui: 8 -> 9"],
+        )
+        self.assertEqual(
+            self.graph.baseline_raises(previous, {"counts": {"test": {"core|tui": 1}}}),
+            ["test core|tui: 0 -> 1 (new pair)"],
+        )
+
     def test_checked_in_baseline_holds(self) -> None:
         self.assertEqual(self.graph.check(), [])
 

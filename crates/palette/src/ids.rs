@@ -229,3 +229,50 @@ pub fn normalize_hex_rgb_color(value: &str) -> Option<String> {
     let (r, g, b) = parse_hex_rgb(value)?;
     Some(format!("#{r:02x}{g:02x}{b:02x}"))
 }
+
+// Theme ids and hex parsing are what the runtime links (without `ratatui`),
+// so their tests must not sit behind the `ratatui` gate that `tests.rs` needs.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_rgb_parses_with_or_without_hash_and_rejects_malformed_input() {
+        assert_eq!(parse_hex_rgb("#1a1B26"), Some((26, 27, 38)));
+        assert_eq!(parse_hex_rgb("  1a1b26 "), Some((26, 27, 38)));
+        assert_eq!(
+            normalize_hex_rgb_color("#1A1B26").as_deref(),
+            Some("#1a1b26")
+        );
+        for bad in ["#123", "#zzzzzz", "", "#1a1b2", "#1a1b267", "#+1a1b2"] {
+            assert_eq!(parse_hex_rgb(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn theme_names_normalize_aliases_and_reject_unknown_names() {
+        assert_eq!(normalize_theme_name(" Default "), Some("system"));
+        assert_eq!(normalize_theme_name("whale"), Some("dark"));
+        assert_eq!(normalize_theme_name("b&w"), Some("grayscale"));
+        assert_eq!(normalize_theme_name("not-a-theme"), None);
+        for id in SELECTABLE_THEMES {
+            assert_eq!(ThemeId::from_name(id.name()), Some(*id), "{}", id.name());
+        }
+    }
+
+    #[test]
+    fn custom_theme_selector_accepts_only_bounded_ascii_slugs() {
+        assert_eq!(
+            normalize_user_theme_selector("custom: My_Theme-2 "),
+            Ok(Some("custom:my_theme-2".to_string()))
+        );
+        assert_eq!(normalize_user_theme_selector("dark"), Ok(None));
+        for bad in ["custom:", "custom:a/b", "custom:../x", "custom:ünïcode"] {
+            assert!(normalize_user_theme_selector(bad).is_err(), "{bad:?}");
+        }
+        assert!(normalize_user_theme_selector(&format!("custom:{}", "a".repeat(65))).is_err());
+        assert_eq!(normalize_theme_setting("whale").as_deref(), Ok("dark"));
+        assert!(normalize_theme_setting("custom:../x").is_err());
+        assert!(normalize_theme_setting("nope").is_err());
+    }
+}

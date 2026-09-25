@@ -1065,3 +1065,37 @@ impl crate::host_terminal::HostTerminal for TuiHostTerminal {
 pub(crate) fn install_host_terminal() {
     let _ = crate::host_terminal::install(Box::new(TuiHostTerminal));
 }
+
+#[cfg(test)]
+mod host_terminal_tests {
+    use super::TuiHostTerminal;
+    use crate::host_terminal::HostTerminal;
+    use crate::notify::DeliveryOutcome;
+    use crate::tui::notifications::{configured_method, install_configured_method};
+
+    /// The `notify` tool reaches delivery only through the installed host:
+    /// the TUI's host must hand the model's text to the delivery path that
+    /// honors the installed method, so `method = "off"` stays silent.
+    #[test]
+    fn tui_host_routes_the_notify_tool_through_the_installed_method() {
+        let _lock = crate::test_support::lock_test_env();
+        let previous_method = configured_method();
+        let config = |text: &str| -> crate::config::Config {
+            toml::from_str(text).expect("notifications config should parse")
+        };
+        // Settings reach the host the way the composition root sends them;
+        // `condition = "always"` so the attention policy (checked first)
+        // lets the call reach the method check whatever the runner's focus.
+        TuiHostTerminal.apply_notification_settings(
+            &config("[notifications]\nmethod = \"off\"\ncondition = \"always\"\n")
+                .notifications_config(),
+        );
+
+        let receipt = TuiHostTerminal.notify_model("done", None);
+
+        TuiHostTerminal
+            .apply_notification_settings(&config("[notifications]\n").notifications_config());
+        install_configured_method(previous_method);
+        assert_eq!(receipt, DeliveryOutcome::SuppressedByMethod.receipt());
+    }
+}

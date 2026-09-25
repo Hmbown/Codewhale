@@ -35,7 +35,11 @@ The baseline is `scripts/runtime-boundary-baseline.json`. `--check` (default)
 fails on any increased count or new key and prints `file:line` for it; it also
 fails when a count dropped and the baseline was not lowered in the same change,
 so the baseline stays honest. `--update` rewrites the baseline and refuses to
-raise any count.
+raise any count. `--baseline-ref REV` (CI passes the PR base) also fails when
+the committed baseline holds any count above the baseline at REV, so a
+hand-edited JSON cannot raise the ratchet either.
+
+`super::` chains that climb to the crate root count like `crate::` paths.
 
 See docs/design/TUI_DECONSTRUCTION.md (runtime split, ratchet).
 """
@@ -47,6 +51,7 @@ import collections
 import json
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,7 +59,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TUI_SRC = REPO_ROOT / "crates" / "tui" / "src"
 RUNTIME_SRC = REPO_ROOT / "crates" / "runtime" / "src"
-BASELINE = REPO_ROOT / "scripts" / "runtime-boundary-baseline.json"
+BASELINE_REPO_PATH = "scripts/runtime-boundary-baseline.json"
+BASELINE = REPO_ROOT / BASELINE_REPO_PATH
 
 SEEDS = (
     "core",
@@ -288,6 +294,9 @@ class Crate:
 
 USE_RE = re.compile(r"\buse\s+crate::")
 PATH_RE = re.compile(r"(?<![\$\w])crate::(\w+)")
+# `super::super::tui::x` reaches the crate root just like `crate::tui::x`.
+SUPER_RE = re.compile(r"(?<![\$\w:])((?:super\s*::\s*)+)(\{|\w+)")
+INLINE_MOD_RE = re.compile(r"\bmod\s+\w+\s*\{")
 UILIB_RE = re.compile(r"(?<![\w:])(ratatui|crossterm|codewhale_tui)(?:::|\s*;|\s*\{)")
 DOC_LINK_RE = re.compile(r"\[`?crate::(tui|commands)\b")
 
@@ -368,6 +377,43 @@ def file_is_test(rel: str, exact: set[str], prefixes: set[str]) -> bool:
     )
 
 
+def file_depth(rel: str) -> int:
+    """Module depth of a source file below the crate root (`lib.rs` is 0)."""
+    parts = rel.split("/")
+    if len(parts) == 1:
+        return 0 if parts[0] in ("lib.rs", "main.rs") else 1
+    return len(parts) - 1 if parts[-1] == "mod.rs" else len(parts)
+
+
+def inline_mod_spans(code: str) -> list[tuple[int, int]]:
+    """Byte ranges of inline `mod name { ... }` bodies (each adds one level)."""
+    return [(m.end() - 1, match_brace(code, m.end() - 1)) for m in INLINE_MOD_RE.finditer(code)]
+
+
+def super_root_targets(code: str, rel: str) -> list[tuple[int, str]]:
+    """`(offset, first segment)` for every `super::` chain that climbs to the crate root.
+
+    A chain of k `super`s written at module depth d (file depth plus the
+    enclosing inline `mod` blocks) names the crate root when k == d; a
+    shorter chain stays inside the module and is not a cross-module edge.
+    """
+    base = file_depth(rel)
+    spans = inline_mod_spans(code)
+    out: list[tuple[int, str]] = []
+    for m in SUPER_RE.finditer(code):
+        k = m.group(1).count("super")
+        depth = base + sum(1 for a, b in spans if a < m.start() < b)
+        if k != depth:
+            continue
+        if m.group(2) == "{":
+            end = match_brace(code, m.end() - 1)
+            for _, path in use_leaves(code[m.end() : end]):
+                out.append((m.start(), path[0]))
+        else:
+            out.append((m.start(), m.group(2)))
+    return out
+
+
 def collect_refs(crate: Crate, all_modules: set[str], prefix: str) -> list[Ref]:
     exact, prefixes = test_file_set(crate)
     refs: list[Ref] = []
@@ -409,6 +455,13 @@ def collect_refs(crate: Crate, all_modules: set[str], prefix: str) -> list[Ref]:
                 continue
             line = code.count("\n", 0, m.start()) + 1
             refs.append(Ref(kind_at(m.start()), mod, target_of(m.group(1)), f"{prefix}/{rel}", line, lines[line - 1].strip()[:160]))
+        for pos, name in super_root_targets(code, rel):
+            # `pub(in super::super)` and glob imports name no item; only a
+            # known module or crate-root binding is an edge.
+            if name not in all_modules and name not in crate.root_names:
+                continue
+            line = code.count("\n", 0, pos) + 1
+            refs.append(Ref(kind_at(pos), mod, target_of(name), f"{prefix}/{rel}", line, lines[line - 1].strip()[:160]))
     return refs
 
 
@@ -533,6 +586,41 @@ def load_baseline(path: Path = BASELINE) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def load_baseline_at_ref(ref: str, root: Path = REPO_ROOT) -> dict | None:
+    """The baseline as committed at `ref`; None when it did not exist yet."""
+    commit = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+    if commit.returncode != 0:
+        raise ValueError(f"baseline ref {ref!r} is unavailable: {commit.stderr.strip()}")
+    shown = subprocess.run(
+        ["git", "show", f"{ref}:{BASELINE_REPO_PATH}"],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+    if shown.returncode != 0:
+        return None
+    return json.loads(shown.stdout)
+
+
+def baseline_raises(previous: dict, current: dict) -> list[str]:
+    """Counts the committed baseline holds above the baseline it replaces.
+
+    The local `--update` refuses to raise, but the JSON is an ordinary file:
+    without this comparison a change could add a reference and bump the
+    count by hand in the same commit, and `check` would pass.
+    """
+    raised: list[str] = []
+    prev_counts = previous.get("counts", {})
+    for cat in CATEGORIES:
+        prev = prev_counts.get(cat, {})
+        for key, n in current.get("counts", {}).get(cat, {}).items():
+            b = prev.get(key, 0)
+            if n > b:
+                raised.append(f"{cat} {key}: {b} -> {n}" + (" (new pair)" if key not in prev else ""))
+    return raised
+
+
 def baseline_document(report: Report) -> dict:
     return {
         "_comment": (
@@ -545,13 +633,34 @@ def baseline_document(report: Report) -> dict:
     }
 
 
-def check(path: Path = BASELINE, report: Report | None = None) -> list[str]:
-    """Return violation lines (empty when the ratchet holds)."""
+def check(
+    path: Path = BASELINE,
+    report: Report | None = None,
+    baseline_ref: str | None = None,
+) -> list[str]:
+    """Return violation lines (empty when the ratchet holds).
+
+    With `baseline_ref` (CI passes the PR base), the committed baseline must
+    also be no higher than the one at that revision.
+    """
     report = report or build_report()
     if not path.is_file():
         return [f"missing baseline {path.relative_to(REPO_ROOT)}; run with --update"]
-    rises, drops = compare(load_baseline(path), report)
     problems = []
+    if baseline_ref:
+        try:
+            previous = load_baseline_at_ref(baseline_ref)
+        except (ValueError, json.JSONDecodeError) as error:
+            return [str(error)]
+        if previous is not None:
+            raised = baseline_raises(previous, load_baseline(path))
+            if raised:
+                problems.append(
+                    f"the baseline was raised relative to {baseline_ref} (counts only go down; "
+                    "remove the reference instead of editing the JSON):"
+                )
+                problems.extend(f"  {r}" for r in raised)
+    rises, drops = compare(load_baseline(path), report)
     if rises:
         problems.append("runtime -> UI references rose (the ratchet only goes down):")
         problems.extend(f"  {r}" for r in rises)
@@ -570,6 +679,10 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--check", action="store_true", help="enforce the ratchet (default)")
     mode.add_argument("--update", action="store_true", help="lower the baseline to the current counts")
     mode.add_argument("--report", action="store_true", help="print counts and closure as JSON")
+    parser.add_argument(
+        "--baseline-ref",
+        help="git revision whose committed baseline the current one may not exceed (CI: the PR base)",
+    )
     args = parser.parse_args(argv)
 
     report = build_report()
@@ -593,7 +706,7 @@ def main(argv: list[str] | None = None) -> int:
         BASELINE.write_text(json.dumps(baseline_document(report), indent=2) + "\n", encoding="utf-8")
         print(f"[runtime-boundary] baseline written: {totals(report.counts)}")
         return 0
-    problems = check(report=report)
+    problems = check(report=report, baseline_ref=args.baseline_ref)
     if problems:
         print("[runtime-boundary] FAIL", file=sys.stderr)
         for p in problems:

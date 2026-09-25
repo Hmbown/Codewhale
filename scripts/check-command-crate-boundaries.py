@@ -39,6 +39,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import re
@@ -219,7 +220,12 @@ def check_dependency_graph(graph: dict[str, set[str]]) -> list[BoundaryViolation
 def cargo_tree_packages(package: str) -> set[str]:
     """Package names in `cargo tree -p <package> -e normal,build` (per-package features)."""
     result = subprocess.run(
-        ["cargo", "tree", "-p", package, "-e", "normal,build", "--prefix", "none", "--locked"],
+        # `--target all`: a dependency behind `cfg(windows)` counts too, not
+        # only the ones the host target resolves.
+        [
+            "cargo", "tree", "-p", package, "-e", "normal,build", "--target", "all",
+            "--prefix", "none", "--locked",
+        ],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -336,9 +342,9 @@ def load_runtime_ratchet():
     return module
 
 
-def check_runtime_ratchet() -> list[BoundaryViolation]:
+def check_runtime_ratchet(baseline_ref: str | None = None) -> list[BoundaryViolation]:
     """Runtime -> UI references may only go down (docs/design/TUI_DECONSTRUCTION.md, runtime split)."""
-    problems = load_runtime_ratchet().check()
+    problems = load_runtime_ratchet().check(baseline_ref=baseline_ref)
     return [BoundaryViolation("runtime-ratchet", "scripts/runtime-boundary-baseline.json", p) for p in problems]
 
 
@@ -346,6 +352,7 @@ def run_checks(
     metadata: dict | None = None,
     tree: Callable[[str], set[str]] | None = None,
     ratchet: bool = True,
+    baseline_ref: str | None = None,
 ) -> list[BoundaryViolation]:
     """Run all boundary checks; return the collected violations."""
     graph = dependency_graph(metadata) if metadata is not None else dependency_graph(
@@ -359,13 +366,18 @@ def run_checks(
         if rule.source_dir is not None:
             violations.extend(check_source_dir(rule))
     if ratchet:
-        violations.extend(check_runtime_ratchet())
+        violations.extend(check_runtime_ratchet(baseline_ref))
     return violations
 
 
 def main(argv: list[str] | None = None) -> int:
-    del argv  # reserved for future flags (e.g. --update); check is the default
-    violations = run_checks()
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
+    parser.add_argument(
+        "--baseline-ref",
+        help="git revision (CI: the PR base) whose runtime ratchet baseline may not be exceeded",
+    )
+    args = parser.parse_args(argv)
+    violations = run_checks(baseline_ref=args.baseline_ref)
     if violations:
         print("[command-crate-boundaries] FAIL", file=sys.stderr)
         for violation in violations:

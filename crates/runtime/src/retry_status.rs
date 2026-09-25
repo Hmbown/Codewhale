@@ -86,7 +86,7 @@ impl RetryState {
 
 /// Lazy-init the cell on first read so callers don't have to initialize
 /// process-wide state at boot.
-#[cfg(not(any(test, feature = "test-support")))]
+#[cfg(not(any(test, all(feature = "test-thread-scoped-state", debug_assertions))))]
 fn with_state<R>(f: impl FnOnce(&mut RetryState) -> R) -> R {
     static STATE: OnceLock<Mutex<RetryState>> = OnceLock::new();
     let mut state = STATE
@@ -96,7 +96,7 @@ fn with_state<R>(f: impl FnOnce(&mut RetryState) -> R) -> R {
     f(&mut state)
 }
 
-#[cfg(not(any(test, feature = "test-support")))]
+#[cfg(not(any(test, all(feature = "test-thread-scoped-state", debug_assertions))))]
 fn with_rate_limit<R>(f: impl FnOnce(&mut Option<Instant>) -> R) -> R {
     static STATE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
     let mut state = STATE
@@ -115,7 +115,14 @@ fn with_rate_limit<R>(f: impl FnOnce(&mut Option<Instant>) -> R) -> R {
 /// provider pause into another test's assertions. Scoping by thread removes the
 /// race at its source rather than asking every future test that happens to
 /// perform HTTP to remember a lock.
-#[cfg(any(test, feature = "test-support"))]
+///
+/// This changes behavior (a `Retry-After` pause no longer holds across tokio
+/// worker threads), so it is *not* part of `test-support`, which only adds
+/// helpers. The TUI's tests opt in with `test-thread-scoped-state`, and even
+/// then only a build with debug assertions gets it: an optimized build, e.g.
+/// `cargo build --release --workspace --all-features`, keeps the process-wide
+/// pause.
+#[cfg(any(test, all(feature = "test-thread-scoped-state", debug_assertions)))]
 fn with_state<R>(f: impl FnOnce(&mut RetryState) -> R) -> R {
     #[allow(clippy::type_complexity)]
     static STATE: OnceLock<Mutex<std::collections::HashMap<std::thread::ThreadId, RetryState>>> =
@@ -129,7 +136,7 @@ fn with_state<R>(f: impl FnOnce(&mut RetryState) -> R) -> R {
         .or_insert(RetryState::Idle))
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, all(feature = "test-thread-scoped-state", debug_assertions)))]
 fn with_rate_limit<R>(f: impl FnOnce(&mut Option<Instant>) -> R) -> R {
     #[allow(clippy::type_complexity)]
     static STATE: OnceLock<
