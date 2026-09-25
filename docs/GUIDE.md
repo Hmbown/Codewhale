@@ -519,10 +519,12 @@ codewhale receipts --last
 codewhale receipts <session-id> --format json
 ```
 
-A receipt says what it cannot show. Files changed by a shell command (for
-example `rm` or a build) are not itemized; only file tools are. Terminal
-sessions do not save a passing command's exit code or how long each call
-took. [RECEIPTS.md](RECEIPTS.md) has the full contract.
+A receipt says what it cannot show. A terminal session's receipt lists the
+files a command changed from each turn's workspace snapshots; a Runtime
+thread's lists only file tools. Terminal sessions do not save a passing
+command's exit code or how long each call took. A call Codewhale blocked
+before it started (Auto-Review, a policy, invalid input) is listed as
+blocked, with the reason, and is not counted as run. [RECEIPTS.md](RECEIPTS.md) has the full contract.
 
 ## 8. Sub-agents and Parallel Work
 

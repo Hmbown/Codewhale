@@ -30,9 +30,12 @@ quieter, and Fleet runs can be checked before they spend anything.
   codes, web and MCP calls, agents, approvals and who gave them, and failures.
   They also count what ran without asking and name the posture each turn ran
   under, read from the turn's own record. A call Codewhale blocked before it
-  started is listed as not run, with the reason, and is not counted as run.
-  All three read the records Codewhale
-  already keeps and say what those records do not hold
+  started (Auto-Review or guardian, a tool policy, a refused sandbox
+  escalation, invalid input, a missing tool) is listed as blocked, with the
+  reason, and is not counted as run or as ran without asking. A terminal
+  session's receipt also lists the files a command changed in each turn,
+  from the workspace snapshots taken before and after it. All three read the
+  records Codewhale already keeps and say what those records do not hold
   ([docs/RECEIPTS.md](docs/RECEIPTS.md)). `audit.log` is not that record: it
   logs security events, and it logs an approval only when one is requested,
   which under Full Access is almost never.

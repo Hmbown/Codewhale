@@ -10849,15 +10849,16 @@ fn tool_error_messages_include_actionable_hints() {
     let formatted = format_tool_error(&timeout, "exec_shell");
     assert!(formatted.contains("timed out"));
 
-    // #3020: Plan-mode denials already explain the fix — pass through
-    // verbatim, with no conflicting "Adjust approval mode" suffix.
+    // #3020: Plan-mode denials already explain the fix — no conflicting
+    // "Adjust approval mode" suffix, but the denial lead stays so a receipt
+    // can tell the call never ran.
     let plan_denied = ToolError::permission_denied(
         "'bash' is not available in Plan mode — switch to Work mode (`/mode work`) to run commands and code.",
     );
     let formatted = format_tool_error(&plan_denied, "bash");
     assert_eq!(
         formatted,
-        "'bash' is not available in Plan mode — switch to Work mode (`/mode work`) to run commands and code."
+        "Tool 'bash' was denied: 'bash' is not available in Plan mode — switch to Work mode (`/mode work`) to run commands and code."
     );
 
     // Bare denials still get the actionable suffix.

@@ -55,6 +55,6 @@ pub const DEFAULT_MAX_SNAPSHOTS: usize = 50;
 pub use repo::{
     DEFAULT_MAX_WORKSPACE_BYTES_FOR_SNAPSHOT, GATE_TOO_LARGE_MARKER, GATE_TOO_MANY_ENTRIES_MARKER,
     GATE_UNSAFE_LOCATION_MARKER, PathRestoreAction, PathRestoreOutcome, SIZE_WALK_MAX_ENTRIES,
-    Snapshot, SnapshotId, SnapshotRepo, WorkspaceGate, estimate_workspace_size_bounded,
-    workspace_relative_path,
+    Snapshot, SnapshotId, SnapshotPathChange, SnapshotRepo, WorkspaceGate,
+    estimate_workspace_size_bounded, workspace_relative_path,
 };

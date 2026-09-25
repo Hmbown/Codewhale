@@ -9,15 +9,28 @@
 //! - a Runtime thread (the app, `codewhale serve`): the thread's turn and item
 //!   records plus the `approval.*` events in its append-only event log.
 //!
+//! A terminal session also reads the workspace snapshots the engine already
+//! takes before and after each turn (`crate::snapshot`, when snapshots are
+//! on): their difference is every file the turn changed, including files a
+//! shell command changed, which no tool record names.
+//!
 //! Both are normalized into [`ToolStep`]s and [`ApprovalStep`]s and then
 //! classified by the same code, so `/receipts`, `codewhale receipts`, and
 //! `GET /v1/threads/{id}/receipt` cannot disagree about what happened.
 //!
 //! The builder only reads. It never calls a provider, runs a tool, or writes
-//! a file. It exports no reasoning text and no raw tool output: commands,
+//! a file (reading the snapshots runs `git diff` inside the side repo, which
+//! touches neither the work tree nor the user's repository). It exports no reasoning text and no raw tool output: commands,
 //! queries, and error lines are bounded and passed through the shared secret
 //! redactor. A fact the record does not hold is reported as not recorded,
 //! never inferred from display text (see `docs/RECEIPTS.md`).
+//!
+//! Known limits: a Runtime thread's engine does not tag its snapshots with
+//! the thread, so a thread receipt cannot read them and says that shell file
+//! changes are not itemized. A snapshot difference covers everything that
+//! wrote to the workspace during the turn, not only this agent. Snapshots are
+//! pruned to the newest [`crate::snapshot::DEFAULT_MAX_SNAPSHOTS`], so older
+//! turns have none.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -107,8 +120,12 @@ pub struct ReceiptSource {
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct ReceiptTotals {
-    /// Distinct paths changed by file tools.
+    /// Distinct paths changed, by file tools or (from the turn's workspace
+    /// snapshots) by anything else during the turn.
     pub files_changed: usize,
+    /// Of `files_changed`, paths no file tool changed: a command, a build, or
+    /// another process wrote them during the turn.
+    pub files_changed_outside_file_tools: usize,
     pub files_created: usize,
     pub files_deleted: usize,
     /// Sum over changes whose line counts are recorded.
@@ -134,6 +151,11 @@ pub struct ReceiptTotals {
     pub ran_without_asking: usize,
     /// Actions that ran and failed, plus failed turns.
     pub failures: usize,
+    /// Calls Codewhale refused before they started: an Auto-Review or
+    /// guardian block, a tool-policy or allow-list denial, a sandbox
+    /// escalation the posture cannot grant, invalid input, or a tool that is
+    /// not available. Not counted as run, as failed, or as ran without asking.
+    pub blocked: usize,
     /// Reads, searches, and other calls that are counted but not listed
     /// unless they failed.
     pub other_tool_calls: usize,
@@ -195,6 +217,15 @@ pub struct ReceiptAction {
 pub enum ActionKind {
     FileChange {
         files: Vec<FileTouch>,
+    },
+    /// Files that changed in the workspace during a turn with no file tool
+    /// naming them, read from the turn's before/after snapshots. A command
+    /// changed them, or something else writing to the workspace did.
+    WorkspaceChange {
+        files: Vec<FileTouch>,
+        /// More paths changed than are listed.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
     },
     Command {
         command: String,
@@ -274,10 +305,13 @@ pub enum ActionStatus {
     Ok,
     /// Ran and failed.
     Failed,
-    /// Did not run: held at approval (denied, timed out, never answered), or
-    /// refused by Codewhale before it started (a policy or Auto-Review block,
-    /// invalid input, a tool that is not available).
+    /// Did not run: held at approval (denied, timed out, never answered).
     NotRun,
+    /// Did not run: Codewhale refused it before it started (an Auto-Review
+    /// or guardian block, a policy or allow-list denial, a sandbox escalation
+    /// the posture cannot grant, invalid input, a tool that is not
+    /// available). `error` carries the reason.
+    Blocked,
     Interrupted,
     Running,
     /// The record does not show whether it ran: there is no result, or a
@@ -346,6 +380,14 @@ struct ToolStep {
 /// A turn and the permission posture its own record names, if any.
 type TurnPosture = (String, Option<&'static str>);
 
+/// Files a turn changed, from its before/after workspace snapshots.
+#[derive(Debug, Clone, Default)]
+struct TurnWorkspaceChange {
+    files: Vec<FileTouch>,
+    /// More paths changed than [`MAX_FILES_PER_ACTION`].
+    truncated: bool,
+}
+
 #[derive(Debug, Clone)]
 struct ApprovalStep {
     turn: Option<String>,
@@ -367,7 +409,7 @@ pub(crate) fn session_receipt(
     turn: Option<&str>,
 ) -> anyhow::Result<Receipt> {
     let mut notes = BTreeSet::new();
-    let (steps, turn_postures) = steps_from_messages(messages);
+    let (steps, turn_postures, turn_prompts) = steps_from_messages(messages);
     let approvals = match ApprovalReplay::from_receipts(approval_receipts) {
         Ok(replay) => approvals_from_replay(&replay),
         Err(error) => {
@@ -404,11 +446,49 @@ pub(crate) fn session_receipt(
             "Approvals: this session started before Codewhale kept an approval log (0.9.10, 2026-08-20), so it cannot show which calls asked first.".to_string(),
         );
     }
+    let snapshot_changes = match source.workspace.as_deref() {
+        Some(workspace) => snapshot_turn_changes(
+            std::path::Path::new(workspace),
+            &source.id,
+            &turn_prompts,
+            turn,
+        ),
+        None => Ok(None),
+    };
+    let workspace_changes = match snapshot_changes {
+        Ok(Some((changes, unmatched))) => {
+            notes.insert(
+                "Files changed outside file tools come from the workspace snapshots taken before and after each turn, so they include anything that wrote to the workspace during the turn, not only Codewhale.".to_string(),
+            );
+            if unmatched > 0 {
+                notes.insert(format!(
+                    "Shell file changes: {} without a before/after snapshot (snapshots off, or pruned; the newest {} are kept), so files a command changed there are not itemized.",
+                    plural(unmatched, "turn", "turns"),
+                    crate::snapshot::DEFAULT_MAX_SNAPSHOTS
+                ));
+            }
+            changes
+        }
+        Ok(None) => {
+            notes.insert(
+                "Shell file changes: this workspace has no snapshots (snapshots are off, or the workspace is too large for them), so files a command changed are not itemized; only file tools are.".to_string(),
+            );
+            Vec::new()
+        }
+        Err(error) => {
+            notes.insert(format!(
+                "Shell file changes: the workspace snapshots could not be read ({}), so files a command changed are not itemized; only file tools are.",
+                bounded(&error, MAX_ERROR_CHARS)
+            ));
+            Vec::new()
+        }
+    };
     Ok(assemble(
         source,
         steps,
         approvals,
         Vec::new(),
+        workspace_changes,
         Assembly {
             turn,
             kind: SourceKind::Session,
@@ -481,18 +561,22 @@ pub(crate) fn thread_receipt(
         started_at: Some(thread.created_at),
         updated_at: Some(thread.updated_at),
     };
+    let notes = BTreeSet::from([
+        "Shell file changes: a Runtime thread's workspace snapshots are not tagged with the thread, so files a command changed are not itemized; only file tools are.".to_string(),
+    ]);
     Ok(assemble(
         source,
         steps,
         approvals,
         failures,
+        Vec::new(),
         Assembly {
             turn,
             kind: SourceKind::Thread,
             turn_postures,
             approvals_recorded: true,
         },
-        BTreeSet::new(),
+        notes,
     ))
 }
 
@@ -619,10 +703,19 @@ pub(crate) fn run_receipts_command(
 /// a real user prompt, by the same rule edit-last-turn and titles use
 /// ([`crate::runtime_handoff::classify_user_turn_prompt`]); runtime-injected
 /// messages and tool results do not start one.
-fn steps_from_messages(messages: &[Message]) -> (Vec<ToolStep>, Vec<TurnPosture>) {
+/// Each turn's prompt text (the user's words, without the `<turn_meta>`
+/// block) comes back too: it labels the turn's workspace snapshots.
+fn steps_from_messages(
+    messages: &[Message],
+) -> (
+    Vec<ToolStep>,
+    Vec<TurnPosture>,
+    Vec<(String, Option<String>)>,
+) {
     let mut steps: Vec<ToolStep> = Vec::new();
     let mut by_id: HashMap<String, usize> = HashMap::new();
     let mut turn_postures: Vec<TurnPosture> = Vec::new();
+    let mut turn_prompts: Vec<(String, Option<String>)> = Vec::new();
     let mut turn = 0usize;
     for message in messages {
         if crate::runtime_handoff::classify_user_turn_prompt(message)
@@ -630,6 +723,7 @@ fn steps_from_messages(messages: &[Message]) -> (Vec<ToolStep>, Vec<TurnPosture>
         {
             turn += 1;
             turn_postures.push((turn.to_string(), turn_meta_posture(message)));
+            turn_prompts.push((turn.to_string(), prompt_text(message)));
         }
         for block in &message.content {
             match block {
@@ -670,7 +764,117 @@ fn steps_from_messages(messages: &[Message]) -> (Vec<ToolStep>, Vec<TurnPosture>
             }
         }
     }
-    (steps, turn_postures)
+    (steps, turn_postures, turn_prompts)
+}
+
+/// The prompt a user message carries: its text blocks, less the
+/// `<turn_meta>` block the engine appends.
+fn prompt_text(message: &Message) -> Option<String> {
+    let meta_index = crate::runtime_handoff::turn_metadata_text(message).map(|(index, _)| index);
+    message
+        .content
+        .iter()
+        .enumerate()
+        .find_map(|(index, block)| match block {
+            ContentBlock::Text { text, .. } if Some(index) != meta_index => Some(text.clone()),
+            _ => None,
+        })
+}
+
+/// Files each turn changed, from the `pre-turn:N` / `post-turn:N` snapshots
+/// the engine takes around a turn in this session (`core::turn`). A turn is
+/// matched to its pair by the prompt snippet the labels carry, in order, the
+/// same way `/restore` listings are read ([`crate::core::turn::
+/// snapshot_label_prompt_snippet`]). Turns with no pair are returned in the
+/// second list. `None` when this workspace has no snapshot repo.
+fn snapshot_turn_changes(
+    workspace: &std::path::Path,
+    session_id: &str,
+    turn_prompts: &[(String, Option<String>)],
+    wanted: Option<&str>,
+) -> Result<Option<(Vec<(String, TurnWorkspaceChange)>, usize)>, String> {
+    use crate::core::turn::{parse_snapshot_label, snapshot_label_prompt_snippet};
+    let Some(repo) = crate::snapshot::SnapshotRepo::open_existing(workspace)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let mut snapshots = repo.list(usize::MAX).map_err(|error| error.to_string())?;
+    snapshots.reverse();
+    // Pair each post-turn:N with the open pre-turn:N of this session, oldest
+    // first. The sequence restarts when the session is resumed, so a pair
+    // closes on the first matching post-turn.
+    let mut open: HashMap<u64, (crate::snapshot::SnapshotId, Option<String>)> = HashMap::new();
+    let mut pairs = Vec::new();
+    for snapshot in snapshots
+        .into_iter()
+        .filter(|snapshot| snapshot.session_id.as_deref() == Some(session_id))
+    {
+        let label = parse_snapshot_label(&snapshot.label);
+        let Some(seq) = label.seq else { continue };
+        match label.kind.as_str() {
+            "pre-turn" => {
+                open.insert(seq, (snapshot.id, label.prompt_snippet));
+            }
+            "post-turn" => {
+                if let Some((pre, snippet)) = open.remove(&seq) {
+                    pairs.push((pre, snapshot.id, snippet));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut changes = Vec::new();
+    let mut unmatched = 0usize;
+    let mut next_pair = 0usize;
+    for (turn, prompt) in turn_prompts {
+        let snippet = prompt.as_deref().and_then(snapshot_label_prompt_snippet);
+        let found = pairs[next_pair..]
+            .iter()
+            .position(|(_, _, label)| *label == snippet)
+            .map(|offset| next_pair + offset);
+        let Some(index) = found else {
+            if wanted.is_none_or(|wanted| wanted == turn) {
+                unmatched += 1;
+            }
+            continue;
+        };
+        next_pair = index + 1;
+        if wanted.is_some_and(|wanted| wanted != turn) {
+            continue;
+        }
+        let (pre, post, _) = &pairs[index];
+        let (paths, truncated) = repo
+            .changed_paths_between(pre, post, MAX_FILES_PER_ACTION)
+            .map_err(|error| error.to_string())?;
+        let files = paths
+            .into_iter()
+            .map(|change| FileTouch {
+                path: change.path,
+                change: match change.status {
+                    'A' => FileChangeKind::Created,
+                    'D' => FileChangeKind::Deleted,
+                    _ => FileChangeKind::Edited,
+                },
+                lines_added: change.added,
+                lines_removed: change.removed,
+            })
+            .collect();
+        changes.push((turn.clone(), TurnWorkspaceChange { files, truncated }));
+    }
+    Ok(Some((changes, unmatched)))
+}
+
+/// `path` relative to `workspace` when it is inside it, without a leading
+/// `./`, for comparing a file tool's path with a snapshot's.
+fn workspace_relative(path: &str, workspace: Option<&str>) -> String {
+    let relative = workspace
+        .and_then(|workspace| {
+            path.strip_prefix(workspace.trim_end_matches('/'))
+                .and_then(|rest| rest.strip_prefix('/'))
+        })
+        .unwrap_or(path);
+    relative.trim_start_matches("./").to_string()
 }
 
 /// The posture line the engine writes into a prompt's `<turn_meta>` block
@@ -1481,6 +1685,9 @@ fn failure_evidence(step: &ToolStep) -> FailureEvidence {
     if number(facts, &["exit_code", "return_code"]).is_some() {
         return FailureEvidence::Ran;
     }
+    if string_field(facts, &["side_effect_status"]).as_deref() == Some("not_started") {
+        return FailureEvidence::Refused;
+    }
     let Some(output) = step.output.as_deref() else {
         return FailureEvidence::Unclear;
     };
@@ -1608,6 +1815,7 @@ fn assemble(
     steps: Vec<ToolStep>,
     approvals: Vec<ApprovalStep>,
     turn_failures: Vec<(String, Option<DateTime<Utc>>, Option<String>)>,
+    workspace_changes: Vec<(String, TurnWorkspaceChange)>,
     scope: Assembly<'_>,
     mut notes: BTreeSet<String>,
 ) -> Receipt {
@@ -1656,7 +1864,7 @@ fn assemble(
             // call it blocks before running with an error result too.
             StepOutcome::Failed => match failure_evidence(step) {
                 FailureEvidence::Ran => ActionStatus::Failed,
-                FailureEvidence::Refused => ActionStatus::NotRun,
+                FailureEvidence::Refused => ActionStatus::Blocked,
                 FailureEvidence::Unclear if is_command => ActionStatus::Unknown,
                 FailureEvidence::Unclear => ActionStatus::Failed,
             },
@@ -1677,7 +1885,10 @@ fn assemble(
             }
             Classified::Other => {
                 totals.other_tool_calls += 1;
-                if status != ActionStatus::Failed && status != ActionStatus::NotRun {
+                if !matches!(
+                    status,
+                    ActionStatus::Failed | ActionStatus::NotRun | ActionStatus::Blocked
+                ) {
                     continue;
                 }
                 ActionKind::Tool
@@ -1708,13 +1919,12 @@ fn assemble(
             status,
             duration_ms,
             approval,
-            // A refusal's reason is the fact worth keeping; a held call's
+            // A block's reason is the fact worth keeping; a held call's
             // approval already says why it did not run.
-            error: match status {
-                ActionStatus::Failed | ActionStatus::Unknown => true,
-                ActionStatus::NotRun => !held_at_approval,
-                _ => false,
-            }
+            error: matches!(
+                status,
+                ActionStatus::Failed | ActionStatus::Unknown | ActionStatus::Blocked
+            )
             .then(|| first_error_line(step.output.as_deref()))
             .flatten(),
         });
@@ -1767,6 +1977,55 @@ fn assemble(
         });
     }
 
+    for (turn_id, change) in workspace_changes {
+        if !in_scope(Some(&turn_id)) {
+            continue;
+        }
+        // File tools already itemize their own paths in this turn.
+        let tool_paths: BTreeSet<String> = actions
+            .iter()
+            .filter(|action| action.turn.as_deref() == Some(turn_id.as_str()))
+            .filter(|action| action.status == ActionStatus::Ok)
+            .filter_map(|action| match &action.what {
+                ActionKind::FileChange { files } => Some(files),
+                _ => None,
+            })
+            .flatten()
+            .map(|file| workspace_relative(&file.path, source.workspace.as_deref()))
+            .collect();
+        let files: Vec<FileTouch> = change
+            .files
+            .into_iter()
+            .filter(|file| !tool_paths.contains(&file.path))
+            .collect();
+        if files.is_empty() && !change.truncated {
+            continue;
+        }
+        // Slot it after the turn's last listed action.
+        let at = actions
+            .iter()
+            .rposition(|action| action.turn.as_deref() == Some(turn_id.as_str()))
+            .map_or(actions.len(), |index| index + 1);
+        actions.insert(
+            at,
+            ReceiptAction {
+                seq: 0,
+                turn: Some(turn_id),
+                at: None,
+                call_id: None,
+                tool: "workspace".to_string(),
+                what: ActionKind::WorkspaceChange {
+                    files,
+                    truncated: change.truncated,
+                },
+                status: ActionStatus::Ok,
+                duration_ms: None,
+                approval: None,
+                error: None,
+            },
+        );
+    }
+
     if kind == SourceKind::Thread {
         // Runtime actions carry timestamps; keep each turn's order and slot
         // standalone approvals and turn failures where they happened.
@@ -1809,9 +2068,6 @@ fn assemble(
             "Whether it ran: {unclear} call(s) have no result, or returned an error with no exit code, so the record does not show that they started. They are listed but not counted as run."
         ));
     }
-    notes.insert(
-        "Shell file changes: files a command changes (for example `rm` or a build) are not itemized; only file tools are.".to_string(),
-    );
 
     let omitted_actions = actions.len().saturating_sub(MAX_RECEIPT_ACTIONS);
     actions.truncate(MAX_RECEIPT_ACTIONS);
@@ -1832,8 +2088,9 @@ impl ReceiptAction {
     /// A change, command, code run, web or MCP call, or agent that ran with
     /// no approval on record.
     fn ran_without_asking(&self) -> bool {
-        // `Unknown` and `NotRun` are left out: the record does not show the
-        // call started.
+        // `Unknown`, `NotRun`, and `Blocked` are left out: the call did not
+        // start, or the record does not show that it did. A workspace change
+        // is not a call.
         self.approval.is_none()
             && matches!(
                 self.status,
@@ -1858,13 +2115,24 @@ fn tally(actions: &[ReceiptAction], totals: &mut ReceiptTotals) {
     let mut changed: BTreeSet<&str> = BTreeSet::new();
     let mut created: BTreeSet<&str> = BTreeSet::new();
     let mut deleted: BTreeSet<&str> = BTreeSet::new();
+    let mut outside: BTreeSet<&str> = BTreeSet::new();
     for action in actions {
-        let ran = !matches!(action.status, ActionStatus::NotRun | ActionStatus::Unknown);
-        if action.status == ActionStatus::Failed {
-            totals.failures += 1;
+        let ran = !matches!(
+            action.status,
+            ActionStatus::NotRun | ActionStatus::Blocked | ActionStatus::Unknown
+        );
+        match action.status {
+            ActionStatus::Failed => totals.failures += 1,
+            ActionStatus::Blocked => totals.blocked += 1,
+            _ => {}
         }
         match &action.what {
-            ActionKind::FileChange { files } if action.status == ActionStatus::Ok => {
+            ActionKind::FileChange { files } | ActionKind::WorkspaceChange { files, .. }
+                if action.status == ActionStatus::Ok =>
+            {
+                if matches!(action.what, ActionKind::WorkspaceChange { .. }) {
+                    outside.extend(files.iter().map(|file| file.path.as_str()));
+                }
                 for file in files {
                     changed.insert(&file.path);
                     match file.change {
@@ -1937,6 +2205,7 @@ fn tally(actions: &[ReceiptAction], totals: &mut ReceiptTotals) {
     totals.files_changed = changed.len();
     totals.files_created = created.len();
     totals.files_deleted = deleted.len();
+    totals.files_changed_outside_file_tools = outside.len();
 }
 
 // ---------------------------------------------------------------------------
@@ -1956,6 +2225,12 @@ pub fn totals_line(receipt: &Receipt) -> String {
             part.push_str(&format!(
                 " (+{} −{})",
                 totals.lines_added, totals.lines_removed
+            ));
+        }
+        if totals.files_changed_outside_file_tools > 0 {
+            part.push_str(&format!(
+                ", {} outside file tools",
+                totals.files_changed_outside_file_tools
             ));
         }
         parts.push(part);
@@ -2021,6 +2296,9 @@ pub fn totals_line(receipt: &Receipt) -> String {
     }
     if approvals.pending > 0 {
         parts.push(format!("{} waiting", approvals.pending));
+    }
+    if totals.blocked > 0 {
+        parts.push(format!("{} blocked before running", totals.blocked));
     }
     let failures_beyond_commands = totals.failures.saturating_sub(totals.commands_failed);
     if failures_beyond_commands > 0 {
@@ -2137,6 +2415,16 @@ fn action_phrase(action: &ReceiptAction) -> String {
                     .join(", ")
             ),
         },
+        ActionKind::WorkspaceChange { files, truncated } => {
+            let mut text = format!(
+                "changed outside file tools (a command or another process): {}",
+                files.iter().map(file_phrase).collect::<Vec<_>>().join(", ")
+            );
+            if *truncated {
+                text.push_str(", and more");
+            }
+            text
+        }
         ActionKind::Command {
             command,
             cwd,
@@ -2259,10 +2547,12 @@ pub fn action_line(action: &ReceiptAction) -> String {
     match action.status {
         // An approval line already reads as a request, not a run.
         ActionStatus::NotRun if action.what == ActionKind::Approval => {}
-        ActionStatus::NotRun => {
+        ActionStatus::NotRun => line = with_base_verb("did not", &line),
+        ActionStatus::Blocked => {
             line = with_base_verb("did not", &line);
+            line.push_str(" — blocked");
             if let Some(error) = &action.error {
-                line.push_str(&format!(" — refused: {error}"));
+                line.push_str(&format!(": {error}"));
             }
         }
         ActionStatus::Failed => {
@@ -2285,7 +2575,7 @@ pub fn action_line(action: &ReceiptAction) -> String {
         _ => {}
     }
     if let Some(ms) = action.duration_ms
-        && action.status != ActionStatus::NotRun
+        && !matches!(action.status, ActionStatus::NotRun | ActionStatus::Blocked)
     {
         line.push_str(&format!(" · {}", duration_label(ms)));
     }

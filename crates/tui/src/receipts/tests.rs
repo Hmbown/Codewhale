@@ -591,6 +591,20 @@ fn calls_blocked_before_running_are_not_counted_as_run() {
             "Error: Tool 'mcp_linear_create_issue' was denied: Tool 'mcp_linear_create_issue' is in the disallowed-tools list. Adjust approval mode or request permission.",
             true,
         ),
+        // A sandbox escalation the posture cannot grant, and a Plan-mode
+        // refusal, as `format_tool_error_with_schema` writes them.
+        tool_use("s1", "exec_shell", json!({"command": "sudo make install"})),
+        tool_result(
+            "s1",
+            "Error: Tool 'exec_shell' was denied: Sandbox escalation requires a one-shot user approval, but the current Full Access posture cannot provide it. Switch to Ask or continue without escalation.. Adjust approval mode or request permission.",
+            true,
+        ),
+        tool_use("p1", "exec_shell", json!({"command": "rm notes.md"})),
+        tool_result(
+            "p1",
+            "Error: Tool 'exec_shell' was denied: 'exec_shell' is not available in Plan mode - switch to Work mode (`/mode work`) to modify files or run write-capable tools.",
+            true,
+        ),
     ];
     let mut source = session_source_fixture();
     source.started_at = Some("2026-09-24T00:00:00Z".parse().expect("time"));
@@ -600,13 +614,15 @@ fn calls_blocked_before_running_are_not_counted_as_run() {
     assert_eq!(
         statuses,
         vec![
-            ActionStatus::NotRun,
-            ActionStatus::NotRun,
-            ActionStatus::NotRun,
+            ActionStatus::Blocked,
+            ActionStatus::Blocked,
+            ActionStatus::Blocked,
             ActionStatus::Failed,
             ActionStatus::Unknown,
             ActionStatus::Unknown,
-            ActionStatus::NotRun,
+            ActionStatus::Blocked,
+            ActionStatus::Blocked,
+            ActionStatus::Blocked,
         ]
     );
     let totals = &receipt.totals;
@@ -621,10 +637,16 @@ fn calls_blocked_before_running_are_not_counted_as_run() {
         "a refused or unproven call did not run without asking"
     );
     assert_eq!(totals.failures, 1);
+    assert_eq!(totals.blocked, 6);
+    assert!(
+        totals_line(&receipt).contains("6 blocked before running"),
+        "{}",
+        totals_line(&receipt)
+    );
     let first = action_line(&receipt.actions[0]);
     assert!(
         first.starts_with(
-            "did not run `rm -rf /` — refused: Tool 'bash' was denied: Auto-Review blocked"
+            "did not run `rm -rf /` — blocked: Tool 'bash' was denied: Auto-Review blocked"
         ),
         "{first}"
     );
@@ -638,7 +660,7 @@ fn calls_blocked_before_running_are_not_counted_as_run() {
     );
     assert!(
         action_line(&receipt.actions[6])
-            .starts_with("did not call linear · create_issue — refused:"),
+            .starts_with("did not call linear · create_issue — blocked:"),
         "{}",
         action_line(&receipt.actions[6])
     );
@@ -673,9 +695,10 @@ fn thread_call_refused_by_the_runtime_is_not_run() {
         .expect("refused call is listed");
     assert_eq!(
         line,
-        "did not call read — refused: Failed to authorize tool execution: Tool 'read' is in the disallowed-tools list"
+        "did not call read — blocked: Failed to authorize tool execution: Tool 'read' is in the disallowed-tools list"
     );
     assert_eq!(receipt.totals.failures, 1, "only the failed turn");
+    assert_eq!(receipt.totals.blocked, 1);
 }
 
 #[test]
@@ -763,4 +786,96 @@ fn backticks_in_a_command_keep_its_code_span_whole() {
     assert_eq!(code_span("cargo test"), "`cargo test`");
     assert_eq!(code_span("echo `date`"), "`` echo `date` ``");
     assert_eq!(code_span("a ``b`` c"), "```a ``b`` c```");
+}
+
+/// Files a command changed show up from the turn's own before/after
+/// snapshots; files a file tool already names are not listed twice.
+#[test]
+fn shell_file_changes_come_from_the_turn_snapshots() {
+    let _lock = crate::test_support::lock_test_env();
+    let home = tempfile::tempdir().expect("home");
+    let _env = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+    let workspace = tempfile::tempdir().expect("workspace");
+    let root = workspace.path();
+    std::fs::write(root.join("a.txt"), "one\n").expect("a");
+    std::fs::write(root.join("b.txt"), "one\ntwo\n").expect("b");
+
+    let session = "sess-snap";
+    crate::core::turn::pre_turn_snapshot(root, 1, 0, Some("tidy up"), Some(session))
+        .expect("pre-turn snapshot");
+    // The file tool's write, then what the shell command did.
+    std::fs::write(root.join("a.txt"), "new\n").expect("a");
+    std::fs::write(root.join("b.txt"), "one\n").expect("b");
+    std::fs::write(root.join("c.txt"), "made by a build\n").expect("c");
+    crate::core::turn::post_turn_snapshot(root, 1, 0, Some("tidy up"), Some(session))
+        .expect("post-turn snapshot");
+
+    let messages = vec![
+        prompt_with_posture("tidy up", "Full Access"),
+        tool_use(
+            "w1",
+            "write_file",
+            json!({"path": "a.txt", "content": "new\n"}),
+        ),
+        tool_result("w1", "Wrote a.txt", false),
+        tool_use("x1", "exec_shell", json!({"command": "./tidy.sh"})),
+        tool_result("x1", "done", false),
+        // A turn with no snapshot pair.
+        prompt_with_posture("and again", "Full Access"),
+    ];
+    let mut source = session_source_fixture();
+    source.id = session.to_string();
+    source.workspace = Some(root.display().to_string());
+    let receipt = session_receipt(source, &messages, &[], None).expect("receipt");
+
+    let outside = receipt
+        .actions
+        .iter()
+        .find_map(|action| match &action.what {
+            ActionKind::WorkspaceChange { files, .. } => Some((action, files)),
+            _ => None,
+        })
+        .expect("a workspace change is listed");
+    assert_eq!(outside.0.turn.as_deref(), Some("1"));
+    let paths: Vec<(&str, FileChangeKind, Option<u64>, Option<u64>)> = outside
+        .1
+        .iter()
+        .map(|file| {
+            (
+                file.path.as_str(),
+                file.change,
+                file.lines_added,
+                file.lines_removed,
+            )
+        })
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            ("b.txt", FileChangeKind::Edited, Some(0), Some(1)),
+            ("c.txt", FileChangeKind::Created, Some(1), Some(0)),
+        ]
+    );
+    assert_eq!(receipt.totals.files_changed, 3);
+    assert_eq!(receipt.totals.files_changed_outside_file_tools, 2);
+    assert_eq!(
+        receipt.totals.ran_without_asking, 2,
+        "the write and the command; a workspace change is not a call"
+    );
+    assert!(
+        action_line(outside.0).starts_with(
+            "changed outside file tools (a command or another process): edited b.txt (+0 −1), created c.txt"
+        ),
+        "{}",
+        action_line(outside.0)
+    );
+    assert!(
+        receipt
+            .not_recorded
+            .iter()
+            .any(|note| note
+                .starts_with("Shell file changes: 1 turn without a before/after snapshot")),
+        "{:?}",
+        receipt.not_recorded
+    );
 }

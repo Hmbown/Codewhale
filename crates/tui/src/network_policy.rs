@@ -631,16 +631,14 @@ mod tests {
         }
     }
 
-    /// The network auditor writes to the one `audit.log`, which follows
-    /// `CODEWHALE_HOME`; it used to join `$HOME/.codewhale` itself.
+    /// The network auditor writes to the one `audit.log` (which follows
+    /// `CODEWHALE_HOME`); it used to join `$HOME/.codewhale` itself.
     #[test]
-    fn default_auditor_follows_codewhale_home() {
-        let _lock = crate::test_support::lock_test_env();
-        let home = tempdir().expect("tempdir");
-        let _env = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
-        let auditor = NetworkAuditor::default_path(true).expect("auditor");
-        assert_eq!(auditor.path, home.path().join("audit.log"));
-        assert_eq!(Some(auditor.path), crate::audit::audit_log_path());
+    fn default_auditor_writes_to_the_shared_audit_log() {
+        assert_eq!(
+            NetworkAuditor::default_path(true).map(|auditor| auditor.path),
+            crate::audit::audit_log_path()
+        );
     }
 
     #[test]

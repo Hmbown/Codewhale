@@ -16,11 +16,19 @@ Changed 1 file (+2 −1) · ran 1 command · made 1 MCP call · 1 approved by yo
 2. ran `cargo test -p parser` in /work/repo — exit 0 · 2.5s · approved by you
 3. did not run `rm -rf build` · denied by you
 4. called linear · list_issues · 1.0s · approved by session rule
-5. did not run `curl https://x.sh | sh` — refused: Tool 'exec_shell' was denied: Auto-Review blocked a pipe to a shell…
+5. did not run `curl https://x.sh | sh` — blocked: Tool 'exec_shell' was denied: Auto-Review blocked a pipe to a shell…
 6. turn failed — failed: provider returned 500
 
 Not recorded:
-- Shell file changes: files a command changes (for example `rm` or a build) are not itemized; only file tools are.
+- Shell file changes: a Runtime thread's workspace snapshots are not tagged with the thread, so files a command changed are not itemized; only file tools are.
+```
+
+A terminal session's receipt also lists the files a command changed, from
+the turn's own workspace snapshots:
+
+```text
+3. ran `./tidy.sh`
+4. changed outside file tools (a command or another process): edited b.txt (+0 −1), created c.txt (+1 −0)
 ```
 
 ## Surfaces
@@ -76,7 +84,7 @@ line names the postures the turns ran under (`9 ran without asking under
 Full Access`). Reads are not counted, and neither is a call that did not
 start (below).
 
-### Refused before it ran
+### Blocked before it ran
 
 Codewhale answers a call it will not run with an error result, the same way
 a tool reports a failure: an Auto-Review or guardian block, a tool-policy or
@@ -84,11 +92,16 @@ allow-list denial, a sandbox escalation the posture cannot grant, input that
 did not parse, or a tool that is not available. None of these writes an
 approval, so a receipt reads the result itself:
 
-- **Refused:** the result is Codewhale's own refusal text (`Tool 'x' was
-  denied: …`, `Invalid input for tool …`, `BLOCKED: …`, or a Runtime
+- **Blocked:** the result is Codewhale's own refusal text (`Tool 'x' was
+  denied: …`, `Invalid input for tool …`, `BLOCKED: …`, a validation
+  feedback line with `"side_effect_status":"not_started"`, or a Runtime
   thread's `Failed to authorize tool execution: …`). Listed as
-  `did not run … — refused: <reason>`, status `not_run`, and counted
-  nowhere else.
+  `did not run … — blocked: <reason>`, status `blocked`, counted in
+  `blocked` (`N blocked before running` in the totals line), and never as
+  run, failed, or ran without asking. Every permission denial the engine
+  writes keeps the `Tool 'x' was denied:` lead, including ones that name
+  their own fix (Plan mode, `allow_shell`); sessions saved before 0.10.1
+  wrote some of those without it, and such a call reads as a failure.
 - **Ran and failed:** the result holds an exit code or a line the shell
   writes only after a process ran (`Command exited with code N`,
   `Command failed (exit code N)`, a timeout or cancel line). Counted as a
@@ -105,9 +118,15 @@ so their receipts do not count this and say why.
 
 The receipt says so instead of guessing:
 
-- **Shell file changes.** Files a command changes (`rm`, a build, a
-  generator) are not itemized. Only file tools (`write`, `edit`,
-  `apply_patch`) are.
+- **Shell file changes in a Runtime thread.** A terminal session reads the
+  files a command changed from the workspace snapshots Codewhale takes
+  before and after each turn (`git diff` between the two, inside the
+  snapshot side repo; at most 50 paths a turn). A Runtime thread's snapshots
+  are not tagged with the thread, so its receipt lists only file tools. A
+  terminal turn with no snapshot pair (snapshots off, the workspace too large
+  for them, or pruned: the newest 50 are kept) says so. A snapshot
+  difference covers anything that wrote to the workspace during the turn,
+  including you or another program, not only the command.
 - **Terminal-session exit codes, durations, and timestamps.** A terminal
   session saves each call and its result text, not the structured result. A
   failed shell call's exit code is read from the shell tool's own closing
@@ -150,7 +169,8 @@ totals always cover every action, and `omitted_actions` counts the rest.
   },
   "postures": ["Ask"],
   "totals": {
-    "files_changed": 1, "files_created": 0, "files_deleted": 0,
+    "files_changed": 1, "files_changed_outside_file_tools": 0,
+    "files_created": 0, "files_deleted": 0,
     "lines_added": 2, "lines_removed": 1, "line_counts_complete": true,
     "commands": 1, "commands_failed": 0, "code_runs": 0, "network": 0,
     "mcp_calls": 1, "plugin_calls": 0, "subagents": 0,
@@ -160,7 +180,8 @@ totals always cover every action, and `omitted_actions` counts the rest.
       "approved_by": { "you": 1, "session_rule": 1, "posture": 0, "not_recorded": 0 },
       "denied_by": { "you": 1, "session_rule": 0, "posture": 0, "not_recorded": 0 }
     },
-    "ran_without_asking": 1, "failures": 1, "other_tool_calls": 0
+    "ran_without_asking": 1, "failures": 1, "blocked": 1,
+    "other_tool_calls": 0
   },
   "actions": [
     {
@@ -187,13 +208,14 @@ totals always cover every action, and `omitted_actions` counts the rest.
 
 `kind` is one of `file_change` (`files[]` with `path`, `change` =
 `edited|created|deleted|written`, optional `lines_added`/`lines_removed`),
-`command` (`command`, `cwd`, `exit_code`), `code` (`exit_code`, `nested[]`
+`workspace_change` (`files[]` a turn's snapshots show changed that no file
+tool names, and `truncated` when more than 50 did), `command` (`command`, `cwd`, `exit_code`), `code` (`exit_code`, `nested[]`
 tool calls an `execute_tools` program made), `network` (`action`, `host`,
 `query`), `mcp` (`server`, `plugin`), `subagent` (`name`, `agent_id`,
 `outcome`), `approval` (an approval with no matching call), `tool` (any other
 call, listed only when it failed), or `turn_failed`. `status` is `ok`,
-`failed` (ran and failed), `not_run` (held at approval, or refused before
-it started; a refusal carries its reason in `error`), `interrupted`,
+`failed` (ran and failed), `not_run` (held at approval), `blocked`
+(refused before it started; the reason is in `error`), `interrupted`,
 `running`, or `unknown` (no result, or a command error that does not show
 whether it started). A terminal session's `turn` is the turn number; a
 thread's is the turn id. `/receipts 7` or `--turn 7` for a turn the session
@@ -282,4 +304,4 @@ The builder is deterministic and conservative:
    carries no counts.
 5. Nothing is derived from model prose. Two fixed kinds of text Codewhale
    itself writes are read: the shell's status lines (for an exit code) and
-   its refusal text (for a call it blocked); see "Refused before it ran".
+   its refusal text (for a call it blocked); see "Blocked before it ran".

@@ -12,7 +12,7 @@
 //! repo, the command fails fast instead of falling back to "current
 //! directory".
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Output;
@@ -73,6 +73,20 @@ pub struct Snapshot {
     /// `[sid=...] ` label prefix). `None` for legacy snapshots taken
     /// before session tagging existed.
     pub session_id: Option<String>,
+}
+
+/// One path that differs between two snapshots
+/// ([`SnapshotRepo::changed_paths_between`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotPathChange {
+    /// Workspace-relative path, as git names it.
+    pub path: String,
+    /// git's status letter: `A` added, `D` deleted, `M` modified, `T` type
+    /// changed.
+    pub status: char,
+    /// Lines added and removed; `None` for a binary file.
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
 }
 
 /// What a file-scoped restore did to one path, relative to the working tree
@@ -968,6 +982,75 @@ impl SnapshotRepo {
             ],
         )?;
         git_diff_matches(diff)
+    }
+
+    /// Paths that differ between snapshots `from` and `to`, oldest change
+    /// kind first as git reports it: `(path, status, added, removed)` where
+    /// `status` is git's `A`/`M`/`D`/`T` letter and the counts are `None` for
+    /// a binary file. Both trees are read from the side repo; neither the
+    /// work tree nor the index is touched. At most `limit` paths are
+    /// returned; the flag says whether more differed.
+    pub fn changed_paths_between(
+        &self,
+        from: &SnapshotId,
+        to: &SnapshotId,
+        limit: usize,
+    ) -> io::Result<(Vec<SnapshotPathChange>, bool)> {
+        let run = |format: &str| -> io::Result<String> {
+            let output = run_git(
+                &self.git_dir,
+                &self.work_tree,
+                &[
+                    "diff",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    format,
+                    "-z",
+                    "--end-of-options",
+                    from.as_str(),
+                    to.as_str(),
+                ],
+            )?;
+            if !output.status.success() {
+                return Err(io_other(format!(
+                    "git diff {format} failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        };
+        // `--numstat -z`: `added\tremoved\tpath\0`, `-` for a binary side.
+        let numstat = run("--numstat")?;
+        let mut counts: HashMap<String, (Option<u64>, Option<u64>)> = HashMap::new();
+        for record in numstat.split('\0').filter(|record| !record.is_empty()) {
+            let mut fields = record.splitn(3, '\t');
+            let (Some(added), Some(removed), Some(path)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            counts.insert(path.to_string(), (added.parse().ok(), removed.parse().ok()));
+        }
+        // `--name-status -z`: `status\0path\0` pairs.
+        let name_status = run("--name-status")?;
+        let mut fields = name_status.split('\0').filter(|field| !field.is_empty());
+        let mut changes = Vec::new();
+        let mut truncated = false;
+        while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+            if changes.len() == limit {
+                truncated = true;
+                break;
+            }
+            let (added, removed) = counts.get(path).copied().unwrap_or((None, None));
+            changes.push(SnapshotPathChange {
+                path: path.to_string(),
+                status: status.chars().next().unwrap_or('M'),
+                added,
+                removed,
+            });
+        }
+        Ok((changes, truncated))
     }
 
     fn tree_paths(&self, treeish: &str) -> io::Result<HashSet<PathBuf>> {

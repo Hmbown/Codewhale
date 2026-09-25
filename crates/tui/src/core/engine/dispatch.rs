@@ -449,12 +449,15 @@ pub(super) fn format_tool_error_with_schema(
         }
         ToolError::PermissionDenied { message } => {
             let lower = message.to_ascii_lowercase();
-            // #3020: Pass through messages that already name the denial cause.
-            if mentions_mode_word(&lower)
-                || lower.contains("allow_shell")
-                || lower.contains("denied by user")
-            {
+            // #3020: messages that already name the denial cause get no
+            // conflicting "Adjust approval mode" suffix. They keep the
+            // `Tool '…' was denied:` lead, which is how a receipt tells a
+            // call Codewhale blocked from one that ran and failed; an
+            // approval denial already starts `Tool '…' denied by user`.
+            if lower.contains("denied by user") {
                 message.clone()
+            } else if mentions_mode_word(&lower) || lower.contains("allow_shell") {
+                format!("Tool '{tool_name}' was denied: {message}")
             } else {
                 format!(
                     "Tool '{tool_name}' was denied: {message}. Adjust approval mode or request permission."
