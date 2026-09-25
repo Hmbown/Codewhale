@@ -1962,3 +1962,49 @@ fn global_skill_roots_come_from_the_os_home_only() {
         "every runtime root is under the OS home or the workspace: {dirs:?}"
     );
 }
+
+/// Repository-supplied skills are instructions nobody reviewed: they stay out
+/// of runtime discovery until the workspace is trusted, and discovery says so
+/// rather than dropping them silently.
+#[test]
+fn project_skills_require_workspace_trust() {
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path();
+    write_skill(
+        &workspace.join(".claude").join("skills"),
+        "repo-skill",
+        "from the repository",
+        "do repo things",
+    );
+    write_skill(
+        &workspace.join(".codewhale").join("skills"),
+        "owned-project-skill",
+        "project owned",
+        "owned",
+    );
+
+    let registry = super::discover_in_workspace(workspace);
+    assert!(registry.get("repo-skill").is_none());
+    assert!(registry.get("owned-project-skill").is_none());
+    assert!(
+        registry
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("not trusted") && warning.contains("/trust")),
+        "{:?}",
+        registry.warnings()
+    );
+
+    crate::config::save_workspace_trust(workspace).expect("trust workspace");
+    let registry = super::discover_in_workspace(workspace);
+    assert!(registry.get("repo-skill").is_some());
+    assert!(registry.get("owned-project-skill").is_some());
+    assert!(
+        !registry
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("not trusted")),
+        "{:?}",
+        registry.warnings()
+    );
+}
