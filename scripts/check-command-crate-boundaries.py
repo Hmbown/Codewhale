@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Deterministic crate-boundary gate for the command extraction (FEAT-014).
+"""Deterministic crate-boundary gate (FEAT-014, runtime split RS-0).
+
+The gate is table-driven: `BOUNDARY_RULES` names each guarded package, how its
+dependency graph is read (`metadata` or `tree`, see below), the packages it
+may never reach, and the source scan for its crate. The runtime/TUI split adds
+the runtime -> UI reference ratchet (`scripts/split/module_graph.py`).
+
+Dependency modes:
+
+* ``metadata`` reads `cargo metadata --no-deps` and walks normal edges between
+  workspace packages. Cheap and exact for "never reach this workspace crate".
+* ``tree`` runs `cargo tree -p <package> -e normal,build --prefix none`, which
+  resolves features for that package alone. `cargo metadata` unifies features
+  across the workspace, so a rule like "the runtime never reaches ratatui"
+  must use this mode once the TUI enables palette's `ratatui` feature.
 
 Enforces the EPIC-006 boundary contract:
 
@@ -25,23 +39,35 @@ Usage:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_DIR = REPO_ROOT / "crates" / "command-contract" / "src"
 CONTRACT_PACKAGE = "codewhale-command-contract"
 FORBIDDEN_TUI_PACKAGE = "codewhale-tui"
 
-# Workspace packages that must stay free of any (normal) path to the TUI. The
-# contract carries the portable shapes; `codewhale-secrets` owns the shared pure
-# sanitizer those shapes' handlers consume. Both are prerequisites for
-# `codewhale-commands` (FEAT-016/043), so a TUI edge here would silently drag
-# the whole TUI into the extracted command crate.
-TUI_FREE_PACKAGES = (CONTRACT_PACKAGE, "codewhale-secrets")
+
+@dataclass(frozen=True)
+class BoundaryRule:
+    """One guarded package: how to read its graph and what it may not reach."""
+
+    package: str
+    mode: str  # "metadata" or "tree"
+    forbidden_packages: tuple[str, ...]
+    reason: str
+    source_dir: Path | None = None
+    source_scan: Callable[[str, str], list] | None = None
+
+
+# Filled in below once the scan functions exist.
+BOUNDARY_RULES: tuple[BoundaryRule, ...] = ()
 
 # Import lines that must never appear in the contract (narrowly scoped: real
 # imports only, comments never match because they do not start with `use`).
@@ -117,25 +143,39 @@ def dependency_graph(metadata: dict) -> dict[str, set[str]]:
     return graph
 
 
-def reaches_tui(package: str, graph: dict[str, set[str]]) -> bool:
-    """Whether `package` transitively reaches the forbidden TUI package."""
+def reaches(package: str, forbidden: set[str], graph: dict[str, set[str]]) -> str | None:
+    """The first forbidden package `package` transitively reaches, if any."""
     seen: set[str] = set()
     stack = list(graph.get(package, set()))
     while stack:
         name = stack.pop()
-        if name == FORBIDDEN_TUI_PACKAGE:
-            return True
+        if name in forbidden:
+            return name
         if name in seen:
             continue
         seen.add(name)
         stack.extend(graph.get(name, set()))
-    return False
+    return None
+
+
+def reaches_tui(package: str, graph: dict[str, set[str]]) -> bool:
+    """Whether `package` transitively reaches the forbidden TUI package."""
+    return reaches(package, {FORBIDDEN_TUI_PACKAGE}, graph) is not None
+
+
+def metadata_rules() -> tuple[BoundaryRule, ...]:
+    return tuple(rule for rule in BOUNDARY_RULES if rule.mode == "metadata")
+
+
+def tree_rules() -> tuple[BoundaryRule, ...]:
+    return tuple(rule for rule in BOUNDARY_RULES if rule.mode == "tree")
 
 
 def check_dependency_graph(graph: dict[str, set[str]]) -> list[BoundaryViolation]:
-    """No TUI-free package may reach codewhale-tui through normal edges."""
+    """No metadata-mode package may reach a forbidden package through normal edges."""
     violations: list[BoundaryViolation] = []
-    for package in TUI_FREE_PACKAGES:
+    for rule in metadata_rules():
+        package = rule.package
         if package not in graph:
             violations.append(
                 BoundaryViolation(
@@ -145,15 +185,49 @@ def check_dependency_graph(graph: dict[str, set[str]]) -> list[BoundaryViolation
                 )
             )
             continue
-        if reaches_tui(package, graph):
+        hit = reaches(package, set(rule.forbidden_packages), graph)
+        if hit:
             violations.append(
                 BoundaryViolation(
                     "dependency-graph",
                     package,
-                    f"transitively depends on {FORBIDDEN_TUI_PACKAGE}",
+                    f"transitively depends on {hit} ({rule.reason})",
                 )
             )
     return violations
+
+
+def cargo_tree_packages(package: str) -> set[str]:
+    """Package names in `cargo tree -p <package> -e normal,build` (per-package features)."""
+    result = subprocess.run(
+        ["cargo", "tree", "-p", package, "-e", "normal,build", "--prefix", "none", "--locked"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return parse_cargo_tree(result.stdout)
+
+
+def parse_cargo_tree(text: str) -> set[str]:
+    names: set[str] = set()
+    for line in text.splitlines():
+        parts = line.split()
+        if parts:
+            names.add(parts[0])
+    return names
+
+
+def check_tree_packages(rule: BoundaryRule, names: set[str]) -> list[BoundaryViolation]:
+    """A tree-mode package's resolved dependency set must avoid its forbidden list."""
+    return [
+        BoundaryViolation(
+            "dependency-tree",
+            rule.package,
+            f"cargo tree reaches {name} ({rule.reason})",
+        )
+        for name in sorted(names & set(rule.forbidden_packages))
+    ]
 
 
 def check_contract_source_text(text: str, display_path: str) -> list[BoundaryViolation]:
@@ -189,30 +263,66 @@ def check_contract_source_text(text: str, display_path: str) -> list[BoundaryVio
     return violations
 
 
-def check_contract_source() -> list[BoundaryViolation]:
-    """Scan contract production source for forbidden imports and symbols."""
-    violations: list[BoundaryViolation] = []
-    if not CONTRACT_DIR.is_dir():
+def check_source_dir(rule: BoundaryRule) -> list[BoundaryViolation]:
+    """Scan one rule's production source for forbidden imports and symbols."""
+    assert rule.source_dir is not None and rule.source_scan is not None
+    if not rule.source_dir.is_dir():
         return [
             BoundaryViolation(
                 "source-scan",
-                str(CONTRACT_DIR),
-                "command-contract src directory missing",
+                str(rule.source_dir),
+                f"{rule.package} src directory missing",
             )
         ]
-    for path in sorted(CONTRACT_DIR.rglob("*.rs")):
+    violations: list[BoundaryViolation] = []
+    for path in sorted(rule.source_dir.rglob("*.rs")):
         text = path.read_text(encoding="utf-8")
         rel = path.relative_to(REPO_ROOT)
-        violations.extend(check_contract_source_text(text, str(rel)))
+        violations.extend(rule.source_scan(text, str(rel)))
     return violations
 
 
-def run_checks(metadata: dict | None = None) -> list[BoundaryViolation]:
+def check_contract_source() -> list[BoundaryViolation]:
+    """Scan contract production source for forbidden imports and symbols."""
+    return check_source_dir(next(r for r in BOUNDARY_RULES if r.package == CONTRACT_PACKAGE))
+
+
+def load_runtime_ratchet():
+    """Import scripts/split/module_graph.py (the runtime -> UI ratchet)."""
+    path = REPO_ROOT / "scripts" / "split" / "module_graph.py"
+    spec = importlib.util.spec_from_file_location("runtime_module_graph", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def check_runtime_ratchet() -> list[BoundaryViolation]:
+    """Runtime -> UI references may only go down (docs/design/TUI_DECONSTRUCTION.md, runtime split)."""
+    problems = load_runtime_ratchet().check()
+    return [BoundaryViolation("runtime-ratchet", "scripts/runtime-boundary-baseline.json", p) for p in problems]
+
+
+def run_checks(
+    metadata: dict | None = None,
+    tree: Callable[[str], set[str]] | None = None,
+    ratchet: bool = True,
+) -> list[BoundaryViolation]:
     """Run all boundary checks; return the collected violations."""
     graph = dependency_graph(metadata) if metadata is not None else dependency_graph(
         load_workspace_metadata()
     )
-    return check_dependency_graph(graph) + check_contract_source()
+    violations = check_dependency_graph(graph)
+    tree = tree or cargo_tree_packages
+    for rule in tree_rules():
+        violations.extend(check_tree_packages(rule, tree(rule.package)))
+    for rule in BOUNDARY_RULES:
+        if rule.source_dir is not None:
+            violations.extend(check_source_dir(rule))
+    if ratchet:
+        violations.extend(check_runtime_ratchet())
+    return violations
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -225,10 +335,34 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(
         f"[command-crate-boundaries] PASS: "
-        f"{', '.join(TUI_FREE_PACKAGES)} have no {FORBIDDEN_TUI_PACKAGE} edge; "
-        "no forbidden import, composite context, or boxed handler in the contract"
+        f"{', '.join(rule.package for rule in BOUNDARY_RULES)} avoid their forbidden "
+        "packages; no forbidden import, composite context, or boxed handler in the "
+        "contract; runtime -> UI ratchet holds"
     )
     return 0
+
+
+BOUNDARY_RULES = (
+    # The contract carries the portable command shapes (EPIC-006).
+    BoundaryRule(
+        CONTRACT_PACKAGE,
+        "metadata",
+        (FORBIDDEN_TUI_PACKAGE,),
+        "the command contract must stay UI-free",
+        CONTRACT_DIR,
+        check_contract_source_text,
+    ),
+    # `codewhale-secrets` owns the shared pure sanitizer the contract's
+    # handlers consume (FEAT-025 D4); a TUI edge would drag the TUI into
+    # `codewhale-commands` (FEAT-016/043).
+    BoundaryRule(
+        "codewhale-secrets",
+        "metadata",
+        (FORBIDDEN_TUI_PACKAGE,),
+        "the shared sanitizer must stay UI-free",
+    ),
+)
+TUI_FREE_PACKAGES = tuple(rule.package for rule in metadata_rules())
 
 
 if __name__ == "__main__":

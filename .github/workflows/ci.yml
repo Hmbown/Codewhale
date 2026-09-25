@@ -370,11 +370,16 @@ jobs:
         with:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@nextest
       - name: Hermetic safety and authorization tests
         env:
           RUST_MIN_STACK: "8388608"
+        # nextest fails when the filter selects no test (`--no-tests=fail`),
+        # so moving these modules to another crate cannot turn this step into
+        # a silent 0-test pass. Name every package that owns safety tests
+        # explicitly; add `-p codewhale-runtime` when those modules move there.
         run: |
-          sh scripts/with-hermetic-test-home.sh cargo test -p codewhale-tui --lib --locked -- auto_review authority sandbox
+          sh scripts/with-hermetic-test-home.sh cargo nextest run -p codewhale-tui --lib --locked --no-tests=fail -E 'test(auto_review) | test(authority) | test(sandbox)'
           sh scripts/with-hermetic-test-home.sh cargo test -p codewhale-execpolicy --locked
 
   lint:
