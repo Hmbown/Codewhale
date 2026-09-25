@@ -21,7 +21,7 @@ same command with `--check` to reject drift. A source digest identifies the
 snapshot. Builds require no sibling checkout or network lookup for tokens.
 
 The terminal's Whale, Blue Stage and Shoreline presets remain owned by
-`crates/palette/src/tokens.rs`. They are distinct themes; their copied GPUI
+`crates/palette/src/rgb.rs`. They are distinct themes; their copied GPUI
 constants no longer supply the website's colors.
 
 ## Theme and components
