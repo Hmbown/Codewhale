@@ -5,6 +5,7 @@ pub mod journal;
 pub mod prefix_cache;
 pub mod request;
 pub mod role;
+pub mod secret_eq;
 pub mod session;
 pub mod tool_parser;
 

@@ -917,7 +917,9 @@ async fn require_app_server_token(
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|raw| raw.strip_prefix("Bearer "))
-        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()));
+        .is_some_and(|token| {
+            codewhale_core::secret_eq::constant_time_eq(token.as_bytes(), expected.as_bytes())
+        });
 
     if authorized {
         next.run(req).await
@@ -933,18 +935,6 @@ async fn require_app_server_token(
         )
             .into_response()
     }
-}
-
-/// Compares the full length of both inputs regardless of where they first
-/// differ, so auth failures don't leak the matching prefix length via timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = a.len() ^ b.len();
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= usize::from(x ^ y);
-    }
-    diff == 0
 }
 
 fn params_or_object(params: Value) -> Value {
