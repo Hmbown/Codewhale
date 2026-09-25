@@ -121,7 +121,10 @@ fn with_rate_limit<R>(f: impl FnOnce(&mut Option<Instant>) -> R) -> R {
 /// helpers. The TUI's tests opt in with `test-thread-scoped-state`, and even
 /// then only a build with debug assertions gets it: an optimized build, e.g.
 /// `cargo build --release --workspace --all-features`, keeps the process-wide
-/// pause.
+/// pause. Cargo unifies features across one build, so under
+/// `cargo test --workspace` (or a debug `--all-features` build) the debug
+/// `codewhale` binary that integration tests spawn gets the per-thread pause
+/// too; release and optimized binaries never do.
 #[cfg(any(test, all(feature = "test-thread-scoped-state", debug_assertions)))]
 fn with_state<R>(f: impl FnOnce(&mut RetryState) -> R) -> R {
     #[allow(clippy::type_complexity)]

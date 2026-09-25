@@ -65,8 +65,9 @@ impl ToolSpec for NotifyTool {
     }
 
     fn capabilities(&self) -> Vec<ToolCapability> {
-        // No filesystem or shell side effects; the only output is a single
-        // terminal-escape write to stdout. Mark as ReadOnly so the
+        // No filesystem or shell side effects; the only output is one
+        // notification the terminal host delivers (or declines to, when
+        // none is installed). Mark as ReadOnly so the
         // approval-requirement default is `Auto` and the tool routes
         // through without prompting.
         vec![ToolCapability::ReadOnly]
@@ -190,6 +191,11 @@ mod tests {
             .await
             .expect("ok");
         assert!(result.success);
-        assert!(result.content.contains("done"));
+        // The receipt is the installed host's, not a hard-coded "sent": no
+        // host is installed in this test binary, so it is the no-host one.
+        assert_eq!(
+            result.content,
+            "notification not sent: no terminal host: done"
+        );
     }
 }
