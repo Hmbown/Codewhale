@@ -3988,12 +3988,27 @@ pub(crate) async fn run_event_loop(
                         risk,
                         reason,
                     } => {
-                        // A permission decision nobody was prompted for. The
-                        // audit log already has the full record; the
+                        // A permission decision nobody was prompted for. It
+                        // goes to `audit.log` (what `/permissions` promises;
+                        // until 0.10.1 only `CODEWHALE_TOOL_AUDIT_LOG` got
+                        // it), written off the event loop (#6149). The
                         // transcript gets a one-line receipt so the person
                         // can see who decided and why, without a modal. It is
                         // held until the tool card completes so it lands
                         // under that card rather than inside a running run.
+                        let audit = serde_json::json!({
+                            "session_id": app.current_session_id,
+                            "agent_id": agent_id,
+                            "tool_id": tool_id,
+                            "tool_name": tool_name,
+                            "gate": gate.as_str(),
+                            "decision": decision.as_str(),
+                            "risk": risk,
+                            "reason": codewhale_secrets::redact::redact_secrets(&reason),
+                        });
+                        tokio::task::spawn_blocking(move || {
+                            log_sensitive_event("tool.gate.decision", audit);
+                        });
                         let receipt = crate::tui::gate_receipts::tool_gate_receipt(
                             app.ui_locale,
                             &tool_name,

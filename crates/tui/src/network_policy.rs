@@ -317,15 +317,14 @@ impl NetworkAuditor {
         Self { path, enabled }
     }
 
-    /// Auditor pointing at `~/.codewhale/audit.log`. Returns `None` if the
-    /// home directory can't be resolved.
+    /// Auditor pointing at the same `audit.log` every other audit event uses:
+    /// `$CODEWHALE_HOME/audit.log`, else `~/.codewhale/audit.log`. It used to
+    /// join `$HOME/.codewhale` itself, which ignored `CODEWHALE_HOME` and let
+    /// test processes append to the developer's real log. Returns `None` if
+    /// no Codewhale home resolves.
     #[must_use]
     pub fn default_path(enabled: bool) -> Option<Self> {
-        let home = crate::config::effective_home_dir()?;
-        Some(Self::new(
-            home.join(".codewhale").join("audit.log"),
-            enabled,
-        ))
+        Some(Self::new(crate::audit::audit_log_path()?, enabled))
     }
 
     /// Append one line. Best-effort: errors are logged via `eprintln!` but
