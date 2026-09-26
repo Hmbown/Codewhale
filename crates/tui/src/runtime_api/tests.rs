@@ -6111,6 +6111,11 @@ async fn session_export_retry_after_a_crash_binds_the_document_it_wrote() -> Res
     assert_eq!(retry.status(), StatusCode::OK);
     let retry: serde_json::Value = retry.json().await?;
     assert_eq!(retry["session_id"], expected_id);
+    // Later requests address the session by the id the server returned.
+    let session_id = retry["session_id"]
+        .as_str()
+        .expect("session_id is a string")
+        .to_string();
     assert_eq!(
         runtime_threads.get_thread(&thread.id).await?.session_id,
         Some(expected_id.clone())
@@ -6151,14 +6156,14 @@ async fn session_export_retry_after_a_crash_binds_the_document_it_wrote() -> Res
         .open(&lease_path)?;
     assert!(crate::runtime_threads::try_lock_file_exclusive(&lease)?);
     let refused = client
-        .delete(format!("http://{addr}/v1/sessions/{expected_id}"))
+        .delete(format!("http://{addr}/v1/sessions/{session_id}"))
         .send()
         .await?;
     assert_eq!(refused.status(), StatusCode::CONFLICT);
     assert!(manager.session_document_exists(&expected_id));
     drop(lease);
     let deleted = client
-        .delete(format!("http://{addr}/v1/sessions/{expected_id}"))
+        .delete(format!("http://{addr}/v1/sessions/{session_id}"))
         .send()
         .await?;
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);

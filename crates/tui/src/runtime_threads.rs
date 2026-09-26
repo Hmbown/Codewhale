@@ -5152,24 +5152,68 @@ impl HeldRuntimeStore {
     }
 
     /// Move the store to `destination`, still holding its lock, so no opener
-    /// can race the move. Nothing is unlinked.
+    /// can race the move. Store data is never unlinked; only the lock file,
+    /// a lease with no content, is removed once the move is done.
+    ///
+    /// The store directory itself is not renamed: it contains the open lock
+    /// file, and Windows refuses to rename a directory while a handle inside
+    /// it is open. Each other entry is renamed into `destination` instead,
+    /// which every platform allows while a sibling is open. After the lock
+    /// drops, the lease file and the emptied directory are removed; an
+    /// opener that races in then only finds (or recreates) an empty store.
     pub(crate) fn move_to(self, destination: &Path) -> Result<()> {
         anyhow::ensure!(
             !destination.exists(),
             "set-aside destination {} already exists",
             destination.display()
         );
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        let source = self.binding.data_dir.clone();
+        fs::create_dir_all(destination)
+            .with_context(|| format!("Failed to create {}", destination.display()))?;
+        let entries = fs::read_dir(&source)
+            .with_context(|| format!("Failed to read Runtime store {}", source.display()))?;
+        let mut moved: Vec<std::ffi::OsString> = Vec::new();
+        let mut result = Ok(());
+        for entry in entries {
+            let name = match entry {
+                Ok(entry) => entry.file_name(),
+                Err(error) => {
+                    result = Err(anyhow::Error::from(error)
+                        .context(format!("Failed to read Runtime store {}", source.display())));
+                    break;
+                }
+            };
+            if name == RUNTIME_PROCESS_OWNER_LOCK_FILE {
+                continue;
+            }
+            if let Err(error) = fs::rename(source.join(&name), destination.join(&name)) {
+                result = Err(anyhow::Error::from(error).context(format!(
+                    "Failed to move Runtime store {} to {}",
+                    source.display(),
+                    destination.display()
+                )));
+                break;
+            }
+            moved.push(name);
         }
-        fs::rename(&self.binding.data_dir, destination).with_context(|| {
-            format!(
-                "Failed to move Runtime store {} to {}",
-                self.binding.data_dir.display(),
-                destination.display()
-            )
-        })?;
+        if let Err(error) = result {
+            // Put back what already moved so the store is never left split
+            // across two directories; the lock is still held.
+            for name in moved {
+                let _ = fs::rename(destination.join(&name), source.join(&name));
+            }
+            let _ = fs::remove_dir(destination);
+            return Err(error);
+        }
+        drop(self);
+        match fs::remove_file(source.join(RUNTIME_PROCESS_OWNER_LOCK_FILE)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // An opener raced in and holds the lease: the store it opened is
+            // empty and stays where it is.
+            Err(_) => return Ok(()),
+        }
+        let _ = fs::remove_dir(&source);
         Ok(())
     }
 
