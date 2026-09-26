@@ -11,6 +11,23 @@ pub(super) struct CompactionPass {
     pub usage: Usage,
 }
 
+/// Engine-side sink for compaction downgrade notices.
+///
+/// Delivered as `Event::Status`, the same channel other engine status lines
+/// use, so a long recovery says what it is doing while it runs. A full event
+/// channel drops the notice instead of stalling the pass; the same sentence
+/// is already in the log via `logging::warn`.
+#[derive(Debug)]
+struct EngineCompactionNoticeSink {
+    tx: mpsc::Sender<Event>,
+}
+
+impl crate::compaction::CompactionNoticeSink for EngineCompactionNoticeSink {
+    fn notice(&self, message: String) {
+        let _ = self.tx.try_send(Event::Status { message });
+    }
+}
+
 impl Engine {
     pub(super) async fn emit_compaction_started(
         &mut self,
@@ -183,6 +200,9 @@ impl Engine {
             .get_or_insert_with(|| self.config.workspace.clone());
         let mut prepared = PreparedCompactionEnvelope::new(config);
         prepared.session_id = Some(self.session.id.clone());
+        prepared.notice_sink = Some(std::sync::Arc::new(EngineCompactionNoticeSink {
+            tx: self.tx_event.clone(),
+        }));
         // The summary request must carry the reasoning tier the turn sends:
         // reasoning routes render it at the head of the prompt, so omitting
         // it forfeited the whole cached history prefix (#6540).
@@ -708,4 +728,26 @@ pub(super) fn is_provider_rejection(err: &anyhow::Error) -> bool {
                 | ErrorCategory::RateLimit
                 | ErrorCategory::Timeout
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compaction::CompactionNoticeSink as _;
+
+    /// The engine sink is the one link between a compaction downgrade and the
+    /// person watching: the notice must land on the status line, not only in
+    /// the log.
+    #[tokio::test]
+    async fn compaction_notice_sink_delivers_a_status_event() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let sink = EngineCompactionNoticeSink { tx };
+        sink.notice("Making room re-encoded 2 inline image(s)".to_string());
+        match rx.recv().await {
+            Some(Event::Status { message }) => {
+                assert!(message.contains("re-encoded"), "{message}");
+            }
+            other => panic!("expected a Status event, got {other:?}"),
+        }
+    }
 }
