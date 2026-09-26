@@ -16607,6 +16607,16 @@ async fn repeated_typed_denials_stop_worker_as_failed_not_budget() {
         Some("Partial report: every bash call was denied."),
         "the report-only response's text is the recorded result"
     );
+    // The refusals reached the model as errors, not as successful results.
+    let transcript = checkpoint_messages_to_text(
+        &result
+            .checkpoint
+            .as_ref()
+            .expect("the stalled worker keeps its transcript")
+            .messages,
+    );
+    assert!(transcript.contains("(error)"), "{transcript}");
+    assert!(!transcript.contains("(ok)"), "{transcript}");
 }
 
 #[tokio::test]
@@ -20478,6 +20488,10 @@ fn a_network_denied_child_cannot_address_a_remote_location_through_any_tool() {
             "Bash",
             json!({"action": "run", "command": "gh issue view 5287"}),
         ),
+        // #6015: a network read inside a pipeline or chain, and npm reads.
+        ("bash", json!({"command": "gh pr view 1 | head"})),
+        ("bash", json!({"command": "ls && gh issue list"})),
+        ("bash", json!({"command": "npm view x | head"})),
     ] {
         assert!(
             reject_network_reaching_input(name, &input).is_err(),
@@ -24577,4 +24591,375 @@ fn queued_budget_note_names_the_end_time_and_keeps_the_cause_stable() {
     assert_eq!(note, later, "same deadline, same text: no stale countdown");
     let reason = format!("{SUBAGENT_QUEUED_LAUNCH_REASON} {note}");
     assert_eq!(queued_reason_cause(&reason), SUBAGENT_QUEUED_LAUNCH_REASON);
+}
+
+/// #6015: read-only children run read-only shell commands, refusals come back
+/// as actionable error results, and the child ends with an honest status.
+mod readonly_shell_6015 {
+    use super::*;
+
+    /// One `bash` call per command, then a text report.
+    async fn scripted_bash_calls_client(
+        commands: Vec<&'static str>,
+        report: &'static str,
+    ) -> (CodewhaleClient, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/{*path}",
+            post({
+                let calls = Arc::clone(&calls);
+                move |Json(_body): Json<Value>| {
+                    let calls = Arc::clone(&calls);
+                    let commands = commands.clone();
+                    async move {
+                        let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                        let usage = json!({
+                            "prompt_tokens": 10,
+                            "completion_tokens": 5,
+                            "total_tokens": 15
+                        });
+                        let body = match commands.get(attempt) {
+                            Some(command) => json!({
+                                "id": format!("chatcmpl-ro-{attempt}"),
+                                "model": "deepseek-v4-flash",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": null,
+                                        "tool_calls": [{
+                                            "id": format!("call_ro_{attempt}"),
+                                            "type": "function",
+                                            "function": {
+                                                "name": "bash",
+                                                "arguments": json!({"command": command}).to_string()
+                                            }
+                                        }]
+                                    },
+                                    "finish_reason": "tool_calls"
+                                }],
+                                "usage": usage
+                            }),
+                            None => json!({
+                                "id": format!("chatcmpl-ro-report-{attempt}"),
+                                "model": "deepseek-v4-flash",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": report},
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": usage
+                            }),
+                        };
+                        Json(body).into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let config = crate::config::Config {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(format!("http://{addr}/v1")),
+            retry: Some(crate::config::RetryConfig {
+                enabled: Some(false),
+                max_retries: Some(0),
+                initial_delay: Some(0.0),
+                max_delay: Some(0.0),
+                exponential_base: Some(1.0),
+            }),
+            ..crate::config::Config::default()
+        };
+        (
+            CodewhaleClient::new(&config).expect("scripted chat client"),
+            calls,
+        )
+    }
+
+    fn scout_runtime(workspace: &Path, client: CodewhaleClient) -> SubAgentRuntime {
+        let mut runtime =
+            stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+        runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
+        seed_read_only_role_deny_list(&mut runtime);
+        runtime.client = client;
+        runtime.context = ToolContext::new(workspace);
+        runtime
+    }
+
+    async fn run_scout(workspace: &Path, client: CodewhaleClient, id: &str) -> SubAgentResult {
+        let manager = Arc::new(RwLock::new(SubAgentManager::new(
+            workspace.to_path_buf(),
+            2,
+        )));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let agent = SubAgent::new(
+            id.to_string(),
+            FleetRole::Scout,
+            "Inspect the workspace".to_string(),
+            make_assignment(),
+            "deepseek-v4-flash".to_string(),
+            Some("Probe".to_string()),
+            None,
+            input_tx,
+            workspace.to_path_buf(),
+            "boot_readonly".to_string(),
+        );
+        {
+            let mut manager = manager.write().await;
+            manager.agents.insert(id.to_string(), agent);
+            manager.register_worker(make_worker_spec(id, workspace.to_path_buf()));
+        }
+        let mut runtime = scout_runtime(workspace, client);
+        runtime.manager = Arc::clone(&manager);
+        run_subagent_task(SubAgentTask {
+            manager_handle: Arc::clone(&manager),
+            runtime,
+            agent_id: id.to_string(),
+            agent_type: FleetRole::Scout,
+            prompt: "Inspect the workspace".to_string(),
+            assignment: make_assignment(),
+            allowed_tools: None,
+            fork_context: false,
+            started_at: Instant::now(),
+            max_steps: 20,
+            wall_time: DEFAULT_CHILD_WALL_TIME,
+            input_rx,
+            launch_gate: None,
+            _foreground_child_registration: None,
+        })
+        .await;
+        manager
+            .read()
+            .await
+            .get_result(id)
+            .expect("agent registered")
+    }
+
+    /// Every tool result the child sent back, in order: (is_error, content).
+    fn tool_results(result: &SubAgentResult) -> Vec<(Option<bool>, String)> {
+        result
+            .checkpoint
+            .as_ref()
+            .expect("the child keeps a checkpoint of its transcript")
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    is_error, content, ..
+                } => Some((*is_error, content.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn git(workspace: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_scout_runs_read_only_commands_and_completes() {
+        let tmp = tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("sub")).expect("sub");
+        std::fs::write(tmp.path().join("sub/listed.txt"), "x\n").expect("listed");
+        std::fs::write(tmp.path().join("notes.txt"), "the needle line\n").expect("notes");
+        git(tmp.path(), &["init", "-q"]);
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-q", "-m", "seed commit subject"]);
+
+        let (client, calls) = scripted_bash_calls_client(
+            vec!["cd sub && ls", "git grep -n needle", "git log --oneline -1"],
+            "Found the needle in notes.txt.",
+        )
+        .await;
+        let result = run_scout(tmp.path(), client, "agent_ro_reads").await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(
+            matches!(result.status, SubAgentStatus::Completed),
+            "{:?}",
+            result.status
+        );
+        assert!(result.steps_taken >= 4, "steps {}", result.steps_taken);
+        assert_eq!(
+            result.result.as_deref(),
+            Some("Found the needle in notes.txt.")
+        );
+        let results = tool_results(&result);
+        assert_eq!(results.len(), 3, "{results:?}");
+        for (is_error, content) in &results {
+            assert_eq!(*is_error, None, "a read must not be refused: {content}");
+        }
+        assert!(results[0].1.contains("listed.txt"), "{}", results[0].1);
+        assert!(results[1].1.contains("needle"), "{}", results[1].1);
+        assert!(
+            results[2].1.contains("seed commit subject"),
+            "{}",
+            results[2].1
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_scout_write_attempt_is_an_actionable_error_result() {
+        let tmp = tempdir().expect("tempdir");
+        let (client, calls) =
+            scripted_bash_calls_client(vec!["touch evil.txt"], "Reported the blocked probe.").await;
+        let result = run_scout(tmp.path(), client, "agent_ro_write").await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the worker takes another step"
+        );
+        assert!(!tmp.path().join("evil.txt").exists());
+        assert!(
+            matches!(result.status, SubAgentStatus::Completed),
+            "{:?}",
+            result.status
+        );
+        assert_eq!(
+            result.result.as_deref(),
+            Some("Reported the blocked probe.")
+        );
+        let results = tool_results(&result);
+        assert_eq!(results.len(), 1, "{results:?}");
+        let (is_error, content) = &results[0];
+        assert_eq!(*is_error, Some(true), "{content}");
+        assert!(content.contains("[shell.readonly.command]"), "{content}");
+        assert!(content.contains("program: `touch`"), "{content}");
+        assert!(content.contains("File tool"), "{content}");
+        for absent in ["Git", "Run tests", "/mode"] {
+            assert!(!content.contains(absent), "{absent} in {content}");
+        }
+        assert!(
+            checkpoint_messages_to_text(&result.checkpoint.as_ref().unwrap().messages)
+                .contains("(error)")
+        );
+    }
+
+    /// Every read-only gate gives the same admit/refuse answer and, for a
+    /// refusal, the same rule text: the Scout posture gate, the shared
+    /// predicate, the durable authority, and the executor.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_gates_agree_and_share_refusal_text() {
+        use crate::tools::spec::{
+            ToolAuthorityEnvelope, ToolMutationAuthority, ToolShellAuthority,
+            ToolVerificationAuthority,
+        };
+        let tmp = tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("sub")).expect("sub");
+        std::fs::write(tmp.path().join("sub/a.txt"), "needle\n").expect("fixture");
+
+        let child = SubAgentToolRegistry::new(
+            scout_runtime(tmp.path(), stub_runtime().client),
+            FleetRole::Scout,
+            None,
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        let durable = ToolContext::new(tmp.path())
+            .with_tool_authority(ToolAuthorityEnvelope {
+                schema_version: 1,
+                owner: "scout-durable".to_string(),
+                authority: ToolMutationAuthority::ReadOnly,
+                network_access: Some(true),
+                shell: ToolShellAuthority::ReadOnly,
+                verification: ToolVerificationAuthority::None,
+                writable_roots: Vec::new(),
+                writable_files: Vec::new(),
+                coordination_contracts: Vec::new(),
+            })
+            .expect("durable authority")
+            .with_shell_policy(ShellPolicy::ReadOnly);
+        let executor = ToolContext::new(tmp.path())
+            .with_shell_policy(ShellPolicy::ReadOnly)
+            .with_owner_agent("agent_gate", "gate");
+        let bash = crate::tools::shell::BashTool::new("Bash");
+
+        for (command, admitted) in [
+            ("ls", true),
+            ("cat sub/a.txt", true),
+            ("cd sub && ls", true),
+            ("ls | head -1", true),
+            ("cat sub/a.txt && echo ---", true),
+            ("find . -name '*.txt'", true),
+            ("sed -n 1p sub/a.txt", true),
+            ("wc -l sub/a.txt 2>/dev/null", true),
+            ("git log --oneline -3; git status --short", true),
+            ("touch x", false),
+            ("ls && rm x", false),
+            ("cat sub/a.txt > b", false),
+            ("echo $(id)", false),
+            ("python3 -c 'print(1)'", false),
+            ("git commit -m x", false),
+            ("sort -o out sub/a.txt", false),
+            ("cd sub; ls", false),
+            ("(ls)", false),
+            ("ls &", false),
+            ("gh issue close 1", false),
+        ] {
+            let lower = json!({"command": command});
+            let upper = json!({"action": "run", "command": command});
+            assert_eq!(
+                crate::tools::shell::agent_readonly_bash_input(&lower),
+                admitted,
+                "{command}"
+            );
+            let authority =
+                crate::tools::registry::enforce_tool_authority("Bash", &upper, &bash, &durable);
+            let posture = child.execute("gate_call", "bash", lower.clone()).await;
+            let executed = bash.execute(upper.clone(), &executor).await;
+            if admitted {
+                authority.unwrap_or_else(|error| panic!("{command}: {error}"));
+                for outcome in [
+                    posture.err().map(|error| error.to_string()),
+                    executed.err().map(|error| error.to_string()),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    assert!(
+                        !outcome.contains("[shell.readonly.command]"),
+                        "{command} was refused by a gate: {outcome}"
+                    );
+                }
+                continue;
+            }
+            let normalized = crate::tools::shell::normalize_readonly_cd(&lower);
+            let rule = codewhale_execpolicy::command_safety::agent_readonly_verdict(
+                normalized["command"].as_str().unwrap(),
+            )
+            .expect_err("refused")
+            .to_string();
+            for (gate, message) in [
+                ("authority", authority.expect_err("refused").to_string()),
+                ("posture", posture.expect_err("refused").to_string()),
+                ("execute", executed.expect_err("refused").to_string()),
+            ] {
+                assert!(
+                    message.contains(&rule),
+                    "{gate} refusal for {command} lacks the shared rule {rule:?}: {message}"
+                );
+            }
+        }
+        assert!(!tmp.path().join("x").exists());
+        assert!(!tmp.path().join("b").exists());
+        assert!(!tmp.path().join("out").exists());
+    }
 }

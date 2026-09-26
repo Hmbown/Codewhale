@@ -2154,9 +2154,9 @@ impl ShellManager {
 
         // Create command spec and prepare sandboxed environment
         let spec = if let Some(workspace) = readonly_workspace {
-            if command.contains('|') {
-                let piped = hardened_readonly_pipeline(command, workspace)?;
-                CommandSpec::shell(&piped, work_dir.clone(), Duration::from_millis(timeout_ms))
+            if readonly_command_needs_shell(command) {
+                let script = hardened_readonly_script(command, workspace)?;
+                CommandSpec::shell(&script, work_dir.clone(), Duration::from_millis(timeout_ms))
             } else {
                 let (program, args) = hardened_readonly_argv(command)?;
                 let program = resolve_readonly_program(&program, workspace)?;
@@ -3604,8 +3604,9 @@ use crate::tools::spec::{
 };
 use async_trait::async_trait;
 use codewhale_execpolicy::command_safety::{
-    SafetyLevel, analyze_command, extract_primary_command, is_agent_readonly_shell_command,
-    is_github_readonly_command, is_parallel_readonly_command, normalize_windows_command_paths,
+    NetworkRead, ReadonlyRejection, SafetyLevel, agent_readonly_verdict, analyze_command,
+    extract_primary_command, is_parallel_readonly_command, normalize_windows_command_paths,
+    readonly_network_reads, split_leading_cd,
 };
 use codewhale_execpolicy::toml_rules::{ExecPolicyConfig, RuleDecision};
 use serde_json::json;
@@ -3946,29 +3947,37 @@ fn require_no_nul<'a>(value: &'a str, field: &str) -> Result<&'a str, ToolError>
     Ok(value)
 }
 
-fn enforce_readonly_github_network_policy(
-    command: &str,
-    context: &ToolContext,
-) -> Result<(), ToolError> {
-    if !is_github_readonly_command(command) {
-        return Ok(());
-    }
+/// Apply the network policy to every network read inside a read-only
+/// command, segment by segment, so a pipeline or chain cannot hide one.
+/// A full shell keeps its historical scope here: only a lone `gh` read is
+/// judged, because its other network use is governed elsewhere.
+fn enforce_readonly_network_reads(command: &str, context: &ToolContext) -> Result<(), ToolError> {
     let Some(decider) = context.network_policy.as_ref() else {
         return Ok(());
     };
-
-    use crate::network_policy::Decision;
-    match decider.evaluate("api.github.com", "Bash") {
-        Decision::Allow => Ok(()),
-        Decision::Deny => Err(ToolError::permission_denied(
-            "Read-only GitHub CLI access to 'api.github.com' is blocked by the active network policy."
-                .to_string(),
-        )),
-        Decision::Prompt => Err(ToolError::permission_denied(
-            "Read-only GitHub CLI access to 'api.github.com' requires network approval; allow that host in the parent session or network policy before dispatching the scout."
-                .to_string(),
-        )),
+    let mut reads = readonly_network_reads(command);
+    if context.shell_policy != ShellPolicy::ReadOnly {
+        let lone = agent_readonly_verdict(command).is_ok_and(|segments| segments.len() == 1);
+        reads.retain(|read| lone && *read == NetworkRead::GitHub);
     }
+    use crate::network_policy::Decision;
+    for read in reads {
+        let host = read.host();
+        match decider.evaluate(host, "Bash") {
+            Decision::Allow => {}
+            Decision::Deny => {
+                return Err(ToolError::permission_denied(format!(
+                    "Read-only network access to '{host}' is blocked by the active network policy."
+                )));
+            }
+            Decision::Prompt => {
+                return Err(ToolError::permission_denied(format!(
+                    "Read-only network access to '{host}' requires network approval; allow that host in the parent session or network policy first."
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// This is a request for mandatory filesystem/network isolation, not a claim
@@ -4018,37 +4027,113 @@ fn require_native_readonly_execution(exec_env: &ExecEnv) -> Result<()> {
 
 /// `exec_shell_input_is_parallel_readonly` with the agent-posture classifier:
 /// same input-shape restrictions (run action only, no background/tty/stdin),
-/// but commands are judged by [`is_agent_readonly_shell_command`] so
+/// but commands are judged by
+/// [`codewhale_execpolicy::command_safety::agent_readonly_verdict`] so
 /// `ShellPolicy::ReadOnly` agents keep a usable inspection surface
-/// (pipelines, globs, `git -C`, `find`, `sed -n`, `npm view`).
-fn exec_shell_input_agent_readonly(input: &serde_json::Value) -> bool {
+/// (pipelines and chains of reads, globs, `git -C`, `find`, `sed -n`,
+/// `npm view`). Callers pass input already through [`normalize_readonly_cd`].
+fn exec_shell_input_agent_readonly_verdict(
+    input: &serde_json::Value,
+) -> Result<(), ReadonlyRejection> {
     if enforced_readonly_input(input) {
-        return true;
+        return Ok(());
     }
     if !exec_shell_input_is_parallel_readonly_shape(input) {
-        return false;
+        return Err(ReadonlyRejection::new(
+            "shape",
+            "read-only shell accepts only a foreground `command` with optional `cwd` and timeout; background, stdin, interactive and TTY modes are not admitted",
+        ));
     }
     let command = input
         .get("command")
         .and_then(serde_json::Value::as_str)
         .expect("shape check established a command string");
-    is_agent_readonly_shell_command(command)
+    agent_readonly_verdict(command).map(|_| ())
 }
 
-/// `exec_shell_input_agent_readonly` is also the gate-side predicate for the
+/// Move a leading `cd <dir> &&` into the `cwd` field, resolved against any
+/// `cwd` already present, so no gate has to interpret `cd`: the ordinary
+/// working-directory workspace check then judges the directory, and every
+/// gate and the executor see the same rewritten input. Only the shape
+/// [`split_leading_cd`] accepts is rewritten; `read_only: true` input runs
+/// its command unchanged under the enforced lane.
+pub(crate) fn normalize_readonly_cd(input: &serde_json::Value) -> serde_json::Value {
+    let mut input = input.clone();
+    if enforced_readonly_input(&input) {
+        return input;
+    }
+    // Bounded: each pass removes one leading `cd`.
+    for _ in 0..4 {
+        let Some((dir, rest)) = input
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .and_then(split_leading_cd)
+        else {
+            break;
+        };
+        let cwd = match input.get("cwd") {
+            None | Some(serde_json::Value::Null) => dir,
+            Some(serde_json::Value::String(existing)) => std::path::Path::new(existing)
+                .join(&dir)
+                .to_string_lossy()
+                .into_owned(),
+            // A wrong type is reported by the executor's own type check.
+            Some(_) => break,
+        };
+        input["command"] = json!(rest);
+        input["cwd"] = json!(cwd);
+    }
+    input
+}
+
+/// The refusal a read-only agent sees, shared by every gate that judges the
+/// agent grammar (subagent posture, durable authority, and the executor), so
+/// the rule text is byte-identical wherever a command is refused. The next
+/// steps name only tools such an agent has.
+pub(crate) fn readonly_refusal(rejection: &ReadonlyRejection, enforced_lane: bool) -> String {
+    let lane = if enforced_lane {
+        ", rerun it with `read_only: true` to run it in an enforced read-only sandbox"
+    } else {
+        ""
+    };
+    format!(
+        "{rejection}. Next: use admitted reads only (the shell tool description lists the grammar), read or search files with the File tool{lane}, or, if the probe is essential, return your findings and the blocked probe to the parent."
+    )
+}
+
+/// Whether `read_only: true` can run here: a native enforcing sandbox and
+/// no external backend.
+pub(crate) fn readonly_enforced_lane_available(context: &ToolContext) -> bool {
+    context.sandbox_backend.is_none()
+        && context.shell_manager.lock().is_ok_and(|manager| {
+            manager
+                .configured_sandbox_type()
+                .is_some_and(is_native_readonly_sandbox)
+        })
+}
+
+/// `exec_shell_input_agent_readonly_verdict` is also the gate-side predicate for the
 /// subagent posture check (#5426): the catalog carve-out that admits
 /// canonical `bash` to Scout/Reviewer/Planner must judge the same call the
 /// `BashTool::execute` `ShellPolicy::ReadOnly` branch will judge, so the
 /// posture gate can admit a proven-readonly call without ever widening past
 /// the execute-time refusal.
 pub(crate) fn agent_readonly_bash_input(input: &serde_json::Value) -> bool {
+    agent_readonly_bash_verdict(input).is_ok()
+}
+
+/// [`agent_readonly_bash_input`] with the rule that refused the call.
+pub(crate) fn agent_readonly_bash_verdict(
+    input: &serde_json::Value,
+) -> Result<(), ReadonlyRejection> {
     // Canonical lowercase `bash` advertises `timeout` in seconds, while the
     // internal executor contract uses `timeout_ms`. Normalize through the same
     // translator the concrete tool uses so posture, session approval, envelope,
     // and execute judge one input (#5595). Legacy/internal shapes fall back to
-    // their existing direct classification.
+    // their existing direct classification. A leading `cd` is then moved into
+    // `cwd` exactly as `BashTool::execute` does.
     let translated = contract_bash_legacy_input(input).unwrap_or_else(|_| input.clone());
-    exec_shell_input_agent_readonly(&translated)
+    exec_shell_input_agent_readonly_verdict(&normalize_readonly_cd(&translated))
 }
 
 fn exec_shell_input_is_parallel_readonly(input: &serde_json::Value) -> bool {
@@ -4110,7 +4195,15 @@ fn exec_shell_input_is_parallel_readonly_shape(input: &serde_json::Value) -> boo
         .is_some()
 }
 
-fn hardened_readonly_pipeline(command: &str, workspace: &std::path::Path) -> Result<String> {
+/// Whether a classifier-approved read needs a shell to join its segments or
+/// apply an admitted redirect; a lone plain command runs as direct argv.
+fn readonly_command_needs_shell(command: &str) -> bool {
+    agent_readonly_verdict(command).map_or(true, |segments| {
+        segments.len() > 1 || segments.iter().any(|segment| !segment.redirects.is_empty())
+    })
+}
+
+fn hardened_readonly_script(command: &str, workspace: &std::path::Path) -> Result<String> {
     use crate::shell_dispatcher::ShellKind;
     // POSIX quoting must never be passed to a different command interpreter.
     let supported = match crate::shell_dispatcher::global_dispatcher().kind() {
@@ -4125,32 +4218,35 @@ fn hardened_readonly_pipeline(command: &str, workspace: &std::path::Path) -> Res
     };
     if !supported {
         return Err(anyhow!(
-            "read-only pipelines require bash or zsh; run each read separately"
+            "read-only pipelines and chains require bash or zsh; run each read separately"
         ));
     }
-    if !is_agent_readonly_shell_command(command) {
-        return Err(anyhow!(
-            "pipeline contains a command outside the read-only policy"
-        ));
+    let segments = agent_readonly_verdict(command)
+        .map_err(|rejection| anyhow!("command is outside the read-only policy: {rejection}"))?;
+    let mut script = String::from("set -o pipefail;");
+    for segment in &segments {
+        let (program, args) = hardened_readonly_argv(&segment.command)?;
+        let program = resolve_readonly_program(&program, workspace)?;
+        let program = program
+            .to_str()
+            .ok_or_else(|| anyhow!("read-only executable path is not valid UTF-8"))?;
+        for word in std::iter::once(program).chain(args.iter().map(String::as_str)) {
+            script.push(' ');
+            script.push_str(&shell_words::quote(word));
+        }
+        for redirect in &segment.redirects {
+            script.push(' ');
+            script.push_str(redirect);
+        }
+        if let Some(join) = segment.join {
+            script.push(' ');
+            script.push_str(join.as_str());
+        }
     }
-    let segments = command
-        .split('|')
-        .map(|segment| {
-            let (program, args) = hardened_readonly_argv(segment)?;
-            let program = resolve_readonly_program(&program, workspace)?;
-            let program = program
-                .to_str()
-                .ok_or_else(|| anyhow!("read-only executable path is not valid UTF-8"))?;
-            Ok(std::iter::once(program)
-                .chain(args.iter().map(String::as_str))
-                .map(|arg| shell_words::quote(arg).into_owned())
-                .collect::<Vec<_>>()
-                .join(" "))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    // The only shell operators are our pipes. Filenames cannot expand into
-    // options or unvalidated symlinks; every Git stage retains helper guards.
-    Ok(format!("set -o pipefail; {}", segments.join(" | ")))
+    // The only shell syntax is the admitted operators and redirect words.
+    // Filenames cannot expand into options or unvalidated symlinks; every Git
+    // stage retains helper guards.
+    Ok(script)
 }
 
 fn hardened_readonly_argv(command: &str) -> Result<(String, Vec<String>)> {
@@ -4215,6 +4311,28 @@ fn hardened_readonly_argv(command: &str) -> Result<(String, Vec<String>)> {
 }
 
 fn enforce_readonly_workspace_operands(
+    command: &str,
+    workspace: &std::path::Path,
+    effective_cwd: &std::path::Path,
+) -> Result<(), ToolError> {
+    // Judge each segment of a pipeline or chain on its own, so the `gh`
+    // exemption below covers only the `gh` segment itself.
+    let segments = agent_readonly_verdict(command).map_or_else(
+        |_| vec![command.to_string()],
+        |segments| {
+            segments
+                .into_iter()
+                .map(|segment| segment.command)
+                .collect()
+        },
+    );
+    for segment in &segments {
+        enforce_readonly_segment_operands(segment, workspace, effective_cwd)?;
+    }
+    Ok(())
+}
+
+fn enforce_readonly_segment_operands(
     command: &str,
     workspace: &std::path::Path,
     effective_cwd: &std::path::Path,
@@ -5111,6 +5229,13 @@ impl ToolSpec for BashTool {
         input: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
+        // A leading `cd <dir> &&` becomes the working directory before any
+        // check, exactly as the read-only gates judged it.
+        let input = if context.shell_policy == ShellPolicy::ReadOnly {
+            normalize_readonly_cd(&input)
+        } else {
+            input
+        };
         // `and_then(as_str).unwrap_or("run")` treated *any* non-string
         // `action` as absent and fell through to the branch that runs
         // arbitrary code: `Bash{action: 3, command: "…"}` executed the
@@ -5190,20 +5315,27 @@ impl ToolSpec for BashTool {
                     "Shell tools are disabled by the active permission profile.",
                 ));
             }
-            ShellPolicy::ReadOnly if !exec_shell_input_agent_readonly(&input) => {
-                // #6298: a child has no mode to switch to, so the parent's
-                // `/mode work` advice is unreachable. Name the child's own
-                // alternatives instead, plus the escalation path.
-                let message = if context.owner_agent_id.is_some() {
-                    "Shell command blocked by read-only shell policy. As a sub-agent you cannot switch modes: read files with read_file/grep_files, inspect Git with fetch/log/show (merge_tree for merge results), run checks with Run tests/verifiers (pass `cwd` when the checks live in a subdirectory), and report the blocked probe to the parent instead of working around it."
-                } else {
-                    "Shell command blocked by read-only shell policy. Use a non-mutating, non-background inspection command, or switch to Work mode (`/mode work`) for write-capable shell work."
-                };
-                return Ok(ToolResult::error(message));
+            ShellPolicy::ReadOnly => {
+                if let Err(rejection) = exec_shell_input_agent_readonly_verdict(&input) {
+                    // A typed denial, so a Fleet worker's no-progress guard
+                    // counts it. #6298: an agent has no mode to switch to,
+                    // so it gets the same next steps as the other read-only
+                    // gates; only a parent session is pointed at Work mode.
+                    let message = if context.owner_agent_id.is_some()
+                        || context.tool_authority.is_some()
+                    {
+                        readonly_refusal(&rejection, readonly_enforced_lane_available(context))
+                    } else {
+                        format!(
+                            "{rejection}. Use a read-only inspection command, or switch to Work mode (`/mode work`) for write-capable shell work."
+                        )
+                    };
+                    return Err(ToolError::permission_denied(message));
+                }
             }
-            ShellPolicy::ReadOnly | ShellPolicy::Full => {}
+            ShellPolicy::Full => {}
         }
-        enforce_readonly_github_network_policy(command, context)?;
+        enforce_readonly_network_reads(command, context)?;
         let requested_timeout_ms = if self.optional_timeout {
             input
                 .get("timeout_ms")

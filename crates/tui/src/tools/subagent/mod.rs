@@ -14791,7 +14791,9 @@ async fn run_subagent(
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: tool_id,
                     content: result,
-                    is_error: None,
+                    // Refusals reach the provider as errors, matching the
+                    // parent turn loop (#6015).
+                    is_error: Some(true),
                     content_blocks: None,
                 });
                 continue;
@@ -14954,7 +14956,9 @@ async fn run_subagent(
             tool_results.push(ContentBlock::ToolResult {
                 tool_use_id: tool_id,
                 content: result,
-                is_error: None,
+                // A refused or failed call is marked as an error for the
+                // provider, matching the parent turn loop (#6015).
+                is_error: (!tool_ok).then_some(true),
                 content_blocks: (!content_blocks.is_empty()).then_some(content_blocks),
             });
         }
@@ -19209,11 +19213,25 @@ impl SubAgentToolRegistry {
         // bypass where a read-only child could quietly write or shell out.
         if !self.posture_permits_tool(name, Some(&input)) {
             if self.allows_bounded_readonly_bash(name) {
-                return Err(admission_denied(format!(
-                    "[shell.readonly.command] Tool {name} input did not match the bounded read-only shell grammar for Fleet role `{role}`. {guidance}",
-                    role = self.agent_type.as_str(),
-                    guidance = codewhale_execpolicy::command_safety::readonly_command_help()
-                )));
+                // #6015: the same rule text and next steps as the durable
+                // authority and the executor, from the one classifier.
+                let lane =
+                    crate::tools::shell::readonly_enforced_lane_available(self.registry.context());
+                return Err(admission_denied(
+                    match crate::tools::shell::agent_readonly_bash_verdict(&input) {
+                        Err(rejection) => format!(
+                            "{} (tool {name}, Fleet role `{role}`)",
+                            crate::tools::shell::readonly_refusal(&rejection, lane),
+                            role = self.agent_type.as_str(),
+                        ),
+                        Ok(()) => format!(
+                            "[shell.readonly.command] Tool {name} input did not match the bounded read-only shell grammar for Fleet role `{role}`. {guidance}",
+                            role = self.agent_type.as_str(),
+                            guidance =
+                                codewhale_execpolicy::command_safety::readonly_command_help()
+                        ),
+                    },
+                ));
             }
             return Err(admission_denied(format!(
                 "[role.posture.denied] Tool {name} is not permitted for the read-only Fleet role `{role}`. Use an `implement` or `general` role (or `custom` with an explicit allowed_tools list) to mutate the workspace or run shell commands.",
@@ -19559,12 +19577,16 @@ fn carries_network_url(input: &Value) -> bool {
 /// written. It fails closed and names the posture, so the refusal reads as a
 /// contract rather than a malfunction.
 fn reject_network_reaching_input(name: &str, input: &Value) -> Result<()> {
-    let github_shell_read = matches!(name, "bash" | "Bash" | "exec_shell")
+    // Judged per segment, so a gh or npm read inside a pipeline or chain is
+    // still a network read (#6015).
+    let shell_network_read = matches!(name, "bash" | "Bash" | "exec_shell")
         && input
             .get("command")
             .and_then(Value::as_str)
-            .is_some_and(codewhale_execpolicy::command_safety::is_github_readonly_command);
-    if !github_shell_read && !carries_network_url(input) {
+            .is_some_and(|command| {
+                !codewhale_execpolicy::command_safety::readonly_network_reads(command).is_empty()
+            });
+    if !shell_network_read && !carries_network_url(input) {
         return Ok(());
     }
     Err(anyhow!(

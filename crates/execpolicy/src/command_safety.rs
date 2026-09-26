@@ -668,7 +668,8 @@ pub struct ReadonlySegment {
     start: usize,
 }
 
-const READONLY_OPERATOR_HINT: &str = "join reads with |, &&, || or ; and use single quotes for literal text";
+const READONLY_OPERATOR_HINT: &str =
+    "join reads with |, &&, || or ; and use single quotes for literal text";
 
 /// Allow-direction lexer for [`agent_readonly_verdict`]. It tracks quotes and
 /// splits only on unquoted `|`, `&&`, `||` and `;`. Every other unquoted
@@ -946,13 +947,24 @@ pub fn readonly_network_reads(command: &str) -> Vec<NetworkRead> {
 /// this set failed on an option or operand; any other program is refused as
 /// a program.
 const AGENT_READONLY_PROGRAMS: &[&str] = &[
-    "git", "gh", "find", "sed", "npm", "sort", "uniq", "cut", "tr", "comm", "echo", "printf",
-    "codewhale", "codew",
+    "git",
+    "gh",
+    "find",
+    "sed",
+    "npm",
+    "sort",
+    "uniq",
+    "cut",
+    "tr",
+    "comm",
+    "echo",
+    "printf",
+    "codewhale",
+    "codew",
 ];
 
-const AGENT_GIT_SUBCOMMANDS: &[&str] = &[
-    "status", "log", "diff", "show", "ls-files", "blame", "grep",
-];
+const AGENT_GIT_SUBCOMMANDS: &[&str] =
+    &["status", "log", "diff", "show", "ls-files", "blame", "grep"];
 
 fn agent_segment_verdict(segment: &str) -> Result<(), ReadonlyRejection> {
     let segment = segment.trim();
@@ -996,7 +1008,9 @@ fn agent_segment_verdict(segment: &str) -> Result<(), ReadonlyRejection> {
             match rest.first().map(String::as_str) {
                 Some(flag) if flag.starts_with('-') => ReadonlyRejection::new(
                     "option",
-                    format!("Git global option `{flag}` is not admitted; only -C <dir> and --no-pager may precede the subcommand"),
+                    format!(
+                        "Git global option `{flag}` is not admitted; only -C <dir> and --no-pager may precede the subcommand"
+                    ),
                 ),
                 Some(sub) if !AGENT_GIT_SUBCOMMANDS.contains(&sub) => ReadonlyRejection::new(
                     "subcommand",
@@ -1036,7 +1050,9 @@ fn agent_segment_verdict(segment: &str) -> Result<(), ReadonlyRejection> {
         ),
         "echo" | "printf" => ReadonlyRejection::new(
             "option",
-            format!("`{program}` is admitted with literal text only: no `*`, no leading `~`, and no printf options"),
+            format!(
+                "`{program}` is admitted with literal text only: no `*`, no leading `~`, and no printf options"
+            ),
         ),
         _ if known => option_rejection(segment, program),
         _ => ReadonlyRejection::new(
@@ -2959,8 +2975,8 @@ mod tests {
             ("FOO=1 ls", "env_prefix", "environment"),
             ("ls && cd b && ls", "cd", "first command"),
         ] {
-            let rejection = agent_readonly_verdict(command)
-                .expect_err(&format!("{command} must be refused"));
+            let rejection =
+                agent_readonly_verdict(command).expect_err(&format!("{command} must be refused"));
             assert_eq!(rejection.rule, rule, "{command}: {rejection}");
             let rendered = rejection.to_string();
             assert!(

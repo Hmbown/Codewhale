@@ -313,14 +313,18 @@ async fn lowercase_bash_readonly_refusal_names_work_mode() {
     let workspace = tempdir().expect("workspace");
     let context = ToolContext::new(workspace.path())
         .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly);
-    let result = LowercaseBashTool
+    let error = LowercaseBashTool
         .execute(json!({"command": "touch blocked-by-plan"}), &context)
         .await
-        .expect("policy refusal is a normal tool result");
+        .expect_err("policy refusal is a typed denial");
 
-    assert!(!result.success);
-    assert!(result.content.contains("Work mode (`/mode work`)"));
-    assert!(!result.content.contains("Act mode"));
+    assert!(
+        matches!(error, ToolError::PermissionDenied { .. }),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("Work mode (`/mode work`)"), "{message}");
+    assert!(!message.contains("Act mode"));
     assert!(!workspace.path().join("blocked-by-plan").exists());
 }
 
@@ -1160,22 +1164,35 @@ fn readonly_github_shell_calls_obey_the_host_network_policy_before_spawn() {
     };
 
     let allow = context(crate::network_policy::DecisionToml::Allow);
-    enforce_readonly_github_network_policy("gh issue view 5287", &allow)
+    enforce_readonly_network_reads("gh issue view 5287", &allow)
         .expect("allowed github.com policy");
 
     let deny = context(crate::network_policy::DecisionToml::Deny);
-    let denied = enforce_readonly_github_network_policy("gh issue list", &deny)
+    let denied = enforce_readonly_network_reads("gh issue list", &deny)
         .expect_err("deny must stop before spawning gh")
         .to_string();
     assert!(denied.contains("blocked by the active network policy"));
-    enforce_readonly_github_network_policy("git status", &deny)
+    enforce_readonly_network_reads("git status", &deny)
         .expect("local reads do not consult the network policy");
 
     let prompt = context(crate::network_policy::DecisionToml::Prompt);
-    let prompted = enforce_readonly_github_network_policy("gh issue view 5287", &prompt)
+    let prompted = enforce_readonly_network_reads("gh issue view 5287", &prompt)
         .expect_err("headless Scout cannot prompt interactively")
         .to_string();
     assert!(prompted.contains("requires network approval"));
+
+    // Read-only agents: every segment is judged, and npm reads count too.
+    let readonly_deny = context(crate::network_policy::DecisionToml::Deny)
+        .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly);
+    for command in ["gh pr view 1 | head", "ls && gh issue list", "npm view x"] {
+        let denied = enforce_readonly_network_reads(command, &readonly_deny)
+            .expect_err("a network read inside a composition is still judged")
+            .to_string();
+        assert!(denied.contains("blocked"), "{command}: {denied}");
+    }
+    // A full shell keeps its historical scope: only a lone gh read.
+    enforce_readonly_network_reads("gh pr view 1 | head", &deny)
+        .expect("full shell pipelines are governed elsewhere");
 }
 
 #[test]
@@ -1195,76 +1212,164 @@ async fn read_only_shell_policy_blocks_non_readonly_commands() {
         .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly);
     let tool = BashTool::new("Bash");
 
-    let result = tool
-        .execute(json!({"command": "cargo build"}), &ctx)
-        .await
-        .expect("execute");
-    assert!(!result.success);
-    assert!(result.content.contains("read-only shell policy"));
-
-    let result = tool
-        .execute(
+    for (input, rule) in [
+        (json!({"command": "cargo build"}), "program:"),
+        (
             json!({"command": "git status -s", "background": true}),
-            &ctx,
-        )
-        .await
-        .expect("execute");
-    assert!(!result.success);
-    assert!(result.content.contains("read-only shell policy"));
-
-    for command in [
-        "git --config-env=core.fsmonitor=SHELL status",
-        "git -cdiff.foo.textconv=./repo-script diff HEAD",
-        "rg -f/etc/passwd needle .",
+            "shape:",
+        ),
+        (
+            json!({"command": "git --config-env=core.fsmonitor=SHELL status"}),
+            "option:",
+        ),
+        (
+            json!({"command": "git -cdiff.foo.textconv=./repo-script diff HEAD"}),
+            "option:",
+        ),
+        (json!({"command": "rg -f/etc/passwd needle ."}), "option:"),
+        (json!({"command": "touch x && ls"}), "program:"),
     ] {
-        let result = tool
-            .execute(json!({"command": command}), &ctx)
+        // A typed denial, so a Fleet worker's no-progress guard counts it.
+        let error = tool
+            .execute(input.clone(), &ctx)
             .await
-            .expect("classifier refusal");
-        assert!(!result.success, "{command}: {}", result.content);
+            .expect_err("classifier refusal");
         assert!(
-            result.content.contains("read-only shell policy"),
-            "{command}"
+            matches!(error, ToolError::PermissionDenied { .. }),
+            "{input}: {error}"
         );
+        let message = error.to_string();
+        assert!(message.contains("[shell.readonly.command]"), "{message}");
+        assert!(message.contains(rule), "{input}: {message}");
     }
+    assert!(!tmp.path().join("x").exists());
 }
 
 #[tokio::test]
 async fn read_only_refusal_names_child_alternatives_instead_of_mode_switch() {
     // #6298: a child has no `/mode` to switch to — a refusal that tells it to
     // switch modes is a dead end beside an available absurd path. The child
-    // branch must name the child's own alternatives and the escalation path.
+    // branch must name the child's own alternatives and the escalation path,
+    // and only tools a read-only child actually has (#6015).
     let tmp = tempdir().expect("tempdir");
     let child_ctx = ToolContext::new(tmp.path())
         .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly)
         .with_owner_agent("agent_child", "child");
     let tool = BashTool::new("Bash");
-    let result = tool
-        .execute(json!({"command": "cargo build"}), &child_ctx)
+    let message = tool
+        .execute(json!({"command": "touch evil.txt"}), &child_ctx)
         .await
-        .expect("execute");
-    assert!(!result.success);
-    assert!(result.content.contains("read-only shell policy"));
-    assert!(result.content.contains("read_file"));
+        .expect_err("refused")
+        .to_string();
+    let rejection = codewhale_execpolicy::command_safety::agent_readonly_verdict("touch evil.txt")
+        .expect_err("touch is not a read");
+    assert!(message.contains(&rejection.to_string()), "{message}");
+    assert!(message.contains("program: `touch`"), "{message}");
+    assert!(message.contains("File tool"), "{message}");
     assert!(
-        result
-            .content
-            .contains("report the blocked probe to the parent")
+        message.contains("return your findings and the blocked probe to the parent"),
+        "{message}"
     );
-    assert!(
-        !result.content.contains("/mode work"),
-        "child must never be told to switch modes: {}",
-        result.content
-    );
+    for absent in ["/mode work", "Git", "Run tests", "merge_tree"] {
+        assert!(!message.contains(absent), "{absent} in {message}");
+    }
+    assert!(!tmp.path().join("evil.txt").exists());
 
     let parent_ctx = ToolContext::new(tmp.path())
         .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly);
-    let result = tool
+    let message = tool
         .execute(json!({"command": "cargo build"}), &parent_ctx)
         .await
-        .expect("execute");
-    assert!(!result.success);
-    assert!(result.content.contains("/mode work"));
+        .expect_err("refused")
+        .to_string();
+    assert!(message.contains("/mode work"), "{message}");
+}
+
+#[test]
+fn leading_cd_moves_into_cwd_for_every_gate() {
+    let rewritten = normalize_readonly_cd(&json!({"command": "cd sub && ls"}));
+    assert_eq!(rewritten, json!({"command": "ls", "cwd": "sub"}));
+    let rewritten =
+        normalize_readonly_cd(&json!({"command": "cd inner && git diff", "cwd": "sub"}));
+    assert_eq!(rewritten["command"], "git diff");
+    assert_eq!(
+        std::path::Path::new(rewritten["cwd"].as_str().unwrap()),
+        std::path::Path::new("sub").join("inner")
+    );
+    for command in ["cd a; ls", "ls && cd b && ls", "cd && ls", "cd $X && ls"] {
+        let input = json!({"command": command});
+        assert_eq!(normalize_readonly_cd(&input), input, "{command}");
+        assert!(!agent_readonly_bash_input(&input), "{command}");
+    }
+    // The enforced lane runs its command unchanged.
+    let enforced = json!({"command": "cd sub && ls", "read_only": true});
+    assert_eq!(normalize_readonly_cd(&enforced), enforced);
+    assert!(agent_readonly_bash_input(
+        &json!({"command": "cd sub && ls"})
+    ));
+    assert!(agent_readonly_bash_input(
+        &json!({"command": "cd sub && git diff && echo '=== FILES ===' && ls -la"})
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn read_only_shell_runs_chains_and_leading_cd() {
+    let workspace = tempdir().expect("workspace");
+    std::fs::create_dir(workspace.path().join("sub")).expect("sub");
+    std::fs::write(workspace.path().join("sub").join("a.txt"), "alpha\n").expect("a");
+    std::fs::write(workspace.path().join("b.txt"), "beta\n").expect("b");
+    let ctx = ToolContext::new(workspace.path())
+        .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly);
+    let tool = BashTool::new("Bash");
+    let result = tool
+        .execute(json!({"command": "cd sub && ls"}), &ctx)
+        .await
+        .expect("cd is moved into cwd");
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("a.txt"), "{}", result.content);
+    assert!(!result.content.contains("b.txt"), "{}", result.content);
+
+    let result = tool
+        .execute(
+            json!({"command": "cat b.txt && echo --- && cat sub/a.txt 2>/dev/null"}),
+            &ctx,
+        )
+        .await
+        .expect("chain of reads");
+    if !result.success && result.content.contains("require bash or zsh") {
+        return;
+    }
+    assert!(result.success, "{}", result.content);
+    assert!(result.content.contains("beta"), "{}", result.content);
+    assert!(result.content.contains("---"), "{}", result.content);
+    assert!(result.content.contains("alpha"), "{}", result.content);
+
+    let error = tool
+        .execute(json!({"command": "cd .. && ls"}), &ctx)
+        .await
+        .expect_err("a cd outside the workspace is refused")
+        .to_string();
+    assert!(
+        error.contains("escapes workspace") || error.contains("outside_workspace"),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn read_only_operand_checks_apply_to_every_segment() {
+    let workspace = tempdir().expect("workspace");
+    let ctx = ToolContext::new(workspace.path())
+        .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly);
+    let error = BashTool::new("Bash")
+        .execute(json!({"command": "gh pr view 1 && cat /etc/passwd"}), &ctx)
+        .await
+        .expect_err("the gh exemption covers only the gh segment");
+    assert!(
+        error.to_string().contains("shell.readonly.operand"),
+        "{error}"
+    );
 }
 
 #[cfg(unix)]
@@ -4619,7 +4724,7 @@ async fn readonly_pipeline_preserves_arguments_and_disables_git_helpers() {
         assert!(
             ordinary
                 .content
-                .contains("read-only pipelines require bash or zsh")
+                .contains("read-only pipelines and chains require bash or zsh")
         );
         return;
     }
@@ -4629,7 +4734,7 @@ async fn readonly_pipeline_preserves_arguments_and_disables_git_helpers() {
             .await
             .is_err()
     );
-    let pipeline = hardened_readonly_pipeline("git show HEAD | cat", workspace.path()).unwrap();
+    let pipeline = hardened_readonly_script("git show HEAD | cat", workspace.path()).unwrap();
     assert!(pipeline.contains("--no-ext-diff"));
     assert!(pipeline.contains("--no-textconv"));
     assert!(pipeline.contains("--no-show-signature"));
@@ -4648,12 +4753,14 @@ async fn readonly_sed_extra_options_never_mutate_files() {
         "sed -n 1p -e 1e input.txt",
         "sed -n 1p -f script input.txt",
     ] {
-        let result = BashTool::new("Bash")
+        let error = BashTool::new("Bash")
             .execute(json!({"command": command}), &ctx)
             .await
-            .unwrap();
-        assert!(!result.success, "{command}");
-        assert!(result.content.contains("read-only shell policy"));
+            .expect_err("refused");
+        assert!(
+            error.to_string().contains("[shell.readonly.command]"),
+            "{command}: {error}"
+        );
         assert_eq!(std::fs::read_to_string(&source).unwrap(), "first\nsecond\n");
     }
     let result = BashTool::new("Bash")
