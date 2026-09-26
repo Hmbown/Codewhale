@@ -117,6 +117,7 @@ mod session_export;
 mod session_manager;
 mod session_peek;
 mod session_projection;
+mod session_reconcile;
 mod session_resume;
 mod settings;
 mod shell_dispatcher;
@@ -1180,6 +1181,17 @@ struct DoctorArgs {
     /// Apply the planned repairs without prompting (requires --fix)
     #[arg(long, default_value_t = false, requires = "fix")]
     yes: bool,
+    /// Repair the saved-session store now: re-index recoverable sessions,
+    /// unbind dead thread links, set aside (never delete) what nothing uses
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with_all = ["json", "context_json"]
+    )]
+    repair_sessions: bool,
+    /// With --repair-sessions: report what would be repaired, change nothing
+    #[arg(long, default_value_t = false, requires = "repair_sessions")]
+    dry_run: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -2290,6 +2302,9 @@ async fn run_async_main_dispatch(
                     }
                 };
                 let workspace = resolve_workspace(&cli);
+                if args.repair_sessions {
+                    return run_doctor_repair_sessions(args.dry_run);
+                }
                 if args.context_json {
                     run_doctor_context_json(&config, &workspace)
                 } else if args.json {
@@ -4629,6 +4644,16 @@ async fn run_doctor(
     for line in crate::doctor::secret_backend_human_lines(&secret_backend) {
         println!("  · {line}");
     }
+
+    println!();
+    println!("{}", "Sessions:".bold());
+    println!(
+        "  · {}",
+        crate::session_reconcile::last_run(&doctor_paths.sessions).map_or_else(
+            || "no session repair has run yet (it runs at launch; `codewhale doctor --repair-sessions` runs it now)".to_string(),
+            |summary| summary.doctor_detail()
+        )
+    );
 
     // State root (v0.8.44)
     println!();
@@ -7119,6 +7144,28 @@ fn runtime_posture_source_id(source: codewhale_config::RuntimePostureSource) -> 
 /// Emit a bounded, secret-redacted JSON failure when configuration cannot be
 /// loaded or validated. Invalid configuration must not be forced through the
 /// normal doctor report because its route/capability facts would be misleading.
+/// `codewhale doctor --repair-sessions [--dry-run]` (#6144).
+fn run_doctor_repair_sessions(dry_run: bool) -> Result<()> {
+    let manager = session_manager::SessionManager::default_location()?;
+    let summary = crate::session_reconcile::reconcile(
+        &manager,
+        &crate::session_reconcile::ReconcileOptions {
+            dry_run,
+            ..Default::default()
+        },
+    )?;
+    let report = serde_json::to_string_pretty(&summary)?;
+    if summary.skipped_concurrent {
+        println!("Another Codewhale process is repairing the session store; try again shortly.");
+    } else if dry_run {
+        println!("Session repair (dry run — nothing changed):");
+    } else {
+        println!("Session repair:");
+    }
+    println!("{report}");
+    Ok(())
+}
+
 fn run_doctor_json_config_error(error: &anyhow::Error) -> Result<()> {
     let safe_message = error
         .downcast_ref::<crate::config::SafeConfigDiagnostic>()
@@ -7274,6 +7321,9 @@ fn run_doctor_json(
         "version": env!("CARGO_PKG_VERSION"),
         "config_path": config_path.display().to_string(),
         "config_present": config_path.exists(),
+        "sessions": {
+            "last_repair": crate::session_reconcile::last_run(&doctor_paths.sessions),
+        },
         "paths": doctor_paths,
         "secret_backend": secret_backend,
         "workspace": workspace.display().to_string(),

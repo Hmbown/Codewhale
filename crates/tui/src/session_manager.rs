@@ -49,7 +49,7 @@ const SESSION_GOALS_DIR: &str = ".goals";
 const CURRENT_SESSION_GOAL_SCHEMA_VERSION: u32 = 2;
 const MAX_SESSION_GOAL_OBJECTIVE_CHARS: usize = 8_192;
 const MAX_SESSION_GOAL_FILE_BYTES: u64 = 64 * 1_024;
-const CURRENT_SESSION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const CURRENT_SESSION_SCHEMA_VERSION: u32 = 1;
 const CURRENT_QUEUE_SCHEMA_VERSION: u32 = 1;
 const LATE_USAGE_DIR: &str = ".late-usage";
 const CURRENT_LATE_USAGE_SCHEMA_VERSION: u32 = 1;
@@ -418,13 +418,32 @@ pub enum SessionMutator {
 /// release the previous claim in the same step — otherwise a `/new` would
 /// leave the old id permanently locked against the dashboard.
 pub fn set_live_session(session_id: Option<&str>) {
+    let session_id = session_id.map(str::trim).filter(|id| !id.is_empty());
     if let Ok(mut live) = live_sessions().write() {
         live.clear();
-        if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+        if let Some(id) = session_id {
             live.insert(id.to_string());
         }
     }
+    // A lease for any other session is released with the claim it backed.
+    if let Ok(mut lease) = LIVE_SESSION_LEASE.lock()
+        && lease.as_ref().map(|(id, _)| id.as_str()) != session_id
+    {
+        *lease = None;
+    }
 }
+
+/// The cross-process half of the live claim (#6144): an exclusive lock on
+/// `.late-usage/<id>.live`, held for as long as this process owns the
+/// session. The registry above only protects against writers in this
+/// process; a standalone `codewhale serve` or a second TUI could still
+/// rewrite or delete the document an interactive session is about to
+/// autosave over. This lock is separate from the per-write `<id>.lock`, so the
+/// owner's own saves never contend with it. It is a liveness signal only —
+/// the file carries no data. `None` for the file records a lease that could
+/// not be taken (another process holds it), so it is not retried per save.
+static LIVE_SESSION_LEASE: std::sync::Mutex<Option<(String, Option<fs::File>)>> =
+    std::sync::Mutex::new(None);
 
 /// Is this session currently owned by **this process's** interactive surface?
 ///
@@ -441,7 +460,7 @@ pub fn is_live_session(session_id: &str) -> bool {
 ///
 /// `ResourceBusy` so callers can map it to a typed conflict rather than
 /// pattern-matching on a message.
-fn live_session_conflict(session_id: &str) -> std::io::Error {
+pub(crate) fn live_session_conflict(session_id: &str) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::ResourceBusy,
         format!(
@@ -1394,6 +1413,76 @@ impl SessionManager {
         &self.sessions_dir
     }
 
+    /// The live-lease file for `session_id`; see [`set_live_session`].
+    fn live_lease_path(&self, session_id: &str, create_dir: bool) -> io::Result<PathBuf> {
+        let (late_path, _) = if create_dir {
+            self.ensure_late_usage_paths(session_id)?
+        } else {
+            self.late_usage_paths(session_id)?
+        };
+        Ok(late_path.with_extension("live"))
+    }
+
+    /// Claim `session_id` for this process's interactive surface: the
+    /// in-process registry ([`set_live_session`]) plus the cross-process
+    /// lease in this store, so writers in other processes see it too.
+    pub fn claim_live_session(&self, session_id: &str) {
+        set_live_session(Some(session_id));
+        let id = session_id.trim();
+        let Ok(mut lease) = LIVE_SESSION_LEASE.lock() else {
+            return;
+        };
+        if lease.as_ref().is_some_and(|(held, _)| held == id) {
+            return;
+        }
+        let file = self.live_lease_path(id, true).and_then(|path| {
+            let file = open_private_lock_file(&path)?;
+            Ok(crate::runtime_threads::try_lock_file_exclusive(&file)?.then_some(file))
+        });
+        match &file {
+            Ok(Some(_)) => {}
+            Ok(None) => tracing::warn!(
+                session_id = id,
+                "another Codewhale process already holds this session open"
+            ),
+            Err(error) => {
+                tracing::debug!(session_id = id, %error, "session live lease unavailable");
+            }
+        }
+        *lease = Some((id.to_string(), file.ok().flatten()));
+    }
+
+    /// Is `session_id` open in an interactive session in this process *or any
+    /// other*? External writers (the Runtime API, retention) check this before
+    /// rewriting or deleting a document, because the process holding it would
+    /// revert the change at its next autosave (#6144).
+    #[must_use]
+    pub fn is_session_live_anywhere(&self, session_id: &str) -> bool {
+        if is_live_session(session_id) {
+            return true;
+        }
+        let Ok(path) = self.live_lease_path(session_id, false) else {
+            return false;
+        };
+        let file = match open_private_read_file(&path) {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        // Contention means a live holder; acquiring proves none, and the
+        // probe's lock is released when `file` drops here.
+        matches!(
+            crate::runtime_threads::try_lock_file_exclusive(&file),
+            Ok(false)
+        )
+    }
+
+    /// Whether a saved document exists for `session_id`.
+    #[must_use]
+    pub fn session_document_exists(&self, session_id: &str) -> bool {
+        self.validated_session_path(session_id)
+            .is_ok_and(|path| path.is_file())
+    }
+
     fn late_usage_paths(&self, session_id: &str) -> io::Result<(PathBuf, PathBuf)> {
         let session_id = self.validated_session_id(session_id)?;
         let dir = self.sessions_dir.join(LATE_USAGE_DIR);
@@ -1938,12 +2027,28 @@ impl SessionManager {
         boot_id: &str,
     ) -> std::io::Result<()> {
         let id = self.validated_session_id(session_id)?.to_string();
-        let mut owners = self.load_session_boot_owners();
-        owners.retain(|owned, _| owned == &id || self.session_record_exists(owned));
-        owners.insert(id, boot_id.to_string());
-        let content = serde_json::to_string_pretty(&owners)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        write_atomic(&self.session_boot_owners_path(), content.as_bytes())
+        self.with_boot_owners_lock(|| {
+            let mut owners = self.load_session_boot_owners();
+            owners.retain(|owned, _| owned == &id || self.session_record_exists(owned));
+            owners.insert(id, boot_id.to_string());
+            let content = serde_json::to_string_pretty(&owners)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            write_atomic(&self.session_boot_owners_path(), content.as_bytes())
+        })
+    }
+
+    /// Serialize the sidecar's read-modify-write across processes. Two
+    /// processes stamping at once each read the old map and the second rename
+    /// dropped the first one's entry (#6144 P8).
+    fn with_boot_owners_lock<T>(&self, update: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        let lock_file = open_private_lock_file(
+            &self
+                .sessions_dir
+                .join(format!("{SESSION_BOOT_OWNERS_STEM}.lock")),
+        )?;
+        let mut lock = fd_lock::RwLock::new(lock_file);
+        let _guard = lock.write()?;
+        update()
     }
 
     /// The session-instance boot id stamped on this session's persisted
@@ -1986,13 +2091,16 @@ impl SessionManager {
         let Ok(id) = self.validated_session_id(session_id) else {
             return;
         };
-        let mut owners = self.load_session_boot_owners();
-        if owners.remove(id).is_none() {
-            return;
-        }
-        if let Ok(content) = serde_json::to_string_pretty(&owners) {
-            let _ = write_atomic(&self.session_boot_owners_path(), content.as_bytes());
-        }
+        let _ = self.with_boot_owners_lock(|| {
+            let mut owners = self.load_session_boot_owners();
+            if owners.remove(id).is_none() {
+                return Ok(());
+            }
+            if let Ok(content) = serde_json::to_string_pretty(&owners) {
+                write_atomic(&self.session_boot_owners_path(), content.as_bytes())?;
+            }
+            Ok(())
+        });
     }
 
     /// Preserve the exact pre-import session once, before the first graph-
@@ -2628,7 +2736,7 @@ impl SessionManager {
     /// and appears before any large `messages`/`tool_log` payload. We
     /// fall back to a full-file read only if the prefix doesn't yield a
     /// parseable metadata block (e.g. an oddly-formatted legacy file).
-    fn load_session_metadata(path: &Path) -> std::io::Result<SessionMetadata> {
+    pub(crate) fn load_session_metadata(path: &Path) -> std::io::Result<SessionMetadata> {
         use std::io::Read;
 
         const PREFIX_BYTES: usize = 64 * 1024;
@@ -2704,6 +2812,12 @@ impl SessionManager {
                 Err(error) => Err(error),
             };
         }
+        // The store this document is bound to is named by its binding, not by
+        // its id: a host store usually sits under another conversation's
+        // directory. Read it before the document is gone (#6144 P2).
+        let bound_store = Self::load_session_metadata(&path)
+            .ok()
+            .and_then(|metadata| metadata.runtime_store);
         self.save_session_goal(id, None)?;
         // Publish the tombstone before removing data. A crash or a delayed
         // callback can no longer re-create this session's accounting. The
@@ -2744,10 +2858,12 @@ impl SessionManager {
                 return Ok(());
             }
             // Other conversations and automations can share this host's Runtime
-            // authority. Deleting a transcript must never delete that store.
+            // authority. Deleting a transcript must never delete that store —
+            // including a `runtime-recovered-*` sibling, which another
+            // document may be bound to.
             for entry in fs::read_dir(&session_dir)? {
                 let entry = entry?;
-                if entry.file_name() == "runtime" {
+                if is_runtime_store_dir_name(&entry.file_name()) {
                     continue;
                 }
                 if entry.file_type()?.is_dir() {
@@ -2756,11 +2872,38 @@ impl SessionManager {
                     fs::remove_file(entry.path())?;
                 }
             }
-            if fs::read_dir(&session_dir)?.next().is_none() {
-                fs::remove_dir(session_dir)?;
-            }
+        }
+        self.retire_released_stores(id, bound_store);
+        if session_dir.is_dir() && fs::read_dir(&session_dir)?.next().is_none() {
+            fs::remove_dir(session_dir)?;
         }
         Ok(())
+    }
+
+    /// Set aside the stores a deleted document released — the one its
+    /// binding names, and any left under its own directory — when nothing
+    /// else binds them and they hold no work. Never unlinks; a store in use,
+    /// holding work, or bound elsewhere stays exactly where it is (#6144 P2).
+    fn retire_released_stores(
+        &self,
+        id: &str,
+        bound_store: Option<crate::runtime_threads::RuntimeStoreBinding>,
+    ) {
+        let mut candidates: Vec<PathBuf> = bound_store
+            .map(|binding| binding.data_dir)
+            .into_iter()
+            .collect();
+        if let Ok(entries) = fs::read_dir(self.sessions_dir.join(id.trim())) {
+            candidates.extend(
+                entries
+                    .flatten()
+                    .filter(|entry| is_runtime_store_dir_name(&entry.file_name()))
+                    .map(|entry| entry.path()),
+            );
+        }
+        for store in candidates {
+            crate::session_reconcile::retire_unbound_store(self, &store, "session deleted");
+        }
     }
 
     /// Clean up old sessions to stay within the active cap.
@@ -2947,6 +3090,14 @@ impl SessionManager {
             .filter(|s| s.title.to_lowercase().contains(&query_lower))
             .collect())
     }
+}
+
+/// A Runtime store directory inside a session directory: `runtime`, or a
+/// `runtime-recovered-*` sibling opened for a conversation whose store was
+/// missing.
+pub(crate) fn is_runtime_store_dir_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name == "runtime" || name.starts_with("runtime-recovered-"))
 }
 
 /// Unicode format characters that never belong in a session title: bidi

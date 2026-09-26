@@ -123,9 +123,9 @@ use self::auth::{
     runtime_request_is_authorized,
 };
 use self::sessions::{
-    create_session_from_thread, delete_session, get_session, list_session_artifacts, list_sessions,
-    list_sessions_summary, patch_session, read_session_artifact, resume_session_thread,
-    save_current_session,
+    create_session_from_thread, delete_session, get_session, get_session_repair,
+    list_session_artifacts, list_sessions, list_sessions_summary, patch_session,
+    read_session_artifact, resume_session_thread, save_current_session,
 };
 #[cfg(test)]
 use self::sessions::{messages_from_thread_detail, session_to_detail};
@@ -996,6 +996,9 @@ pub async fn run_http_server(
     );
 
     let sessions_dir = default_sessions_dir().unwrap_or_else(|_| fallback_sessions_dir());
+    // Repair the saved-session store once per server start (#6144); this
+    // server's own store is open by now, so it reads as in use.
+    crate::session_reconcile::spawn_background_reconcile(None);
     let runtime_token_env = runtime_token_environment(&|name| std::env::var(name).ok());
     let runtime_token_alias_warning =
         runtime_token_alias_warning(options.auth_token.as_deref(), &runtime_token_env);
@@ -1188,6 +1191,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
                 .put(save_current_session),
         )
         .route("/v1/sessions/summary", get(list_sessions_summary))
+        .route("/v1/sessions/repair", get(get_session_repair))
         .route(
             "/v1/sessions/{id}",
             get(get_session).patch(patch_session).delete(delete_session),

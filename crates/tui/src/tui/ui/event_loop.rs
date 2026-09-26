@@ -908,6 +908,12 @@ pub async fn run_tui(
         );
     }
     let _task_shutdown = task_manager.shutdown_guard();
+    // The store this host holds, remembered for exit (#6144 P1b).
+    let own_store = task_manager.session_store_binding();
+    // Repair the session store in the background now that this host holds
+    // its own Runtime store — and any store it resumed or recovered into — so
+    // those read as in use, never as candidates (#6144).
+    crate::session_reconcile::spawn_background_reconcile(app.current_session_id.clone());
     let mut automation_service = AutomationManager::default_location()?;
     automation_service.bind_task_manager(&task_manager)?;
     let automations = std::sync::Arc::new(tokio::sync::Mutex::new(automation_service));
@@ -1171,6 +1177,25 @@ pub async fn run_tui(
         }
         handle.try_send(PersistRequest::Shutdown);
         let _ = task.await;
+    }
+
+    // A host that never bound a document to its own store leaves it empty
+    // (#6144 P1b). Set it aside on the way out. A document binding it, work
+    // in it, or anything in this process still holding it keeps it; the next
+    // launch's repair applies the same exact rule to whatever remains.
+    if let Some(store) = own_store {
+        app.runtime_services.task_manager = None;
+        drop(task_manager);
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(manager) = SessionManager::default_location() {
+                crate::session_reconcile::retire_unbound_store(
+                    &manager,
+                    &store.data_dir,
+                    "host exited without binding its store",
+                );
+            }
+        })
+        .await;
     }
 
     cleanup_guard.defused = true;
@@ -1624,6 +1649,12 @@ pub(crate) async fn run_event_loop(
             app.status_message = Some("Resumed after suspend".to_string());
             app.needs_redraw = true;
             force_terminal_repaint = true;
+        }
+
+        // The background session-store repair's one-line result (#6144).
+        if let Some(notice) = crate::session_reconcile::take_pending_notice() {
+            app.push_status_toast(notice, StatusToastLevel::Info, None);
+            app.needs_redraw = true;
         }
 
         // The disclosure is a transcript cell, not a toast: a 12 s toast
