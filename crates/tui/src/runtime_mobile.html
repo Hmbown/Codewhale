@@ -275,6 +275,7 @@
       // cursor. Frames at or below it are replays and are skipped.
       lastSeq: 0,
       retryDelay: 750,
+      openedAt: 0,
       eventCount: 0,
       requestProof: "",
       streamTicket: ""
@@ -569,6 +570,7 @@
       state.activeTurnId = "";
       state.lastSeq = 0;
       state.retryDelay = 750;
+      state.openedAt = 0;
       state.eventCount = 0;
       $("event-count").textContent = "0 events";
       $("active-title").textContent = title || id;
@@ -593,14 +595,27 @@
     }
 
     // Reconnect from `cursor` (undefined: nothing shown yet, open fresh) after
-    // a bounded backoff that resets once a stream opens.
+    // a bounded backoff. The backoff resets only after a stream stayed open a
+    // while: a Runtime that opens and at once ends the stream (a history it
+    // cannot read) is retried ever more slowly, not hammered. A Runtime that is not
+    // reachable yet fails the stream-ticket fetch itself (a network TypeError):
+    // keep trying. An HTTP refusal (for example an expired session) is final.
     function scheduleResume(id, cursor) {
+      if (state.openedAt && Date.now() - state.openedAt > 10000) state.retryDelay = 750;
+      state.openedAt = 0;
       const delay = state.retryDelay;
       state.retryDelay = Math.min(state.retryDelay * 2, 15000);
       window.setTimeout(() => {
-        if (state.threadId === id) {
-          openThreadEvents(id, cursor).catch((err) => setStatus(err.message, "bad"));
-        }
+        if (state.threadId !== id) return;
+        openThreadEvents(id, cursor).catch((err) => {
+          if (state.threadId !== id) return;
+          if (err instanceof TypeError) {
+            setStatus("Connection lost; reconnecting", "warn");
+            scheduleResume(id, cursor);
+          } else {
+            setStatus(err.message, "bad");
+          }
+        });
       }, delay);
     }
 
@@ -663,9 +678,15 @@
         setStatus(streamEndStatus(data.reason), "warn");
         scheduleResume(id, state.lastSeq);
       });
+      // A Runtime that cannot serve this thread answers and at once ends the
+      // stream; claim "Connected" only once the stream has stayed open.
       source.onopen = () => {
-        state.retryDelay = 750;
-        setStatus("Connected", "ok");
+        state.openedAt = Date.now();
+        window.setTimeout(() => {
+          if (state.source === source && source.readyState === EventSource.OPEN) {
+            setStatus("Connected", "ok");
+          }
+        }, 400);
       };
       // No `stream.end`: the connection dropped (network, proxy, or a Runtime
       // that exited without warning). Resume from what is already shown.
