@@ -9634,6 +9634,7 @@ async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parkin
         started_at: Instant::now(),
         max_steps: 3,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -9806,6 +9807,7 @@ async fn subagent_retries_api_timeout_before_succeeding() {
         started_at: Instant::now(),
         max_steps: 3,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -10004,6 +10006,7 @@ async fn subagent_retries_transient_provider_header_timeout_before_succeeding() 
         started_at: Instant::now(),
         max_steps: 3,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -10077,6 +10080,7 @@ async fn subagent_rate_limit_exhaustion_interrupts_with_checkpoint() {
         started_at: Instant::now(),
         max_steps: 3,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -16026,6 +16030,7 @@ async fn run_subagent_task_claims_before_delivery_and_then_finalizes() {
         started_at: Instant::now(),
         max_steps: 1,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -16114,6 +16119,7 @@ async fn cancellation_wins_task_race_but_still_fans_in_exactly_once() {
         started_at: Instant::now(),
         max_steps: 1,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -16317,6 +16323,7 @@ async fn fatal_provider_failure_mid_run_parks_a_continuable_checkpoint() {
         started_at: Instant::now(),
         max_steps: 4,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -16417,6 +16424,7 @@ async fn fatal_provider_failure_mid_run_parks_a_continuable_checkpoint() {
         started_at: Instant::now(),
         max_steps: 2,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: resume_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -16576,6 +16584,7 @@ async fn repeated_typed_denials_stop_worker_as_failed_not_budget() {
         started_at: Instant::now(),
         max_steps: 20,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -16672,6 +16681,7 @@ async fn non_retryable_provider_failure_fans_in_to_every_terminal_sink() {
         started_at: Instant::now(),
         max_steps: 1,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -17475,6 +17485,7 @@ async fn launch_gate_queues_extra_direct_children() {
             started_at: Instant::now(),
             max_steps: 1,
             wall_time: DEFAULT_CHILD_WALL_TIME,
+            wall_ceiling_ms: None,
             input_rx,
             launch_gate: gate,
             _foreground_child_registration: None,
@@ -17629,6 +17640,7 @@ async fn queued_turn_owned_child_parks_without_a_false_start_transition() {
         started_at: Instant::now(),
         max_steps: 1,
         wall_time: Duration::from_secs(5),
+        wall_ceiling_ms: None,
         input_rx,
         launch_gate: Some(Arc::clone(&gate)),
         _foreground_child_registration: Some(registration),
@@ -17729,7 +17741,7 @@ async fn queued_turn_owned_child_parks_without_a_false_start_transition() {
 }
 
 #[tokio::test]
-async fn launch_gate_wait_counts_against_child_wall_timeout() {
+async fn launch_gate_wait_that_never_ends_fails_as_never_started() {
     use tokio_util::sync::CancellationToken;
 
     const WALL_TIME: Duration = Duration::from_millis(150);
@@ -17777,6 +17789,7 @@ async fn launch_gate_wait_counts_against_child_wall_timeout() {
         started_at: Instant::now(),
         max_steps: 1,
         wall_time: WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx,
         launch_gate: Some(Arc::clone(&gate)),
         _foreground_child_registration: None,
@@ -17823,22 +17836,27 @@ async fn launch_gate_wait_counts_against_child_wall_timeout() {
     let snapshot = manager
         .get_result(&agent_id)
         .expect("timed-out child remains inspectable");
-    assert_eq!(snapshot.status, SubAgentStatus::BudgetExhausted);
-    let error = &snapshot
-        .checkpoint
-        .as_ref()
-        .expect("wall-budget checkpoint")
-        .reason;
-    assert!(
-        error.contains("child wall-time budget exhausted"),
-        "{error}"
-    );
+    // #6015: a child that never got a launch slot did no work; it is not a
+    // run that exhausted its budget.
+    let error = match &snapshot.status {
+        SubAgentStatus::Failed(error) => error.clone(),
+        other => panic!("expected Failed(never started), got {other:?}"),
+    };
+    assert!(error.contains("never started"), "{error}");
+    assert!(!error.contains("wall-time budget exhausted"), "{error}");
+    assert_eq!(snapshot.steps_taken, 0);
 
     let worker = manager
         .get_worker_record(&agent_id)
         .expect("timed-out durable worker remains inspectable");
     assert_eq!(worker.status, AgentWorkerStatus::Failed);
-    assert_eq!(worker.error.as_deref(), Some(error.as_str()));
+    assert!(
+        worker
+            .error
+            .as_deref()
+            .is_some_and(|reason| reason.contains("never started")),
+        "{worker:?}"
+    );
     assert!(
         worker
             .events
@@ -18051,6 +18069,7 @@ pub(super) async fn run_incomplete_response_worker(
         started_at: Instant::now(),
         max_steps,
         wall_time: DEFAULT_CHILD_WALL_TIME,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -18243,6 +18262,7 @@ async fn spawn_budget_capped_worker(
         started_at: Instant::now(),
         max_steps,
         wall_time,
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -18438,6 +18458,7 @@ async fn worker_compacts_past_its_context_window_and_keeps_working() {
         started_at: Instant::now(),
         max_steps: 20,
         wall_time: Duration::from_secs(300),
+        wall_ceiling_ms: None,
         input_rx: task_input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -24582,7 +24603,7 @@ fn queued_budget_note_names_the_end_time_and_keeps_the_cause_stable() {
     let note = queued_budget_note(Duration::from_secs(30 * 60), now);
     assert_eq!(
         note,
-        "(wall budget ends at 14:32; it keeps running while queued)"
+        "(stops waiting at 14:32; its work budget starts at launch)"
     );
     let later = queued_budget_note(
         Duration::from_secs(10 * 60),
@@ -24728,6 +24749,7 @@ mod readonly_shell_6015 {
             started_at: Instant::now(),
             max_steps: 20,
             wall_time: DEFAULT_CHILD_WALL_TIME,
+            wall_ceiling_ms: None,
             input_rx,
             launch_gate: None,
             _foreground_child_registration: None,
@@ -24962,4 +24984,123 @@ mod readonly_shell_6015 {
         assert!(!tmp.path().join("b").exists());
         assert!(!tmp.path().join("out").exists());
     }
+}
+
+/// #6015: a child that waits for a launch slot gets its full work budget
+/// from the moment it launches. Under the old shared deadline, the queue wait
+/// below would leave too little time for the one slow model response.
+#[tokio::test]
+async fn late_launch_permit_still_gets_the_full_work_budget() {
+    use tokio_util::sync::CancellationToken;
+
+    const WALL_TIME: Duration = Duration::from_millis(2_000);
+    const QUEUE_HOLD: Duration = Duration::from_millis(1_500);
+    const MODEL_DELAY: Duration = Duration::from_millis(900);
+
+    let app = Router::new().route(
+        "/{*path}",
+        post(move |Json(_body): Json<Value>| async move {
+            tokio::time::sleep(MODEL_DELAY).await;
+            Json(json!({
+                "id": "chatcmpl-late",
+                "model": "deepseek-v4-flash",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "done after launch"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+            }))
+            .into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let client = CodewhaleClient::new(&crate::config::Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(format!("http://{addr}/v1")),
+        retry: Some(crate::config::RetryConfig {
+            enabled: Some(false),
+            max_retries: Some(0),
+            initial_delay: Some(0.0),
+            max_delay: Some(0.0),
+            exponential_base: Some(1.0),
+        }),
+        ..crate::config::Config::default()
+    })
+    .expect("delayed chat client");
+
+    let tmp = tempdir().expect("tempdir");
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(
+        tmp.path().to_path_buf(),
+        2,
+    )));
+    let (input_tx, input_rx) = mpsc::unbounded_channel();
+    let agent_id = "agent_late_permit".to_string();
+    let mut agent = SubAgent::new(
+        agent_id.clone(),
+        FleetRole::Worker,
+        "Answer".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        Some(vec![]),
+        input_tx,
+        tmp.path().to_path_buf(),
+        "boot_test".to_string(),
+    );
+    agent.status = SubAgentStatus::Running;
+    let mut runtime = stub_runtime();
+    runtime.client = client;
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(tmp.path());
+    runtime = runtime.with_cancel_token(CancellationToken::new());
+    {
+        let mut manager = manager.write().await;
+        manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+        manager.agents.insert(agent_id.clone(), agent);
+    }
+
+    let gate = Arc::new(governor::DynamicGate::new(1));
+    let held = Arc::clone(&gate).try_acquire().expect("hold the only slot");
+    let task_handle = tokio::spawn(run_subagent_task(SubAgentTask {
+        manager_handle: Arc::clone(&manager),
+        runtime,
+        agent_id: agent_id.clone(),
+        agent_type: FleetRole::Worker,
+        prompt: "Answer".to_string(),
+        assignment: make_assignment(),
+        allowed_tools: Some(vec![]),
+        fork_context: false,
+        started_at: Instant::now(),
+        max_steps: 1,
+        wall_time: WALL_TIME,
+        wall_ceiling_ms: None,
+        input_rx,
+        launch_gate: Some(Arc::clone(&gate)),
+        _foreground_child_registration: None,
+    }));
+    tokio::time::sleep(QUEUE_HOLD).await;
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(10), task_handle)
+        .await
+        .expect("child finishes")
+        .expect("child task exits cleanly");
+
+    let snapshot = manager
+        .read()
+        .await
+        .get_result(&agent_id)
+        .expect("child remains inspectable");
+    assert!(
+        matches!(snapshot.status, SubAgentStatus::Completed),
+        "a late launch must still get its full budget: {:?}",
+        snapshot.status
+    );
+    assert_eq!(snapshot.result.as_deref(), Some("done after launch"));
 }

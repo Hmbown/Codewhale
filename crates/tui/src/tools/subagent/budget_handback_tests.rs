@@ -197,6 +197,7 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
         started_at: Instant::now(),
         max_steps,
         wall_time: Duration::from_secs(wall_time_secs),
+        wall_ceiling_ms: None,
         input_rx,
         launch_gate: None,
         _foreground_child_registration: None,

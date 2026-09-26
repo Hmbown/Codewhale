@@ -599,16 +599,18 @@ zero representation for that default never cancels a finite inherited cap.
 seconds. An explicit value may go above that built-in default, for long
 unattended work; an operator-configured `default_wall_time_secs` is both the
 default and a ceiling, and role, parent, and saved-run deadlines still only
-narrow. It includes admission queue time, model requests, and tools. The
-effective absolute deadline is persisted.
+narrow. It covers model requests and tools. The effective absolute deadline
+is persisted.
 
-The wall clock starts when the agent is started, not when it gets a launch
-slot. This is deliberate. The queue wait and the run share one deadline, so a
-saturated or rate-limited fleet cannot keep an agent alive past the budget
-you gave it. The cost is that time spent queued is time taken from the run.
-The queued row says so instead of hiding it: it names the reason for the wait
-and the time the wall budget ends. If agents regularly spend a large share of
-their budget queued, start fewer at once or raise `wall_time_secs`.
+The work clock starts when the agent gets a launch slot. An agent that waits
+in the launch queue waits at most `wall_time_secs`; if no slot opens in that
+time it fails with a `never started` reason and zero steps, instead of being
+reported as a run that used up its budget. An agent that does get a slot
+after waiting receives its full `wall_time_secs` from that moment, still
+bounded by any parent, saved-run or source deadline. So a parent can wait up
+to about twice `wall_time_secs` for a queued agent. The queued row names the
+reason for the wait and the time the agent stops waiting. If agents often
+wait long, start fewer at once.
 
 For example, a focused review can request:
 
