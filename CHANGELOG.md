@@ -26,6 +26,21 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Added
 
+- Runtime API: turns now record what they produced. Each item and turn
+  carries typed artifact references (path, kind, size, revision, and a
+  restore point when file-revert would accept one) for files a tool wrote,
+  spilled tool output, and media.
+  - Once the post-turn snapshot settles, the turn also lists what changed in
+    the workspace while it ran, including shell and sub-agent writes. It then
+    publishes `turn.artifacts`.
+  - `GET /v1/threads/{id}/turns/{turn_id}/artifacts` lists a turn's
+    references, and `.../artifacts/{artifact_id}` reads one from the
+    workspace, the post-turn snapshot or the session artifact directory.
+  - Spills from unbound runtime threads were unreadable before; they are now
+    readable.
+  - The legacy `artifact_refs` field is now filled with the workspace files a
+    tool call wrote, so Preview in current desktop builds shows them
+  ([#6653](https://github.com/Hmbown/Codewhale/issues/6653)).
 - Runtime API: `POST /v1/threads/{id}/fork-at-turn` forks a thread at a named
   user turn, keeping that turn and every turn before it. The receipt matches
   `/undo` and returns the first dropped prompt so a client can put it back in

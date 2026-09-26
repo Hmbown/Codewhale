@@ -154,6 +154,127 @@ Session artifacts are the oversized tool outputs a session recorded as
   workspace file read. A record whose stored path is absolute or leaves the
   session directory is 403; a record whose file is gone is 404.
 
+These routes only serve what a SavedSession indexes (plus immutable image
+evidence). A runtime turn's spills are read through the turn route below. An
+unbound runtime thread's engine has no SavedSession index at all, so for its
+spills the turn record is the only way in.
+
+#### Turn artifacts
+
+A turn records what it produced as typed references on its items and on the
+turn itself. Nothing is scanned to build them. Each fact is recorded where the
+bytes were written:
+- file tools and `apply_patch` report `size`/`sha256` in `mutation.files[]`;
+- spills report `artifact_digest`;
+- tool media reports `sha256`.
+
+The workspace-level half comes from the snapshot pair the engine already
+takes: `pre-turn:<n>` and `post-turn:<n>` in the existing side repo. No second
+store or snapshot is involved.
+
+A reference (`TurnArtifactRef`) carries:
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Stable within the turn. A file's id is `file_` plus the first 32 hex digits of SHA-256(path). A spill's is `art_<call>`. Media's is `art_image_<sha256>`. |
+| `kind` | `file`, `tool_output` or `media`. |
+| `path` | For `file`: workspace-relative with `/` separators. For `tool_output` and `media`: session-relative (`artifacts/...`). |
+| `change` | For `file` only: `created`, `updated`, `deleted` or `renamed`. A rename also has `previous_path`. |
+| `size` | Byte size. Absent when the file was deleted. |
+| `revision` | SHA-256 hex of the whole content. This is the value `GET /v1/workspace/files/read` reports as `revision`, and file-revert's `expected_hash` is `sha256:` + `revision`. Absent when the file was deleted, or for a delta blob over 16 MiB. |
+| `content_type` | For `media`: the exact media type. |
+| `session_id` | For `tool_output` and `media`: the artifact session that owns the bytes. |
+| `item_id`, `tool_call_id`, `tool_name` | The tool call that wrote it. Absent for a change seen only in the workspace delta. |
+| `source` | `tool_mutation`, `tool_output_spill`, `tool_media`, or `workspace_changed_during_turn`. |
+| `restore_snapshot_id` | A snapshot `POST /v1/threads/{id}/file-revert` accepts for this path on this thread. Present only when that call can succeed: the thread is bound to a saved session and the snapshot is tagged with that session. For a tool write it is the call's `tool:<call>` snapshot; for a delta change it is the turn's `pre-turn` snapshot. |
+| `recorded_at` | When the reference was recorded. |
+
+Where references appear:
+- **Items.** `TurnItemRecord.artifacts` lists what one tool call produced. It
+  is set when the call completes, succeeded or failed, so `item.completed` and
+  `item.failed` carry it live.
+- **Legacy projection.** `artifact_refs` is derived from `artifacts`. It holds
+  only the workspace-relative paths of files that still exist: never spills,
+  media or deleted files.
+- **Turns.** `TurnRecord.artifacts` is the turn aggregate. It is computed by
+  one merge and ordered most recent first.
+  - Spill and media refs are always kept.
+  - File refs compose in item order: created then deleted drops the file,
+    created then updated stays `created`, and a rename folds its origin.
+  - Once the workspace delta settles, it is authoritative for the net change,
+    `size` and `revision` of every path the snapshots can see. It adds files
+    no tool receipt named, such as shell and sub-agent writes. It drops an item
+    path the snapshots track but that ended the turn unchanged.
+  - The aggregate is capped at 1000 refs, and `workspace.truncated` /
+    `workspace.omitted` report the cut.
+
+`TurnRecord.workspace` follows the delta's lifecycle. It is `null` while the
+turn runs. `turn.completed` carries it with one of these states:
+- `pending`: the post-turn snapshot or its diff is still running. When they
+  finish, the runtime publishes `turn.artifacts`
+  (`{turn_id, workspace, artifacts}`). That event may arrive after the next
+  turn's `turn.started`, so key it by `turn_id`.
+- `settled`: the delta is merged, and `post_turn_snapshot_id` is set.
+- `unavailable`: no delta will come. `reason` says why:
+  - `snapshots_disabled`, `workspace_too_large`, `too_many_files`,
+    `unsafe_location`, `snapshot_failed`: the snapshot gates.
+  - `not_captured`: a compaction or purge operation, or a turn whose engine
+    ended before reporting a pair.
+  - `runtime_restarted`: the process stopped before the delta settled. This is
+    reconciled at startup and never recomputed.
+  - `settlement_timeout`: the post-turn snapshot hung past 10 minutes.
+  - `delta_failed`: the diff itself failed.
+
+  `artifacts` still holds what the tool receipts recorded. `turn.artifacts` is
+  published for every settlement outcome, so a client waiting on `pending`
+  always hears back.
+
+What the delta means, and what it cannot see:
+- **It is a workspace diff, not attribution.** A delta change is everything
+  that changed in the workspace while the turn ran. That includes an editor,
+  another thread, or a background job writing the same workspace at the same
+  time. `source: workspace_changed_during_turn` says exactly that.
+- **Excluded paths are invisible to snapshots.** This covers the built-in
+  excludes (for example `node_modules/`, `target/`, `dist/`, `build/`,
+  `.next/`, and binary and media extensions) and the workspace's `.gitignore`. A file tool's write to
+  such a path is still reported from its receipt. A shell command's write to
+  one is not reported at all.
+- **Shell writes have no per-call record.** A shell command's writes are
+  never attributed to its item, only to the turn, and only when snapshots are
+  enabled.
+
+Routes:
+
+- `GET /v1/threads/{id}/turns/{turn_id}/artifacts` returns
+  `{thread_id, turn_id, workspace, artifacts}` from the runtime store's turn
+  record. While the turn runs, `artifacts` is merged from its items on the fly
+  and `workspace` is `null`. An unknown turn, or a turn of another thread, is
+  404.
+- `GET /v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}?offset=&limit=&revision=`
+  reads one reference.
+  - It uses the workspace file read's window contract (`size`, `revision`,
+    `offset`, `bytes`, `truncated`, `encoding`, `content`) and adds:
+    - `artifact`: the reference;
+    - `source`: `workspace`, `snapshot` or `session_artifact`;
+    - `current`: whether the workspace still holds these bytes, or `null`
+      when that is not a question for this reference.
+  - `revision` selects an intermediate revision one of the turn's items
+    recorded. The default is the reference's own revision.
+  - A `file` is served from the workspace when it still holds the recorded
+    revision (`current: true`). Otherwise it comes from the turn's post-turn
+    snapshot (`current: false`).
+  - A `tool_output` or `media` reference is read under the session artifact
+    root the writer used. The same confinement, image-manifest and integrity
+    checks apply as for the session route.
+
+| Status | When |
+| --- | --- |
+| 404 | Unknown thread, turn or artifact id, or a `revision` this turn never recorded. |
+| 409 | A file's recorded revision is in neither the workspace nor the snapshot store (snapshots are pruned after 50 per workspace or 7 days), or a session artifact's bytes no longer hash to the recorded revision. The message names the current revision. |
+| 410 | The turn deleted the file (restore it with `file-revert` and `restore_snapshot_id`), or a session artifact's bytes were pruned. |
+| 413 | Content over 16 MiB. |
+| 403 | A symlink, or a reference that leaves its root. |
+
 Fleet receipt artifacts keep their own route
 (`GET /v1/fleet/runs/{run_id}/receipts/{task_id}/evidence`).
 
@@ -592,8 +713,9 @@ subscribing so a reload cannot strand work whose request event is at or before
 An existing thread's model, mode, permission posture, workspace, and branch are
 display-only in this client. Files/Changes, PTY/terminal, preview, artifacts,
 provider login or global-default switching, Fleet creation, and
-undo/retry/restore controls are intentionally absent until the Runtime publishes
-explicit contracts for them.
+undo/retry/restore controls are not built into this page. The native desktop
+client covers them through the workspace-file, turn-artifact, terminal and
+workspace-restore routes documented here.
 
 ### Mobile control page
 
@@ -630,7 +752,8 @@ a TLS or verified transport boundary.
 - `DELETE /v1/sessions/{id}`
 - `POST /v1/sessions/{id}/resume-thread`
 - `GET /v1/sessions/{id}/artifacts` and `GET /v1/sessions/{id}/artifacts/{artifact_id}?offset=&limit=`
-  (see workspace files and session artifacts above)
+  (see workspace files and session artifacts above; runtime-turn spills are
+  read through `GET /v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}`)
 
 Sessions and threads answer the same `include_archived` / `archived_only` pair
 with the same meaning, and `search` is the same fuzzy match (title, id,
@@ -810,6 +933,8 @@ route.
 - `POST /v1/threads/{id}/turns`
 - `POST /v1/threads/{id}/turns/{turn_id}/steer` - inject guidance into the running turn. The response is a receipt for what actually happened, not for what was attempted; see [Steer delivery](#steer-delivery).
 - `POST /v1/threads/{id}/turns/{turn_id}/interrupt`
+- `GET /v1/threads/{id}/turns/{turn_id}/artifacts` - what the turn produced: typed references plus the workspace-delta state. See [Turn artifacts](#turn-artifacts).
+- `GET /v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}?offset=&limit=&revision=` - read one reference from the workspace, the post-turn snapshot, or the session artifact directory.
 - `POST /v1/threads/{id}/compact` (manual compaction)
 - `POST /v1/threads/{id}/undo` - fork the thread with the last N turns removed (`{"depth": N}`, default 0 = last turn only); returns the forked thread plus `original_user_text` so a GUI can pre-populate the input box
 - `POST /v1/threads/{id}/fork-at-turn` - fork at one named user turn (`{"turn_id": "turn_…"}`, as `GET /v1/threads/{id}` reports it). The fork *keeps* that turn and every turn before it, and drops the turns after it; naming the last turn therefore keeps the whole conversation. The receipt is `/undo`'s (`thread`, `original_user_text`, `original_user_images`), carrying the *first dropped* user turn's prompt — what was asked next, even when a prompt-less turn such as a manual `/compact` sits between — so a client can put it back in the composer for editing. The source thread, its session document and the workspace are untouched, and there is no file rollback: a fork is a sibling conversation, and rewinding the workspace would rewind the branch left behind with it. Clients should name the turn instead of computing a `depth` — the transcript they render and the turn list this cuts are not the same list (steers, image-only prompts and injected handoffs each sit on one side only), and a client-side count that is off by one forks the wrong prefix while answering `201`. `400` when the turn is not a user turn of that thread.
@@ -1749,10 +1874,12 @@ The runtime uses a durable Thread/Turn/Item lifecycle.
   `latest_response_bookmark`, `archived`
 - **TurnRecord** — `id`, `thread_id`, `status` (`queued|in_progress|completed|
   failed|interrupted|canceled`), `effective_provider`, `effective_model`,
-  `effective_billing_surface`, timestamps, duration, usage, error summary
+  `effective_billing_surface`, timestamps, duration, usage, error summary,
+  `artifacts` and `workspace` (see [Turn artifacts](#turn-artifacts))
 - **TurnItemRecord** — `id`, `turn_id`, `kind` (`user_message|agent_message|
   tool_call|file_change|command_execution|context_compaction|status|error`),
-  lifecycle `status`, `metadata`
+  lifecycle `status`, `metadata`, `artifacts` and the legacy
+  `artifact_refs` projection
 
 Events are append-only with a global monotonic `seq` for replay/resume.
 
@@ -1864,7 +1991,7 @@ case: read the item's status, or wait for the event.
 
 Common event names: `thread.started`, `thread.forked`, `turn.started`,
 `turn.lifecycle`, `turn.steered`, `turn.steer_dropped`, `turn.interrupt_requested`,
-`turn.completed`, `item.started`, `item.delta`, `item.completed`,
+`turn.completed`, `turn.artifacts`, `item.started`, `item.delta`, `item.completed`,
 `item.failed`, `item.interrupted`, `approval.required`, `approval.decided`,
 `approval.timeout`, `user_input.required`, `user_input.answered`,
 `user_input.canceled`, `tool_call.requested`, `tool_call.resolved`,

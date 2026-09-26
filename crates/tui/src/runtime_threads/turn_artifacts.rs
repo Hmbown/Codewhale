@@ -113,8 +113,10 @@ pub(crate) struct ToolArtifactContext<'a> {
     pub item_id: &'a str,
     pub tool_call_id: &'a str,
     pub tool_name: &'a str,
-    /// The thread workspace every file path is confined to.
-    pub workspace: &'a Path,
+    /// The thread workspace every file path is confined to: as configured,
+    /// and canonicalized when that differs (tools resolve against the
+    /// configured path, which may traverse a symlink such as macOS `/var`).
+    pub workspace_roots: &'a [PathBuf],
     /// The thread's bound saved-session id. A restore point is published
     /// only when the snapshot is tagged with exactly this session.
     pub bound_session_id: Option<&'a str>,
@@ -136,15 +138,13 @@ pub(crate) fn is_sha256_hex(value: &str) -> bool {
 
 /// Normalize a tool-supplied path into a workspace-relative display path.
 ///
-/// Accepts a relative path or an absolute one inside the workspace (either
-/// as given or canonicalized: tools resolve against the configured path,
-/// which may itself traverse a symlink such as macOS `/var`). Refuses `..`,
-/// empty, non-UTF-8, anything outside, and `.git` (never served).
-pub(crate) fn confined_workspace_path(workspace: &Path, raw: &str) -> Option<String> {
-    let rel = crate::snapshot::workspace_relative_path(workspace, raw).or_else(|| {
-        let canonical = workspace.canonicalize().ok()?;
-        crate::snapshot::workspace_relative_path(&canonical, raw)
-    })?;
+/// Accepts a relative path or an absolute one inside any of the workspace's
+/// root spellings. Refuses `..`, empty, non-UTF-8, anything outside, and
+/// `.git` (never served).
+pub(crate) fn confined_workspace_path(workspace_roots: &[PathBuf], raw: &str) -> Option<String> {
+    let rel = workspace_roots
+        .iter()
+        .find_map(|root| crate::snapshot::workspace_relative_path(root, raw))?;
     relative_display(&rel)
 }
 
@@ -270,7 +270,7 @@ pub(crate) fn artifact_refs_from_tool_metadata(
             let Some(path) = entry
                 .get("path")
                 .and_then(Value::as_str)
-                .and_then(|raw| confined_workspace_path(context.workspace, raw))
+                .and_then(|raw| confined_workspace_path(context.workspace_roots, raw))
             else {
                 continue;
             };
@@ -297,7 +297,7 @@ pub(crate) fn artifact_refs_from_tool_metadata(
                 entry
                     .get(key)
                     .and_then(Value::as_str)
-                    .and_then(|raw| confined_workspace_path(context.workspace, raw))
+                    .and_then(|raw| confined_workspace_path(context.workspace_roots, raw))
             };
             let (Some(from), Some(to)) = (confine("from"), confine("to")) else {
                 continue;
@@ -695,12 +695,12 @@ mod tests {
 
     const SNAPSHOT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    fn context<'a>(workspace: &'a Path, bound: Option<&'a str>) -> ToolArtifactContext<'a> {
+    fn context<'a>(workspace: &'a [PathBuf], bound: Option<&'a str>) -> ToolArtifactContext<'a> {
         ToolArtifactContext {
             item_id: "item_1",
             tool_call_id: "call_1",
             tool_name: "apply_patch",
-            workspace,
+            workspace_roots: workspace,
             bound_session_id: bound,
             recorded_at: Utc::now(),
         }
@@ -729,8 +729,10 @@ mod tests {
             "restore_snapshot_id": SNAPSHOT,
             "restore_snapshot_session_id": "sess-1",
         });
-        let refs =
-            artifact_refs_from_tool_metadata(&metadata, &context(workspace.path(), Some("sess-1")));
+        let refs = artifact_refs_from_tool_metadata(
+            &metadata,
+            &context(&[workspace.path().to_path_buf()], Some("sess-1")),
+        );
         let paths: Vec<&str> = refs.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(
             paths,
@@ -784,9 +786,12 @@ mod tests {
             value
         };
         let restore = |value: &Value, bound| {
-            artifact_refs_from_tool_metadata(value, &context(workspace.path(), bound))[0]
-                .restore_snapshot_id
-                .clone()
+            artifact_refs_from_tool_metadata(
+                value,
+                &context(&[workspace.path().to_path_buf()], bound),
+            )[0]
+            .restore_snapshot_id
+            .clone()
         };
         assert_eq!(
             restore(&metadata(Some("sess-1")), Some("sess-1")).as_deref(),
@@ -818,7 +823,10 @@ mod tests {
                 { "session_id": "sess-abc", "artifact_id": "art_image_short" }
             ],
         });
-        let refs = artifact_refs_from_tool_metadata(&metadata, &context(workspace.path(), None));
+        let refs = artifact_refs_from_tool_metadata(
+            &metadata,
+            &context(&[workspace.path().to_path_buf()], None),
+        );
         assert_eq!(refs.len(), 2, "{refs:?}");
         let spill = &refs[0];
         assert_eq!(spill.kind, TurnArtifactKind::ToolOutput);
@@ -845,8 +853,11 @@ mod tests {
             value[key] = forged.clone();
             value.as_object_mut().unwrap().remove("tool_media");
             assert!(
-                artifact_refs_from_tool_metadata(&value, &context(workspace.path(), None))
-                    .is_empty(),
+                artifact_refs_from_tool_metadata(
+                    &value,
+                    &context(&[workspace.path().to_path_buf()], None)
+                )
+                .is_empty(),
                 "{key}={forged} must not become a ref"
             );
         }

@@ -12937,6 +12937,15 @@ impl RuntimeThreadManager {
             .load_thread(&thread_id)
             .map(|thread| (thread.workspace, thread.session_id))
             .unwrap_or_else(|_| (self.workspace.clone(), None));
+        let artifact_workspace_roots = {
+            let mut roots = vec![artifact_workspace.clone()];
+            if let Ok(canonical) = tokio::fs::canonicalize(&artifact_workspace).await
+                && canonical != artifact_workspace
+            {
+                roots.push(canonical);
+            }
+            roots
+        };
         // The engine's pre/post-turn snapshot pair, reported just before
         // TurnComplete. Settlement diffs it to learn what the turn changed.
         let mut workspace_capture: Option<TurnWorkspaceCapture> = None;
@@ -13394,7 +13403,7 @@ impl RuntimeThreadManager {
                                             item_id: &item_id,
                                             tool_call_id: &id,
                                             tool_name: &name,
-                                            workspace: &artifact_workspace,
+                                            workspace_roots: &artifact_workspace_roots,
                                             bound_session_id: artifact_bound_session.as_deref(),
                                             recorded_at: now,
                                         },
