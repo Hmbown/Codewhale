@@ -19356,3 +19356,48 @@ async fn runtime_tool_completion_fires_after_and_error_hooks() -> Result<()> {
     );
     Ok(())
 }
+
+/// #6582: a Runtime API shell tool completion hands the command's exit code
+/// to `tool_call_after`, as the TUI does. The runtime path used to pass
+/// `None`, so `DEEPSEEK_TOOL_EXIT_CODE` was never set on Runtime API threads.
+/// The command exits 0 because `bash` reports a nonzero exit as a
+/// `ToolError`, which carries no metadata and so no exit code on any surface.
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_shell_completion_delivers_exit_code_to_after_hook() -> Result<()> {
+    use crate::hooks::{Hook, HookEvent, HooksConfig};
+    use crate::tools::spec::ToolSpec;
+    let dir = tempfile::tempdir()?;
+    let log = dir.path().join("hooks.log");
+    let manager = test_manager(test_runtime_dir())?;
+    let config = Config {
+        hooks: Some(HooksConfig {
+            hooks: vec![Hook::new(
+                HookEvent::ToolCallAfter,
+                &format!(
+                    "printf '%s %s\\n' \"$CODEWHALE_TOOL_CALL_ID\" \"${{DEEPSEEK_TOOL_EXIT_CODE-unset}}\" >> {}",
+                    log.display()
+                ),
+            )],
+            enabled: true,
+            ..HooksConfig::default()
+        }),
+        ..Config::default()
+    };
+    let hooks = manager.hook_executor_for_workspace(&config, dir.path(), None);
+    let context = crate::tools::spec::ToolContext::new(dir.path());
+    let result = crate::tools::shell::LowercaseBashTool
+        .execute(json!({"command": "exit 0"}), &context)
+        .await;
+    fire_runtime_tool_completion_hooks(&hooks, "thr_1", "call-shell", "bash", &result);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if !text.is_empty() || Instant::now() >= deadline {
+            break text;
+        }
+        sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(text.trim_end(), "call-shell 0", "{result:?}");
+    Ok(())
+}

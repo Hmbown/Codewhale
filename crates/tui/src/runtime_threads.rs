@@ -647,13 +647,14 @@ fn fire_runtime_tool_completion_hooks(
         Ok(output) => (output.content.clone(), output.success),
         Err(error) => (error.to_string(), false),
     };
+    let exit_code = crate::hooks::reported_tool_exit_code(result);
     let context = || {
         HookContext::new()
             .with_workspace(hooks.default_working_dir().to_path_buf())
             .with_session_id(thread_id)
             .with_tool_name(name)
             .with_tool_call_id(id)
-            .with_tool_result(&text, success, None)
+            .with_tool_result(&text, success, exit_code)
     };
     if wants_after && let Err(error) = hooks.submit_observer(HookEvent::ToolCallAfter, context()) {
         tracing::warn!(target: "hooks", %error, thread_id, "tool_call_after hook was not submitted");
