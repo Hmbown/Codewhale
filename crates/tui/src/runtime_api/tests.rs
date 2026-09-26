@@ -10888,9 +10888,13 @@ async fn provider_models_expose_exact_image_input_facts_and_thread_selection_sta
         .find(|entry| entry["id"] == "deepseek-v4-pro")
         .context("DeepSeek text model entry")?;
     assert_eq!(text_only["image_input"], "unsupported");
-    // A reasoning-capable model does not imply a published effort ladder.
-    assert_eq!(text_only["reasoning_effort"], "unknown");
-    assert_eq!(text_only["reasoning_effort_levels"], json!([]));
+    // The effort ladder is the one the catalog row publishes (#6396).
+    assert_eq!(text_only["reasoning_effort"], "supported");
+    assert!(
+        text_only["reasoning_effort_levels"]
+            .as_array()
+            .is_some_and(|levels| !levels.is_empty())
+    );
 
     let config_before = get_config(&client, &addr).await;
     let response = client

@@ -2762,7 +2762,7 @@ mod tests {
         let offline = route.audit(&usage);
         assert_eq!(
             offline.estimate.expect("bundled OpenRouter price").usd,
-            0.16
+            0.15
         );
         assert_eq!(
             offline.provenance,

@@ -862,8 +862,8 @@ fn bundled_deepseek_flash_routes_support_image_input() {
 #[test]
 fn bundled_seed_canonical_entries_use_upstream_keys_and_yield_to_provider_rows() {
     // #6396 slice B: canonical entries carry upstream `vendor/model` keys. The
-    // hand-qualified xiaomi-mimo provider rows still win offline, and a vendor
-    // namespace never leaks out as its own (non-route) provider.
+    // xiaomi-mimo provider rows still win offline, and a vendor namespace
+    // never leaks out as its own (non-route) provider.
     let catalog = bundled_models_dev_catalog();
     for key in ["xiaomi/mimo-v2.6-pro", "xiaomi/mimo-v2.6-flash"] {
         assert!(catalog.model(key).is_some(), "{key} canonical entry");
@@ -879,10 +879,12 @@ fn bundled_seed_canonical_entries_use_upstream_keys_and_yield_to_provider_rows()
             row.canonical_model, None,
             "{model} comes from the provider row"
         );
+        // The text-only hold is gone (#6396): upstream lists image input,
+        // and a wrong claim costs one rejected, retried request.
         assert_eq!(
-            crate::models_dev::image_input_support(row.modalities.as_ref()),
-            crate::route::CapabilityState::Unsupported,
-            "{model} keeps the verified text-only qualification"
+            row.to_offering().capabilities.image_input,
+            crate::route::CapabilityState::Supported,
+            "{model} carries upstream's image input"
         );
     }
 }
@@ -911,13 +913,23 @@ fn bundled_seed_cold_start_joins_namespaced_entries_without_provider_rows() {
     }
 }
 
+/// The bundled Claude row as it read before the seed was generated: text-only.
+fn stale_text_only_seed_row() -> CatalogOffering {
+    let mut row = find(&bundled_catalog_offerings(), "anthropic", "claude-opus-5").clone();
+    row.modalities = Some(ModelsDevModalities {
+        input: vec!["text".into()],
+        output: vec!["text".into()],
+    });
+    row
+}
+
 #[test]
 fn bundled_text_only_rows_leave_image_input_unknown_not_unsupported() {
-    // #6396: every Anthropic seed row says `input: [text]` while the provider
-    // accepts images. A cold start without a live refresh must not strip the
-    // user's images on the strength of that stale row.
-    let rows = bundled_catalog_offerings();
-    let seed = find(&rows, "anthropic", "claude-opus-5");
+    // #6396: the hand-kept seed listed every Anthropic row as `input: [text]`
+    // while the provider accepts images, and a cold start stripped them. The
+    // seed is generated now, but it still lags providers, so simulate a stale
+    // text-only row: it must not strip the user's images.
+    let seed = &stale_text_only_seed_row();
     assert_eq!(seed.source, CatalogSource::Bundled);
     assert_eq!(
         crate::models_dev::image_input_support(seed.modalities.as_ref()),
@@ -974,7 +986,7 @@ fn offline_resolver_keeps_images_for_a_text_only_seed_row() {
 
 #[test]
 fn signed_patch_keeps_the_seed_as_the_modality_authority() {
-    let seed = find(&bundled_catalog_offerings(), "anthropic", "claude-opus-5").clone();
+    let seed = stale_text_only_seed_row();
     let key = seed.merge_key();
     let mut rows = BTreeMap::from([(key.clone(), seed)]);
     let facts = crate::cloud_facts::ScopedFacts {
@@ -1067,7 +1079,12 @@ fn bundled_asset_yields_real_chat_offerings_for_key_models() {
         kimi_k3.limit.as_ref().and_then(|l| l.context),
         Some(1_048_576)
     );
-    assert_eq!(kimi_k3.limit.as_ref().and_then(|l| l.output), Some(131_072));
+    // Upstream's output figure; requests stay capped at 131,072 by the
+    // compatibility limit table in crates/models (intersected at dispatch).
+    assert_eq!(
+        kimi_k3.limit.as_ref().and_then(|l| l.output),
+        Some(1_048_576)
+    );
     let kimi_k3_input_modalities = kimi_k3
         .modalities
         .as_ref()
@@ -1092,6 +1109,7 @@ fn bundled_asset_yields_real_chat_offerings_for_key_models() {
         .map(String::as_str)
         .collect::<Vec<_>>();
     assert_eq!(input_modalities, ["text", "image", "video"]);
+    // Codewhale's recorded controls, applied by a correction (#6396).
     assert_eq!(
         minimax_m3.reasoning_options[0]
             .get("default")
@@ -1115,7 +1133,7 @@ fn bundled_asset_yields_real_chat_offerings_for_key_models() {
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    assert_eq!(grok_input_modalities, ["text", "image"]);
+    assert_eq!(grok_input_modalities, ["text", "image", "pdf"]);
     assert_eq!(
         grok_46.reasoning_options[0]
             .get("default")
@@ -1196,21 +1214,11 @@ fn bundled_asset_pricing_is_honest() {
     assert_eq!(cost.output, Some(4.40));
     assert_eq!(cost.cache_read, Some(0.26));
 
-    // GLM-5.3 is live on the Coding Plan, but Z.ai has published no USD PAYG
-    // rate for it. Coding Plan credit multipliers are not USD, so every
-    // glm-5.3 row *except Flash* stays unpriced rather than inheriting
-    // glm-5.2's rates. GLM-5.3-Flash has a published list (2026-08-26).
-    for row in &rows {
-        let wire = row.wire_model_id.to_ascii_lowercase();
-        if wire.contains("glm-5.3") && !wire.contains("flash") {
-            assert!(
-                row.cost.is_none(),
-                "{}/{}: glm-5.3 must stay unpriced until Z.ai publishes rates",
-                row.provider,
-                row.wire_model_id
-            );
-        }
-    }
+    // The default Z.ai route is the GLM Coding Plan, which bills credit
+    // multipliers, so a Codewhale correction keeps GLM-5.3 unpriced there even
+    // though Models.dev lists a USD rate (#6396).
+    let glm53 = find(&rows, "zai", "GLM-5.3");
+    assert!(glm53.cost.is_none());
 
     let glm53_flash = find(&rows, "zai", "GLM-5.3-Flash");
     let cost = glm53_flash
@@ -1241,10 +1249,10 @@ fn bundled_asset_pricing_is_honest() {
         .cost
         .as_ref()
         .expect("qwen/qwen3.8-flash must ship priced (durable list rates, no promo)");
-    assert_eq!(cost.input, Some(0.16));
-    assert_eq!(cost.output, Some(0.47));
-    assert_eq!(cost.cache_read, Some(0.016));
-    assert_eq!(cost.cache_write, Some(0.20));
+    // The rates are upstream's, pinned by the seed lock; a re-lock that moves
+    // them shows up in `seed lock`'s review report, not here.
+    assert!(cost.input.is_some_and(|rate| rate > 0.0));
+    assert!(cost.output.is_some_and(|rate| rate > 0.0));
     assert_eq!(
         qwen38_flash.limit.as_ref().and_then(|l| l.context),
         Some(1_000_000)
@@ -1419,7 +1427,9 @@ fn stepfun_bundled_coding_models_preserve_default_and_plan_pricing_boundary() {
         .find(|row| row.wire_model_id == "step-5-preview")
         .unwrap();
     assert_eq!(step5.limit.as_ref().unwrap().context, Some(1_000_000));
-    assert_eq!(step5.limit.as_ref().unwrap().output, Some(1_000_000));
+    // Models.dev lists 65,536; the old seed said 1,000,000. The lower bound is
+    // the one a request can always use (#6396).
+    assert_eq!(step5.limit.as_ref().unwrap().output, Some(65_536));
     assert_eq!(
         step5.modalities.as_ref().unwrap().input,
         ["text", "image", "video"]
@@ -1436,7 +1446,7 @@ fn stepfun_bundled_coding_models_preserve_default_and_plan_pricing_boundary() {
         march.reasoning_options[0]["values"],
         serde_json::json!(["low", "high"])
     );
-    assert_eq!(march.limit.as_ref().unwrap().output, None);
+    assert_eq!(march.limit.as_ref().unwrap().output, Some(256_000));
 }
 
 // ---- Codewhale corrections (#6396) -------------------------------------

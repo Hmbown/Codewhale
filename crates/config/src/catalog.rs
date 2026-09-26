@@ -255,11 +255,12 @@ impl CatalogOffering {
 ///
 /// This is **not** a competing curated source of truth. Preferred metadata comes
 /// from the live Models.dev catalog (#4187). The bundled asset is a compact
-/// network-free seed of verified in-repo defaults (context/output from
-/// `crates/tui/src/models.rs`, USD pricing from `crates/tui/src/pricing.rs`) so
-/// [`crate::route::RouteResolver::new`] and pickers still work offline or after
-/// a failed refresh. See the asset's `_meta.role` / `_meta.source` and the
-/// honesty rule on omitted pricing (`UnknownOrStale`, never a fabricated zero).
+/// network-free projection of the Models.dev rows Codewhale ships, generated
+/// by `scripts/catalog_models_dev.py seed render` from a reviewed spec and a
+/// pinned lock (#6396), so [`crate::route::RouteResolver::new`] and pickers
+/// still work offline or after a failed refresh. Deliberate holds (withheld
+/// prices, clamped limits) are not in the asset: [`corrections`] applies them
+/// to it and to live rows alike.
 pub const BUNDLED_MODELS_DEV_JSON: &str = include_str!("../assets/models_dev.bundled.json");
 
 /// Parse-once cache for the committed bundled Models.dev snapshot.

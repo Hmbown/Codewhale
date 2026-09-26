@@ -307,12 +307,14 @@ impl ReasoningEffort {
     pub fn catalog_effort_values(provider: ApiProvider, wire_model: &str) -> Option<Vec<Self>> {
         let offering = crate::provider_lake::catalog_offering_for_model(provider, wire_model)?;
         let mut efforts = Vec::new();
+        let mut has_toggle = false;
         for option in &offering.reasoning_options {
-            if !option
-                .get("type")
-                .and_then(|value| value.as_str())
-                .is_some_and(|kind| kind.eq_ignore_ascii_case("effort"))
-            {
+            let kind = option.get("type").and_then(|value| value.as_str());
+            if kind.is_some_and(|kind| kind.eq_ignore_ascii_case("toggle")) {
+                has_toggle = true;
+                continue;
+            }
+            if !kind.is_some_and(|kind| kind.eq_ignore_ascii_case("effort")) {
                 continue;
             }
             let Some(values) = option.get("values").and_then(|value| value.as_array()) else {
@@ -325,6 +327,11 @@ impl ReasoningEffort {
                     efforts.push(effort);
                 }
             }
+        }
+        // A Models.dev `toggle` beside an effort ladder means reasoning can also
+        // be switched off (#6396); an explicit off must not round up.
+        if has_toggle && !efforts.is_empty() && !efforts.contains(&Self::Off) {
+            efforts.insert(0, Self::Off);
         }
         (!efforts.is_empty()).then_some(efforts)
     }

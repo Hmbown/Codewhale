@@ -1,28 +1,27 @@
 {
   "_meta": {
-    "about": "Offline/stale fallback Models.dev-shaped catalog snapshot for Codewhale (#3385, demoted by #4188).",
+    "about": "Offline fallback Models.dev-shaped catalog snapshot for Codewhale (#3385, demoted by #4188, generated since #6396).",
     "schema": "Matches crates/config/src/models_dev.rs ModelsDevCatalog ({ models, providers }).",
     "role": "NOT a competing source of truth. Preferred metadata is the live Models.dev catalog published into ProviderLake (#4187). This asset is used only when live/cache rows are unavailable (offline startup, failed refresh, or empty cache).",
-    "source": "Compact offline seed of verified in-repo defaults (context/output from crates/models/src/lib.rs; USD pricing from crates/tui/src/pricing.rs) for providers Codewhale ships with. It is intentionally smaller than a full Models.dev dump; live refresh supersedes these rows on (provider, wire_model_id) identity.",
-    "honesty": "Pricing is intentionally OMITTED where a flat catalog row would be misleading: DeepSeek-native rows (priced via the time-aware DeepSeek table elsewhere, kept UnknownOrStale at the route layer), Grok 4.6 (rates double once a prompt reaches 200K tokens), aggregator-hosted DeepSeek rows (aggregator account terms, not DeepSeek Platform pricing), Xiaomi MiMo rows (published PAYG rates apply only to sk- pay-as-you-go keys; the catalog cannot distinguish that billing surface from credit/quota Token Plan keys, so MiMo stays unpriced), and Alibaba Model Studio Token/Coding Plan rows (upstream lists zero per-token cost because usage draws on plan quota, not per-token billing; a zero here would read as 'free'). Absent pricing surfaces as PricingSku::UnknownOrStale, never a fabricated zero.",
+    "source": "Rows are projected unedited from Models.dev onto the fields models_dev.rs reads; provider headers, id mapping, defaults and canonical joins come from scripts/catalog/models_dev_seed.toml.",
+    "corrections": "Deliberate holds (withheld prices, clamped limits) are not in this file. They live in crates/config/assets/catalog_corrections.json and apply to this seed and to live refresh alike.",
     "default_rows": "Each provider's `default: true` wire id equals that provider's built-in DEFAULT_*_MODEL so RouteResolver::new() and the descriptor stay in agreement when offline.",
-    "curated": "qwen3.8-max (GA) is curated ahead of upstream Models.dev, which as of 2026-08-03 lists only qwen3.8-max-preview; facts verified against the owner's Token Plan console (2026-08-03): ~1M context, 128K output, image understanding, always-on reasoning. deepseek-v4-flash-0731 keeps the console/in-repo wire id for the row upstream serves as deepseek-v4-flash. Coding Plan rows for qwen3.8-max-preview, deepseek-v4-pro, deepseek-v4-flash-0731, and glm-5.2 are curated from the Token Plan upstream entries (upstream alibaba-coding-plan does not list them yet); the in-repo route layer already offers the same model set on both plans. Upstream provider ids alibaba-token-plan(-cn) / alibaba-coding-plan(-cn) were merged onto the CodeWhale provider ids (live refresh normalizes them via ProviderKind aliases; the -cn regional variants stay upstream-id browse rows until Codewhale ships China endpoints).",
-    "qwen_3_8_flash_2026_08_26": "OpenRouter qwen/qwen3.8-flash recorded 2026-08-26 against https://models.dev/api.json: release_date 2026-08-26, 1,000,000 context / 131,072 output, text+image+video input / text output, reasoning true, tool_call true, family qwen. Durable list prices (no promo annotation): input 0.16, output 0.47, cache_read 0.016, cache_write 0.20 per 1M. Alibaba first-party lists only qwen3.8-max (already curated, unpriced on Token Plan); this seed curates the OpenRouter row only and does not invent a first-party flash id. Live refresh supersedes on (provider, wire_model_id) identity. The flash suffix is not a GA family default, so DEFAULT_MODELSTUDIO_TOKEN_PLAN_MODEL stays qwen3.8-max and this row is not default: true.",
     "pending_release_metadata": "GLM-5.3 is live on the Z.ai Coding Plan (docs.z.ai/devpack/overview and docs.z.ai/devpack/latest-model, recorded 2026-08-13) and is the default direct Z.ai model (DEFAULT_ZAI_MODEL); explicit GLM-5.2 selections keep their own id. First-party wire id is GLM-5.3; OpenRouter mirror is z-ai/glm-5.3. Capability/limit/dialect values still inherit from GLM-5.2 until Z.ai publishes distinct 5.3 numbers. Pricing stays absent: Coding Plan publishes credit multipliers, not a USD PAYG row we can stand behind. Z.ai may auto-route GLM-5.2/GLM-5.1 requests to GLM-5.3 on their side; Codewhale still sends the selected picker id. Do not send a [1m] suffix. Scope stays first-party Z.ai plus the OpenRouter mirror; add third-party gateway rows only against that gateway's own published roster.",
-    "glm_5_3_flash_2026_08_26": "GLM-5.3-Flash recorded 2026-08-26 against https://docs.z.ai/guides/overview/pricing: natively multimodal (text/image/video), 1,000,000 context / 131,072 output, reasoning + tools. First-party wire id GLM-5.3-Flash; OpenRouter mirror z-ai/glm-5.3-flash. Durable list prices (not the 50% promo ending 2026-09-09 UTC+8): input 0.15, output 0.50, cache_read 0.03 per 1M. Flash is a picker row and the faster/explore sibling of GLM-5.3; DEFAULT_ZAI_MODEL stays GLM-5.3.",
-    "currency_sweep_2026_08_17": "Rows re-verified against official pages on 2026-08-17 (#5470 follow-up): gpt-5.6-terra 2.00/12.00 (cache read 0.20, write 2.50) and gpt-5.6-luna 0.20/1.20 (0.02/0.25) per developers.openai.com model pages; claude-sonnet-5 2.00/10.00 (0.20/2.50) is now Anthropic's standard price (the 2026-09-01 increase was cancelled) and claude-opus-5 5.00/25.00 (0.50/6.25) was added; kimi-k3 3.00/15.00 (0.30) and kimi-k2.7-code-highspeed 1.90/8.00 (0.38) per platform.kimi.ai; MiniMax-M2.7-highspeed 0.60/2.40 (0.06/0.375) per platform.minimax.io; grok-4.5 (500K) and grok-4.3 (1M) carry limits only because xAI doubles their rates past 200K (same rule as grok-4.6); OpenRouter dots-studio/dots-3-note-preview:free carries limits only (its single free endpoint publishes $0, which this seed does not restate as a price).",
-    "coverage": "21 providers, 100 provider model rows, 4 canonical model entries (offline seed only).",
-    "stepfun_2026_09_19": "Official https://platform.stepfun.ai/docs/en/guides/models/step-5-preview and step-3.7-flash / step-3.5-flash: four coding models, tools and reasoning. Step 5 has 1,000,000 context/output and text/image/video input; Step 3.7 has 256K context and text/image/video input. Its existing 256K output remains models.dev-sourced; no output limit is invented for Step 3.5. Step 3.5-2603 offers low/high effort, Step 3.7 and Step 5 low/medium/high. Base Step 3.5 uses provider-default reasoning. The existing Step 3.7 default is preserved. PAYG costs are deliberately omitted here because the same model ids serve Step Plan subscription quota; endpoint-scoped rates live in pricing.rs. Audio/image generators and retired model ids are not coding routes.",
-    "mimo_v2_6_2026_09_21": "MiMo 2.6 rows staged 2026-09-21 from https://models.dev/catalog.json (xiaomi/mimo-v2.6-pro, xiaomi/mimo-v2.6-flash): reasoning + tool_call true, upstream limits 1,048,576 context / 131,072 output, staged as the family's 1,000,000 / 131,072 to match the in-repo MiMo rows. Both stay unpriced under `honesty` (published PAYG rates cover only sk- pay-as-you-go keys; Token Plan quota cannot be told apart from them). DEFAULT_XIAOMI_MIMO_MODEL stays mimo-v2.5-pro per `default_rows`, so neither new row is `default: true`. Upstream advertises text+image+audio+video+pdf input; the seed keeps the xiaomi-mimo family's verified text-only row until the route is qualified for wider modalities. No first-party -free id exists upstream; none is staged.",
-    "canonical_key_shape_2026_09_25": "#6396 slice B: canonical `models` entries use upstream Models.dev keys (`vendor/model`). xiaomi/mimo-v2.6-pro and xiaomi/mimo-v2.6-flash were projected from https://models.dev/catalog.json on 2026-09-25 onto the fields ModelsDevModel reads, unedited. Offline, a namespaced entry becomes a route row under its CodeWhale provider id (`xiaomi` -> `xiaomi-mimo`) only where no provider row exists, so the providers.xiaomi-mimo 2.6 rows still win and keep the family's verified text-only qualification; the canonical entries record upstream's wider modalities. The two bare keys (deepseek-v4-pro, deepseek-v4-flash) stay bare because they are the canonical ids every hosted DeepSeek row's `base_model`, the route layer and pricing already name; renaming them is a canonical-identity migration, not a seed refresh."
+    "generated_by": "python3 scripts/catalog_models_dev.py seed render from scripts/catalog/models_dev_seed.toml and scripts/catalog/models_dev_seed.lock.json. Do not edit this file by hand; see docs/CATALOG_REFRESH.md.",
+    "upstream": "https://models.dev/catalog.json fetched 2026-09-26T09:07:10Z sha256 1e559956cfa16dad77e1fd5f1f38ae533276b397aca15c2b0ebb71d6e50e64a3",
+    "coverage": "21 providers, 100 provider model rows, 4 canonical model entries."
   },
   "models": {
     "deepseek-v4-pro": {
       "id": "deepseek-v4-pro",
       "name": "DeepSeek V4 Pro",
-      "family": "deepseek",
+      "family": "deepseek-thinking",
+      "attachment": false,
       "reasoning": true,
       "tool_call": true,
+      "structured_output": true,
+      "temperature": true,
+      "open_weights": true,
       "modalities": {
         "input": [
           "text"
@@ -34,15 +33,18 @@
       "limit": {
         "context": 1000000,
         "output": 384000
-      },
-      "open_weights": true
+      }
     },
     "deepseek-v4-flash": {
       "id": "deepseek-v4-flash",
       "name": "DeepSeek V4 Flash",
-      "family": "deepseek",
+      "family": "deepseek-flash",
+      "attachment": false,
       "reasoning": true,
       "tool_call": true,
+      "structured_output": true,
+      "temperature": true,
+      "open_weights": true,
       "modalities": {
         "input": [
           "text"
@@ -54,8 +56,7 @@
       "limit": {
         "context": 1000000,
         "output": 384000
-      },
-      "open_weights": true
+      }
     },
     "xiaomi/mimo-v2.6-pro": {
       "id": "xiaomi/mimo-v2.6-pro",
@@ -66,10 +67,6 @@
       "tool_call": true,
       "temperature": true,
       "open_weights": true,
-      "limit": {
-        "context": 1048576,
-        "output": 131072
-      },
       "modalities": {
         "input": [
           "text",
@@ -80,6 +77,10 @@
         "output": [
           "text"
         ]
+      },
+      "limit": {
+        "context": 1048576,
+        "output": 131072
       }
     },
     "xiaomi/mimo-v2.6-flash": {
@@ -91,10 +92,6 @@
       "tool_call": true,
       "temperature": true,
       "open_weights": true,
-      "limit": {
-        "context": 1048576,
-        "output": 131072
-      },
       "modalities": {
         "input": [
           "text",
@@ -105,6 +102,10 @@
         "output": [
           "text"
         ]
+      },
+      "limit": {
+        "context": 1048576,
+        "output": 131072
       }
     }
   },
@@ -122,9 +123,29 @@
           "id": "deepseek-v4-pro",
           "base_model": "deepseek-v4-pro",
           "name": "DeepSeek V4 Pro",
-          "family": "deepseek",
+          "family": "deepseek-thinking",
+          "attachment": false,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -135,16 +156,41 @@
           },
           "limit": {
             "context": 1000000,
-            "output": 384000
+            "output": 393216
+          },
+          "cost": {
+            "input": 0.435,
+            "output": 0.87,
+            "cache_read": 0.003625
           }
         },
         "deepseek-v4-flash": {
           "id": "deepseek-v4-flash",
           "base_model": "deepseek-v4-flash",
           "name": "DeepSeek V4 Flash",
-          "family": "deepseek",
+          "family": "deepseek-flash",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text",
@@ -156,16 +202,41 @@
           },
           "limit": {
             "context": 1000000,
-            "output": 384000
+            "output": 393216
+          },
+          "cost": {
+            "input": 0.15,
+            "output": 0.6,
+            "cache_read": 0.003
           }
         },
         "deepseek-v4-flash-vision-exp": {
           "id": "deepseek-v4-flash-vision-exp",
           "base_model": "deepseek-v4-flash",
-          "name": "DeepSeek V4 Flash Vision (experimental)",
-          "family": "deepseek",
+          "name": "DeepSeek V4 Flash Vision Exp",
+          "family": "deepseek-flash",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text",
@@ -177,17 +248,42 @@
           },
           "limit": {
             "context": 1000000,
-            "output": 384000
+            "output": 393216
+          },
+          "cost": {
+            "input": 0.15,
+            "output": 0.6,
+            "cache_read": 0.003
           }
         },
         "deepseek-flash": {
           "id": "deepseek-flash",
           "base_model": "deepseek-flash",
           "name": "DeepSeek V4.1 Flash",
-          "family": "deepseek",
+          "family": "deepseek-flash",
           "default": true,
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text",
@@ -199,7 +295,12 @@
           },
           "limit": {
             "context": 1000000,
-            "output": 384000
+            "output": 393216
+          },
+          "cost": {
+            "input": 0.15,
+            "output": 0.6,
+            "cache_read": 0.003
           }
         }
       }
@@ -219,6 +320,7 @@
           "id": "GLM-5.2",
           "name": "GLM-5.2",
           "family": "glm",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -229,7 +331,13 @@
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -245,7 +353,8 @@
           "cost": {
             "input": 1.4,
             "output": 4.4,
-            "cache_read": 0.26
+            "cache_read": 0.26,
+            "cache_write": 0
           }
         },
         "GLM-5.3": {
@@ -253,17 +362,25 @@
           "name": "GLM-5.3",
           "family": "glm",
           "default": true,
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
               "type": "effort",
               "values": [
+                "low",
                 "high",
                 "max"
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -275,29 +392,43 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 1.4,
+            "output": 4.4,
+            "cache_read": 0.26,
+            "cache_write": 0
           }
         },
         "GLM-5.3-Flash": {
           "id": "GLM-5.3-Flash",
           "name": "GLM-5.3-Flash",
-          "family": "glm",
+          "family": "glm-flash",
           "attachment": true,
           "reasoning": true,
           "reasoning_options": [
             {
               "type": "effort",
               "values": [
+                "low",
                 "high",
                 "max"
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text",
               "image",
-              "video"
+              "video",
+              "pdf"
             ],
             "output": [
               "text"
@@ -310,15 +441,28 @@
           "cost": {
             "input": 0.15,
             "output": 0.5,
-            "cache_read": 0.03
+            "cache_read": 0.03,
+            "cache_write": 0
           }
         },
         "glm-5.1": {
           "id": "glm-5.1",
           "name": "GLM-5.1",
           "family": "glm",
+          "attachment": false,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -328,21 +472,34 @@
             ]
           },
           "limit": {
-            "context": 202752,
+            "context": 200000,
             "output": 131072
           },
           "cost": {
             "input": 1.4,
             "output": 4.4,
-            "cache_read": 0.26
+            "cache_read": 0.26,
+            "cache_write": 0
           }
         },
         "GLM-5-Turbo": {
           "id": "GLM-5-Turbo",
-          "name": "GLM-5 Turbo",
+          "name": "GLM-5-Turbo",
           "family": "glm",
+          "attachment": false,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text"
@@ -352,13 +509,14 @@
             ]
           },
           "limit": {
-            "context": 202752,
+            "context": 200000,
             "output": 131072
           },
           "cost": {
             "input": 1.2,
-            "output": 4.0,
-            "cache_read": 0.24
+            "output": 4,
+            "cache_read": 0.24,
+            "cache_write": 0
           }
         }
       }
@@ -377,8 +535,28 @@
           "id": "kimi-k3",
           "name": "Kimi K3",
           "family": "kimi-k3",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": false,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text",
@@ -391,24 +569,34 @@
           },
           "limit": {
             "context": 1048576,
-            "output": 131072
+            "output": 1048576
           },
           "cost": {
-            "input": 3.0,
-            "output": 15.0,
+            "input": 3,
+            "output": 15,
             "cache_read": 0.3
           }
         },
         "kimi-k2.7-code": {
           "id": "kimi-k2.7-code",
           "name": "Kimi K2.7 Code",
-          "family": "kimi",
+          "family": "kimi-k2",
           "default": true,
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": false,
+          "open_weights": true,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image",
+              "video"
             ],
             "output": [
               "text"
@@ -420,19 +608,29 @@
           },
           "cost": {
             "input": 0.95,
-            "output": 4.0,
+            "output": 4,
             "cache_read": 0.19
           }
         },
         "kimi-k2.7-code-highspeed": {
           "id": "kimi-k2.7-code-highspeed",
-          "name": "Kimi K2.7 Code (high-speed)",
-          "family": "kimi",
+          "name": "Kimi K2.7 Code HighSpeed",
+          "family": "kimi-k2",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": false,
+          "open_weights": true,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image",
+              "video"
             ],
             "output": [
               "text"
@@ -444,19 +642,33 @@
           },
           "cost": {
             "input": 1.9,
-            "output": 8.0,
+            "output": 8,
             "cache_read": 0.38
           }
         },
         "kimi-k2.6": {
           "id": "kimi-k2.6",
           "name": "Kimi K2.6",
-          "family": "kimi",
+          "family": "kimi-k2",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image",
+              "video"
             ],
             "output": [
               "text"
@@ -468,7 +680,7 @@
           },
           "cost": {
             "input": 0.95,
-            "output": 4.0,
+            "output": 4,
             "cache_read": 0.16
           }
         }
@@ -485,22 +697,19 @@
       "models": {
         "MiniMax-M3": {
           "id": "MiniMax-M3",
-          "name": "MiniMax M3",
+          "name": "MiniMax-M3",
           "family": "minimax",
           "default": true,
           "attachment": true,
           "reasoning": true,
           "reasoning_options": [
             {
-              "type": "thinking",
-              "values": [
-                "adaptive",
-                "disabled"
-              ],
-              "default": "adaptive"
+              "type": "toggle"
             }
           ],
           "tool_call": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text",
@@ -513,24 +722,24 @@
           },
           "limit": {
             "context": 1000000,
-            "output": 524288
+            "output": 512000
+          },
+          "cost": {
+            "input": 0.3,
+            "output": 1.2,
+            "cache_read": 0.06
           }
         },
         "MiniMax-M2.7": {
           "id": "MiniMax-M2.7",
-          "name": "MiniMax M2.7",
+          "name": "MiniMax-M2.7",
           "family": "minimax",
+          "attachment": false,
           "reasoning": true,
-          "reasoning_options": [
-            {
-              "type": "thinking",
-              "values": [
-                "always_on"
-              ],
-              "default": "always_on"
-            }
-          ],
+          "reasoning_options": [],
           "tool_call": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -541,7 +750,7 @@
           },
           "limit": {
             "context": 204800,
-            "output": 204800
+            "output": 131072
           },
           "cost": {
             "input": 0.3,
@@ -552,19 +761,14 @@
         },
         "MiniMax-M2.7-highspeed": {
           "id": "MiniMax-M2.7-highspeed",
-          "name": "MiniMax M2.7 (high-speed)",
+          "name": "MiniMax-M2.7-highspeed",
           "family": "minimax",
+          "attachment": false,
           "reasoning": true,
-          "reasoning_options": [
-            {
-              "type": "thinking",
-              "values": [
-                "always_on"
-              ],
-              "default": "always_on"
-            }
-          ],
+          "reasoning_options": [],
           "tool_call": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -575,7 +779,7 @@
           },
           "limit": {
             "context": 204800,
-            "output": 204800
+            "output": 131072
           },
           "cost": {
             "input": 0.6,
@@ -597,22 +801,19 @@
       "models": {
         "MiniMax-M3": {
           "id": "MiniMax-M3",
-          "name": "MiniMax M3",
+          "name": "MiniMax-M3",
           "family": "minimax",
           "default": true,
           "attachment": true,
           "reasoning": true,
           "reasoning_options": [
             {
-              "type": "thinking",
-              "values": [
-                "adaptive",
-                "disabled"
-              ],
-              "default": "disabled"
+              "type": "toggle"
             }
           ],
           "tool_call": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text",
@@ -625,24 +826,24 @@
           },
           "limit": {
             "context": 1000000,
-            "output": 524288
+            "output": 512000
+          },
+          "cost": {
+            "input": 0.3,
+            "output": 1.2,
+            "cache_read": 0.06
           }
         },
         "MiniMax-M2.7": {
           "id": "MiniMax-M2.7",
-          "name": "MiniMax M2.7",
+          "name": "MiniMax-M2.7",
           "family": "minimax",
+          "attachment": false,
           "reasoning": true,
-          "reasoning_options": [
-            {
-              "type": "thinking",
-              "values": [
-                "always_on"
-              ],
-              "default": "always_on"
-            }
-          ],
+          "reasoning_options": [],
           "tool_call": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -653,7 +854,7 @@
           },
           "limit": {
             "context": 204800,
-            "output": 204800
+            "output": 131072
           },
           "cost": {
             "input": 0.3,
@@ -664,19 +865,14 @@
         },
         "MiniMax-M2.7-highspeed": {
           "id": "MiniMax-M2.7-highspeed",
-          "name": "MiniMax M2.7 (high-speed)",
+          "name": "MiniMax-M2.7-highspeed",
           "family": "minimax",
+          "attachment": false,
           "reasoning": true,
-          "reasoning_options": [
-            {
-              "type": "thinking",
-              "values": [
-                "always_on"
-              ],
-              "default": "always_on"
-            }
-          ],
+          "reasoning_options": [],
           "tool_call": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -687,7 +883,7 @@
           },
           "limit": {
             "context": 204800,
-            "output": 204800
+            "output": 131072
           },
           "cost": {
             "input": 0.6,
@@ -717,19 +913,35 @@
           "reasoning": true,
           "reasoning_options": [
             {
-              "type": "thinking",
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
               "values": [
-                "always_on"
-              ],
-              "default": "always_on"
+                "low",
+                "medium",
+                "xhigh"
+              ]
+            },
+            {
+              "type": "budget_tokens",
+              "min": 0,
+              "max": 262144
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
-              "image"
+              "image",
+              "video",
+              "pdf"
             ],
             "output": [
               "text"
@@ -738,6 +950,12 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "qwen3.8-max-preview": {
@@ -761,8 +979,13 @@
               "max": 262144
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -776,6 +999,12 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "qwen3.7-plus": {
@@ -793,8 +1022,13 @@
               "max": 262144
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -808,12 +1042,19 @@
           "limit": {
             "context": 1000000,
             "output": 65536
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "qwen3.7-max": {
           "id": "qwen3.7-max",
           "name": "Qwen3.7 Max",
           "family": "qwen",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -824,8 +1065,13 @@
               "max": 262144
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text"
@@ -837,6 +1083,12 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "qwen3.6-flash": {
@@ -854,8 +1106,13 @@
               "max": 131072
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -869,12 +1126,19 @@
           "limit": {
             "context": 1000000,
             "output": 65536
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "deepseek-v4-pro": {
           "id": "deepseek-v4-pro",
           "name": "DeepSeek V4 Pro",
           "family": "deepseek-thinking",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -888,8 +1152,13 @@
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -901,12 +1170,19 @@
           "limit": {
             "context": 1000000,
             "output": 384000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "deepseek-v4-flash-0731": {
           "id": "deepseek-v4-flash-0731",
-          "name": "DeepSeek V4 Flash (0731)",
+          "name": "DeepSeek V4 Flash 0731",
           "family": "deepseek-flash",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -920,8 +1196,13 @@
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -933,12 +1214,19 @@
           "limit": {
             "context": 1000000,
             "output": 384000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "glm-5.2": {
           "id": "glm-5.2",
           "name": "GLM-5.2",
           "family": "glm",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -949,8 +1237,13 @@
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -962,6 +1255,12 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         }
       }
@@ -985,19 +1284,35 @@
           "reasoning": true,
           "reasoning_options": [
             {
-              "type": "thinking",
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
               "values": [
-                "always_on"
-              ],
-              "default": "always_on"
+                "low",
+                "medium",
+                "xhigh"
+              ]
+            },
+            {
+              "type": "budget_tokens",
+              "min": 0,
+              "max": 262144
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
-              "image"
+              "image",
+              "video",
+              "pdf"
             ],
             "output": [
               "text"
@@ -1006,6 +1321,12 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "qwen3.8-max-preview": {
@@ -1029,8 +1350,13 @@
               "max": 262144
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -1044,6 +1370,12 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "qwen3.7-plus": {
@@ -1061,8 +1393,13 @@
               "max": 262144
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -1076,12 +1413,19 @@
           "limit": {
             "context": 1000000,
             "output": 65536
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "qwen3.7-max": {
           "id": "qwen3.7-max",
           "name": "Qwen3.7 Max",
           "family": "qwen",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -1092,8 +1436,13 @@
               "max": 262144
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text"
@@ -1105,6 +1454,12 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "qwen3.6-flash": {
@@ -1122,8 +1477,13 @@
               "max": 131072
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -1137,12 +1497,19 @@
           "limit": {
             "context": 1000000,
             "output": 65536
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "deepseek-v4-pro": {
           "id": "deepseek-v4-pro",
           "name": "DeepSeek V4 Pro",
           "family": "deepseek-thinking",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -1156,8 +1523,13 @@
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -1169,12 +1541,19 @@
           "limit": {
             "context": 1000000,
             "output": 384000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "deepseek-v4-flash-0731": {
           "id": "deepseek-v4-flash-0731",
-          "name": "DeepSeek V4 Flash (0731)",
+          "name": "DeepSeek V4 Flash 0731",
           "family": "deepseek-flash",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -1188,8 +1567,13 @@
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -1201,12 +1585,19 @@
           "limit": {
             "context": 1000000,
             "output": 384000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "glm-5.2": {
           "id": "glm-5.2",
           "name": "GLM-5.2",
           "family": "glm",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -1217,8 +1608,13 @@
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -1230,6 +1626,12 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         }
       }
@@ -1253,19 +1655,35 @@
           "reasoning": true,
           "reasoning_options": [
             {
-              "type": "thinking",
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
               "values": [
-                "always_on"
-              ],
-              "default": "always_on"
+                "low",
+                "medium",
+                "xhigh"
+              ]
+            },
+            {
+              "type": "budget_tokens",
+              "min": 0,
+              "max": 262144
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
-              "image"
+              "image",
+              "video",
+              "pdf"
             ],
             "output": [
               "text"
@@ -1274,6 +1692,12 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "qwen3.8-max-preview": {
@@ -1297,8 +1721,13 @@
               "max": 262144
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -1312,6 +1741,12 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "qwen3.7-plus": {
@@ -1323,14 +1758,11 @@
           "reasoning_options": [
             {
               "type": "toggle"
-            },
-            {
-              "type": "budget_tokens",
-              "max": 262144
             }
           ],
           "tool_call": true,
-          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -1344,24 +1776,28 @@
           "limit": {
             "context": 1000000,
             "output": 64000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "qwen3.7-max": {
           "id": "qwen3.7-max",
           "name": "Qwen3.7 Max",
           "family": "qwen",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
               "type": "toggle"
-            },
-            {
-              "type": "budget_tokens",
-              "max": 262144
             }
           ],
           "tool_call": true,
-          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text"
@@ -1373,6 +1809,12 @@
           "limit": {
             "context": 1000000,
             "output": 65536
+          },
+          "cost": {
+            "input": 2.5,
+            "output": 7.5,
+            "cache_read": 0.5,
+            "cache_write": 3.125
           }
         },
         "qwen3.6-flash": {
@@ -1384,14 +1826,12 @@
           "reasoning_options": [
             {
               "type": "toggle"
-            },
-            {
-              "type": "budget_tokens",
-              "max": 131072
             }
           ],
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -1405,12 +1845,18 @@
           "limit": {
             "context": 1000000,
             "output": 65536
+          },
+          "cost": {
+            "input": 0.1875,
+            "output": 1.125,
+            "cache_write": 0.234375
           }
         },
         "deepseek-v4-pro": {
           "id": "deepseek-v4-pro",
           "name": "DeepSeek V4 Pro",
           "family": "deepseek-thinking",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -1424,8 +1870,13 @@
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -1437,12 +1888,19 @@
           "limit": {
             "context": 1000000,
             "output": 384000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "deepseek-v4-flash-0731": {
           "id": "deepseek-v4-flash-0731",
-          "name": "DeepSeek V4 Flash (0731)",
+          "name": "DeepSeek V4 Flash 0731",
           "family": "deepseek-flash",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -1456,8 +1914,13 @@
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -1469,12 +1932,19 @@
           "limit": {
             "context": 1000000,
             "output": 384000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "glm-5.2": {
           "id": "glm-5.2",
           "name": "GLM-5.2",
           "family": "glm",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -1485,8 +1955,13 @@
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -1498,6 +1973,12 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         }
       }
@@ -1521,19 +2002,35 @@
           "reasoning": true,
           "reasoning_options": [
             {
-              "type": "thinking",
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
               "values": [
-                "always_on"
-              ],
-              "default": "always_on"
+                "low",
+                "medium",
+                "xhigh"
+              ]
+            },
+            {
+              "type": "budget_tokens",
+              "min": 0,
+              "max": 262144
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
-              "image"
+              "image",
+              "video",
+              "pdf"
             ],
             "output": [
               "text"
@@ -1542,6 +2039,12 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "qwen3.8-max-preview": {
@@ -1565,8 +2068,13 @@
               "max": 262144
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -1580,6 +2088,12 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "qwen3.7-plus": {
@@ -1591,14 +2105,11 @@
           "reasoning_options": [
             {
               "type": "toggle"
-            },
-            {
-              "type": "budget_tokens",
-              "max": 262144
             }
           ],
           "tool_call": true,
-          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -1612,24 +2123,28 @@
           "limit": {
             "context": 1000000,
             "output": 64000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "qwen3.7-max": {
           "id": "qwen3.7-max",
           "name": "Qwen3.7 Max",
           "family": "qwen",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
               "type": "toggle"
-            },
-            {
-              "type": "budget_tokens",
-              "max": 262144
             }
           ],
           "tool_call": true,
-          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text"
@@ -1641,6 +2156,12 @@
           "limit": {
             "context": 1000000,
             "output": 65536
+          },
+          "cost": {
+            "input": 2.5,
+            "output": 7.5,
+            "cache_read": 0.5,
+            "cache_write": 3.125
           }
         },
         "qwen3.6-flash": {
@@ -1652,14 +2173,12 @@
           "reasoning_options": [
             {
               "type": "toggle"
-            },
-            {
-              "type": "budget_tokens",
-              "max": 131072
             }
           ],
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -1673,12 +2192,18 @@
           "limit": {
             "context": 1000000,
             "output": 65536
+          },
+          "cost": {
+            "input": 0.1875,
+            "output": 1.125,
+            "cache_write": 0.234375
           }
         },
         "deepseek-v4-pro": {
           "id": "deepseek-v4-pro",
           "name": "DeepSeek V4 Pro",
           "family": "deepseek-thinking",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -1692,8 +2217,13 @@
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -1705,12 +2235,19 @@
           "limit": {
             "context": 1000000,
             "output": 384000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "deepseek-v4-flash-0731": {
           "id": "deepseek-v4-flash-0731",
-          "name": "DeepSeek V4 Flash (0731)",
+          "name": "DeepSeek V4 Flash 0731",
           "family": "deepseek-flash",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -1724,8 +2261,13 @@
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -1737,12 +2279,19 @@
           "limit": {
             "context": 1000000,
             "output": 384000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         },
         "glm-5.2": {
           "id": "glm-5.2",
           "name": "GLM-5.2",
           "family": "glm",
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -1753,8 +2302,13 @@
               ]
             }
           ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -1766,6 +2320,12 @@
           "limit": {
             "context": 1000000,
             "output": 131072
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0
           }
         }
       }
@@ -1784,25 +2344,24 @@
           "id": "muse-spark-1.1",
           "name": "Muse Spark 1.1",
           "family": "muse",
-          "default": false,
           "attachment": true,
           "reasoning": true,
           "reasoning_options": [
             {
               "type": "effort",
               "values": [
-                "none",
                 "minimal",
                 "low",
                 "medium",
                 "high",
-                "xhigh",
-                "ultra"
+                "xhigh"
               ]
             }
           ],
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -1815,8 +2374,8 @@
             ]
           },
           "limit": {
-            "context": 1000000,
-            "output": 32000
+            "context": 1048576,
+            "output": 131072
           },
           "cost": {
             "input": 1.25,
@@ -1835,32 +2394,33 @@
             {
               "type": "effort",
               "values": [
-                "none",
                 "minimal",
                 "low",
                 "medium",
                 "high",
-                "xhigh",
-                "ultra"
+                "xhigh"
               ]
             }
           ],
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
               "image",
+              "video",
               "pdf",
-              "video"
+              "audio"
             ],
             "output": [
               "text"
             ]
           },
           "limit": {
-            "context": 1000000,
-            "output": 32000
+            "context": 1048576,
+            "output": 131072
           },
           "cost": {
             "input": 1.25,
@@ -1870,41 +2430,41 @@
         },
         "muse-spark-1.2-contributor": {
           "id": "muse-spark-1.2-contributor",
-          "name": "Muse Spark 1.2 (Contributor)",
+          "name": "Muse Spark 1.2 Contributor",
           "family": "muse",
-          "default": false,
           "attachment": true,
           "reasoning": true,
           "reasoning_options": [
             {
               "type": "effort",
               "values": [
-                "none",
                 "minimal",
                 "low",
                 "medium",
                 "high",
-                "xhigh",
-                "ultra"
+                "xhigh"
               ]
             }
           ],
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
               "image",
+              "video",
               "pdf",
-              "video"
+              "audio"
             ],
             "output": [
               "text"
             ]
           },
           "limit": {
-            "context": 1000000,
-            "output": 32000
+            "context": 1048576,
+            "output": 131072
           },
           "cost": {
             "input": 0.1,
@@ -1927,11 +2487,29 @@
           "id": "gpt-5.5",
           "name": "GPT-5.5",
           "family": "gpt",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh"
+              ]
+            }
+          ],
           "tool_call": true,
+          "structured_output": true,
+          "temperature": false,
+          "open_weights": false,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image",
+              "pdf"
             ],
             "output": [
               "text"
@@ -1939,46 +2517,35 @@
           },
           "limit": {
             "context": 1050000,
+            "input": 922000,
             "output": 128000
           },
           "cost": {
-            "input": 5.0,
-            "output": 30.0,
+            "input": 5,
+            "output": 30,
             "cache_read": 0.5
           }
         },
         "gpt-5.5-pro": {
           "id": "gpt-5.5-pro",
           "name": "GPT-5.5 Pro",
-          "family": "gpt",
-          "reasoning": true,
-          "tool_call": true,
-          "modalities": {
-            "input": [
-              "text"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 1050000,
-            "output": 128000
-          },
-          "cost": {
-            "input": 30.0,
-            "output": 180.0
-          }
-        },
-        "gpt-5.6": {
-          "id": "gpt-5.6",
-          "name": "GPT-5.6 Sol",
-          "family": "gpt",
-          "default": true,
+          "family": "gpt-pro",
           "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "medium",
+                "high",
+                "xhigh"
+              ]
+            }
+          ],
           "tool_call": true,
           "structured_output": true,
+          "temperature": false,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -1995,20 +2562,79 @@
             "output": 128000
           },
           "cost": {
-            "input": 5.0,
-            "output": 30.0,
-            "cache_read": 0.5,
-            "cache_write": 6.25
+            "input": 30,
+            "output": 180
+          }
+        },
+        "gpt-5.6": {
+          "id": "gpt-5.6",
+          "name": "GPT-5.6",
+          "family": "gpt-sol",
+          "default": true,
+          "attachment": true,
+          "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "tool_call": true,
+          "structured_output": true,
+          "temperature": false,
+          "open_weights": false,
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "pdf"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1050000,
+            "input": 922000,
+            "output": 128000
+          },
+          "cost": {
+            "input": 4,
+            "output": 20,
+            "cache_read": 0.4,
+            "cache_write": 5
           }
         },
         "gpt-5.6-sol": {
           "id": "gpt-5.6-sol",
           "name": "GPT-5.6 Sol",
-          "family": "gpt",
+          "family": "gpt-sol",
           "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
           "tool_call": true,
           "structured_output": true,
+          "temperature": false,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -2025,20 +2651,35 @@
             "output": 128000
           },
           "cost": {
-            "input": 5.0,
-            "output": 30.0,
-            "cache_read": 0.5,
-            "cache_write": 6.25
+            "input": 4,
+            "output": 20,
+            "cache_read": 0.4,
+            "cache_write": 5
           }
         },
         "gpt-5.6-terra": {
           "id": "gpt-5.6-terra",
           "name": "GPT-5.6 Terra",
-          "family": "gpt-mini",
+          "family": "gpt-terra",
           "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
           "tool_call": true,
           "structured_output": true,
+          "temperature": false,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -2055,8 +2696,8 @@
             "output": 128000
           },
           "cost": {
-            "input": 2.0,
-            "output": 12.0,
+            "input": 2,
+            "output": 12,
             "cache_read": 0.2,
             "cache_write": 2.5
           }
@@ -2064,11 +2705,26 @@
         "gpt-5.6-luna": {
           "id": "gpt-5.6-luna",
           "name": "GPT-5.6 Luna",
-          "family": "gpt-nano",
+          "family": "gpt-luna",
           "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
           "tool_call": true,
           "structured_output": true,
+          "temperature": false,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -2095,11 +2751,29 @@
           "id": "gpt-5.3-codex",
           "name": "GPT-5.3 Codex",
           "family": "gpt-codex",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh"
+              ]
+            }
+          ],
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image",
+              "pdf"
             ],
             "output": [
               "text"
@@ -2107,11 +2781,12 @@
           },
           "limit": {
             "context": 400000,
+            "input": 272000,
             "output": 128000
           },
           "cost": {
             "input": 1.75,
-            "output": 14.0,
+            "output": 14,
             "cache_read": 0.175
           }
         }
@@ -2129,13 +2804,34 @@
         "claude-sonnet-4-6": {
           "id": "claude-sonnet-4-6",
           "name": "Claude Sonnet 4.6",
-          "family": "claude",
+          "family": "claude-sonnet",
           "default": true,
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "max"
+              ]
+            },
+            {
+              "type": "budget_tokens",
+              "min": 1024
+            }
+          ],
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image",
+              "pdf"
             ],
             "output": [
               "text"
@@ -2146,8 +2842,8 @@
             "output": 128000
           },
           "cost": {
-            "input": 3.0,
-            "output": 15.0,
+            "input": 3,
+            "output": 15,
             "cache_read": 0.3,
             "cache_write": 3.75
           }
@@ -2155,12 +2851,30 @@
         "claude-opus-4-8": {
           "id": "claude-opus-4-8",
           "name": "Claude Opus 4.8",
-          "family": "claude",
+          "family": "claude-opus",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
           "tool_call": true,
+          "structured_output": true,
+          "temperature": false,
+          "open_weights": false,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image",
+              "pdf"
             ],
             "output": [
               "text"
@@ -2171,21 +2885,33 @@
             "output": 128000
           },
           "cost": {
-            "input": 5.0,
-            "output": 25.0,
+            "input": 5,
+            "output": 25,
             "cache_read": 0.5,
             "cache_write": 6.25
           }
         },
         "claude-haiku-4-5": {
           "id": "claude-haiku-4-5",
-          "name": "Claude Haiku 4.5",
-          "family": "claude",
+          "name": "Claude Haiku 4.5 (latest)",
+          "family": "claude-haiku",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "budget_tokens",
+              "min": 1024
+            }
+          ],
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image",
+              "pdf"
             ],
             "output": [
               "text"
@@ -2196,8 +2922,8 @@
             "output": 64000
           },
           "cost": {
-            "input": 1.0,
-            "output": 5.0,
+            "input": 1,
+            "output": 5,
             "cache_read": 0.1,
             "cache_write": 1.25
           }
@@ -2205,12 +2931,30 @@
         "claude-opus-5": {
           "id": "claude-opus-5",
           "name": "Claude Opus 5",
-          "family": "claude",
+          "family": "claude-opus",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
           "tool_call": true,
+          "structured_output": true,
+          "temperature": false,
+          "open_weights": false,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image",
+              "pdf"
             ],
             "output": [
               "text"
@@ -2221,8 +2965,8 @@
             "output": 128000
           },
           "cost": {
-            "input": 5.0,
-            "output": 25.0,
+            "input": 5,
+            "output": 25,
             "cache_read": 0.5,
             "cache_write": 6.25
           }
@@ -2230,12 +2974,33 @@
         "claude-sonnet-5": {
           "id": "claude-sonnet-5",
           "name": "Claude Sonnet 5",
-          "family": "claude",
+          "family": "claude-sonnet",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
           "tool_call": true,
+          "structured_output": true,
+          "temperature": false,
+          "open_weights": false,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image",
+              "pdf"
             ],
             "output": [
               "text"
@@ -2246,8 +3011,8 @@
             "output": 128000
           },
           "cost": {
-            "input": 2.0,
-            "output": 10.0,
+            "input": 2,
+            "output": 10,
             "cache_read": 0.2,
             "cache_write": 2.5
           }
@@ -2255,12 +3020,30 @@
         "claude-fable-5": {
           "id": "claude-fable-5",
           "name": "Claude Fable 5",
-          "family": "claude",
+          "family": "claude-fable",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
           "tool_call": true,
+          "structured_output": true,
+          "temperature": false,
+          "open_weights": false,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image",
+              "pdf"
             ],
             "output": [
               "text"
@@ -2271,9 +3054,9 @@
             "output": 128000
           },
           "cost": {
-            "input": 10.0,
-            "output": 50.0,
-            "cache_read": 1.0,
+            "input": 10,
+            "output": 50,
+            "cache_read": 1,
             "cache_write": 12.5
           }
         }
@@ -2291,11 +3074,30 @@
         "deepseek/deepseek-v4-pro": {
           "id": "deepseek/deepseek-v4-pro",
           "base_model": "deepseek-v4-pro",
-          "name": "DeepSeek V4 Pro (OpenRouter)",
-          "family": "deepseek",
+          "name": "DeepSeek V4 Pro",
+          "family": "deepseek-thinking",
           "default": true,
+          "attachment": false,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "high",
+                "xhigh"
+              ]
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -2305,17 +3107,41 @@
             ]
           },
           "limit": {
-            "context": 1000000,
+            "context": 1048576,
             "output": 384000
+          },
+          "cost": {
+            "input": 0.418818,
+            "output": 0.837636,
+            "cache_read": 0.034902
           }
         },
         "deepseek/deepseek-v4-flash": {
           "id": "deepseek/deepseek-v4-flash",
           "base_model": "deepseek-v4-flash",
-          "name": "DeepSeek V4 Flash (OpenRouter)",
-          "family": "deepseek",
+          "name": "DeepSeek V4 Flash",
+          "family": "deepseek-flash",
+          "attachment": false,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "high",
+                "xhigh"
+              ]
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -2325,197 +3151,33 @@
             ]
           },
           "limit": {
-            "context": 1000000,
+            "context": 1048576,
             "output": 384000
+          },
+          "cost": {
+            "input": 0.04704,
+            "output": 0.09408,
+            "cache_read": 0.009408
           }
         },
         "qwen/qwen3.8-flash": {
           "id": "qwen/qwen3.8-flash",
           "name": "Qwen3.8 Flash",
           "family": "qwen",
-          "reasoning": true,
-          "tool_call": true,
-          "modalities": {
-            "input": [
-              "text",
-              "image",
-              "video"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 1000000,
-            "output": 131072
-          },
-          "cost": {
-            "input": 0.16,
-            "output": 0.47,
-            "cache_read": 0.016,
-            "cache_write": 0.2
-          }
-        },
-        "qwen/qwen3.6-flash": {
-          "id": "qwen/qwen3.6-flash",
-          "name": "Qwen3.6 Flash",
-          "family": "qwen",
-          "reasoning": true,
-          "tool_call": true,
-          "modalities": {
-            "input": [
-              "text"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 1000000,
-            "output": 65536
-          },
-          "cost": {
-            "input": 0.1875,
-            "output": 1.125
-          }
-        },
-        "qwen/qwen3.6-plus": {
-          "id": "qwen/qwen3.6-plus",
-          "name": "Qwen3.6 Plus",
-          "family": "qwen",
-          "reasoning": true,
-          "tool_call": true,
-          "modalities": {
-            "input": [
-              "text"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 1000000,
-            "output": 65536
-          },
-          "cost": {
-            "input": 0.325,
-            "output": 1.95
-          }
-        },
-        "qwen/qwen3.6-35b-a3b": {
-          "id": "qwen/qwen3.6-35b-a3b",
-          "name": "Qwen3.6 35B-A3B",
-          "family": "qwen",
-          "reasoning": true,
-          "tool_call": true,
-          "modalities": {
-            "input": [
-              "text"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 262144,
-            "output": 262140
-          },
-          "cost": {
-            "input": 0.14,
-            "output": 1.0,
-            "cache_read": 0.05
-          }
-        },
-        "qwen/qwen3.7-plus": {
-          "id": "qwen/qwen3.7-plus",
-          "name": "Qwen3.7 Plus",
-          "family": "qwen",
-          "reasoning": true,
-          "tool_call": true,
-          "modalities": {
-            "input": [
-              "text"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "cost": {
-            "input": 0.32,
-            "output": 1.28,
-            "cache_read": 0.064,
-            "cache_write": 0.4
-          }
-        },
-        "minimax/minimax-m3": {
-          "id": "minimax/minimax-m3",
-          "name": "MiniMax M3 (OpenRouter)",
-          "family": "minimax",
-          "reasoning": true,
-          "tool_call": true,
-          "modalities": {
-            "input": [
-              "text"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 1000000,
-            "output": 524288
-          },
-          "cost": {
-            "input": 0.3,
-            "output": 1.2,
-            "cache_read": 0.06
-          }
-        },
-        "z-ai/glm-5.2": {
-          "id": "z-ai/glm-5.2",
-          "name": "GLM-5.2 (OpenRouter)",
-          "family": "glm",
-          "reasoning": true,
-          "tool_call": true,
-          "modalities": {
-            "input": [
-              "text"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 1000000,
-            "output": 131072
-          }
-        },
-        "z-ai/glm-5.3": {
-          "id": "z-ai/glm-5.3",
-          "name": "GLM-5.3 (OpenRouter)",
-          "family": "glm",
-          "reasoning": true,
-          "tool_call": true,
-          "modalities": {
-            "input": [
-              "text"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 1000000,
-            "output": 131072
-          }
-        },
-        "z-ai/glm-5.3-flash": {
-          "id": "z-ai/glm-5.3-flash",
-          "name": "GLM-5.3-Flash (OpenRouter)",
-          "family": "glm",
           "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "budget_tokens"
+            }
+          ],
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -2532,16 +3194,321 @@
           },
           "cost": {
             "input": 0.15,
+            "output": 0.47,
+            "cache_read": 0.016,
+            "cache_write": 0.2
+          }
+        },
+        "qwen/qwen3.6-flash": {
+          "id": "qwen/qwen3.6-flash",
+          "name": "Qwen3.6 Flash",
+          "family": "qwen3.6",
+          "attachment": true,
+          "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            }
+          ],
+          "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "video"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          },
+          "cost": {
+            "input": 0.1875,
+            "output": 1.125,
+            "cache_write": 0.234375
+          }
+        },
+        "qwen/qwen3.6-plus": {
+          "id": "qwen/qwen3.6-plus",
+          "name": "Qwen3.6 Plus",
+          "family": "qwen",
+          "attachment": true,
+          "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            }
+          ],
+          "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "video"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          },
+          "cost": {
+            "input": 0.325,
+            "output": 1.95,
+            "cache_write": 0.40625
+          }
+        },
+        "qwen/qwen3.6-35b-a3b": {
+          "id": "qwen/qwen3.6-35b-a3b",
+          "name": "Qwen3.6 35B-A3B",
+          "family": "qwen",
+          "attachment": true,
+          "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            }
+          ],
+          "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "video"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 235929
+          },
+          "cost": {
+            "input": 0.15,
+            "output": 1,
+            "cache_read": 0.05
+          }
+        },
+        "qwen/qwen3.7-plus": {
+          "id": "qwen/qwen3.7-plus",
+          "name": "Qwen3.7 Plus",
+          "family": "qwen",
+          "attachment": true,
+          "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            }
+          ],
+          "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 131072
+          },
+          "cost": {
+            "input": 0.32,
+            "output": 1.28,
+            "cache_read": 0.064,
+            "cache_write": 0.4
+          }
+        },
+        "minimax/minimax-m3": {
+          "id": "minimax/minimax-m3",
+          "name": "MiniMax-M3",
+          "family": "minimax",
+          "attachment": true,
+          "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            }
+          ],
+          "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "video"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1048576,
+            "output": 512000
+          },
+          "cost": {
+            "input": 0.3,
+            "output": 1.2,
+            "cache_read": 0.06
+          }
+        },
+        "z-ai/glm-5.2": {
+          "id": "z-ai/glm-5.2",
+          "name": "GLM-5.2",
+          "family": "glm",
+          "attachment": false,
+          "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "high",
+                "xhigh"
+              ]
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1048576,
+            "output": 131072
+          },
+          "cost": {
+            "input": 0.6496,
+            "output": 2.0416,
+            "cache_read": 0.12064
+          }
+        },
+        "z-ai/glm-5.3": {
+          "id": "z-ai/glm-5.3",
+          "name": "GLM-5.3",
+          "family": "glm",
+          "attachment": false,
+          "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1310720,
+            "output": 131072
+          },
+          "cost": {
+            "input": 0.3794,
+            "output": 1.1924,
+            "cache_read": 0.07046
+          }
+        },
+        "z-ai/glm-5.3-flash": {
+          "id": "z-ai/glm-5.3-flash",
+          "name": "GLM-5.3-Flash",
+          "family": "glm-flash",
+          "attachment": true,
+          "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "video"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1310720,
+            "output": 131072
+          },
+          "cost": {
+            "input": 0.04,
             "output": 0.5,
-            "cache_read": 0.03
+            "cache_read": 0.015
           }
         },
         "dots-studio/dots-3-note-preview:free": {
           "id": "dots-studio/dots-3-note-preview:free",
-          "name": "Dots Studio Dots3-Note Preview (OpenRouter, free endpoint)",
-          "family": "dots",
+          "name": "Dots3-Note Preview (free)",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            }
+          ],
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -2553,7 +3520,11 @@
           },
           "limit": {
             "context": 512000,
-            "output": 512000
+            "output": 460800
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
           }
         }
       }
@@ -2570,11 +3541,30 @@
         "deepseek-ai/DeepSeek-V4-Pro": {
           "id": "deepseek-ai/DeepSeek-V4-Pro",
           "base_model": "deepseek-v4-pro",
-          "name": "DeepSeek V4 Pro (Together)",
+          "name": "DeepSeek V4 Pro",
           "family": "deepseek",
           "default": true,
+          "attachment": false,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -2584,8 +3574,13 @@
             ]
           },
           "limit": {
-            "context": 1000000,
+            "context": 512000,
             "output": 384000
+          },
+          "cost": {
+            "input": 1.74,
+            "output": 3.48,
+            "cache_read": 0.2
           }
         },
         "deepseek-ai/DeepSeek-V4-Flash": {
@@ -2622,11 +3617,30 @@
         "accounts/fireworks/models/deepseek-v4-pro": {
           "id": "accounts/fireworks/models/deepseek-v4-pro",
           "base_model": "deepseek-v4-pro",
-          "name": "DeepSeek V4 Pro (Fireworks)",
-          "family": "deepseek",
+          "name": "DeepSeek V4 Pro",
+          "family": "deepseek-thinking",
           "default": true,
+          "attachment": false,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -2638,6 +3652,11 @@
           "limit": {
             "context": 1000000,
             "output": 384000
+          },
+          "cost": {
+            "input": 1.2,
+            "output": 1.2,
+            "cache_read": 0.6
           }
         }
       }
@@ -2654,11 +3673,32 @@
         "deepseek/deepseek-v4-pro": {
           "id": "deepseek/deepseek-v4-pro",
           "base_model": "deepseek-v4-pro",
-          "name": "DeepSeek V4 Pro (Novita)",
-          "family": "deepseek",
+          "name": "DeepSeek V4 Pro",
+          "family": "deepseek-thinking",
           "default": true,
+          "attachment": false,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high",
+                "xhigh"
+              ]
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -2668,17 +3708,44 @@
             ]
           },
           "limit": {
-            "context": 1000000,
-            "output": 384000
+            "context": 1048576,
+            "output": 393216
+          },
+          "cost": {
+            "input": 1.6,
+            "output": 3.2,
+            "cache_read": 0.135
           }
         },
         "deepseek/deepseek-v4-flash": {
           "id": "deepseek/deepseek-v4-flash",
           "base_model": "deepseek-v4-flash",
-          "name": "DeepSeek V4 Flash (Novita)",
-          "family": "deepseek",
+          "name": "DeepSeek V4 Flash",
+          "family": "deepseek-flash",
+          "attachment": false,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh"
+              ]
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -2688,8 +3755,13 @@
             ]
           },
           "limit": {
-            "context": 1000000,
-            "output": 384000
+            "context": 1048576,
+            "output": 393216
+          },
+          "cost": {
+            "input": 0.14,
+            "output": 0.28,
+            "cache_read": 0.028
           }
         }
       }
@@ -2706,11 +3778,25 @@
         "deepseek-ai/DeepSeek-V4-Pro": {
           "id": "deepseek-ai/DeepSeek-V4-Pro",
           "base_model": "deepseek-v4-pro",
-          "name": "DeepSeek V4 Pro (SiliconFlow)",
-          "family": "deepseek",
+          "name": "DeepSeek V4 Pro",
+          "family": "deepseek-thinking",
           "default": true,
+          "attachment": false,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "budget_tokens",
+              "min": 128,
+              "max": 32768
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -2722,15 +3808,34 @@
           "limit": {
             "context": 1000000,
             "output": 384000
+          },
+          "cost": {
+            "input": 1.50162,
+            "output": 3.135,
+            "cache_read": 0.135
           }
         },
         "deepseek-ai/DeepSeek-V4-Flash": {
           "id": "deepseek-ai/DeepSeek-V4-Flash",
           "base_model": "deepseek-v4-flash",
-          "name": "DeepSeek V4 Flash (SiliconFlow)",
-          "family": "deepseek",
+          "name": "DeepSeek V4 Flash",
+          "family": "deepseek-flash",
+          "attachment": false,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "budget_tokens",
+              "min": 128,
+              "max": 32768
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -2742,6 +3847,11 @@
           "limit": {
             "context": 1000000,
             "output": 384000
+          },
+          "cost": {
+            "input": 0.13,
+            "output": 0.28,
+            "cache_read": 0.028
           }
         }
       }
@@ -2760,8 +3870,15 @@
           "name": "Trinity Large Thinking",
           "family": "trinity",
           "default": true,
+          "attachment": false,
           "reasoning": true,
+          "reasoning_options": [],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -2776,7 +3893,8 @@
           },
           "cost": {
             "input": 0.25,
-            "output": 0.8
+            "output": 0.8,
+            "cache_read": 0.06
           }
         },
         "trinity-mini": {
@@ -2822,23 +3940,31 @@
                 "medium",
                 "high",
                 "xhigh"
-              ],
-              "default": "high"
+              ]
             }
           ],
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
-              "image"
+              "image",
+              "pdf"
             ],
             "output": [
               "text"
             ]
           },
           "limit": {
-            "context": 500000
+            "context": 500000,
+            "output": 500000
+          },
+          "cost": {
+            "input": 2,
+            "output": 6,
+            "cache_read": 0.5
           }
         },
         "grok-4.6": {
@@ -2856,29 +3982,38 @@
                 "medium",
                 "high",
                 "xhigh"
-              ],
-              "default": "high"
+              ]
             }
           ],
           "tool_call": true,
           "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
-              "image"
+              "image",
+              "pdf"
             ],
             "output": [
               "text"
             ]
           },
           "limit": {
-            "context": 500000
+            "context": 500000,
+            "output": 500000
+          },
+          "cost": {
+            "input": 2,
+            "output": 6,
+            "cache_read": 0.5
           }
         },
         "grok-4.5": {
           "id": "grok-4.5",
           "name": "Grok 4.5",
           "family": "grok",
+          "attachment": true,
           "reasoning": true,
           "reasoning_options": [
             {
@@ -2887,41 +4022,72 @@
                 "low",
                 "medium",
                 "high"
-              ],
-              "default": "high"
+              ]
             }
           ],
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
-              "image"
+              "image",
+              "pdf"
             ],
             "output": [
               "text"
             ]
           },
           "limit": {
-            "context": 500000
+            "context": 500000,
+            "output": 500000
+          },
+          "cost": {
+            "input": 2,
+            "output": 6,
+            "cache_read": 0.3
           }
         },
         "grok-4.3": {
           "id": "grok-4.3",
           "name": "Grok 4.3",
           "family": "grok",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "low",
+                "medium",
+                "high"
+              ]
+            }
+          ],
           "tool_call": true,
+          "structured_output": true,
+          "temperature": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
-              "image"
+              "image",
+              "pdf"
             ],
             "output": [
               "text"
             ]
           },
           "limit": {
-            "context": 1000000
+            "context": 1000000,
+            "output": 30000
+          },
+          "cost": {
+            "input": 1.25,
+            "output": 2.5,
+            "cache_read": 0.2
           }
         }
       }
@@ -2938,11 +4104,22 @@
       "models": {
         "mimo-v2.5-pro": {
           "id": "mimo-v2.5-pro",
-          "name": "MiMo v2.5 Pro",
+          "name": "MiMo-V2.5-Pro",
           "family": "mimo",
           "default": true,
+          "attachment": false,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text"
@@ -2952,65 +4129,127 @@
             ]
           },
           "limit": {
-            "context": 1000000,
+            "context": 1048576,
             "output": 131072
+          },
+          "cost": {
+            "input": 0.435,
+            "output": 0.87,
+            "cache_read": 0.0036
           }
         },
         "mimo-v2.5": {
           "id": "mimo-v2.5",
-          "name": "MiMo v2.5",
+          "name": "MiMo-V2.5",
           "family": "mimo",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image",
+              "audio",
+              "video"
             ],
             "output": [
               "text"
             ]
           },
           "limit": {
-            "context": 1000000,
+            "context": 1048576,
             "output": 131072
+          },
+          "cost": {
+            "input": 0.14,
+            "output": 0.28,
+            "cache_read": 0.0028
           }
         },
         "mimo-v2.6-pro": {
           "id": "mimo-v2.6-pro",
-          "name": "MiMo v2.6 Pro",
+          "name": "MiMo-V2.6-Pro",
           "family": "mimo",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image",
+              "audio",
+              "video"
             ],
             "output": [
               "text"
             ]
           },
           "limit": {
-            "context": 1000000,
+            "context": 1048576,
             "output": 131072
+          },
+          "cost": {
+            "input": 0.435,
+            "output": 0.87,
+            "cache_read": 0.0036
           }
         },
         "mimo-v2.6-flash": {
           "id": "mimo-v2.6-flash",
-          "name": "MiMo v2.6 Flash",
+          "name": "MiMo-V2.6-Flash",
           "family": "mimo",
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "toggle"
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image",
+              "audio",
+              "video"
             ],
             "output": [
               "text"
             ]
           },
           "limit": {
-            "context": 1000000,
+            "context": 1048576,
             "output": 131072
+          },
+          "cost": {
+            "input": 0.14,
+            "output": 0.28,
+            "cache_read": 0.0028
           }
         }
       }
@@ -3028,46 +4267,8 @@
         "step-3.5-flash": {
           "id": "step-3.5-flash",
           "name": "Step 3.5 Flash",
-          "family": "step",
+          "attachment": false,
           "reasoning": true,
-          "tool_call": true,
-          "modalities": {
-            "input": [
-              "text"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 256000
-          },
-          "reasoning_options": [
-            {
-              "type": "thinking",
-              "values": [
-                "adaptive"
-              ]
-            }
-          ]
-        },
-        "step-3.5-flash-2603": {
-          "id": "step-3.5-flash-2603",
-          "name": "Step 3.5 Flash 2603",
-          "family": "step",
-          "reasoning": true,
-          "tool_call": true,
-          "modalities": {
-            "input": [
-              "text"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 256000
-          },
           "reasoning_options": [
             {
               "type": "effort",
@@ -3076,14 +4277,93 @@
                 "high"
               ]
             }
-          ]
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "tool_call": true,
+          "temperature": true,
+          "open_weights": true,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 256000,
+            "input": 256000,
+            "output": 256000
+          },
+          "cost": {
+            "input": 0.1,
+            "output": 0.3,
+            "cache_read": 0.02
+          }
+        },
+        "step-3.5-flash-2603": {
+          "id": "step-3.5-flash-2603",
+          "name": "Step 3.5 Flash 2603",
+          "attachment": false,
+          "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "high"
+              ]
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "tool_call": true,
+          "temperature": true,
+          "open_weights": true,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 256000,
+            "input": 256000,
+            "output": 256000
+          },
+          "cost": {
+            "input": 0.1,
+            "output": 0.3,
+            "cache_read": 0.02
+          }
         },
         "step-3.7-flash": {
           "id": "step-3.7-flash",
           "name": "Step 3.7 Flash",
-          "family": "step",
+          "default": true,
+          "attachment": true,
           "reasoning": true,
+          "reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high"
+              ]
+            }
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "temperature": true,
+          "open_weights": true,
           "modalities": {
             "input": [
               "text",
@@ -3096,9 +4376,20 @@
           },
           "limit": {
             "context": 256000,
+            "input": 256000,
             "output": 256000
           },
-          "default": true,
+          "cost": {
+            "input": 0.185,
+            "output": 1.11,
+            "cache_read": 0.037
+          }
+        },
+        "step-5-preview": {
+          "id": "step-5-preview",
+          "name": "Step 5 Preview",
+          "attachment": true,
+          "reasoning": true,
           "reasoning_options": [
             {
               "type": "effort",
@@ -3108,14 +4399,13 @@
                 "high"
               ]
             }
-          ]
-        },
-        "step-5-preview": {
-          "id": "step-5-preview",
-          "name": "Step 5 Preview",
-          "family": "step",
-          "reasoning": true,
+          ],
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "tool_call": true,
+          "structured_output": true,
+          "open_weights": false,
           "modalities": {
             "input": [
               "text",
@@ -3128,18 +4418,14 @@
           },
           "limit": {
             "context": 1000000,
-            "output": 1000000
+            "input": 1000000,
+            "output": 65536
           },
-          "reasoning_options": [
-            {
-              "type": "effort",
-              "values": [
-                "low",
-                "medium",
-                "high"
-              ]
-            }
-          ]
+          "cost": {
+            "input": 0.959,
+            "output": 2.741,
+            "cache_read": 0.048
+          }
         }
       }
     }
