@@ -915,7 +915,9 @@ fn member_shadow_badge(
             ProfileOrigin::Workspace => MessageId::FleetRosterShadowBadgeProjectOverride,
             ProfileOrigin::Personal => MessageId::FleetRosterShadowBadgePersonalOverride,
             ProfileOrigin::Config => MessageId::FleetRosterShadowBadgeConfigOverride,
-            ProfileOrigin::Plugin | ProfileOrigin::BuiltIn => return None,
+            ProfileOrigin::Plugin | ProfileOrigin::BuiltIn | ProfileOrigin::ClaudeCode => {
+                return None;
+            }
         }
     };
     Some(format!("  {}", tr(locale, id)))

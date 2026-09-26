@@ -1,0 +1,25 @@
+{
+  "name": "@codewhale/extension-host",
+  "version": "0.1.0",
+  "description": "Codewhale's TypeScript extension host: runs reviewed plugin code (Cordis/DSH model) behind the Rust core's approval gate.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.4",
+    "@deepseek-ai/cosmokit": "1.8.5",
+    "@deepseek-ai/dsh-util-values": "0.1.7-alpha.2",
+    "@deepseek-ai/schemastery": "3.18.4",
+    "@types/node": "22.20.4",
+    "esbuild": "0.28.1",
+    "typescript": "5.9.3"
+  }
+}

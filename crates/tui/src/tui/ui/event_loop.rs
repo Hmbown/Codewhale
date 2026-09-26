@@ -3439,6 +3439,7 @@ pub(crate) async fn run_event_loop(
                         spawn_depth,
                         model,
                         route_source: _,
+                        display_name,
                     } if event_owner_is_active(
                         app.current_session_id.as_deref(),
                         &owner_session_id,
@@ -3450,6 +3451,9 @@ pub(crate) async fn run_event_loop(
                         let meta = app.agent_progress_meta.entry(id.clone()).or_default();
                         meta.parent_run_id = parent_run_id;
                         meta.spawn_depth = spawn_depth;
+                        // The engine's name for the child, before any snapshot
+                        // arrives, so the first label is already the right one.
+                        meta.display_name = display_name;
                         meta.current_activity = worker_status.map(|status| {
                             AgentCurrentActivity::bounded(
                                 status.into(),
@@ -3552,12 +3556,19 @@ pub(crate) async fn run_event_loop(
                         id,
                         result,
                         outcome,
+                        display_name,
                         ..
                     } if event_owner_is_active(
                         app.current_session_id.as_deref(),
                         &owner_session_id,
                     ) =>
                     {
+                        if display_name.is_some() {
+                            app.agent_progress_meta
+                                .entry(id.clone())
+                                .or_default()
+                                .display_name = display_name;
+                        }
                         let subagent_elapsed = app
                             .agent_activity_started_at
                             .or(app.turn_started_at)
@@ -3606,9 +3617,10 @@ pub(crate) async fn run_event_loop(
                                 notifications::settings(config)
                         {
                             let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
+                            let label = app.ensure_agent_label(&id);
                             let payload = notifications::subagent_terminal_payload(
                                 app.ui_locale,
-                                &id,
+                                &label,
                                 &result,
                                 terminal_status,
                                 include_summary,
@@ -5943,12 +5955,9 @@ pub(crate) async fn run_event_loop(
                 {
                     let sel = app.selected_text();
                     if !sel.is_empty() {
-                        if app.clipboard.write_text(&sel).is_ok() {
-                            app.push_status_toast(
-                                "Copied to clipboard",
-                                StatusToastLevel::Info,
-                                None,
-                            );
+                        if let Ok(transport) = app.clipboard.write_text_status(&sel) {
+                            let receipt = copy_receipt(app, transport, "Copied to clipboard");
+                            app.push_status_toast(receipt, StatusToastLevel::Info, None);
                             app.clear_selection();
                         } else {
                             app.push_status_toast("Copy failed", StatusToastLevel::Error, None);
@@ -6686,13 +6695,11 @@ pub(crate) async fn run_event_loop(
                     // When the composer is empty (transcript focus) →
                     // copy the focused cell text to the system clipboard.
                     if app.input.is_empty() && app.view_stack.is_empty() {
-                        if copy_focused_cell(app) {
-                            app.push_status_toast(
-                                "Copied to clipboard",
-                                StatusToastLevel::Info,
-                                Some(2_000),
-                            );
-                        } else {
+                        // `copy_focused_cell` leaves its own receipt, which
+                        // names the transport; a toast here said "Copied"
+                        // even when only the terminal was asked to copy.
+                        app.status_message = None;
+                        if !copy_focused_cell(app) && app.status_message.is_none() {
                             app.status_message = Some("No transcript cell to copy".to_string());
                         }
                     } else {
@@ -6700,15 +6707,7 @@ pub(crate) async fn run_event_loop(
                     }
                 }
                 KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let sel = app.selected_text();
-                    if !sel.is_empty() {
-                        if app.clipboard.write_text(&sel).is_ok() {
-                            app.push_status_toast("Cut to clipboard", StatusToastLevel::Info, None);
-                            app.delete_selection();
-                        } else {
-                            app.push_status_toast("Cut failed", StatusToastLevel::Error, None);
-                        }
-                    }
+                    crate::tui::mouse_ui::cut_selection(app);
                 }
                 _ if key_shortcuts::is_paste_shortcut(&key) => {
                     app.paste_from_clipboard();

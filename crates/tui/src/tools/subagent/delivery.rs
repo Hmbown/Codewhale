@@ -627,6 +627,9 @@ pub(super) struct DeliveryVerificationInputs {
     pub write_perm: bool,
     pub deliverables: Vec<String>,
     pub allowed: Vec<bool>,
+    /// The worker ran in its own isolated worktree and settled in a state that
+    /// cannot be resumed there; remove the worktree if it changed nothing.
+    pub remove_worktree_if_unchanged: bool,
 }
 
 /// Pure compute half of worker delivery verification: the git trio +

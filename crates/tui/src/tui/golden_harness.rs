@@ -88,7 +88,10 @@ pub(crate) fn golden_path(name: &str) -> std::path::PathBuf {
 // standing complaint about the startup screen ("everything in the same dim
 // gray") was, mechanically, invisible to this suite.
 //
-// The ink plane closes that hole. Each painted cell becomes one character
+// An ink plane would close that hole: each painted cell becomes one character
 // keyed to its (fg, bg, modifier) triple, with a legend resolving those keys
-// to concrete values, so a contrast change shows up as a golden diff.
+// to concrete values, so a contrast change shows up as a golden diff. Its
+// helpers were removed with the startup goldens that used them (39d29e66ac),
+// so this harness checks symbols only today. #6223 tracks bringing the ink
+// plane back across every render shape at once.
 // ---------------------------------------------------------------------------

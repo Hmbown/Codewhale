@@ -2566,10 +2566,9 @@ mod tests {
             redact_machine_tokens("prefix cwc_key_abc suffix"),
             "prefix cwc_key_abc suffix"
         );
-        // The dispatch runner's summary path inherits the redaction.
-        let summary = crate::dispatch_runner::summary_line(&format!("done with {token}"));
-        assert!(!summary.contains("AAAAAAAA"));
-        assert!(summary.contains("[redacted]"));
+        // `dispatch_runner` tests that its summary path inherits this
+        // redaction; asserting it here would pull a late module into the
+        // runtime closure (scripts/split/module_graph.py).
         assert!(
             !sanitize_error("clone failed https://user:token@github.com/org/repo.git")
                 .contains("token"),

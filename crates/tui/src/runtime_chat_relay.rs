@@ -777,6 +777,8 @@ impl RuntimeChatRelayHost {
                     auto_approve: Some(false),
                     dynamic_tools: Vec::new(),
                     environment_id: None,
+                    model_provider: None,
+                    model_provider_id: None,
                 },
                 &reserved_native_turn_id,
             )

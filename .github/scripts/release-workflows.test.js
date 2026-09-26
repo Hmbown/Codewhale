@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { execFileSync } = require("node:child_process");
 
 const repoRoot = path.resolve(__dirname, "..", "..");
 const {
@@ -82,9 +83,9 @@ const npmSmokeCases = [
   ["light PR", "pull_request", false, "ubuntu-latest", true, true, false, false, false],
   ["manual Ubuntu", "workflow_dispatch", true, "ubuntu-latest", true, true, true, true, false],
   ["main Ubuntu", "push", true, "ubuntu-latest", true, true, false, false, true],
-  ["main macOS", "push", true, "macos-latest", true, true, true, false, false],
+  ["manual macOS", "workflow_dispatch", true, "macos-latest", true, true, true, false, false],
   ["main Windows", "push", true, "windows-latest", true, true, true, false, false],
-  ["main cache failure", "push", true, "macos-latest", true, false, true, false, false],
+  ["main cache failure", "push", true, "windows-latest", true, false, true, false, false],
   ["light main", "push", false, "ubuntu-latest", true, true, false, false, false],
   ["schedule", "schedule", true, "ubuntu-latest", true, true, false, false, false],
 ];
@@ -121,6 +122,76 @@ for (const [label, event, heavy, os, trusted, cache, execute, linuxDeps, cnb] of
     );
   }
 }
+// The matrix itself: pull requests keep the single required Ubuntu context,
+// main pushes skip the hosted-macOS leg (5-job concurrency cap), and a manual
+// full-CI dispatch still covers all three platforms.
+const npmSmokeMatrix = npmSmokeJob.match(/^        os: \$\{\{ fromJSON\((.+)\) \}\}$/m)?.[1];
+assert.ok(npmSmokeMatrix, "the wrapper job must keep an event-keyed OS matrix");
+for (const [event, expected] of [
+  ["pull_request", ["ubuntu-latest"]],
+  ["push", ["ubuntu-latest", "windows-latest"]],
+  ["workflow_dispatch", ["ubuntu-latest", "macos-latest", "windows-latest"]],
+]) {
+  assert.deepEqual(
+    JSON.parse(vm.runInNewContext(npmSmokeMatrix, { github: { event_name: event } })),
+    expected,
+    `npm wrapper smoke matrix for ${event}`,
+  );
+}
+// Change detection: a path Rust embeds or its tests read must never classify
+// light, or a "docs-only" edit skips the Rust gates that consume it. Run the
+// workflow's own `case` block in bash against every include_str!/include_bytes!
+// target in the tree plus the files Rust tests read at runtime.
+const heavyCase = ci.match(
+  /\n( +)case "\$\{path\}" in\n[\s\S]*?\n\1  \*\)\n\1    heavy=true\n\1    ;;\n\1esac\n/,
+)?.[0];
+assert.ok(heavyCase, "ci.yml must keep the heavy/light change classification case block");
+function classify(paths) {
+  const script = `while IFS= read -r path; do heavy=false\n${heavyCase}\nprintf '%s\\t%s\\n' "$heavy" "$path"; done`;
+  const out = execFileSync("bash", ["-c", script], { input: `${paths.join("\n")}\n`, encoding: "utf8" });
+  return new Map(out.trim().split("\n").map((line) => line.split("\t").reverse()));
+}
+const rustSources = execFileSync("git", ["ls-files", "-z", "--", "*.rs"], { cwd: repoRoot, encoding: "utf8" })
+  .split("\0")
+  .filter(Boolean);
+const includeTargets = new Set();
+const includePattern =
+  /include_(?:str|bytes)!\s*\(\s*(?:concat!\s*\(\s*(?:env!\s*\(\s*"(\w+)"\s*\)\s*,\s*)?)?"([^"]+)"/g;
+for (const file of rustSources) {
+  const text = fs.readFileSync(path.join(repoRoot, file), "utf8");
+  for (const [, env, target] of text.matchAll(includePattern)) {
+    let base = path.dirname(file);
+    if (env === "CARGO_MANIFEST_DIR") {
+      while (base !== "." && !fs.existsSync(path.join(repoRoot, base, "Cargo.toml"))) base = path.dirname(base);
+    } else if (env) {
+      continue; // OUT_DIR and friends are build outputs, not tracked inputs.
+    }
+    const resolved = path.posix.normalize(path.posix.join(base, target.replace(/^\//, "")));
+    if (!resolved.endsWith(".rs") && fs.existsSync(path.join(repoRoot, resolved))) includeTargets.add(resolved);
+  }
+}
+assert.ok(includeTargets.size > 60, `include_str! scan found only ${includeTargets.size} targets`);
+assert.ok(
+  [...includeTargets].some((target) => !target.startsWith("crates/")),
+  "include_str! scan must see the targets outside crates/ (docs/HOOKS.md, ...)",
+);
+// Read with fs at test time, not embedded; keep in sync with the ci.yml arm.
+const rustTestReads = [
+  "docs/FLEET_WORKFLOW_TUTORIAL.md",
+  "docs/examples/fleet-dogfood.toml",
+  "docs/2512.24601v2.pdf",
+];
+const mustBeHeavy = [...includeTargets, ...rustTestReads];
+const heavyVerdicts = classify(mustBeHeavy);
+for (const target of mustBeHeavy) {
+  assert.equal(heavyVerdicts.get(target), "true", `${target} feeds Rust and must classify heavy`);
+}
+const lightVerdicts = classify(["README.md", "docs/ARCHITECTURE.md", "CHANGELOG.md", ".github/ISSUE_TEMPLATE/bug.yml"]);
+for (const [target, verdict] of lightVerdicts) {
+  assert.equal(verdict, "false", `${target} is docs-only and must stay light`);
+}
+console.log(`Change detection OK: ${mustBeHeavy.length} Rust-consumed non-.rs paths classify heavy.`);
+
 console.log(`Wrapper CI guards OK: ${npmSmokeCases.length} event cases, ${npmSmokeSteps.length} steps each.`);
 
 assert.match(ci, /^  workflow_dispatch:\n    inputs:\n      expected_sha:/m);
@@ -377,6 +448,17 @@ for (const block of rustCacheBlocks) {
 
 // One parity gate, called by the release candidate and the public release,
 // and the release refuses a tag without a green RC receipt for its exact SHA.
+// The release gate must lint at least as strictly as the merge gate.
+function clippyAllows(source, label) {
+  const command = source.match(/cargo clippy --workspace --all-targets --all-features --locked -- \\\n([\s\S]*?)\n(?! +-)/)?.[1];
+  assert.ok(command, `${label} must run workspace all-targets clippy`);
+  return [...command.matchAll(/-A (clippy::\w+)/g)].map((match) => match[1]).sort();
+}
+assert.deepEqual(
+  clippyAllows(parityWorkflow, "release-parity.yml"),
+  clippyAllows(ci, "ci.yml"),
+  "release-parity.yml clippy allowances must match ci.yml",
+);
 const parity = parityWorkflow.match(/\n  parity:\n([\s\S]*)$/);
 assert.ok(parity, "release-parity.yml must define the parity job");
 assert.match(parityWorkflow, /^on:\n  workflow_call:\n/m, "parity must be a reusable workflow");
@@ -602,6 +684,13 @@ const cnbTagVersionCheck = cnbTagRelease[1].indexOf(
   "./scripts/release/check-versions.sh --require-dated-release",
 );
 assert.ok(cnbTagVersionCheck >= 0, "CNB publication must reject undated source candidates");
+for (const [label, workflow] of [["release-candidate.yml", candidate], ["release.yml", release]]) {
+  assert.match(
+    workflow,
+    /\.\/scripts\/release\/check-versions\.sh --require-dated-release/,
+    `${label} must reject undated source candidates before building`,
+  );
+}
 assert.ok(cnbTagVersionCheck < cnbTagBuild, "CNB must validate release notes before building public assets");
 assert.match(cnbTagRelease[1], /checkout_sha="\$\(git rev-parse 'HEAD\^\{commit\}'\)"/);
 assert.match(cnbTagRelease[1], /commit_sha="\$\{CNB_COMMIT:-\$\{checkout_sha\}\}"/);

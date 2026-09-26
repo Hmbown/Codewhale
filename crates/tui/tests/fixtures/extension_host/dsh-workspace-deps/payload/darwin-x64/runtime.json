@@ -1,0 +1,10 @@
+{
+  "desktopVersion": "0.0.0-codewhale-fixture",
+  "platform": "darwin",
+  "arch": "x64",
+  "python": "3.12.8",
+  "pythonPackages": {
+    "numpy": "2.1.0",
+    "pandas": "2.2.3"
+  }
+}

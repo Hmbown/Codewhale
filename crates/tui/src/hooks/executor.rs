@@ -12,24 +12,17 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
+use crate::process_tree::ProcessTree;
 #[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
+use crate::process_tree::windows_io_error;
 #[cfg(windows)]
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::CloseHandle;
 #[cfg(windows)]
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 #[cfg(windows)]
-use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
-};
-#[cfg(windows)]
 use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
-#[cfg(windows)]
-use windows::core::PCWSTR;
 
 /// Context passed to hooks via environment variables
 #[derive(Debug, Clone, Default)]
@@ -898,141 +891,21 @@ pub struct TurnEndPayloadInput<'a> {
     pub queued_message_count: usize,
 }
 
-/// Owns the process tree created for one hook invocation.
-///
-/// Hooks run through a shell, so killing only the immediate `sh`/`cmd.exe`
-/// child can leave the actual hook runtime alive. Unix hooks get their own
-/// process group and Windows hooks are attached to a kill-on-close Job Object.
-/// Dropping this guard after the shell exits also closes inherited stdout and
-/// stderr pipes held by any lingering descendants.
-struct HookProcessTree {
-    #[cfg(unix)]
-    pgid: libc::pid_t,
+/// Kill a hook's whole process tree (see [`crate::process_tree`]): hooks run
+/// through a shell, so killing only the immediate `sh`/`cmd.exe` child can
+/// leave the actual hook runtime alive. Falls back to `taskkill /T` on Windows
+/// and to the immediate child everywhere.
+fn terminate_tree(process_tree: &ProcessTree, child: &mut Child) {
+    let result = process_tree.kill();
     #[cfg(windows)]
-    job: WindowsHookJob,
-}
-
-impl HookProcessTree {
-    fn attach(child: &Child) -> std::io::Result<Self> {
-        #[cfg(unix)]
-        {
-            Ok(Self {
-                pgid: child.id() as libc::pid_t,
-            })
-        }
-
-        #[cfg(windows)]
-        {
-            Ok(Self {
-                job: WindowsHookJob::attach(child)?,
-            })
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            Ok(Self {})
-        }
+    let result = result.or_else(|_| kill_windows_process_tree(child.id()));
+    if let Err(error) = result {
+        tracing::warn!(
+            ?error,
+            "failed to terminate hook process tree; killing immediate child"
+        );
+        let _ = child.kill();
     }
-
-    fn terminate(&self, child: &mut Child) {
-        #[cfg(unix)]
-        {
-            // SAFETY: kill(2) dereferences no pointers.
-            let result = unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
-            if result != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    tracing::warn!(?error, "failed to terminate hook process group");
-                    let _ = child.kill();
-                }
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            let result = self
-                .job
-                .terminate()
-                .or_else(|_| kill_windows_process_tree(child.id()));
-            if let Err(error) = result {
-                tracing::warn!(
-                    ?error,
-                    "failed to terminate hook process tree; killing immediate child"
-                );
-                let _ = child.kill();
-            }
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = child.kill();
-        }
-    }
-}
-
-impl Drop for HookProcessTree {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        // SAFETY: kill(2) dereferences no pointers.
-        unsafe {
-            // The shell may have exited while one of its descendants still
-            // holds a captured pipe. Reaping the process group keeps hook
-            // lifetimes bounded and lets the reader threads finish.
-            let _ = libc::kill(-self.pgid, libc::SIGKILL);
-        }
-        // On Windows, dropping WindowsHookJob closes a Job Object configured
-        // with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
-    }
-}
-
-#[cfg(windows)]
-struct WindowsHookJob {
-    handle: HANDLE,
-}
-
-#[cfg(windows)]
-impl WindowsHookJob {
-    fn attach(child: &Child) -> std::io::Result<Self> {
-        // SAFETY: returned handle is owned by the new wrapper.
-        let handle = unsafe { CreateJobObjectW(None, PCWSTR::null()).map_err(windows_io_error)? };
-        let job = Self { handle };
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-
-        // SAFETY: `limits` is live with matching size; both handles are live.
-        unsafe {
-            SetInformationJobObject(
-                job.handle,
-                JobObjectExtendedLimitInformation,
-                &limits as *const _ as *const core::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-            .map_err(windows_io_error)?;
-            AssignProcessToJobObject(job.handle, HANDLE(child.as_raw_handle()))
-                .map_err(windows_io_error)?;
-        }
-        Ok(job)
-    }
-
-    fn terminate(&self) -> std::io::Result<()> {
-        // SAFETY: `self.handle` is a live owned job handle.
-        unsafe { TerminateJobObject(self.handle, 1).map_err(windows_io_error) }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WindowsHookJob {
-    fn drop(&mut self) {
-        // SAFETY: `self.handle` is owned here; Drop runs once.
-        unsafe {
-            let _ = CloseHandle(self.handle);
-        }
-    }
-}
-
-#[cfg(windows)]
-fn windows_io_error(error: windows::core::Error) -> std::io::Error {
-    std::io::Error::other(error)
 }
 
 #[cfg(windows)]
@@ -1130,9 +1003,9 @@ fn kill_and_reap_immediate_child(child: &mut Child, timeout: Duration) -> bool {
 /// resolved interpreter path, and the OS message: the caller turns them into a
 /// user-visible "hook could not answer" receipt, and on Windows a raw spawn
 /// error echoes the whole command line back. The detail is logged instead.
-fn spawn_hook_child(command: &mut Command) -> std::io::Result<(Child, HookProcessTree)> {
+fn spawn_hook_child(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
     let mut child = command.spawn()?;
-    let process_tree = match HookProcessTree::attach(&child) {
+    let process_tree = match ProcessTree::attach(&child) {
         Ok(process_tree) => process_tree,
         Err(error) => {
             // Windows hooks are created suspended, so a containment failure
@@ -1622,6 +1495,12 @@ impl HookExecutor {
     /// hooks without reaching for `cat ~/.deepseek/config.toml`.
     pub fn config(&self) -> &HooksConfig {
         &self.config
+    }
+
+    /// The workspace hooks run in unless a hook names its own directory.
+    #[must_use]
+    pub fn default_working_dir(&self) -> &std::path::Path {
+        &self.default_working_dir
     }
 
     pub fn session_id(&self) -> &str {
@@ -2612,9 +2491,9 @@ const WINDOWS_TASKKILL_TIMEOUT: Duration = Duration::from_secs(2);
 fn terminate_and_reap(
     hook_name: Option<&str>,
     child: &mut Child,
-    process_tree: HookProcessTree,
+    process_tree: ProcessTree,
 ) -> bool {
-    process_tree.terminate(child);
+    terminate_tree(&process_tree, child);
     // Drop before the wait, not after: on Windows this closes the Job Object
     // and is itself a kill, and on Unix it re-signals the group. Waiting first
     // would delay the very thing meant to make the wait short.

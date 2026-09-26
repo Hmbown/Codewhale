@@ -239,6 +239,7 @@ impl WorkflowRunJournal {
                             label,
                             phase,
                             message,
+                            ..
                         } = &event.kind
                         {
                             run.push_dispatch_failure(WorkflowDispatchFailure {
@@ -515,6 +516,7 @@ mod tests {
                         label: Some(format!("rejected-{index}")),
                         phase: Some("fan-out".to_string()),
                         message,
+                        queue_ticket: None,
                     },
                 ),
             );
@@ -661,6 +663,7 @@ mod tests {
                 workflow_goal: Some("review release".to_string()),
                 source_path: None,
                 token_budget: None,
+                max_concurrent: None,
             },
         ));
         assert_eq!(super::super::host_workflow_stage(&record), "queued");
@@ -702,6 +705,7 @@ mod tests {
                 workflow_phase_id: Some("review".to_string()),
                 workflow_task_label: Some("reviewer".to_string()),
                 workflow_child_index: Some(0),
+                queue_ticket: None,
                 fleet_receipt: None,
             })),
         ));
@@ -713,6 +717,8 @@ mod tests {
             WorkflowUiEventKind::TaskCompleted {
                 task_id: "reviewer-1".to_string(),
                 status: super::super::IrWorkflowRunStatus::Succeeded,
+                reason: None,
+                kind: None,
                 usage: None,
             },
         ));
@@ -773,6 +779,7 @@ mod tests {
                 workflow_phase_id: Some("scan".to_string()),
                 workflow_task_label: None,
                 workflow_child_index: Some(0),
+                queue_ticket: None,
                 fleet_receipt: None,
             })),
         );

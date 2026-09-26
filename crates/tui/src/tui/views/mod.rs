@@ -626,9 +626,12 @@ pub enum ContextMenuAction {
     OpenCommandPalette,
     OpenContextInspector,
     OpenHelp,
-    /// Open the selected file:line in the user's editor.
+    /// Open a workspace file at a line in the user's editor. The path was
+    /// resolved inside the workspace when the menu was built; the entry is
+    /// only offered when it resolved.
     OpenFileAtLine {
-        cell_index: usize,
+        path: std::path::PathBuf,
+        line: u32,
     },
     /// Hide a transcript cell. Adds the cell's index to `collapsed_cells`.
     HideCell {
@@ -640,18 +643,35 @@ pub enum ContextMenuAction {
     },
     /// Show all currently hidden cells.
     ShowAllHidden,
-    /// Execute a slash command associated with a contextual UI row.
-    ExecuteCommand {
-        command: String,
-    },
+    /// Run a work-surface row action — the same typed action a left click or
+    /// Enter on that row runs, never a free-form command string.
+    Row(crate::tui::app::SidebarRowAction),
     /// Copy a pre-resolved text payload (e.g. a sidebar row's full text)
     /// to the clipboard.
     CopyText {
         text: String,
     },
+    /// Act on a row of the open Extensions panel, found again by its id.
+    Extension {
+        item_id: String,
+        verb: ExtensionMenuVerb,
+    },
     /// Pin/unpin the host terminal window (normal window ↔ always-on-top
     /// mini window). Windows only; no-op elsewhere.
     ToggleWindowPin,
+}
+
+/// What an Extensions row menu entry does to its row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionMenuVerb {
+    /// The row's own action — what Enter runs.
+    Activate,
+    /// Show the row's state, description and detail in a pager.
+    Details,
+    /// The row's reversible on/off switch.
+    Toggle,
+    /// Remove the row. The menu already asked for confirmation.
+    Remove,
 }
 
 #[derive(Debug, Clone)]
@@ -1087,6 +1107,14 @@ pub enum ViewEvent {
     ContextMenuSelected {
         action: ContextMenuAction,
     },
+    /// A modal view asks for a context menu over itself (the Extensions
+    /// panel's row menu). The host pushes it on top of the view.
+    OpenContextMenu {
+        title: String,
+        entries: Vec<crate::tui::context_menu::ContextMenuEntry>,
+        column: u16,
+        row: u16,
+    },
     /// Emitted by the pager (`c` / `y`) to copy its body to the system
     /// clipboard. The host handler writes via `app.clipboard` and surfaces a
     /// status message — modal views cannot reach `app` directly. `label` is
@@ -1461,6 +1489,22 @@ impl ViewStack {
         self.views
             .last()
             .is_some_and(|view| view.kind() == ModalKind::Extensions)
+    }
+
+    /// Run an Extensions row-menu entry against the panel, when it is on
+    /// top. `None` when the panel is gone or no longer lists the row.
+    pub fn extensions_menu_action(
+        &mut self,
+        item_id: &str,
+        verb: ExtensionMenuVerb,
+    ) -> Option<Vec<ViewEvent>> {
+        let action = self
+            .views
+            .last_mut()?
+            .as_any_mut()
+            .downcast_mut::<extensions::ExtensionsView>()?
+            .run_menu_verb(item_id, verb)?;
+        Some(self.apply_action(action))
     }
 
     /// Whether a provider picker anywhere in the stack has been used — a key

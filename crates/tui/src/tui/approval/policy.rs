@@ -8,27 +8,10 @@ use crate::tools::canonical_action::canonical_action_alias;
 use codewhale_execpolicy::command_safety::is_parallel_readonly_command;
 use serde_json::Value;
 
-/// Categorizes tools by cost/risk level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolCategory {
-    /// Free, read-only operations (`list_dir`, `read_file`, todo_*)
-    Safe,
-    /// File modifications (`write_file`, `edit_file`)
-    FileWrite,
-    /// Shell execution (`exec_shell`)
-    Shell,
-    /// Network-oriented built-in tools
-    Network,
-    /// Read-only MCP discovery and resource access
-    McpRead,
-    /// MCP actions that may change remote state
-    McpAction,
-    /// Sub-agent lifecycle (`agent` start/status/peek/cancel); the child's
-    /// own tool gates govern what it may actually do.
-    Agent,
-    /// Unknown or unclassified tool surface
-    Unknown,
-}
+// Tool categorization is runtime policy (the extension host and auto-review
+// both consult it), so it lives in `core::authority`; re-exported here for the
+// approval views.
+pub use crate::core::authority::{ToolCategory, get_tool_category_for_call};
 
 /// Stakes-based variant for the takeover modal.
 ///
@@ -62,86 +45,6 @@ pub enum ApprovalStakes {
     Routine,
     Elevated,
     Critical,
-}
-
-/// Get the category for a tool by name.
-pub fn get_tool_category(name: &str) -> ToolCategory {
-    if name == "agent" || name == "workflow" {
-        // Workflow is multi-agent orchestration; reuse Agent stakes/routing
-        // and specialize the impact card via build_impact_summary (#4126).
-        ToolCategory::Agent
-    } else if matches!(
-        name,
-        "write" | "edit" | "write_file" | "edit_file" | "apply_patch"
-    ) {
-        ToolCategory::FileWrite
-    } else if matches!(
-        name,
-        "web_run" | "web_search" | "fetch_url" | "wait_for_dev_server" | "registry_sync"
-    ) {
-        ToolCategory::Network
-    } else if matches!(
-        name,
-        "bash"
-            | "Bash"
-            | "exec_shell"
-            | "task_shell_start"
-            | "task_shell_wait"
-            | "exec_shell_wait"
-            | "exec_shell_interact"
-            | "exec_shell_cancel"
-            | "exec_wait"
-            | "exec_interact"
-    ) {
-        ToolCategory::Shell
-    } else if name.starts_with("list_mcp_")
-        || name.starts_with("read_mcp_")
-        || name.starts_with("get_mcp_")
-    {
-        ToolCategory::McpRead
-    } else if name.starts_with("mcp_") {
-        ToolCategory::McpAction
-    } else if matches!(
-        name,
-        "read"
-            | "read_file"
-            | "list_dir"
-            | "work_update"
-            | "todo_write"
-            | "todo_read"
-            | "checklist_write"
-            | "note"
-            | "update_plan"
-            | "search"
-            | "file_search"
-            | "grep_files"
-            | "git_status"
-            | "git_diff"
-            | "git_log"
-            | "git_show"
-            | "git_blame"
-            | "git_commit_plan"
-            | "project"
-            | "diagnostics"
-    ) || name.starts_with("read_")
-        || name.starts_with("list_")
-        || name.starts_with("get_")
-    {
-        ToolCategory::Safe
-    } else if matches!(name, "start_mcp_server" | "start_registry_mcp_server") {
-        // Starting an MCP server spawns child processes or opens network
-        // connections — classify as McpAction to trigger appropriate
-        // approval prompts.
-        ToolCategory::McpAction
-    } else {
-        ToolCategory::Unknown
-    }
-}
-
-/// Categorize a concrete call after resolving an action-based canonical tool.
-#[must_use]
-pub fn get_tool_category_for_call(name: &str, params: &Value) -> ToolCategory {
-    get_tool_category(canonical_action_alias(name, params))
 }
 
 #[must_use]
@@ -227,6 +130,7 @@ pub fn classify_risk(tool_name: &str, category: ToolCategory, params: &Value) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::authority::get_tool_category;
     use serde_json::json;
 
     #[test]

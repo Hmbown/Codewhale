@@ -2118,13 +2118,43 @@ fn build_default_headers(
     // identify the app, never the user, and a user-configured header of the
     // same name below still wins (the extra-header loop overwrites).
     if api_provider == ApiProvider::Openrouter {
+        // `HTTP-Referer` is the only required header: it is the app's unique
+        // identifier, and without it OpenRouter creates no app page at all.
         headers.insert(
             HeaderName::from_static("http-referer"),
             HeaderValue::from_static("https://codewhale.net"),
         );
+        // `X-OpenRouter-Title` is the current display-name header. `X-Title`
+        // is only kept for backwards compatibility — OpenRouter still honours
+        // it, and a base-URL override can point this provider at an
+        // OpenRouter-compatible gateway that knows the old name and not the
+        // new one. Two bytes of redundancy is cheaper than losing attribution.
+        //
+        // Both names carry one display title. A user who configures either
+        // one (a fork, say, setting only the legacy `X-Title`) must control
+        // the name on both, or the default left on the other header would
+        // silently override theirs on OpenRouter.
+        let user_title = |wanted: &str| {
+            extra_headers.iter().find_map(|(name, value)| {
+                let value = value.trim();
+                (name.trim().eq_ignore_ascii_case(wanted) && !value.is_empty()).then_some(value)
+            })
+        };
+        let title = HeaderValue::from_str(
+            user_title("x-openrouter-title")
+                .or_else(|| user_title("x-title"))
+                .unwrap_or("Codewhale"),
+        )?;
+        headers.insert(HeaderName::from_static("x-openrouter-title"), title.clone());
+        headers.insert(HeaderName::from_static("x-title"), title);
+        // Marketplace categories, at most two per request. These place the app
+        // under Coding → CLI Agents and Productivity → Personal Agents on
+        // openrouter.ai/apps, which is how the rankings page groups entries.
+        // Unrecognised values are dropped silently, so these must stay exactly
+        // as OpenRouter spells them.
         headers.insert(
-            HeaderName::from_static("x-title"),
-            HeaderValue::from_static("Codewhale"),
+            HeaderName::from_static("x-openrouter-categories"),
+            HeaderValue::from_static("cli-agent,personal-agent"),
         );
     }
     // OpenCode Go / OpenCode Zen gateways (https://opencode.ai/docs/go/)
@@ -5306,7 +5336,7 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// OpenRouter app attribution: the two headers that put an app on
+    /// OpenRouter app attribution: the headers that put an app on
     /// openrouter.ai's rankings are sent for OpenRouter routes only, and a
     /// user-configured header of the same name wins.
     #[test]
@@ -5328,6 +5358,22 @@ mod tests {
             headers.get("x-title").and_then(|v| v.to_str().ok()),
             Some("Codewhale")
         );
+        // The current display-name header, alongside the legacy one.
+        assert_eq!(
+            headers
+                .get("x-openrouter-title")
+                .and_then(|v| v.to_str().ok()),
+            Some("Codewhale")
+        );
+        // Marketplace categories must match OpenRouter's spelling exactly:
+        // unrecognised values are dropped silently, so a typo here is
+        // invisible in production and only shows up as a missing listing.
+        assert_eq!(
+            headers
+                .get("x-openrouter-categories")
+                .and_then(|v| v.to_str().ok()),
+            Some("cli-agent,personal-agent")
+        );
 
         // Attribution identifies this app to OpenRouter's rankings and has
         // no business on any other route, whichever provider that is.
@@ -5348,7 +5394,9 @@ mod tests {
             )
             .expect("headers");
             assert!(
-                other.get("http-referer").is_none() && other.get("x-title").is_none(),
+                other.get("http-referer").is_none()
+                    && other.get("x-title").is_none()
+                    && other.get("x-openrouter-title").is_none(),
                 "{provider:?} must not receive OpenRouter attribution headers"
             );
         }
@@ -5362,10 +5410,34 @@ mod tests {
             false,
         )
         .expect("headers");
-        assert_eq!(
-            overridden.get("x-title").and_then(|v| v.to_str().ok()),
-            Some("My Fork")
-        );
+        // A user title on the legacy header alone must follow onto the
+        // current one, or OpenRouter would still show "Codewhale".
+        for name in ["x-title", "x-openrouter-title"] {
+            assert_eq!(
+                overridden.get(name).and_then(|v| v.to_str().ok()),
+                Some("My Fork"),
+                "{name} must carry the user's title"
+            );
+        }
+
+        // And the other way round: setting only the current header also
+        // renames the legacy one, so the two never disagree.
+        let current_only = build_default_headers(
+            "sk-or-key",
+            &HashMap::from([("X-OpenRouter-Title".to_string(), "My Fork".to_string())]),
+            ApiProvider::Openrouter,
+            "https://openrouter.ai/api/v1",
+            WireFormat::ChatCompletions,
+            false,
+        )
+        .expect("headers");
+        for name in ["x-title", "x-openrouter-title"] {
+            assert_eq!(
+                current_only.get(name).and_then(|v| v.to_str().ok()),
+                Some("My Fork"),
+                "{name} must carry the user's title"
+            );
+        }
     }
 
     #[test]

@@ -1736,6 +1736,18 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
 
 // === Types ===
 
+/// `[extension_host]`: settings for the experimental TypeScript extension
+/// host (`[features] extension_host`). User config only: project-scope config
+/// is applied by an explicit allowlist that does not include this table.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionHostConfig {
+    /// Path to a Node.js runtime (>= 22.19). Tried before every `node` on
+    /// `PATH`; each candidate must actually run and meet the floor.
+    #[serde(default)]
+    pub node: Option<String>,
+}
+
 /// Raw retry configuration loaded from config files.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RetryConfig {
@@ -3062,6 +3074,9 @@ pub struct Config {
     pub max_subagents: Option<usize>,
     pub retry: Option<RetryConfig>,
     pub features: Option<FeaturesToml>,
+    /// Experimental TypeScript extension host settings.
+    #[serde(default)]
+    pub extension_host: Option<ExtensionHostConfig>,
 
     /// Deterministic user-level auto-review policy for tool calls. The engine
     /// applies these rules after built-in safety floors, so config cannot
@@ -11438,6 +11453,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         control_socket: override_cfg.control_socket.or(base.control_socket),
         providers: merge_providers(base.providers, override_cfg.providers),
         features: merge_features(base.features, override_cfg.features),
+        extension_host: override_cfg.extension_host.or(base.extension_host),
         notifications: override_cfg.notifications.or(base.notifications),
         approval: override_cfg.approval.or(base.approval),
         network: override_cfg.network.or(base.network),

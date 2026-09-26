@@ -13,13 +13,14 @@ contract.
 
 ## Scope
 
-Hooks are a **TUI runtime feature**. Every firing point lives in the
-interactive TUI and in the engine turn loop it drives.
+Hooks fire in the interactive TUI and in the engine turn loop, which the
+Runtime API threads behind the desktop app and web drive as well.
 
 | Surface | Fires hooks |
 | --- | --- |
 | `codewhale` / `codew` interactive TUI | yes |
 | `codewhale exec` (headless one-shot) | opt-in: `--hooks` fires `tool_call_before` and `shell_env` |
+| Runtime API threads (desktop app, web) | yes: `tool_call_before`, `shell_env`, `tool_call_after`, `on_error`; `GET /v1/hooks` lists the set |
 | the `codewhale` CLI dispatcher and its subcommands | no |
 | app-server / ACP | no |
 | the `workflow` tool and sub-agent *internals* | no — but the TUI fires `subagent_spawn` / `subagent_complete` around them |

@@ -966,6 +966,16 @@ pub enum MessageId {
     KbPasteAttach,
     KbCopySelection,
     ClipboardSshPasteHint,
+    /// Copy receipt when a native clipboard confirmed the write.
+    ClipboardCopied,
+    /// Copy receipt when the text went to the terminal (OSC 52 / tmux),
+    /// which never acknowledges it.
+    ClipboardSentToTerminal,
+    /// Cut when only the terminal took the copy: the text is kept, because
+    /// the terminal never confirms it.
+    ClipboardCutKeptText,
+    /// Paste found nothing: the clipboard read came back empty or failed.
+    ClipboardNothingToPaste,
     KbContextMenu,
     KbPointerScroll,
     KbPointerClick,
@@ -1347,6 +1357,23 @@ pub enum MessageId {
     CtxMenuWindowUnpin,
     /// Right-click menu: description for the window-pin entry.
     CtxMenuWindowPinDesc,
+    /// Right-click menu: a work-surface row's own command, `{command}`.
+    CtxMenuRunCommand,
+    CtxMenuOpen,
+    /// Right-click menu on an agent row: the one agent destination.
+    CtxMenuFocusAgent,
+    CtxMenuFocusAgentDesc,
+    CtxMenuCopyId,
+    CtxMenuCopyRow,
+    CtxMenuStopAgent,
+    /// Right-click menu: stop a work item (job, task, workflow run).
+    CtxMenuStopWork,
+    /// Right-click menu: label an armed destructive row shows until the
+    /// second activation runs it.
+    CtxMenuConfirmArmed,
+    /// Open in editor refused at launch: `{path}` is no longer a regular
+    /// file inside the workspace reached without links.
+    CtxMenuEditorRefused,
     /// `/pin` command description (always-on-top mini-window toggle).
     CmdPinDescription,
     /// Status toast: host window is now the always-on-top mini window.
@@ -1997,6 +2024,8 @@ pub enum MessageId {
     SnapshotsDisabledTooLarge,
     SnapshotsDisabledTooManyFiles,
     SnapshotsDisabledUnsafeLocation,
+    SnapshotsHistoryRepaired,
+    SnapshotsFailing,
     SessionIdDivergedNotice,
     RuntimeStoreUnreadableNotice,
     RuntimeStoreUnwritableNotice,
@@ -2355,6 +2384,8 @@ pub enum MessageId {
     AgentFocusPlaceholder,
     AgentFocusNoTranscript,
     AgentFocusOmitted,
+    AgentFocusResult,
+    AgentFocusStopReason,
     AgentFocusFollowUpDelivered,
     AgentFocusFollowUpQueued,
     AgentFocusFollowUpContinued,
@@ -3432,6 +3463,10 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::KbPasteAttach,
     MessageId::KbCopySelection,
     MessageId::ClipboardSshPasteHint,
+    MessageId::ClipboardCopied,
+    MessageId::ClipboardSentToTerminal,
+    MessageId::ClipboardCutKeptText,
+    MessageId::ClipboardNothingToPaste,
     MessageId::KbContextMenu,
     MessageId::KbPointerScroll,
     MessageId::KbPointerClick,
@@ -3801,6 +3836,16 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CtxMenuWindowPin,
     MessageId::CtxMenuWindowUnpin,
     MessageId::CtxMenuWindowPinDesc,
+    MessageId::CtxMenuRunCommand,
+    MessageId::CtxMenuOpen,
+    MessageId::CtxMenuFocusAgent,
+    MessageId::CtxMenuFocusAgentDesc,
+    MessageId::CtxMenuCopyId,
+    MessageId::CtxMenuCopyRow,
+    MessageId::CtxMenuStopAgent,
+    MessageId::CtxMenuStopWork,
+    MessageId::CtxMenuConfirmArmed,
+    MessageId::CtxMenuEditorRefused,
     MessageId::CmdPinDescription,
     MessageId::WindowPinActive,
     MessageId::WindowPinReleased,
@@ -4401,6 +4446,8 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SnapshotsDisabledTooLarge,
     MessageId::SnapshotsDisabledTooManyFiles,
     MessageId::SnapshotsDisabledUnsafeLocation,
+    MessageId::SnapshotsHistoryRepaired,
+    MessageId::SnapshotsFailing,
     MessageId::SessionIdDivergedNotice,
     MessageId::RuntimeStoreUnreadableNotice,
     MessageId::RuntimeStoreUnwritableNotice,
@@ -4731,6 +4778,8 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::AgentFocusPlaceholder,
     MessageId::AgentFocusNoTranscript,
     MessageId::AgentFocusOmitted,
+    MessageId::AgentFocusResult,
+    MessageId::AgentFocusStopReason,
     MessageId::AgentFocusFollowUpDelivered,
     MessageId::AgentFocusFollowUpQueued,
     MessageId::AgentFocusFollowUpContinued,

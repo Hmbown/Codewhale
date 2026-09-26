@@ -175,6 +175,16 @@ fn run_exec(server: &MockServer, exec_args: &[&str]) -> String {
 /// Run `codewhale-tui exec <exec_args>` and return whether it exited
 /// successfully, its stdout and its stderr.
 fn run_exec_unchecked(server: &MockServer, exec_args: &[&str]) -> (bool, String, String) {
+    run_exec_in_home(server, exec_args, |_| {})
+}
+
+/// [`run_exec_unchecked`] with a hook that prepares the isolated `$HOME`
+/// before the run, e.g. to install an MCP config.
+fn run_exec_in_home(
+    server: &MockServer,
+    exec_args: &[&str],
+    prepare_home: impl FnOnce(&std::path::Path),
+) -> (bool, String, String) {
     let workspace = TempDir::new().expect("workspace tempdir");
     let home = TempDir::new().expect("home tempdir");
 
@@ -211,6 +221,7 @@ fn run_exec_unchecked(server: &MockServer, exec_args: &[&str]) -> (bool, String,
 
     std::fs::create_dir_all(home.path().join(".codewhale")).expect("create codewhale config dir");
     std::fs::create_dir_all(home.path().join(".deepseek")).expect("create deepseek config dir");
+    prepare_home(home.path());
 
     let mut child = command.spawn().expect("spawn codewhale-tui exec");
     let stdout_reader = read_pipe_in_background(child.stdout.take().expect("stdout pipe"));
@@ -594,4 +605,75 @@ async fn plain_exec_bounds_output_limit_continuations() {
             );
         }
     }
+}
+
+/// A stdio MCP server that reads `initialize`, closes its stdin, answers, and
+/// stays alive: the client's next write (`notifications/initialized`) always
+/// hits a pipe with no reader. That is the shape of the real failure, where a
+/// plugin's MCP server whose `node` could not start made `exec --auto` die of
+/// SIGPIPE (exit 141) before printing anything.
+const STDIN_CLOSING_MCP_SERVER: &str = r#"IFS= read -r _line; exec 0<&-; printf '%s\n' '{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"stdin-closer","version":"1.0.0"},"capabilities":{"tools":{}}}}'; sleep 10"#;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_auto_survives_an_mcp_server_that_closes_its_stdin() {
+    let server = start_mock_llm(answer_sse_without_usage("ok")).await;
+    let (success, stdout, stderr) = run_exec_in_home(
+        &server,
+        &["--auto", "--model", TEST_MODEL, "Reply with exactly: ok"],
+        |home| {
+            let config = json!({
+                "mcpServers": {
+                    "stdin-closer": {
+                        "command": "sh",
+                        "args": ["-c", STDIN_CLOSING_MCP_SERVER],
+                        // Connect at session start, as the Computer Use
+                        // plugin's server does, instead of on first use.
+                        "required": true
+                    }
+                }
+            });
+            let path = home.join(".codewhale").join("mcp.json");
+            std::fs::write(&path, config.to_string()).expect("write mcp.json");
+        },
+    );
+    assert!(
+        success,
+        "exec --auto must not die when an MCP peer closes its pipe\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(stdout.trim(), "ok", "stderr:\n{stderr}");
+}
+
+/// Plain `exec` offers no tools, yet DeepSeek can still answer with nothing
+/// but a DSML tool call. The markup must never reach stdout, and the run must
+/// fail once with the real reason instead of re-requesting the same call and
+/// ending on "the provider response was incomplete".
+#[tokio::test(flavor = "multi_thread")]
+async fn one_shot_exec_strips_deepseek_dsml_and_points_at_auto() {
+    let dsml = "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"read_file\">\n<｜｜DSML｜｜ parameter name=\"path\" string=\"true\">note.txt</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>\n";
+    let server = start_mock_llm(answer_sse_without_usage(dsml)).await;
+    let (success, stdout, stderr) = run_exec_unchecked(
+        &server,
+        &[
+            "--model",
+            TEST_MODEL,
+            "Read note.txt and tell me its contents.",
+        ],
+    );
+    assert!(
+        !success,
+        "a tool-call-only answer is not an answer\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("DSML") && !stdout.contains("read_file"),
+        "raw tool-call markup reached stdout: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("--auto") && stderr.contains("offers no tools"),
+        "the user is told the task needs tools: {stderr}"
+    );
+    assert_eq!(
+        chat_bodies(&server).await.len(),
+        1,
+        "a zero-tool text call must not be re-requested\nstderr:\n{stderr}"
+    );
 }

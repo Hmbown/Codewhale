@@ -1,0 +1,15 @@
+{
+  "direction": "host_to_core",
+  "valid": false,
+  "frame": {
+    "jsonrpc": "2.0",
+    "method": "ext/faulted",
+    "params": {
+      "owner": {
+        "plugin_id": "p",
+        "generation": 1
+      },
+      "error": "x"
+    }
+  }
+}

@@ -363,7 +363,6 @@ fn envelope_rejects_duplicate_new_slots_deterministically() {
 /// Deterministic fake project facet over portable values only.
 struct FakeProject {
     lsp_enabled: bool,
-    share: ProjectShareProjection,
     goal: ProjectGoalState,
 }
 
@@ -371,12 +370,6 @@ impl FakeProject {
     fn new() -> Self {
         Self {
             lsp_enabled: false,
-            share: ProjectShareProjection {
-                history_is_empty: true,
-                history_len: 0,
-                model: "deepseek-chat".to_string(),
-                mode_label: "ACT".to_string(),
-            },
             goal: ProjectGoalState {
                 objective: Some("Ship FEAT-021".to_string()),
                 status: ProjectGoalStatus::Active,
@@ -406,10 +399,6 @@ impl CommandProjectContext for FakeProject {
     fn lsp_set(&mut self, enabled: bool) -> Result<(), String> {
         self.lsp_enabled = enabled;
         Ok(())
-    }
-
-    fn share_projection(&self) -> ProjectShareProjection {
-        self.share.clone()
     }
 
     fn goal_state(&self) -> ProjectGoalState {
@@ -644,16 +633,6 @@ fn project_facet_is_object_safe_and_typed() {
     assert!(project.lsp_enabled());
     project.lsp_set(false).unwrap();
     assert!(!project.lsp_enabled());
-}
-
-#[test]
-fn project_share_projection_preserves_semantic_values() {
-    let project = FakeProject::new();
-    let share = project.share_projection();
-    assert!(share.history_is_empty);
-    assert_eq!(share.history_len, 0);
-    assert_eq!(share.model, "deepseek-chat");
-    assert_eq!(share.mode_label, "ACT");
 }
 
 #[test]

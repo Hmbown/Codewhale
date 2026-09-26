@@ -522,8 +522,12 @@ pub(crate) fn copy_cell_to_clipboard(app: &mut App, cell_index: usize) -> bool {
         app.status_message = Some("Message is empty".to_string());
         return false;
     }
-    if app.clipboard.write_text(&text).is_ok() {
-        app.status_message = Some("Message copied".to_string());
+    if let Ok(transport) = app.clipboard.write_text_status(&text) {
+        app.status_message = Some(crate::tui::mouse_ui::copy_receipt(
+            app,
+            transport,
+            "Message copied",
+        ));
         true
     } else {
         app.status_message = Some("Copy failed".to_string());

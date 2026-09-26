@@ -44,6 +44,10 @@ pub enum Feature {
     Verify,
     /// Expose `execute_tools` eagerly so the model composes by default (CodeMode).
     CodeMode,
+    /// Run reviewed plugins' `native` host code in the TypeScript extension
+    /// host (experimental). Toggling it changes the plugin activation policy,
+    /// so every plugin is re-reviewed after a restart, in either direction.
+    ExtensionHost,
 }
 
 impl fmt::Display for Stage {
@@ -238,6 +242,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         // goes back to deferred (reachable through tool_search).
         default_enabled: true,
     },
+    FeatureSpec {
+        id: Feature::ExtensionHost,
+        key: "extension_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
 ];
 
 #[cfg(test)]
@@ -267,6 +277,15 @@ mod tests {
         assert!(features.enabled(Feature::CodeMode));
         features.apply_map(&BTreeMap::from([("code_mode".to_string(), false)]));
         assert!(!features.enabled(Feature::CodeMode));
+    }
+
+    #[test]
+    fn extension_host_flag_parses_and_defaults_off() {
+        assert_eq!(
+            feature_from_key("extension_host"),
+            Some(Feature::ExtensionHost)
+        );
+        assert!(!Features::with_defaults().enabled(Feature::ExtensionHost));
     }
 
     #[test]

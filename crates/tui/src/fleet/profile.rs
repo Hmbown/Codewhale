@@ -19,6 +19,9 @@ pub use super::roster::ProfileOrigin;
 
 pub const WORKSPACE_AGENT_PROFILE_DIR: &str = ".codewhale/agents";
 pub const PERSONAL_AGENT_PROFILE_DIR: &str = "agents";
+/// Claude Code agent definitions, read from both the project and the home
+/// directory (`<workspace>/.claude/agents`, `~/.claude/agents`).
+pub const CLAUDE_AGENT_DIR: &str = ".claude/agents";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FleetProfileScope {
@@ -316,6 +319,198 @@ pub(crate) fn load_plugin_agent_profiles_from_component(
         profile.plugin_authority = Some(authority.clone());
     }
     Ok((profiles, issues))
+}
+
+/// Claude Code's user-level agent directory (`~/.claude/agents`). Tests never
+/// read the developer's real home directory.
+pub fn claude_user_agent_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    dirs::home_dir().map(|home| home.join(CLAUDE_AGENT_DIR))
+}
+
+/// Claude Code tools that only read. An agent whose `tools:` list stays inside
+/// this set runs on the read-only `explore` posture.
+const CLAUDE_READ_ONLY_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "glob",
+    "ls",
+    "webfetch",
+    "websearch",
+    "notebookread",
+    "todowrite",
+    "todoread",
+];
+
+/// Claude Code tools that change files. Any of these in `tools:` maps the
+/// agent to the `implement` posture.
+const CLAUDE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "notebookedit"];
+
+/// Load Claude Code agent definitions (`*.md` with YAML frontmatter) from one
+/// directory. Frontmatter is read by the same parser as `SKILL.md`.
+///
+/// The mapping is deliberately small: `name` → id, `description` →
+/// description, the Markdown body → role instructions, `tools` → the closest
+/// role posture, `model` → model hint (Claude's `inherit`/`sonnet`/`opus`/
+/// `haiku` aliases inherit the session route). `color` is cosmetic and
+/// ignored. Any other key would change behavior Codewhale cannot reproduce, so
+/// that file becomes a load issue instead of silently loading as something
+/// else. Permissions stay at the floor: a Markdown agent can never grant shell
+/// or trust — only a `.codewhale/agents/*.toml` profile can.
+pub fn load_claude_agent_profiles_from_dir(
+    dir: impl AsRef<Path>,
+) -> Result<(Vec<AgentProfile>, Vec<AgentProfileLoadIssue>)> {
+    let dir = dir.as_ref();
+    if !dir.is_dir() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut paths = std::fs::read_dir(dir)
+        .with_context(|| format!("reading Claude agent dir {}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("md"))
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    let origin = ProfileOrigin::ClaudeCode;
+    let mut profiles: Vec<AgentProfile> = Vec::new();
+    let mut issues = Vec::new();
+    for path in paths {
+        match load_claude_agent_file(&path) {
+            Ok(profile) => {
+                if profiles
+                    .iter()
+                    .any(|existing| existing.id.eq_ignore_ascii_case(&profile.id))
+                {
+                    issues.push(AgentProfileLoadIssue::new(
+                        &path,
+                        Some(&profile.id),
+                        origin,
+                        format!(
+                            "duplicate Claude agent name {} in {}",
+                            profile.id,
+                            dir.display()
+                        ),
+                    ));
+                    continue;
+                }
+                profiles.push(profile);
+            }
+            Err(err) => issues.push(AgentProfileLoadIssue::new(
+                &path,
+                None,
+                origin,
+                format!("{err:#}"),
+            )),
+        }
+    }
+    Ok((profiles, issues))
+}
+
+fn load_claude_agent_file(path: &Path) -> Result<AgentProfile> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading Claude agent {}", path.display()))?;
+    let (metadata, body) = crate::skills::parse_frontmatter(&raw)
+        .map_err(|err| anyhow!("parsing Claude agent {}: {err}", path.display()))?
+        .ok_or_else(|| {
+            anyhow!(
+                "Claude agent {} has no `---` frontmatter block",
+                path.display()
+            )
+        })?;
+
+    let mut unmapped: Vec<&str> = metadata
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !matches!(*key, "name" | "description" | "tools" | "model" | "color"))
+        .collect();
+    if !unmapped.is_empty() {
+        unmapped.sort_unstable();
+        bail!(
+            "Claude agent {} uses frontmatter Codewhale cannot honor ({}); remove it, or define this agent as a .codewhale/agents/*.toml profile",
+            path.display(),
+            unmapped.join(", ")
+        );
+    }
+
+    let fallback_id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("agent");
+    let id = non_empty_trimmed(metadata.get("name").map(String::as_str))
+        .unwrap_or(fallback_id)
+        .to_string();
+    validate_agent_profile_token(path, "name", &id)?;
+
+    let role_name = claude_tools_role(metadata.get("tools").map(String::as_str)).to_string();
+    let model = non_empty_trimmed(metadata.get("model").map(String::as_str))
+        .filter(|model| {
+            !matches!(
+                model.to_ascii_lowercase().as_str(),
+                "inherit" | "sonnet" | "opus" | "haiku"
+            )
+        })
+        .map(str::to_string);
+    validate_agent_profile_model_hint(path, model.as_deref())?;
+
+    let description =
+        non_empty_trimmed(metadata.get("description").map(String::as_str)).map(str::to_string);
+    let instructions = trimmed_non_empty(body).map(str::to_string);
+    Ok(AgentProfile {
+        id,
+        display_name: None,
+        description: description.clone(),
+        requires: Vec::new(),
+        profile: FleetProfile {
+            slot: FleetSlot::from_name(&role_name),
+            role: FleetRole {
+                name: role_name,
+                description,
+                instructions,
+            },
+            loadout: FleetLoadout::default(),
+            model,
+            provider: None,
+            reasoning_effort: None,
+            permissions: FleetProfilePermissions::default(),
+            delegation: FleetDelegationHints::default(),
+        },
+        source: path.to_path_buf(),
+        origin: ProfileOrigin::ClaudeCode,
+        plugin_authority: None,
+    })
+}
+
+/// Closest Codewhale role posture for a Claude `tools:` allowlist. No list
+/// means Claude's "all tools", which is the documented `general` default.
+fn claude_tools_role(tools: Option<&str>) -> &'static str {
+    let Some(tools) = tools.and_then(trimmed_non_empty) else {
+        return "general";
+    };
+    let names: Vec<String> = tools
+        .split([',', ' ', '\t'])
+        .map(|tool| {
+            tool.trim()
+                .trim_matches(['[', ']', '"', '\''])
+                .to_ascii_lowercase()
+        })
+        .filter(|tool| !tool.is_empty())
+        .collect();
+    if names
+        .iter()
+        .any(|tool| CLAUDE_WRITE_TOOLS.contains(&tool.as_str()))
+    {
+        "implement"
+    } else if names
+        .iter()
+        .all(|tool| CLAUDE_READ_ONLY_TOOLS.contains(&tool.as_str()))
+    {
+        "explore"
+    } else {
+        // Bash or MCP tools without file writes: the shell-capable posture.
+        "test"
+    }
 }
 
 /// Read only the identity-bearing fields from workspace profiles for the
@@ -1141,6 +1336,73 @@ reasoning = "expensive"
         };
         let rendered = draft.render_toml();
         assert!(!rendered.contains("provider"), "{rendered}");
+    }
+
+    #[test]
+    fn claude_tools_map_to_the_closest_role_posture() {
+        assert_eq!(claude_tools_role(None), "general");
+        assert_eq!(claude_tools_role(Some("  ")), "general");
+        assert_eq!(
+            claude_tools_role(Some("Read, Grep, Glob, WebFetch")),
+            "explore"
+        );
+        assert_eq!(claude_tools_role(Some("[Read, Grep]")), "explore");
+        assert_eq!(claude_tools_role(Some("Read, Bash")), "test");
+        assert_eq!(claude_tools_role(Some("Read, mcp__github__search")), "test");
+        assert_eq!(claude_tools_role(Some("Read, Edit")), "implement");
+        assert_eq!(claude_tools_role(Some("Bash MultiEdit")), "implement");
+    }
+
+    #[test]
+    fn claude_agent_without_frontmatter_or_name_is_handled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_profile(tmp.path(), "plain.md", "# Just a heading\nno frontmatter\n");
+        write_profile(
+            tmp.path(),
+            "from-stem.md",
+            "---\ndescription: >\n  Folded\n  description\nmodel: deepseek-v4-pro\n---\nBody.\n",
+        );
+        let (profiles, issues) = load_claude_agent_profiles_from_dir(tmp.path()).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, "from-stem");
+        assert_eq!(
+            profiles[0].description.as_deref(),
+            Some("Folded description")
+        );
+        assert_eq!(
+            profiles[0].profile.model.as_deref(),
+            Some("deepseek-v4-pro")
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, "plain");
+        assert!(
+            issues[0].detail.contains("no `---` frontmatter"),
+            "{}",
+            issues[0].detail
+        );
+    }
+
+    #[test]
+    fn claude_agent_tools_as_a_yaml_list_keep_the_read_only_posture() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_profile(
+            tmp.path(),
+            "reader.md",
+            "---\nname: reader\ntools:\n  - Read\n  - \"Grep\"\ndescription: Reads\n---\nBody.\n",
+        );
+        write_profile(
+            tmp.path(),
+            "writer.md",
+            "---\nname: writer\ntools:\n- Read\n- Edit\n---\nBody.\n",
+        );
+        let (mut profiles, issues) = load_claude_agent_profiles_from_dir(tmp.path()).unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
+        profiles.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(profiles[0].id, "reader");
+        assert_eq!(profiles[0].profile.role.name, "explore");
+        assert_eq!(profiles[0].description.as_deref(), Some("Reads"));
+        assert_eq!(profiles[1].id, "writer");
+        assert_eq!(profiles[1].profile.role.name, "implement");
     }
 
     fn write_profile(dir: &Path, filename: &str, contents: &str) -> PathBuf {

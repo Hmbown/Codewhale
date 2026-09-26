@@ -1356,6 +1356,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/threads/{id}/resume", post(resume_thread))
         .route("/v1/threads/{id}/fork", post(fork_thread))
         .route("/v1/threads/{id}/undo", post(undo_thread_turn))
+        .route("/v1/threads/{id}/fork-at-turn", post(fork_thread_at_turn))
         .route("/v1/threads/{id}/patch-undo", post(patch_undo_thread_turn))
         .route("/v1/threads/{id}/file-revert", post(revert_thread_file))
         .route("/v1/threads/{id}/retry", post(retry_thread_turn))
@@ -1421,6 +1422,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/tasks/{id}/cancel", post(cancel_task))
         .route("/v1/skills", get(list_skills))
         .route("/v1/commands", get(list_commands))
+        .route("/v1/hooks", get(list_hooks))
         .route(
             "/v1/skills/{name}",
             post(set_skill_enabled).delete(uninstall_skill_api),
@@ -3514,6 +3516,127 @@ async fn list_commands(
     Ok(Json(CommandsResponse { commands }))
 }
 
+#[derive(Debug, Deserialize)]
+struct HooksQuery {
+    /// Report the hooks a thread's engine runs (its workspace); defaults to
+    /// the server workspace.
+    thread_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HooksResponse {
+    workspace: String,
+    enabled: bool,
+    hooks: Vec<HookEntry>,
+    /// Hooks rejected or warned about at load, one redaction-safe line each.
+    problems: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HookEntry {
+    name: Option<String>,
+    event: &'static str,
+    /// The shell command, with credential-shaped values masked.
+    command: String,
+    background: bool,
+    timeout_secs: u64,
+    /// `global` (user config), `plugin` (reviewed plugin) or `project`
+    /// (trusted, approved `.codewhale/hooks.toml`).
+    source: &'static str,
+}
+
+/// Mask a hook command for `GET /v1/hooks`. Keyed and credential-shaped
+/// values go through the shared redactor; every URL additionally keeps only
+/// its scheme and host, because webhook secrets live in the path
+/// (`https://hooks.slack.com/services/T…/B…/<secret>`) where no key names
+/// them.
+fn redact_hook_command_for_listing(command: &str) -> String {
+    let masked = codewhale_config::persistence::redact_secrets(command);
+    masked
+        .split(' ')
+        .map(|word| match word.find("://") {
+            Some(scheme_end) => {
+                let rest = &word[scheme_end + 3..];
+                let host_end = rest.find(['/', '?', '#', '"', '\'']).unwrap_or(rest.len());
+                let host = &rest[..host_end];
+                // Userinfo (`user:pass@host`) is a credential too.
+                let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+                let tail = &rest[host_end..];
+                let quote = tail
+                    .chars()
+                    .last()
+                    .filter(|c| matches!(c, '"' | '\''))
+                    .map(String::from)
+                    .unwrap_or_default();
+                let path = if tail.len() > quote.len() {
+                    "/[redacted]"
+                } else {
+                    ""
+                };
+                format!("{}{host}{path}{quote}", &word[..scheme_end + 3])
+            }
+            None => word.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `GET /v1/hooks` (B4): the hook set Runtime API threads run, from the same
+/// loader their engines use, so clients show one truth instead of keeping a
+/// hook table of their own.
+async fn list_hooks(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<HooksQuery>,
+) -> Result<Json<HooksResponse>, ApiError> {
+    let workspace = match query.thread_id.as_deref() {
+        Some(id) => {
+            state
+                .runtime_threads
+                .get_thread(id)
+                .await
+                .map_err(map_thread_err)?
+                .workspace
+        }
+        None => state.workspace.clone(),
+    };
+    let config = state.config.read().clone();
+    let plugins = state.plugin_discovery.registry_for_workspace(&workspace);
+    let executor = state.runtime_threads.hook_executor_for_workspace(
+        &config,
+        &workspace,
+        Some(plugins.as_ref()),
+    );
+    let hooks_config = executor.config();
+    let hooks = hooks_config
+        .hooks
+        .iter()
+        .map(|hook| HookEntry {
+            name: hook.name.clone(),
+            event: hook.event.as_str(),
+            command: redact_hook_command_for_listing(&hook.command),
+            background: hook.background,
+            timeout_secs: hook.timeout_secs,
+            source: if hook.project_authority.is_some() {
+                "project"
+            } else if hook.plugin_authority.is_some() {
+                "plugin"
+            } else {
+                "global"
+            },
+        })
+        .collect();
+    Ok(Json(HooksResponse {
+        workspace: workspace.display().to_string(),
+        enabled: hooks_config.enabled,
+        hooks,
+        problems: hooks_config
+            .problems
+            .iter()
+            .map(crate::hooks::HookConfigProblem::summary)
+            .collect(),
+    }))
+}
+
 async fn list_skills(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<SkillsResponse>, ApiError> {
@@ -5526,6 +5649,44 @@ async fn undo_thread_turn(
     ))
 }
 
+#[derive(Debug, Deserialize)]
+struct ForkAtTurnRequest {
+    /// The user turn to fork at, as `GET /v1/threads/{id}` reports it. The
+    /// fork keeps that turn and every turn before it, and drops the rest.
+    turn_id: String,
+}
+
+/// Fork a thread at one named user turn — the client-side "continue from this
+/// turn" affordance, which carries on in the new thread.
+///
+/// The fork keeps the named turn and everything before it, so the branch point
+/// is the answer a person is looking at rather than the question above it;
+/// naming the last turn keeps the whole conversation. The receipt is
+/// deliberately the undo receipt: the first dropped turn's prompt comes back
+/// with the new thread, so a client can put what was asked next into the
+/// composer and let the person edit or replace it. The source thread, its
+/// session document and the workspace are untouched — no file rollback happens
+/// here, because the branch that was left behind shares the workspace.
+async fn fork_thread_at_turn(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<ForkAtTurnRequest>,
+) -> Result<(StatusCode, Json<UndoTurnResponse>), ApiError> {
+    let (forked_thread, original_user_text, original_user_images, _) = state
+        .runtime_threads
+        .fork_at_user_turn(&id, &req.turn_id)
+        .await
+        .map_err(map_thread_err)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(UndoTurnResponse {
+            thread: forked_thread,
+            original_user_text,
+            original_user_images,
+        }),
+    ))
+}
+
 /// Result of the snapshot-based file rollback step of patch-undo, reported
 /// alongside the new forked thread.
 #[derive(Debug, Serialize)]
@@ -5989,6 +6150,8 @@ async fn retry_thread_turn(
                 auto_approve: None,
                 dynamic_tools: req.dynamic_tools,
                 environment_id: None,
+                model_provider: None,
+                model_provider_id: None,
             },
         )
         .await
@@ -7797,7 +7960,13 @@ fn provider_models_for_api(
     .ok()
     .flatten()
     .is_some_and(|entry| entry.fetched_at > 0);
-    if !config.model_ids_pass_through_for_provider(provider) || exact_catalog {
+    // A pass-through provider normally lists only what its own live catalog
+    // returned. When that catalog cannot exist (an OAuth route), the catalog
+    // lake's next layers (Models.dev, then the bundled snapshot) answer.
+    if !config.model_ids_pass_through_for_provider(provider)
+        || exact_catalog
+        || crate::provider_lake::live_catalog_unavailable(config, provider)
+    {
         for model in crate::provider_lake::models_for_provider(config, active_provider, provider) {
             push_unique_model(&mut models, &model);
         }

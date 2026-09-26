@@ -1,0 +1,23 @@
+{
+  "direction": "core_to_host",
+  "valid": true,
+  "frame": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "method": "tool/call",
+    "params": {
+      "handle": 17,
+      "call_id": "call-1",
+      "input": {
+        "q": [
+          1,
+          2,
+          {
+            "x": null
+          }
+        ]
+      },
+      "deadline_ms": 120000
+    }
+  }
+}

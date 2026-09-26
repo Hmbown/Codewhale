@@ -484,6 +484,10 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> MouseOutcome {
                 action,
             }
         }
+        // Right-click is the context menu's (`mouse_ui::open_context_menu`
+        // reads the row under the pointer). The catch-all below used to mark
+        // it consumed, so no menu ever opened over the work surface.
+        MouseEventKind::Down(MouseButton::Right) => MouseOutcome::default(),
         _ => MouseOutcome {
             consumed: true,
             action: None,

@@ -747,7 +747,11 @@ outside the current VS Code folder.
 
 Thread forks are sibling runtime threads, not an in-place tree projection.
 `thread.forked` events include `source_thread_id`; internal backtrack-aware
-forks may also include `backtrack_depth_from_tail` and `dropped_turn_id`.
+forks may also include `backtrack_depth_from_tail` and `dropped_turn_id`, and
+a fork anchored to a named turn (`/fork-at-turn`) reports them with the depth
+resolved from that turn, and names the first user turn it dropped (not the
+anchor, which a named-turn fork keeps, and not a prompt-less turn such as a
+manual compaction that sits between them).
 Thread list and summary responses remain flat in v0.8.40, so clients that need
 a graph should reconstruct it from events instead of assuming list order is a
 complete tree.
@@ -786,9 +790,21 @@ accept an empty string to clear a previously-set value. Added in v0.8.10 (#562):
   "model": "deepseek-v4-pro",
   "mode": "agent",
   "title": "User-set thread title",
-  "system_prompt": "You are a useful assistant."
+  "system_prompt": "You are a useful assistant.",
+  "model_provider": "custom",
+  "model_provider_id": "lm-studio"
 }
 ```
+
+`model_provider` switches the provider the thread's future turns use. It
+takes a built-in kind (`deepseek`, `xai`, ...) or a configured route name, as
+`/provider` does. `model_provider_id` names one exact `[providers.<id>]` table
+and wins over a route name. The target route is resolved and its client
+preflighted before anything is saved, so an unknown or credential-less
+provider is refused and nothing changes. Without `model`, the thread takes the
+new provider's default model; an `auto` thread stays `auto`. The loaded
+engine and conversation history are kept, and the next turn installs the new
+route.
 
 **Turns** (within a thread)
 - `POST /v1/threads/{id}/turns`
@@ -796,6 +812,7 @@ accept an empty string to clear a previously-set value. Added in v0.8.10 (#562):
 - `POST /v1/threads/{id}/turns/{turn_id}/interrupt`
 - `POST /v1/threads/{id}/compact` (manual compaction)
 - `POST /v1/threads/{id}/undo` - fork the thread with the last N turns removed (`{"depth": N}`, default 0 = last turn only); returns the forked thread plus `original_user_text` so a GUI can pre-populate the input box
+- `POST /v1/threads/{id}/fork-at-turn` - fork at one named user turn (`{"turn_id": "turn_…"}`, as `GET /v1/threads/{id}` reports it). The fork *keeps* that turn and every turn before it, and drops the turns after it; naming the last turn therefore keeps the whole conversation. The receipt is `/undo`'s (`thread`, `original_user_text`, `original_user_images`), carrying the *first dropped* user turn's prompt — what was asked next, even when a prompt-less turn such as a manual `/compact` sits between — so a client can put it back in the composer for editing. The source thread, its session document and the workspace are untouched, and there is no file rollback: a fork is a sibling conversation, and rewinding the workspace would rewind the branch left behind with it. Clients should name the turn instead of computing a `depth` — the transcript they render and the turn list this cuts are not the same list (steers, image-only prompts and injected handoffs each sit on one side only), and a client-side count that is off by one forks the wrong prefix while answering `201`. `400` when the turn is not a user turn of that thread.
 - `POST /v1/threads/{id}/patch-undo` - snapshot-based whole-workspace rollback followed by the same fork (`{"depth": N}`); returns `patch_result` (`files_restored`, `summary`, `snapshot_label`) alongside the forked thread. See [Workspace restore endpoints](#workspace-restore-endpoints) for the trust, admission and abort rules.
 - `POST /v1/threads/{id}/file-revert` - restore exactly one file from one named snapshot (`{"path", "snapshot_id", "expected_hash"}`); never forks the conversation. See [Workspace restore endpoints](#workspace-restore-endpoints).
 - `POST /v1/threads/{id}/retry` - fork with the last N turns removed and immediately start a new turn (`{"depth": N, "prompt": "..."}`; `prompt` overrides the original user text, which is re-used when omitted)
@@ -811,6 +828,12 @@ accept an empty string to clear a previously-set value. Added in v0.8.10 (#562):
   "allowed_tools": []
 }
 ```
+
+The same `model_provider` / `model_provider_id` fields on a turn route that
+one turn through another provider. The saved thread keeps its provider.
+Without `model`, the turn uses that provider's default model (an `auto` thread
+stays `auto`). The override is always preflighted and is part of the
+`operation_key` fingerprint.
 
 Resolution is deterministic: a turn override wins over the thread default,
 which wins over the Runtime's normal configuration. For tools, reaching normal
@@ -1315,10 +1338,43 @@ also how a client sees model-spawned work.
   `hidden` for rows the product does not advertise, and `shadowed_by` /
   `shadowed_aliases` where a user command has taken a builtin's spelling.
 
+  Each entry also carries the composer argument shape, computed the way the
+  TUI composer computes it, so a client does not re-derive it from `usage`
+  (#6230):
+  - `requires_argument` — the usage line mentions any argument, required or
+    optional.
+  - `requires_required_argument` — the usage line has a `<required>` argument
+    outside every `[optional]` group.
+  - `composer_wants_trailing_space` — accepting the command leaves a trailing
+    space for its arguments.
+  - `palette_runs_directly` — the palette runs the command on selection
+    instead of pasting it into the composer.
+  - `show_in_empty_discovery` — the command is listed when the slash menu
+    opens with no filter text.
+
+  User commands derive these from `takes_arguments`: their arguments are
+  never required, a template that takes arguments waits in the composer and
+  one that does not runs directly, and a `hidden` template stays out of empty
+  discovery.
+
   The same registry the TUI palette reads, so a desktop palette can be
   checked against it instead of drifting from it. Two rules a client must
   respect: a `binding: "host"` row is never submitted as a model prompt, and
   a user command shadowing a builtin name wins that spelling.
+
+**Hooks**
+- `GET /v1/hooks[?thread_id=...]` — `{workspace, enabled, hooks: [...],
+  problems: [...]}`: the hook set Runtime API threads run for that workspace
+  (the server workspace, or the named thread's). Per entry: `name`, `event`,
+  `command` (credential-shaped values masked; every URL keeps only its scheme and host), `background`, `timeout_secs`,
+  and `source` (`global` user config, `plugin` reviewed plugin, `project`
+  trusted and approved `.codewhale/hooks.toml`). `problems` lists hooks
+  rejected or warned about at load, one line each.
+
+  Every Runtime thread builds its engine with this set: `tool_call_before`
+  can deny a call, `shell_env` applies to shell tools, and `tool_call_after`
+  and `on_error` (for a failed tool) fire as observers, as they do in the TUI.
+  Clients read this route instead of keeping a hook table of their own.
 
 **Context** (per-thread context pressure, APPS-90)
 - `GET /v1/threads/{id}/context` — `input_tokens` (the conservative live
