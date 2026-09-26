@@ -61,6 +61,69 @@
       "reason": "DeepSeek publishes a 384K output limit; Models.dev lists 393216 (384 x 1024). Which one the API accepts is unverified, and the lower bound is accepted either way."
     },
     {
+      "provider": "openrouter",
+      "id": "deepseek/deepseek-v4-pro",
+      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
+    },
+    {
+      "provider": "openrouter",
+      "id": "deepseek/deepseek-v4-flash",
+      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
+    },
+    {
+      "provider": "together",
+      "id": "deepseek-ai/DeepSeek-V4-Pro",
+      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
+    },
+    {
+      "provider": "together",
+      "id": "deepseek-ai/DeepSeek-V4-Flash",
+      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
+    },
+    {
+      "provider": "fireworks",
+      "id": "accounts/fireworks/models/deepseek-v4-pro",
+      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
+    },
+    {
+      "provider": "novita",
+      "id": "deepseek/deepseek-v4-pro",
+      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
+    },
+    {
+      "provider": "novita",
+      "id": "deepseek/deepseek-v4-flash",
+      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
+    },
+    {
+      "provider": "siliconflow",
+      "id": "deepseek-ai/DeepSeek-V4-Pro",
+      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
+    },
+    {
+      "provider": "siliconflow",
+      "id": "deepseek-ai/DeepSeek-V4-Flash",
+      "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."
+    },
+    {
+      "provider": "novita",
+      "id": "deepseek/deepseek-v4-pro",
+      "max_output": 384000,
+      "reason": "DeepSeek publishes a 384K output limit; Models.dev lists 393216 for Novita (384 x 1024). Which one the API accepts is unverified, and the lower bound is accepted either way."
+    },
+    {
+      "provider": "novita",
+      "id": "deepseek/deepseek-v4-flash",
+      "max_output": 384000,
+      "reason": "DeepSeek publishes a 384K output limit; Models.dev lists 393216 for Novita (384 x 1024). Which one the API accepts is unverified, and the lower bound is accepted either way."
+    },
+    {
+      "provider": "xai",
+      "id": "grok-4.3",
+      "reasoning_options": [],
+      "reason": "xAI documents no reasoning_effort control for grok-4.3, so Codewhale sends none (6be755f31 / #6501); Models.dev lists an effort ladder."
+    },
+    {
       "provider": "minimax",
       "id": "MiniMax-M3",
       "pricing_withheld": "MiniMax doubles M3 rates once a prompt passes 512K tokens. A flat catalog rate would understate long sessions."
