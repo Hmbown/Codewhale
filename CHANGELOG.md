@@ -68,6 +68,8 @@ quieter, and Fleet runs can be checked before they spend anything.
   answer: the markup is removed, and an answer that was only a tool call
   fails at once with the reason and a pointer to `--auto`, instead of asking
   the model again and blaming an incomplete provider response.
+- Resuming a session keeps its "Resumed:" confirmation on screen instead of
+  replacing it with "Make room automatically: on" when nothing was switched.
 - The installation page is generated from `docs/INSTALL.md`, so the website
   and the guide can no longer disagree; broken anchors and unsafe links fail
   the build ([#6450](https://github.com/Hmbown/Codewhale/pull/6450)).

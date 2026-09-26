@@ -16538,9 +16538,10 @@ async fn same_turn_fork_carries_the_updated_todo() {
     );
 }
 
-/// U1: hosts resend the compaction config on every model or route sync. An
-/// unchanged config must not produce a status line, which used to overwrite
-/// a real error (the missing-key notice) in the footer.
+/// U1: hosts resend the compaction config on every model, route or session
+/// sync. A config whose switch did not move must not produce a status line,
+/// which used to overwrite a real error (the missing-key notice) and the
+/// "Resumed:" receipt in the footer.
 #[tokio::test]
 async fn unchanged_compaction_config_is_acknowledged_silently() {
     let tmp = tempdir().expect("tempdir");
@@ -16559,7 +16560,18 @@ async fn unchanged_compaction_config_is_acknowledged_silently() {
         })
         .await
         .expect("send unchanged config");
-    let mut changed = current;
+    // A session restore resyncs the model and window with the switch as it
+    // was: applied, but not news.
+    let mut resynced = current.clone();
+    resynced.model = format!("{}-resynced", current.model);
+    resynced.effective_context_window = Some(64_000);
+    handle
+        .send(Op::SetCompaction {
+            config: resynced.clone(),
+        })
+        .await
+        .expect("send resynced config");
+    let mut changed = resynced;
     changed.enabled = !changed.enabled;
     let expected = if changed.enabled {
         "Make room automatically: on"
@@ -16583,7 +16595,7 @@ async fn unchanged_compaction_config_is_acknowledged_silently() {
     };
     assert_eq!(
         first_status, expected,
-        "the unchanged config produced no status; only the real change did"
+        "unchanged and resynced configs produced no status; only the switch did"
     );
     drop(rx);
     run.abort();

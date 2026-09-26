@@ -3193,13 +3193,17 @@ impl Engine {
                             .await;
                     }
                     Op::SetCompaction { config } => {
-                        // Hosts resend the compaction config on every route
-                        // or model sync. An unchanged config is not news; its
-                        // acknowledgement used to overwrite a real error in
-                        // the footer (U1).
-                        if self.config.compaction != config {
-                            let enabled = config.enabled;
-                            self.config.compaction = config;
+                        // Hosts resend the compaction config on every route,
+                        // model or session sync, and those syncs move the
+                        // model, window and thresholds without the user
+                        // touching the switch. Only the switch is news: an
+                        // acknowledgement for anything else used to overwrite
+                        // a real error in the footer (U1) and the "Resumed:"
+                        // receipt a session restore had just shown.
+                        let enabled = config.enabled;
+                        let switched = self.config.compaction.enabled != enabled;
+                        self.config.compaction = config;
+                        if switched {
                             let _ = self
                                 .tx_event
                                 .send(Event::status(format!(
