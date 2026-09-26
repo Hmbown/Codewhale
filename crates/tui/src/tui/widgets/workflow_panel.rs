@@ -1392,6 +1392,12 @@ impl WorkflowPanel {
                 error,
                 at_ms,
             } => {
+                // A cancel is final. Under backpressure the VM's own
+                // `run_completed` can land after `run_cancelled`; it must not
+                // repaint a stopped run as finished or drop the cancel reason.
+                if self.lifecycle == WorkflowPanelLifecycle::Cancelled {
+                    return;
+                }
                 self.lifecycle = if matches!(status, WorkflowPanelLifecycle::Running) {
                     WorkflowPanelLifecycle::Succeeded
                 } else {
@@ -2508,6 +2514,27 @@ mod tests {
             at_ms: 1_200,
         });
         panel
+    }
+
+    #[test]
+    fn late_run_completed_keeps_a_cancelled_run_cancelled() {
+        let mut panel = started_panel();
+        panel.apply_event(WorkflowPanelEvent::RunCancelled {
+            reason: "stopped by you".to_string(),
+            at_ms: 2_000,
+        });
+        panel.apply_event(WorkflowPanelEvent::RunCompleted {
+            status: WorkflowPanelLifecycle::Succeeded,
+            error: None,
+            at_ms: 2_100,
+        });
+        assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Cancelled);
+        assert_eq!(panel.error.as_deref(), Some("stopped by you"));
+        assert_eq!(panel.completed_at_ms, Some(2_000));
+        assert_eq!(
+            panel.find_row_mut("t1").expect("row").status,
+            WorkflowRowStatus::Cancelled
+        );
     }
 
     /// #4208: every decorative glyph the run map emits — expand marks, role

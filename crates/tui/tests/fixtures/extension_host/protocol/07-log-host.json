@@ -1,0 +1,12 @@
+{
+  "direction": "host_to_core",
+  "valid": true,
+  "frame": {
+    "jsonrpc": "2.0",
+    "method": "log",
+    "params": {
+      "level": "info",
+      "msg": "host started"
+    }
+  }
+}

@@ -163,19 +163,17 @@ fn execute_structcopy(app: &mut App, arg: Option<&str>) -> CommandResult {
         // the default clipboard path never prints the payload.
         return CommandResult::message(json);
     }
-    // `requires_terminal_paste()` is true only for an SSH session with no
-    // forwarded display, where the sole transport is the terminal client
-    // itself. That write is queued on a background writer, so a successful
-    // return means "accepted for transport", not "in the clipboard".
-    let terminal_client = app.clipboard.requires_terminal_paste();
+    // A terminal write (OSC 52 / tmux) is queued on a background writer and
+    // never acknowledged, so it reports "queued", not "in the clipboard".
+    // That covers SSH without a display and a native clipboard that failed.
     let bytes = json.len();
-    match app.clipboard.write_text(&json) {
-        Ok(()) if terminal_client => CommandResult::message(
+    match app.clipboard.write_text_status(&json) {
+        Ok(crate::tui::clipboard::CopyTransport::Terminal) => CommandResult::message(
             tr(app.ui_locale, MessageId::CmdStructcopyClipboardQueued)
                 .replace("{kind}", &label)
                 .replace("{bytes}", &bytes.to_string()),
         ),
-        Ok(()) => CommandResult::message(
+        Ok(crate::tui::clipboard::CopyTransport::Native) => CommandResult::message(
             tr(app.ui_locale, MessageId::CmdStructcopyClipboardAccepted)
                 .replace("{kind}", &label)
                 .replace("{bytes}", &bytes.to_string()),
@@ -2753,7 +2751,9 @@ mod tests {
         let tmpdir = TempDir::new().expect("tempdir");
         let mut app = test_app(&tmpdir);
         seed_transcript(&mut app);
-        app.clipboard = ClipboardHandler::for_test(true, false);
+        // SSH with no display: the write goes to the terminal writer, as in
+        // production, and the receipt follows the transport that took it.
+        app.clipboard = ClipboardHandler::terminal_only_for_test();
         assert!(app.clipboard.requires_terminal_paste());
 
         let result = execute_structcopy(&mut app, Some("turn 1"));

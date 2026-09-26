@@ -3003,26 +3003,71 @@ fn tool_value_style() -> Style {
 /// Returns the first match rather than every match: a click is one request to
 /// open one file.
 pub(crate) fn first_file_line_reference(text: &str, workspace: &Path) -> Option<(PathBuf, u32)> {
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let Some((before, after)) = trimmed.rsplit_once(':') else {
-            continue;
-        };
-        if after.is_empty() || !after.chars().all(|c| c.is_ascii_digit()) {
-            continue;
+    text.lines()
+        .find_map(|line| file_line_reference(line, workspace))
+}
+
+/// The first `path:line` on one line of text that names a file inside the
+/// workspace, as `(absolute path, line)`.
+///
+/// Accepts the forms tools and models print: `src/a.rs:12`, `src/a.rs:12:5`,
+/// `--> src/a.rs:12:5` (rustc), `` `src/a.rs:12` `` and a reference inside a
+/// sentence or brackets. The text is model output, so it is not trusted to
+/// name a file: every candidate goes through [`workspace_file`], which
+/// refuses `..`, absolute paths outside the workspace and links.
+pub(crate) fn file_line_reference(line: &str, workspace: &Path) -> Option<(PathBuf, u32)> {
+    line.split_whitespace().find_map(|token| {
+        // Leading `.` stays: `./src/a.rs` is relative, not `/src/a.rs`.
+        let token = token
+            .trim_start_matches(['`', '\'', '"', '(', '[', '<'])
+            .trim_end_matches(['`', '\'', '"', ')', ']', '>', ',', ';', '.']);
+        let (path_str, line_no) = split_path_line(token)?;
+        if !looks_like_file_path(path_str) {
+            return None;
         }
-        let path_str = before.trim();
-        if path_str.is_empty() || !looks_like_file_path(path_str) {
-            continue;
+        let path_str = path_str.strip_prefix("./").unwrap_or(path_str);
+        workspace_file(workspace, path_str).map(|absolute| (absolute, line_no))
+    })
+}
+
+/// The regular file `raw` names inside `workspace`, as
+/// `workspace.join(relative)`, or `None`.
+///
+/// [`crate::snapshot::workspace_relative_path`] checks only the text, and
+/// `is_file()` follows links, so a link inside the workspace (`vendor -> /`,
+/// `notes.md -> ~/.ssh/config`) used to pass. Each part below the workspace
+/// is read with `symlink_metadata` and a link is refused, as
+/// `runtime_api::workspace::confined_directory` does, and the resolved path
+/// must still sit under the resolved workspace. Callers that act later check
+/// again at that point: this is a check at one moment, not a lock.
+pub(crate) fn workspace_file(workspace: &Path, raw: &str) -> Option<PathBuf> {
+    let relative = crate::snapshot::workspace_relative_path(workspace, raw)?;
+    let mut path = workspace.to_path_buf();
+    let mut is_file = false;
+    for component in relative.components() {
+        path.push(component);
+        let metadata = std::fs::symlink_metadata(&path).ok()?;
+        if crate::plugins::metadata_is_link_or_reparse(&metadata) {
+            return None;
         }
-        let abs_path = if Path::new(path_str).is_absolute() {
-            PathBuf::from(path_str)
-        } else {
-            workspace.join(path_str)
-        };
-        if abs_path.is_file() {
-            return Some((abs_path, after.parse().unwrap_or(1)));
+        is_file = metadata.is_file();
+    }
+    let resolved_workspace = workspace.canonicalize().ok()?;
+    let inside = path.canonicalize().ok()?.starts_with(&resolved_workspace);
+    (is_file && inside).then_some(path)
+}
+
+/// Split `path:N`, `path:N:C` or `path:N:text` at the first all-digit
+/// segment after the path. Earlier colons stay in the path (`C:\x.rs:3`).
+fn split_path_line(token: &str) -> Option<(&str, u32)> {
+    let mut offset = 0;
+    for (index, part) in token.split(':').enumerate() {
+        if index > 0 && !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
+            let path = token[..offset].strip_suffix(':')?;
+            let line = part.parse().ok().filter(|line| *line > 0)?;
+            return (!path.is_empty()).then_some((path, line));
         }
+        offset += part.len() + 1;
     }
     None
 }

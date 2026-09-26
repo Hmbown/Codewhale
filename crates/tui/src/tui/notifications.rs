@@ -974,31 +974,30 @@ pub fn completed_turn_payload(
 }
 
 /// Compose a notification payload for a terminal sub-agent outcome. The
-/// agent id is always the detail line; the child's first human-readable
-/// summary line, when there is one, becomes the (redacted, bounded)
-/// preview. The headline reflects the actual status so a Stop/failed
-/// worker is never announced as successfully complete (#4408).
+/// agent's name (the same label every other surface shows, never its raw id)
+/// is the detail line, and the headline of its result is the (redacted,
+/// bounded) preview: the first sentence of prose, not a `## Summary` heading
+/// (#6565). The headline reflects the actual status so a Stop/failed worker is
+/// never announced as successfully complete (#4408).
 pub fn subagent_terminal_payload(
     locale: Locale,
-    id: &str,
+    label: &str,
     result: &str,
     status: &SubAgentStatus,
     include_summary: bool,
     elapsed: Duration,
 ) -> NotificationPayload {
-    let result_line = result
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with("<codewhale:subagent.done>"));
     let headline = completion_status(
         &tr(locale, subagent_terminal_label(status)),
         include_summary,
         elapsed,
         None,
     );
-    let preview = result_line.and_then(text_summary);
+    let preview = crate::agent_roster::result_headline(result)
+        .as_deref()
+        .and_then(text_summary);
 
-    NotificationPayload::subagent_terminal(&headline, id).with_preview(preview.as_deref())
+    NotificationPayload::subagent_terminal(&headline, label).with_preview(preview.as_deref())
 }
 
 pub(crate) fn subagent_terminal_label(status: &SubAgentStatus) -> MessageId {

@@ -296,6 +296,125 @@ pub fn resolve_node() -> Option<String> {
         .clone()
 }
 
+/// A Node.js runtime chosen by *running* each candidate, plus every candidate
+/// rejected on the way and why (for `/plugin` and doctor diagnostics).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NodeResolution {
+    pub selected: Option<(PathBuf, (u32, u32, u32))>,
+    pub rejected: Vec<(PathBuf, String)>,
+}
+
+impl NodeResolution {
+    /// One-line human summary of why no runtime was selected.
+    #[must_use]
+    pub fn describe_rejections(&self) -> String {
+        if self.rejected.is_empty() {
+            return "no `node` found on PATH".to_string();
+        }
+        self.rejected
+            .iter()
+            .map(|(path, reason)| format!("{}: {reason}", path.display()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// Parse `node --version` output (`v22.20.0`).
+#[must_use]
+pub fn parse_node_version(banner: &str) -> Option<(u32, u32, u32)> {
+    let version = banner.trim().strip_prefix('v')?;
+    let mut parts = version.split(['.', '-']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Whether `version` satisfies the extension host floor `^22.19 || >=24`
+/// (the DSH `engines` range: odd-numbered 23 is not an LTS line).
+#[must_use]
+pub fn node_version_supported_for_extension_host(version: (u32, u32, u32)) -> bool {
+    let (major, minor, _) = version;
+    (major == 22 && minor >= 19) || major >= 24
+}
+
+fn probe_node_version(path: &Path) -> Result<(u32, u32, u32), String> {
+    // Only absolute candidates are run: a relative `PATH` entry resolves
+    // against the current (workspace) directory, where a repository could
+    // plant a `node`.
+    if !path.is_absolute() {
+        return Err("not an absolute path; skipped".to_string());
+    }
+    let mut cmd = Command::new(path);
+    crate::utils::suppress_console_window(&mut cmd);
+    // The probe runs unsandboxed, so it gets no inherited environment (no
+    // credentials, no NODE_OPTIONS preloads); Windows needs SystemRoot to
+    // load system DLLs.
+    cmd.env_clear();
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        cmd.env("SystemRoot", root);
+    }
+    cmd.arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let output = cmd
+        .output()
+        .map_err(|error| format!("does not start ({error})"))?;
+    if !output.status.success() {
+        return Err(format!("does not run (exit {})", output.status));
+    }
+    let banner = String::from_utf8_lossy(&output.stdout);
+    parse_node_version(&banner)
+        .ok_or_else(|| format!("unrecognized version banner `{}`", banner.trim()))
+}
+
+/// Resolve a Node.js runtime for the extension host by trying candidates in
+/// order and keeping the first that *runs* and meets the version floor:
+/// the `[extension_host] node` override, then every `node` on `PATH` (not
+/// only the first — a broken Homebrew node ahead of a working one is a real
+/// failure mode). Blocking: call from `spawn_blocking` in async code.
+///
+/// [`resolve_node`] keeps its single-probe contract for `js_execution`.
+#[must_use]
+pub fn resolve_node_for_extension_host(override_path: Option<&Path>) -> NodeResolution {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(path) = override_path {
+        candidates.push(path.to_path_buf());
+    }
+    let program = if cfg!(windows) { "node.exe" } else { "node" };
+    candidates.extend(
+        executable_path_candidates(program)
+            .into_iter()
+            .filter(|candidate| candidate.is_file()),
+    );
+    select_node(candidates)
+}
+
+fn select_node(candidates: Vec<PathBuf>) -> NodeResolution {
+    let mut seen = std::collections::HashSet::new();
+    let mut resolution = NodeResolution::default();
+    for candidate in candidates {
+        // Deduplicate by spelling only: resolving symlinks here would be a
+        // blocking call per candidate for a cosmetic gain.
+        if !seen.insert(candidate.clone()) {
+            continue;
+        }
+        match probe_node_version(&candidate) {
+            Ok(version) if node_version_supported_for_extension_host(version) => {
+                resolution.selected = Some((candidate, version));
+                break;
+            }
+            Ok((major, minor, patch)) => resolution.rejected.push((
+                candidate,
+                format!("v{major}.{minor}.{patch} is below the ^22.19 || >=24 floor"),
+            )),
+            Err(reason) => resolution.rejected.push((candidate, reason)),
+        }
+    }
+    resolution
+}
+
 // ---------------------------------------------------------------------------
 // ExternalTool trait — unified subprocess interface
 // ---------------------------------------------------------------------------
@@ -704,6 +823,54 @@ pub fn split_interpreter_spec(spec: &str) -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_version_banner_parses_and_floor_matches_dsh_engines() {
+        assert_eq!(parse_node_version("v22.20.0\n"), Some((22, 20, 0)));
+        assert_eq!(parse_node_version("v24.1.0-nightly"), Some((24, 1, 0)));
+        assert_eq!(parse_node_version("22.20.0"), None);
+        assert!(node_version_supported_for_extension_host((22, 19, 0)));
+        assert!(!node_version_supported_for_extension_host((22, 18, 9)));
+        assert!(!node_version_supported_for_extension_host((23, 11, 0)));
+        assert!(!node_version_supported_for_extension_host((20, 19, 0)));
+        assert!(node_version_supported_for_extension_host((24, 0, 0)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_ladder_skips_broken_and_old_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let broken = script(
+            "broken-node",
+            "echo 'dyld: Library not loaded' >&2; exit 134",
+        );
+        let old = script("old-node", "echo v20.11.1");
+        let good = script("good-node", "echo v22.20.0");
+        let later = script("later-node", "echo v24.0.0");
+        let relative = PathBuf::from("node_modules/.bin/node");
+        let resolution = select_node(vec![
+            relative.clone(),
+            broken.clone(),
+            old.clone(),
+            good.clone(),
+            later,
+        ]);
+        assert_eq!(resolution.selected, Some((good, (22, 20, 0))));
+        assert_eq!(resolution.rejected.len(), 3);
+        assert_eq!(resolution.rejected[0].0, relative);
+        assert!(resolution.rejected[0].1.contains("not an absolute path"));
+        assert_eq!(resolution.rejected[1].0, broken);
+        assert!(resolution.rejected[1].1.contains("does not run"));
+        assert_eq!(resolution.rejected[2].0, old);
+        assert!(resolution.rejected[2].1.contains("below"));
+    }
 
     #[test]
     fn probe_executable_returns_false_for_unknown_binary() {

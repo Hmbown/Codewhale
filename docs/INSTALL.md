@@ -466,15 +466,19 @@ Run `brew trust --formula hmbown/deepseek-tui/codewhale` or `brew trust hmbown/d
 
 Run `brew trust hmbown/deepseek-tui` first, or use the full name above.
 
-Tested with Homebrew 7.0.6: the install took 73 s. The formula is version
-0.10.0 and downloads the official release binaries, so there's no compile. It
-provides **both** `codewhale` and `codew`, and depends on `node`, which pulled
-in 31 bottles (~560 MB) on Linux.
+Tested with Homebrew 7.0.6 against the v0.10.0 tap formula: the install took
+73 s. The tap formula tracks the latest release and downloads the official
+release binaries, so there's no compile. It provides **both** `codewhale` and
+`codew`. The `Hmbown/deepseek-tui` tap formula also depends on `node`, which
+pulled in 31 bottles (~560 MB) on Linux. That `node` dependency belongs to
+this tap formula only. The core TUI runs without Node; Computer Use and the JS
+execution tool use it when it is on PATH.
 
 * **Upgrade:** `brew upgrade codewhale`. (`codewhale update` refuses, and
   suggests migrating.)
 * **Uninstall:** `brew uninstall codewhale && brew untap Hmbown/deepseek-tui`.
-  This also autoremoves node and the other dependencies it pulled in. Homebrew's
+  This also autoremoves the tap's node dependency and anything else it pulled
+  in. Homebrew's
   download cache (`~/.cache/Homebrew`, ~330 MB) stays until
   `brew cleanup --prune=all`.
 

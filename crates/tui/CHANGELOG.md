@@ -18,13 +18,21 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Contributors
 
-- **[@gaord](https://github.com/gaord)** — let undo roll back files for the turn it is undoing ([#6483](https://github.com/Hmbown/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/Hmbown/Codewhale/pull/6406)), and exposed user-defined provider routes to native clients ([#6404](https://github.com/Hmbown/Codewhale/pull/6404)).
+- **[@gaord](https://github.com/gaord)** — let a client fork a thread at a named turn ([#6580](https://github.com/Hmbown/Codewhale/pull/6580)), let undo roll back files for the turn it is undoing ([#6483](https://github.com/Hmbown/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/Hmbown/Codewhale/pull/6406)), and exposed user-defined provider routes to native clients ([#6404](https://github.com/Hmbown/Codewhale/pull/6404)).
 - **[@Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)).
 - **[@aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test ([#6581](https://github.com/Hmbown/Codewhale/pull/6581)).
 - **[@dajiaohuang](https://github.com/dajiaohuang)** — `codewhale config set` checks a known setting's value against its schema type before saving it ([#6568](https://github.com/Hmbown/Codewhale/pull/6568)).
+- **[@Water-Run](https://github.com/Water-Run)** — ingested namespaced model-only catalog entries so models present only in the canonical `models` map reach the offering list ([#6400](https://github.com/Hmbown/Codewhale/pull/6400)), and retired the blanket dead-code allowance with its unused feature stages, tightening the budget to match ([#6402](https://github.com/Hmbown/Codewhale/pull/6402)).
 
 ### Added
 
+- Runtime API: `POST /v1/threads/{id}/fork-at-turn` forks a thread at a named
+  user turn, keeping that turn and every turn before it. The receipt matches
+  `/undo` and returns the first dropped prompt so a client can put it back in
+  the composer. Naming the turn replaces a client-computed depth, which could
+  fork the wrong prefix. The fork leaves the workspace and any running turn
+  untouched
+  ([#6580](https://github.com/Hmbown/Codewhale/pull/6580), thanks @gaord).
 - Official model routing: `/router` (also `/model router`) sets up the Auto
   router with presets: Jev (TypeSafe's decision model, via OpenRouter or a
   TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes
@@ -43,6 +51,14 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Fixed
 
+- `codewhale exec --auto` no longer exits 141 with no output when a child
+  it writes to, such as a stdio MCP server, closes its pipe early. Headless
+  exec now ignores SIGPIPE while it runs, as the interactive TUI already did,
+  and `exec ... | head` still ends quietly. One-shot `codewhale exec` no
+  longer prints DeepSeek's raw `<｜｜DSML｜｜ calls>` tool-call markup as its
+  answer: the markup is removed, and an answer that was only a tool call
+  fails at once with the reason and a pointer to `--auto`, instead of asking
+  the model again and blaming an incomplete provider response.
 - The installation page is generated from `docs/INSTALL.md`, so the website
   and the guide can no longer disagree; broken anchors and unsafe links fail
   the build ([#6450](https://github.com/Hmbown/Codewhale/pull/6450)).
@@ -199,6 +215,13 @@ quieter, and Fleet runs can be checked before they spend anything.
 - `workflow(fleet:)` runs Fleets saved from the Fleet UI, and finds
   workspace Fleets under `.codewhale/fleets`.
 - The runtime API can stop a delegated agent run from the desktop.
+- A finished agent's answer is no longer cut off. Its row and its completion
+  notification show the first sentence of its result instead of a
+  `## Summary` heading or its last tool, and opening the agent shows the whole
+  result, or the full reason it stopped, even when no transcript was captured.
+  Each agent also has one name: a workflow task's label or its dispatch name
+  appears on the rows, the notification and the runtime API alike, never its
+  internal id ([#6565](https://github.com/Hmbown/Codewhale/issues/6565)).
 
 ### Plugins
 
@@ -264,7 +287,7 @@ v0.9.14 candidate.
 - **[@VincentCorleone](https://github.com/VincentCorleone)** — defined and implemented the weixin-bridge Quick Start so a first run works from the README alone ([#6170](https://github.com/Hmbown/Codewhale/pull/6170), harvested).
 - **[@Serendo](https://github.com/Serendo)** — fixed the `/config` theme editor exiting the panel on an arrow key ([#6336](https://github.com/Hmbown/Codewhale/pull/6336)).
 - **[@yetuge](https://github.com/yetuge)** — dropped the retired `token_budget` field from the subagent documentation ([#6335](https://github.com/Hmbown/Codewhale/pull/6335)).
-- **[@Water-Run](https://github.com/Water-Run)** — ingested namespaced model-only catalog entries so models present only in the canonical `models` map reach the offering list ([#6400](https://github.com/Hmbown/Codewhale/pull/6400)); translated the local browser client guide into Simplified Chinese ([#6401](https://github.com/Hmbown/Codewhale/pull/6401)); and retired the blanket dead-code allowance with its unused feature stages, tightening the budget to match ([#6402](https://github.com/Hmbown/Codewhale/pull/6402)).
+- **[@Water-Run](https://github.com/Water-Run)** — translated the local browser client guide into Simplified Chinese ([#6401](https://github.com/Hmbown/Codewhale/pull/6401)). Water-Run's catalog and dead-code work (#6400, #6402) landed after the v0.10.0 tag and ships in v0.10.1.
 ### Security
 - Children never inherit desktop or computer-control tools. Desktop control is
   the most machine-wide capability in the catalog, and a verifier child
@@ -5851,6 +5874,8 @@ Thank you to the contributors whose code, reports, and reviews shaped v0.9.1:
   report that exposed lossy high-bit process-status handling (#4100).
 - [@w1w218](https://github.com/w1w218) — the Windows ARM64 release request and
   real-device motivation (#4267).
+- [@stream2stream](https://github.com/stream2stream) — the legacy-session
+  recovery report that led to the read-only doctor diagnostic (#4032, #4539).
 - [@Angel-Hair](https://github.com/Angel-Hair) — session-owned read-before-edit
   tracking and the explicit, backwards-compatible `apply_patch` replacement
   contract (PRs #4475 and #4476).

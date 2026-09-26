@@ -1520,6 +1520,18 @@ fn codex_route_matches_cli_account(config: &Config) -> bool {
     crate::oauth::auth_file_path() == cli_auth_path
 }
 
+/// Whether a provider-scoped live listing can never exist for this route.
+/// OAuth-authenticated routes (other than Codex, which owns its own roster)
+/// have no catalog endpoint Codewhale may call, so listings fall back to the
+/// next catalog layer — live Models.dev, then the bundled snapshot — instead
+/// of treating the missing live listing as "no models".
+pub(crate) fn live_catalog_unavailable(config: &Config, provider: ApiProvider) -> bool {
+    provider != ApiProvider::OpenaiCodex
+        && config
+            .auth_mode_for_provider(provider)
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("oauth"))
+}
+
 pub(crate) async fn update_provider_catalog(
     config: &Config,
     identity: &ProviderIdentity,
@@ -1566,10 +1578,7 @@ pub(crate) async fn update_provider_catalog(
         receipt.error = Some("cli_key_is_scoped_to_active_provider");
         return receipt;
     }
-    if route_config
-        .auth_mode_for_provider(identity.provider)
-        .is_some_and(|mode| mode.eq_ignore_ascii_case("oauth"))
-    {
+    if live_catalog_unavailable(&route_config, identity.provider) {
         receipt.outcome = "skipped";
         receipt.error = Some("oauth_catalog_unavailable");
         return receipt;

@@ -477,7 +477,9 @@ mod tests {
                 role: Some("builder".to_string()),
             },
             model: "test-model".to_string(),
-            nickname: Some("Blue Whale".to_string()),
+            nickname: Some(crate::tools::subagent::whale_name_for_id_in_locale(
+                agent_id, "en",
+            )),
             status: SubAgentStatus::Running,
             worker_status: None,
             runtime_permissions: None,
@@ -501,6 +503,10 @@ mod tests {
 
         let work = pending_work_from_app(&app);
         let labels: Vec<&str> = work.items.iter().map(|item| item.label.as_str()).collect();
-        assert_eq!(labels, ["triage·builder", "Blue Whale·builder"]);
+        let whale = crate::tools::subagent::whale_name_for_id_in_locale("agent_plain_lane", "en");
+        assert_eq!(
+            labels,
+            ["triage·builder".to_string(), format!("{whale}·builder")]
+        );
     }
 }

@@ -118,8 +118,17 @@ fn marketplace_builtin_candidate_routes_to_existing_bundle_review() {
         Some("marketplace install codewhale computer-use"),
         None,
     );
-    assert!(result.is_error);
-    assert!(result.message.unwrap().contains("already exists"));
+    // B5: the published install command succeeds and says it is built in.
+    assert!(!result.is_error, "{:?}", result.message);
+    let message = result.message.unwrap();
+    assert!(message.contains("built into Codewhale"), "{message}");
+    assert!(
+        message.contains(&format!(
+            "/plugin show {}",
+            escape_review_text(original.id.as_str())
+        )),
+        "{message}"
+    );
     let retained = app.plugin_registry.get("computer-use").unwrap();
     assert_eq!(retained.content_hash, original.content_hash);
     assert_eq!(retained.trust_status, original.trust_status);
