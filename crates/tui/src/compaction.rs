@@ -1748,38 +1748,46 @@ async fn create_summary(
                 RequestSizeLadder::Start => {
                     let shrunk =
                         crate::image_attach::shrink_images_for_request(&mut request_messages);
-                    if shrunk.images == 0 {
+                    if shrunk.images_seen == 0 {
                         return Err(err.context(
                             "The summary request exceeded the provider's request-body limit and the history carries no inline images to re-encode",
                         ));
                     }
                     size_ladder = RequestSizeLadder::ImagesShrunk;
-                    let message = format!(
-                        "Making room exceeded the provider's request-body limit (HTTP 413); re-encoded {} inline image(s) smaller ({} to {}) and is retrying the summary.",
-                        shrunk.images,
-                        crate::image_attach::human_bytes(shrunk.bytes_before),
-                        crate::image_attach::human_bytes(shrunk.bytes_after),
-                    );
-                    logging::warn(&message);
-                    deliver_compaction_notice(notice_sink, message);
+                    if shrunk.images > 0 {
+                        let message = format!(
+                            "Making room exceeded the provider's request-body limit (HTTP 413); re-encoded {} inline image(s) smaller ({} to {}) and is retrying the summary.",
+                            shrunk.images,
+                            crate::image_attach::human_bytes(shrunk.bytes_before),
+                            crate::image_attach::human_bytes(shrunk.bytes_after),
+                        );
+                        logging::warn(&message);
+                        deliver_compaction_notice(notice_sink, message);
+                        continue;
+                    }
+                    // Images are present but every one already fits its share of
+                    // the byte budget, and the body was still refused: the cap
+                    // sits below the budget. A retry would send identical bytes,
+                    // so replace the images now instead of failing the pass.
+                    if let Err(replace_error) =
+                        replace_inline_images_for_retry(&mut request_messages, notice_sink)
+                    {
+                        return Err(err.context(format!(
+                            "The summary request exceeded the provider's request-body limit; {replace_error}"
+                        )));
+                    }
+                    size_ladder = RequestSizeLadder::ImagesReplaced;
                     continue;
                 }
                 RequestSizeLadder::ImagesShrunk => {
-                    let replaced = crate::image_attach::replace_images_with_placeholders(
-                        &mut request_messages,
-                        "the summary request exceeded the provider's request-body limit (HTTP 413)",
-                    );
-                    if replaced == 0 {
-                        return Err(err.context(
-                            "The summary request still exceeded the provider's request-body limit and no inline images were left to replace",
-                        ));
+                    if let Err(replace_error) =
+                        replace_inline_images_for_retry(&mut request_messages, notice_sink)
+                    {
+                        return Err(err.context(format!(
+                            "The summary request still exceeded the provider's request-body limit and {replace_error}"
+                        )));
                     }
                     size_ladder = RequestSizeLadder::ImagesReplaced;
-                    let message = format!(
-                        "Making room still exceeded the provider's request-body limit; replaced {replaced} inline image(s) with text notes for this summary pass and is retrying.",
-                    );
-                    logging::warn(&message);
-                    deliver_compaction_notice(notice_sink, message);
                     continue;
                 }
                 RequestSizeLadder::ImagesReplaced => {
@@ -1900,9 +1908,13 @@ enum RequestSizeLadder {
 fn is_request_too_large_error(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
         let lower = cause.to_string().to_lowercase();
+        // The client always renders the status code into the message
+        // ("HTTP 413"), so that token is the primary signal; the phrase list
+        // below catches gateways that state the condition without it.
         lower.contains("http 413")
             || lower.contains("payload too large")
             || lower.contains("request entity too large")
+            || lower.contains("request body too large")
             || lower.contains("length limit exceeded")
     })
 }
@@ -1912,6 +1924,30 @@ fn deliver_compaction_notice(sink: Option<&dyn CompactionNoticeSink>, message: S
     if let Some(sink) = sink {
         sink.notice(message);
     }
+}
+
+/// Replace every inline image for one retry and announce it.
+///
+/// Shared by the two rungs that can reach the replace step: after a shrink
+/// pass that changed something, and directly when the images already fit the
+/// byte budget but the body was refused anyway.
+fn replace_inline_images_for_retry(
+    messages: &mut Vec<Message>,
+    notice_sink: Option<&dyn CompactionNoticeSink>,
+) -> Result<usize> {
+    let replaced = crate::image_attach::replace_images_with_placeholders(
+        messages,
+        "the summary request exceeded the provider's request-body limit (HTTP 413)",
+    );
+    if replaced == 0 {
+        anyhow::bail!("no inline images were left to replace");
+    }
+    let message = format!(
+        "Making room still exceeded the provider's request-body limit; replaced {replaced} inline image(s) with text notes for this summary pass and is retrying."
+    );
+    logging::warn(&message);
+    deliver_compaction_notice(notice_sink, message);
+    Ok(replaced)
 }
 
 fn is_context_window_error(e: &anyhow::Error) -> bool {
@@ -2538,6 +2574,50 @@ mod tests {
             "the user hears about the downgrade: {notices:?}"
         );
         assert!(notices[0].contains("413"), "{notices:?}");
+    }
+
+    #[tokio::test]
+    async fn request_body_413_with_in_budget_images_skips_the_noop_retry_and_replaces() {
+        // The images fit their share of the 2 MiB budget, yet the endpoint
+        // refused the body: the cap sits below the budget. The ladder must not
+        // report "no images" (which would fail the pass outright) and must not
+        // resend identical bytes — it goes straight to the replace rung.
+        let _environment = crate::test_support::lock_test_env();
+        let messages = vec![
+            msg("user", "context before the screenshot"),
+            user_image_message(&png_data_url(64, 64)),
+        ];
+        let client = ScriptedSummaryClient::with_outcomes(vec![
+            Err(request_body_413()),
+            Ok(summary_content()),
+        ]);
+        let sink = std::sync::Arc::new(RecordingNoticeSink::default());
+        let envelope = body_413_retry_envelope(sink.clone());
+        let mut usage = Usage::default();
+
+        let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
+        assert!(
+            result.is_ok(),
+            "in-budget images must still let the ladder finish: {result:?}"
+        );
+        let requests = client.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 2, "replace directly, no identical retry");
+        assert!(
+            inline_image_bytes(&requests[0]) > 0,
+            "the fixture carried the image"
+        );
+        assert_eq!(
+            inline_image_bytes(&requests[1]),
+            0,
+            "the retry carries notes, not bytes"
+        );
+        let notices = sink.messages();
+        assert_eq!(
+            notices.len(),
+            1,
+            "one notice for the replace rung: {notices:?}"
+        );
+        assert!(notices[0].contains("replaced"), "{notices:?}");
     }
 
     #[tokio::test]

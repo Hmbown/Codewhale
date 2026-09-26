@@ -124,8 +124,12 @@ fn compaction_shrink_leaves_an_under_budget_history_untouched() {
     let mut messages = image_blocks_fixture();
     let before = messages.clone();
     let outcome = shrink_images_for_request_with_budget(&mut messages, 32 * 1024 * 1024);
-    assert_eq!(outcome, ShrunkInlineImages::default());
-    assert_eq!(messages, before, "a fitting request is never rewritten");
+    assert_eq!(outcome.images, 0, "a fitting request is never rewritten");
+    assert_eq!(
+        outcome.images_seen, 2,
+        "the request still carried images, and the ladder must be able to tell"
+    );
+    assert_eq!(messages, before);
 }
 
 #[test]

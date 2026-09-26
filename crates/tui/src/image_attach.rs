@@ -801,6 +801,13 @@ const COMPACTION_IMAGE_JPEG_QUALITY: u8 = 80;
 pub(crate) struct ShrunkInlineImages {
     /// Images that were re-encoded smaller.
     pub images: usize,
+    /// Inline images the request carried, rewritten or not.
+    ///
+    /// `images == 0` alone cannot tell "nothing to do because every image
+    /// already fits" from "there were no images"; a request-size ladder must
+    /// not conflate the two, because only the second makes the next rung
+    /// pointless.
+    pub images_seen: usize,
     /// Decoded bytes of those images before the pass.
     pub bytes_before: usize,
     /// Decoded bytes of those images after the pass.
@@ -814,10 +821,12 @@ pub(crate) struct ShrunkInlineImages {
 /// that the wire projection reads back out via
 /// [`provider_tool_result_image_refs`].
 ///
-/// `images == 0` means nothing was rewritten — there were no inline images,
-/// or each was already under its share of the budget — so a caller that is
+/// `images == 0` means nothing was rewritten — either there were no inline
+/// images, or each was already under its share of the budget. Check
+/// [`ShrunkInlineImages::images_seen`] to tell those apart: a caller that is
 /// still looking at a body-size rejection must climb to the next rung rather
-/// than resend the same bytes.
+/// than resend the same bytes, and when images are present but nothing was
+/// rewritten, the next rung is the only one that can still change the payload.
 pub(crate) fn shrink_images_for_request(
     messages: &mut [codewhale_models::Message],
 ) -> ShrunkInlineImages {
@@ -832,9 +841,20 @@ pub(crate) fn shrink_images_for_request_with_budget(
 ) -> ShrunkInlineImages {
     let sizes = inline_image_sizes(messages);
     let total: usize = sizes.iter().sum();
-    if sizes.is_empty() || total <= budget {
-        return ShrunkInlineImages::default();
+    let images_seen = sizes.len();
+    if total <= budget {
+        // Images may be present and simply already fit: report them as seen
+        // without rewriting, so a caller can tell "nothing to shrink" from
+        // "nothing there".
+        return ShrunkInlineImages {
+            images_seen,
+            ..ShrunkInlineImages::default()
+        };
     }
+    // A share of the budget per image, floored so a few large images still come
+    // back readable. With many images the floor can push the total past
+    // `budget`; the caller's next rung (replace with notes) covers that case,
+    // not a tighter share here.
     let per_image = (budget / sizes.len()).max(COMPACTION_IMAGE_MIN_BUDGET_BYTES);
     let mut outcome = ShrunkInlineImages::default();
     for message in messages.iter_mut() {
@@ -864,6 +884,7 @@ pub(crate) fn shrink_images_for_request_with_budget(
             }
         }
     }
+    outcome.images_seen = images_seen;
     outcome
 }
 
