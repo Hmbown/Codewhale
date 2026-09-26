@@ -4470,28 +4470,31 @@ impl Engine {
                     // state before file-modifying tools execute so `/undo` can
                     // revert the most recent write_file/edit_file/apply_patch.
                     // See `should_pre_tool_snapshot` for the gating rationale (#3292).
-                    if should_pre_tool_snapshot(
-                        self.config.snapshots_enabled,
-                        result_override.is_some(),
-                        tool_name.as_str(),
-                        &tool_input,
-                    ) {
-                        let ws = self.session.workspace.clone();
-                        let tid = tool_id.clone();
-                        let cap = self.config.snapshots_max_workspace_bytes;
-                        let sid = self.session.id.clone();
-                        let taken = tokio::task::spawn_blocking(move || {
-                            crate::core::turn::pre_tool_snapshot(&ws, &tid, cap, Some(&sid))
-                        })
-                        .await
-                        .ok()
-                        .flatten();
-                        self.emit_snapshot_receipt(
-                            crate::snapshot::WorkspaceSnapshotKind::Tool,
-                            taken,
-                            Some(tool_id.as_str()),
+                    // A host that records restore points also bounds every call
+                    // that may write (a shell command, a program, a write-capable
+                    // MCP tool) so the span it ran in is known; its post-tool
+                    // snapshot is taken once it returns.
+                    let bounded_tool = self.config.record_restore_points
+                        && self.config.snapshots_enabled
+                        && result_override.is_none()
+                        && !plan.read_only;
+                    let mut tool_restore_point = false;
+                    if bounded_tool
+                        || should_pre_tool_snapshot(
+                            self.config.snapshots_enabled,
+                            result_override.is_some(),
+                            tool_name.as_str(),
+                            &tool_input,
                         )
-                        .await;
+                    {
+                        tool_restore_point = self
+                            .take_restore_point(
+                                crate::snapshot::WorkspaceSnapshotKind::Tool,
+                                format!("tool:{tool_id}"),
+                                Some(tool_id.as_str()),
+                                super::file_write_tool_target_paths(&tool_name, &tool_input),
+                            )
+                            .await;
                         self.emit_pending_snapshot_notices().await;
                     }
 
@@ -4571,6 +4574,18 @@ impl Engine {
                         result = Ok(RichToolResult::plain(
                             self.cancelled_active_tool_result(&tool_id, origin_turn_id),
                         ));
+                    }
+
+                    // Close the span the call ran in (recording hosts only).
+                    if tool_restore_point && self.config.record_restore_points {
+                        self.take_restore_point(
+                            crate::snapshot::WorkspaceSnapshotKind::PostTool,
+                            format!("post-tool:{tool_id}"),
+                            Some(tool_id.as_str()),
+                            None,
+                        )
+                        .await;
+                        self.emit_pending_snapshot_notices().await;
                     }
 
                     if let Some(approval_stamp) = approval_stamp
@@ -4945,20 +4960,11 @@ impl Engine {
             plan.name.as_str(),
             &plan.input,
         ) {
-            let ws = self.session.workspace.clone();
-            let tid = nested_id.clone();
-            let cap = self.config.snapshots_max_workspace_bytes;
-            let sid = self.session.id.clone();
-            let taken = tokio::task::spawn_blocking(move || {
-                crate::core::turn::pre_tool_snapshot(&ws, &tid, cap, Some(&sid))
-            })
-            .await
-            .ok()
-            .flatten();
-            self.emit_snapshot_receipt(
+            self.take_restore_point(
                 crate::snapshot::WorkspaceSnapshotKind::Tool,
-                taken,
+                format!("tool:{nested_id}"),
                 Some(nested_id.as_str()),
+                super::file_write_tool_target_paths(&plan.name, &plan.input),
             )
             .await;
             self.emit_pending_snapshot_notices().await;

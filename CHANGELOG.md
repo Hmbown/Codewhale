@@ -59,8 +59,13 @@ quieter, and Fleet runs can be checked before they spend anything.
   under the thread's own id across restarts, and a fork owns the turns it
   inherited. `patch-undo` restores only the files the undone turns changed,
   including every write in a turn, and leaves later edits by the user or
-  another thread alone. When it cannot restore files it now refuses with `409`
-  and an `error.code` instead of returning `201`
+  another thread alone. Every tool call that may write is bounded by its own
+  snapshots, so a file another thread or an editor changed while the turn ran
+  is never reverted as the turn's, and a turn's restore points survive the
+  snapshot count cap. When it cannot restore files (including a write to a
+  gitignored path) it now refuses with `409` and an `error.code` instead of
+  returning `201`. A nameless `PUT /v1/sessions` updates the document the
+  thread is bound to
   ([#6621](https://github.com/Hmbown/Codewhale/issues/6621)).
 - `codewhale exec --auto` no longer exits 141 with no output when a child
   it writes to, such as a stdio MCP server, closes its pipe early. Headless

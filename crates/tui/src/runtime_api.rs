@@ -5798,9 +5798,10 @@ async fn patch_undo_thread_turn(
 }
 
 /// Error codes a patch-undo refusal carries in `error.code`. A client offers a
-/// conversation-only `POST /v1/threads/{id}/undo` for the first three.
+/// conversation-only `POST /v1/threads/{id}/undo` for the first four.
 const PATCH_UNDO_NO_RESTORE_POINT: &str = "restore_point_unavailable";
 const PATCH_UNDO_RESTORE_POINT_PRUNED: &str = "restore_point_pruned";
+const PATCH_UNDO_PATH_NOT_SNAPSHOTTED: &str = "path_not_snapshotted";
 const PATCH_UNDO_WORKSPACE_CHANGED: &str = "workspace_changed_since_turn";
 const PATCH_UNDO_UNTRUSTED: &str = "restore_requires_trust";
 const PATCH_UNDO_WORKSPACE_UNAVAILABLE: &str = "workspace_unavailable";
@@ -5812,42 +5813,175 @@ struct UndoSegment {
     pre: crate::snapshot::SnapshotId,
     post: crate::snapshot::SnapshotId,
     pre_label: String,
+    /// Paths that changed in the window only while one of the turn's own
+    /// tool calls was running: the turn's changes.
+    owned: std::collections::BTreeSet<PathBuf>,
+    /// Paths that changed in the window while none of the turn's tools could
+    /// have written them: someone else's changes.
+    foreign: std::collections::BTreeSet<PathBuf>,
 }
 
 /// Pair each `pre_turn` receipt of a turn with the `post_turn` receipt that
-/// closes it, in recorded order. A turn can hold more than one window (a
-/// shell turn and a model turn under one runtime turn); a `post_turn` with no
-/// open window cannot belong to this turn and is skipped. `None` means a
-/// window the engine never closed (the turn died before its post-turn
-/// snapshot) or no window at all.
+/// closes it, in recorded order, as index ranges into `snapshots` (the
+/// `tool`/`post_tool` receipts between them are the window's inner spans). A
+/// turn can hold more than one window (a shell turn and a model turn under
+/// one runtime turn); a `post_turn` with no open window cannot belong to this
+/// turn and is skipped. `None` means a window the engine never closed (the
+/// turn died before its post-turn snapshot) or no window at all.
 fn turn_snapshot_windows(
     snapshots: &[crate::snapshot::WorkspaceSnapshotRef],
-) -> Option<
-    Vec<(
-        &crate::snapshot::WorkspaceSnapshotRef,
-        &crate::snapshot::WorkspaceSnapshotRef,
-    )>,
-> {
+) -> Option<Vec<std::ops::RangeInclusive<usize>>> {
     use crate::snapshot::WorkspaceSnapshotKind;
     let mut windows = Vec::new();
     let mut open = None;
-    for snapshot in snapshots {
+    for (index, snapshot) in snapshots.iter().enumerate() {
         match snapshot.kind {
             WorkspaceSnapshotKind::PreTurn => {
                 if open.is_some() {
                     return None;
                 }
-                open = Some(snapshot);
+                open = Some(index);
             }
             WorkspaceSnapshotKind::PostTurn => {
                 if let Some(pre) = open.take() {
-                    windows.push((pre, snapshot));
+                    windows.push(pre..=index);
                 }
             }
-            WorkspaceSnapshotKind::Tool => {}
+            WorkspaceSnapshotKind::Tool | WorkspaceSnapshotKind::PostTool => {}
         }
     }
     (open.is_none() && !windows.is_empty()).then_some(windows)
+}
+
+/// A path a file tool declared it writes, as a workspace-relative path the
+/// snapshots would hold, or `None` when it is outside the workspace.
+fn declared_write_path(workspace: &FsPath, raw: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let candidate = FsPath::new(raw);
+    let rel = if candidate.is_absolute() {
+        let canonical_workspace = workspace.canonicalize().ok();
+        let canonical_candidate = candidate
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .zip(candidate.file_name())
+            .map(|(parent, name)| parent.join(name));
+        [Some(workspace), canonical_workspace.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(|root| {
+                candidate
+                    .strip_prefix(root)
+                    .ok()
+                    .or_else(|| canonical_candidate.as_deref()?.strip_prefix(root).ok())
+                    .map(FsPath::to_path_buf)
+            })?
+    } else {
+        candidate.to_path_buf()
+    };
+    let rel: PathBuf = rel
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .collect();
+    crate::snapshot::workspace_relative_path(workspace, rel.to_str()?)
+}
+
+/// Who could have changed the workspace in the span after one receipt.
+enum SpanWriter {
+    /// None of the turn's tool calls was running.
+    Nobody,
+    /// A call whose writes are not declared (a shell command, a program).
+    Undeclared,
+    /// A file tool that declared exactly these paths.
+    Declared(std::collections::BTreeSet<PathBuf>),
+}
+
+/// Split a window's changes into the turn's own and everyone else's, from
+/// the spans its receipts bound: a path belongs to the turn only if it
+/// changed while one of the turn's tool calls was running and, for a file
+/// tool, is one the call declared. A span whose changes were not recorded
+/// (a snapshot in it failed) cannot be attributed and fails closed.
+fn attribute_window(
+    workspace: &FsPath,
+    turn_id: &str,
+    receipts: &[crate::snapshot::WorkspaceSnapshotRef],
+) -> Result<
+    (
+        std::collections::BTreeSet<PathBuf>,
+        std::collections::BTreeSet<PathBuf>,
+    ),
+    ApiError,
+> {
+    use crate::snapshot::WorkspaceSnapshotKind;
+    let mut owned = std::collections::BTreeSet::new();
+    let mut foreign = std::collections::BTreeSet::new();
+    // Undeclared calls whose `post_tool` receipt is still ahead: everything
+    // up to it (a program's nested calls included) is theirs.
+    let mut open_undeclared: Vec<&str> = Vec::new();
+    let mut writer = SpanWriter::Nobody;
+    for (index, receipt) in receipts.iter().enumerate() {
+        if index > 0 {
+            let Some(changed) = receipt.changed_paths.as_ref() else {
+                return Err(no_restore_point(
+                    turn_id,
+                    "has an incomplete record of what changed while it ran (a snapshot during the turn failed), so its changes cannot be told apart from anyone else's",
+                ));
+            };
+            for path in changed {
+                let path = PathBuf::from(path);
+                match &writer {
+                    SpanWriter::Undeclared => {
+                        owned.insert(path);
+                    }
+                    SpanWriter::Declared(declared) if declared.contains(&path) => {
+                        owned.insert(path);
+                    }
+                    SpanWriter::Declared(_) | SpanWriter::Nobody => {
+                        foreign.insert(path);
+                    }
+                }
+            }
+        }
+        match receipt.kind {
+            WorkspaceSnapshotKind::Tool => {
+                if receipt.write_paths.is_none()
+                    && let Some(call) = receipt.tool_call_id.as_deref()
+                    && receipts[index + 1..].iter().any(|later| {
+                        later.kind == WorkspaceSnapshotKind::PostTool
+                            && later.tool_call_id.as_deref() == Some(call)
+                    })
+                {
+                    open_undeclared.push(call);
+                }
+            }
+            WorkspaceSnapshotKind::PostTool => {
+                if let Some(call) = receipt.tool_call_id.as_deref() {
+                    open_undeclared.retain(|open| *open != call);
+                }
+            }
+            WorkspaceSnapshotKind::PreTurn | WorkspaceSnapshotKind::PostTurn => {}
+        }
+        writer = if !open_undeclared.is_empty() {
+            SpanWriter::Undeclared
+        } else {
+            match receipt.kind {
+                // A shell turn: its command runs from the pre-turn snapshot.
+                WorkspaceSnapshotKind::PreTurn if receipt.tool_call_id.is_some() => {
+                    SpanWriter::Undeclared
+                }
+                WorkspaceSnapshotKind::Tool => match receipt.write_paths.as_ref() {
+                    Some(paths) => SpanWriter::Declared(
+                        paths
+                            .iter()
+                            .filter_map(|raw| declared_write_path(workspace, raw))
+                            .collect(),
+                    ),
+                    None => SpanWriter::Undeclared,
+                },
+                _ => SpanWriter::Nobody,
+            }
+        };
+    }
+    Ok((owned, foreign))
 }
 
 fn no_restore_point(turn_id: &str, why: &str) -> ApiError {
@@ -5874,13 +6008,22 @@ fn no_restore_point(turn_id: &str, why: &str) -> ApiError {
 /// # What is restored
 ///
 /// For each dropped turn's window, the paths that differ between its
-/// pre-turn and post-turn snapshots are the turn's changes. Each such path
-/// goes back to its content before the first dropped turn that changed it,
-/// and nothing outside that set is touched: later work by the user or by
-/// another thread in the same workspace survives. The whole turn goes, not
-/// just its last write. Changes another writer made to those same paths
-/// *during* a dropped turn are indistinguishable from the turn's own and are
-/// rolled back with it.
+/// pre-turn and post-turn snapshots are candidates, and each must be the
+/// turn's own: it changed only while one of the turn's tool calls was running
+/// (the engine bounds every call that may write with a `tool` and a
+/// `post_tool` snapshot and records what changed in each span), and, for a
+/// file tool, it is a path the call declared. A path that changed while none
+/// of the turn's tools could have written it — another thread, an editor, a
+/// background process — is someone else's change: the undo is refused rather
+/// than revert it. Each of the turn's paths goes back to its content before
+/// the first dropped turn that changed it, and nothing outside that set is
+/// touched, so later work survives. The whole turn goes, not just its last
+/// write.
+///
+/// A path a file tool declared that the snapshots cannot hold (ignored by
+/// `.gitignore` or the built-in exclusions, or outside the workspace) is
+/// refused too: no snapshot can put it back, so "nothing to restore" would
+/// be a lie.
 ///
 /// # The rollback contract
 ///
@@ -5932,7 +6075,7 @@ fn patch_undo_workspace_files(
         windows.extend(
             turn_windows
                 .into_iter()
-                .map(|(pre, post)| (turn, pre, post)),
+                .map(|range| (turn, &turn.snapshots[range])),
         );
     }
     if windows.is_empty() {
@@ -5973,15 +6116,56 @@ fn patch_undo_workspace_files(
                 .with_code(PATCH_UNDO_RESTORE_POINT_PRUNED)
             })
     };
+
+    // Every path a dropped file-tool call declared must be one the snapshots
+    // hold; otherwise its change is invisible to them and cannot be undone.
+    let mut not_snapshotted = std::collections::BTreeSet::new();
+    for turn in dropped_turns.iter().filter(|turn| turn.may_change_files) {
+        let receipt_writes = turn
+            .snapshots
+            .iter()
+            .filter(|receipt| {
+                receipt
+                    .tool_call_id
+                    .as_ref()
+                    .is_none_or(|call| !turn.unrun_tool_calls.contains(call))
+            })
+            .filter_map(|receipt| receipt.write_paths.as_ref())
+            .flatten();
+        for raw in turn.declared_writes.iter().chain(receipt_writes) {
+            let covered = match declared_write_path(workspace, raw) {
+                Some(rel) => !repo.path_is_excluded(&rel).map_err(|e| {
+                    ApiError::internal(format!(
+                        "Failed to check snapshot coverage; conversation preserved: {e}"
+                    ))
+                })?,
+                None => false,
+            };
+            if !covered {
+                not_snapshotted.insert(raw.clone());
+            }
+        }
+    }
+    if !not_snapshotted.is_empty() {
+        return Err(ApiError::conflict(format!(
+            "The undone turn(s) wrote {}, which workspace snapshots do not hold (ignored by .gitignore or the built-in snapshot exclusions, or outside the workspace), so those changes cannot be restored; nothing was changed. Use POST /v1/threads/{{id}}/undo for a conversation-only undo and restore those files yourself.",
+            not_snapshotted.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+        .with_code(PATCH_UNDO_PATH_NOT_SNAPSHOTTED));
+    }
+
     let mut segments = Vec::with_capacity(windows.len());
-    for (turn, pre, post) in windows {
-        let (pre, pre_label) = resolve(&turn.turn_id, pre)?;
-        let (post, _) = resolve(&turn.turn_id, post)?;
+    for (turn, receipts) in windows {
+        let (pre, pre_label) = resolve(&turn.turn_id, &receipts[0])?;
+        let (post, _) = resolve(&turn.turn_id, &receipts[receipts.len() - 1])?;
+        let (owned, foreign) = attribute_window(workspace, &turn.turn_id, receipts)?;
         segments.push(UndoSegment {
             turn_id: turn.turn_id.clone(),
             pre,
             post,
             pre_label,
+            owned,
+            foreign,
         });
     }
 
@@ -6004,10 +6188,26 @@ fn patch_undo_workspace_files(
         (crate::snapshot::SnapshotId, crate::snapshot::SnapshotId),
     > = std::collections::BTreeMap::new();
     for segment in &segments {
-        for path in repo
+        let changed = repo
             .changed_paths_between(&segment.pre, &segment.post)
-            .map_err(compare_err)?
-        {
+            .map_err(compare_err)?;
+        // A path someone else changed while the turn ran cannot be told
+        // apart from the turn's own change to it, and reverting it would
+        // erase their work: refuse instead of guessing.
+        let not_owned: Vec<String> = changed
+            .iter()
+            .filter(|path| segment.foreign.contains(*path) || !segment.owned.contains(*path))
+            .map(|path| path.display().to_string())
+            .collect();
+        if !not_owned.is_empty() {
+            return Err(ApiError::conflict(format!(
+                "{} changed while turn {} ran but outside its own tool calls (another thread, an editor or a background process), so undoing the turn would revert changes it did not make; nothing was changed. Revert the turn's files individually with file-revert, or use /undo for a conversation-only undo.",
+                not_owned.join(", "),
+                segment.turn_id
+            ))
+            .with_code(PATCH_UNDO_WORKSPACE_CHANGED));
+        }
+        for path in changed {
             match plan.get_mut(&path) {
                 None => {
                     plan.insert(path, (segment.pre.clone(), segment.post.clone()));

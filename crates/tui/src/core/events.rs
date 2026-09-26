@@ -282,10 +282,11 @@ pub enum Event {
     },
 
     /// The engine took a workspace snapshot for the running turn: before it
-    /// (`pre_turn`), before one file-modifying tool call (`tool`), or after it
+    /// (`pre_turn`), before one file-modifying tool call (`tool`), after that
+    /// call (`post_tool`, recording hosts only), or after the turn
     /// (`post_turn`). A host that records these on its turn records owns
     /// exactly those restore points (see `crate::snapshot::WorkspaceSnapshotRef`).
-    /// With `EngineConfig::await_post_turn_snapshot` every receipt of a turn
+    /// With `EngineConfig::record_restore_points` every receipt of a turn
     /// arrives before its `TurnComplete`.
     WorkspaceSnapshotTaken {
         snapshot: crate::snapshot::WorkspaceSnapshotRef,

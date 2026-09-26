@@ -4882,6 +4882,15 @@ pub(crate) struct DroppedTurnSnapshots {
     pub may_change_files: bool,
     /// The restore points the engine reported for the turn, in order.
     pub snapshots: Vec<crate::snapshot::WorkspaceSnapshotRef>,
+    /// Paths the turn's file-tool calls (`write_file`, `edit_file`,
+    /// `apply_patch`) declared they write, as the calls named them, for every
+    /// call that ran (completed, or stopped mid-run). A turn-scoped undo can
+    /// only restore what the snapshots hold, so each is checked against the
+    /// snapshot exclusions.
+    pub declared_writes: Vec<String>,
+    /// Tool calls recorded as failed, canceled or never started: whatever
+    /// paths their snapshot receipts declare, they wrote nothing.
+    pub unrun_tool_calls: std::collections::BTreeSet<String>,
 }
 
 /// Shared ownership of an existing task's join. A canceled drain drops only
@@ -9550,12 +9559,47 @@ impl RuntimeThreadManager {
                     )
                 });
                 let ran_here = turn.permission_posture.is_some();
+                let mut declared_writes = Vec::new();
+                let mut unrun_tool_calls = std::collections::BTreeSet::new();
+                for item in items {
+                    let Some(meta) = item.metadata.as_ref() else {
+                        continue;
+                    };
+                    let call_id = meta.get("tool_use_id").and_then(Value::as_str);
+                    if matches!(
+                        item.status,
+                        TurnItemLifecycleStatus::Failed
+                            | TurnItemLifecycleStatus::Canceled
+                            | TurnItemLifecycleStatus::Queued
+                    ) {
+                        if let Some(call_id) = call_id {
+                            unrun_tool_calls.insert(call_id.to_string());
+                        }
+                        continue;
+                    }
+                    let (Some(name), Some(input)) = (
+                        meta.get("tool_name").and_then(Value::as_str),
+                        meta.get("tool_input").and_then(Value::as_str),
+                    ) else {
+                        continue;
+                    };
+                    let Ok(input) = serde_json::from_str::<Value>(input) else {
+                        continue;
+                    };
+                    if let Some(paths) =
+                        crate::core::engine::file_write_tool_target_paths(name, &input)
+                    {
+                        declared_writes.extend(paths);
+                    }
+                }
                 DroppedTurnSnapshots {
                     turn_id: turn.id.clone(),
                     may_change_files: !turn.routing_settlement
                         && !items.is_empty()
                         && (ran_tools || !ran_here),
                     snapshots: turn.workspace_snapshots.clone(),
+                    declared_writes,
+                    unrun_tool_calls,
                 }
             })
             .collect();
@@ -12250,9 +12294,12 @@ impl RuntimeThreadManager {
                     .snapshots_config()
                     .max_workspace_gb
                     .saturating_mul(1024 * 1024 * 1024),
-                // Every snapshot receipt, post-turn included, must reach
-                // `monitor_turn` before the turn settles.
-                await_post_turn_snapshot: true,
+                // Every snapshot receipt, post-turn included, reaches
+                // `monitor_turn` before the turn settles, and every tool
+                // call that may write is bounded by its own snapshots, so
+                // turn-scoped undo can tell the turn's changes from anyone
+                // else's.
+                record_restore_points: true,
                 lsp_config,
                 runtime_services: crate::tools::spec::RuntimeToolServices {
                     task_manager: self.task_manager.lock().upgrade(),
@@ -14363,7 +14410,7 @@ impl RuntimeThreadManager {
                 EngineEvent::WorkspaceSnapshotTaken { snapshot } => {
                     // The restore point belongs to the turn this monitor
                     // owns: snapshot receipts share the engine's FIFO
-                    // channel and, with `await_post_turn_snapshot`, all
+                    // channel and, with `record_restore_points`, all
                     // arrive before this turn's TurnComplete. A receipt that
                     // cannot be recorded leaves the turn without that
                     // restore point, and patch-undo then refuses the turn

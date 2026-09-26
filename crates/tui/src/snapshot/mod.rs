@@ -48,8 +48,11 @@ pub mod repo;
 pub use paths::{snapshot_dir_for, snapshot_git_dir};
 pub use prune::{DEFAULT_MAX_AGE, prune_older_than};
 
-/// Maximum snapshots kept per workspace side-repo. Oldest are pruned
-/// after each new snapshot to cap disk usage (#1112).
+/// Snapshots kept per workspace side-repo, pruned after each new snapshot to
+/// cap disk usage (#1112): the newest this many, plus the newest this many
+/// turn boundaries (`pre-turn:` / `post-turn:`), so a burst of per-tool
+/// snapshots can never push out the restore points of the turns that took
+/// them (see [`SnapshotRepo::prune_keep_last_n`]).
 pub const DEFAULT_MAX_SNAPSHOTS: usize = 50;
 #[allow(unused_imports)]
 pub use repo::{
@@ -67,6 +70,10 @@ pub enum WorkspaceSnapshotKind {
     PreTurn,
     /// Before one file-modifying tool call ran (`tool:<call_id>` label).
     Tool,
+    /// After a tool call that had a `tool` snapshot finished
+    /// (`post-tool:<call_id>` label). Taken only by hosts that record
+    /// restore points, so the span a tool ran in is bounded on both sides.
+    PostTool,
     /// After the turn finished (`post-turn:` label).
     PostTurn,
 }
@@ -77,6 +84,7 @@ impl WorkspaceSnapshotKind {
         match self {
             Self::PreTurn => "pre-turn:",
             Self::Tool => "tool:",
+            Self::PostTool => "post-tool:",
             Self::PostTurn => "post-turn:",
         }
     }
@@ -102,9 +110,25 @@ pub struct WorkspaceSnapshotRef {
     pub tree_id: String,
     /// Session tag the snapshot was taken under.
     pub session_id: String,
-    /// Tool call the snapshot preceded, for [`WorkspaceSnapshotKind::Tool`].
+    /// The tool call that runs from this snapshot to the next one of the
+    /// turn: the call a `tool` snapshot preceded, or, on a `pre_turn`
+    /// snapshot, the user shell command a shell turn runs. A `post_tool`
+    /// snapshot names the call it closes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// For a `tool` snapshot of a file tool (`write_file`, `edit_file`,
+    /// `apply_patch`): the paths the call declared it writes, as it named
+    /// them. Absent for a tool whose writes are not declared (a shell
+    /// command, a program), which may change any path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_paths: Option<Vec<String>>,
+    /// Workspace-relative paths whose content changed since the turn's
+    /// previous snapshot: what happened in the span this snapshot closes.
+    /// Absent on a `pre_turn` snapshot (nothing precedes it in the turn) and
+    /// when it could not be computed (the previous snapshot failed or is
+    /// gone), which leaves that span unaccounted for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_paths: Option<Vec<String>>,
 }
 
 impl WorkspaceSnapshotRef {
@@ -120,6 +144,8 @@ impl WorkspaceSnapshotRef {
             tree_id: taken.tree.as_str().to_string(),
             session_id: session_id.to_string(),
             tool_call_id: tool_call_id.map(str::to_string),
+            write_paths: None,
+            changed_paths: None,
         }
     }
 

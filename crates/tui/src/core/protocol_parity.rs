@@ -1453,6 +1453,8 @@ mod tests {
                     tree_id: "b".repeat(40),
                     session_id: "thr_1".into(),
                     tool_call_id: Some("c1".into()),
+                    write_paths: Some(vec!["src/lib.rs".into()]),
+                    changed_paths: Some(Vec::new()),
                 },
             },
             Event::RoutedTurnUsage {

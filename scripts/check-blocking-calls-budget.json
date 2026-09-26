@@ -332,6 +332,9 @@
   "crates/tui/src/rlm/turn.rs": {
     "std_fs": 2
   },
+  "crates/tui/src/runtime_api.rs": {
+    "path_canonicalize": 2
+  },
   "crates/tui/src/runtime_api/diagnostics.rs": {
     "std_fs": 5
   },

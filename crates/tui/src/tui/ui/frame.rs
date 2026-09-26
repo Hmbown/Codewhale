@@ -998,7 +998,7 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
             .saturating_mul(1024 * 1024 * 1024),
         // The TUI records no snapshot receipts; its post-turn snapshot stays
         // off the input path (#234).
-        await_post_turn_snapshot: false,
+        record_restore_points: false,
         lsp_config: config
             .lsp
             .clone()

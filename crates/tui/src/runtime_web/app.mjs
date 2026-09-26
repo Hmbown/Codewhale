@@ -8,6 +8,7 @@ export const STREAM_EVENT_NAMES = [
   "turn.steered",
   "turn.steer_dropped",
   "turn.interrupt_requested",
+  "turn.workspace_snapshot",
   "turn.completed",
   "item.started",
   "item.delta",
@@ -119,6 +120,15 @@ export function applyRuntimeEvent(state, envelope) {
     const turnId = envelope.turn_id;
     const turn = turnId ? state.turns.get(turnId) : null;
     if (turn) state.turns.set(turnId, { ...turn, status: "in_progress" });
+  } else if (eventName === "turn.workspace_snapshot") {
+    // The payload is one restore-point receipt; the turn record keeps them
+    // in the order the engine took them (`workspace_snapshots`).
+    const turnId = envelope.turn_id;
+    const turn = turnId ? state.turns.get(turnId) : null;
+    if (turn && payload.kind && payload.tree_id) {
+      const receipts = Array.isArray(turn.workspace_snapshots) ? turn.workspace_snapshots : [];
+      state.turns.set(turnId, { ...turn, workspace_snapshots: [...receipts, payload] });
+    }
   } else if (
     eventName === "item.started"
     || eventName === "item.completed"

@@ -402,7 +402,8 @@ pub enum EventMsg {
     },
     /// A workspace snapshot the engine took for the running turn
     /// (`WorkspaceSnapshotRef` serialized: `kind`, `snapshot_id`, `tree_id`,
-    /// `session_id`, optional `tool_call_id`).
+    /// `session_id`, optional `tool_call_id`, `write_paths` and
+    /// `changed_paths`).
     WorkspaceSnapshotTaken {
         thread_id: ThreadId,
         session_id: SessionId,

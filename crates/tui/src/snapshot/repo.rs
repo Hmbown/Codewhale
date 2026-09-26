@@ -1531,25 +1531,47 @@ impl SnapshotRepo {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
-    /// Keep only the latest `max_count` snapshots, dropping older ones.
+    /// Prune by count: keep the newest `max_count` snapshots, plus the newest
+    /// `max_count` turn boundaries (`pre-turn:` / `post-turn:`), and drop the
+    /// rest.
     ///
-    /// Uses `commit-tree` with no `-p` to create a true orphan commit at
-    /// the eldest survivor's tree, preserving its label.  The old chain
-    /// has zero refs after gc and is physically reclaimed.
-    /// Keep only the latest `max_count` snapshots by rebuilding the
-    /// survivor chain as orphan commits.  Each survivor's tree and label
-    /// are preserved — only the parent chain to older snapshots is cut.
-    /// Old objects become unreachable and gc reclaims them.
+    /// Turn boundaries are the restore points turn-scoped undo resolves, and
+    /// every other kind (`tool:`, `post-tool:`, `pre-restore:`) can arrive in
+    /// bursts: one turn with more file-modifying tool calls than `max_count`,
+    /// or several threads sharing the workspace, would otherwise push out the
+    /// running turn's own `pre-turn:` snapshot before its `post-turn:` one is
+    /// taken. So the boundaries are retained by their own count, and at most
+    /// `2 * max_count` snapshots survive.
+    ///
+    /// The survivors are rebuilt as a fresh orphan chain; each keeps its
+    /// tree, label, session id and timestamp, and the dropped ones become
+    /// unreachable for gc to reclaim.
     pub fn prune_keep_last_n(&self, max_count: usize) -> io::Result<usize> {
         let snapshots = self.list(usize::MAX)?;
         if snapshots.len() <= max_count {
             return Ok(0);
         }
-        let keep = max_count;
-        let removed = snapshots.len() - keep;
-        // snapshots are newest-first: [0..keep] are the survivors. Rebuild
-        // them as an orphan chain so the older tail is reclaimed.
-        self.rebuild_survivor_chain(&snapshots[..keep])?;
+        // Newest first: keep the first `max_count` of every kind, and the
+        // first `max_count` turn boundaries wherever they sit.
+        let mut boundaries_kept = 0usize;
+        let survivors: Vec<Snapshot> = snapshots
+            .iter()
+            .enumerate()
+            .filter(|(index, snapshot)| {
+                let boundary = is_turn_boundary_label(&snapshot.label);
+                let keep = *index < max_count || (boundary && boundaries_kept < max_count);
+                if keep && boundary {
+                    boundaries_kept += 1;
+                }
+                keep
+            })
+            .map(|(_, snapshot)| snapshot.clone())
+            .collect();
+        let removed = snapshots.len() - survivors.len();
+        if removed == 0 || survivors.is_empty() {
+            return Ok(0);
+        }
+        self.rebuild_survivor_chain(&survivors)?;
         let _ = run_git(
             &self.git_dir,
             &self.work_tree,
@@ -1561,6 +1583,29 @@ impl SnapshotRepo {
             &["gc", "--prune=now", "--quiet"],
         );
         Ok(removed)
+    }
+
+    /// Whether a snapshot of the workspace would leave `rel` out: it is
+    /// excluded by the workspace's `.gitignore` files or the built-in
+    /// snapshot exclusions and not already tracked. Such a path is never in
+    /// any snapshot, so no restore can put it back.
+    pub fn path_is_excluded(&self, rel: &Path) -> io::Result<bool> {
+        let rel_str = rel
+            .to_str()
+            .ok_or_else(|| io_other("snapshot path must be UTF-8"))?;
+        let out = run_git(
+            &self.git_dir,
+            &self.work_tree,
+            &["check-ignore", "--quiet", "--", rel_str],
+        )?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(io_other(format!(
+                "git check-ignore failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))),
+        }
     }
 
     /// Drop unreachable loose objects left behind by interrupted or
@@ -1587,6 +1632,13 @@ impl SnapshotRepo {
     pub fn work_tree(&self) -> &Path {
         &self.work_tree
     }
+}
+
+/// Whether `label` marks a turn boundary (`pre-turn:` / `post-turn:`), the
+/// restore points [`SnapshotRepo::prune_keep_last_n`] retains by their own
+/// count.
+fn is_turn_boundary_label(label: &str) -> bool {
+    label.starts_with("pre-turn:") || label.starts_with("post-turn:")
 }
 
 fn write_builtin_excludes(git_dir: &Path) -> io::Result<()> {
@@ -3270,6 +3322,70 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].label, "pre-turn:1");
         assert_eq!(list[0].session_id, None);
+    }
+
+    /// A burst of per-tool snapshots larger than the count cap never pushes
+    /// out the turn boundaries: the running turn's `pre-turn:` restore point
+    /// survives its own 50-write turn and another thread's burst.
+    #[test]
+    fn prune_keep_last_n_retains_turn_boundaries_through_a_tool_burst() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        let file = repo.work_tree().join("a.txt");
+        std::fs::write(&file, "v0").unwrap();
+        let older_post = repo
+            .take_snapshot("post-turn:0", Some("thr_a"))
+            .expect("snapshot");
+        let pre = repo
+            .take_snapshot("pre-turn:1", Some("thr_a"))
+            .expect("snapshot");
+        for i in 0..6 {
+            std::fs::write(&file, format!("v{}", i + 1)).unwrap();
+            repo.take_snapshot(&format!("tool:call-{i}"), Some("thr_a"))
+                .expect("snapshot");
+            repo.take_snapshot(&format!("post-tool:call-{i}"), Some("thr_a"))
+                .expect("snapshot");
+        }
+        // 14 snapshots, cap 3: the newest three plus the (two) boundaries.
+        let removed = repo.prune_keep_last_n(3).expect("prune");
+        assert_eq!(removed, 9);
+        let labels: Vec<String> = repo
+            .list(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|snapshot| snapshot.label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "post-tool:call-5",
+                "tool:call-5",
+                "post-tool:call-4",
+                "pre-turn:1",
+                "post-turn:0",
+            ]
+        );
+        let trees: Vec<SnapshotId> = repo
+            .list(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|snapshot| snapshot.tree)
+            .collect();
+        assert!(trees.contains(&pre.tree) && trees.contains(&older_post.tree));
+
+        // Boundaries are themselves capped at the same count.
+        for i in 2..6 {
+            repo.take_snapshot(&format!("pre-turn:{i}"), Some("thr_a"))
+                .expect("snapshot");
+        }
+        repo.prune_keep_last_n(3).expect("prune");
+        let boundaries = repo
+            .list(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .filter(|snapshot| is_turn_boundary_label(&snapshot.label))
+            .count();
+        assert_eq!(boundaries, 3);
     }
 
     #[test]

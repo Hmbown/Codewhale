@@ -1072,17 +1072,29 @@ than treated as having nothing to restore.
 
 **Ownership.** A thread owns exactly the workspace restore points recorded on
 its own turns. While a turn runs, the engine reports each snapshot it takes —
-`pre_turn` before the turn, `tool` before each file-modifying tool call,
-`post_turn` when it ends (always before the turn settles) — and the Runtime
-appends it to the turn record's `workspace_snapshots`, in order:
+`pre_turn` before the turn, `tool` before and `post_tool` after each tool call
+that may write (every call that is not read-only: file tools, shell commands,
+programs, write-capable MCP tools), `post_turn` when it ends (always before
+the turn settles) — and the Runtime appends it to the turn record's
+`workspace_snapshots`, in order:
 
 ```json
 "workspace_snapshots": [
   { "kind": "pre_turn", "snapshot_id": "<commit>", "tree_id": "<tree>", "session_id": "thr_1a2b3c4d" },
-  { "kind": "tool", "snapshot_id": "<commit>", "tree_id": "<tree>", "session_id": "thr_1a2b3c4d", "tool_call_id": "call_…" },
-  { "kind": "post_turn", "snapshot_id": "<commit>", "tree_id": "<tree>", "session_id": "thr_1a2b3c4d" }
+  { "kind": "tool", "snapshot_id": "<commit>", "tree_id": "<tree>", "session_id": "thr_1a2b3c4d", "tool_call_id": "call_…", "write_paths": ["src/lib.rs"], "changed_paths": [] },
+  { "kind": "post_tool", "snapshot_id": "<commit>", "tree_id": "<tree>", "session_id": "thr_1a2b3c4d", "tool_call_id": "call_…", "changed_paths": ["src/lib.rs"] },
+  { "kind": "post_turn", "snapshot_id": "<commit>", "tree_id": "<tree>", "session_id": "thr_1a2b3c4d", "changed_paths": [] }
 ]
 ```
+
+`changed_paths` lists the workspace-relative paths whose content changed since
+the turn's previous receipt — what happened in the span the receipt closes; it
+is absent on `pre_turn` and when it could not be computed (a snapshot in
+between failed). `write_paths` is set on the `tool` receipt of a file tool
+(`write_file`, `edit_file`, `apply_patch`) to the paths the call declared, as
+it named them; a tool without it (a shell command) may write any path. On a
+user shell turn the `pre_turn` receipt carries the command's `tool_call_id`,
+since the command runs from it to `post_turn`.
 
 Each receipt is also published as a `turn.workspace_snapshot` event (payload:
 the receipt). The engine runs every Runtime thread under the thread's own id,
@@ -1094,7 +1106,10 @@ inherited. Another thread's, or a TUI session's, snapshots in the same
 workspace are never candidates. `tree_id` is the durable identity: a prune
 rebuilds the side repo and rewrites every commit id but keeps each tree, and a
 restore point resolves only to a stored snapshot with the same tree, session
-tag and kind. Turns recorded before receipts existed, turns imported by
+tag and kind. The count prune after each snapshot keeps the newest 50
+snapshots plus the newest 50 turn boundaries (`pre-turn:`/`post-turn:`), so a
+turn with more tool calls than that, or a burst from another thread, never
+pushes out a recent turn's own restore points. Turns recorded before receipts existed, turns imported by
 `resume-thread`, and turns run with snapshots off or unavailable have none.
 
 **Safety net.** Every restore first records a `pre-restore:<target>` snapshot
@@ -1105,13 +1120,24 @@ requested file is excluded from it (for example by `.gitignore`), the request
 fails and nothing is changed.
 
 **`patch-undo`.** Undoes whole turns. For each dropped turn's `pre_turn` →
-`post_turn` window, the paths that differ between the two snapshots are the
-turn's changes; each goes back to its content before the first dropped turn
-that changed it, and nothing else is touched, so later work by the user or
-another thread in the same workspace survives. (A write another process made
-to one of those paths *during* a dropped turn is indistinguishable from the
-turn's own and goes with it.) Then the conversation forks exactly as `/undo`
-does. `201` means either files were restored (`files_restored: true`, one
+`post_turn` window, the paths that differ between the two snapshots must all be
+the turn's own: changed only in the span of one of the turn's tool calls (a
+`tool` → `post_tool` span, or a shell turn's whole window), and, inside a file
+tool's span, a path that call declared. A path that changed while none of the
+turn's tools could have written it — another thread, an editor, a background
+process — is someone else's change, and the undo is refused rather than revert
+it. Each of the turn's paths goes back to its content before the first dropped
+turn that changed it, and nothing else is touched, so later work by the user or
+another thread in the same workspace survives. Then the conversation forks
+exactly as `/undo` does.
+
+Snapshots never hold paths excluded by the workspace's `.gitignore` files or
+the built-in snapshot exclusions (`node_modules/`, `target/`, `dist/`, build
+caches, binary artifacts), nor paths outside the workspace. A dropped file-tool
+call that declared such a path is refused with `path_not_snapshotted`, because
+no snapshot can put it back. A shell command declares no paths: what it writes
+under an excluded path (build output, dependency installs) is outside what
+`patch-undo` restores and is not reported. `201` means either files were restored (`files_restored: true`, one
 `<action> <path>` line per file in `summary`, `snapshot_label` naming the
 pre-turn snapshot) or there was provably nothing to restore
 (`files_restored: false`): every dropped turn ran here without a tool call,
@@ -1123,11 +1149,12 @@ changed and no fork is published; `error.code` says why:
 | --- | --- |
 | `restore_point_unavailable` | a dropped turn that may have changed files has no complete recorded restore point (older record, imported by `resume-thread`, snapshots off, or the snapshot failed) |
 | `restore_point_pruned` | the restore point is no longer in the snapshot store |
-| `workspace_changed_since_turn` | a path the turns changed was changed afterwards (or between two dropped turns), or is not a regular file |
+| `path_not_snapshotted` | a dropped file-tool call wrote a path snapshots do not hold (ignored, built-in exclusion, or outside the workspace) |
+| `workspace_changed_since_turn` | a path the turns changed was changed afterwards (or between two dropped turns), a path changed while a dropped turn ran but outside its own tool calls, or a path that is not a regular file |
 | `restore_requires_trust` | there is something to restore and the thread is not in trusted mode or Full Access |
 | `workspace_unavailable` | the workspace directory is not available |
 
-For the first three a client can offer the conversation-only
+For the first four a client can offer the conversation-only
 `POST /v1/threads/{id}/undo` instead, and `file-revert` for individual files.
 Snapshot repository, listing or comparison failures abort with `500` and also
 preserve the conversation, so a turn is never dropped while its file changes
