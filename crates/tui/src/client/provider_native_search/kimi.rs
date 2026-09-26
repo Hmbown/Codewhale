@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::{
     ProviderNativeSearchClient, ProviderNativeSearchRequest, ProviderNativeSearchResponse,
-    citation_from_url, citations_from_text, joined_answer, push_citation,
+    citation_from_url, citations_from_text, finish_reason_is_length, joined_answer, push_citation,
 };
 use crate::{
     client::api_url,
@@ -16,7 +16,9 @@ use crate::{
 
 const MAX_NATIVE_SEARCH_ROUNDS: usize = 4;
 const MAX_NATIVE_SEARCH_TOOL_CALLS: usize = 8;
-const NATIVE_SEARCH_MAX_COMPLETION_TOKENS: u32 = 4_096;
+/// What the Kimi adapters requested before #6508, kept for a model whose
+/// output ceiling the catalogue does not document.
+const PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS: u32 = 4_096;
 const WEB_SEARCH_FORMULA_URI: &str = "moonshot/web-search:latest";
 const WEB_SEARCH_FORMULA_FUNCTION: &str = "web_search";
 
@@ -69,13 +71,15 @@ async fn search_builtin(
     })];
     let mut tool_calls_executed = 0;
     let url = api_url(&client.inner.base_url, "chat/completions");
+    let max_completion_tokens =
+        client.answer_output_tokens(PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS);
 
     for _ in 0..MAX_NATIVE_SEARCH_ROUNDS {
         let body = json!({
             "model": client.inner.default_model,
             "messages": &messages,
             "tools": &tools,
-            "max_completion_tokens": NATIVE_SEARCH_MAX_COMPLETION_TOKENS,
+            "max_completion_tokens": max_completion_tokens,
             "stream": false,
             "thinking": { "type": "disabled" },
         });
@@ -88,7 +92,7 @@ async fn search_builtin(
             .and_then(Value::as_object)
             .context("Kimi web search response omitted assistant message")?;
         if choice.get("finish_reason").and_then(Value::as_str) != Some("tool_calls") {
-            return Ok(parse_final_message(message));
+            return Ok(parse_final_message(message, choice));
         }
 
         messages.push(Value::Object(message.clone()));
@@ -144,6 +148,8 @@ async fn search_formula(
     })];
     let mut tool_calls_executed = 0;
     let chat_url = api_url(&client.inner.base_url, "chat/completions");
+    let max_completion_tokens =
+        client.answer_output_tokens(PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS);
     let fiber_url = api_url(&client.inner.base_url, &format!("{formula_path}/fibers"));
 
     for _ in 0..MAX_NATIVE_SEARCH_ROUNDS {
@@ -151,7 +157,7 @@ async fn search_formula(
             "model": client.inner.default_model,
             "messages": &messages,
             "tools": &tools,
-            "max_completion_tokens": NATIVE_SEARCH_MAX_COMPLETION_TOKENS,
+            "max_completion_tokens": max_completion_tokens,
             "stream": false,
         });
         let payload = client.post_json(&chat_url, &body, &[]).await?;
@@ -167,7 +173,7 @@ async fn search_formula(
             .and_then(Value::as_array)
             .filter(|calls| !calls.is_empty())
         else {
-            return Ok(parse_final_message(message));
+            return Ok(parse_final_message(message, choice));
         };
 
         reserve_native_search_tool_calls(&mut tool_calls_executed, tool_calls.len())?;
@@ -289,10 +295,16 @@ fn parse_kimi_code(payload: &Value) -> ProviderNativeSearchResponse {
     ProviderNativeSearchResponse {
         answer: None,
         citations,
+        truncated: false,
     }
 }
 
-fn parse_final_message(message: &Map<String, Value>) -> ProviderNativeSearchResponse {
+/// The final answer of a Kimi search loop. `finish_reason: "length"` means
+/// Kimi stopped it at the output limit, so it is marked as cut (#6508).
+fn parse_final_message(
+    message: &Map<String, Value>,
+    choice: &Value,
+) -> ProviderNativeSearchResponse {
     let answer = message
         .get("content")
         .and_then(Value::as_str)
@@ -306,6 +318,7 @@ fn parse_final_message(message: &Map<String, Value>) -> ProviderNativeSearchResp
     ProviderNativeSearchResponse {
         answer: joined_answer(answer.into_iter().collect()),
         citations,
+        truncated: finish_reason_is_length(Some(choice)),
     }
 }
 
@@ -347,7 +360,7 @@ mod tests {
     fn direct_search_contracts_are_bounded() {
         let tools = builtin_search_tools();
         assert_eq!(tools[0]["function"]["name"], "$web_search");
-        assert_eq!(NATIVE_SEARCH_MAX_COMPLETION_TOKENS, 4_096);
+        assert_eq!(PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS, 4_096);
 
         let formula_tools = formula_web_search_tools(&json!({
             "tools": [{
@@ -403,9 +416,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn finish_reason_length_marks_the_final_answer_as_cut() {
+        // Both Kimi loops end in parse_final_message. A reply stopped at the
+        // output limit used to be returned as a finished answer (#6508).
+        let message = json!({ "role": "assistant", "content": "Partial answer" });
+        let message = message.as_object().expect("object");
+        let cut = parse_final_message(message, &json!({ "finish_reason": "length" }));
+        assert!(cut.truncated);
+        assert_eq!(cut.answer.as_deref(), Some("Partial answer"));
+        let whole = parse_final_message(message, &json!({ "finish_reason": "stop" }));
+        assert!(!whole.truncated);
+    }
+
+    #[test]
+    fn model_without_a_documented_ceiling_keeps_4096() {
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(ProvidersConfig {
+                moonshot: ProviderConfig {
+                    api_key: Some("moonshot-test-key".to_string()),
+                    base_url: Some("https://api.moonshot.ai/v1".to_string()),
+                    model: Some("kimi-unlisted-test-model".to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        };
+        let client = ProviderNativeSearchClient::new(
+            crate::client::CodewhaleClient::new(&config).expect("test Moonshot client"),
+        )
+        .expect("Moonshot native adapter");
+        let route_cap = client
+            .inner
+            .effective_max_output_tokens("kimi-unlisted-test-model");
+        assert_eq!(
+            client.answer_output_tokens(PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS),
+            PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS.min(route_cap)
+        );
+    }
+
     #[tokio::test]
     async fn k3_formula_executes_tool_fiber_and_returns_citations() {
         let server = MockServer::start().await;
+        let config = Config {
+            provider: Some("moonshot".to_string()),
+            providers: Some(ProvidersConfig {
+                moonshot: ProviderConfig {
+                    api_key: Some("moonshot-test-key".to_string()),
+                    base_url: Some(format!("{}/v1", server.uri())),
+                    model: Some("kimi-k3".to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        };
+        let client = ProviderNativeSearchClient::new(
+            crate::client::CodewhaleClient::new(&config).expect("test Moonshot client"),
+        )
+        .expect("Moonshot native adapter");
+        let expected_completion_tokens =
+            client.answer_output_tokens(PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS);
         Mock::given(method("GET"))
             .and(path("/v1/formulas/moonshot/web-search:latest/tools"))
             .and(header("authorization", "Bearer moonshot-test-key"))
@@ -431,7 +504,7 @@ mod tests {
             .and(header("authorization", "Bearer moonshot-test-key"))
             .and(body_partial_json(json!({
                 "model": "kimi-k3",
-                "max_completion_tokens": 4096,
+                "max_completion_tokens": expected_completion_tokens,
                 "tools": [{
                     "type": "function",
                     "function": { "name": "web_search" }
@@ -488,24 +561,6 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-
-        let config = Config {
-            provider: Some("moonshot".to_string()),
-            providers: Some(ProvidersConfig {
-                moonshot: ProviderConfig {
-                    api_key: Some("moonshot-test-key".to_string()),
-                    base_url: Some(format!("{}/v1", server.uri())),
-                    model: Some("kimi-k3".to_string()),
-                    ..ProviderConfig::default()
-                },
-                ..ProvidersConfig::default()
-            }),
-            ..Config::default()
-        };
-        let client = ProviderNativeSearchClient::new(
-            crate::client::CodewhaleClient::new(&config).expect("test Moonshot client"),
-        )
-        .expect("Moonshot native adapter");
 
         let response = search_formula(&client, &request())
             .await

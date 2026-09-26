@@ -435,7 +435,11 @@ impl SearchBackend for ProviderNativeSearchBackend<'_> {
             ),
             backend_detail: Some(host),
             results,
-            degraded: Vec::new(),
+            degraded: if response.truncated {
+                vec![DegradedReason::AnswerCutByProvider]
+            } else {
+                Vec::new()
+            },
             note: response.answer,
         })
     }

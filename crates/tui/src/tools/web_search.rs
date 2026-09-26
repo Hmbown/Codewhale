@@ -1292,12 +1292,21 @@ fn finalize_search_response(
         cache_hit: false,
     };
     let count = raw.results.len();
-    let message = match (count, raw.note.as_deref()) {
+    let mut message = match (count, raw.note.as_deref()) {
         (0, Some(note)) => format!("No results found. {note}"),
         (0, None) => "No results found".to_string(),
         (_, Some(note)) => format!("Found {count} result(s). {note}"),
         (_, None) => format!("Found {count} result(s)"),
     };
+    // The answer sits in the message; say right next to it when the provider
+    // cut it short (#6508).
+    if let Some(cut) = receipt
+        .degraded
+        .iter()
+        .find(|reason| matches!(reason, DegradedReason::AnswerCutByProvider))
+    {
+        message.push_str(&format!("\n[{}]", cut.message()));
+    }
 
     SearchResponse {
         query: query.query,
@@ -3827,6 +3836,96 @@ mod tests {
             }
         )));
         assert!(response.message.contains("Grounded answer."));
+    }
+
+    fn native_backend_search(note: String, degraded: Vec<DegradedReason>) -> BackendSearch {
+        BackendSearch {
+            backend: BackendId::ProviderNative,
+            source: "provider-native/anthropic/claude-opus-4-8".to_string(),
+            backend_detail: Some("api.anthropic.com".to_string()),
+            results: (1..=5)
+                .map(|rank| {
+                    SearchResult::new(
+                        rank,
+                        format!("Source {rank}"),
+                        format!("https://example.com/{rank}"),
+                        None,
+                        None,
+                    )
+                })
+                .collect(),
+            degraded,
+            note: Some(note),
+        }
+    }
+
+    fn native_query() -> SearchQuery {
+        SearchQuery::new("current release".to_string(), 5, None, Vec::new(), None)
+    }
+
+    fn native_capabilities() -> QueryCapabilities {
+        QueryCapabilities {
+            max_results: CapabilityState::Supported,
+            recency: CapabilityState::Unsupported,
+            domains: CapabilityState::Supported,
+            locale: CapabilityState::Unsupported,
+            published_date: CapabilityState::Unknown,
+        }
+    }
+
+    #[test]
+    fn native_answer_reaches_the_model_whole_under_the_route_budget() {
+        // #6508: a 6,000-character native answer with five citations used to
+        // reach a 128K route as a ~900-character snippet (and earlier was cut
+        // at 4,000 characters). Now the search result is whole within the
+        // route's one inline budget.
+        let answer = format!("{}END OF ANSWER", "Grounded answer sentence. ".repeat(240));
+        assert!(answer.chars().count() > 6_000);
+        let response = finalize_search_response(
+            native_query(),
+            native_capabilities(),
+            native_backend_search(answer.clone(), Vec::new()),
+            Instant::now(),
+        );
+        assert!(response.message.ends_with("END OF ANSWER"));
+        assert!(!response.message.contains("output limit"));
+
+        let output = crate::tools::spec::ToolResult::json(&response).expect("json");
+        let context = crate::core::engine::compact_tool_result_for_route(
+            crate::config::ApiProvider::Deepseek,
+            "deepseek-v3.2-128k",
+            None,
+            "web_search",
+            &output,
+        );
+        assert_eq!(context, output.content.trim());
+        assert!(context.contains("END OF ANSWER"));
+    }
+
+    #[test]
+    fn native_answer_cut_by_the_provider_says_so() {
+        let response = finalize_search_response(
+            native_query(),
+            native_capabilities(),
+            native_backend_search(
+                "Partial answer".to_string(),
+                vec![DegradedReason::AnswerCutByProvider],
+            ),
+            Instant::now(),
+        );
+        assert!(
+            response
+                .receipt
+                .degraded
+                .contains(&DegradedReason::AnswerCutByProvider)
+        );
+        assert!(
+            response
+                .message
+                .contains("the provider stopped the search answer at its output limit"),
+            "{}",
+            response.message
+        );
     }
 
     #[test]
