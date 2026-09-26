@@ -440,15 +440,73 @@ impl RenderedStrip {
     }
 }
 
+/// Prompt-cache hit rates, each labelled by whose requests it covers (#6565).
+///
+/// `parent` is this conversation's own requests: the footer `cache N%` and it
+/// never change meaning. `agents` covers sub-agent and other background
+/// requests. `combined` weights both by their tokens. Each is `None` when its
+/// requests reported no cache telemetry; no report is never 0%.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheRates {
+    pub parent: Option<u8>,
+    pub agents: Option<u8>,
+    pub combined: Option<u8>,
+}
+
+fn hit_percent(hit: u64, miss: u64) -> Option<u8> {
+    let total = hit.saturating_add(miss);
+    (total > 0).then(|| u8::try_from((hit.saturating_mul(100) + total / 2) / total).unwrap_or(100))
+}
+
+#[must_use]
+pub fn cache_rates(app: &crate::tui::app::App) -> CacheRates {
+    let parent_hit = u64::from(app.session.displayed_total_cache_hit_tokens());
+    let parent_miss = u64::from(app.session.displayed_total_cache_miss_tokens());
+    let agents = app
+        .session
+        .subagent_cache_hit_tokens
+        .zip(app.session.subagent_cache_miss_tokens);
+    CacheRates {
+        parent: hit_percent(parent_hit, parent_miss),
+        agents: agents.and_then(|(hit, miss)| hit_percent(hit, miss)),
+        combined: agents.and_then(|(hit, miss)| {
+            hit_percent(
+                parent_hit.saturating_add(hit),
+                parent_miss.saturating_add(miss),
+            )
+        }),
+    }
+}
+
+impl CacheRates {
+    /// `parent 82% · agents 64% · combined 75%` with the given words, or just
+    /// `82%` when only the parent reported. `None` when nothing did.
+    #[must_use]
+    pub fn labelled(&self, parent: &str, agents: &str, combined: &str) -> Option<String> {
+        match (self.parent, self.agents) {
+            (Some(pct), None) => Some(format!("{pct}%")),
+            (None, None) => None,
+            _ => Some(
+                [
+                    (parent, self.parent),
+                    (agents, self.agents),
+                    (combined, self.combined),
+                ]
+                .into_iter()
+                .filter_map(|(word, pct)| pct.map(|pct| format!("{word} {pct}%")))
+                .collect::<Vec<_>>()
+                .join(" · "),
+            ),
+        }
+    }
+}
+
 /// Snapshot the live app state into the strip's inputs.
 #[must_use]
 pub fn snapshot_from_app(app: &crate::tui::app::App) -> MetricsSnapshot {
-    let hit = u64::from(app.session.displayed_total_cache_hit_tokens());
-    let miss = u64::from(app.session.displayed_total_cache_miss_tokens());
-    let cache_hit_percent = (hit + miss > 0).then(|| {
-        // Widen before adding so saturated counters never exceed 100%.
-        u8::try_from((hit * 100 + (hit + miss) / 2) / (hit + miss)).unwrap_or(100)
-    });
+    // The footer rate is this conversation's own requests; sub-agent cache
+    // is shown beside it, labelled, in PRICE and `/cache` (#6565).
+    let cache_hit_percent = cache_rates(app).parent;
     MetricsSnapshot {
         turns: app.turn_counter,
         steps: app.session_metrics.steps(),
@@ -673,5 +731,52 @@ mod tests {
         metrics.clear_in_flight();
         metrics.record_tool_completed_at("b", t0 + Duration::from_secs(5));
         assert_eq!(metrics.tool_time, Duration::from_millis(1_500));
+    }
+
+    #[test]
+    fn sub_agent_cache_is_shown_beside_the_parent_rate_never_folded_into_it() {
+        // #6565: the footer rate keeps meaning this conversation's requests;
+        // agents and the token-weighted combination are labelled beside it.
+        let mut app = crate::tui::app::App::new(
+            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+            &crate::config::Config::default(),
+        );
+        assert_eq!(cache_rates(&app), CacheRates::default());
+        assert_eq!(
+            cache_rates(&app).labelled("parent", "agents", "combined"),
+            None
+        );
+
+        app.session.total_cache_hit_tokens = 800;
+        app.session.total_cache_miss_tokens = 200;
+        assert_eq!(snapshot_from_app(&app).cache_hit_percent, Some(80));
+        assert_eq!(
+            cache_rates(&app)
+                .labelled("parent", "agents", "combined")
+                .as_deref(),
+            Some("80%")
+        );
+
+        app.session.subagent_cache_hit_tokens = Some(200);
+        app.session.subagent_cache_miss_tokens = Some(800);
+        let rates = cache_rates(&app);
+        assert_eq!(
+            rates,
+            CacheRates {
+                parent: Some(80),
+                agents: Some(20),
+                combined: Some(50),
+            }
+        );
+        assert_eq!(
+            rates.labelled("parent", "agents", "combined").as_deref(),
+            Some("parent 80% · agents 20% · combined 50%")
+        );
+        // The footer figure did not move.
+        assert_eq!(snapshot_from_app(&app).cache_hit_percent, Some(80));
+
+        // A loaded session starts the scope over, like the parent totals.
+        app.session.reset_token_breakdown();
+        assert_eq!(app.session.subagent_cache_hit_tokens, None);
     }
 }

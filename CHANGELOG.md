@@ -193,6 +193,12 @@ quieter, and Fleet runs can be checked before they spend anything.
 - `workflow(fleet:)` runs Fleets saved from the Fleet UI, and finds
   workspace Fleets under `.codewhale/fleets`.
 - The runtime API can stop a delegated agent run from the desktop.
+- The mobile page shows the thread's agents: a strip naming each one, its
+  state, and what it is doing or what it found, rebuilt when the page
+  reconnects. Sub-agent prompt caching now counts toward the session. PRICE
+  and `/cache` show the parent, agents and combined hit rates, each labelled,
+  and the footer `cache N%` still means this conversation's own requests
+  ([#6565](https://github.com/Hmbown/Codewhale/issues/6565)).
 
 ### Plugins
 

@@ -98,9 +98,10 @@ export const CHANGELOG: ChangelogRelease[] = [
           "A queued agent says why it is waiting, for example when launches are throttled after provider rate limits, and when its time budget ends (#6277).",
           "Stopping an agent that writes files keeps and names the work it had changed, as a budget stop already did (#5529).",
           "workflow(fleet:) runs Fleets saved from the Fleet UI, and finds workspace Fleets under .codewhale/fleets.",
-          "The runtime API can stop a delegated agent run from the desktop."
+          "The runtime API can stop a delegated agent run from the desktop.",
+          "The mobile page shows the thread's agents: a strip naming each one, its state, and what it is doing or what it found, rebuilt when the page reconnects. Sub-agent prompt caching now counts toward the session. PRICE and /cache show the parent, agents and combined hit rates, each labelled, and the footer cache N% still means this conversation's own requests (#6565)."
         ],
-        "itemCount": 5
+        "itemCount": 6
       },
       {
         "heading": "Plugins",

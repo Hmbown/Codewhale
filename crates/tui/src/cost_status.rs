@@ -84,6 +84,13 @@ pub struct PendingBackgroundCost {
     /// batch. These travel with the money so a session snapshot can make a
     /// replay idempotent after reload.
     pub usage_source_fingerprints: BTreeSet<String>,
+    /// Prompt-cache classes the background routes reported, through
+    /// [`crate::pricing::token_usage_for_pricing`] so they never exceed the
+    /// input they partition (#6565). `None` until a child reports cache
+    /// telemetry at all: no report is not a 0% hit rate.
+    pub cache_hit_tokens: Option<u64>,
+    pub cache_miss_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
 }
 
 /// Immutable, non-secret route evidence captured before a provider request.
@@ -2050,6 +2057,15 @@ fn fold_audit_into_pending(
     if let Some(cost) = audit.estimate {
         pending.estimate = pending.estimate.saturating_add(cost);
     }
+    if usage.prompt_cache_hit_tokens.is_some() || usage.prompt_cache_miss_tokens.is_some() {
+        let classes = crate::pricing::token_usage_for_pricing(usage);
+        let add = |slot: &mut Option<u64>, tokens: u64| {
+            *slot = Some(slot.unwrap_or(0).saturating_add(tokens));
+        };
+        add(&mut pending.cache_hit_tokens, classes.cache_read);
+        add(&mut pending.cache_miss_tokens, classes.input);
+        add(&mut pending.cache_write_tokens, classes.cache_write);
+    }
 
     // Only money-metered/unknown-basis turns belong in missing-money coverage
     // or its reason list. A subscription/local receipt is still audited below,
@@ -3052,6 +3068,41 @@ mod tests {
             Some(crate::config::DEFAULT_DEEPSEEK_BASE_URL),
             Utc::now(),
         )
+    }
+
+    #[test]
+    fn child_cache_classes_reach_the_background_pool_only_when_reported() {
+        // #6565: sub-agent cache was missing from session totals.
+        let reported = background_cost_for_runtime_usage(&RuntimeUsageRecord {
+            source_id: "child-cache-reported".into(),
+            usage: EffectiveRouteUsage {
+                route: deepseek_envelope(),
+                usage: Usage {
+                    input_tokens: 1_000,
+                    output_tokens: 50,
+                    prompt_cache_hit_tokens: Some(700),
+                    prompt_cache_miss_tokens: Some(300),
+                    ..Usage::default()
+                },
+            },
+        });
+        assert_eq!(reported.cache_hit_tokens, Some(700));
+        assert_eq!(reported.cache_miss_tokens, Some(300));
+        assert_eq!(reported.cache_write_tokens, Some(0));
+
+        let silent = background_cost_for_runtime_usage(&RuntimeUsageRecord {
+            source_id: "child-cache-silent".into(),
+            usage: EffectiveRouteUsage {
+                route: deepseek_envelope(),
+                usage: Usage {
+                    input_tokens: 1_000,
+                    output_tokens: 50,
+                    ..Usage::default()
+                },
+            },
+        });
+        assert_eq!(silent.cache_hit_tokens, None, "no report is not 0%");
+        assert_eq!(silent.cache_miss_tokens, None);
     }
 
     #[test]

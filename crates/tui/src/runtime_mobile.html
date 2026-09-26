@@ -191,6 +191,23 @@
       color: var(--muted);
       font-size: 13px;
     }
+    #agents-section[hidden] { display: none; }
+    .agent-row {
+      display: grid;
+      grid-template-columns: minmax(0, auto) auto;
+      gap: 2px 8px;
+      padding: 6px 0;
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+    }
+    .agent-row:last-child { border-bottom: 0; }
+    .agent-name { font-weight: 600; overflow-wrap: anywhere; }
+    .agent-state { color: var(--muted); text-align: right; }
+    .agent-action {
+      grid-column: 1 / -1;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
     @media (min-width: 900px) {
       main {
         grid-template-columns: 330px minmax(0, 1fr);
@@ -229,6 +246,14 @@
         <button id="new-thread" class="primary">New</button>
       </div>
       <div class="body"><div id="threads"></div></div>
+    </section>
+
+    <section id="agents-section" hidden>
+      <div class="head">
+        <strong>Agents</strong>
+        <span id="agent-count" class="meta"></span>
+      </div>
+      <div class="body"><div id="agents"></div></div>
     </section>
 
     <section class="chat">
@@ -273,7 +298,10 @@
       source: null,
       eventCount: 0,
       requestProof: "",
-      streamTicket: ""
+      streamTicket: "",
+      // Sub-agents of the open thread, by agent id: rebuilt from the
+      // agent.* events the stream replays, so a reconnect restores it.
+      agents: new Map()
     };
 
     function setStatus(message, tone = "") {
@@ -429,8 +457,81 @@
       return data && typeof data === "object" && "payload" in data ? data.payload : data;
     }
 
+    // The name every Codewhale surface shows for an agent (its workflow
+    // label or dispatch name), never its internal id. Hosts that predate the
+    // name get an ordinal instead.
+    function agentName(payload) {
+      const known = state.agents.get(payload.agent_id);
+      if (payload.agent_name) return payload.agent_name;
+      if (known && known.name) return known.name;
+      return "agent " + (known ? known.order : state.agents.size + 1);
+    }
+
+    // The first line of prose in a result summary, not its heading.
+    function resultHeadline(text) {
+      const summary = String(text || "").replace(/^Sub-agent .*? (completed|failed|cancelled|interrupted|budget_exhausted|settled \(outcome unconfirmed\)): /, "");
+      const line = summary.split("\n").map((part) => part.trim())
+        .find((part) => part && !part.startsWith("#") && !part.startsWith("<codewhale:"));
+      return line || "";
+    }
+
+    function noteAgentEvent(name, data) {
+      if (!name.startsWith("agent.")) return;
+      const payload = eventPayload(data) || {};
+      const id = payload.agent_id;
+      if (!id) return;
+      let agent = state.agents.get(id);
+      if (!agent) {
+        agent = { name: "", state: "", action: "", order: state.agents.size + 1 };
+        state.agents.set(id, agent);
+      }
+      if (payload.agent_name) agent.name = payload.agent_name;
+      if (name === "agent.spawned") {
+        agent.state = "running";
+        agent.action = "starting";
+      } else if (name === "agent.progress") {
+        agent.state = "running";
+        agent.action = [String(payload.worker_status || "").replace(/_/g, " "),
+          payload.step ? "step " + payload.step : ""].filter(Boolean).join(" · ");
+      } else if (name === "agent.completed") {
+        agent.state = String(payload.worker_status || "settled").replace(/_/g, " ");
+        agent.action = resultHeadline((payload.item || {}).summary);
+      }
+      renderAgents();
+    }
+
+    function renderAgents() {
+      const list = $("agents");
+      list.innerHTML = "";
+      let running = 0;
+      for (const [id, agent] of state.agents) {
+        if (agent.state === "running") running += 1;
+        const row = document.createElement("div");
+        row.className = "agent-row";
+        row.innerHTML =
+          "<span class='agent-name'>" + escapeHtml(agentName({ agent_id: id })) + "</span>" +
+          "<span class='agent-state'>" + escapeHtml(agent.state) + "</span>" +
+          (agent.action ? "<span class='agent-action'>" + escapeHtml(agent.action) + "</span>" : "");
+        list.appendChild(row);
+      }
+      $("agents-section").hidden = state.agents.size === 0;
+      $("agent-count").textContent = state.agents.size
+        ? running + " running · " + state.agents.size + " total"
+        : "";
+    }
+
     function eventText(name, data) {
       const payload = eventPayload(data) || {};
+      if (name === "agent.spawned") return agentName(payload) + " started";
+      if (name === "agent.progress") {
+        return agentName(payload) + ": " + String(payload.worker_status || "working").replace(/_/g, " ") +
+          (payload.step ? " · step " + payload.step : "");
+      }
+      if (name === "agent.completed") {
+        const headline = resultHeadline((payload.item || {}).summary);
+        return agentName(payload) + " " + String(payload.worker_status || "settled").replace(/_/g, " ") +
+          (headline ? ": " + headline : "");
+      }
       if (name === "item.delta") return payload.delta || "";
       if (name === "item.started") {
         const tool = payload.tool;
@@ -489,6 +590,7 @@
     }
 
     function appendEvent(name, data) {
+      noteAgentEvent(name, data);
       const text = eventText(name, data);
       if (!text) return;
       const item = document.createElement("div");
@@ -497,6 +599,7 @@
       if (name === "item.started" || name.includes("tool")) item.classList.add("tool");
       if (name.includes("failed") || name.includes("denied") || name.includes("timeout")) item.classList.add("error");
       if (name === "turn.completed" || name === "approval.decided") item.classList.add("ok");
+      if (name.startsWith("agent.")) item.classList.add("tool");
       item.innerHTML = "<div class='meta'>" + escapeHtml(name) + "</div>" + escapeHtml(text);
 
       const approval = approvalInfo(name, data);
@@ -567,6 +670,8 @@
       $("event-count").textContent = "0 events";
       $("active-title").textContent = title || id;
       $("events").innerHTML = "";
+      state.agents.clear();
+      renderAgents();
       if (state.source) state.source.close();
       await openThreadEvents(id);
       await loadThreads();
@@ -597,7 +702,10 @@
         "approval.required",
         "approval.decided",
         "approval.timeout",
-        "sandbox.denied"
+        "sandbox.denied",
+        "agent.spawned",
+        "agent.progress",
+        "agent.completed"
       ];
       for (const name of names) {
         source.addEventListener(name, (ev) => {

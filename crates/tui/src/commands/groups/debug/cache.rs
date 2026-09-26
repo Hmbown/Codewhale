@@ -57,7 +57,14 @@ pub fn cache(app: &mut App, arg: Option<&str>) -> CommandResult {
         .min(crate::tui::app::App::TURN_CACHE_HISTORY_CAP);
 
     if cap == 0 {
-        return CommandResult::message(tr(app.ui_locale, MessageId::CmdCacheNoData));
+        // Sub-agents may have reported cache even before this conversation
+        // ran a turn of its own.
+        let mut message = tr(app.ui_locale, MessageId::CmdCacheNoData).into_owned();
+        if let Some(line) = session_cache_rates_line(app, app.ui_locale) {
+            message.push_str("\n\n");
+            message.push_str(&line);
+        }
+        return CommandResult::message(message);
     }
 
     CommandResult::message(format_cache_history(app, count, app.ui_locale))
@@ -818,8 +825,26 @@ fn format_cache_history(app: &App, count: usize, locale: Locale) -> String {
         footer.push_str(&tr(locale, MessageId::CmdCacheUnpricedNote).replace("{notes}", &notes));
     }
     footer.push_str(&tr(locale, MessageId::CmdCacheAdvice));
+    if let Some(line) = session_cache_rates_line(app, locale) {
+        footer.push_str("\n\n");
+        footer.push_str(&line);
+    }
 
     format!("{header}{body}{footer}")
+}
+
+/// `Session cache hit rate: parent 82% · agents 64% · combined 75%`: this
+/// conversation's own requests, its sub-agents' and both token-weighted,
+/// each labelled (#6565). `None` when nothing reported cache telemetry.
+fn session_cache_rates_line(app: &App, locale: Locale) -> Option<String> {
+    let rates = crate::tui::session_metrics::cache_rates(app);
+    rates.agents?;
+    let rates = rates.labelled(
+        &tr(locale, MessageId::CmdCacheRateParent),
+        &tr(locale, MessageId::CmdCacheRateAgents),
+        &tr(locale, MessageId::CmdCacheRateCombined),
+    )?;
+    Some(tr(locale, MessageId::CmdCacheSessionRates).replace("{rates}", &rates))
 }
 
 fn format_turn_cache_route(rec: &TurnCacheRecord) -> String {
