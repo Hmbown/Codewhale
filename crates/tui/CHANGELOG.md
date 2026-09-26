@@ -198,8 +198,15 @@ quieter, and Fleet runs can be checked before they spend anything.
 - `codewhale fleet run <spec> --check` runs every validation a real run would
   and stops there: nothing is created, launched or spent.
 - A queued agent says why it is waiting, for example when launches are
-  throttled after provider rate limits, and when its time budget ends
+  throttled after provider rate limits, and when it stops waiting
   ([#6277](https://github.com/Hmbown/Codewhale/issues/6277)).
+- Read-only agents can run chained inspection commands (a leading `cd`,
+  `&&`, `;`, `echo` separators, `2>/dev/null`), and a refused command now
+  names the rule it broke and what to do instead. Durable Fleet workers
+  accept the same read-only commands as in-session agents. An agent's time
+  budget starts when it launches, and a queued agent that never gets a slot
+  says it never started
+  ([#6015](https://github.com/Hmbown/Codewhale/issues/6015)).
 - Stopping an agent that writes files keeps and names the work it had
   changed, as a budget stop already did
   ([#5529](https://github.com/Hmbown/Codewhale/issues/5529)).

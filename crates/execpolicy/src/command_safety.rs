@@ -382,13 +382,20 @@ const PARALLEL_READONLY_PREFIXES: &[&str] = &[
     "fd",
 ];
 
-/// Discoverable guidance from the same local command families used by the
-/// strict classifier. Options, paths and the caller's envelope still apply.
+/// Discoverable guidance for the agent read-only grammar
+/// ([`agent_readonly_verdict`]), built from the same tables it checks.
+/// Options and workspace paths still apply.
 #[must_use]
 pub fn readonly_command_help() -> String {
     format!(
-        "Use a single inspection command with the tool's cwd field instead of cd or shell chaining. Local command families: {}. Options and workspace path checks still apply. Avoid pipes, redirects, substitutions, inline environment assignments and shell operators. For branches or revisions use git status, git log or git show; git branch and git rev-parse are outside this subset. If an essential probe remains blocked, return the findings and the blocked probe to the parent; this worker cannot change its own role.",
-        PARALLEL_READONLY_PREFIXES.join(", ")
+        "Read-only shell grammar: {}; find without -exec/-delete; sed -n <range>p; the text filters sort, uniq, cut, tr and comm; literal echo/printf; git {} (optionally after -C <dir> or --no-pager); and, when network access is granted, gh issue/pr/release/repo/run/workflow view or list and npm view. Join reads with |, &&, || or ;. A leading `cd <dir> &&` sets the working directory, and the only redirects are 2>/dev/null, >/dev/null and 2>&1. Not admitted: other redirects, $ or backtick expansion, subshells, backgrounding, inline environment assignments, and any other program (python, awk, jq, cargo and so on). Options and workspace path checks still apply. git branch and git rev-parse are outside this subset; use git status, git log or git show. If an essential probe remains blocked, return the findings and the blocked probe to the parent; this worker cannot change its own role.",
+        PARALLEL_READONLY_PREFIXES
+            .iter()
+            .filter(|prefix| !prefix.starts_with("git "))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", "),
+        AGENT_GIT_SUBCOMMANDS.join("/"),
     )
 }
 
@@ -561,16 +568,20 @@ fn readonly_tokens_admitted(trimmed: &str) -> bool {
 }
 
 /// Read-only shell surface for `ShellPolicy::ReadOnly` agents (fleet scouts
-/// and reviewers, #5356 follow-up): the parallel auto-approve table widened by
-/// exactly the shapes real repo reconnaissance needs, still
-/// mutation-proof-by-construction.
+/// and reviewers, #5356 follow-up; durable Fleet workers since #6015): the
+/// parallel auto-approve table widened by exactly the shapes real repo
+/// reconnaissance needs, still mutation-proof-by-construction.
 ///
 /// Relaxations relative to [`is_parallel_readonly_command`] (which stays
 /// untouched for the parent's parallel auto-approve chunks, where its
 /// tightness is load-bearing):
 ///
-/// - pipelines `a | b`, where **every** segment must itself be an admitted
-///   read-only command (an empty segment — including `||` — rejects);
+/// - compositions `a | b`, `a && b`, `a || b` and `a; b`, where **every**
+///   segment must itself be an admitted read (an empty segment rejects).
+///   Reads in sequence add no ability that a single read lacks;
+/// - the redirect words `2>/dev/null`, `>/dev/null` and `2>&1`, which only
+///   discard or merge output;
+/// - quoted shell metacharacters, which are data (`rg 'a && b; c' src`);
 /// - literal `*` arguments (for tools such as `find -name '*.rs'`); shell
 ///   expansion is never allowed to introduce operands after validation;
 /// - `git -C <dir> <subcommand>` and `git --no-pager <subcommand>`, whose
@@ -582,43 +593,498 @@ fn readonly_tokens_admitted(trimmed: &str) -> bool {
 /// - `npm view|show|info <pkg>` — registry reads, matching the scout role's
 ///   network-capable read-only posture;
 /// - pure text filters `sort`, `uniq`, `cut`, `tr`, `comm` as pipeline
-///   stages.
+///   stages, and literal `echo`/`printf` separators.
 ///
-/// Everything else keeps the parallel classifier's posture: no separators,
+/// Everything else keeps the parallel classifier's posture: no other
 /// redirects, backgrounding, command/parameter expansion, subshells, or
-/// env-assignment prefixes.
+/// env-assignment prefixes. A leading `cd <dir> &&` is not interpreted here;
+/// callers move it into the tool's working directory first
+/// ([`split_leading_cd`]).
 pub fn is_agent_readonly_shell_command(command: &str) -> bool {
-    let trimmed = normalize_windows_command_paths(command);
-    let trimmed = trimmed.trim();
-    if trimmed.is_empty() {
-        return false;
+    agent_readonly_verdict(command).is_ok()
+}
+
+/// Why [`agent_readonly_verdict`] refused a command. The same code that
+/// decides produces the reason, so the refusal text cannot drift from the
+/// decision. Rendered as `[shell.readonly.command] <rule>: <detail>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadonlyRejection {
+    /// Stable rule name: `operator`, `quote`, `program`, `subcommand`,
+    /// `option`, `env_prefix`, `cd`, or `shape`.
+    pub rule: &'static str,
+    /// Human-readable specifics: the character, program or option refused.
+    pub detail: String,
+}
+
+impl ReadonlyRejection {
+    #[must_use]
+    pub fn new(rule: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            rule,
+            detail: detail.into(),
+        }
     }
-    if trimmed.chars().any(|ch| {
-        matches!(
-            ch,
-            '\n' | '\r'
-                | ';'
-                | '&'
-                | '>'
-                | '<'
-                | '`'
-                | '$'
-                | '?'
-                | '['
-                | ']'
-                | '{'
-                | '}'
-                | '('
-                | ')'
+}
+
+impl std::fmt::Display for ReadonlyRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[shell.readonly.command] {}: {}", self.rule, self.detail)
+    }
+}
+
+impl std::error::Error for ReadonlyRejection {}
+
+/// The shell operator that follows a read-only segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadonlyJoin {
+    Pipe,
+    And,
+    Or,
+    Then,
+}
+
+impl ReadonlyJoin {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pipe => "|",
+            Self::And => "&&",
+            Self::Or => "||",
+            Self::Then => ";",
+        }
+    }
+}
+
+/// One admitted command of a read-only composition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadonlySegment {
+    /// The command text with the admitted redirect words removed. Quoting is
+    /// preserved; split it with a POSIX word splitter.
+    pub command: String,
+    /// Admitted redirect words, canonical spelling, in source order.
+    pub redirects: Vec<&'static str>,
+    /// The operator that follows this segment; `None` for the last one.
+    pub join: Option<ReadonlyJoin>,
+    start: usize,
+}
+
+const READONLY_OPERATOR_HINT: &str =
+    "join reads with |, &&, || or ; and use single quotes for literal text";
+
+/// Allow-direction lexer for [`agent_readonly_verdict`]. It tracks quotes and
+/// splits only on unquoted `|`, `&&`, `||` and `;`. Every other unquoted
+/// shell metacharacter it does not recognise is refused, so an unknown
+/// construct fails closed.
+fn lex_readonly_command(command: &str) -> Result<Vec<ReadonlySegment>, ReadonlyRejection> {
+    let operator = |what: &str| {
+        ReadonlyRejection::new(
+            "operator",
+            format!("{what} is not admitted in a read-only command; {READONLY_OPERATOR_HINT}"),
         )
-    }) {
-        return false;
+    };
+    if command.contains(['\n', '\r']) {
+        return Err(operator("a newline"));
     }
-    // A pipeline is admitted only when every segment is: `a | b` is two
-    // read-only commands, while `a | | b`, `a |`, and `||` all carry an empty
-    // segment and reject. Quoted pipes inside an argument mis-split here,
-    // which only ever makes a segment fail classification (fail closed).
-    trimmed.split('|').all(is_agent_readonly_segment)
+    let chars = command.char_indices().collect::<Vec<_>>();
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut redirects = Vec::new();
+    let mut start = 0;
+    let mut word_start = 0;
+    let mut index = 0;
+    let unbalanced = || {
+        ReadonlyRejection::new(
+            "quote",
+            "the command has an unbalanced quote or a trailing backslash",
+        )
+    };
+    while index < chars.len() {
+        let (position, ch) = chars[index];
+        match ch {
+            '\\' => {
+                let Some(&(_, next)) = chars.get(index + 1) else {
+                    return Err(unbalanced());
+                };
+                current.push(ch);
+                current.push(next);
+                index += 2;
+                continue;
+            }
+            '\'' => {
+                current.push(ch);
+                index += 1;
+                loop {
+                    let Some(&(_, quoted)) = chars.get(index) else {
+                        return Err(unbalanced());
+                    };
+                    current.push(quoted);
+                    index += 1;
+                    if quoted == '\'' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            '"' => {
+                current.push(ch);
+                index += 1;
+                loop {
+                    let Some(&(_, quoted)) = chars.get(index) else {
+                        return Err(unbalanced());
+                    };
+                    match quoted {
+                        '"' => {
+                            current.push(quoted);
+                            index += 1;
+                            break;
+                        }
+                        '\\' => {
+                            let Some(&(_, escaped)) = chars.get(index + 1) else {
+                                return Err(unbalanced());
+                            };
+                            current.push(quoted);
+                            current.push(escaped);
+                            index += 2;
+                        }
+                        '$' | '`' => {
+                            return Err(operator(&format!(
+                                "{} expansion inside double quotes",
+                                expansion_name(quoted)
+                            )));
+                        }
+                        _ => {
+                            current.push(quoted);
+                            index += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+            '$' | '`' => {
+                return Err(operator(&format!("{} expansion", expansion_name(ch))));
+            }
+            '|' | '&' | ';' => {
+                let next = chars.get(index + 1).map(|&(_, next)| next);
+                let (join, width) = match (ch, next) {
+                    ('|', Some('|')) => (ReadonlyJoin::Or, 2),
+                    ('|', Some('&')) => return Err(operator("`|&`")),
+                    ('|', _) => (ReadonlyJoin::Pipe, 1),
+                    ('&', Some('&')) => (ReadonlyJoin::And, 2),
+                    ('&', _) => return Err(operator("a background `&`")),
+                    _ => (ReadonlyJoin::Then, 1),
+                };
+                segments.push(ReadonlySegment {
+                    command: std::mem::take(&mut current),
+                    redirects: std::mem::take(&mut redirects),
+                    join: Some(join),
+                    start,
+                });
+                start = position + width;
+                word_start = 0;
+                index += width;
+                continue;
+            }
+            '>' => {
+                let word = &current[word_start..];
+                let rest = &command[position..];
+                let matched = if word == "2" && rest.starts_with(">&1") {
+                    Some(("2>&1", 3))
+                } else if word.is_empty() || word == "2" {
+                    let after = &rest[1..];
+                    let target = after.trim_start_matches(' ');
+                    target.starts_with("/dev/null").then(|| {
+                        (
+                            if word == "2" {
+                                "2>/dev/null"
+                            } else {
+                                ">/dev/null"
+                            },
+                            1 + (after.len() - target.len()) + "/dev/null".len(),
+                        )
+                    })
+                } else {
+                    None
+                };
+                let bounded = matched.filter(|(_, width)| {
+                    rest[*width..]
+                        .chars()
+                        .next()
+                        .is_none_or(|next| next.is_whitespace() || matches!(next, '|' | '&' | ';'))
+                });
+                let Some((redirect, width)) = bounded else {
+                    return Err(operator(
+                        "a `>` redirect other than 2>/dev/null, >/dev/null or 2>&1",
+                    ));
+                };
+                current.truncate(word_start);
+                redirects.push(redirect);
+                // Every consumed character is ASCII, so bytes == chars.
+                index += width;
+                continue;
+            }
+            '<' | '(' | ')' | '{' | '}' | '[' | ']' | '?' => {
+                return Err(operator(&format!("unquoted `{ch}`")));
+            }
+            '#' if current[word_start..].is_empty() => {
+                return Err(operator("an unquoted `#` comment"));
+            }
+            ch if ch.is_whitespace() => {
+                current.push(ch);
+                word_start = current.len();
+            }
+            ch => current.push(ch),
+        }
+        index += 1;
+    }
+    segments.push(ReadonlySegment {
+        command: current,
+        redirects,
+        join: None,
+        start,
+    });
+    if segments
+        .iter()
+        .any(|segment| segment.command.trim().is_empty())
+    {
+        return Err(operator("an empty command next to a shell operator"));
+    }
+    Ok(segments)
+}
+
+fn expansion_name(ch: char) -> &'static str {
+    if ch == '$' { "`$`" } else { "backtick" }
+}
+
+/// Judge a command for `ShellPolicy::ReadOnly` agents and return its admitted
+/// segments, or the specific rule that refused it. See
+/// [`is_agent_readonly_shell_command`] for the grammar.
+pub fn agent_readonly_verdict(command: &str) -> Result<Vec<ReadonlySegment>, ReadonlyRejection> {
+    let normalized = normalize_windows_command_paths(command);
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return Err(ReadonlyRejection::new("program", "the command is empty"));
+    }
+    let segments = lex_readonly_command(trimmed)?;
+    for segment in &segments {
+        agent_segment_verdict(&segment.command)?;
+    }
+    Ok(segments)
+}
+
+/// Split a leading `cd <dir> && rest` into `(dir, rest)` so a caller can move
+/// the directory into the tool's working-directory field, where the ordinary
+/// workspace check judges it. Only one literal operand is accepted, only as
+/// the first command and only before `&&`; anything else returns `None` and
+/// the classifier refuses the `cd` with its own rule.
+#[must_use]
+pub fn split_leading_cd(command: &str) -> Option<(String, String)> {
+    let stripped = command.replace(r"\\?\", "");
+    let trimmed = stripped.trim_start();
+    if !trimmed.starts_with("cd") {
+        return None;
+    }
+    let segments = lex_readonly_command(trimmed).ok()?;
+    let first = segments.first()?;
+    if first.join != Some(ReadonlyJoin::And) || !first.redirects.is_empty() {
+        return None;
+    }
+    let tokens = shell_words(&normalize_windows_command_paths(&first.command));
+    let [program, dir] = tokens.as_slice() else {
+        return None;
+    };
+    if program != "cd" || dir.is_empty() || dir.starts_with('-') || dir.starts_with('~') {
+        return None;
+    }
+    let rest = trimmed[segments.get(1)?.start..].trim();
+    (!rest.is_empty()).then(|| (dir.clone(), rest.to_string()))
+}
+
+/// A network read inside an admitted read-only command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NetworkRead {
+    /// A `gh` view/list read against github.com.
+    GitHub,
+    /// An `npm view|show|info` registry read.
+    Npm,
+}
+
+impl NetworkRead {
+    /// The host the read contacts, as the network policy names it.
+    #[must_use]
+    pub const fn host(self) -> &'static str {
+        match self {
+            Self::GitHub => "api.github.com",
+            Self::Npm => "registry.npmjs.org",
+        }
+    }
+}
+
+/// The network reads in a command the agent read-only grammar admits, one
+/// entry per host, judged segment by segment so a pipeline or chain cannot
+/// hide one. Leading `cd <dir> &&` prefixes are removed first, the same way
+/// the shell gates move them into the working directory, so the command is
+/// judged as it will run. A command the grammar still refuses reports none:
+/// it never runs as a classifier-approved read.
+#[must_use]
+pub fn readonly_network_reads(command: &str) -> Vec<NetworkRead> {
+    let mut command = command.to_string();
+    // Each pass removes one leading `cd`, so this terminates.
+    while let Some((_, rest)) = split_leading_cd(&command) {
+        command = rest;
+    }
+    let Ok(segments) = agent_readonly_verdict(&command) else {
+        return Vec::new();
+    };
+    let mut reads = Vec::new();
+    for segment in &segments {
+        let tokens = shell_words(&normalize_windows_command_paths(&segment.command));
+        let read = match tokens.first().map(String::as_str) {
+            Some("gh") => NetworkRead::GitHub,
+            Some("npm") => NetworkRead::Npm,
+            _ => continue,
+        };
+        if !reads.contains(&read) {
+            reads.push(read);
+        }
+    }
+    reads
+}
+
+/// Programs the agent grammar knows. A refused segment whose program is in
+/// this set failed on an option or operand; any other program is refused as
+/// a program.
+const AGENT_READONLY_PROGRAMS: &[&str] = &[
+    "git",
+    "gh",
+    "find",
+    "sed",
+    "npm",
+    "sort",
+    "uniq",
+    "cut",
+    "tr",
+    "comm",
+    "echo",
+    "printf",
+    "codewhale",
+    "codew",
+];
+
+const AGENT_GIT_SUBCOMMANDS: &[&str] =
+    &["status", "log", "diff", "show", "ls-files", "blame", "grep"];
+
+fn agent_segment_verdict(segment: &str) -> Result<(), ReadonlyRejection> {
+    let segment = segment.trim();
+    let tokens = shell_words(segment);
+    let Some(program) = tokens.first() else {
+        return Err(ReadonlyRejection::new(
+            "operator",
+            "an empty command next to a shell operator",
+        ));
+    };
+    if primary_token_index(&tokens) != Some(0) || program.contains('=') {
+        return Err(ReadonlyRejection::new(
+            "env_prefix",
+            format!(
+                "`{segment}` starts with an environment assignment or `env`; run the command itself"
+            ),
+        ));
+    }
+    if is_agent_readonly_segment(segment) {
+        return Ok(());
+    }
+    let program = program.as_str();
+    let known = AGENT_READONLY_PROGRAMS.contains(&program)
+        || PARALLEL_READONLY_PREFIXES
+            .iter()
+            .any(|prefix| prefix.split_whitespace().next() == Some(program));
+    Err(match program {
+        "cd" => ReadonlyRejection::new(
+            "cd",
+            "`cd` is admitted only as the first command, written `cd <dir> && ...`, or as the tool's `cwd` field where it has one",
+        ),
+        "git" => {
+            let mut rest = &tokens[1..];
+            loop {
+                match rest.first().map(String::as_str) {
+                    Some("--no-pager") => rest = &rest[1..],
+                    Some("-C") if rest.len() >= 2 => rest = &rest[2..],
+                    _ => break,
+                }
+            }
+            match rest.first().map(String::as_str) {
+                Some(flag) if flag.starts_with('-') => ReadonlyRejection::new(
+                    "option",
+                    format!(
+                        "Git global option `{flag}` is not admitted; only -C <dir> and --no-pager may precede the subcommand"
+                    ),
+                ),
+                Some(sub) if !AGENT_GIT_SUBCOMMANDS.contains(&sub) => ReadonlyRejection::new(
+                    "subcommand",
+                    format!(
+                        "`git {sub}` is not a read-only Git inspection; admitted: {}. For branches or revisions use git status, git log or git show",
+                        AGENT_GIT_SUBCOMMANDS.join(", ")
+                    ),
+                ),
+                None => ReadonlyRejection::new("subcommand", "`git` needs a read-only subcommand"),
+                Some(_) => option_rejection(segment, "git"),
+            }
+        }
+        "gh" => {
+            let family = tokens
+                .iter()
+                .skip(1)
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let canonical = format!("gh {family}");
+            if GITHUB_READONLY_PREFIXES.contains(&canonical.as_str()) {
+                option_rejection(segment, "gh")
+            } else {
+                ReadonlyRejection::new(
+                    "subcommand",
+                    format!(
+                        "`{canonical}` is not a read-only GitHub CLI read; admitted: {}",
+                        GITHUB_READONLY_PREFIXES.join(", ")
+                    ),
+                )
+            }
+        }
+        "npm" if !is_agent_readonly_npm(&tokens) => ReadonlyRejection::new(
+            "subcommand",
+            "only `npm view`, `npm show` and `npm info` are admitted",
+        ),
+        "echo" | "printf" => ReadonlyRejection::new(
+            "option",
+            format!(
+                "`{program}` is admitted with literal text only: no `*`, no leading `~`, and no printf options"
+            ),
+        ),
+        _ if known => option_rejection(segment, program),
+        _ => ReadonlyRejection::new(
+            "program",
+            format!(
+                "`{program}` is not a read-only inspection command; admitted programs: {}, {}",
+                PARALLEL_READONLY_PREFIXES
+                    .iter()
+                    .filter_map(|prefix| prefix.split_whitespace().next())
+                    .filter(|name| *name != "git")
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                AGENT_READONLY_PROGRAMS.join(", ")
+            ),
+        ),
+    })
+}
+
+fn option_rejection(segment: &str, program: &str) -> ReadonlyRejection {
+    ReadonlyRejection::new(
+        "option",
+        format!(
+            "`{segment}` uses an option or operand outside the read-only grammar for `{program}`"
+        ),
+    )
 }
 
 fn is_agent_readonly_segment(segment: &str) -> bool {
@@ -639,6 +1105,7 @@ fn is_agent_readonly_segment(segment: &str) -> bool {
         "find" => is_agent_readonly_find(&tokens),
         "sed" => is_agent_readonly_sed(&tokens),
         "npm" => is_agent_readonly_npm(&tokens),
+        "echo" | "printf" => is_agent_readonly_literal_print(&tokens),
         "sort" => agent_text_filter_options_match(
             &tokens,
             &[
@@ -749,10 +1216,11 @@ fn is_agent_readonly_segment(segment: &str) -> bool {
             2,
         ),
         // Everything else re-uses the parallel table verbatim (including the
-        // gh families and per-command option allowlists); its glob-free
-        // charset is enforced by the caller having already rejected every
-        // metacharacter this classifier permits except `|` and `*`, and the
-        // shared token logic re-checks the rest.
+        // gh families and per-command option allowlists). The lexer in
+        // `lex_readonly_command` has already refused every unquoted shell
+        // metacharacter except `*` and the admitted operators/redirects, so
+        // what reaches here is literal words; the shared token logic
+        // re-checks programs and options.
         _ => readonly_tokens_admitted(segment),
     }
 }
@@ -876,40 +1344,25 @@ fn is_agent_readonly_sed(tokens: &[String]) -> bool {
             .is_some_and(|(a, b)| numeric(a) && numeric(b))
 }
 
+/// `echo`/`printf` as literal separators (`echo ---`). The lexer has already
+/// refused `$` and backticks outside single quotes, so the words are literal;
+/// a `*` or leading `~` would still expand, and printf options are refused.
+fn is_agent_readonly_literal_print(tokens: &[String]) -> bool {
+    let literal = |token: &String| !token.contains('*') && !token.starts_with('~');
+    match tokens[0].as_str() {
+        "echo" => tokens[1..].iter().all(literal),
+        _ => {
+            tokens.get(1).is_some_and(|format| !format.starts_with('-'))
+                && tokens[1..].iter().all(literal)
+        }
+    }
+}
+
 fn is_agent_readonly_npm(tokens: &[String]) -> bool {
     matches!(
         tokens.get(1).map(String::as_str),
         Some("view" | "show" | "info")
     )
-}
-
-/// Return `true` only for the networked GitHub CLI subset admitted by
-/// [`is_parallel_readonly_command`].
-///
-/// Fleet uses this second predicate to apply its independent network ceiling
-/// and the configured per-host network policy. Keeping it derived from the
-/// full read-only classifier means a separator, redirect, background marker,
-/// executable flag, or unsupported `gh` verb can never be mislabeled merely
-/// because its first token is `gh`.
-#[must_use]
-pub fn is_github_readonly_command(command: &str) -> bool {
-    if !is_parallel_readonly_command(command) {
-        return false;
-    }
-
-    let tokens = shell_words(command.trim());
-    let Some(start) = primary_token_index(&tokens) else {
-        return false;
-    };
-    let command_tokens = &tokens[start..];
-    let command_refs = command_tokens
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    let canonical = classify_command(&command_refs);
-    GITHUB_READONLY_PREFIXES
-        .iter()
-        .any(|prefix| *prefix == canonical)
 }
 
 #[rustfmt::skip] // Keep one auditable policy row per command instead of vertically exploding strings.
@@ -2428,20 +2881,43 @@ mod tests {
     }
 
     #[test]
-    fn github_readonly_classifier_only_marks_the_networked_read_subset() {
+    fn network_reads_mark_only_admitted_github_and_npm_segments() {
         for command in [
             "gh issue list",
             "gh issue view 5287 --json title,state",
             "gh issue view 5287 -R owner/repo",
             "gh issue view 5287 -R github.com/owner/repo",
+            "gh pr view 1 | head",
+            "ls && gh issue list",
         ] {
-            assert!(
-                is_github_readonly_command(command),
-                "{command} should be a read-only GitHub network command"
+            assert_eq!(
+                readonly_network_reads(command),
+                vec![NetworkRead::GitHub],
+                "{command} should be a read-only GitHub network read"
             );
         }
+        assert_eq!(
+            readonly_network_reads("npm view x | head"),
+            vec![NetworkRead::Npm]
+        );
+        assert_eq!(
+            readonly_network_reads("gh pr view 1; npm view x; gh pr list"),
+            vec![NetworkRead::GitHub, NetworkRead::Npm]
+        );
+        // A leading `cd` is moved into the working directory by the gates,
+        // so the read behind it is still a network read.
+        assert_eq!(
+            readonly_network_reads("cd . && gh pr view 1"),
+            vec![NetworkRead::GitHub]
+        );
+        assert_eq!(
+            readonly_network_reads("cd a && cd b && npm view x"),
+            vec![NetworkRead::Npm]
+        );
         for command in [
             "git status",
+            "rg gh",
+            "rg 'gh pr view' src",
             "gh issue edit 5287 --title changed",
             "gh issue view 5287 > issue.txt",
             "gh issue view 5287 -R git.example.com/owner/repo",
@@ -2450,9 +2926,113 @@ mod tests {
             "bash -lc 'gh issue view 5287 && touch pwned'",
         ] {
             assert!(
-                !is_github_readonly_command(command),
-                "{command} must not be classified as read-only GitHub access"
+                readonly_network_reads(command).is_empty(),
+                "{command} must not be classified as an admitted network read"
             );
+        }
+    }
+
+    #[test]
+    fn agent_readonly_admits_chains_of_admitted_reads() {
+        for command in [
+            "git diff HEAD && echo '=== FILES ===' && ls -la",
+            "cat a && echo --- && cat b",
+            "rg -n x 2>/dev/null",
+            "rg -n x 2> /dev/null | head -5",
+            "git log --oneline -3; git status --short",
+            "rg x src | head -5 || echo none",
+            "rg 'a && b; c' src",
+            "rg \"a | b > c\" src",
+            "rg 'foo[0-9]?' src",
+            "git log 2>&1 | head",
+            "git status >/dev/null && echo clean",
+            "printf '%s' done",
+            "echo -n x",
+            "rg a\\;b src",
+        ] {
+            assert!(
+                agent_readonly_verdict(command).is_ok(),
+                "{command} should be admitted: {:?}",
+                agent_readonly_verdict(command)
+            );
+        }
+    }
+
+    #[test]
+    fn agent_readonly_refusals_name_the_rule() {
+        for (command, rule, needle) in [
+            ("ls && rm x", "program", "`rm`"),
+            ("ls; sh", "program", "`sh`"),
+            ("python3 -c 'print(1)'", "program", "`python3`"),
+            ("ls a;b", "program", "`b`"),
+            ("touch evil.txt", "program", "`touch`"),
+            ("cat a > b", "operator", "`>`"),
+            ("rg x 2>/tmp/out", "operator", "`>`"),
+            ("rg x >/dev/nullx", "operator", "`>`"),
+            ("rg x 1>/dev/null", "operator", "`>`"),
+            ("echo $(id)", "operator", "`$`"),
+            ("echo \"$HOME\"", "operator", "`$`"),
+            ("echo `id`", "operator", "backtick"),
+            ("(ls)", "operator", "`(`"),
+            ("ls &", "operator", "background"),
+            ("ls |& cat", "operator", "`|&`"),
+            ("ls ;; ls", "operator", "empty"),
+            ("ls &&", "operator", "empty"),
+            ("ls <a", "operator", "`<`"),
+            ("ls # comment", "operator", "`#`"),
+            ("ls 'x", "quote", "unbalanced"),
+            ("ls \"x", "quote", "unbalanced"),
+            ("ls x\\", "quote", "backslash"),
+            ("git branch -a", "subcommand", "git branch"),
+            ("git -c core.pager=x log", "option", "-c"),
+            ("gh pr create", "subcommand", "gh pr create"),
+            ("npm install x", "subcommand", "npm view"),
+            ("sort -o out f", "option", "`sort`"),
+            ("echo *", "option", "literal"),
+            ("FOO=1 ls", "env_prefix", "environment"),
+            ("ls && cd b && ls", "cd", "first command"),
+        ] {
+            let rejection =
+                agent_readonly_verdict(command).expect_err(&format!("{command} must be refused"));
+            assert_eq!(rejection.rule, rule, "{command}: {rejection}");
+            let rendered = rejection.to_string();
+            assert!(
+                rendered.starts_with(&format!("[shell.readonly.command] {rule}: ")),
+                "{rendered}"
+            );
+            assert!(rendered.contains(needle), "{command}: {rendered}");
+        }
+    }
+
+    #[test]
+    fn leading_cd_splits_only_the_admitted_shape() {
+        assert_eq!(
+            split_leading_cd("cd sub && ls"),
+            Some(("sub".to_string(), "ls".to_string()))
+        );
+        assert_eq!(
+            split_leading_cd("cd 'a b' && git diff && echo x"),
+            Some(("a b".to_string(), "git diff && echo x".to_string()))
+        );
+        assert_eq!(
+            split_leading_cd("cd /etc && cat passwd"),
+            Some(("/etc".to_string(), "cat passwd".to_string()))
+        );
+        for command in [
+            "cd a; ls",
+            "cd a || ls",
+            "cd a | ls",
+            "ls && cd b && ls",
+            "cd && ls",
+            "cd $X && ls",
+            "cd ~ && ls",
+            "cd - && ls",
+            "cd a b && ls",
+            "cd a 2>/dev/null && ls",
+            "cd a &&",
+            "cdx a && ls",
+        ] {
+            assert_eq!(split_leading_cd(command), None, "{command}");
         }
     }
 

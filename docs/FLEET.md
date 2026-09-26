@@ -233,6 +233,10 @@ live parent. For standalone `codewhale fleet` execution, Runtime instead uses
 the bounded tool-authority envelope minted from the task's explicit write
 scope together with live config, sandbox, and platform enforcement. Neither
 path reads authority from the profile's storage scope or identity selector.
+A worker whose envelope grants read-only shell access runs the same read-only
+command grammar as an in-session read-only agent, including pipelines, chains
+and a leading `cd` (see "Read-only shell commands" in `docs/SUBAGENTS.md`);
+`gh` and `npm view` reads also need the envelope's network grant.
 
 Picking a concrete model pins its provider explicitly: the saved profile records both
 `model` and `provider` fields, so the route it names doesn't depend on

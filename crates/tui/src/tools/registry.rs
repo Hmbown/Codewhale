@@ -539,42 +539,53 @@ pub(crate) fn enforce_tool_authority(
     }
     let capabilities = tool.capabilities();
     if matches!(name, "bash" | "Bash" | "exec_shell") {
-        // Numeric sed inspection already has an execution-time read-only
-        // grammar. Reuse it here without promoting the broader child shell
-        // surface (including pipelines/network reads) into machine authority,
-        // or changing the parent's parallel/approval classification (#6015).
-        let bounded_sed = context.shell_policy == crate::worker_profile::ShellPolicy::ReadOnly
-            && input
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(|command| {
-                    command.split_whitespace().next() == Some("sed") && !command.contains('|')
-                })
-            && super::shell::agent_readonly_bash_input(input);
-        if tool.is_read_only_for(input) || bounded_sed {
-            if authority.shell != crate::tools::spec::ToolShellAuthority::ReadOnly {
-                return Err(ToolError::permission_denied(format!(
+        // One authority (#6015): a durable worker's shell is judged by the
+        // same agent read-only grammar and input normalization as in-session
+        // agents (`agent_readonly_bash_verdict`), and `BashTool::execute`
+        // applies it again under the clamped `ShellPolicy::ReadOnly`. The
+        // parent's parallel/approval classification (`is_read_only_for`) is
+        // not an authority here.
+        let verdict = super::shell::agent_readonly_bash_verdict(input);
+        if authority.shell != crate::tools::spec::ToolShellAuthority::ReadOnly {
+            return Err(ToolError::permission_denied(if verdict.is_ok() {
+                format!(
                     "worker '{}' cannot run {name}: its machine-readable authority envelope does not grant read-only shell access",
                     authority.owner
-                )));
-            }
-            let networked_read = input
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(codewhale_execpolicy::command_safety::is_github_readonly_command);
-            if networked_read && authority.network_access != Some(true) {
-                return Err(ToolError::permission_denied(format!(
-                    "worker '{}' cannot use read-only GitHub CLI access: its machine-readable authority envelope does not grant network access",
-                    authority.owner
-                )));
-            }
-            return Ok(());
+                )
+            } else {
+                format!(
+                    "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope. {}",
+                    authority.owner,
+                    codewhale_execpolicy::command_safety::readonly_command_help()
+                )
+            }));
         }
-        return Err(ToolError::permission_denied(format!(
-            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope. {}",
-            authority.owner,
-            codewhale_execpolicy::command_safety::readonly_command_help()
-        )));
+        if let Err(rejection) = verdict {
+            return Err(ToolError::permission_denied(format!(
+                "worker '{}' cannot run {name}: {}",
+                authority.owner,
+                super::shell::readonly_refusal(
+                    &rejection,
+                    super::shell::readonly_enforced_lane_available(context)
+                )
+            )));
+        }
+        let hosts = input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(codewhale_execpolicy::command_safety::readonly_network_reads)
+            .unwrap_or_default()
+            .into_iter()
+            .map(codewhale_execpolicy::command_safety::NetworkRead::host)
+            .collect::<Vec<_>>();
+        if !hosts.is_empty() && authority.network_access != Some(true) {
+            return Err(ToolError::permission_denied(format!(
+                "worker '{}' cannot use read-only network access to {}: its machine-readable authority envelope does not grant network access",
+                authority.owner,
+                hosts.join(", ")
+            )));
+        }
+        return Ok(());
     }
     if name == "Run" {
         if bounded_verifier {

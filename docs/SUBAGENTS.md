@@ -272,6 +272,38 @@ change inside a worker's broad scope is not enough to attribute that write to
 the worker. `path:LINE` and `path:LINE-LINE` evidence citations, including
 sentence punctuation and Markdown links, never count as edit claims.
 
+### Read-only shell commands
+
+Scout, reviewer and planner agents, agents narrowed with
+`write_authority: "read_only"`, and durable Fleet workers with a read-only
+shell grant all judge `bash` calls by the same read-only grammar:
+
+- inspection programs: `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `which`,
+  `stat`, `file`, `du`, `df`, `grep`, `rg`, `fd`, `find` without `-exec` or
+  `-delete`, and `sed -n <range>p`;
+- `git status`, `log`, `diff`, `show`, `ls-files`, `blame` and `grep`,
+  optionally after `-C <dir>` or `--no-pager`;
+- the text filters `sort`, `uniq`, `cut`, `tr` and `comm`, and literal
+  `echo`/`printf`;
+- with a network grant, `gh` issue/pr/release/repo/run/workflow view or list
+  reads and `npm view`.
+
+Admitted commands can be joined with `|`, `&&`, `||` and `;`, for example
+`git diff HEAD && echo '=== FILES ===' && ls -la`. A leading `cd <dir> &&`
+sets the working directory, and that directory must be inside the workspace.
+The only redirects are `2>/dev/null`, `>/dev/null` and `2>&1`. Quoted text is
+data, so `rg 'a && b' src` is one search. Other redirects, `$` or backtick
+expansion, subshells, backgrounding, inline environment assignments, and any
+other program (such as `python`, `awk`, `jq` or `cargo`) are refused. Options
+and path operands are still checked, and each `gh` or `npm` read needs the
+network grant wherever it appears in the command.
+
+A refused command comes back to the agent as an error result that names the
+rule, for example
+`[shell.readonly.command] program: `touch` is not a read-only inspection command`,
+followed by what the agent can do instead. The agent keeps working, and
+repeated refusals without progress end it as failed rather than completed.
+
 ### Reading beside a writer
 
 Read-only tools and classifier-approved shell reads can run while a peer owns
@@ -599,16 +631,19 @@ zero representation for that default never cancels a finite inherited cap.
 seconds. An explicit value may go above that built-in default, for long
 unattended work; an operator-configured `default_wall_time_secs` is both the
 default and a ceiling, and role, parent, and saved-run deadlines still only
-narrow. It includes admission queue time, model requests, and tools. The
-effective absolute deadline is persisted.
+narrow. It covers model requests and tools. The effective absolute deadline
+is persisted, and saved again when a queued agent launches, so a later
+continuation is bounded by the deadline the agent actually worked to.
 
-The wall clock starts when the agent is started, not when it gets a launch
-slot. This is deliberate. The queue wait and the run share one deadline, so a
-saturated or rate-limited fleet cannot keep an agent alive past the budget
-you gave it. The cost is that time spent queued is time taken from the run.
-The queued row says so instead of hiding it: it names the reason for the wait
-and the time the wall budget ends. If agents regularly spend a large share of
-their budget queued, start fewer at once or raise `wall_time_secs`.
+The work clock starts when the agent gets a launch slot. An agent that waits
+in the launch queue waits at most `wall_time_secs`; if no slot opens in that
+time it fails with a `never started` reason and zero steps, instead of being
+reported as a run that used up its budget. An agent that does get a slot
+after waiting receives its full `wall_time_secs` from that moment, still
+bounded by any parent, saved-run or source deadline. So a parent can wait up
+to about twice `wall_time_secs` for a queued agent. The queued row names the
+reason for the wait and the time the agent stops waiting. If agents often
+wait long, start fewer at once.
 
 For example, a focused review can request:
 
