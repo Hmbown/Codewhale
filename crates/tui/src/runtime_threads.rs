@@ -9366,10 +9366,15 @@ impl RuntimeThreadManager {
             if thread.archived || thread.session_id.as_deref() != Some(session_id) {
                 continue;
             }
+            // The checkpoint must cover the *whole* document. Hydration
+            // accepts a prefix (the document may have grown since the bind),
+            // but that thread shows the prefix plus its own turns, so anything
+            // another writer appended after the bind would be missing from it.
+            // A grown document gets a fresh thread holding all of it instead.
             if let Some(checkpoint) = thread.saved_session_checkpoint.as_ref()
                 && !matches!(
                     checkpoint_prefix_len(checkpoint, &session.messages),
-                    Ok(Some(_))
+                    Ok(Some(len)) if len == session.messages.len()
                 )
             {
                 continue;

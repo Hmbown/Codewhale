@@ -274,6 +274,49 @@ async fn reconcile_unbinds_threads_whose_document_is_gone() {
     assert!(receipts.contains("thread_unbound") && receipts.contains("deleted-document"));
 }
 
+/// R4 then R3 in a store no document binds: deleting a document from the
+/// session picker leaves the threads naming it bound. They are unbound (with
+/// a receipt) and then recovered, instead of keeping the store forever.
+#[tokio::test]
+async fn reconcile_recovers_threads_in_an_unbound_store_bound_to_a_missing_document() {
+    let _env = lock_test_env();
+    let fx = Fixture::new();
+    let (store, thread_id) = fx.store_with_thread("picker-deleted").await;
+    {
+        let opened = RuntimeThreadStore::open(store.clone()).unwrap();
+        let mut thread = opened.load_thread(&thread_id).unwrap();
+        thread.session_id = Some("deleted-from-picker".into());
+        opened.save_thread(&thread).unwrap();
+    }
+
+    let summary = fx.run();
+    assert_eq!(summary.threads_unbound, 1, "{summary:?}");
+    assert_eq!(summary.sessions_recovered, 1, "{summary:?}");
+    assert_eq!(summary.stores_kept_with_work, 0, "{summary:?}");
+
+    let id = crate::runtime_threads::thread_session_id(&thread_id);
+    let recovered = fx.sessions.load_session(&id).expect("recovered document");
+    assert!(recovered.metadata.title.starts_with("Recovered: "));
+    assert_eq!(
+        recovered
+            .metadata
+            .runtime_store
+            .expect("bound to its store")
+            .data_dir,
+        store.canonicalize().unwrap()
+    );
+    let thread = RuntimeThreadStore::open(store.clone())
+        .unwrap()
+        .load_thread(&thread_id)
+        .unwrap();
+    assert_eq!(thread.session_id.as_deref(), Some(id.as_str()));
+    let receipts = fs::read_to_string(store.join(THREAD_UNBIND_RECEIPTS_FILE)).unwrap();
+    assert!(receipts.contains("deleted-from-picker"), "{receipts}");
+
+    let again = fx.run();
+    assert!(!again.changed(), "{again:?}");
+}
+
 /// R1: an unreadable document is set aside with its hash; a document from a
 /// newer build is left alone.
 #[test]

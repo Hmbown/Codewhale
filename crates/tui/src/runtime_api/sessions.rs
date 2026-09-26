@@ -452,16 +452,17 @@ pub(super) async fn create_session_from_thread(
     // Export is idempotent (#6144). Every POST used to mint a fresh document
     // and rebind the thread to it, so each re-export left the previous
     // document unreferenced, and a crash between the save and the bind below
-    // left the new one unreferenced too. The thread's own document is
-    // updated in place; a thread with none gets the id derived from it —
-    // the one its engine already writes artifacts under — so a retry after
-    // such a crash finds and binds the document it already wrote.
-    let session_handle = detail
-        .thread
-        .session_id
-        .clone()
-        .filter(|id| manager.session_document_exists(id))
-        .unwrap_or_else(|| crate::runtime_threads::thread_session_id(&detail.thread.id));
+    // left the new one unreferenced too. Export writes only the document id
+    // derived from the thread — the one its engine already writes artifacts
+    // under — so a re-export or a retry after such a crash updates and binds
+    // the document it already wrote.
+    //
+    // The document the thread is currently bound to is deliberately *not*
+    // the target: a thread opened with `resume-thread` is bound to the
+    // original saved session, often a TUI conversation, and rewriting it from
+    // this thread's lossier projection would drop its images, tool work and
+    // system prompt. Export leaves that document untouched.
+    let session_handle = crate::runtime_threads::thread_session_id(&detail.thread.id);
     if manager.is_session_live_anywhere(&session_handle) {
         return Err(map_session_err(
             &session_handle,

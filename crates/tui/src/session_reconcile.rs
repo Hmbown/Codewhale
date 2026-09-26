@@ -798,6 +798,18 @@ impl Run<'_> {
         path: &Path,
         exists: impl Fn(&str) -> bool,
     ) {
+        // R4 applies here too. Deleting a document from the session picker
+        // does not unbind the threads naming it, so an unbound store can hold
+        // threads bound to a document that is gone. Left bound, they are
+        // neither loadable through that document nor recoverable below, and
+        // the store is kept forever. Unbinding them (with a receipt) makes
+        // them recoverable in this same pass.
+        if !self.options.dry_run {
+            match held.unbind_threads_without_documents(&exists) {
+                Ok(count) => self.summary.threads_unbound += count,
+                Err(error) => return self.error(&format!("threads in {}", path.display()), error),
+            }
+        }
         let threads = match held.recoverable_threads() {
             Ok(threads) => threads,
             Err(error) => return self.error(&format!("threads in {}", path.display()), error),

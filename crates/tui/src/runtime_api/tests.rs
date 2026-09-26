@@ -5621,6 +5621,188 @@ async fn session_resume_thread_reuses_the_thread_that_already_holds_it() -> Resu
     Ok(())
 }
 
+/// A saved conversation fixture with a system prompt, written under `id`.
+fn write_resumable_session_fixture(sessions_dir: &std::path::Path, id: &str) -> Result<()> {
+    let session = json!({
+        "schema_version": 1,
+        "metadata": {
+            "id": id,
+            "title": "Resumable fixture",
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:10:00Z",
+            "message_count": 2,
+            "total_tokens": 100,
+            "model": "deepseek-v4-pro",
+            "workspace": "/tmp/test",
+            "mode": "agent"
+        },
+        "messages": [
+            {
+                "role": "user",
+                "content": [{ "type": "text", "text": "Hello, world!" }]
+            },
+            {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "Hello! How can I help you?" }]
+            }
+        ],
+        "system_prompt": "You are the original conversation's system prompt."
+    });
+    fs::write(
+        sessions_dir.join(format!("{id}.json")),
+        serde_json::to_string_pretty(&session)?,
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_export_of_a_resumed_thread_leaves_the_source_document_untouched() -> Result<()> {
+    // A resumed thread is bound to the original saved session. Exporting it
+    // writes the thread's own document; rewriting the original from the
+    // thread's projection would drop what the projection does not carry.
+    let _env = lock_test_env();
+    let dir = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+    let root = dir.path().join("server");
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir)?;
+    write_resumable_session_fixture(&sessions_dir, "sess_export_source")?;
+
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let resumed = client
+        .post(format!(
+            "http://{addr}/v1/sessions/sess_export_source/resume-thread"
+        ))
+        .json(&json!({}))
+        .send()
+        .await?;
+    assert_eq!(resumed.status(), StatusCode::CREATED);
+    let resumed: serde_json::Value = resumed.json().await?;
+    let thread_id = resumed["thread_id"]
+        .as_str()
+        .context("missing resumed thread id")?
+        .to_string();
+    let source_path = sessions_dir.join("sess_export_source.json");
+    let source_before = fs::read(&source_path)?;
+
+    let exported = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&json!({ "thread_id": thread_id }))
+        .send()
+        .await?;
+    assert_eq!(exported.status(), StatusCode::CREATED);
+    let exported: serde_json::Value = exported.json().await?;
+    let expected_id = crate::runtime_threads::thread_session_id(&thread_id);
+    assert_eq!(exported["session_id"], expected_id.as_str());
+    assert_eq!(
+        fs::read(&source_path)?,
+        source_before,
+        "export must not rewrite the document the thread was resumed from"
+    );
+    assert_eq!(
+        runtime_threads.get_thread(&thread_id).await?.session_id,
+        Some(expected_id.clone())
+    );
+
+    // A second export updates the thread's own document, still not the source.
+    let again = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&json!({ "thread_id": thread_id }))
+        .send()
+        .await?;
+    assert_eq!(again.status(), StatusCode::OK);
+    let again: serde_json::Value = again.json().await?;
+    assert_eq!(again["session_id"], expected_id.as_str());
+    assert_eq!(fs::read(&source_path)?, source_before);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_resume_thread_mints_a_fresh_thread_when_the_document_grew() -> Result<()> {
+    // The thread holding a conversation shows its checkpointed prefix plus its
+    // own turns. Messages another writer appended after the bind are not in
+    // that thread, so resuming the grown document must not hand it back.
+    let _env = lock_test_env();
+    let dir = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+    let root = dir.path().join("server");
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir)?;
+    write_resumable_session_fixture(&sessions_dir, "sess_grown_resume")?;
+
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let url = format!("http://{addr}/v1/sessions/sess_grown_resume/resume-thread");
+    let first = client.post(&url).json(&json!({})).send().await?;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first: serde_json::Value = first.json().await?;
+    let first_thread = first["thread_id"]
+        .as_str()
+        .context("missing resumed thread id")?
+        .to_string();
+
+    // The TUI keeps working on the same conversation and autosaves.
+    let manager = crate::session_manager::SessionManager::new(sessions_dir.clone())?;
+    let mut grown = manager.load_session("sess_grown_resume")?;
+    for (role, text) in [
+        (Role::User, "One more question from the terminal"),
+        (Role::Assistant, "And its answer"),
+    ] {
+        grown.messages.push(Message {
+            role,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        });
+    }
+    grown.metadata.message_count = grown.messages.len();
+    manager.save_session(&grown)?;
+
+    let second = client.post(&url).json(&json!({})).send().await?;
+    assert_eq!(second.status(), StatusCode::CREATED);
+    let second: serde_json::Value = second.json().await?;
+    let second_thread = second["thread_id"]
+        .as_str()
+        .context("missing resumed thread id")?
+        .to_string();
+    assert_ne!(second_thread, first_thread);
+    assert_eq!(second["message_count"], 4);
+    let detail = runtime_threads.get_thread_detail(&second_thread).await?;
+    let texts: Vec<String> = detail
+        .items
+        .iter()
+        .flat_map(|item| [Some(item.summary.clone()), item.detail.clone()])
+        .flatten()
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("One more question from the terminal")),
+        "the fresh thread must hold the appended messages: {texts:?}"
+    );
+
+    // Resuming again finds the fresh thread, whose checkpoint covers it all.
+    let third = client.post(&url).json(&json!({})).send().await?;
+    assert_eq!(third.status(), StatusCode::OK);
+    let third: serde_json::Value = third.json().await?;
+    assert_eq!(third["thread_id"], second_thread.as_str());
+
+    handle.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn session_resume_thread_ignores_an_archived_thread_holding_the_session() -> Result<()> {
     // Archiving is how a conversation is taken off the rail. Handing the

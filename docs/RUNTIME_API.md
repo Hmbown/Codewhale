@@ -628,13 +628,16 @@ a TLS or verified transport boundary.
   read-only peek instead of the full transcript)
 - `PATCH /v1/sessions/{id}` (`{ "title"?: string, "archived"?: bool }`)
 - `DELETE /v1/sessions/{id}`
-- `POST /v1/sessions/{id}/resume-thread`
+- `POST /v1/sessions/{id}/resume-thread` returns the open thread that already
+  holds the whole saved session (`200`), or seeds a new thread from it (`201`)
+  when none does, including when the session grew after that thread opened it.
 - `GET /v1/sessions/{id}/artifacts` and `GET /v1/sessions/{id}/artifacts/{artifact_id}?offset=&limit=`
   (see workspace files and session artifacts above)
 - `POST /v1/sessions` (`{ "thread_id": string, "title"?: string }`) exports a
-  thread as a saved session. It is idempotent: the thread's own document is
-  updated in place (`200`), and a thread without one gets a document whose id
-  is derived from the thread (`201`), so a retry never makes a duplicate.
+  thread as a saved session. It is idempotent: it writes only the document
+  whose id is derived from the thread, creating it the first time (`201`) and
+  updating it after (`200`), so a retry never makes a duplicate. A session the
+  thread was resumed from is left unchanged.
 - `PUT /v1/sessions` (`{ "thread_id"?: string, "session_id"?: string }`) saves
   a thread's live conversation. Naming a `session_id` that another thread is
   bound to returns `409 Conflict`.
