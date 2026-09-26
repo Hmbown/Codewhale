@@ -895,9 +895,13 @@ jobs:
     # macOS leg runs on the self-hosted Mac (trusted event and
     # CW_SELF_HOSTED_MAC == 'true'), it runs these two steps on the warm
     # build instead. The name keeps "(fork PR)" so check contexts stay stable.
+    # Hosted macOS allows only five concurrent jobs per account, and this job
+    # doubled every pull request's claim on them, queueing the required Test
+    # (macos-latest) leg for hours. So pull requests skip it and every push to
+    # main still runs it; a regression shows up on the merge that caused it.
     name: macOS budget and eval (fork PR)
     needs: changes
-    if: needs.changes.outputs.heavy == 'true' && !(needs.changes.outputs.trusted == 'true' && vars.CW_SELF_HOSTED_MAC == 'true')
+    if: needs.changes.outputs.heavy == 'true' && github.event_name != 'pull_request' && !(needs.changes.outputs.trusted == 'true' && vars.CW_SELF_HOSTED_MAC == 'true')
     timeout-minutes: 75
     runs-on: macos-latest
     steps:
