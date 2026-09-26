@@ -209,7 +209,7 @@ pub(crate) fn resolve_credential_source_with(
 
     if config.config_credentials_are_bound_to_provider_endpoint(provider) {
         if config
-            .provider_config_string_with_runtime_fallback(provider, |entry| entry.api_key.clone())
+            .provider_route_string_with_deepseek_fallback(provider, |entry| entry.api_key.clone())
             .is_some_and(|key| {
                 classify_config_api_key_value(&key) == ConfigApiKeyValueKind::Literal
             })
@@ -266,17 +266,6 @@ pub(crate) fn resolve_credential_source_with(
                 ),
             ));
         }
-    }
-
-    if (matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
-        || (provider == ApiProvider::Custom && config.uses_legacy_literal_custom_route()))
-        && config.config_credentials_are_bound_to_provider_endpoint(provider)
-        && config
-            .api_key
-            .as_ref()
-            .is_some_and(|key| classify_config_api_key_value(key) == ConfigApiKeyValueKind::Literal)
-    {
-        return CredentialResolution::found(CredentialSource::RootConfigApiKey);
     }
 
     // Last resort: the user-global config file. A key saved there must not

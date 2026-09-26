@@ -1553,24 +1553,26 @@ fn runtime_event_process_child_helper() {
                 .expect("event writer count must be numeric");
             std::fs::write(&signal, b"ready").expect("announce ready event writer");
             wait_for_runtime_event_test_file(&start, "writer start barrier");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build event writer runtime");
-            runtime.block_on(async {
-                for index in 0..count {
-                    store
-                        .append_event(
-                            &thread_id,
-                            None,
-                            None,
-                            "process.event",
-                            json!({ "worker": worker, "index": index }),
-                        )
-                        .await
-                        .expect("append cross-process Runtime event");
-                }
-            });
+            // The same transaction `append_event` runs, with a lock budget
+            // sized for contention rather than the interactive 5 s default.
+            // The claim here is that sequences never collide across
+            // processes; four writers each fsyncing eight appends on a loaded
+            // CI runner have starved one polling writer past 5 s (macOS and
+            // Windows), which failed the run without any duplicate sequence.
+            // 25 s stays inside the parent's 30 s wait, so a genuinely stuck
+            // lock still fails here with its own message.
+            for index in 0..count {
+                store
+                    .append_event_transaction(
+                        thread_id.clone(),
+                        None,
+                        None,
+                        "process.event".to_string(),
+                        json!({ "worker": worker, "index": index }),
+                        Duration::from_secs(25),
+                    )
+                    .expect("append cross-process Runtime event");
+            }
         }
         "holder" => {
             store
@@ -2168,9 +2170,9 @@ async fn explicit_local_thread_model_does_not_require_an_unrelated_default_catal
     let root = tempfile::tempdir()?;
     let config = Config {
         provider: Some("ollama".into()),
-        base_url: Some("http://127.0.0.1:11497/v1".into()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(None, Some("http://127.0.0.1:11497/v1".into()));
     let manager = RuntimeThreadManager::open(
         config,
         root.path().to_path_buf(),
@@ -2271,13 +2273,13 @@ async fn named_custom_thread_identity_round_trips_and_fails_closed_when_removed(
 }
 
 #[test]
-fn legacy_literal_custom_thread_resume_requires_and_keeps_root_route() -> Result<()> {
+fn legacy_literal_custom_thread_resumes_on_the_migrated_table() -> Result<()> {
     let config = Config {
         provider: Some("custom".to_string()),
-        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
         default_text_model: Some("legacy-default-model".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(None, Some("http://127.0.0.1:18180/v1".to_string()));
     let manager = RuntimeThreadManager::open(
         config.clone(),
         PathBuf::from("."),
@@ -2296,14 +2298,7 @@ fn legacy_literal_custom_thread_resume_requires_and_keeps_root_route() -> Result
         route.config.active_route_base_url(),
         "http://127.0.0.1:18180/v1"
     );
-    assert!(
-        route
-            .config
-            .providers
-            .as_ref()
-            .is_none_or(|providers| !providers.custom.contains_key("custom")),
-        "route resolution must not synthesize an ambiguous [providers.custom] table"
-    );
+    // The top-level route is the `[providers.custom]` table since #6394.
     assert_eq!(
         route
             .config
@@ -2312,7 +2307,7 @@ fn legacy_literal_custom_thread_resume_requires_and_keeps_root_route() -> Result
         crate::config::ProviderIdentity {
             provider: ApiProvider::Custom,
             key: "custom".to_string(),
-            exact_id: None,
+            exact_id: Some("custom".to_string()),
             migrated_legacy_ollama_cloud_route: false,
         }
     );
@@ -2348,20 +2343,20 @@ fn legacy_literal_custom_thread_resume_requires_and_keeps_root_route() -> Result
         .resolved_route_for_thread(&named_config, &restored)
         .expect_err("id-less root record must not migrate to a named table")
         .to_string();
-    assert!(error.contains("root-level"), "{error}");
+    assert!(error.contains("[providers.custom]"), "{error}");
     assert!(error.contains("will not guess or fall back"), "{error}");
 
     Ok(())
 }
 
 #[tokio::test]
-async fn root_custom_thread_and_turn_writers_omit_exact_id() -> Result<()> {
+async fn literal_custom_thread_and_turn_writers_record_the_table_id() -> Result<()> {
     let config = Config {
         provider: Some("custom".to_string()),
-        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
         default_text_model: Some("legacy-root-model".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(None, Some("http://127.0.0.1:18180/v1".to_string()));
     let manager = RuntimeThreadManager::open(
         config,
         PathBuf::from("."),
@@ -2373,9 +2368,9 @@ async fn root_custom_thread_and_turn_writers_omit_exact_id() -> Result<()> {
             ..CreateThreadRequest::default()
         })
         .await?;
+    // The literal route is the `[providers.custom]` table since #6394.
     assert_eq!(thread.model_provider.as_deref(), Some("custom"));
-    assert_eq!(thread.model_provider_id, None);
-    assert!(!serde_json::to_string(&thread)?.contains("model_provider_id"));
+    assert_eq!(thread.model_provider_id.as_deref(), Some("custom"));
 
     let mut harness = install_mock_engine(&manager, &thread.id).await;
     let turn = manager
@@ -2388,12 +2383,11 @@ async fn root_custom_thread_and_turn_writers_omit_exact_id() -> Result<()> {
         )
         .await?;
     assert_eq!(turn.effective_provider.as_deref(), Some("custom"));
-    assert_eq!(turn.effective_provider_id, None);
-    assert!(!serde_json::to_string(&turn)?.contains("effective_provider_id"));
+    assert_eq!(turn.effective_provider_id.as_deref(), Some("custom"));
     match harness.rx_op.recv().await {
         Some(Op::SendMessage(TurnSpec { route, .. })) => {
             assert_eq!(route.identity.key, "custom");
-            assert_eq!(route.identity.exact_id, None);
+            assert_eq!(route.identity.exact_id.as_deref(), Some("custom"));
             assert_eq!(
                 route.config.active_route_base_url(),
                 "http://127.0.0.1:18180/v1"
@@ -3864,7 +3858,7 @@ async fn concurrent_turn_starts_leave_one_claim_and_one_consistent_durable_turn(
 }
 
 #[test]
-fn legacy_custom_thread_stays_on_root_when_literal_table_coexists() -> Result<()> {
+fn legacy_custom_thread_resumes_on_the_literal_table_when_both_exist() -> Result<()> {
     let mut custom = std::collections::HashMap::new();
     custom.insert(
         "custom".to_string(),
@@ -3877,14 +3871,14 @@ fn legacy_custom_thread_stays_on_root_when_literal_table_coexists() -> Result<()
     );
     let config = Config {
         provider: Some("custom".to_string()),
-        base_url: Some("http://127.0.0.1:18181/v1".to_string()),
         default_text_model: Some("legacy-root-model".to_string()),
         providers: Some(crate::config::ProvidersConfig {
             custom,
             ..crate::config::ProvidersConfig::default()
         }),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(None, Some("http://127.0.0.1:18181/v1".to_string()));
     let manager = RuntimeThreadManager::open(
         config.clone(),
         PathBuf::from("."),
@@ -3895,13 +3889,15 @@ fn legacy_custom_thread_stays_on_root_when_literal_table_coexists() -> Result<()
     legacy.model_provider = Some("custom".to_string());
     legacy.model_provider_id = None;
 
+    // Beside the literal table, the older top-level endpoint is DeepSeek's
+    // (#6394): an id-less record resumes on the table like an exact one.
     let root = manager.resolved_route_for_thread(&config, &legacy)?;
     assert_eq!(root.identity.provider, ApiProvider::Custom);
     assert_eq!(root.identity.key, "custom");
-    assert_eq!(root.identity.exact_id, None);
+    assert_eq!(root.identity.exact_id.as_deref(), Some("custom"));
     assert_eq!(
         root.config.active_route_base_url(),
-        "http://127.0.0.1:18181/v1"
+        "http://127.0.0.1:18182/v1"
     );
 
     legacy.model_provider_id = Some("custom".to_string());
@@ -3915,16 +3911,17 @@ fn legacy_custom_thread_stays_on_root_when_literal_table_coexists() -> Result<()
     );
     let root_only = Config {
         provider: Some("custom".to_string()),
-        base_url: Some("http://127.0.0.1:18181/v1".to_string()),
         default_text_model: Some("legacy-root-model".to_string()),
         ..Config::default()
-    };
-    let error = manager
-        .resolved_route_for_thread(&root_only, &legacy)
-        .expect_err("exact literal table thread must not fall back to root")
-        .to_string();
-    assert!(error.contains("[providers.custom]"), "{error}");
-    assert!(error.contains("will not fall back"), "{error}");
+    }
+    .with_legacy_root(None, Some("http://127.0.0.1:18181/v1".to_string()));
+    // A top-level-only literal route became the table, so the exact thread
+    // resumes on it.
+    let resumed = manager.resolved_route_for_thread(&root_only, &legacy)?;
+    assert_eq!(
+        resumed.config.active_route_base_url(),
+        "http://127.0.0.1:18181/v1"
+    );
     Ok(())
 }
 
@@ -3942,14 +3939,14 @@ async fn empty_imported_custom_id_fails_closed_when_root_and_table_coexist() -> 
     );
     let config = Config {
         provider: Some("custom".to_string()),
-        base_url: Some("http://127.0.0.1:18181/v1".to_string()),
         default_text_model: Some("legacy-root-model".to_string()),
         providers: Some(crate::config::ProvidersConfig {
             custom,
             ..crate::config::ProvidersConfig::default()
         }),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(None, Some("http://127.0.0.1:18181/v1".to_string()));
     let manager = RuntimeThreadManager::open(
         config.clone(),
         PathBuf::from("."),
@@ -10154,10 +10151,12 @@ async fn compact_thread_with_real_engine_reaches_terminal_status() -> Result<()>
             // This test intentionally crosses the real-engine boundary. Give
             // client preflight a hermetic credential and closed-loopback URL;
             // the assertion permits the resulting terminal failure.
-            api_key: Some("runtime-thread-test-key".to_string()),
-            base_url: Some("http://127.0.0.1:1/v1".to_string()),
             ..Config::default()
-        },
+        }
+        .with_legacy_root(
+            Some("runtime-thread-test-key".to_string()),
+            Some("http://127.0.0.1:1/v1".to_string()),
+        ),
         PathBuf::from("."),
         test_manager_config(test_runtime_dir()),
     )?;
@@ -17678,10 +17677,10 @@ mod runtime_image_inputs {
         let mut config = Config {
             provider: Some("deepseek".into()),
             default_text_model: Some("deepseek-v4-flash-vision-exp".into()),
-            api_key: Some("synthetic-image-fixture-key".into()),
             runtime_chat_isolated: true,
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("synthetic-image-fixture-key".into()), None);
         config.set_provider_model_override(
             ApiProvider::Deepseek,
             Some("deepseek-v4-flash-vision-exp".into()),

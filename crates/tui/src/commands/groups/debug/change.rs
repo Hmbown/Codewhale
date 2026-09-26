@@ -306,7 +306,7 @@ mod tests {
     fn make_app(tmpdir: &tempfile::TempDir, locale: Locale, has_api_key: bool) -> App {
         let mut config = Config::default();
         if has_api_key {
-            config.api_key = Some("test-key".to_string());
+            config.set_legacy_root(Some("test-key".to_string()), None);
         }
         let mut app = App::new(
             TuiOptions {

@@ -17,13 +17,15 @@
 # `--provider fireworks`, `--provider siliconflow`, `--provider siliconflow-CN`,
 # `/provider arcee`, `/provider moonshot`, `/provider qianfan`, `/provider sglang`, `/provider vllm`,
 # `/provider ollama`, `/provider huggingface`, `/provider stepfun`, `/provider openmodel`,
-# `/provider opencode-go`, `/provider opencode-zen`, `/provider meta`, `/provider xai`) toggle without having to re-enter keys. Keys and
-# endpoints live in each provider's `[providers.<name>]` table. An older
-# top-level `api_key` / `base_url` is still read: it belongs to
-# `[providers.deepseek]` (or to the vendor whose official host it names), and
-# `codewhale config migrate` moves it there in the file.
+# `/provider opencode-go`, `/provider opencode-zen`, `/provider meta`, `/provider xai`) toggle without having to re-enter keys. Top-level
+# `api_key` / `base_url` are
+# still read as DeepSeek defaults when `[providers.deepseek]` is absent
+# (backward compatibility).
 provider = "deepseek" # deepseek | deepseek-cn | deepseek-anthropic | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | orcarouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | ollama-cloud | huggingface | modelscope | together | qianfan | openai-codex | anthropic | openmodel | deepinfra | sakana | longcat | opencode-go | opencode-zen | meta | xai | mistral | telecomjs | google | edenai | zenmux | csdn | concentrate | modelstudio-token-plan | modelstudio-coding-plan | codewhale
+api_key = "YOUR_DEEPSEEK_API_KEY" # must be non-empty
+base_url = "https://api.deepseek.com/beta"
 # provider = "deepseek-cn"                       # legacy alias (official host is still https://api.deepseek.com)
+# base_url = "https://api.deepseek.com"         # opt out of DeepSeek beta features
 # Optional custom model request headers for OpenAI-compatible gateways.
 # Authorization and Content-Type are managed by the client and cannot be overridden here.
 # http_headers = { "X-Model-Provider-Id" = "your-model-provider" }
@@ -574,9 +576,8 @@ max_subagents = 10 # optional (default 64, clamped to 1-128)
 
 # DeepSeek Platform (https://platform.deepseek.com)
 [providers.deepseek]
-api_key = "YOUR_DEEPSEEK_API_KEY" # must be non-empty; deepseek-cn reads it too
-base_url = "https://api.deepseek.com/beta"
-# base_url = "https://api.deepseek.com"         # opt out of DeepSeek beta features
+# api_key = "YOUR_DEEPSEEK_API_KEY"
+# base_url = "https://api.deepseek.com/beta"
 # model = "deepseek-v4-pro"
 # Custom DeepSeek-compatible example:
 # base_url = "https://your-provider.example/v1"
@@ -1159,6 +1160,7 @@ base_url = "https://api.deepseek.com/beta"
 alternate_screen = "auto"   # auto/always start on the alternate screen; never starts inline (keeps terminal scrollback). /fullscreen and /inline switch at runtime
 mouse_capture = true        # true: TUI-owned mouse selection (payload set by selection_copy_markdown); false: raw terminal selection/copy
 selection_copy_markdown = true # true: copy transcript drag selections as Markdown source; false: rendered text
+terminal_probe_timeout_ms = 500 # optional startup terminal-mode timeout (100-5000ms)
 stream_chunk_timeout_secs = 900 # optional SSE idle timeout per chunk (0 = default, 1-3600)
 # Model steps are uncapped by default. Uncomment to install an explicit
 # ceiling; omission or 0 means no step limit, positive values clamp to 1-100000.
@@ -1235,21 +1237,6 @@ exec_policy = true
                         # (#4196). On by default; the agent decides when to spend
                         # the extra reasoning, so cost is only incurred on demand.
                         # Set false to remove it from the model's tool catalog.
-# extension_host = false # EXPERIMENTAL. Run reviewed plugins' `native` host code
-                        # (TypeScript/JavaScript, Cordis/DSH plugin model) in a
-                        # Node.js sidecar. Tools only in this phase; every
-                        # extension tool always asks for approval. On macOS
-                        # the host runs under Seatbelt (no network, no reads of
-                        # ~/.codewhale secrets/credentials/config/sessions,
-                        # writes only to its data dir and temp dirs); on Linux
-                        # and Windows it runs with your user permissions.
-                        # Toggling this changes the plugin activation policy,
-                        # so every plugin must be re-reviewed afterwards.
-
-# [extension_host]
-# node = "/usr/local/bin/node"  # Node.js ^22.19 || >=24. Tried first; otherwise
-#                               # every `node` on PATH is tried in order and the
-#                               # first that runs and meets the floor is used.
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Vision Model Configuration (optional)
@@ -1306,24 +1293,27 @@ exponential_base = 2.0
 # `[compaction]` table yet; runtime compaction budgets are chosen by the TUI
 # from the active model/context window.
 
-# [context] supports one key, `project_pack` (default false, #4781). The
-# removed seam-manager keys (enabled, verbatim_window_turns, l1/l2/l3_threshold,
-# seam_model) are ignored if an older config still carries them.
+# [context] supports `enabled` (default false) and `project_pack` (#4781).
+# The old seam-manager keys (verbatim_window_turns, l1/l2/l3_threshold,
+# seam_model) are parsed but ignored — seam_manager.rs no longer exists.
 
 # ─────────────────────────────────────────────────────────────────────────────────
-# Workshop / Tool-Output Budgets
+# Workshop / Large-Output Routing (#548)
 # ─────────────────────────────────────────────────────────────────────────────────
-# By default an oversized tool result uses bounded spillover: a result under the
-# byte threshold stays inline, a larger one gets a head/tail preview plus a
-# session artifact the model can read back. There is no synthesis sub-agent and
-# no per-call `raw = true` escape.
+# Tool outputs exceeding `large_output_threshold_tokens` are routed through a
+# V4-Flash synthesis sub-agent.  Only the synthesis reaches the parent context;
+# the raw text is stored in the workshop variable `last_tool_result` so the
+# parent can call `promote_to_context` later if it needs the full content.
 #
-# `large_output_threshold_tokens` and `[workshop.per_tool_thresholds]` only take
-# effect when the process opts in to adaptive evidence routing with
-# `CODEWHALE_ADAPTIVE_OUTPUT_ROUTING=1`; they set where a result stops being
-# inline and becomes handle-only evidence. Per-tool keys are exact tool names as
-# the model sees them (`bash`, `fetch_url`, ...). The two byte ceilings below
-# apply either way.
+# Per-tool overrides let high-volume tools (e.g. Bash) use tighter
+# thresholds without changing the global default. Name tools by the identifiers
+# the model actually sees — `exec_shell`, `grep_files`, and `web_search` were
+# retired and an override keyed to them matches nothing.
+#
+# There is no per-call `raw = true` escape. It was documented here, but
+# `raw = true` on a tool call does NOT bypass routing: the adaptive router
+# ignores it, and it is honoured only under the legacy
+# `CODEWHALE_CLASSIC_OUTPUT_ROUTING` switch. No tool advertises it.
 #
 # [workshop]
 # large_output_threshold_tokens = 4096
@@ -1333,32 +1323,27 @@ exponential_base = 2.0
 # # it. Hard cap is 2MiB.
 # # read_result_max_bytes = 102400
 # # tool_result_max_bytes = 102400
-# [workshop.per_tool_thresholds]   # adaptive routing only
-# bash      = 2048     # shell output becomes handle-only evidence sooner
-# fetch_url = 8192     # web pages can be large; give them more room
+# [workshop.per_tool_thresholds]
+# Bash = 2048          # shell output synthesised aggressively
+# Web  = 8192          # web results can be large; give them more room
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Profile Example (for multiple environments)
 # ─────────────────────────────────────────────────────────────────────────────────
 # Select a profile with `deepseek --profile <name>` or `DEEPSEEK_PROFILE=<name>`.
-# A profile's provider tables override the same fields of the base tables.
-[profiles.work.providers.deepseek]
+[profiles.work]
 api_key = "WORK_DEEPSEEK_API_KEY"
 base_url = "https://api.deepseek.com/beta"
 
 [profiles.dev]
-allow_shell = true
-
-[profiles.dev.providers.deepseek]
 api_key = "DEV_DEEPSEEK_API_KEY"
+allow_shell = true
 
 [profiles.nvidia-nim]
 provider = "nvidia-nim"
-default_text_model = "deepseek-ai/deepseek-v4-pro"
-
-[profiles.nvidia-nim.providers.nvidia_nim]
 api_key = "YOUR_NVIDIA_API_KEY"
 base_url = "https://integrate.api.nvidia.com/v1"
+default_text_model = "deepseek-ai/deepseek-v4-pro"
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Desktop Notifications (OSC 9 / BEL on long agent-turn completion)

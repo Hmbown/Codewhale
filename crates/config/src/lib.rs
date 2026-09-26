@@ -8,6 +8,7 @@ pub mod credentials;
 pub mod descriptors;
 pub mod device_code;
 pub mod external_credentials;
+pub mod legacy_root;
 pub mod model_reference;
 pub mod models_dev;
 pub mod notifications;
@@ -26,8 +27,10 @@ pub mod setup_state;
 pub mod user_constitution;
 mod xai_credentials;
 pub use config_document::{
-    create_config_document, mutate_config_document, replace_config_document_if_unchanged,
-    set_config_document_value, unset_config_document_value, with_config_write_lock,
+    create_config_document, migrate_legacy_root_config, mutate_config_document,
+    mutate_config_document_with_migration, preview_legacy_root_config,
+    replace_config_document_if_unchanged, set_config_document_value, unset_config_document_value,
+    with_config_write_lock,
 };
 pub use model_reference::{Modality, ModelReferenceCard, ModelReferenceDatabase};
 pub(crate) use provider_defaults::*;
@@ -873,11 +876,8 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigToml {
-    /// TUI-compatible DeepSeek API key. Kept at the root so both `deepseek`
-    /// and `codewhale-tui` can share a single config file.
-    pub api_key: Option<String>,
-    /// TUI-compatible DeepSeek base URL.
-    pub base_url: Option<String>,
+    // There is no top-level `api_key` or `base_url`: every parse moves the
+    // legacy root keys into `[providers.<name>]` first (`legacy_root`, #6394).
     /// Optional extra HTTP headers forwarded to model API requests.
     #[serde(default, skip_serializing_if = "http_headers_are_effectively_empty")]
     pub http_headers: BTreeMap<String, String>,
@@ -1179,18 +1179,10 @@ fn set_provider_config_value(
             config.providers.for_provider_mut(provider).vendor = Some(value.to_string());
         }
         ProviderConfigField::ApiKey => {
-            let value = value.to_string();
-            config.providers.for_provider_mut(provider).api_key = Some(value.clone());
-            if provider == ProviderKind::Deepseek {
-                config.api_key = Some(value);
-            }
+            config.providers.for_provider_mut(provider).api_key = Some(value.to_string());
         }
         ProviderConfigField::BaseUrl => {
-            let value = value.to_string();
-            config.providers.for_provider_mut(provider).base_url = Some(value.clone());
-            if provider == ProviderKind::Deepseek {
-                config.base_url = Some(value);
-            }
+            config.providers.for_provider_mut(provider).base_url = Some(value.to_string());
         }
         ProviderConfigField::Model => {
             let value = value.to_string();
@@ -1249,15 +1241,9 @@ fn unset_provider_config_value(
         }
         ProviderConfigField::ApiKey => {
             config.providers.for_provider_mut(provider).api_key = None;
-            if provider == ProviderKind::Deepseek {
-                config.api_key = None;
-            }
         }
         ProviderConfigField::BaseUrl => {
             config.providers.for_provider_mut(provider).base_url = None;
-            if provider == ProviderKind::Deepseek {
-                config.base_url = None;
-            }
         }
         ProviderConfigField::Model => {
             config.providers.for_provider_mut(provider).model = None;
@@ -2495,6 +2481,24 @@ impl ConfigToml {
             .unwrap_or_else(|| self.provider.as_str())
     }
 
+    /// The real key behind a legacy top-level `api_key` / `base_url`.
+    ///
+    /// Those keys no longer exist at the top level (#6394); `config get|set|
+    /// unset base_url` addresses the active provider's own table instead, so
+    /// the value lands where the route reads it.
+    #[must_use]
+    pub fn root_alias_key(&self, key: &str) -> Option<String> {
+        let field = match key {
+            "api_key" | "apiKey" => "api_key",
+            "base_url" | "baseUrl" => "base_url",
+            _ => return None,
+        };
+        let table = self
+            .named_custom_provider_id()
+            .unwrap_or_else(|| self.provider.provider().provider_config_key());
+        Some(format!("providers.{table}.{field}"))
+    }
+
     /// Return the exact id only when the root selection names a dynamic custom
     /// provider rather than the legacy literal `custom` route.
     #[must_use]
@@ -2769,6 +2773,9 @@ impl ConfigToml {
 
     #[must_use]
     pub fn get_value(&self, key: &str) -> Option<String> {
+        if let Some(alias) = self.root_alias_key(key) {
+            return self.get_value(&alias);
+        }
         if notifications::in_namespace(key) {
             let setting = notifications::NotificationSetting::parse(key)?;
             return Some(
@@ -2796,8 +2803,6 @@ impl ConfigToml {
             "stream_chunk_timeout_secs" | "tui.stream_chunk_timeout_secs" => {
                 Some(self.stream_chunk_timeout_secs().to_string())
             }
-            "api_key" => self.api_key.clone(),
-            "base_url" => self.base_url.clone(),
             "http_headers" => serialize_http_headers(&self.http_headers),
             "default_text_model" => self.default_text_model.clone(),
             "model" => self.model.clone(),
@@ -2840,6 +2845,9 @@ impl ConfigToml {
 
     #[must_use]
     pub fn get_display_value(&self, key: &str) -> Option<String> {
+        if let Some(alias) = self.root_alias_key(key) {
+            return self.get_display_value(&alias);
+        }
         if notifications::in_namespace(key) {
             return self.get_value(key);
         }
@@ -2929,6 +2937,9 @@ impl ConfigToml {
     }
 
     pub fn set_value(&mut self, key: &str, value: &str) -> Result<()> {
+        if let Some(alias) = self.root_alias_key(key) {
+            return self.set_value(&alias, value);
+        }
         if notifications::in_namespace(key) {
             let setting = notifications::NotificationSetting::required(key)?;
             let update = notifications::NotificationConfigUpdate::parse(setting, value)?;
@@ -2961,8 +2972,6 @@ impl ConfigToml {
                     )
                 })?;
             }
-            "api_key" => self.api_key = Some(value.to_string()),
-            "base_url" => self.base_url = Some(value.to_string()),
             "http_headers" => self.http_headers = parse_http_headers(value)?,
             "default_text_model" => self.default_text_model = Some(value.to_string()),
             "model" => self.model = Some(value.to_string()),
@@ -3017,6 +3026,9 @@ impl ConfigToml {
     }
 
     pub fn unset_value(&mut self, key: &str) -> Result<()> {
+        if let Some(alias) = self.root_alias_key(key) {
+            return self.unset_value(&alias);
+        }
         if notifications::in_namespace(key) {
             let setting = notifications::NotificationSetting::required(key)?;
             return notifications::edit_extras(&mut self.extras, setting, None);
@@ -3039,8 +3051,6 @@ impl ConfigToml {
                 self.provider = ProviderKind::Deepseek;
                 self.selected_provider_id = None;
             }
-            "api_key" => self.api_key = None,
-            "base_url" => self.base_url = None,
             "http_headers" => self.http_headers.clear(),
             "default_text_model" => self.default_text_model = None,
             "model" => self.model = None,
@@ -3068,12 +3078,6 @@ impl ConfigToml {
         let mut out = BTreeMap::new();
         out.insert("provider".to_string(), self.provider_id().to_string());
 
-        if let Some(v) = self.api_key.as_ref() {
-            out.insert("api_key".to_string(), redact_secret(v));
-        }
-        if let Some(v) = self.base_url.as_ref() {
-            out.insert("base_url".to_string(), v.clone());
-        }
         if let Some(v) = serialize_http_headers_for_display(&self.http_headers) {
             out.insert("http_headers".to_string(), v);
         }
@@ -3208,41 +3212,18 @@ impl ConfigToml {
                 provider_cfg.model = fb.model.clone();
             }
         }
-        let root_deepseek_api_key = (provider == ProviderKind::Deepseek)
-            .then(|| self.api_key.clone())
-            .flatten();
-        // Root `base_url` is the legacy DeepSeek field, but Xiaomi MiMo and
-        // OpenAI Codex also honour it when the per-provider table has no
-        // endpoint of its own. Silently ignoring a configured root URL while
-        // also dropping the root model made both routes unusable from a
-        // minimal top-level config.
-        //
-        // A root that is not an endpoint this provider owns is not inherited.
-        // A legacy DeepSeek host otherwise became the MiMo route's endpoint:
-        // the custom-endpoint guard withheld the MiMo credential from it and the
-        // route answered with DeepSeek's unauthenticated 401 while the user
-        // believed they were testing their own key. DeepSeek itself owns the
-        // field, so its root stays unfiltered; every other reader must match its
-        // own official endpoint family (`provider_base_url_is_official`).
-        let root_base_url = matches!(
-            provider,
-            ProviderKind::Deepseek | ProviderKind::XiaomiMimo | ProviderKind::OpenaiCodex
-        )
-        .then(|| self.base_url.clone())
-        .flatten()
-        .filter(|base| {
-            provider == ProviderKind::Deepseek || provider_base_url_is_official(provider, base)
-        });
         let auth_mode = cli
             .auth_mode
             .clone()
             .or_else(|| env.auth_mode.clone())
             .or_else(|| provider_cfg.auth_mode.clone())
             .or_else(|| self.auth_mode.clone());
-        let from_file = provider_cfg.api_key.clone().or(root_deepseek_api_key);
+        // The legacy top-level key and endpoint were moved into their owning
+        // `[providers.<name>]` table when the file was parsed (#6394).
+        let from_file = provider_cfg.api_key.clone();
         let cli_base_url = cli.base_url.clone();
         let env_base_url = env.base_url_for(provider);
-        let file_base_url = provider_cfg.base_url.clone().or(root_base_url);
+        let file_base_url = provider_cfg.base_url.clone();
         let base_url_from_file =
             cli_base_url.is_none() && env_base_url.is_none() && file_base_url.is_some();
         let configured_base_url = cli_base_url.or(env_base_url).or(file_base_url);
@@ -5193,6 +5174,8 @@ pub struct ConfigStore {
     /// Original file text, retained so [`save`](Self::save) can merge
     /// comments back after serialisation.
     original_raw: Option<String>,
+    /// What loading moved in memory from legacy top-level keys (#6394).
+    legacy_root: legacy_root::LegacyRootMigration,
 }
 
 /// Parse a [`ConfigToml`] on a dedicated thread with an explicit stack size.
@@ -5206,20 +5189,44 @@ pub struct ConfigStore {
 /// `ConfigToml` parse goes through here so config-store loads stay safe
 /// regardless of the calling thread's stack budget.
 fn parse_config_toml_str(contents: &str) -> Result<ConfigToml, toml::de::Error> {
+    parse_config_toml_with_receipt(contents).map(|(config, _)| config)
+}
+
+/// [`parse_config_toml_str`] plus the receipt of the legacy top-level keys it
+/// moved in memory (#6394).
+fn parse_config_toml_with_receipt(
+    contents: &str,
+) -> Result<(ConfigToml, legacy_root::LegacyRootMigration), toml::de::Error> {
     std::thread::scope(|scope| {
         match std::thread::Builder::new()
             .name("config-toml-parse".to_string())
             .stack_size(16 * 1024 * 1024)
-            .spawn_scoped(scope, || toml::from_str::<ConfigToml>(contents))
+            .spawn_scoped(scope, || parse_config_toml_canonical(contents))
         {
             Ok(handle) => handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
             // Spawning can only fail under resource exhaustion; parsing on
             // the caller's stack is still the best remaining option.
-            Err(_) => toml::from_str::<ConfigToml>(contents),
+            Err(_) => parse_config_toml_canonical(contents),
         }
     })
+}
+
+fn parse_config_toml_canonical(
+    contents: &str,
+) -> Result<(ConfigToml, legacy_root::LegacyRootMigration), toml::de::Error> {
+    let (text, receipt) = legacy_root::canonicalize_text(contents)?;
+    let config = toml::from_str::<ConfigToml>(&text)?;
+    Ok((config, receipt))
+}
+
+/// Parse any `config.toml`-shaped document into [`ConfigToml`], moving legacy
+/// top-level `base_url` / `api_key` into their provider tables first. Every
+/// caller outside this crate (bundle import, tests) parses through here so a
+/// top-level key can never land in `extras`.
+pub fn parse_config_toml(contents: &str) -> Result<ConfigToml, toml::de::Error> {
+    parse_config_toml_str(contents)
 }
 
 impl ConfigStore {
@@ -5233,9 +5240,9 @@ impl ConfigStore {
 
     pub fn load(path: Option<PathBuf>) -> Result<Self> {
         let path = resolve_config_path(path)?;
-        let (config, original_raw) = if checked_path_exists(&path)? {
+        let (config, original_raw, legacy_root) = if checked_path_exists(&path)? {
             let raw = read_checked_config_file(&path)?;
-            let mut parsed: ConfigToml = parse_config_toml_str(&raw).map_err(|_| {
+            let (mut parsed, receipt) = parse_config_toml_with_receipt(&raw).map_err(|_| {
                 anyhow::anyhow!(
                     "failed to parse config at {}; file contents were omitted",
                     quote_os_path(&path)
@@ -5254,9 +5261,13 @@ impl ConfigStore {
                         format!("failed to parse config at {}", quote_os_path(&path))
                     })?;
             }
-            (parsed, Some(raw))
+            (parsed, Some(raw), receipt)
         } else {
-            (ConfigToml::default(), None)
+            (
+                ConfigToml::default(),
+                None,
+                legacy_root::LegacyRootMigration::default(),
+            )
         };
         let permissions = load_sibling_permissions(&path)?;
 
@@ -5265,7 +5276,15 @@ impl ConfigStore {
             config,
             permissions,
             original_raw,
+            legacy_root,
         })
+    }
+
+    /// What loading moved in memory from legacy top-level keys. Loading never
+    /// rewrites the file; the next save does, keeping any conflict in place.
+    #[must_use]
+    pub fn legacy_root_migration(&self) -> &legacy_root::LegacyRootMigration {
+        &self.legacy_root
     }
 
     /// Render the exact body [`save`](Self::save) would write: the serialized
@@ -5288,12 +5307,29 @@ impl ConfigStore {
             serialized = document.to_string();
         }
         if let Some(ref original_raw) = self.original_raw {
-            merge_and_preserve_comments(&serialized, original_raw).with_context(|| {
+            // Comments come from the original with legacy top-level keys
+            // already moved (#6394): a comment above a moved key stays in
+            // place instead of vanishing with the key.
+            let decor_source = legacy_root::migrated_document_text(original_raw);
+            let merged = merge_and_preserve_comments(
+                &serialized,
+                decor_source.as_deref().unwrap_or(original_raw),
+            )
+            .with_context(|| {
                 format!(
                     "cannot safely preserve config at {}; reload it and retry instead of replacing an unmergeable snapshot",
                     quote_os_path(&self.path)
                 )
-            })
+            })?;
+            // The typed body has no top-level keys. A conflicting pair the
+            // user never touched goes back exactly as it was on disk.
+            let mut document = merged
+                .parse::<toml_edit::DocumentMut>()
+                .context("failed to edit serialized config")?;
+            if legacy_root::restore_conflicts(&mut document, original_raw) {
+                return Ok(document.to_string());
+            }
+            Ok(merged)
         } else {
             Ok(serialized)
         }
@@ -5302,6 +5338,9 @@ impl ConfigStore {
     pub fn save(&mut self) -> Result<()> {
         let path = normalize_config_file_path(self.path.clone())?;
         let body = self.rendered_body()?;
+        if let Some(original_raw) = self.original_raw.as_deref() {
+            note_legacy_root_file_migration(&path, original_raw)?;
+        }
         replace_config_document_if_unchanged(&path, self.original_raw.as_deref(), &body)?;
         self.original_raw = Some(body);
         Ok(())
@@ -5571,6 +5610,52 @@ fn is_legacy_antigravity_name(value: &str) -> bool {
     value.eq_ignore_ascii_case("antigravity") || value.eq_ignore_ascii_case("agy")
 }
 
+/// Before a write moves legacy top-level keys (#6394), keep one credential-free
+/// copy of the file as it was, and queue a one-line notice for the caller's
+/// status channel. Does nothing when the original has nothing to move.
+pub(crate) fn note_legacy_root_file_migration(path: &Path, original_raw: &str) -> Result<()> {
+    let Ok(document) = original_raw.parse::<toml_edit::DocumentMut>() else {
+        return Ok(());
+    };
+    let receipt = legacy_root::preview_document(&document, None);
+    if !receipt.changes_file() {
+        return Ok(());
+    }
+    let backup = write_legacy_root_backup(path, original_raw)?;
+    legacy_root::queue_notice(&receipt, &backup);
+    Ok(())
+}
+
+/// Keep one credential-free copy of the file as it was before legacy
+/// top-level keys first moved. Later migrations never overwrite it.
+pub(crate) fn write_legacy_root_backup(path: &Path, original_raw: &str) -> Result<PathBuf> {
+    let backup = checked_config_sibling_path(path, &pre_migrate_backup_file_name(path))?;
+    if !backup.exists() {
+        let scrubbed = config_toml_without_plaintext_api_keys(original_raw)?;
+        persistence::atomic_write(&backup, scrubbed.as_bytes()).with_context(|| {
+            format!(
+                "failed to create config backup {} before moving top-level keys",
+                backup.display()
+            )
+        })?;
+    }
+    Ok(backup)
+}
+
+fn pre_migrate_backup_file_name(path: &Path) -> OsString {
+    let mut file_name = path
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from(CONFIG_FILE_NAME));
+    file_name.push(".pre-migrate.bak");
+    file_name
+}
+
+/// Path of the one-time backup written before legacy top-level keys moved.
+pub fn legacy_root_backup_path(path: &Path) -> Result<PathBuf> {
+    checked_config_sibling_path(path, &pre_migrate_backup_file_name(path))
+}
+
 fn write_one_time_config_backup(path: &Path) -> Result<()> {
     let backup = checked_config_backup_path(path)?;
     if backup.exists() {
@@ -5607,7 +5692,8 @@ fn config_toml_without_plaintext_api_keys(raw: &str) -> Result<String> {
 }
 
 fn remove_plaintext_api_keys_recursive(table: &mut dyn toml_edit::TableLike) {
-    table.remove("api_key");
+    // Keep a comment written above the key (often the file header).
+    config_document::remove_key_preserving_leading_decor(table, "api_key");
     for (_, item) in table.iter_mut() {
         if let toml_edit::Item::ArrayOfTables(tables) = item {
             for nested in tables.iter_mut() {

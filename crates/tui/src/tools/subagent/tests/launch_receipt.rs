@@ -27,11 +27,11 @@ fn consultant_runtime(
         ..Default::default()
     };
     let config = crate::config::Config {
-        api_key: Some("deepseek-test-key".to_string()),
         provider: Some("deepseek".to_string()),
         providers: Some(providers),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("deepseek-test-key".to_string()), None);
     let client = CodewhaleClient::new(&config).expect("DeepSeek parent client");
     SubAgentRuntime::new(
         client,

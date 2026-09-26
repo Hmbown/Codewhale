@@ -1457,28 +1457,30 @@ api_key_env = "CW_OPERATE_MISSING_TEST_KEY"
     }
 
     #[test]
-    fn keepalive_legacy_custom_keeps_absent_exact_id() -> Result<()> {
+    fn keepalive_legacy_custom_records_the_table_id() -> Result<()> {
         let _env = crate::test_support::lock_test_env();
         let _cli = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
         let root = TempDir::new()?;
         let manager = AutomationManager::open_for_test(root.path().join("automations"))?;
         let config = crate::config::Config {
             provider: Some("custom".into()),
-            base_url: Some("https://legacy.example.test/v1".into()),
             default_text_model: Some("legacy-model".into()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(None, Some("https://legacy.example.test/v1".into()));
         upsert_keepalive(&manager, root.path(), false, &config, None)?;
         let record = manager.get_automation(OPERATE_KEEPALIVE_ID)?;
         assert_eq!(record.model.as_deref(), Some("legacy-model"));
+        // The literal route is the `[providers.custom]` table since #6394.
         assert_eq!(record.model_provider.as_deref(), Some("custom"));
-        assert_eq!(record.model_provider_id, None);
+        assert_eq!(record.model_provider_id.as_deref(), Some("custom"));
         upsert_keepalive(&manager, root.path(), false, &config, None)?;
         assert_eq!(
             manager
                 .get_automation(OPERATE_KEEPALIVE_ID)?
-                .model_provider_id,
-            None
+                .model_provider_id
+                .as_deref(),
+            Some("custom")
         );
         Ok(())
     }

@@ -51,6 +51,15 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Fixed
 
+- A top-level `base_url` or `api_key` in `config.toml` now means one thing
+  everywhere. Every reader used its own rule for which routes inherited it,
+  which is how a DeepSeek endpoint became the Xiaomi MiMo route's and failed
+  with DeepSeek's 401. Old files keep working: the keys are read as
+  `[providers.deepseek]` (or the vendor whose official host they name), the
+  next save moves them there with a one-time backup and a one-line note, and
+  a value that disagrees with its table is left for `codewhale config migrate
+  --prefer` to settle. `codewhale config doctor` shows what is in use
+  ([#6394](https://github.com/Hmbown/Codewhale/issues/6394)).
 - `codewhale exec --auto` no longer exits 141 with no output when a child
   it writes to, such as a stdio MCP server, closes its pipe early. Headless
   exec now ignores SIGPIPE while it runs, as the interactive TUI already did,
@@ -59,6 +68,8 @@ quieter, and Fleet runs can be checked before they spend anything.
   answer: the markup is removed, and an answer that was only a tool call
   fails at once with the reason and a pointer to `--auto`, instead of asking
   the model again and blaming an incomplete provider response.
+- Resuming a session keeps its "Resumed:" confirmation on screen instead of
+  replacing it with "Make room automatically: on" when nothing was switched.
 - The installation page is generated from `docs/INSTALL.md`, so the website
   and the guide can no longer disagree; broken anchors and unsafe links fail
   the build ([#6450](https://github.com/Hmbown/Codewhale/pull/6450)).

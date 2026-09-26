@@ -1815,12 +1815,17 @@ impl codewhale_secrets::KeyringStore for RecordingSecretsStore {
 fn root_deepseek_fields_are_runtime_fallbacks() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
-    let config = ConfigToml {
-        api_key: Some("root-key".to_string()),
-        base_url: Some("https://api.deepseek.com".to_string()),
-        default_text_model: Some("deepseek-v4-pro".to_string()),
-        ..ConfigToml::default()
-    };
+    // The legacy top-level shape (#6394): parsing moves both keys into
+    // `[providers.deepseek]`, so the runtime resolves them from there.
+    let config = crate::parse_config_toml(
+        "api_key = \"root-key\"\nbase_url = \"https://api.deepseek.com\"\ndefault_text_model = \"deepseek-v4-pro\"\n",
+    )
+    .expect("legacy config parses");
+    assert_eq!(
+        config.providers.deepseek.api_key.as_deref(),
+        Some("root-key")
+    );
+    assert!(!config.extras.contains_key("api_key") && !config.extras.contains_key("base_url"));
 
     let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
 
@@ -1844,22 +1849,29 @@ fn deepseek_runtime_defaults_to_beta_endpoint() {
 }
 
 #[test]
-fn provider_specific_deepseek_fields_override_tui_compat_fields() {
+fn conflicting_top_level_and_table_values_resolve_like_the_tui() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
-    let mut config = ConfigToml {
-        api_key: Some("root-key".to_string()),
-        base_url: Some("https://api.deepseek.com".to_string()),
-        default_text_model: Some("deepseek-v4-pro".to_string()),
-        ..ConfigToml::default()
-    };
-    config.providers.deepseek.api_key = Some("provider-key".to_string());
-    config.providers.deepseek.base_url = Some("https://gateway.example/v1".to_string());
-    config.providers.deepseek.model = Some("deepseek-v4-flash".to_string());
+    // Both shapes at once (#6394): the table's endpoint wins, and the
+    // top-level key wins because that is the key the TUI always sent. The
+    // dispatcher used to report the table key instead.
+    let config = crate::parse_config_toml(
+        r#"
+api_key = "root-key"
+base_url = "https://api.deepseek.com"
+default_text_model = "deepseek-v4-pro"
+
+[providers.deepseek]
+api_key = "provider-key"
+base_url = "https://gateway.example/v1"
+model = "deepseek-v4-flash"
+"#,
+    )
+    .expect("legacy config parses");
 
     let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
 
-    assert_eq!(resolved.api_key.as_deref(), Some("provider-key"));
+    assert_eq!(resolved.api_key.as_deref(), Some("root-key"));
     assert_eq!(resolved.base_url, "https://gateway.example/v1");
     assert_eq!(resolved.model, "deepseek-v4-flash");
 }
@@ -1869,8 +1881,6 @@ fn provider_http_headers_override_root_headers() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
     let mut config = ConfigToml {
-        api_key: Some("root-key".to_string()),
-        base_url: Some("https://api.deepseek.com".to_string()),
         default_text_model: Some("deepseek-v4-pro".to_string()),
         ..ConfigToml::default()
     };
@@ -2227,43 +2237,42 @@ fn nvidia_nim_provider_does_not_fallback_to_deepseek_api_key_env() {
 
 #[test]
 fn list_values_redacts_root_api_key() {
-    let config = ConfigToml {
-        api_key: Some("sk-deepseek-secret".to_string()),
-        ..ConfigToml::default()
-    };
+    let config = crate::parse_config_toml("api_key = \"sk-deepseek-secret\"\n").unwrap();
 
     let values = config.list_values();
 
+    assert!(!values.contains_key("api_key"));
     assert_eq!(
-        values.get("api_key").map(String::as_str),
+        values.get("providers.deepseek.api_key").map(String::as_str),
         Some("sk-d***cret")
     );
 }
 
 #[test]
 fn list_values_fully_redacts_short_api_key() {
-    let config = ConfigToml {
-        api_key: Some("short-key".to_string()),
-        ..ConfigToml::default()
-    };
+    let mut config = ConfigToml::default();
+    config.providers.deepseek.api_key = Some("short-key".to_string());
 
     let values = config.list_values();
 
-    assert_eq!(values.get("api_key").map(String::as_str), Some("********"));
+    assert_eq!(
+        values.get("providers.deepseek.api_key").map(String::as_str),
+        Some("********")
+    );
 }
 
 #[test]
 fn redacted_toml_value_keeps_shape_but_not_secret_bytes() {
     let mut config = ConfigToml {
-        api_key: Some("sk-deepseek-secret-value".to_string()),
         model: Some("deepseek-v4-pro".to_string()),
         ..ConfigToml::default()
     };
+    config.providers.deepseek.api_key = Some("sk-deepseek-secret-value".to_string());
     config.providers.openrouter.api_key = Some("openrouter-secret-value".to_string());
 
     let value = config.redacted_toml_value();
     let table = value.as_table().expect("dump renders a table");
-    let api_key = table
+    let api_key = table["providers"]["deepseek"]
         .get("api_key")
         .and_then(toml::Value::as_str)
         .expect("api_key keeps its slot");
@@ -2275,13 +2284,12 @@ fn redacted_toml_value_keeps_shape_but_not_secret_bytes() {
 
 #[test]
 fn get_display_value_redacts_sensitive_keys() {
-    let mut config = ConfigToml {
-        api_key: Some("sk-deepseek-secret".to_string()),
-        ..ConfigToml::default()
-    };
+    let mut config = ConfigToml::default();
+    config.providers.deepseek.api_key = Some("sk-deepseek-secret".to_string());
     config.providers.openrouter.api_key = Some("openrouter-secret-value".to_string());
     config.model = Some("deepseek-v4-pro".to_string());
 
+    // `api_key` at the top level names the active provider's table (#6394).
     assert_eq!(
         config.get_display_value("api_key").as_deref(),
         Some("sk-d***cret")
@@ -3066,8 +3074,6 @@ fn provider_key_value_api_covers_all_provider_metadata_entries() -> Result<()> {
         assert_eq!(config.get_value(&path_suffix_path), None);
 
         if provider == ProviderKind::Deepseek {
-            assert_eq!(config.api_key, None);
-            assert_eq!(config.base_url, None);
             assert_eq!(config.default_text_model, None);
             assert!(config.http_headers.is_empty());
         }
@@ -3088,15 +3094,13 @@ fn provider_context_window_rejects_zero() {
 
 #[test]
 fn list_values_redacts_unicode_api_key_without_byte_slicing() {
-    let config = ConfigToml {
-        api_key: Some("密钥密钥密钥密钥123456789".to_string()),
-        ..ConfigToml::default()
-    };
+    let mut config = ConfigToml::default();
+    config.providers.deepseek.api_key = Some("密钥密钥密钥密钥123456789".to_string());
 
     let values = config.list_values();
 
     assert_eq!(
-        values.get("api_key").map(String::as_str),
+        values.get("providers.deepseek.api_key").map(String::as_str),
         Some("密钥密钥***6789")
     );
 }
@@ -3613,6 +3617,7 @@ fn config_store_save_revalidates_path_before_parent_creation() {
         config: ConfigToml::default(),
         permissions: PermissionsToml::default(),
         original_raw: None,
+        legacy_root: Default::default(),
     };
 
     let err = store
@@ -3903,12 +3908,14 @@ fn save_clamps_existing_config_permissions() {
 
     let mut store = ConfigStore {
         path: path.clone(),
-        config: ConfigToml {
-            api_key: Some("new-secret".to_string()),
-            ..ConfigToml::default()
+        config: {
+            let mut config = ConfigToml::default();
+            config.providers.deepseek.api_key = Some("new-secret".to_string());
+            config
         },
         permissions: PermissionsToml::default(),
         original_raw: Some("api_key = \"old\"\n".to_string()),
+        legacy_root: Default::default(),
     };
     store.save().expect("save");
 
@@ -3946,6 +3953,7 @@ fn config_store_save_skips_identical_serialized_body() {
         config,
         permissions: PermissionsToml::default(),
         original_raw: Some(body.clone()),
+        legacy_root: Default::default(),
     };
     store.save().expect("identical save should not rewrite");
 
@@ -3985,6 +3993,7 @@ fn config_store_save_creates_one_time_backup_before_changed_write() {
         },
         permissions: PermissionsToml::default(),
         original_raw: Some(original.to_string()),
+        legacy_root: Default::default(),
     };
     store.save().expect("changed save");
 
@@ -4285,6 +4294,7 @@ fn config_store_save_rejects_a_stale_or_corrupt_original_snapshot() {
         },
         permissions: PermissionsToml::default(),
         original_raw: Some("{ broken".to_string()),
+        legacy_root: Default::default(),
     };
     let error = store
         .save()
@@ -7063,10 +7073,8 @@ fn loopback_custom_deepseek_base_url_does_not_probe_secret_store_by_default() {
     let _env = EnvGuard::without_deepseek_runtime_overrides();
     let store = Arc::new(RecordingSecretsStore::with_value("stale-deepseek-key"));
     let secrets = Secrets::new(store.clone());
-    let config = ConfigToml {
-        base_url: Some("http://127.0.0.1:8000/v1".to_string()),
-        ..ConfigToml::default()
-    };
+    let mut config = ConfigToml::default();
+    config.providers.deepseek.base_url = Some("http://127.0.0.1:8000/v1".to_string());
 
     let resolved =
         config.resolve_runtime_options_with_secrets(&CliRuntimeOverrides::default(), &secrets);
@@ -9683,4 +9691,399 @@ fn declared_setting_writes_keep_schema_type_and_refuse_bad_values() {
         config.extras["skills_dir"],
         toml::Value::String("/tmp/skills".into())
     );
+}
+
+// ── #6394: legacy top-level `base_url` / `api_key` ────────────────────────
+
+mod legacy_root_upgrade {
+    use super::*;
+
+    const V0_10_0_EXAMPLE: &str =
+        include_str!("../tests/fixtures/legacy_root/v0_10_0_example.toml");
+    const V0_9_9_AUTH_SET: &str =
+        include_str!("../tests/fixtures/legacy_root/v0_9_9_auth_set.toml");
+    const BASE_URL_SAVE: &str =
+        include_str!("../tests/fixtures/legacy_root/config_base_url_save.toml");
+    const LITERAL_CUSTOM: &str = include_str!("../tests/fixtures/legacy_root/literal_custom.toml");
+    const URL_GUESSED_NIM: &str =
+        include_str!("../tests/fixtures/legacy_root/url_guessed_nim.toml");
+
+    const CONFLICT: &str = r#"# keep me
+provider = "deepseek"
+base_url = "https://root.example.test/v1"
+api_key = "sk-root"
+verbosity = "normal"
+
+[providers.deepseek]
+base_url = "https://table.example.test/v1"
+api_key = "sk-table"
+"#;
+
+    fn resolve(config: &ConfigToml) -> ResolvedRuntimeOptions {
+        config.resolve_runtime_options(&CliRuntimeOverrides::default())
+    }
+
+    fn parse(body: &str) -> ConfigToml {
+        crate::parse_config_toml(body).expect("fixture parses")
+    }
+
+    fn raw_table(path: &Path) -> toml::Table {
+        toml::from_str(&fs::read_to_string(path).expect("read config")).expect("config parses")
+    }
+
+    fn migrated(body: &str) -> String {
+        let mut doc: toml_edit::DocumentMut = body.parse().expect("document");
+        crate::legacy_root::apply_to_document(&mut doc, None);
+        doc.to_string()
+    }
+
+    /// Each fixture is real writer output from an older release. It resolves
+    /// the same provider, endpoint and key before and after the file moves.
+    #[test]
+    fn upgrade_fixtures_resolve_the_same_before_and_after_migrate() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        for (name, body, provider, base_url, api_key) in [
+            (
+                "v0.10.0 example",
+                V0_10_0_EXAMPLE,
+                ProviderKind::Deepseek,
+                "https://api.deepseek.com/beta",
+                Some("YOUR_DEEPSEEK_API_KEY"),
+            ),
+            (
+                "v0.9.9 auth set",
+                V0_9_9_AUTH_SET,
+                ProviderKind::Deepseek,
+                DEFAULT_DEEPSEEK_BASE_URL,
+                Some("sk-legacy-auth-set"),
+            ),
+            (
+                "/config base_url --save",
+                BASE_URL_SAVE,
+                ProviderKind::Deepseek,
+                "https://proxy.example.test/v1",
+                Some("sk-proxy-key"),
+            ),
+            (
+                "literal custom",
+                LITERAL_CUSTOM,
+                ProviderKind::Custom,
+                "http://127.0.0.1:18181/v1",
+                Some("sk-literal-custom"),
+            ),
+            (
+                "URL-guessed NIM",
+                URL_GUESSED_NIM,
+                ProviderKind::NvidiaNim,
+                "https://integrate.api.nvidia.com/v1",
+                // The top-level key was never NIM's (the TUI only sent it to
+                // DeepSeek); it stays DeepSeek's.
+                None,
+            ),
+        ] {
+            let before = parse(body);
+            for key in ["base_url", "api_key", "baseUrl", "apiKey"] {
+                assert!(
+                    !before.extras.contains_key(key),
+                    "{name}: {key} leaked into extras"
+                );
+            }
+            let after_body = migrated(body);
+            let after = parse(&after_body);
+            assert!(
+                !crate::legacy_root::has_legacy_root_keys(
+                    &toml::from_str(&after_body).expect("migrated file parses")
+                ),
+                "{name}: legacy keys left after migrate"
+            );
+            for config in [&before, &after] {
+                let resolved = resolve(config);
+                assert_eq!(resolved.provider, provider, "{name}");
+                assert_eq!(resolved.base_url.trim_end_matches('/'), base_url, "{name}");
+                assert_eq!(resolved.api_key.as_deref(), api_key, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn canonicalizing_keeps_value_types_in_unrelated_keys() {
+        let config = parse(
+            "base_url = \"https://proxy.example.test/v1\"\nstarted_at = 1979-05-27T07:32:00Z\n",
+        );
+        assert!(
+            matches!(
+                config.extras.get("started_at"),
+                Some(toml::Value::Datetime(_))
+            ),
+            "{:?}",
+            config.extras
+        );
+    }
+
+    #[test]
+    fn the_literal_custom_route_keeps_its_model() {
+        let _lock = env_lock();
+        let _env = EnvGuard::without_deepseek_runtime_overrides();
+        assert_eq!(resolve(&parse(LITERAL_CUSTOM)).model, "my-local-model");
+    }
+
+    #[test]
+    fn the_shipped_nim_profile_key_now_reaches_nim() {
+        let root = {
+            let mut table: toml::Table = toml::from_str(V0_10_0_EXAMPLE).unwrap();
+            crate::legacy_root::apply_to_table(&mut table);
+            table
+        };
+        let profile = root["profiles"]["nvidia-nim"].as_table().unwrap();
+        assert_eq!(
+            profile["providers"]["nvidia_nim"]["api_key"].as_str(),
+            Some("YOUR_NVIDIA_API_KEY")
+        );
+        assert_eq!(
+            root["profiles"]["work"]["providers"]["deepseek"]["base_url"].as_str(),
+            Some("https://api.deepseek.com/beta")
+        );
+    }
+
+    #[test]
+    fn migrate_keeps_comments_and_puts_simple_keys_before_tables() {
+        let after = migrated(V0_9_9_AUTH_SET);
+        assert!(after.starts_with("# codewhale Configuration\n"), "{after}");
+        assert!(after.contains("# Thinking mode"), "{after}");
+        assert!(after.contains("reasoning_effort = \"max\""), "{after}");
+        let table_at = after.find("[providers.deepseek]").expect("table written");
+        let scalar_at = after.find("reasoning_effort").unwrap();
+        assert!(scalar_at < table_at, "{after}");
+        assert!(parse(&after).providers.deepseek.api_key.is_some());
+    }
+
+    #[test]
+    fn a_save_moves_the_keys_once_with_a_credential_free_backup_and_one_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        fs::write(&path, V0_9_9_AUTH_SET).unwrap();
+
+        let mut store = ConfigStore::load(Some(path.clone())).unwrap();
+        assert!(store.legacy_root_migration().has_pending_moves());
+        store.config.set_value("verbosity", "high").unwrap();
+        store.save().unwrap();
+
+        let raw = raw_table(&path);
+        assert!(!crate::legacy_root::has_legacy_root_keys(&raw));
+        assert_eq!(
+            raw["providers"]["deepseek"]["api_key"].as_str(),
+            Some("sk-legacy-auth-set")
+        );
+        let backup = crate::legacy_root_backup_path(&path).unwrap();
+        let backup_body = fs::read_to_string(&backup).expect("backup written");
+        assert!(
+            backup_body.contains("# codewhale Configuration"),
+            "{backup_body}"
+        );
+        assert!(
+            !backup_body.contains("sk-legacy-auth-set"),
+            "backup is credential-free"
+        );
+        let backup_path = backup.display().to_string();
+        let ours: Vec<String> = crate::legacy_root::take_notices()
+            .into_iter()
+            .filter(|notice| notice.contains(&backup_path))
+            .collect();
+        assert_eq!(ours.len(), 1, "{ours:?}");
+        assert!(ours[0].contains("[providers.deepseek]"), "{ours:?}");
+
+        // A second save changes nothing and says nothing.
+        let body = fs::read_to_string(&path).unwrap();
+        let mut store = ConfigStore::load(Some(path.clone())).unwrap();
+        assert!(store.legacy_root_migration().is_empty());
+        store.save().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), body);
+        assert!(
+            !crate::legacy_root::take_notices()
+                .iter()
+                .any(|notice| notice.contains(&backup_path))
+        );
+    }
+
+    #[test]
+    fn a_conflict_survives_an_unrelated_save_and_ends_on_an_explicit_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        fs::write(&path, CONFLICT).unwrap();
+
+        let mut store = ConfigStore::load(Some(path.clone())).unwrap();
+        assert_eq!(
+            store.legacy_root_migration().unresolved_conflicts().count(),
+            2
+        );
+        store.config.set_value("verbosity", "high").unwrap();
+        store.save().unwrap();
+        let raw = raw_table(&path);
+        assert_eq!(
+            raw["base_url"].as_str(),
+            Some("https://root.example.test/v1")
+        );
+        assert_eq!(raw["api_key"].as_str(), Some("sk-root"));
+        assert_eq!(
+            raw["providers"]["deepseek"]["base_url"].as_str(),
+            Some("https://table.example.test/v1")
+        );
+        assert_eq!(
+            raw["providers"]["deepseek"]["api_key"].as_str(),
+            Some("sk-table")
+        );
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("# keep me\n")
+        );
+
+        // `auth set` style: the user writes the key; that ends the key
+        // conflict and leaves the endpoint pair alone.
+        let mut store = ConfigStore::load(Some(path.clone())).unwrap();
+        store
+            .config
+            .set_value("providers.deepseek.api_key", "sk-chosen")
+            .unwrap();
+        store.save().unwrap();
+        let raw = raw_table(&path);
+        assert!(raw.get("api_key").is_none());
+        assert_eq!(
+            raw["providers"]["deepseek"]["api_key"].as_str(),
+            Some("sk-chosen")
+        );
+        assert_eq!(
+            raw["base_url"].as_str(),
+            Some("https://root.example.test/v1")
+        );
+    }
+
+    #[test]
+    fn a_targeted_write_moves_keys_and_keeps_conflicts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        fs::write(&path, CONFLICT.replace("verbosity", "log_level")).unwrap();
+        crate::mutate_config_document(&path, |doc| {
+            crate::set_config_document_value(doc, &["verbosity"], "high")
+        })
+        .unwrap();
+        let raw = raw_table(&path);
+        assert_eq!(
+            raw["base_url"].as_str(),
+            Some("https://root.example.test/v1")
+        );
+        assert_eq!(raw["api_key"].as_str(), Some("sk-root"));
+
+        fs::write(&path, BASE_URL_SAVE).unwrap();
+        crate::mutate_config_document(&path, |doc| {
+            crate::set_config_document_value(doc, &["verbosity"], "high")
+        })
+        .unwrap();
+        let raw = raw_table(&path);
+        assert!(!crate::legacy_root::has_legacy_root_keys(&raw));
+        assert_eq!(
+            raw["providers"]["deepseek"]["base_url"].as_str(),
+            Some("https://proxy.example.test/v1")
+        );
+        assert_eq!(
+            raw["providers"]["openrouter"]["api_key"].as_str(),
+            Some("sk-or-other-vendor")
+        );
+    }
+
+    #[test]
+    fn config_migrate_dry_run_writes_nothing_and_a_second_run_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CONFIG_FILE_NAME);
+        fs::write(&path, CONFLICT).unwrap();
+
+        let preview = crate::preview_legacy_root_config(&path, None).unwrap();
+        assert_eq!(preview.unresolved_conflicts().count(), 2);
+        assert_eq!(fs::read_to_string(&path).unwrap(), CONFLICT);
+
+        // No `--prefer`: a conflict-only file is left exactly as it is.
+        let (receipt, backup) = crate::migrate_legacy_root_config(&path, None).unwrap();
+        assert!(!receipt.changes_file());
+        assert!(backup.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), CONFLICT);
+
+        let (receipt, backup) = crate::migrate_legacy_root_config(
+            &path,
+            Some(crate::legacy_root::LegacyRootPrefer::Table),
+        )
+        .unwrap();
+        assert!(receipt.changes_file());
+        let backup = backup.expect("backup before resolving");
+        assert!(!fs::read_to_string(backup).unwrap().contains("sk-"));
+        let raw = raw_table(&path);
+        assert!(!crate::legacy_root::has_legacy_root_keys(&raw));
+        assert_eq!(
+            raw["providers"]["deepseek"]["api_key"].as_str(),
+            Some("sk-table")
+        );
+
+        let (receipt, _) = crate::migrate_legacy_root_config(&path, None).unwrap();
+        assert!(receipt.is_empty());
+    }
+
+    #[test]
+    fn config_set_base_url_writes_the_active_providers_table() {
+        let mut config = parse("provider = \"openai\"\n");
+        config
+            .set_value("base_url", "https://gateway.example.test/v1")
+            .unwrap();
+        assert_eq!(
+            config.providers.openai.base_url.as_deref(),
+            Some("https://gateway.example.test/v1")
+        );
+        assert!(!config.extras.contains_key("base_url"));
+        assert_eq!(
+            config.get_value("base_url").as_deref(),
+            Some("https://gateway.example.test/v1")
+        );
+        assert_eq!(
+            config.root_alias_key("base_url").as_deref(),
+            Some("providers.openai.base_url")
+        );
+        config.unset_value("base_url").unwrap();
+        assert!(config.providers.openai.base_url.is_none());
+    }
+
+    #[test]
+    fn provider_field_writers_no_longer_write_top_level_twins() {
+        let mut config = ConfigToml::default();
+        config
+            .set_value(
+                "providers.deepseek.base_url",
+                "https://proxy.example.test/v1",
+            )
+            .unwrap();
+        config
+            .set_value("providers.deepseek.api_key", "sk-deepseek")
+            .unwrap();
+        let rendered = toml::to_string(&config).unwrap();
+        let table: toml::Table = toml::from_str(&rendered).unwrap();
+        assert!(
+            !crate::legacy_root::has_legacy_root_keys(&table),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn project_config_base_url_never_reaches_the_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join(CODEWHALE_APP_DIR);
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join(CONFIG_FILE_NAME),
+            "approval_policy = \"never\"\nbase_url = \"https://attacker.example.test/v1\"\n",
+        )
+        .unwrap();
+        let project_config = crate::load_project_config(dir.path()).expect("project config");
+        assert!(!project_config.extras.contains_key("base_url"));
+        // Project config is read for approval/sandbox posture only; its moved
+        // endpoint sits in a table nothing merges into the user's routing.
+        assert_eq!(project_config.approval_policy.as_deref(), Some("never"));
+    }
 }

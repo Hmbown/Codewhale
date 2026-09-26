@@ -1026,17 +1026,12 @@ pub(crate) fn mcp_import_apply(
 }
 
 pub(crate) fn clear_active_provider_api_key_from_memory(app: &App, config: &mut Config) {
-    let active_identity = app.provider_identity_for_persistence();
-    let clears_legacy_root = matches!(
-        app.api_provider,
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN
-    ) || (app.api_provider == ApiProvider::Custom
-        && active_identity == ApiProvider::Custom.as_str()
-        && config.uses_legacy_literal_custom_route());
-    if clears_legacy_root {
-        config.api_key = None;
-    }
     config.set_provider_api_key_override(app.api_provider, None);
+    // DeepSeek-CN reads DeepSeek's key (they used to share the top-level key,
+    // #6394), so clearing it clears that shared key too, as on disk.
+    if app.api_provider == ApiProvider::DeepseekCN {
+        config.set_provider_api_key_override(ApiProvider::Deepseek, None);
+    }
     if app.api_provider == ApiProvider::Xai {
         let entry = config.provider_config_for_mut(ApiProvider::Xai);
         entry.auth_mode = None;

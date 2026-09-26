@@ -1620,8 +1620,8 @@ pub struct App {
     /// Built-ins use their canonical slug; named custom providers retain the
     /// user-owned key instead of collapsing to `custom`.
     pub(crate) provider_identity: String,
-    /// Additive exact configured id for persistence. `None` preserves the
-    /// legacy root-level custom route even when a same-key table appears.
+    /// Additive exact configured id for persistence. An id-less `custom`
+    /// record resolves to the literal `[providers.custom]` table (#6394).
     pub(crate) provider_exact_id: Option<String>,
     /// Primary provider plus configured fallback providers for this session.
     pub provider_chain: Option<ProviderChain>,

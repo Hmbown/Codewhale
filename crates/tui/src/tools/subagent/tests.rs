@@ -2176,10 +2176,12 @@ pub(super) async fn delayed_chat_client(
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake chat client");
     (client, calls, bodies)
 }
@@ -2774,10 +2776,12 @@ async fn always_delayed_chat_client(
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake always-slow chat client");
     (client, calls)
 }
@@ -2880,10 +2884,12 @@ async fn transient_header_timeout_then_success_chat_client(
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake transient chat client");
     (client, calls)
 }
@@ -2922,8 +2928,6 @@ async fn always_rate_limited_chat_client() -> (CodewhaleClient, Arc<AtomicUsize>
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         retry: Some(crate::config::RetryConfig {
             enabled: Some(false),
             max_retries: Some(0),
@@ -2932,7 +2936,11 @@ async fn always_rate_limited_chat_client() -> (CodewhaleClient, Arc<AtomicUsize>
             exponential_base: Some(1.0),
         }),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake rate-limited chat client");
     (client, calls)
 }
@@ -2972,8 +2980,6 @@ async fn always_invalid_request_chat_client() -> (CodewhaleClient, Arc<AtomicUsi
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         retry: Some(crate::config::RetryConfig {
             enabled: Some(false),
             max_retries: Some(0),
@@ -2982,7 +2988,11 @@ async fn always_invalid_request_chat_client() -> (CodewhaleClient, Arc<AtomicUsi
             exponential_base: Some(1.0),
         }),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake invalid-request chat client");
     (client, calls)
 }
@@ -4717,7 +4727,6 @@ fn credentialless_xai_runtime() -> SubAgentRuntime {
         .expect("stub config")
         .as_ref()
         .clone();
-    config.api_key = None;
     config.providers = None;
     runtime.api_config = Some(std::sync::Arc::new(config));
     runtime
@@ -4857,12 +4866,14 @@ async fn structured_custom_pin_refuses_named_provider_migration_but_accepts_lite
     );
     let literal = crate::config::Config {
         provider: Some("custom".into()),
-        base_url: Some("http://127.0.0.1:2/v1".into()),
-        api_key: Some("fixture-literal-key".into()),
         default_text_model: Some("model-x".into()),
         subagents: pin(),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(
+        Some("fixture-literal-key".into()),
+        Some("http://127.0.0.1:2/v1".into()),
+    );
     for (config, should_bind) in [(named, false), (literal, true)] {
         let mut runtime = stub_runtime();
         runtime.client = CodewhaleClient::new(&config).unwrap();
@@ -14797,9 +14808,9 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
     // rebinding (#5042) needs it to rebuild the client for model-aware
     // routes such as deepseek-v4-flash.
     let stub_config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), None);
     let accounting_origin = SubAgentAccountingOrigin::capture(&context);
     SubAgentRuntime {
         client: stub_client(),
@@ -15099,20 +15110,20 @@ fn stub_client_for_provider(provider: &str) -> CodewhaleClient {
         other => panic!("extend stub_client_for_provider for provider {other}"),
     }
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
         provider: Some(provider.to_string()),
         providers: Some(providers),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), None);
     CodewhaleClient::new(&config).expect("stub client should construct")
 }
 
 fn stub_client() -> CodewhaleClient {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), None);
     CodewhaleClient::new(&config).expect("stub client should construct")
 }
 
@@ -16253,8 +16264,6 @@ async fn tool_call_then_invalid_request_chat_client() -> (CodewhaleClient, Arc<A
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         retry: Some(crate::config::RetryConfig {
             enabled: Some(false),
             max_retries: Some(0),
@@ -16263,7 +16272,11 @@ async fn tool_call_then_invalid_request_chat_client() -> (CodewhaleClient, Arc<A
             exponential_base: Some(1.0),
         }),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fatal-midrun chat client");
     (client, calls)
 }
@@ -16509,8 +16522,6 @@ async fn denied_call_then_report_chat_client() -> (CodewhaleClient, Arc<AtomicUs
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         retry: Some(crate::config::RetryConfig {
             enabled: Some(false),
             max_retries: Some(0),
@@ -16519,7 +16530,11 @@ async fn denied_call_then_report_chat_client() -> (CodewhaleClient, Arc<AtomicUs
             exponential_base: Some(1.0),
         }),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("denial-stall chat client");
     (client, calls)
 }
@@ -17899,10 +17914,12 @@ async fn token_heavy_chat_client(
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake chat client");
     (client, calls)
 }
@@ -17975,10 +17992,12 @@ async fn incomplete_then_complete_chat_client(
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake incomplete-response client");
     (client, calls)
 }
@@ -18369,10 +18388,12 @@ async fn compacting_child_chat_client(
     });
 
     let config = crate::config::Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(format!("http://{addr}/v1")),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some(format!("http://{addr}/v1")),
+    );
     let client = CodewhaleClient::new(&config).expect("fake chat client");
     (client, calls, summaries, saw_checkpoint)
 }
@@ -22935,10 +22956,9 @@ mod child_permission_gate {
             .mount(&server)
             .await;
         let config = crate::config::Config {
-            api_key: Some("test-key".to_string()),
-            base_url: Some(server.uri()),
             ..crate::config::Config::default()
-        };
+        }
+        .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
         let client = CodewhaleClient::new(&config).expect("mock-backed client");
         (server, client)
     }
@@ -22966,10 +22986,9 @@ mod child_permission_gate {
             .mount(&server)
             .await;
         let config = crate::config::Config {
-            api_key: Some("test-key".to_string()),
-            base_url: Some(server.uri()),
             ..crate::config::Config::default()
-        };
+        }
+        .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
         let client = CodewhaleClient::new(&config).expect("mock-backed client");
         (server, client)
     }
@@ -22977,10 +22996,12 @@ mod child_permission_gate {
     fn unreachable_client() -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = crate::config::Config {
-            api_key: Some("test-key".to_string()),
-            base_url: Some("http://127.0.0.1:1".to_string()),
             ..crate::config::Config::default()
-        };
+        }
+        .with_legacy_root(
+            Some("test-key".to_string()),
+            Some("http://127.0.0.1:1".to_string()),
+        );
         CodewhaleClient::new(&config).expect("unreachable client")
     }
 
@@ -23924,11 +23945,15 @@ mod child_permission_gate {
             })
             .mount(&server)
             .await;
-        let client = CodewhaleClient::new(&crate::config::Config {
-            api_key: Some("test-guardian-fresh-key".to_string()),
-            base_url: Some(server.uri()),
-            ..Default::default()
-        })
+        let client = CodewhaleClient::new(
+            &crate::config::Config {
+                ..Default::default()
+            }
+            .with_legacy_root(
+                Some("test-guardian-fresh-key".to_string()),
+                Some(server.uri()),
+            ),
+        )
         .expect("mock-backed client");
         let (registry, mut rx, manager) =
             worker_registry(ApprovalMode::Auto, false, true, Some(client));

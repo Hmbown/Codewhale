@@ -48,8 +48,6 @@ pub(crate) enum CredentialSource {
     /// `--api-key` on the command line (or the dispatcher's source-marked
     /// forward of it).
     CliOverride,
-    /// The root `api_key` compatibility slot in the config file.
-    RootConfigApiKey,
     /// `[providers.<table>] api_key`.
     ProviderConfigApiKey { table: String },
     /// `[providers.<table>] api_key_env = "<var>"`, resolved from `<var>`.
@@ -83,7 +81,6 @@ impl CredentialSource {
             Self::AuthModeNone => Cow::Borrowed("auth_mode = \"none\""),
             Self::KeylessRoute { base_url } => Cow::Owned(format!("keyless route {base_url}")),
             Self::CliOverride => Cow::Borrowed("--api-key"),
-            Self::RootConfigApiKey => Cow::Borrowed("config api_key"),
             Self::ProviderConfigApiKey { table } => Cow::Owned(format!("[{table}] api_key")),
             Self::ProviderConfigEnv { var } => Cow::Owned(format!("api_key_env {var}")),
             Self::AmbientEnv { var } => Cow::Owned(var.clone()),

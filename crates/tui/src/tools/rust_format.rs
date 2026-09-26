@@ -50,7 +50,14 @@ use tokio::process::Command;
 const MAX_FORMATTED_BYTES: usize = 1024 * 1024;
 
 /// Wall-clock budget for one `rustfmt` run.
+#[cfg(not(test))]
 const FORMAT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Unit tests assert that normalization *happens*, not how fast. A loaded
+/// Windows CI runner has taken over five seconds to start the rustup
+/// `rustfmt` proxy, which silently skipped normalization and failed the
+/// assertion. The skip-on-timeout path is unchanged; only the budget is.
+#[cfg(test)]
+const FORMAT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Suffix appended to an edit summary when the content was normalized, so the
 /// model knows the returned text is not byte-identical to what it sent.

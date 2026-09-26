@@ -165,9 +165,7 @@ impl App {
                 .active_provider_identity(provider)
                 .unwrap_or_else(|_| {
                     let key = config.provider_identity_for(provider);
-                    let exact_id = (!(provider == ApiProvider::Custom
-                        && config.uses_legacy_literal_custom_route()))
-                    .then(|| key.clone());
+                    let exact_id = Some(key.clone());
                     crate::config::ProviderIdentity {
                         provider,
                         key,

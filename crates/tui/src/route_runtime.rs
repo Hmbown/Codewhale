@@ -10,8 +10,8 @@ use serde::Serialize;
 use crate::client::CodewhaleClient;
 use crate::codex_model_cache::{CodexModelCacheFreshness, model_roster};
 use crate::config::{
-    ApiProvider, Config, DEFAULT_NVIDIA_NIM_BASE_URL, KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS,
-    ProviderIdentity, is_exact_direct_moonshot_k3_route, is_exact_kimi_code_bare_k3_route,
+    ApiProvider, Config, KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS, ProviderIdentity,
+    is_exact_direct_moonshot_k3_route, is_exact_kimi_code_bare_k3_route,
     validate_kimi_code_api_model_id,
 };
 use codewhale_models::DIRECT_KIMI_K3_MAX_OUTPUT_TOKENS;
@@ -904,24 +904,8 @@ fn prepared_route_config(
     let mut route_config = config.clone();
     route_config.scope_to_provider_identity(identity);
     let provider = identity.provider;
-    if matches!(provider, ApiProvider::NvidiaNim)
-        && route_config
-            .base_url
-            .as_deref()
-            .map(|base| !base.contains("integrate.api.nvidia.com"))
-            .unwrap_or(true)
-    {
-        route_config.base_url = Some(DEFAULT_NVIDIA_NIM_BASE_URL.to_string());
-    }
-    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
-        && route_config
-            .base_url
-            .as_deref()
-            .map(root_base_url_belongs_to_non_deepseek_provider)
-            .unwrap_or(false)
-    {
-        route_config.base_url = None;
-    }
+    // A foreign vendor's top-level endpoint was moved into that vendor's own
+    // table when the config was parsed (#6394), so no route can inherit it.
     if let Some(model) = model_selector {
         set_model_for_route(&mut route_config, provider, model);
     }
@@ -929,9 +913,6 @@ fn prepared_route_config(
 }
 
 fn configured_model_for_route(config: &Config, provider: ApiProvider) -> Option<&str> {
-    if provider == ApiProvider::Custom && config.uses_legacy_literal_custom_route() {
-        return config.default_text_model.as_deref();
-    }
     config
         .provider_config_for(provider)
         .and_then(|provider| provider.model.as_deref())
@@ -939,27 +920,6 @@ fn configured_model_for_route(config: &Config, provider: ApiProvider) -> Option<
 
 fn set_model_for_route(config: &mut Config, provider: ApiProvider, model: &str) {
     config.set_provider_model_override(provider, Some(model.to_string()));
-}
-
-fn root_base_url_belongs_to_non_deepseek_provider(base_url: &str) -> bool {
-    let lower = base_url.to_ascii_lowercase();
-    [
-        "integrate.api.nvidia.com",
-        "api.openai.com",
-        "api.atlascloud.ai",
-        "maas-openapi.wanjiedata.com",
-        "volces.com",
-        "openrouter.ai",
-        "xiaomimimo.com",
-        "novita.ai",
-        "fireworks.ai",
-        "siliconflow",
-        "arcee.ai",
-        "moonshot.ai",
-        "api.kimi.com",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
 }
 
 #[cfg(test)]
@@ -996,7 +956,6 @@ mod tests {
             ))
             .unwrap();
             config.provider = Some(identity.into());
-            config.base_url = None;
             config.providers = None;
             config.set_provider_base_url_override(provider, Some(base.into()));
             let declaration = &mut config.custom_models.as_mut().unwrap()[0];

@@ -115,11 +115,7 @@ fn resolve_endpoint(
     });
     let auth_disabled = auth_mode_disables_api_key(auth_mode);
 
-    let configured_api_key = provider_cfg.api_key.as_deref().or_else(|| {
-        (provider_kind == ProviderKind::Deepseek)
-            .then_some(config.api_key.as_deref())
-            .flatten()
-    });
+    let configured_api_key = provider_cfg.api_key.as_deref();
 
     // Provider auth comes only from the resolved endpoint configuration. The
     // HTTP request's Authorization header authenticates the caller to the local
@@ -191,11 +187,6 @@ fn provider_base_url(config: &ConfigToml, provider: ProviderKind) -> String {
         .for_provider(provider)
         .base_url
         .clone()
-        .or_else(|| {
-            (provider == ProviderKind::Deepseek)
-                .then(|| config.base_url.clone())
-                .flatten()
-        })
         .unwrap_or_else(|| metadata.default_base_url().to_string())
 }
 

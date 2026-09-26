@@ -6243,9 +6243,9 @@ mod tests {
     #[test]
     fn provider_health_requires_observed_success_and_keeps_failure_reason() {
         let config = Config {
-            api_key: Some("saved-key".to_string()),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("saved-key".to_string()), None);
         let unchecked = ProviderPickerView::new(ApiProvider::Deepseek, &config);
         let row = unchecked
             .rows
@@ -7454,7 +7454,6 @@ mod tests {
     #[test]
     fn provider_dashboard_row_marks_route_resolver_errors_as_invalid() {
         let config = Config {
-            api_key: Some("deepseek-key".to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 deepseek: crate::config::ProviderConfig {
                     model: Some("anthropic/claude-foreign".to_string()),
@@ -7463,7 +7462,8 @@ mod tests {
                 ..Default::default()
             }),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("deepseek-key".to_string()), None);
         let row = ProviderDashboardRow::from_config(
             ApiProvider::Deepseek,
             ApiProvider::Deepseek,
@@ -7665,9 +7665,9 @@ mod tests {
     #[test]
     fn enter_with_existing_key_emits_apply_and_closes() {
         let config = Config {
-            api_key: Some("existing-deepseek-key".to_string()),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("existing-deepseek-key".to_string()), None);
         let mut picker = ProviderPickerView::new(ApiProvider::NvidiaNim, &config);
         // Navigate to DeepSeek, which has a key from the top-level config.
         move_to_provider(&mut picker, ApiProvider::Deepseek);
@@ -8894,9 +8894,9 @@ mod tests {
     #[test]
     fn configured_provider_footer_mentions_edit_key() {
         let config = Config {
-            api_key: Some("existing-deepseek-key".to_string()),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("existing-deepseek-key".to_string()), None);
         let picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
 
         let rendered = render_text(&picker, 80, 14);

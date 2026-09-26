@@ -92,7 +92,7 @@ fn offline_doctor_loads_never_materialize_secret_environment_overrides() {
                 .is_none()
         );
         assert_eq!(
-            config.base_url.as_deref(),
+            config.deepseek_table_base_url(),
             Some("https://safe-doctor.example:9443/v1")
         );
         assert_eq!(config.allow_shell, Some(false));
@@ -326,9 +326,9 @@ fn doctor_provider_url_reports_omit_secret_capable_components() {
         sentinels[0], sentinels[1], sentinels[2], sentinels[3], sentinels[4], sentinels[5]
     );
     let config = Config {
-        base_url: Some(base_url),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(None, Some(base_url));
     let target = doctor_api_target(&config);
     let human = format!(
         "base_url: {}",
@@ -521,9 +521,9 @@ fn resolve_api_key_source_does_not_probe_system_keyring() {
 #[test]
 fn credential_diagnostic_distinguishes_literal_from_empty_config_keys() {
     let literal = Config {
-        api_key: Some("TEST-LITERAL-CONFIG-KEY".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("TEST-LITERAL-CONFIG-KEY".to_string()), None);
     assert_eq!(
         resolve_credential_diagnostic(&literal),
         CredentialDiagnostic::new(
@@ -550,9 +550,9 @@ fn credential_diagnostic_distinguishes_literal_from_empty_config_keys() {
     assert!(!doctor_has_credentials_or_local_runtime(&empty));
 
     let empty_root = Config {
-        api_key: Some(String::new()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some(String::new()), None);
     assert_eq!(
         resolve_credential_diagnostic(&empty_root).source,
         ApiKeySource::SecretStoreUnprobed
@@ -568,9 +568,9 @@ fn credential_diagnostic_treats_sentinel_as_unprobed_store_not_config() {
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
     let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
     let config = Config {
-        api_key: Some(crate::config::API_KEYRING_SENTINEL.to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some(crate::config::API_KEYRING_SENTINEL.to_string()), None);
 
     assert_eq!(
         resolve_credential_diagnostic(&config),

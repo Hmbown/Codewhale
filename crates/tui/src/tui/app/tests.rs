@@ -1630,9 +1630,9 @@ fn app_new_scenario() {
         let _legacy_provider_env = EnvVarGuard::remove("DEEPSEEK_PROVIDER");
 
         let config = Config {
-            api_key: Some("sk-test-onboarding-key".to_string()),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("sk-test-onboarding-key".to_string()), None);
         let app = App::new(test_options(false), &config);
         assert!(
             !app.onboarding_needs_api_key,
@@ -6273,7 +6273,6 @@ fn startup_and_fallback_skip_inactive_external_only_routes_without_io() {
 
     let config = Config {
         provider: Some(ApiProvider::Deepseek.as_str().to_string()),
-        api_key: Some("active-deepseek-key".to_string()),
         fallback_providers: vec![
             codewhale_config::ProviderKind::OpenaiCodex,
             codewhale_config::ProviderKind::Xai,
@@ -6304,7 +6303,8 @@ fn startup_and_fallback_skip_inactive_external_only_routes_without_io() {
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("active-deepseek-key".to_string()), None);
     let mut options = test_options(false);
     options.skip_onboarding = true;
 
