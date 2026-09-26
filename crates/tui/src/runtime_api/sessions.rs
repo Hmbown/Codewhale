@@ -436,6 +436,7 @@ pub(super) async fn create_session_from_thread(
             message: format!(
                 "Thread {thread_id} has a queued or active turn; wait for completion before saving as a session"
             ),
+            code: None,
         });
     }
 
@@ -764,9 +765,9 @@ async fn persist_thread_cost(
 /// items), this endpoint asks the engine for its live session snapshot so
 /// token counts and message ordering are authoritative.
 ///
-/// `session_id` names the document to write. Omitted, the document is the
-/// conversation's own id (the one its workspace snapshots are tagged with),
-/// so a thread never ends up bound to a session that owns none of them — see
+/// `session_id` names the document to write. Omitted, the thread's bound
+/// document is updated, or, for a thread bound to none, a document is created
+/// under the thread's own conversation id — see
 /// [`crate::core::ops::SessionSnapshot::session_id`].
 pub(super) async fn save_current_session(
     State(state): State<RuntimeApiState>,
@@ -809,73 +810,67 @@ pub(super) async fn save_current_session(
     let manager = SessionManager::new(state.sessions_dir.clone())
         .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
 
+    // Which document this save writes. A named `session_id` wins. With none,
+    // the thread's own document answers it: the one it is bound to (a
+    // `resume-thread` from document X runs bound to X, and saving it must
+    // update X, not start a second copy under another name), else a new
+    // document under the engine's conversation id, which for a Runtime thread
+    // is the thread's own id (see `ensure_engine_loaded`) and so cannot
+    // collide with another thread's document. Snapshot ownership does not
+    // depend on this binding: a thread owns the restore points recorded on
+    // its turns.
+    let document_id = match req.session_id {
+        Some(named) => named,
+        None => state
+            .runtime_threads
+            .get_thread(&thread_id)
+            .await
+            .map_err(map_thread_err)?
+            .session_id
+            .unwrap_or_else(|| snapshot.session_id.clone()),
+    };
+
     // Build or update the session, mirroring TUI's `build_session_snapshot`.
     // Only `io::ErrorKind::NotFound` falls back to creating a new session;
     // other I/O errors (e.g. PermissionDenied) are propagated so callers
     // don't silently overwrite a corrupt or inaccessible session file.
-    let mut session = if let Some(ref existing_id) = req.session_id {
-        match manager.load_session(existing_id) {
-            Ok(existing) => {
-                let mut updated = crate::session_manager::update_session(
-                    existing,
-                    &snapshot.messages,
-                    snapshot.total_tokens,
-                    snapshot.system_prompt.as_ref(),
-                );
-                updated.metadata.model = snapshot.model.clone();
-                updated.metadata.set_model_provider_route(
-                    &snapshot.model_provider,
-                    snapshot.model_provider_id.as_deref(),
-                );
-                updated.metadata.mode = Some(snapshot.mode.clone());
-                updated
-            }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    let mut session = crate::session_manager::create_saved_session_with_id_and_mode(
-                        existing_id.clone(),
-                        &snapshot.messages,
-                        &snapshot.model,
-                        &snapshot.workspace,
-                        snapshot.total_tokens,
-                        snapshot.system_prompt.as_ref(),
-                        Some(snapshot.mode.as_str()),
-                    );
-                    session.metadata.set_model_provider_route(
-                        &snapshot.model_provider,
-                        snapshot.model_provider_id.as_deref(),
-                    );
-                    session
-                } else {
-                    return Err(ApiError::internal(format!(
-                        "Failed to load session {existing_id}: {e}"
-                    )));
-                }
-            }
+    let mut session = match manager.load_session(&document_id) {
+        Ok(existing) => {
+            let mut updated = crate::session_manager::update_session(
+                existing,
+                &snapshot.messages,
+                snapshot.total_tokens,
+                snapshot.system_prompt.as_ref(),
+            );
+            updated.metadata.model = snapshot.model.clone();
+            updated.metadata.set_model_provider_route(
+                &snapshot.model_provider,
+                snapshot.model_provider_id.as_deref(),
+            );
+            updated.metadata.mode = Some(snapshot.mode.clone());
+            updated
         }
-    } else {
-        // No session was named, so the conversation the thread is running
-        // answers it — and the engine's live conversation id *is* that
-        // conversation's identity: every `tool:` / `pre-turn:` workspace
-        // snapshot it took is tagged with it, and `patch-undo` /
-        // `file-revert` select snapshots by the thread's binding. Minting a
-        // third uuid here (what this used to do) left the thread bound to a
-        // document whose id owned none of those snapshots, so an undo forked
-        // the conversation and left every file on disk untouched.
-        let mut session = crate::session_manager::create_saved_session_with_id_and_mode(
-            snapshot.session_id.clone(),
-            &snapshot.messages,
-            &snapshot.model,
-            &snapshot.workspace,
-            snapshot.total_tokens,
-            snapshot.system_prompt.as_ref(),
-            Some(snapshot.mode.as_str()),
-        );
-        session.metadata.set_model_provider_route(
-            &snapshot.model_provider,
-            snapshot.model_provider_id.as_deref(),
-        );
-        session
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut session = crate::session_manager::create_saved_session_with_id_and_mode(
+                document_id.clone(),
+                &snapshot.messages,
+                &snapshot.model,
+                &snapshot.workspace,
+                snapshot.total_tokens,
+                snapshot.system_prompt.as_ref(),
+                Some(snapshot.mode.as_str()),
+            );
+            session.metadata.set_model_provider_route(
+                &snapshot.model_provider,
+                snapshot.model_provider_id.as_deref(),
+            );
+            session
+        }
+        Err(e) => {
+            return Err(ApiError::internal(format!(
+                "Failed to load session {document_id}: {e}"
+            )));
+        }
     };
 
     persist_thread_cost(&state, &thread_id, &mut session).await?;
@@ -1035,6 +1030,7 @@ fn map_session_err(id: &str, err: std::io::Error, action: &str) -> ApiError {
         std::io::ErrorKind::ResourceBusy => ApiError {
             status: StatusCode::CONFLICT,
             message: err.to_string(),
+            code: None,
         },
         _ => ApiError::internal(format!("Failed to {action} session '{id}': {err}")),
     }

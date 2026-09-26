@@ -48,13 +48,112 @@ pub mod repo;
 pub use paths::{snapshot_dir_for, snapshot_git_dir};
 pub use prune::{DEFAULT_MAX_AGE, prune_older_than};
 
-/// Maximum snapshots kept per workspace side-repo. Oldest are pruned
-/// after each new snapshot to cap disk usage (#1112).
+/// Snapshots kept per workspace side-repo, pruned after each new snapshot to
+/// cap disk usage (#1112): the newest this many, plus the newest this many
+/// turn boundaries (`pre-turn:` / `post-turn:`), so a burst of per-tool
+/// snapshots can never push out the restore points of the turns that took
+/// them (see [`SnapshotRepo::prune_keep_last_n`]).
 pub const DEFAULT_MAX_SNAPSHOTS: usize = 50;
 #[allow(unused_imports)]
 pub use repo::{
     DEFAULT_MAX_WORKSPACE_BYTES_FOR_SNAPSHOT, GATE_TOO_LARGE_MARKER, GATE_TOO_MANY_ENTRIES_MARKER,
     GATE_UNSAFE_LOCATION_MARKER, PathRestoreAction, PathRestoreOutcome, SIZE_WALK_MAX_ENTRIES,
-    Snapshot, SnapshotId, SnapshotRepo, WorkspaceGate, estimate_workspace_size_bounded,
-    workspace_relative_path,
+    Snapshot, SnapshotId, SnapshotRepo, TakenSnapshot, WorkspaceGate,
+    estimate_workspace_size_bounded, workspace_relative_path,
 };
+
+/// Which point of a turn a recorded workspace snapshot captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSnapshotKind {
+    /// Before the turn touched anything (`pre-turn:` label).
+    PreTurn,
+    /// Before one file-modifying tool call ran (`tool:<call_id>` label).
+    Tool,
+    /// After a tool call that had a `tool` snapshot finished
+    /// (`post-tool:<call_id>` label). Taken only by hosts that record
+    /// restore points, so the span a tool ran in is bounded on both sides.
+    PostTool,
+    /// After the turn finished (`post-turn:` label).
+    PostTurn,
+}
+
+impl WorkspaceSnapshotKind {
+    /// The label prefix the snapshot repo stores for this kind.
+    pub fn label_prefix(self) -> &'static str {
+        match self {
+            Self::PreTurn => "pre-turn:",
+            Self::Tool => "tool:",
+            Self::PostTool => "post-tool:",
+            Self::PostTurn => "post-turn:",
+        }
+    }
+}
+
+/// Receipt for one workspace snapshot an engine took on behalf of a turn.
+///
+/// The engine reports it (`Event::WorkspaceSnapshotTaken`) and the Runtime
+/// records it on the turn that was running, so a thread owns exactly the
+/// restore points recorded on its own turns — including the turns a fork
+/// inherited — regardless of which saved-session document the thread is
+/// bound to. `tree_id` is the durable identity: a prune rebuilds the side
+/// repo's commit chain and rewrites every commit id, but re-commits the same
+/// trees. `session_id` is the tag the snapshot was taken under; a restore
+/// point only resolves to a snapshot that still carries it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceSnapshotRef {
+    pub kind: WorkspaceSnapshotKind,
+    /// Commit id when the snapshot was taken. A later prune may rewrite it;
+    /// `tree_id` still resolves the snapshot then.
+    pub snapshot_id: String,
+    /// Root tree of the snapshot.
+    pub tree_id: String,
+    /// Session tag the snapshot was taken under.
+    pub session_id: String,
+    /// The tool call that runs from this snapshot to the next one of the
+    /// turn: the call a `tool` snapshot preceded, or, on a `pre_turn`
+    /// snapshot, the user shell command a shell turn runs. A `post_tool`
+    /// snapshot names the call it closes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// For a `tool` snapshot of a file tool (`write_file`, `edit_file`,
+    /// `apply_patch`): the paths the call declared it writes, as it named
+    /// them. Absent for a tool whose writes are not declared (a shell
+    /// command, a program), which may change any path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_paths: Option<Vec<String>>,
+    /// Workspace-relative paths whose content changed since the turn's
+    /// previous snapshot: what happened in the span this snapshot closes.
+    /// Absent on a `pre_turn` snapshot (nothing precedes it in the turn) and
+    /// when it could not be computed (the previous snapshot failed or is
+    /// gone), which leaves that span unaccounted for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_paths: Option<Vec<String>>,
+}
+
+impl WorkspaceSnapshotRef {
+    pub fn new(
+        kind: WorkspaceSnapshotKind,
+        taken: &TakenSnapshot,
+        session_id: &str,
+        tool_call_id: Option<&str>,
+    ) -> Self {
+        Self {
+            kind,
+            snapshot_id: taken.id.as_str().to_string(),
+            tree_id: taken.tree.as_str().to_string(),
+            session_id: session_id.to_string(),
+            tool_call_id: tool_call_id.map(str::to_string),
+            write_paths: None,
+            changed_paths: None,
+        }
+    }
+
+    /// Whether `snapshot` (a row of [`SnapshotRepo::list`]) is this restore
+    /// point: same tree, same session tag, same label kind.
+    pub fn matches(&self, snapshot: &Snapshot) -> bool {
+        snapshot.tree.as_str() == self.tree_id
+            && snapshot.session_id.as_deref() == Some(self.session_id.as_str())
+            && snapshot.label.starts_with(self.kind.label_prefix())
+    }
+}

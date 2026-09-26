@@ -1059,3 +1059,18 @@ test("renders hostile Runtime text only through the textContent sink", async () 
   assert.equal(source.includes("local" + "Storage"), false);
   assert.equal(source.includes("session" + "Storage"), false);
 });
+
+test("records workspace restore-point receipts on their turn in order", () => {
+  const state = createThreadState("thread-a");
+  applySnapshot(state, snapshot("thread-a", 7));
+  const pre = { kind: "pre_turn", snapshot_id: "c1", tree_id: "t1", session_id: "thread-a" };
+  const post = { kind: "post_turn", snapshot_id: "c2", tree_id: "t2", session_id: "thread-a" };
+  assert.equal(applyRuntimeEvent(state, runtimeEvent(8, "turn.workspace_snapshot", pre)), true);
+  assert.equal(applyRuntimeEvent(state, runtimeEvent(9, "turn.workspace_snapshot", post)), true);
+  assert.deepEqual(state.turns.get("turn-1").workspace_snapshots, [pre, post]);
+  // A receipt for a turn the client has not seen still advances continuity.
+  const orphan = runtimeEvent(10, "turn.workspace_snapshot", pre, { turn_id: "turn-9" });
+  assert.equal(applyRuntimeEvent(state, orphan), true);
+  assert.equal(state.latestSeq, 10);
+  assert.equal(state.turns.has("turn-9"), false);
+});

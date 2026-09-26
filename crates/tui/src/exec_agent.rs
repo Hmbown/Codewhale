@@ -584,6 +584,8 @@ pub(crate) async fn run_exec_agent(
             .snapshots_config()
             .max_workspace_gb
             .saturating_mul(1024 * 1024 * 1024),
+        // No host here records snapshot receipts.
+        record_restore_points: false,
         lsp_config,
         runtime_services,
         subagent_model_overrides: execution_config.subagent_model_overrides(),

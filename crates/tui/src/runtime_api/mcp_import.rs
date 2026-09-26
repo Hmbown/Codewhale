@@ -20,6 +20,7 @@ fn import_error(error: anyhow::Error) -> ApiError {
             StatusCode::CONFLICT
         },
         message: error.to_string(),
+        code: None,
     }
 }
 

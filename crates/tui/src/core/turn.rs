@@ -5,7 +5,8 @@
 //!
 //! ## Snapshot lifecycle hooks
 //!
-//! [`pre_turn_snapshot`] and [`post_turn_snapshot`] book-end a turn by
+//! [`restore_point_snapshot`] (`pre-turn:`, `tool:`, `post-tool:`) and
+//! [`post_turn_snapshot`] book-end a turn and its tool calls by
 //! taking a workspace-level snapshot into a side git repo (see
 //! `crate::snapshot`). They are intentionally non-blocking and
 //! non-fatal: any IO error is logged at WARN and swallowed so a busted
@@ -14,7 +15,7 @@
 //! snapshots.
 
 use crate::core::events::TurnRoute;
-use crate::snapshot::SnapshotRepo;
+use crate::snapshot::{SnapshotRepo, TakenSnapshot};
 use codewhale_models::Usage;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -616,15 +617,17 @@ pub(crate) fn parse_snapshot_label(label: &str) -> ParsedSnapshotLabel {
 /// turn, embedded in the snapshot label so `/restore` listings are
 /// human-readable.
 ///
-/// Returns the snapshot SHA on success, `None` on any error. Errors are
-/// logged at WARN; the turn loop must not block on this.
+/// Returns the snapshot (commit and tree) on success, `None` on any error.
+/// Errors are logged at WARN; the turn loop must not block on this. The
+/// engine takes its pre-turn snapshots through [`restore_point_snapshot`].
+#[cfg(test)]
 pub fn pre_turn_snapshot(
     workspace: &Path,
     turn_seq: u64,
     cap_bytes: u64,
     user_prompt: Option<&str>,
     session_id: Option<&str>,
-) -> Option<String> {
+) -> Option<TakenSnapshot> {
     snapshot_with_label(
         workspace,
         &format_snapshot_label("pre-turn", turn_seq, user_prompt),
@@ -633,32 +636,33 @@ pub fn pre_turn_snapshot(
     )
 }
 
-/// Take a `tool:<call_id>` workspace snapshot, taken before executing a
-/// file-modifying tool call (write_file, edit_file, apply_patch).
+/// Take a workspace snapshot under `label` for the running turn, and report
+/// which paths changed since the turn's previous snapshot `since` (a tree or
+/// commit id).
 ///
-/// This enables surgical undo: `/undo` can restore to the most recent
-/// `tool:<call_id>` snapshot to revert just the last file write.
-///
-/// Returns the snapshot SHA on success, `None` on any error. Errors are
-/// logged at WARN and are non-fatal.
-pub fn pre_tool_snapshot(
+/// The comparison runs before the count prune that follows every snapshot,
+/// so `since` is still in the store; `None` for the changed paths means there
+/// was no `since` or it could not be compared. `None` on any error, logged
+/// at WARN; the turn loop must not block on it.
+pub fn restore_point_snapshot(
     workspace: &Path,
-    call_id: &str,
+    label: &str,
     cap_bytes: u64,
     session_id: Option<&str>,
-) -> Option<String> {
-    snapshot_with_label(workspace, &format!("tool:{call_id}"), cap_bytes, session_id)
+    since: Option<&crate::snapshot::SnapshotId>,
+) -> Option<(TakenSnapshot, Option<Vec<std::path::PathBuf>>)> {
+    snapshot_with_label_since(workspace, label, cap_bytes, session_id, since)
 }
 
 /// Take a `post-turn:<seq>` workspace snapshot. Same failure model as
-/// [`pre_turn_snapshot`].
+/// [`restore_point_snapshot`].
 pub fn post_turn_snapshot(
     workspace: &Path,
     turn_seq: u64,
     cap_bytes: u64,
     user_prompt: Option<&str>,
     session_id: Option<&str>,
-) -> Option<String> {
+) -> Option<TakenSnapshot> {
     snapshot_with_label(
         workspace,
         &format_snapshot_label("post-turn", turn_seq, user_prompt),
@@ -672,18 +676,28 @@ fn snapshot_with_label(
     label: &str,
     cap_bytes: u64,
     session_id: Option<&str>,
-) -> Option<String> {
+) -> Option<TakenSnapshot> {
+    snapshot_with_label_since(workspace, label, cap_bytes, session_id, None).map(|(taken, _)| taken)
+}
+
+fn snapshot_with_label_since(
+    workspace: &Path,
+    label: &str,
+    cap_bytes: u64,
+    session_id: Option<&str>,
+    since: Option<&crate::snapshot::SnapshotId>,
+) -> Option<(TakenSnapshot, Option<Vec<std::path::PathBuf>>)> {
     match SnapshotRepo::open_or_init_with_cap(workspace, cap_bytes) {
         Ok(repo) => {
             // Undo that silently stops working is the failure this guards
             // (B2): a repaired history and a failing snapshot both reach the
             // user through the same notice as the gates, never only a log.
             let taken = repo.repair_broken_head().and_then(|repaired| {
-                repo.snapshot_with_session(label, session_id)
-                    .map(|id| (id, repaired))
+                repo.take_snapshot(label, session_id)
+                    .map(|taken| (taken, repaired))
             });
             let (id, repaired) = match taken {
-                Ok((id, repaired)) => (Some(id.into_string()), repaired),
+                Ok((taken, repaired)) => (Some(taken), repaired),
                 Err(e) => {
                     tracing::warn!(target: "snapshot", "snapshot '{label}' failed: {e}");
                     record_snapshot_notice(
@@ -704,11 +718,31 @@ fn snapshot_with_label(
                     String::new(),
                 );
             }
+            // What changed since the turn's previous snapshot, compared
+            // before the prune below can drop that snapshot.
+            let changed = match (&id, since) {
+                (Some(taken), Some(since)) if since.as_str() == taken.tree.as_str() => {
+                    Some(Vec::new())
+                }
+                (Some(taken), Some(since)) => {
+                    match repo.changed_paths_between(since, &taken.tree) {
+                        Ok(paths) => Some(paths),
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "snapshot",
+                                "comparing snapshot '{label}' with the turn's previous one failed: {e}"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
             // Prune oldest snapshots to cap disk usage (#1112).
-            if let Err(e) = repo.prune_keep_last_n(crate::snapshot::DEFAULT_MAX_SNAPSHOTS) {
+            if let Err(e) = repo.prune_keep_last_n(max_snapshots_for(workspace)) {
                 tracing::warn!(target: "snapshot", "snapshot prune failed: {e}");
             }
-            id
+            id.map(|taken| (taken, changed))
         }
         Err(e) => {
             // The first gated failure belongs to this session, even when other
@@ -720,6 +754,49 @@ fn snapshot_with_label(
             }
             None
         }
+    }
+}
+
+/// The count cap [`SnapshotRepo::prune_keep_last_n`] applies after each
+/// snapshot: [`crate::snapshot::DEFAULT_MAX_SNAPSHOTS`], which tests can
+/// lower per workspace to exercise pruning without taking fifty snapshots.
+fn max_snapshots_for(workspace: &Path) -> usize {
+    #[cfg(test)]
+    if let Some(max) = test_max_snapshots::get(workspace) {
+        return max;
+    }
+    let _ = workspace;
+    crate::snapshot::DEFAULT_MAX_SNAPSHOTS
+}
+
+#[cfg(test)]
+pub(crate) mod test_max_snapshots {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    static OVERRIDES: parking_lot::Mutex<Option<HashMap<PathBuf, usize>>> =
+        parking_lot::Mutex::new(None);
+
+    fn key(workspace: &Path) -> PathBuf {
+        workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf())
+    }
+
+    /// Prune `workspace`'s snapshots to `max` (plus as many turn
+    /// boundaries) after each snapshot, for the rest of the test process.
+    pub(crate) fn set(workspace: &Path, max: usize) {
+        OVERRIDES
+            .lock()
+            .get_or_insert_with(HashMap::new)
+            .insert(key(workspace), max);
+    }
+
+    pub(super) fn get(workspace: &Path) -> Option<usize> {
+        OVERRIDES
+            .lock()
+            .as_ref()
+            .and_then(|overrides| overrides.get(&key(workspace)).copied())
     }
 }
 

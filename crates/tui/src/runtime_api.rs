@@ -4494,6 +4494,7 @@ fn mcp_mutation_error(error: anyhow::Error) -> ApiError {
         ApiError {
             status: StatusCode::PRECONDITION_FAILED,
             message: error.to_string(),
+            code: None,
         }
     } else if let Some(error) = error.downcast_ref::<McpManagementFailure>() {
         error.0.clone()
@@ -4509,6 +4510,7 @@ fn mcp_expected_revision(headers: &axum::http::HeaderMap) -> Result<String, ApiE
             status: StatusCode::PRECONDITION_REQUIRED,
             message: "Read the MCP configuration and send its revision in If-Match before saving"
                 .into(),
+            code: None,
         })?
         .to_str()
         .map_err(|_| ApiError::bad_request("Invalid MCP revision"))?
@@ -4592,6 +4594,7 @@ fn require_writable_mcp_server(state: &RuntimeApiState, name: &str) -> Result<()
             message: format!(
                 "MCP server '{name}' is owned by {origin} configuration; manage it at its source"
             ),
+            code: None,
         }),
         None => Err(ApiError::not_found(format!(
             "MCP server '{name}' not found"
@@ -4841,6 +4844,7 @@ async fn create_mcp_server(
                     message: format!(
                         "MCP server '{target_name}' already exists in the effective configuration"
                     ),
+                    code: None,
                 });
             }
             config.servers.insert(target_name, new_cfg.clone());
@@ -4900,6 +4904,7 @@ async fn update_mcp_server(
             return Err(ApiError {
                 status: StatusCode::CONFLICT,
                 message: "Clear this connector's credential configuration before changing its command, arguments, URL, or transport; retained credentials cannot be forwarded to a different target".to_owned(),
+                code: None,
             });
         }
         if existing.command.is_none() && existing.url.is_none() {
@@ -5693,9 +5698,11 @@ async fn fork_thread_at_turn(
 struct PatchUndoResult {
     /// Whether files were restored from a snapshot.
     files_restored: bool,
-    /// Human-readable summary of what was restored (diff stat).
+    /// Human-readable summary: one `<action> <path>` line per restored file,
+    /// or why nothing needed restoring.
     summary: Option<String>,
-    /// The label of the restored snapshot (e.g. "tool:apply_patch" or "pre-turn:3").
+    /// Label of the pre-turn snapshot the files went back to (e.g.
+    /// "pre-turn:3: fix the parser").
     snapshot_label: Option<String>,
 }
 
@@ -5745,12 +5752,15 @@ async fn patch_undo_thread_turn(
         // client does not get to assert it.
         let trusted = thread.trust_mode || thread.auto_approve;
         let workspace = thread.workspace.clone();
-        let session_id = thread.session_id.clone();
+        // The restore points come from the dropped turns' own records, not
+        // from the thread's saved-session binding or a scan of the shared
+        // snapshot store: those are the snapshots this thread owns.
+        let dropped_turns = prepared.dropped_turns().to_vec();
         // Step 1: snapshot-based file rollback. The `?` is deliberate: a
         // refusal or a failed restore aborts *before* the conversation is
         // forked, so the turn never disappears while its file changes stay.
         let patch_result = tokio::task::spawn_blocking(move || {
-            patch_undo_workspace_files(&workspace, session_id.as_deref(), trusted)
+            patch_undo_workspace_files(&workspace, &dropped_turns, trusted)
         })
         .await
         .map_err(|e| ApiError::internal(format!("Patch undo task failed: {e}")))??;
@@ -5787,125 +5797,541 @@ async fn patch_undo_thread_turn(
     .map_err(|e| ApiError::internal(format!("Patch undo task failed: {e}")))?
 }
 
-/// Restore the newest `tool:` or `pre-turn:` snapshot that differs from the
-/// current workspace — same target selection as the TUI's `patch_undo`.
+/// Error codes a patch-undo refusal carries in `error.code`. A client offers a
+/// conversation-only `POST /v1/threads/{id}/undo` for the first four.
+const PATCH_UNDO_NO_RESTORE_POINT: &str = "restore_point_unavailable";
+const PATCH_UNDO_RESTORE_POINT_PRUNED: &str = "restore_point_pruned";
+const PATCH_UNDO_PATH_NOT_SNAPSHOTTED: &str = "path_not_snapshotted";
+const PATCH_UNDO_WORKSPACE_CHANGED: &str = "workspace_changed_since_turn";
+const PATCH_UNDO_UNTRUSTED: &str = "restore_requires_trust";
+const PATCH_UNDO_WORKSPACE_UNAVAILABLE: &str = "workspace_unavailable";
+
+/// One pre-turn → post-turn window of a dropped turn, resolved to the trees
+/// the snapshot store still holds.
+struct UndoSegment {
+    turn_id: String,
+    pre: crate::snapshot::SnapshotId,
+    post: crate::snapshot::SnapshotId,
+    pre_label: String,
+    /// Paths that changed in the window only while one of the turn's own
+    /// tool calls was running: the turn's changes.
+    owned: std::collections::BTreeSet<PathBuf>,
+    /// Paths that changed in the window while none of the turn's tools could
+    /// have written them: someone else's changes.
+    foreign: std::collections::BTreeSet<PathBuf>,
+}
+
+/// Pair each `pre_turn` receipt of a turn with the `post_turn` receipt that
+/// closes it, in recorded order, as index ranges into `snapshots` (the
+/// `tool`/`post_tool` receipts between them are the window's inner spans). A
+/// turn can hold more than one window (a shell turn and a model turn under
+/// one runtime turn); a `post_turn` with no open window cannot belong to this
+/// turn and is skipped. `None` means a window the engine never closed (the
+/// turn died before its post-turn snapshot) or no window at all.
+fn turn_snapshot_windows(
+    snapshots: &[crate::snapshot::WorkspaceSnapshotRef],
+) -> Option<Vec<std::ops::RangeInclusive<usize>>> {
+    use crate::snapshot::WorkspaceSnapshotKind;
+    let mut windows = Vec::new();
+    let mut open = None;
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        match snapshot.kind {
+            WorkspaceSnapshotKind::PreTurn => {
+                if open.is_some() {
+                    return None;
+                }
+                open = Some(index);
+            }
+            WorkspaceSnapshotKind::PostTurn => {
+                if let Some(pre) = open.take() {
+                    windows.push(pre..=index);
+                }
+            }
+            WorkspaceSnapshotKind::Tool | WorkspaceSnapshotKind::PostTool => {}
+        }
+    }
+    (open.is_none() && !windows.is_empty()).then_some(windows)
+}
+
+/// A path a file tool declared it writes, as a workspace-relative path the
+/// snapshots would hold, or `None` when it is outside the workspace.
+fn declared_write_path(workspace: &FsPath, raw: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let candidate = FsPath::new(raw);
+    let rel = if candidate.is_absolute() {
+        let canonical_workspace = workspace.canonicalize().ok();
+        let canonical_candidate = candidate
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .zip(candidate.file_name())
+            .map(|(parent, name)| parent.join(name));
+        [Some(workspace), canonical_workspace.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(|root| {
+                candidate
+                    .strip_prefix(root)
+                    .ok()
+                    .or_else(|| canonical_candidate.as_deref()?.strip_prefix(root).ok())
+                    .map(FsPath::to_path_buf)
+            })?
+    } else {
+        candidate.to_path_buf()
+    };
+    let rel: PathBuf = rel
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .collect();
+    crate::snapshot::workspace_relative_path(workspace, rel.to_str()?)
+}
+
+/// Who could have changed the workspace in the span after one receipt.
+enum SpanWriter {
+    /// None of the turn's tool calls was running.
+    Nobody,
+    /// A call whose writes are not declared (a shell command, a program).
+    Undeclared,
+    /// A file tool that declared exactly these paths.
+    Declared(std::collections::BTreeSet<PathBuf>),
+}
+
+/// Split a window's changes into the turn's own and everyone else's, from
+/// the spans its receipts bound: a path belongs to the turn only if it
+/// changed while one of the turn's tool calls was running and, for a file
+/// tool, is one the call declared. A span whose changes were not recorded
+/// (a snapshot in it failed) cannot be attributed and fails closed.
+fn attribute_window(
+    workspace: &FsPath,
+    turn_id: &str,
+    receipts: &[crate::snapshot::WorkspaceSnapshotRef],
+) -> Result<
+    (
+        std::collections::BTreeSet<PathBuf>,
+        std::collections::BTreeSet<PathBuf>,
+    ),
+    ApiError,
+> {
+    use crate::snapshot::WorkspaceSnapshotKind;
+    let mut owned = std::collections::BTreeSet::new();
+    let mut foreign = std::collections::BTreeSet::new();
+    // Undeclared calls whose `post_tool` receipt is still ahead: everything
+    // up to it (a program's nested calls included) is theirs.
+    let mut open_undeclared: Vec<&str> = Vec::new();
+    let mut writer = SpanWriter::Nobody;
+    for (index, receipt) in receipts.iter().enumerate() {
+        if index > 0 {
+            let Some(changed) = receipt.changed_paths.as_ref() else {
+                return Err(no_restore_point(
+                    turn_id,
+                    "has an incomplete record of what changed while it ran (a snapshot during the turn failed), so its changes cannot be told apart from anyone else's",
+                ));
+            };
+            for path in changed {
+                let path = PathBuf::from(path);
+                match &writer {
+                    SpanWriter::Undeclared => {
+                        owned.insert(path);
+                    }
+                    SpanWriter::Declared(declared) if declared.contains(&path) => {
+                        owned.insert(path);
+                    }
+                    SpanWriter::Declared(_) | SpanWriter::Nobody => {
+                        foreign.insert(path);
+                    }
+                }
+            }
+        }
+        match receipt.kind {
+            WorkspaceSnapshotKind::Tool => {
+                if receipt.write_paths.is_none()
+                    && let Some(call) = receipt.tool_call_id.as_deref()
+                    && receipts[index + 1..].iter().any(|later| {
+                        later.kind == WorkspaceSnapshotKind::PostTool
+                            && later.tool_call_id.as_deref() == Some(call)
+                    })
+                {
+                    open_undeclared.push(call);
+                }
+            }
+            WorkspaceSnapshotKind::PostTool => {
+                if let Some(call) = receipt.tool_call_id.as_deref() {
+                    open_undeclared.retain(|open| *open != call);
+                }
+            }
+            WorkspaceSnapshotKind::PreTurn | WorkspaceSnapshotKind::PostTurn => {}
+        }
+        writer = if !open_undeclared.is_empty() {
+            SpanWriter::Undeclared
+        } else {
+            match receipt.kind {
+                // A shell turn: its command runs from the pre-turn snapshot.
+                WorkspaceSnapshotKind::PreTurn if receipt.tool_call_id.is_some() => {
+                    SpanWriter::Undeclared
+                }
+                WorkspaceSnapshotKind::Tool => match receipt.write_paths.as_ref() {
+                    Some(paths) => SpanWriter::Declared(
+                        paths
+                            .iter()
+                            .filter_map(|raw| declared_write_path(workspace, raw))
+                            .collect(),
+                    ),
+                    None => SpanWriter::Undeclared,
+                },
+                _ => SpanWriter::Nobody,
+            }
+        };
+    }
+    Ok((owned, foreign))
+}
+
+fn no_restore_point(turn_id: &str, why: &str) -> ApiError {
+    ApiError::conflict(format!(
+        "Turn {turn_id} {why}, so its workspace changes cannot be restored; nothing was changed. \
+         Use POST /v1/threads/{{id}}/undo for a conversation-only undo."
+    ))
+    .with_code(PATCH_UNDO_NO_RESTORE_POINT)
+}
+
+/// Roll the workspace files back to where they were before the first dropped
+/// turn — only the files the dropped turns changed, and only when nothing
+/// else changed them since.
+///
+/// # Ownership
+///
+/// The restore points are the `pre_turn`/`post_turn` receipts recorded on the
+/// dropped turns themselves (`TurnRecord::workspace_snapshots`), resolved by
+/// tree and session tag against the snapshot store. Nothing is selected by
+/// scanning the shared store, so another thread's (or the TUI's) snapshots in
+/// the same workspace are never candidates, and a fork restores the turns it
+/// inherited because it carries their records.
+///
+/// # What is restored
+///
+/// For each dropped turn's window, the paths that differ between its
+/// pre-turn and post-turn snapshots are candidates, and each must be the
+/// turn's own: it changed only while one of the turn's tool calls was running
+/// (the engine bounds every call that may write with a `tool` and a
+/// `post_tool` snapshot and records what changed in each span), and, for a
+/// file tool, it is a path the call declared. A path that changed while none
+/// of the turn's tools could have written it — another thread, an editor, a
+/// background process — is someone else's change: the undo is refused rather
+/// than revert it. Each of the turn's paths goes back to its content before
+/// the first dropped turn that changed it, and nothing outside that set is
+/// touched, so later work survives. The whole turn goes, not just its last
+/// write.
+///
+/// A path a file tool declared that the snapshots cannot hold (ignored by
+/// `.gitignore` or the built-in exclusions, or outside the workspace) is
+/// refused too: no snapshot can put it back, so "nothing to restore" would
+/// be a lie.
 ///
 /// # The rollback contract
 ///
 /// `Ok` is a decision the conversation fork may proceed on: either the files
-/// were restored, or there was *provably* nothing to restore. `Err` aborts the
-/// whole undo, and the caller must not fork either — dropping the turn while
-/// leaving its file changes on disk hands the user a workspace the transcript
-/// can no longer account for, which is worse than refusing outright.
+/// were restored, or there was *provably* nothing to restore (the dropped
+/// turns ran here without tools, changed no files, or the files are back at
+/// their pre-turn state). `Err` aborts the whole undo, and the caller must not
+/// fork either: a turn that has no recorded restore point, a pruned restore
+/// point, or a path changed since the turn is a `409` with a stable
+/// `error.code`, never a `201` that forks while the files stay changed.
 ///
 /// `trusted` mirrors the gate the TUI's `patch_undo()` applies
-/// (`yolo || trust_mode`). It is evaluated *after* a real target is found, so
-/// that "there was nothing to revert" still undoes the conversation, while
-/// "there is something to revert but you are not trusted" aborts.
+/// (`yolo || trust_mode`), evaluated once a real change is known.
 fn patch_undo_workspace_files(
     workspace: &FsPath,
-    current_session_id: Option<&str>,
+    dropped_turns: &[crate::runtime_threads::DroppedTurnSnapshots],
     trusted: bool,
 ) -> Result<PatchUndoResult, ApiError> {
     // An unreadable workspace directory (unmounted volume, disconnected
     // share, permissions) proves nothing about the files a turn changed, so
-    // the conversation is not forked away from them. Every repository
-    // failure is operational and aborts for the same reason: "no snapshots"
-    // cannot be proven while Git is unavailable.
+    // the conversation is not forked away from them.
     if !workspace.is_dir() {
         return Err(ApiError::conflict(format!(
             "Workspace directory {} is not available; mount or restore it before undoing files, or use /undo for a conversation-only undo.",
             workspace.display()
-        )));
+        ))
+        .with_code(PATCH_UNDO_WORKSPACE_UNAVAILABLE));
     }
+
+    // Which windows matter. A turn that ran no tool changed no file; a turn
+    // that did must have recorded where it started and ended.
+    let mut windows = Vec::new();
+    for turn in dropped_turns {
+        if !turn.may_change_files {
+            continue;
+        }
+        if turn.snapshots.is_empty() {
+            return Err(no_restore_point(
+                &turn.turn_id,
+                "has no recorded workspace restore point (it predates restore-point receipts, was imported from a saved session, or ran with snapshots off or unavailable)",
+            ));
+        }
+        let Some(turn_windows) = turn_snapshot_windows(&turn.snapshots) else {
+            return Err(no_restore_point(
+                &turn.turn_id,
+                "has no complete pre-turn/post-turn restore point (its snapshot failed or the turn stopped before it was taken)",
+            ));
+        };
+        windows.extend(
+            turn_windows
+                .into_iter()
+                .map(|range| (turn, &turn.snapshots[range])),
+        );
+    }
+    if windows.is_empty() {
+        return Ok(PatchUndoResult {
+            files_restored: false,
+            summary: Some(
+                "The undone turn(s) ran no tools, so they changed no workspace files; nothing to restore."
+                    .to_string(),
+            ),
+            snapshot_label: None,
+        });
+    }
+
+    // Every repository failure is operational and aborts: "nothing to
+    // restore" cannot be proven while Git is unavailable.
     let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace).map_err(|e| {
         ApiError::internal(format!(
             "Snapshot repo unavailable; conversation preserved: {e}"
         ))
     })?;
-    let Some(current_session_id) = current_session_id else {
-        return Ok(PatchUndoResult {
-            files_restored: false,
-            summary: Some(
-                "No current session is bound to this thread; workspace files were not changed."
-                    .to_string(),
-            ),
-            snapshot_label: None,
-        });
-    };
-    let snapshots = repo
-        .list(100)
+    // Resolve by id against the whole store — no listing cap, so an old but
+    // retained restore point is never mistaken for a pruned one.
+    let listed = repo
+        .list(usize::MAX)
         .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?;
-    let mut target = None;
-    for snapshot in snapshots
-        .iter()
-        .filter(|s| s.label.starts_with("tool:") || s.label.starts_with("pre-turn:"))
-        .filter(|s| s.session_id.as_deref() == Some(current_session_id))
-    {
-        if !repo.work_tree_matches_snapshot(&snapshot.id).map_err(|e| {
-            ApiError::internal(format!(
-                "Failed to compare snapshot; conversation preserved: {e}"
-            ))
-        })? {
-            target = Some(snapshot);
-            break;
-        }
-    }
-    let Some(target) = target else {
-        return Ok(PatchUndoResult {
-            files_restored: false,
-            summary: Some(
-                "No current-session tool or pre-turn snapshots differ from the current workspace."
-                    .to_string(),
-            ),
-            snapshot_label: None,
-        });
+    let resolve = |turn_id: &str,
+                   receipt: &crate::snapshot::WorkspaceSnapshotRef|
+     -> Result<(crate::snapshot::SnapshotId, String), ApiError> {
+        listed
+            .iter()
+            .find(|snapshot| receipt.matches(snapshot))
+            .map(|snapshot| (snapshot.tree.clone(), snapshot.label.clone()))
+            .ok_or_else(|| {
+                ApiError::conflict(format!(
+                    "The {} restore point of turn {turn_id} is no longer in the snapshot store (pruned, or its session tag changed), so its workspace changes cannot be restored; nothing was changed. Use POST /v1/threads/{{id}}/undo for a conversation-only undo.",
+                    receipt.kind.label_prefix().trim_end_matches(':')
+                ))
+                .with_code(PATCH_UNDO_RESTORE_POINT_PRUNED)
+            })
     };
 
+    // Every path a dropped file-tool call declared must be one the snapshots
+    // hold; otherwise its change is invisible to them and cannot be undone.
+    let mut not_snapshotted = std::collections::BTreeSet::new();
+    for turn in dropped_turns.iter().filter(|turn| turn.may_change_files) {
+        let receipt_writes = turn
+            .snapshots
+            .iter()
+            .filter(|receipt| {
+                receipt
+                    .tool_call_id
+                    .as_ref()
+                    .is_none_or(|call| !turn.unrun_tool_calls.contains(call))
+            })
+            .filter_map(|receipt| receipt.write_paths.as_ref())
+            .flatten();
+        for raw in turn.declared_writes.iter().chain(receipt_writes) {
+            let covered = match declared_write_path(workspace, raw) {
+                Some(rel) => !repo.path_is_excluded(&rel).map_err(|e| {
+                    ApiError::internal(format!(
+                        "Failed to check snapshot coverage; conversation preserved: {e}"
+                    ))
+                })?,
+                None => false,
+            };
+            if !covered {
+                not_snapshotted.insert(raw.clone());
+            }
+        }
+    }
+    if !not_snapshotted.is_empty() {
+        return Err(ApiError::conflict(format!(
+            "The undone turn(s) wrote {}, which workspace snapshots do not hold (ignored by .gitignore or the built-in snapshot exclusions, or outside the workspace), so those changes cannot be restored; nothing was changed. Use POST /v1/threads/{{id}}/undo for a conversation-only undo and restore those files yourself.",
+            not_snapshotted.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+        .with_code(PATCH_UNDO_PATH_NOT_SNAPSHOTTED));
+    }
+
+    let mut segments = Vec::with_capacity(windows.len());
+    for (turn, receipts) in windows {
+        let (pre, pre_label) = resolve(&turn.turn_id, &receipts[0])?;
+        let (post, _) = resolve(&turn.turn_id, &receipts[receipts.len() - 1])?;
+        let (owned, foreign) = attribute_window(workspace, &turn.turn_id, receipts)?;
+        segments.push(UndoSegment {
+            turn_id: turn.turn_id.clone(),
+            pre,
+            post,
+            pre_label,
+            owned,
+            foreign,
+        });
+    }
+
+    let compare_err = |e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::InvalidInput {
+            ApiError::conflict(format!(
+                "A path the undone turn(s) changed cannot be restored file by file: {e}. Nothing was changed; use /restore for a whole-workspace rollback."
+            ))
+            .with_code(PATCH_UNDO_WORKSPACE_CHANGED)
+        } else {
+            ApiError::internal(format!(
+                "Failed to compare snapshots; conversation preserved: {e}"
+            ))
+        }
+    };
+
+    // path -> (content to restore, content the dropped turns left)
+    let mut plan: std::collections::BTreeMap<
+        PathBuf,
+        (crate::snapshot::SnapshotId, crate::snapshot::SnapshotId),
+    > = std::collections::BTreeMap::new();
+    for segment in &segments {
+        let changed = repo
+            .changed_paths_between(&segment.pre, &segment.post)
+            .map_err(compare_err)?;
+        // A path someone else changed while the turn ran cannot be told
+        // apart from the turn's own change to it, and reverting it would
+        // erase their work: refuse instead of guessing.
+        let not_owned: Vec<String> = changed
+            .iter()
+            .filter(|path| segment.foreign.contains(*path) || !segment.owned.contains(*path))
+            .map(|path| path.display().to_string())
+            .collect();
+        if !not_owned.is_empty() {
+            return Err(ApiError::conflict(format!(
+                "{} changed while turn {} ran but outside its own tool calls (another thread, an editor or a background process), so undoing the turn would revert changes it did not make; nothing was changed. Revert the turn's files individually with file-revert, or use /undo for a conversation-only undo.",
+                not_owned.join(", "),
+                segment.turn_id
+            ))
+            .with_code(PATCH_UNDO_WORKSPACE_CHANGED));
+        }
+        for path in changed {
+            match plan.get_mut(&path) {
+                None => {
+                    plan.insert(path, (segment.pre.clone(), segment.post.clone()));
+                }
+                Some((_, left)) => {
+                    // Between two dropped turns that both changed this path,
+                    // something else changed it too; restoring the earlier
+                    // content would erase that change.
+                    if !repo
+                        .path_same_in_snapshots(left, &segment.pre, &path)
+                        .map_err(compare_err)?
+                    {
+                        return Err(ApiError::conflict(format!(
+                            "'{}' was changed outside turn {} between the undone turns; undoing would erase that change. Nothing was changed.",
+                            path.display(),
+                            segment.turn_id
+                        ))
+                        .with_code(PATCH_UNDO_WORKSPACE_CHANGED));
+                    }
+                    *left = segment.post.clone();
+                }
+            }
+        }
+    }
+
+    // Compare each changed path with the workspace now: already back at its
+    // pre-turn content (skip), still as the turns left it (restore), or
+    // changed since by someone else (refuse — never clobber later work).
+    let mut to_restore = Vec::new();
+    let mut changed_since = Vec::new();
+    for (path, (before, after)) in &plan {
+        if repo
+            .path_matches_snapshot(before, path)
+            .map_err(compare_err)?
+        {
+            continue;
+        }
+        if repo
+            .path_matches_snapshot(after, path)
+            .map_err(compare_err)?
+        {
+            to_restore.push((path.clone(), before.clone(), after.clone()));
+        } else {
+            changed_since.push(path.display().to_string());
+        }
+    }
+    if !changed_since.is_empty() {
+        return Err(ApiError::conflict(format!(
+            "These files changed after the undone turn(s): {}. Undoing would overwrite those changes; nothing was changed. Revert individual files with file-revert, or use /undo for a conversation-only undo.",
+            changed_since.join(", ")
+        ))
+        .with_code(PATCH_UNDO_WORKSPACE_CHANGED));
+    }
+    let first = &segments[0];
+    if to_restore.is_empty() {
+        return Ok(PatchUndoResult {
+            files_restored: false,
+            summary: Some(if plan.is_empty() {
+                "The undone turn(s) left workspace files unchanged; nothing to restore.".to_string()
+            } else {
+                format!(
+                    "The files the undone turn(s) changed are already at their state before turn {}; nothing to restore.",
+                    first.turn_id
+                )
+            }),
+            snapshot_label: None,
+        });
+    }
+
     // Restoring is a workspace mutation. Gate it exactly where the TUI gates
-    // it — after a real, current-session target is known — so the two surfaces
-    // cannot drift into "one refuses, the other half-undoes".
+    // it — after a real, owned change is known — so the two surfaces cannot
+    // drift into "one refuses, the other half-undoes".
     if !trusted {
         return Err(ApiError::conflict(
             "Refusing to undo workspace files outside trusted mode. \
              Turn on /trust or switch this thread to Full Access, then undo again.",
-        ));
+        )
+        .with_code(PATCH_UNDO_UNTRUSTED));
     }
 
-    // Capture what this restore is about to change *before* it runs: after the
-    // checkout the work tree matches the snapshot, so a post-restore stat would
-    // always be empty. Runs against the side repo, not the user's — the user's
-    // `git diff --stat` reports their own uncommitted work, which is not what
-    // the undo changed.
-    let diff_stat = match repo.snapshot_diff_stat(&target.id) {
-        Ok(stat) => stat,
-        Err(e) => {
-            tracing::warn!(
-                target: "snapshot",
-                "diff stat for the patch-undo summary failed: {e}"
-            );
-            None
-        }
-    };
+    let restore_plan: Vec<(PathBuf, crate::snapshot::SnapshotId)> = to_restore
+        .iter()
+        .map(|(path, before, _)| (path.clone(), before.clone()))
+        .collect();
+    let short = &first.pre.as_str()[..first.pre.as_str().len().min(12)];
+    let outcomes = repo
+        .restore_path_plan(&restore_plan, &format!("pre-restore:{short}"), true, || {
+            // Re-verify immediately before the first mutation, after the
+            // safety snapshot: a write that landed meanwhile is refused.
+            for (path, _, after) in &to_restore {
+                if !repo.path_matches_snapshot(after, path)? {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "'{}' changed while the undo was being prepared; nothing was changed.",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock => {
+                ApiError::conflict(e.to_string()).with_code(PATCH_UNDO_WORKSPACE_CHANGED)
+            }
+            std::io::ErrorKind::InvalidInput => compare_err(e),
+            _ => ApiError::internal(format!("Restore failed: {e}")),
+        })?;
 
-    repo.restore(&target.id)
-        .map_err(|e| ApiError::internal(format!("Restore failed: {e}")))?;
-
-    let short = &target.id.as_str()[..target.id.as_str().len().min(8)];
-    let summary = match diff_stat {
-        Some(ref stat) => format!(
-            "Restored snapshot '{}' ({}). Files affected:\n{stat}",
-            target.label, short
-        ),
-        None => format!(
-            "Restored snapshot '{}' ({}). No diff stat available.",
-            target.label, short
-        ),
-    };
+    let lines: Vec<String> = outcomes
+        .iter()
+        .map(|outcome| format!("{} {}", outcome.action.as_str(), outcome.path.display()))
+        .collect();
     Ok(PatchUndoResult {
         files_restored: true,
-        summary: Some(summary),
-        snapshot_label: Some(target.label.clone()),
+        summary: Some(format!(
+            "Restored {} file(s) to their state before turn {} (snapshot '{}'):\n{}",
+            outcomes.len(),
+            first.turn_id,
+            first.pre_label,
+            lines.join("\n")
+        )),
+        snapshot_label: Some(first.pre_label.clone()),
     })
 }
 
@@ -5914,7 +6340,9 @@ struct RevertThreadFileRequest {
     /// The single file to restore, relative to the thread's workspace.
     /// Absolute paths inside the workspace are accepted and normalized.
     path: String,
-    /// Exact pre-tool/pre-turn snapshot from the change the user selected.
+    /// Exact pre-tool/pre-turn restore point from the change the user
+    /// selected: a commit id from `GET /v1/snapshots`, or the `snapshot_id` /
+    /// `tree_id` of a receipt in the thread's `workspace_snapshots`.
     snapshot_id: String,
     /// SHA-256 of the bytes reviewed by the client, or `absent` for deletion.
     expected_hash: String,
@@ -5941,9 +6369,10 @@ struct RevertThreadFileResponse {
 /// hash of the bytes it reviewed; the server never guesses a "newest differing"
 /// snapshot, because an unrelated newer snapshot can erase later user edits.
 ///
-/// Ownership follows the rule the TUI's `/undo` applies: only snapshots tagged
-/// with this thread's own session are candidates, and the thread must be in
-/// trusted mode or Full Access. Nothing to revert is a `409`, not a silent
+/// Ownership: only the `tool:`/`pre-turn:` restore points recorded on this
+/// thread's own turns (`TurnRecord::workspace_snapshots`, fork-inherited turns
+/// included) are candidates, never another thread's or the TUI's snapshots in
+/// the same workspace, and the thread must be in trusted mode or Full Access. Nothing to revert is a `409`, not a silent
 /// success, so the GUI can tell the user why the button did nothing.
 async fn revert_thread_file(
     State(state): State<RuntimeApiState>,
@@ -5972,18 +6401,20 @@ async fn revert_thread_file(
             "Refusing to restore workspace files outside trusted mode. Turn on /trust or switch this thread to Full Access, then retry.",
         ));
     }
-    let Some(session_id) = thread.session_id else {
-        return Err(ApiError::conflict(
-            "Thread has no bound session, so no snapshot can be proven to own this file.",
-        ));
-    };
+    // The restore points this thread owns: the receipts on its own turns
+    // (including turns a fork cloned). Read under the restore reservation, so
+    // no turn is recording one meanwhile.
+    let owned = state
+        .runtime_threads
+        .thread_workspace_snapshots(&thread.id)
+        .map_err(map_thread_err)?;
     let workspace = thread.workspace;
     // The worker owns the reservation: a client disconnect cannot release it
     // while Git is still changing files. Snapshot listing, diffing and
     // checkout all shell out to git; keep that off the async workers.
     let response = tokio::task::spawn_blocking(move || {
         let _reservation = reservation;
-        revert_file_from_snapshot(&workspace, &session_id, &req)
+        revert_file_from_snapshot(&workspace, &owned, &req)
     })
     .await
     .map_err(|e| ApiError::internal(format!("file restore task failed: {e}")))??;
@@ -6006,7 +6437,7 @@ fn expected_hash_is_well_formed(hash: &str) -> bool {
 
 fn revert_file_from_snapshot(
     workspace: &FsPath,
-    session_id: &str,
+    owned: &[crate::snapshot::WorkspaceSnapshotRef],
     req: &RevertThreadFileRequest,
 ) -> Result<RevertThreadFileResponse, ApiError> {
     // Every caller-supplied path passes through this one gate. It accepts a
@@ -6034,22 +6465,43 @@ fn revert_file_from_snapshot(
     let snapshots = repo
         .list(usize::MAX)
         .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?;
-    // Exact identity only: the snapshot must exist, be owned by this thread's
-    // session and be a tool/pre-turn restore point. A stale or foreign id is
-    // a conflict the client resolves by refreshing its change record.
-    let target = snapshots
+    // Exact identity only: the snapshot must still exist, be a tool/pre-turn
+    // restore point recorded on one of this thread's turns, and still carry
+    // the session tag it was recorded with. The client may name it by the
+    // commit id `GET /v1/snapshots` lists now, or by the `snapshot_id` or
+    // `tree_id` its turn record holds (a prune rewrites commit ids but keeps
+    // trees). A foreign, unrecorded or pruned id is a conflict the client
+    // resolves by refreshing its change record.
+    let restore_points: Vec<&crate::snapshot::WorkspaceSnapshotRef> = owned
         .iter()
-        .find(|snapshot| {
-            snapshot.id.as_str() == req.snapshot_id
-                && snapshot.session_id.as_deref() == Some(session_id)
-                && (snapshot.label.starts_with("tool:")
-                    || snapshot.label.starts_with("pre-turn:"))
-        })
-        .ok_or_else(|| {
-            ApiError::conflict(
-                "Selected restore point is unavailable or belongs to another session; refresh the change record and select the change again.",
+        .filter(|receipt| {
+            matches!(
+                receipt.kind,
+                crate::snapshot::WorkspaceSnapshotKind::Tool
+                    | crate::snapshot::WorkspaceSnapshotKind::PreTurn
             )
-        })?;
+        })
+        .collect();
+    let target = match snapshots
+        .iter()
+        .find(|snapshot| snapshot.id.as_str() == req.snapshot_id)
+    {
+        Some(listed) => restore_points
+            .iter()
+            .any(|receipt| receipt.matches(listed))
+            .then_some(listed),
+        None => restore_points
+            .iter()
+            .find(|receipt| {
+                receipt.snapshot_id == req.snapshot_id || receipt.tree_id == req.snapshot_id
+            })
+            .and_then(|receipt| snapshots.iter().find(|listed| receipt.matches(listed))),
+    }
+    .ok_or_else(|| {
+        ApiError::conflict(
+            "Selected restore point is unavailable or belongs to another thread; refresh the change record and select the change again.",
+        )
+    })?;
 
     if !repo
         .path_differs_from_snapshot(&target.id, &rel)
@@ -6533,6 +6985,7 @@ async fn complete_thread_goal(
         return Err(ApiError {
             status: StatusCode::CONFLICT,
             message: format!("goal for thread '{id}' is already complete"),
+            code: None,
         });
     }
     let updated = state
@@ -6547,6 +7000,7 @@ async fn complete_thread_goal(
         .ok_or_else(|| ApiError {
             status: StatusCode::CONFLICT,
             message: format!("goal for thread '{id}' changed concurrently; retry"),
+            code: None,
         })?;
     let _ = state
         .runtime_threads
@@ -6583,6 +7037,7 @@ async fn block_thread_goal(
             message: format!(
                 "goal for thread '{id}' is already complete; cannot transition to blocked"
             ),
+            code: None,
         });
     }
     let updated = state
@@ -6597,6 +7052,7 @@ async fn block_thread_goal(
         .ok_or_else(|| ApiError {
             status: StatusCode::CONFLICT,
             message: format!("goal for thread '{id}' changed concurrently; retry"),
+            code: None,
         })?;
     let _ = state
         .runtime_threads
@@ -10147,6 +10603,9 @@ fn map_agent_mail_err(err: anyhow::Error) -> ApiError {
 struct ApiError {
     status: StatusCode,
     message: String,
+    /// Stable machine-readable reason, serialized as `error.code` when set,
+    /// for refusals a client must branch on rather than show.
+    code: Option<&'static str>,
 }
 
 impl ApiError {
@@ -10154,6 +10613,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -10161,6 +10621,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -10168,6 +10629,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -10175,6 +10637,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_IMPLEMENTED,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -10182,6 +10645,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -10189,6 +10653,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -10196,7 +10661,13 @@ impl ApiError {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: message.into(),
+            code: None,
         }
+    }
+
+    fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
     }
 }
 
@@ -10204,12 +10675,21 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
             self.status,
-            Json(json!({
-                "error": {
-                    "message": self.message,
-                    "status": self.status.as_u16(),
-                }
-            })),
+            Json(match self.code {
+                Some(code) => json!({
+                    "error": {
+                        "message": self.message,
+                        "status": self.status.as_u16(),
+                        "code": code,
+                    }
+                }),
+                None => json!({
+                    "error": {
+                        "message": self.message,
+                        "status": self.status.as_u16(),
+                    }
+                }),
+            }),
         )
             .into_response()
     }

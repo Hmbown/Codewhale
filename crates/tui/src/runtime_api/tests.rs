@@ -480,6 +480,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         ],
         steer_count: 0,
         agent_mail_message_id: None,
+        workspace_snapshots: Vec::new(),
     };
     let item = |id: &str,
                 kind: TurnItemKind,
@@ -953,6 +954,8 @@ struct TestServerOverrides {
     plugin_discovery: Option<Arc<crate::plugins::PluginDiscoveryContext>>,
     /// Pre-seeded workspace LSP manager (test transports, disabled configs).
     lsp_manager: Option<Arc<crate::lsp::LspManager>>,
+    /// Engine LRU capacity; `None` keeps the fixture default of 8.
+    max_active_threads: Option<usize>,
 }
 
 async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
@@ -1186,7 +1189,7 @@ async fn build_test_server(
         RuntimeThreadManagerConfig {
             data_dir: root.join("runtime/runtime"),
             task_data_dir: root.join("runtime"),
-            max_active_threads: 8,
+            max_active_threads: overrides.max_active_threads.unwrap_or(8),
         },
     )?);
     runtime_threads.attach_task_manager(manager.clone());
@@ -5850,16 +5853,10 @@ async fn session_create_from_thread_returns_404_for_missing_thread() -> Result<(
 }
 
 /// `PUT /v1/sessions` with no `session_id` persists the conversation's own id,
-/// not a fresh uuid.
-///
-/// The engine tags every `tool:` / `pre-turn:` workspace snapshot with its live
-/// conversation id, and `patch-undo` / `file-revert` select snapshots by the
-/// thread's `session_id`. Minting a third uuid at save time left those two
-/// disagreeing for every thread whose first save minted the document, so the
-/// toolbar's Undo forked the conversation and rolled no files back, and the
-/// Changes panel's Revert refused a snapshot that existed (reported against the
-/// VS Code client on engine 0.10.0, where no thread's binding matched any
-/// snapshot in the workspace).
+/// not a fresh uuid, so one conversation keeps one document across saves.
+/// (A Runtime thread's engine runs under the thread id; the mock states the
+/// id so the test pins only the save contract. Snapshot ownership no longer
+/// depends on this binding — see the #6621 tests below.)
 #[tokio::test]
 async fn session_save_without_an_id_keeps_the_conversation_that_owns_the_snapshots() -> Result<()> {
     let root = std::env::temp_dir().join(format!("deepseek-session-identity-{}", Uuid::new_v4()));
@@ -5937,8 +5934,7 @@ async fn session_save_without_an_id_keeps_the_conversation_that_owns_the_snapsho
         "a save that names no session must persist the conversation's own id"
     );
 
-    // That is the id `patch_undo_workspace_files` and `revert_file_from_snapshot`
-    // select snapshots by, so the binding and the snapshots must agree.
+    // The thread is bound to that one document.
     let detail: serde_json::Value = client
         .get(format!("http://{addr}/v1/threads/{thread_id}"))
         .send()
@@ -6288,7 +6284,7 @@ async fn fork_at_turn_endpoint_rejects_a_non_user_turn() -> Result<()> {
 }
 
 #[tokio::test]
-async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<()> {
+async fn patch_undo_endpoint_refuses_turns_it_cannot_prove() -> Result<()> {
     let root =
         std::env::temp_dir().join(format!("deepseek-patch-undo-endpoint-{}", Uuid::new_v4()));
     let sessions_dir = root.join("sessions");
@@ -6312,19 +6308,34 @@ async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<(
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     assert!(resp.text().await?.contains("not available"));
 
+    // A seeded (imported) turn records nothing about what it did to the
+    // workspace, so a file undo cannot be proven either way: refused with a
+    // code that points the client at the conversation-only undo, and no
+    // fork is published.
     fs::create_dir_all(root.join("workspace"))?;
     let resp = client
         .post(format!("http://{addr}/v1/threads/{thread_id}/patch-undo"))
         .json(&json!({}))
         .send()
         .await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let refused: serde_json::Value = resp.json().await?;
+    assert_eq!(refused["error"]["code"], "restore_point_unavailable");
+    let threads: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(threads.as_array().map(Vec::len), Some(1), "{threads:#}");
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/undo"))
+        .json(&json!({}))
+        .send()
+        .await?;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let undone: serde_json::Value = resp.json().await?;
-    // The fresh workspace has no tool/pre-turn snapshots to roll back to,
-    // so the file-restore step reports nothing restored while the
-    // conversation undo still forks the thread.
-    assert_eq!(undone["patch_result"]["files_restored"], false);
-    assert!(undone["patch_result"]["summary"].is_string());
     assert_eq!(undone["original_user_text"], "Roll back the patch");
     assert_ne!(undone["thread"]["id"].as_str(), Some(thread_id.as_str()));
 
@@ -6332,8 +6343,68 @@ async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<(
     Ok(())
 }
 
+fn snapshot_receipt(
+    kind: crate::snapshot::WorkspaceSnapshotKind,
+    taken: &crate::snapshot::TakenSnapshot,
+    session_id: &str,
+) -> crate::snapshot::WorkspaceSnapshotRef {
+    crate::snapshot::WorkspaceSnapshotRef::new(kind, taken, session_id, None)
+}
+
+/// The receipts of a shell turn: its command runs from the pre-turn snapshot
+/// to the post-turn one, so the whole window is the turn's own span.
+fn shell_turn_receipts(
+    repo: &crate::snapshot::SnapshotRepo,
+    pre: &crate::snapshot::TakenSnapshot,
+    post: &crate::snapshot::TakenSnapshot,
+    session_id: &str,
+) -> Vec<crate::snapshot::WorkspaceSnapshotRef> {
+    use crate::snapshot::WorkspaceSnapshotKind::{PostTurn, PreTurn};
+    let mut pre_receipt = snapshot_receipt(PreTurn, pre, session_id);
+    pre_receipt.tool_call_id = Some("user_shell_1".to_string());
+    let mut post_receipt = snapshot_receipt(PostTurn, post, session_id);
+    post_receipt.changed_paths = Some(changed_between(repo, pre, post));
+    vec![pre_receipt, post_receipt]
+}
+
+fn changed_between(
+    repo: &crate::snapshot::SnapshotRepo,
+    from: &crate::snapshot::TakenSnapshot,
+    to: &crate::snapshot::TakenSnapshot,
+) -> Vec<String> {
+    repo.changed_paths_between(&from.tree, &to.tree)
+        .expect("diff snapshots")
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn dropped_turn(
+    turn_id: &str,
+    may_change_files: bool,
+    snapshots: Vec<crate::snapshot::WorkspaceSnapshotRef>,
+) -> crate::runtime_threads::DroppedTurnSnapshots {
+    crate::runtime_threads::DroppedTurnSnapshots {
+        turn_id: turn_id.to_string(),
+        may_change_files,
+        snapshots,
+        declared_writes: Vec::new(),
+        unrun_tool_calls: std::collections::BTreeSet::new(),
+    }
+}
+
+fn git_missing() -> bool {
+    crate::dependencies::Git::command().is_none()
+}
+
+/// A patch-undo restores exactly what the dropped turn changed — every write
+/// of the turn, not only its last — and nothing else: later work on other
+/// files and other sessions' snapshots in the same workspace are untouched.
 #[test]
-fn patch_undo_helper_restores_only_the_bound_session() -> Result<()> {
+fn patch_undo_helper_restores_only_the_dropped_turns_changes() -> Result<()> {
+    if git_missing() {
+        return Ok(());
+    }
     let _lock = lock_test_env();
     let root = tempfile::tempdir()?;
     let home = root.path().join("home");
@@ -6343,26 +6414,433 @@ fn patch_undo_helper_restores_only_the_bound_session() -> Result<()> {
     let workspace = root.path().join("workspace");
     fs::create_dir_all(&workspace)?;
     let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
-    let file = workspace.join("a.txt");
+    let a = workspace.join("a.txt");
+    let other = workspace.join("other.txt");
+    fs::write(&a, "before")?;
+    fs::write(&other, "other-before")?;
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
+    fs::write(&a, "first write")?;
+    repo.take_snapshot("tool:call-1", Some("thr_a"))?;
+    fs::write(&a, "second write")?;
+    fs::create_dir_all(workspace.join("made"))?;
+    fs::write(workspace.join("made/new.txt"), "created")?;
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
+    // After the turn: another writer changes an unrelated file, and another
+    // session snapshots the workspace.
+    fs::write(&other, "later work")?;
+    repo.take_snapshot("pre-turn:9", Some("thr_other"))?;
 
-    fs::write(&file, "legacy")?;
-    repo.snapshot("pre-turn:legacy")?;
-    fs::write(&file, "current-before")?;
-    repo.snapshot_with_session("pre-turn:current", Some("session-current"))?;
-    fs::write(&file, "foreign-before")?;
-    repo.snapshot_with_session("pre-turn:foreign", Some("session-foreign"))?;
-    fs::write(&file, "current-after")?;
-
-    let restored = patch_undo_workspace_files(&workspace, Some("session-current"), true)
+    let turn = dropped_turn(
+        "turn_1",
+        true,
+        shell_turn_receipts(&repo, &pre, &post, "thr_a"),
+    );
+    let restored = patch_undo_workspace_files(&workspace, std::slice::from_ref(&turn), true)
         .expect("a trusted rollback should succeed");
     assert!(restored.files_restored, "{:?}", restored.summary);
-    assert_eq!(fs::read_to_string(&file)?, "current-before");
+    assert_eq!(fs::read_to_string(&a)?, "before", "both writes are undone");
+    assert!(!workspace.join("made/new.txt").exists());
+    assert!(
+        !workspace.join("made").exists(),
+        "the directory the turn created goes with it"
+    );
+    assert_eq!(fs::read_to_string(&other)?, "later work");
+    assert!(
+        restored
+            .snapshot_label
+            .as_deref()
+            .is_some_and(|label| label.starts_with("pre-turn:1")),
+        "{:?}",
+        restored.snapshot_label
+    );
 
-    fs::write(&file, "must-stay")?;
-    let unbound = patch_undo_workspace_files(&workspace, None, true)
-        .expect("an unbound thread has nothing to roll back, which is not a refusal");
-    assert!(!unbound.files_restored);
-    assert_eq!(fs::read_to_string(&file)?, "must-stay");
+    // Undoing again finds the files already at their pre-turn state.
+    let again = patch_undo_workspace_files(&workspace, std::slice::from_ref(&turn), true)
+        .expect("already restored is provably nothing to do");
+    assert!(!again.files_restored);
+    Ok(())
+}
+
+/// A turn's changed file that someone edited after the turn is never
+/// clobbered: the undo is refused with a typed code and nothing changes.
+#[test]
+fn patch_undo_helper_refuses_to_overwrite_later_edits() -> Result<()> {
+    if git_missing() {
+        return Ok(());
+    }
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let a = workspace.join("a.txt");
+    fs::write(&a, "before")?;
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
+    fs::write(&a, "turn")?;
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
+    fs::write(&a, "user edit after the turn")?;
+
+    let turn = dropped_turn(
+        "turn_1",
+        true,
+        shell_turn_receipts(&repo, &pre, &post, "thr_a"),
+    );
+    let err = patch_undo_workspace_files(&workspace, &[turn], true)
+        .expect_err("a later edit must not be overwritten");
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert_eq!(err.code, Some(PATCH_UNDO_WORKSPACE_CHANGED));
+    assert!(err.message.contains("a.txt"), "{}", err.message);
+    assert_eq!(fs::read_to_string(&a)?, "user edit after the turn");
+    Ok(())
+}
+
+/// No recorded restore point, an unclosed window, or a pruned / retagged
+/// restore point: the undo fails honestly with a typed 409 instead of
+/// forking over changed files. A turn that ran no tools needs none.
+#[test]
+fn patch_undo_helper_fails_honestly_without_an_owned_restore_point() -> Result<()> {
+    use crate::snapshot::WorkspaceSnapshotKind::PreTurn;
+    if git_missing() {
+        return Ok(());
+    }
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let a = workspace.join("a.txt");
+    fs::write(&a, "before")?;
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
+    fs::write(&a, "after")?;
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
+
+    let cases = [
+        (
+            dropped_turn("legacy", true, Vec::new()),
+            PATCH_UNDO_NO_RESTORE_POINT,
+        ),
+        (
+            dropped_turn(
+                "unclosed",
+                true,
+                vec![snapshot_receipt(PreTurn, &pre, "thr_a")],
+            ),
+            PATCH_UNDO_NO_RESTORE_POINT,
+        ),
+        (
+            dropped_turn(
+                "retagged",
+                true,
+                shell_turn_receipts(&repo, &pre, &post, "thr_someone_else"),
+            ),
+            PATCH_UNDO_RESTORE_POINT_PRUNED,
+        ),
+    ];
+    for (turn, code) in cases {
+        let err = patch_undo_workspace_files(&workspace, std::slice::from_ref(&turn), true)
+            .expect_err(&turn.turn_id);
+        assert_eq!(err.status, StatusCode::CONFLICT, "{}", turn.turn_id);
+        assert_eq!(err.code, Some(code), "{}: {}", turn.turn_id, err.message);
+        assert!(err.message.contains("/undo"), "{}", err.message);
+        assert_eq!(fs::read_to_string(&a)?, "after");
+    }
+
+    let chat_only = patch_undo_workspace_files(
+        &workspace,
+        &[dropped_turn("chat", false, Vec::new())],
+        false,
+    )
+    .expect("a turn that ran no tools changed no files");
+    assert!(!chat_only.files_restored);
+
+    // A prune that drops the restore point's tree fails closed too.
+    let receipts = shell_turn_receipts(&repo, &pre, &post, "thr_a");
+    repo.prune_older_than(Duration::ZERO)?;
+    let err =
+        patch_undo_workspace_files(&workspace, &[dropped_turn("pruned", true, receipts)], true)
+            .expect_err("a pruned restore point cannot be restored");
+    assert_eq!(err.code, Some(PATCH_UNDO_RESTORE_POINT_PRUNED));
+    assert_eq!(fs::read_to_string(&a)?, "after");
+    Ok(())
+}
+
+/// A prune rebuilds the side repo's commit chain, rewriting every commit id
+/// while keeping trees; a recorded restore point still resolves.
+#[test]
+fn patch_undo_helper_survives_a_prune_that_rewrites_commit_ids() -> Result<()> {
+    if git_missing() {
+        return Ok(());
+    }
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let a = workspace.join("a.txt");
+    fs::write(&a, "ancient")?;
+    repo.take_snapshot("pre-turn:0", Some("thr_old"))?;
+    fs::write(&a, "before")?;
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
+    fs::write(&a, "after")?;
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
+    assert_eq!(repo.prune_keep_last_n(2)?, 1);
+    assert!(
+        repo.list(usize::MAX)?
+            .iter()
+            .all(|snapshot| snapshot.id != pre.id && snapshot.id != post.id),
+        "the prune rewrote the survivors' commit ids"
+    );
+
+    let restored = patch_undo_workspace_files(
+        &workspace,
+        &[dropped_turn(
+            "turn_1",
+            true,
+            shell_turn_receipts(&repo, &pre, &post, "thr_a"),
+        )],
+        true,
+    )
+    .expect("the tree still resolves the restore point");
+    assert!(restored.files_restored);
+    assert_eq!(fs::read_to_string(&a)?, "before");
+    Ok(())
+}
+
+/// One recorded receipt with the span data a recording engine reports.
+fn span_receipt(
+    kind: crate::snapshot::WorkspaceSnapshotKind,
+    taken: &crate::snapshot::TakenSnapshot,
+    call: Option<&str>,
+    write_paths: Option<&[&str]>,
+    changed: Option<Vec<String>>,
+) -> crate::snapshot::WorkspaceSnapshotRef {
+    let mut receipt = snapshot_receipt(kind, taken, "thr_a");
+    receipt.tool_call_id = call.map(str::to_string);
+    receipt.write_paths = write_paths.map(|paths| paths.iter().map(|p| p.to_string()).collect());
+    receipt.changed_paths = changed;
+    receipt
+}
+
+/// Attribution from the recorded spans: a path the turn's own declared
+/// write changed is restored; a path someone else changed while the turn
+/// ran — in a span where no tool of the turn was running, or inside a file
+/// tool's span but not a path it declared — refuses the undo instead of
+/// reverting their work. An undeclared (shell) span owns what it changed,
+/// and a span with no record of its changes fails closed.
+#[test]
+fn patch_undo_helper_attributes_changes_to_the_turns_own_tool_spans() -> Result<()> {
+    use crate::snapshot::WorkspaceSnapshotKind::{PostTool, PostTurn, PreTurn, Tool};
+    if git_missing() {
+        return Ok(());
+    }
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let own = workspace.join("own.txt");
+    let sibling = workspace.join("sibling.txt");
+    fs::write(&own, "before")?;
+    fs::write(&sibling, "sibling-before")?;
+
+    // pre → tool(write own.txt) → post_tool → [another thread writes
+    // sibling.txt while the model thinks] → post_turn
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
+    let tool = repo.take_snapshot("tool:call-1", Some("thr_a"))?;
+    fs::write(&own, "turn")?;
+    let post_tool = repo.take_snapshot("post-tool:call-1", Some("thr_a"))?;
+    fs::write(&sibling, "sibling-during-turn")?;
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
+    let receipts = |gap_writer: bool| {
+        let mut receipts = vec![
+            span_receipt(PreTurn, &pre, None, None, None),
+            span_receipt(
+                Tool,
+                &tool,
+                Some("call-1"),
+                Some(&["./own.txt"]),
+                Some(changed_between(&repo, &pre, &tool)),
+            ),
+            span_receipt(
+                PostTool,
+                &post_tool,
+                Some("call-1"),
+                None,
+                Some(changed_between(&repo, &tool, &post_tool)),
+            ),
+            span_receipt(
+                PostTurn,
+                &post,
+                None,
+                None,
+                Some(changed_between(&repo, &post_tool, &post)),
+            ),
+        ];
+        if !gap_writer {
+            // The same history with the sibling's write inside the file
+            // tool's span instead: still not a path the call declared.
+            receipts[2].changed_paths = Some(changed_between(&repo, &tool, &post));
+            receipts[3].changed_paths = Some(Vec::new());
+        }
+        receipts
+    };
+    for gap_writer in [true, false] {
+        let err = patch_undo_workspace_files(
+            &workspace,
+            &[dropped_turn("turn_1", true, receipts(gap_writer))],
+            true,
+        )
+        .expect_err("another writer's change must not be reverted");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(
+            err.code,
+            Some(PATCH_UNDO_WORKSPACE_CHANGED),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("sibling.txt"), "{}", err.message);
+        assert!(!err.message.contains("own.txt"), "{}", err.message);
+        assert_eq!(fs::read_to_string(&own)?, "turn");
+        assert_eq!(fs::read_to_string(&sibling)?, "sibling-during-turn");
+    }
+
+    // Without the sibling's write the turn's own change restores.
+    fs::write(&sibling, "sibling-before")?;
+    let clean_post = repo.take_snapshot("post-turn:2", Some("thr_a"))?;
+    let mut clean = receipts(true);
+    clean[3] = span_receipt(
+        PostTurn,
+        &clean_post,
+        None,
+        None,
+        Some(changed_between(&repo, &post_tool, &clean_post)),
+    );
+    let restored = patch_undo_workspace_files(
+        &workspace,
+        &[dropped_turn("turn_1", true, clean.clone())],
+        true,
+    )
+    .expect("the turn's own write restores");
+    assert!(restored.files_restored, "{:?}", restored.summary);
+    assert_eq!(fs::read_to_string(&own)?, "before");
+
+    // An undeclared tool (a shell command) owns whatever changed in its span.
+    fs::write(&own, "turn")?;
+    let mut shell = clean.clone();
+    shell[1].write_paths = None;
+    let restored =
+        patch_undo_workspace_files(&workspace, &[dropped_turn("turn_1", true, shell)], true)
+            .expect("an undeclared span owns its changes");
+    assert!(restored.files_restored);
+    assert_eq!(fs::read_to_string(&own)?, "before");
+
+    // A span whose changes were never recorded cannot be attributed.
+    fs::write(&own, "turn")?;
+    let mut unknown = clean;
+    unknown[2].changed_paths = None;
+    let err =
+        patch_undo_workspace_files(&workspace, &[dropped_turn("turn_1", true, unknown)], true)
+            .expect_err("an unaccounted span fails closed");
+    assert_eq!(
+        err.code,
+        Some(PATCH_UNDO_NO_RESTORE_POINT),
+        "{}",
+        err.message
+    );
+    assert_eq!(fs::read_to_string(&own)?, "turn");
+    Ok(())
+}
+
+/// A file tool that wrote a path the snapshots never hold (ignored, or
+/// outside the workspace) cannot be undone: refused with its own code even
+/// when the snapshots show nothing changed.
+#[test]
+fn patch_undo_helper_refuses_declared_writes_snapshots_cannot_hold() -> Result<()> {
+    use crate::snapshot::WorkspaceSnapshotKind::{PostTool, PostTurn, PreTurn, Tool};
+    if git_missing() {
+        return Ok(());
+    }
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join(".gitignore"), "*.local\n")?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
+    let tool = repo.take_snapshot("tool:call-1", Some("thr_a"))?;
+    fs::write(workspace.join(".env.local"), "SECRET=changed")?;
+    let post_tool = repo.take_snapshot("post-tool:call-1", Some("thr_a"))?;
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
+    let receipts = |declared: &[&str]| {
+        vec![
+            span_receipt(PreTurn, &pre, None, None, None),
+            span_receipt(
+                Tool,
+                &tool,
+                Some("call-1"),
+                Some(declared),
+                Some(Vec::new()),
+            ),
+            span_receipt(
+                PostTool,
+                &post_tool,
+                Some("call-1"),
+                None,
+                Some(changed_between(&repo, &tool, &post_tool)),
+            ),
+            span_receipt(PostTurn, &post, None, None, Some(Vec::new())),
+        ]
+    };
+    let outside = root.path().join("outside.txt");
+    let outside = outside.to_string_lossy().into_owned();
+    for declared in [".env.local", "node_modules/pkg/index.js", outside.as_str()] {
+        let err = patch_undo_workspace_files(
+            &workspace,
+            &[dropped_turn("turn_1", true, receipts(&[declared]))],
+            true,
+        )
+        .expect_err(declared);
+        assert_eq!(err.status, StatusCode::CONFLICT, "{declared}");
+        assert_eq!(
+            err.code,
+            Some(PATCH_UNDO_PATH_NOT_SNAPSHOTTED),
+            "{declared}: {}",
+            err.message
+        );
+        assert!(err.message.contains(declared), "{}", err.message);
+    }
+    // The same declared write from a call recorded as failed wrote nothing.
+    let mut failed = dropped_turn("turn_1", true, receipts(&[".env.local"]));
+    failed.unrun_tool_calls.insert("call-1".to_string());
+    let result = patch_undo_workspace_files(&workspace, &[failed], true)
+        .expect("a failed call wrote nothing");
+    assert!(!result.files_restored);
+    // Declared through the turn's items rather than a receipt.
+    let mut from_items = dropped_turn("turn_1", true, receipts(&[]));
+    from_items.declared_writes.push(".env.local".to_string());
+    let err = patch_undo_workspace_files(&workspace, &[from_items], true)
+        .expect_err("an item-declared ignored write refuses too");
+    assert_eq!(err.code, Some(PATCH_UNDO_PATH_NOT_SNAPSHOTTED));
     Ok(())
 }
 
@@ -6372,6 +6850,9 @@ fn patch_undo_helper_restores_only_the_bound_session() -> Result<()> {
 /// conversation either.
 #[test]
 fn patch_undo_helper_refuses_an_untrusted_rollback_and_touches_nothing() -> Result<()> {
+    if git_missing() {
+        return Ok(());
+    }
     let _lock = lock_test_env();
     let root = tempfile::tempdir()?;
     let home = root.path().join("home");
@@ -6384,12 +6865,19 @@ fn patch_undo_helper_refuses_an_untrusted_rollback_and_touches_nothing() -> Resu
     let file = workspace.join("a.txt");
 
     fs::write(&file, "before")?;
-    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
     fs::write(&file, "after")?;
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
+    let turn = dropped_turn(
+        "turn_1",
+        true,
+        shell_turn_receipts(&repo, &pre, &post, "thr_a"),
+    );
 
-    let err = patch_undo_workspace_files(&workspace, Some("session-a"), false)
+    let err = patch_undo_workspace_files(&workspace, std::slice::from_ref(&turn), false)
         .expect_err("an untrusted rollback must be refused");
     assert_eq!(err.status, StatusCode::CONFLICT);
+    assert_eq!(err.code, Some(PATCH_UNDO_UNTRUSTED));
     assert!(
         err.message.contains("outside trusted mode"),
         "got: {}",
@@ -6402,7 +6890,7 @@ fn patch_undo_helper_refuses_an_untrusted_rollback_and_touches_nothing() -> Resu
     );
 
     // The identical call once trusted performs the rollback.
-    let restored = patch_undo_workspace_files(&workspace, Some("session-a"), true)
+    let restored = patch_undo_workspace_files(&workspace, &[turn], true)
         .expect("a trusted rollback should succeed");
     assert!(restored.files_restored, "{:?}", restored.summary);
     assert_eq!(fs::read_to_string(&file)?, "before");
@@ -6414,6 +6902,9 @@ fn patch_undo_helper_refuses_an_untrusted_rollback_and_touches_nothing() -> Resu
 /// Undo useless in Ask / Auto-Review for no safety gain.
 #[test]
 fn patch_undo_helper_allows_an_untrusted_undo_with_nothing_to_roll_back() -> Result<()> {
+    if git_missing() {
+        return Ok(());
+    }
     let _lock = lock_test_env();
     let root = tempfile::tempdir()?;
     let home = root.path().join("home");
@@ -6426,11 +6917,20 @@ fn patch_undo_helper_allows_an_untrusted_undo_with_nothing_to_roll_back() -> Res
     let file = workspace.join("a.txt");
 
     fs::write(&file, "only-state")?;
-    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
-    // Nothing changed after the snapshot, so no target exists.
+    let pre = repo.take_snapshot("pre-turn:1", Some("thr_a"))?;
+    // The turn ran a tool but changed nothing.
+    let post = repo.take_snapshot("post-turn:1", Some("thr_a"))?;
 
-    let result = patch_undo_workspace_files(&workspace, Some("session-a"), false)
-        .expect("nothing to roll back is not a refusal");
+    let result = patch_undo_workspace_files(
+        &workspace,
+        &[dropped_turn(
+            "turn_1",
+            true,
+            shell_turn_receipts(&repo, &pre, &post, "thr_a"),
+        )],
+        false,
+    )
+    .expect("nothing to roll back is not a refusal");
     assert!(!result.files_restored);
     assert!(result.summary.is_some());
     assert_eq!(fs::read_to_string(&file)?, "only-state");
@@ -6470,7 +6970,12 @@ fn revert_file_helper_restores_only_the_named_file() -> Result<()> {
 
     fs::write(&wanted, "wanted-before")?;
     fs::write(&other, "other-before")?;
-    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    let taken = repo.take_snapshot("pre-turn:1", Some("session-a"))?;
+    let owned = [snapshot_receipt(
+        crate::snapshot::WorkspaceSnapshotKind::PreTurn,
+        &taken,
+        "session-a",
+    )];
 
     fs::write(&wanted, "wanted-after")?;
     fs::write(&other, "other-after")?;
@@ -6478,7 +6983,7 @@ fn revert_file_helper_restores_only_the_named_file() -> Result<()> {
     let snapshot = repo.list(10)?.remove(0);
     let reverted = revert_file_from_snapshot(
         &workspace,
-        "session-a",
+        &owned,
         &revert_request("wanted.txt", snapshot.id.as_str(), &sha256_of(&wanted)),
     )
     .expect("scoped revert should succeed");
@@ -6509,18 +7014,23 @@ fn revert_file_helper_accepts_an_absolute_path_inside_the_workspace() -> Result<
     let file = workspace.join("a.txt");
 
     fs::write(&file, "v1")?;
-    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    let taken = repo.take_snapshot("pre-turn:1", Some("session-a"))?;
+    let owned = [snapshot_receipt(
+        crate::snapshot::WorkspaceSnapshotKind::PreTurn,
+        &taken,
+        "session-a",
+    )];
     fs::write(&file, "v2")?;
 
     // A recorded path may arrive absolute; normalization reports it back
-    // workspace-relative so the GUI's change record stays consistent.
-    let snapshot = repo.list(10)?.remove(0);
+    // workspace-relative so the GUI's change record stays consistent. The
+    // restore point is named by the tree id its receipt recorded.
     let reverted = revert_file_from_snapshot(
         &workspace,
-        "session-a",
+        &owned,
         &revert_request(
             &file.to_string_lossy(),
-            snapshot.id.as_str(),
+            taken.tree.as_str(),
             &sha256_of(&file),
         ),
     )
@@ -6536,6 +7046,7 @@ fn revert_file_helper_accepts_an_absolute_path_inside_the_workspace() -> Result<
 /// the workspace untouched.
 #[test]
 fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Result<()> {
+    use crate::snapshot::WorkspaceSnapshotKind::{PostTurn, Tool};
     let _lock = lock_test_env();
     let root = tempfile::tempdir()?;
     let home = root.path().join("home");
@@ -6552,18 +7063,24 @@ fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Re
     // then edits a.txt by hand.
     fs::write(&a, "a-before")?;
     fs::write(&b, "b-before")?;
-    let tool_a = repo.snapshot_with_session("tool:call-a", Some("session-a"))?;
+    let tool_a = repo.take_snapshot("tool:call-a", Some("session-a"))?;
     fs::write(&a, "a-after-tool")?;
-    let tool_b = repo.snapshot_with_session("tool:call-b", Some("session-a"))?;
+    let tool_b = repo.take_snapshot("tool:call-b", Some("session-a"))?;
     fs::write(&b, "b-after-tool")?;
     fs::write(&a, "a-user-edit")?;
+    let post = repo.take_snapshot("post-turn:1", Some("session-a"))?;
+    let mut owned = vec![
+        snapshot_receipt(Tool, &tool_a, "session-a"),
+        snapshot_receipt(Tool, &tool_b, "session-a"),
+        snapshot_receipt(PostTurn, &post, "session-a"),
+    ];
 
     // Restoring a.txt from tool B's snapshot would erase only the user edit;
     // the client must ask for tool A's snapshot and gets back a-before.
     let err = revert_file_from_snapshot(
         &workspace,
-        "session-a",
-        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&b)),
+        &owned,
+        &revert_request("a.txt", tool_a.id.as_str(), &sha256_of(&b)),
     )
     .expect_err("a hash from different bytes must refuse");
     assert_eq!(err.status, StatusCode::CONFLICT);
@@ -6576,8 +7093,8 @@ fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Re
 
     let reverted = revert_file_from_snapshot(
         &workspace,
-        "session-a",
-        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&a)),
+        &owned,
+        &revert_request("a.txt", tool_a.id.as_str(), &sha256_of(&a)),
     )
     .expect("exact identity restores");
     assert_eq!(reverted.snapshot_label, "tool:call-a");
@@ -6591,8 +7108,8 @@ fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Re
     // Already matching: 409, nothing changed.
     let err = revert_file_from_snapshot(
         &workspace,
-        "session-a",
-        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&a)),
+        &owned,
+        &revert_request("a.txt", tool_a.id.as_str(), &sha256_of(&a)),
     )
     .expect_err("nothing to revert");
     assert_eq!(err.status, StatusCode::CONFLICT);
@@ -6602,18 +7119,19 @@ fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Re
         err.message
     );
 
-    // A snapshot owned by another session, an unknown id, or a non-restore
-    // label are all refused with a refresh hint.
-    let foreign = repo.snapshot_with_session("tool:foreign", Some("session-b"))?;
-    let post = repo.snapshot_with_session("post-turn:1", Some("session-a"))?;
+    // A snapshot owned by another thread (even when the receipt list is
+    // tampered to name it under this thread's tag), a post-turn state, or an
+    // unknown id are all refused with a refresh hint.
+    let foreign = repo.take_snapshot("tool:foreign", Some("session-b"))?;
+    owned.push(snapshot_receipt(Tool, &foreign, "session-a"));
     for id in [
-        foreign.as_str(),
-        post.as_str(),
+        foreign.id.as_str(),
+        post.id.as_str(),
         "0123456789abcdef0123456789abcdef01234567",
     ] {
         let err = revert_file_from_snapshot(
             &workspace,
-            "session-a",
+            &owned,
             &revert_request("b.txt", id, &sha256_of(&b)),
         )
         .expect_err(id);
@@ -6625,15 +7143,14 @@ fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Re
         );
     }
     assert_eq!(fs::read_to_string(&b)?, "b-after-tool");
-    let _ = tool_b;
 
     // Directories and Git metadata are 400s before anything is compared.
     for path in ["", "src", ".git/config", "../escape.txt"] {
         fs::create_dir_all(workspace.join("src"))?;
         let err = revert_file_from_snapshot(
             &workspace,
-            "session-a",
-            &revert_request(path, tool_a.as_str(), "absent"),
+            &owned,
+            &revert_request(path, tool_a.id.as_str(), "absent"),
         )
         .expect_err(path);
         assert_eq!(err.status, StatusCode::BAD_REQUEST, "{path}");
@@ -6642,7 +7159,7 @@ fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Re
 }
 
 #[test]
-fn revert_file_helper_refuses_foreign_sessions_and_paths_outside_the_workspace() -> Result<()> {
+fn revert_file_helper_refuses_foreign_snapshots_and_paths_outside_the_workspace() -> Result<()> {
     let _lock = lock_test_env();
     let root = tempfile::tempdir()?;
     let home = root.path().join("home");
@@ -6654,22 +7171,22 @@ fn revert_file_helper_refuses_foreign_sessions_and_paths_outside_the_workspace()
     let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
     let file = workspace.join("a.txt");
 
-    // Only another session owns a snapshot, so this session has nothing it is
-    // allowed to revert.
+    // Only another thread recorded a restore point, so this thread owns
+    // nothing it is allowed to revert.
     fs::write(&file, "foreign-before")?;
-    repo.snapshot_with_session("pre-turn:1", Some("session-b"))?;
+    repo.take_snapshot("pre-turn:1", Some("session-b"))?;
     fs::write(&file, "foreign-after")?;
 
     let foreign = repo.list(10)?.remove(0);
     let err = revert_file_from_snapshot(
         &workspace,
-        "session-a",
+        &[],
         &revert_request("a.txt", foreign.id.as_str(), &sha256_of(&file)),
     )
-    .expect_err("a foreign session's snapshot must not be restorable");
+    .expect_err("a foreign thread's snapshot must not be restorable");
     assert_eq!(err.status, StatusCode::CONFLICT);
     assert!(
-        err.message.contains("another session"),
+        err.message.contains("another thread"),
         "got: {}",
         err.message
     );
@@ -6677,7 +7194,7 @@ fn revert_file_helper_refuses_foreign_sessions_and_paths_outside_the_workspace()
 
     let traversal = revert_file_from_snapshot(
         &workspace,
-        "session-a",
+        &[],
         &revert_request("../escape.txt", foreign.id.as_str(), "absent"),
     )
     .expect_err("traversal must be refused");
@@ -6729,9 +7246,10 @@ async fn file_revert_route_probes_as_available_and_404s_unknown_threads() -> Res
 /// Route-level contract for the new destructive endpoint: malformed bodies
 /// are 422/400 before any thread state is read, an untrusted thread is a 409
 /// even with a well-formed request, and a trusted thread without a bound
-/// session is a 409 that names the reason. No file is touched in any case.
+/// restore point it owns is a 409 that names the reason. No file is touched in
+/// any case.
 #[tokio::test]
-async fn file_revert_route_validates_body_then_trust_then_session_binding() -> Result<()> {
+async fn file_revert_route_validates_body_then_trust_then_ownership() -> Result<()> {
     let root = std::env::temp_dir().join(format!("deepseek-file-revert-gates-{}", Uuid::new_v4()));
     let sessions_dir = root.join("sessions");
     let Some((addr, runtime_threads, handle)) =
@@ -6774,7 +7292,8 @@ async fn file_revert_route_validates_body_then_trust_then_session_binding() -> R
     let text = resp.text().await?;
     assert!(text.contains("trusted mode"), "got: {text}");
 
-    // Trusted, but no bound session: still a 409 with the reason.
+    // Trusted, but the thread recorded no such restore point: still a 409
+    // with the reason.
     client
         .patch(format!("http://{addr}/v1/threads/{thread_id}"))
         .json(&json!({ "trust_mode": true }))
@@ -6784,7 +7303,7 @@ async fn file_revert_route_validates_body_then_trust_then_session_binding() -> R
     let resp = client.post(&url).json(&well_formed).send().await?;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let text = resp.text().await?;
-    assert!(text.contains("no bound session"), "got: {text}");
+    assert!(text.contains("refresh the change record"), "got: {text}");
     assert_eq!(fs::read_to_string(&file)?, "keep");
 
     handle.abort();
@@ -6864,10 +7383,7 @@ async fn restore_routes_refuse_an_active_turn_in_the_workspace() -> Result<()> {
         .await?;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let text = resp.text().await?;
-    assert!(
-        text.contains("no bound session") || text.contains("refresh the change record"),
-        "got: {text}"
-    );
+    assert!(text.contains("refresh the change record"), "got: {text}");
     assert_eq!(fs::read_to_string(&file)?, "live");
 
     handle.abort();
@@ -7959,6 +8475,7 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
         item_ids: Vec::new(),
         steer_count: 0,
         agent_mail_message_id: None,
+        workspace_snapshots: Vec::new(),
     };
     // Mirror `TurnRecord::persist_effective_route` (private to the runtime
     // threads module): persist the route envelope onto the turn so the
@@ -8154,6 +8671,7 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
         item_ids: Vec::new(),
         steer_count: 0,
         agent_mail_message_id: None,
+        workspace_snapshots: Vec::new(),
     };
     turn.effective_provider = Some(ApiProvider::Openai.as_str().to_string());
     turn.effective_provider_id = Some(ApiProvider::Openai.as_str().to_string());
@@ -9313,6 +9831,7 @@ fn seed_summary_search_transcript(
             item_ids,
             steer_count: 0,
             agent_mail_message_id: None,
+            workspace_snapshots: Vec::new(),
         })?;
         latest_turn_id = Some(turn_id);
     }
@@ -20179,4 +20698,1053 @@ async fn jobs_api_pty_resize_raw_input_and_nonblocking_poll() -> Result<()> {
     assert_eq!(tail["data"], "");
     handle.abort();
     Ok(())
+}
+
+/// #6621: a Runtime thread owns the workspace restore points recorded on its
+/// own turns, for every kind of thread, through the HTTP API and with real
+/// engines built by `ensure_engine_loaded` (only the model client is
+/// scripted), so the production `EngineConfig` / `SyncSession` identity path
+/// is the one under test.
+mod thread_snapshot_ownership {
+    use super::*;
+    use crate::llm_client::mock::{MockLlmClient, canned};
+
+    struct Fixture {
+        root: PathBuf,
+        workspace: PathBuf,
+        addr: SocketAddr,
+        threads: SharedRuntimeThreadManager,
+        server: tokio::task::JoinHandle<()>,
+        mock: Arc<MockLlmClient>,
+        client: reqwest::Client,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// `None` when git or a loopback listener is unavailable.
+    async fn fixture(root: &FsPath, overrides: TestServerOverrides) -> Result<Option<Fixture>> {
+        if crate::dependencies::Git::command().is_none() {
+            return Ok(None);
+        }
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace)?;
+        // The directory the Runtime's fork and resume paths read saved
+        // sessions from, as production wires it.
+        let sessions_dir = crate::session_manager::default_sessions_dir()?;
+        let Some((addr, threads, server)) =
+            spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+                root.to_path_buf(),
+                sessions_dir,
+                None,
+                false,
+                workspace.clone(),
+                overrides,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mock = Arc::new(MockLlmClient::new(Vec::new()));
+        threads.set_test_model_client(mock.clone());
+        Ok(Some(Fixture {
+            root: root.to_path_buf(),
+            workspace,
+            addr,
+            threads,
+            server,
+            mock,
+            client: crate::tls::reqwest_client(),
+        }))
+    }
+
+    impl Fixture {
+        fn url(&self, path: &str) -> String {
+            format!("http://{}{path}", self.addr)
+        }
+
+        async fn create_thread(&self) -> Result<String> {
+            let created: Value = self
+                .client
+                .post(self.url("/v1/threads"))
+                .json(&json!({
+                    "model": "deepseek-v4-pro",
+                    "mode": "agent",
+                    "workspace": self.workspace,
+                    "trust_mode": true,
+                    "auto_approve": true,
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            Ok(created["id"].as_str().context("thread id")?.to_string())
+        }
+
+        /// Run one real turn whose model writes each `(path, content)` with
+        /// `write_file`, then answers. Returns the settled turn record.
+        async fn write_turn(&self, thread_id: &str, writes: &[(&str, &str)]) -> Result<Value> {
+            for (path, content) in writes {
+                let call_id = format!("call_{}", &Uuid::new_v4().simple().to_string()[..12]);
+                self.mock.push_turn(canned::tool_call_turn(
+                    &call_id,
+                    "write_file",
+                    &json!({ "path": path, "content": content }).to_string(),
+                ));
+            }
+            self.mock.push_turn(canned::simple_text_turn("done"));
+            let started: Value = self
+                .client
+                .post(self.url(&format!("/v1/threads/{thread_id}/turns")))
+                .json(&json!({ "prompt": format!("write {writes:?}") }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let turn_id = started["turn"]["id"]
+                .as_str()
+                .context("turn id")?
+                .to_string();
+            let status = wait_for_terminal_turn_status(
+                &self.client,
+                self.addr,
+                thread_id,
+                &turn_id,
+                Duration::from_secs(60),
+            )
+            .await?;
+            let turn = self.turn(thread_id, &turn_id).await?;
+            assert_eq!(status, "completed", "{turn:#}");
+            Ok(turn)
+        }
+
+        async fn detail(&self, thread_id: &str) -> Result<Value> {
+            Ok(self
+                .client
+                .get(self.url(&format!("/v1/threads/{thread_id}")))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?)
+        }
+
+        async fn turn(&self, thread_id: &str, turn_id: &str) -> Result<Value> {
+            self.detail(thread_id).await?["turns"]
+                .as_array()
+                .and_then(|turns| turns.iter().find(|turn| turn["id"] == turn_id))
+                .cloned()
+                .context("turn not in thread detail")
+        }
+
+        async fn patch_undo(&self, thread_id: &str, depth: usize) -> Result<reqwest::Response> {
+            Ok(self
+                .client
+                .post(self.url(&format!("/v1/threads/{thread_id}/patch-undo")))
+                .json(&json!({ "depth": depth }))
+                .send()
+                .await?)
+        }
+
+        /// Patch-undo that must restore files; returns the fork's id.
+        async fn undo_restoring(&self, thread_id: &str, depth: usize) -> Result<String> {
+            let resp = self.patch_undo(thread_id, depth).await?;
+            let status = resp.status();
+            let body: Value = resp.json().await?;
+            assert_eq!(status, StatusCode::CREATED, "{body:#}");
+            assert_eq!(body["patch_result"]["files_restored"], true, "{body:#}");
+            Ok(body["thread"]["id"]
+                .as_str()
+                .context("fork id")?
+                .to_string())
+        }
+
+        async fn thread_count(&self) -> Result<usize> {
+            let threads: Value = self
+                .client
+                .get(self.url("/v1/threads?include_archived=true"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            Ok(threads.as_array().map_or(0, Vec::len))
+        }
+
+        fn read(&self, path: &str) -> Option<String> {
+            fs::read_to_string(self.workspace.join(path)).ok()
+        }
+    }
+
+    fn receipts(turn: &Value) -> Vec<Value> {
+        turn["workspace_snapshots"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn receipt_kinds(turn: &Value) -> Vec<String> {
+        receipts(turn)
+            .iter()
+            .map(|receipt| receipt["kind"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("codewhale-6621-{name}-{}", Uuid::new_v4()))
+    }
+
+    /// The issue's reproduction: a fresh HTTP thread writes a new file and
+    /// overwrites an existing one (two writes, one turn), and patch-undo
+    /// restores both — the new file deleted, the old one back to its exact
+    /// bytes — and reports it. The turn record carries the restore points,
+    /// tagged with the thread's own id.
+    #[tokio::test]
+    async fn fresh_thread_patch_undo_restores_its_own_turn() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("fresh");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        fs::write(fx.workspace.join("a.txt"), "original bytes\n")?;
+        let thread_id = fx.create_thread().await?;
+        let turn = fx
+            .write_turn(
+                &thread_id,
+                &[("new.txt", "created"), ("a.txt", "overwritten")],
+            )
+            .await?;
+        assert_eq!(fx.read("new.txt").as_deref(), Some("created"));
+        assert_eq!(fx.read("a.txt").as_deref(), Some("overwritten"));
+        assert_eq!(
+            receipt_kinds(&turn),
+            [
+                "pre_turn",
+                "tool",
+                "post_tool",
+                "tool",
+                "post_tool",
+                "post_turn"
+            ],
+            "{turn:#}"
+        );
+        // Each receipt after the first records what changed in the span it
+        // closes: the write happened inside its own tool span.
+        let changed: Vec<Value> = receipts(&turn)
+            .iter()
+            .map(|receipt| receipt["changed_paths"].clone())
+            .collect();
+        assert_eq!(
+            changed,
+            [
+                Value::Null,
+                json!([]),
+                json!(["new.txt"]),
+                json!([]),
+                json!(["a.txt"]),
+                json!([]),
+            ],
+            "{turn:#}"
+        );
+        assert!(
+            receipts(&turn)
+                .iter()
+                .all(|receipt| receipt["session_id"] == thread_id.as_str()),
+            "every restore point is tagged with the thread's own id: {turn:#}"
+        );
+        // The saved-session binding is untouched by any of this.
+        assert!(fx.detail(&thread_id).await?["thread"]["session_id"].is_null());
+
+        let fork = fx.undo_restoring(&thread_id, 0).await?;
+        assert_eq!(fx.read("new.txt"), None, "the created file is removed");
+        assert_eq!(
+            fx.read("a.txt").as_deref(),
+            Some("original bytes\n"),
+            "both writes of the turn are undone, not only the last"
+        );
+        assert_ne!(fork, thread_id);
+        Ok(())
+    }
+
+    /// `depth = 1` drops two turns and restores the workspace to before the
+    /// older one. A chained undo on the returned fork restores the turn that
+    /// fork inherited.
+    #[tokio::test]
+    async fn multi_turn_and_chained_undo_restore_whole_turns() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("depth");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        fs::write(fx.workspace.join("a.txt"), "v0")?;
+        let thread_id = fx.create_thread().await?;
+        fx.write_turn(&thread_id, &[("a.txt", "v1")]).await?;
+        fx.write_turn(&thread_id, &[("a.txt", "v2"), ("b.txt", "b")])
+            .await?;
+
+        fx.undo_restoring(&thread_id, 1).await?;
+        assert_eq!(fx.read("a.txt").as_deref(), Some("v0"));
+        assert_eq!(fx.read("b.txt"), None);
+
+        // Redo both by hand, then undo one turn at a time.
+        let thread_id = fx.create_thread().await?;
+        fx.write_turn(&thread_id, &[("a.txt", "w1")]).await?;
+        fx.write_turn(&thread_id, &[("a.txt", "w2")]).await?;
+        let fork = fx.undo_restoring(&thread_id, 0).await?;
+        assert_eq!(fx.read("a.txt").as_deref(), Some("w1"));
+        fx.undo_restoring(&fork, 0).await?;
+        assert_eq!(
+            fx.read("a.txt").as_deref(),
+            Some("v0"),
+            "the fork owns the turn it inherited"
+        );
+        Ok(())
+    }
+
+    /// `POST /fork` and `fork-at-turn` clone the turn records, so each fork
+    /// restores the turns it inherited.
+    #[tokio::test]
+    async fn forks_restore_inherited_turns() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("fork");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        let thread_id = fx.create_thread().await?;
+        let first = fx.write_turn(&thread_id, &[("one.txt", "1")]).await?;
+        fx.write_turn(&thread_id, &[("two.txt", "2")]).await?;
+
+        let forked: Value = fx
+            .client
+            .post(fx.url(&format!("/v1/threads/{thread_id}/fork")))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let fork_id = forked["id"].as_str().context("fork id")?.to_string();
+        fx.undo_restoring(&fork_id, 0).await?;
+        assert_eq!(fx.read("two.txt"), None);
+        assert_eq!(fx.read("one.txt").as_deref(), Some("1"));
+
+        // Put two.txt back so the original thread's state is consistent,
+        // then branch after the first turn and undo that retained turn.
+        fs::write(fx.workspace.join("two.txt"), "2")?;
+        let branched: Value = fx
+            .client
+            .post(fx.url(&format!("/v1/threads/{thread_id}/fork-at-turn")))
+            .json(&json!({ "turn_id": first["id"] }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let branch_id = branched["thread"]["id"]
+            .as_str()
+            .context("branch id")?
+            .to_string();
+        // two.txt came from a turn the branch dropped, and changed nothing
+        // one.txt holds, so undoing the retained first turn removes one.txt
+        // and leaves two.txt alone.
+        fx.undo_restoring(&branch_id, 0).await?;
+        assert_eq!(fx.read("one.txt"), None);
+        assert_eq!(fx.read("two.txt").as_deref(), Some("2"));
+
+        // A turn this Runtime ran without any tool provably changed nothing:
+        // the undo forks and says so.
+        fx.write_turn(&branch_id, &[]).await?;
+        let resp = fx.patch_undo(&branch_id, 0).await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: Value = resp.json().await?;
+        assert_eq!(body["patch_result"]["files_restored"], false, "{body:#}");
+        assert_eq!(fx.read("two.txt").as_deref(), Some("2"));
+        Ok(())
+    }
+
+    /// Ownership survives engine eviction and a full Runtime restart: the
+    /// engine is rebuilt under the same thread id, a later turn is tagged with
+    /// it too, and the earlier turn still restores.
+    #[tokio::test]
+    async fn ownership_survives_eviction_and_restart() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("restart");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(
+            &root,
+            TestServerOverrides {
+                max_active_threads: Some(1),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let a = fx.create_thread().await?;
+        fx.write_turn(&a, &[("a.txt", "from a")]).await?;
+        // Loading B's engine evicts A's.
+        let b = fx.create_thread().await?;
+        fx.write_turn(&b, &[("b.txt", "from b")]).await?;
+        let second = fx.write_turn(&a, &[("a2.txt", "a again")]).await?;
+        assert!(
+            receipts(&second)
+                .iter()
+                .all(|receipt| receipt["session_id"] == a.as_str()),
+            "a rebuilt engine keeps the thread's identity: {second:#}"
+        );
+        fx.undo_restoring(&a, 0).await?;
+        assert_eq!(fx.read("a2.txt"), None);
+
+        // Restart: stop this Runtime and open another on the same root.
+        let workspace = fx.workspace.clone();
+        drop(fx);
+        let deadline = tokio::time::Instant::now() + ci_scaled(Duration::from_secs(20));
+        let fx = loop {
+            match fixture(&root, TestServerOverrides::default()).await {
+                Ok(Some(fx)) => break fx,
+                Ok(None) => return Ok(()),
+                Err(err) if tokio::time::Instant::now() < deadline => {
+                    tracing::debug!("runtime not reopened yet: {err:#}");
+                    sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        assert_eq!(fx.workspace, workspace);
+        let after_restart = fx.write_turn(&b, &[("b2.txt", "b again")]).await?;
+        assert!(
+            receipts(&after_restart)
+                .iter()
+                .all(|receipt| receipt["session_id"] == b.as_str()),
+            "{after_restart:#}"
+        );
+        fx.undo_restoring(&b, 0).await?;
+        assert_eq!(fx.read("b2.txt"), None);
+        fx.undo_restoring(&b, 1).await?;
+        assert_eq!(fx.read("b.txt"), None, "a pre-restart turn restores");
+        assert_eq!(fx.read("a.txt").as_deref(), Some("from a"));
+        Ok(())
+    }
+
+    /// Saving the thread under any session document — the conversation's own
+    /// id, an explicit other id, or a fresh `POST /v1/sessions` uuid — never
+    /// changes which snapshots the thread owns. A thread resumed from a saved
+    /// session has no recorded restore points for its imported turns, and its
+    /// patch-undo fails honestly without forking or touching files.
+    #[tokio::test]
+    async fn save_and_resume_keep_ownership_honest() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("sessions");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        let thread_id = fx.create_thread().await?;
+        fx.write_turn(&thread_id, &[("saved.txt", "one")]).await?;
+
+        let created: Value = fx
+            .client
+            .post(fx.url("/v1/sessions"))
+            .json(&json!({ "thread_id": thread_id }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let minted = created["session_id"]
+            .as_str()
+            .or_else(|| created["id"].as_str())
+            .context("minted session id")?
+            .to_string();
+        let own: Value = fx
+            .client
+            .put(fx.url("/v1/sessions"))
+            .json(&json!({ "thread_id": thread_id }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        // A nameless save updates the document the thread is bound to.
+        assert_eq!(own["session_id"], minted.as_str());
+        fx.client
+            .put(fx.url("/v1/sessions"))
+            .json(&json!({ "thread_id": thread_id, "session_id": "explicit-doc-6621" }))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(
+            fx.detail(&thread_id).await?["thread"]["session_id"],
+            "explicit-doc-6621"
+        );
+
+        // A turn after the rebinding is still tagged with the thread id.
+        let later = fx.write_turn(&thread_id, &[("later.txt", "two")]).await?;
+        assert!(
+            receipts(&later)
+                .iter()
+                .all(|receipt| receipt["session_id"] == thread_id.as_str()),
+            "{later:#}"
+        );
+        fx.undo_restoring(&thread_id, 1).await?;
+        assert_eq!(fx.read("saved.txt"), None);
+        assert_eq!(fx.read("later.txt"), None);
+
+        // Resume the first (no longer held) document into a new thread.
+        fs::write(fx.workspace.join("saved.txt"), "restored by hand")?;
+        let resumed: Value = fx
+            .client
+            .post(fx.url(&format!("/v1/sessions/{minted}/resume-thread")))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let resumed_id = resumed["thread_id"].as_str().context("resumed thread")?;
+        assert_ne!(resumed_id, thread_id);
+        let before = fx.thread_count().await?;
+        let resp = fx.patch_undo(resumed_id, 0).await?;
+        let status = resp.status();
+        let body: Value = resp.json().await?;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{body:#}\n{:#}",
+            fx.detail(resumed_id).await?
+        );
+        assert_eq!(
+            body["error"]["code"], "restore_point_unavailable",
+            "{body:#}"
+        );
+        assert_eq!(fx.read("saved.txt").as_deref(), Some("restored by hand"));
+        assert_eq!(
+            fx.thread_count().await?,
+            before,
+            "a refused undo forks nothing"
+        );
+        Ok(())
+    }
+
+    /// Two threads in one workspace: neither can revert the other's snapshot
+    /// (nor a TUI session's), and one thread's undo leaves the other's later
+    /// writes in place.
+    #[tokio::test]
+    async fn threads_cannot_restore_each_others_snapshots() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("cross");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        let a = fx.create_thread().await?;
+        let b = fx.create_thread().await?;
+        let b_turn = fx.write_turn(&b, &[("b.txt", "from b")]).await?;
+        let a_turn = fx.write_turn(&a, &[("a.txt", "from a")]).await?;
+        let a_tool = receipts(&a_turn)
+            .into_iter()
+            .find(|receipt| receipt["kind"] == "tool")
+            .context("a tool receipt")?;
+
+        let repo = crate::snapshot::SnapshotRepo::open_or_init(&fx.workspace)?;
+        let tui = repo.take_snapshot("tool:tui-call", Some("tui-session-6621"))?;
+        let listed_a = repo
+            .list(usize::MAX)?
+            .into_iter()
+            .find(|snapshot| snapshot.tree.as_str() == a_tool["tree_id"])
+            .context("a's tool snapshot is listed")?;
+        for foreign in [
+            listed_a.id.as_str().to_string(),
+            a_tool["snapshot_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            a_tool["tree_id"].as_str().unwrap_or_default().to_string(),
+            tui.id.as_str().to_string(),
+        ] {
+            let resp = fx
+                .client
+                .post(fx.url(&format!("/v1/threads/{b}/file-revert")))
+                .json(&json!({
+                    "path": "a.txt",
+                    "snapshot_id": foreign,
+                    "expected_hash": sha256_of(&fx.workspace.join("a.txt")),
+                }))
+                .send()
+                .await?;
+            assert_eq!(resp.status(), StatusCode::CONFLICT, "{foreign}");
+            assert_eq!(fx.read("a.txt").as_deref(), Some("from a"));
+        }
+
+        // B's undo rolls back b.txt only; A's later write survives.
+        fx.undo_restoring(&b, 0).await?;
+        assert_eq!(fx.read("b.txt"), None);
+        assert_eq!(fx.read("a.txt").as_deref(), Some("from a"));
+        let _ = b_turn;
+        Ok(())
+    }
+
+    /// File-revert with the tool restore point from the thread's own turn
+    /// record, on a fresh thread with no saved-session binding.
+    #[tokio::test]
+    async fn fresh_thread_file_revert_uses_its_turn_record() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("revert");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        fs::write(fx.workspace.join("kept.txt"), "before")?;
+        let thread_id = fx.create_thread().await?;
+        let turn = fx
+            .write_turn(&thread_id, &[("kept.txt", "after"), ("made.txt", "new")])
+            .await?;
+        let tools: Vec<Value> = receipts(&turn)
+            .into_iter()
+            .filter(|receipt| receipt["kind"] == "tool")
+            .collect();
+        assert_eq!(tools.len(), 2, "{turn:#}");
+        let url = fx.url(&format!("/v1/threads/{thread_id}/file-revert"));
+
+        let stale = fx
+            .client
+            .post(&url)
+            .json(&json!({
+                "path": "kept.txt",
+                "snapshot_id": tools[0]["snapshot_id"],
+                "expected_hash": "absent",
+            }))
+            .send()
+            .await?;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        assert_eq!(fx.read("kept.txt").as_deref(), Some("after"));
+
+        let reverted: Value = fx
+            .client
+            .post(&url)
+            .json(&json!({
+                "path": "kept.txt",
+                "snapshot_id": tools[0]["snapshot_id"],
+                "expected_hash": sha256_of(&fx.workspace.join("kept.txt")),
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(reverted["action"], "modified");
+        assert_eq!(fx.read("kept.txt").as_deref(), Some("before"));
+
+        let removed: Value = fx
+            .client
+            .post(&url)
+            .json(&json!({
+                "path": "made.txt",
+                "snapshot_id": tools[1]["tree_id"],
+                "expected_hash": sha256_of(&fx.workspace.join("made.txt")),
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(removed["action"], "removed");
+        assert_eq!(fx.read("made.txt"), None);
+        Ok(())
+    }
+
+    /// An undo that cannot restore files fails honestly: snapshots disabled,
+    /// a legacy seeded turn with tool calls and no receipts, a restore point
+    /// pruned from the store, and an untrusted thread. Each is a 409 with a
+    /// code, no fork, and unchanged files.
+    #[tokio::test]
+    async fn undo_that_cannot_restore_files_is_refused() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("honest");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let config = Config {
+            api_key: Some("runtime-api-test-key".to_string()),
+            base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            snapshots: Some(crate::config::SnapshotsConfig {
+                enabled: false,
+                ..crate::config::SnapshotsConfig::default()
+            }),
+            ..Config::default()
+        };
+        let Some(fx) = fixture(
+            &root,
+            TestServerOverrides {
+                config: Some(config),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let refused = |fx: &Fixture, thread: String, code: &'static str| {
+            let fx_url = fx.url(&format!("/v1/threads/{thread}/patch-undo"));
+            let client = fx.client.clone();
+            async move {
+                let resp = client.post(fx_url).json(&json!({})).send().await?;
+                let status = resp.status();
+                let body: Value = resp.json().await?;
+                assert_eq!(status, StatusCode::CONFLICT, "{body:#}");
+                assert_eq!(body["error"]["code"], code, "{body:#}");
+                anyhow::Ok(())
+            }
+        };
+
+        // Snapshots off: the turn wrote a file and recorded no restore point.
+        let off = fx.create_thread().await?;
+        let turn = fx.write_turn(&off, &[("off.txt", "written")]).await?;
+        assert!(receipts(&turn).is_empty(), "{turn:#}");
+        let before = fx.thread_count().await?;
+        refused(&fx, off.clone(), "restore_point_unavailable").await?;
+        assert_eq!(fx.read("off.txt").as_deref(), Some("written"));
+        assert_eq!(fx.thread_count().await?, before);
+
+        // A legacy turn that ran a tool before receipts existed.
+        let legacy = fx.create_thread().await?;
+        fx.threads
+            .seed_thread_from_messages(
+                &legacy,
+                &[
+                    Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: "write legacy.txt".to_string(),
+                            cache_control: None,
+                        }],
+                    },
+                    Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: "call_legacy".to_string(),
+                            name: "write_file".to_string(),
+                            input: json!({ "path": "legacy.txt", "content": "x" }),
+                            caller: None,
+                            thought_signature: None,
+                        }],
+                    },
+                ],
+            )
+            .await?;
+        refused(&fx, legacy, "restore_point_unavailable").await?;
+        assert_eq!(fx.thread_count().await?, before + 1);
+        drop(fx);
+
+        // Snapshots on again: a pruned restore point and an untrusted thread.
+        let root = test_root("honest-on");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        let pruned = fx.create_thread().await?;
+        fx.write_turn(&pruned, &[("pruned.txt", "p")]).await?;
+        crate::snapshot::SnapshotRepo::open_or_init(&fx.workspace)?
+            .prune_older_than(Duration::ZERO)?;
+        refused(&fx, pruned, "restore_point_pruned").await?;
+        assert_eq!(fx.read("pruned.txt").as_deref(), Some("p"));
+
+        let untrusted = fx.create_thread().await?;
+        fx.write_turn(&untrusted, &[("u.txt", "u")]).await?;
+        fx.client
+            .patch(fx.url(&format!("/v1/threads/{untrusted}")))
+            .json(&json!({ "trust_mode": false, "auto_approve": false }))
+            .send()
+            .await?
+            .error_for_status()?;
+        let before = fx.thread_count().await?;
+        refused(&fx, untrusted, "restore_requires_trust").await?;
+        assert_eq!(fx.read("u.txt").as_deref(), Some("u"));
+        assert_eq!(fx.thread_count().await?, before);
+        let _ = &fx.root;
+        Ok(())
+    }
+
+    /// Run one turn from pre-pushed model steps and return it settled.
+    async fn scripted_turn(fx: &Fixture, thread_id: &str, prompt: &str) -> Result<Value> {
+        let started: Value = fx
+            .client
+            .post(fx.url(&format!("/v1/threads/{thread_id}/turns")))
+            .json(&json!({ "prompt": prompt }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let turn_id = started["turn"]["id"]
+            .as_str()
+            .context("turn id")?
+            .to_string();
+        let status = wait_for_terminal_turn_status(
+            &fx.client,
+            fx.addr,
+            thread_id,
+            &turn_id,
+            Duration::from_secs(60),
+        )
+        .await?;
+        let turn = fx.turn(thread_id, &turn_id).await?;
+        assert_eq!(status, "completed", "{turn:#}");
+        Ok(turn)
+    }
+
+    /// Another writer changes a different file while thread A's turn runs
+    /// (here: while the model is thinking, between tool calls). A's
+    /// patch-undo must not revert that file as if the turn had written it:
+    /// it refuses with `workspace_changed_since_turn`, forks nothing and
+    /// changes nothing. Without the other writer the same kind of turn
+    /// restores.
+    #[tokio::test]
+    async fn a_concurrent_writers_change_is_never_undone_as_the_turns() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("concurrent");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        fs::write(fx.workspace.join("sibling.txt"), "sibling before")?;
+        let thread_id = fx.create_thread().await?;
+        fx.mock.push_turn(canned::tool_call_turn(
+            "call_own_write",
+            "write_file",
+            &json!({ "path": "own.txt", "content": "from the turn" }).to_string(),
+        ));
+        let sibling = fx.workspace.join("sibling.txt");
+        fx.mock.push_factory(move |_| {
+            fs::write(&sibling, "another thread's edit").expect("concurrent write");
+            canned::simple_text_turn("done")
+        });
+        let turn = scripted_turn(&fx, &thread_id, "write own.txt").await?;
+        assert_eq!(fx.read("own.txt").as_deref(), Some("from the turn"));
+
+        let before = fx.thread_count().await?;
+        let resp = fx.patch_undo(&thread_id, 0).await?;
+        let status = resp.status();
+        let body: Value = resp.json().await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:#}\n{turn:#}");
+        assert_eq!(
+            body["error"]["code"], "workspace_changed_since_turn",
+            "{body:#}"
+        );
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("sibling.txt"), "{message}");
+        assert_eq!(
+            fx.read("sibling.txt").as_deref(),
+            Some("another thread's edit")
+        );
+        assert_eq!(fx.read("own.txt").as_deref(), Some("from the turn"));
+        assert_eq!(
+            fx.thread_count().await?,
+            before,
+            "a refused undo forks nothing"
+        );
+
+        // A shell command's writes are the turn's own: the engine bounds the
+        // call with its own snapshots, so the undo restores them.
+        let shell_thread: Value = fx
+            .client
+            .post(fx.url("/v1/threads"))
+            .json(&json!({
+                "model": "deepseek-v4-pro",
+                "mode": "agent",
+                "workspace": fx.workspace,
+                "trust_mode": true,
+                "auto_approve": true,
+                "allow_shell": true,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let shell_thread = shell_thread["id"]
+            .as_str()
+            .context("thread id")?
+            .to_string();
+        fx.mock.push_turn(canned::tool_call_turn(
+            "call_shell_write",
+            "bash",
+            &json!({ "command": "printf shell > shell.txt" }).to_string(),
+        ));
+        fx.mock.push_turn(canned::simple_text_turn("done"));
+        let shell_turn = scripted_turn(&fx, &shell_thread, "run a command").await?;
+        assert_eq!(
+            fx.read("shell.txt").as_deref(),
+            Some("shell"),
+            "{shell_turn:#}\n{:#}",
+            fx.detail(&shell_thread).await?["items"]
+        );
+        assert!(
+            receipt_kinds(&shell_turn).contains(&"post_tool".to_string()),
+            "{shell_turn:#}"
+        );
+        fx.undo_restoring(&shell_thread, 0).await?;
+        assert_eq!(fx.read("shell.txt"), None);
+        assert_eq!(
+            fx.read("sibling.txt").as_deref(),
+            Some("another thread's edit")
+        );
+        Ok(())
+    }
+
+    /// A turn whose file tool writes a gitignored file changed something no
+    /// snapshot holds. Its patch-undo is a `409 path_not_snapshotted`, never
+    /// a `201` claiming there was nothing to restore; no fork, file intact.
+    #[tokio::test]
+    async fn undo_of_a_write_to_an_ignored_path_is_refused() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("ignored");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        fs::write(fx.workspace.join(".gitignore"), ".env.local\n")?;
+        fs::write(fx.workspace.join(".env.local"), "TOKEN=old\n")?;
+        let thread_id = fx.create_thread().await?;
+        fx.write_turn(&thread_id, &[(".env.local", "TOKEN=new\n")])
+            .await?;
+        let before = fx.thread_count().await?;
+        let resp = fx.patch_undo(&thread_id, 0).await?;
+        let status = resp.status();
+        let body: Value = resp.json().await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:#}");
+        assert_eq!(body["error"]["code"], "path_not_snapshotted", "{body:#}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(".env.local")),
+            "{body:#}"
+        );
+        assert_eq!(fx.read(".env.local").as_deref(), Some("TOKEN=new\n"));
+        assert_eq!(fx.thread_count().await?, before);
+        Ok(())
+    }
+
+    /// A turn with more file-modifying tool calls than the snapshot count
+    /// cap still undoes: the count prune keeps the turn's own pre-turn and
+    /// post-turn restore points (cap lowered to 3 for this workspace so the
+    /// turn does not need fifty writes).
+    #[tokio::test]
+    async fn a_turn_with_more_writes_than_the_snapshot_cap_still_undoes() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("burst");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        crate::core::turn::test_max_snapshots::set(&fx.workspace, 3);
+        fs::write(fx.workspace.join("f0.txt"), "original")?;
+        let thread_id = fx.create_thread().await?;
+        let writes: Vec<(String, String)> = (0..5)
+            .map(|i| (format!("f{i}.txt"), format!("write {i}")))
+            .collect();
+        let writes: Vec<(&str, &str)> = writes
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str()))
+            .collect();
+        fx.write_turn(&thread_id, &writes).await?;
+        let listed =
+            crate::snapshot::SnapshotRepo::open_or_init(&fx.workspace)?.list(usize::MAX)?;
+        assert!(
+            listed.len() < 12,
+            "the cap pruned the tool snapshots: {}",
+            listed.len()
+        );
+
+        fx.undo_restoring(&thread_id, 0).await?;
+        assert_eq!(fx.read("f0.txt").as_deref(), Some("original"));
+        for i in 1..5 {
+            assert_eq!(fx.read(&format!("f{i}.txt")), None);
+        }
+        Ok(())
+    }
+
+    /// A thread resumed from saved document X is bound to X; saving it
+    /// without naming a document updates X rather than writing a second
+    /// document under another name.
+    #[tokio::test]
+    async fn nameless_save_of_a_resumed_thread_updates_its_document() -> Result<()> {
+        let _env = lock_test_env();
+        let root = test_root("resave");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
+        let Some(fx) = fixture(&root, TestServerOverrides::default()).await? else {
+            return Ok(());
+        };
+        let thread_id = fx.create_thread().await?;
+        fx.write_turn(&thread_id, &[]).await?;
+        let created: Value = fx
+            .client
+            .post(fx.url("/v1/sessions"))
+            .json(&json!({ "thread_id": thread_id }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let document = created["session_id"]
+            .as_str()
+            .or_else(|| created["id"].as_str())
+            .context("saved session id")?
+            .to_string();
+        let manager = crate::session_manager::SessionManager::new(
+            crate::session_manager::default_sessions_dir()?,
+        )?;
+        let messages_before = manager.load_session(&document)?.messages.len();
+
+        let resumed: Value = fx
+            .client
+            .post(fx.url(&format!("/v1/sessions/{document}/resume-thread")))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let resumed_id = resumed["thread_id"]
+            .as_str()
+            .context("resumed thread")?
+            .to_string();
+        assert_eq!(
+            fx.detail(&resumed_id).await?["thread"]["session_id"],
+            document.as_str()
+        );
+        fx.write_turn(&resumed_id, &[]).await?;
+        let documents_before = manager.list_sessions()?.len();
+
+        let saved: Value = fx
+            .client
+            .put(fx.url("/v1/sessions"))
+            .json(&json!({ "thread_id": resumed_id }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(saved["session_id"], document.as_str(), "{saved:#}");
+        assert_eq!(
+            manager.list_sessions()?.len(),
+            documents_before,
+            "no second document"
+        );
+        assert!(
+            manager.load_session(&document)?.messages.len() > messages_before,
+            "the resumed turn was saved into the bound document"
+        );
+        assert_eq!(
+            fx.detail(&resumed_id).await?["thread"]["session_id"],
+            document.as_str()
+        );
+        Ok(())
+    }
 }
