@@ -3,17 +3,24 @@
 //! Cached and non-blocking: probes run off the render path on a background
 //! thread and the renderer only ever reads [`cached_status`].
 //!
-//! A probe shells out to the real `git` binary — up to seven invocations
-//! (`rev-parse --show-toplevel`, `rev-parse --git-common-dir`,
-//! `symbolic-ref --short HEAD` or its `rev-parse --short HEAD` fallback,
-//! `status --porcelain`, `rev-list --left-right --count`,
-//! `worktree list --porcelain`, and `remote get-url origin` by way of
-//! [`crate::remote_control::observed_git_repo`]). There is no `gix`
-//! dependency and no
-//! per-invocation timeout; the earlier claim of both here was wrong, and it
-//! misled a contributor reasoning about probe cost in #5617. All of these
-//! run with `GIT_OPTIONAL_LOCKS=0` so a read never contends for
-//! `.git/index.lock` in the user's repository.
+//! A probe shells out to the real `git` binary. One
+//! `status --porcelain=v2 --branch -z` carries the branch, its upstream,
+//! ahead/behind and every changed path, replacing the separate
+//! `symbolic-ref`, `rev-list` and `status --porcelain` calls it used to make
+//! (#6565). Around it: `rev-parse --show-toplevel`, one
+//! `rev-parse --git-dir --git-common-dir` (repository name and linked
+//! worktree), `log -5` for recent commits, `worktree list --porcelain`, and
+//! `remote get-url origin` by way of
+//! [`crate::remote_control::observed_git_repo`]. Git older than 2.11 has no
+//! porcelain v2; the probe then falls back to the old three calls. There is
+//! no `gix` dependency and no per-invocation timeout. All of these run with
+//! `GIT_OPTIONAL_LOCKS=0` so a read never contends for `.git/index.lock` in
+//! the user's repository.
+//!
+//! The same status call and parser back the composer's "branch | status"
+//! badge ([`context_line`]) and the engine's per-turn git line
+//! ([`probe_workspace_status`]), so the chrome, the Git view and the model
+//! read one parser instead of three.
 //!
 //! This module owns capability and state outside the renderer so
 //! `widgets/mod.rs` / `ui.rs` stay projection-only.
@@ -41,6 +48,17 @@ pub struct GitStatusSnapshot {
     pub dirty: bool,
     pub ahead: u32,
     pub behind: u32,
+    /// Whether the branch tracks an upstream; `ahead`/`behind` mean nothing
+    /// without one.
+    pub has_upstream: bool,
+    /// `branch` holds a short commit id because HEAD is detached.
+    pub detached: bool,
+    pub changes: ChangeCounts,
+    /// The first [`MAX_CHANGED_PATHS`] changed paths, in git's order.
+    pub changed_paths: Vec<ChangedPath>,
+    pub recent_commits: Vec<RecentCommit>,
+    /// This checkout is a linked worktree, not the main one.
+    pub is_linked_worktree: bool,
     pub worktrees: Vec<WorktreeEntry>,
     pub fetched_at: Option<Instant>,
     pub error: Option<String>,
@@ -49,6 +67,293 @@ pub struct GitStatusSnapshot {
     /// repository top level while the workspace stays the subdirectory.
     /// Staleness must compare the probe's own input, not its result.
     pub probed_workspace: Option<PathBuf>,
+}
+
+/// Changed paths by kind, classified exactly as the composer badge always
+/// did: a path can be both staged and modified; `?` is untracked; `U` is a
+/// conflict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChangeCounts {
+    pub staged: usize,
+    pub modified: usize,
+    pub untracked: usize,
+    pub conflicts: usize,
+}
+
+impl ChangeCounts {
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `2 staged, 1 modified`, or `clean`.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let parts = [
+            (self.staged, "staged"),
+            (self.modified, "modified"),
+            (self.untracked, "untracked"),
+            (self.conflicts, "conflicts"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, word)| format!("{count} {word}"))
+        .collect::<Vec<_>>();
+        if parts.is_empty() {
+            "clean".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    fn record(&mut self, x: char, y: char) {
+        if x == '?' && y == '?' {
+            self.untracked = self.untracked.saturating_add(1);
+            return;
+        }
+        if x == 'U' || y == 'U' {
+            self.conflicts = self.conflicts.saturating_add(1);
+        }
+        if x != ' ' && x != '?' {
+            self.staged = self.staged.saturating_add(1);
+        }
+        if y != ' ' && y != '?' {
+            self.modified = self.modified.saturating_add(1);
+        }
+    }
+}
+
+/// One changed path with its two-letter status (`M `, ` M`, `??`, `UU`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedPath {
+    pub code: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentCommit {
+    pub hash: String,
+    pub subject: String,
+    /// Relative commit time as git words it (`3 hours ago`).
+    pub when: String,
+}
+
+/// Changed paths kept for the Git view.
+pub const MAX_CHANGED_PATHS: usize = 20;
+/// Recent commits kept for the Git view.
+const RECENT_COMMITS: &str = "-5";
+
+/// What one `git status --porcelain=v2 --branch -z` says.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PorcelainStatus {
+    /// Branch name, or `None` for a detached HEAD.
+    pub head: Option<String>,
+    /// Commit id; `None` on an unborn branch.
+    pub oid: Option<String>,
+    pub upstream: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+    pub changes: ChangeCounts,
+    pub changed_paths: Vec<ChangedPath>,
+}
+
+impl PorcelainStatus {
+    /// The ref the badge shows: the branch, or `detached:<short id>`.
+    #[must_use]
+    pub fn branch_label(&self) -> Option<String> {
+        match (&self.head, &self.oid) {
+            (Some(head), _) => Some(head.clone()),
+            (None, Some(oid)) => Some(format!("detached:{}", short_oid(oid))),
+            (None, None) => None,
+        }
+    }
+}
+
+fn short_oid(oid: &str) -> &str {
+    oid.get(..7).unwrap_or(oid)
+}
+
+/// Parse `git status --porcelain=v2 --branch -z`. `None` when the output has
+/// no `# branch.` header (a git too old for porcelain v2), so the caller can
+/// fall back.
+#[must_use]
+pub fn parse_porcelain_v2(raw: &str) -> Option<PorcelainStatus> {
+    let mut status = PorcelainStatus::default();
+    let mut saw_branch_header = false;
+    let mut records = raw.split('\0').filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        if let Some(header) = record.strip_prefix("# branch.") {
+            saw_branch_header = true;
+            let (key, value) = header.split_once(' ').unwrap_or((header, ""));
+            match key {
+                "oid" if value != "(initial)" => status.oid = Some(value.to_string()),
+                "head" if value != "(detached)" => status.head = Some(value.to_string()),
+                "upstream" => status.upstream = Some(value.to_string()),
+                "ab" => {
+                    for part in value.split_whitespace() {
+                        if let Some(ahead) = part.strip_prefix('+') {
+                            status.ahead = ahead.parse().unwrap_or(0);
+                        } else if let Some(behind) = part.strip_prefix('-') {
+                            status.behind = behind.parse().unwrap_or(0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let (kind, rest) = record.split_at(record.len().min(2));
+        let (code, path) = match kind {
+            // `1 XY sub mH mI mW hH hI path`
+            "1 " => (rest.get(..2), rest.splitn(8, ' ').nth(7)),
+            // `2 XY sub mH mI mW hH hI Xscore path`, then the original path.
+            "2 " => {
+                let _original = records.next();
+                (rest.get(..2), rest.splitn(9, ' ').nth(8))
+            }
+            // `u XY sub m1 m2 m3 mW h1 h2 h3 path`
+            "u " => (rest.get(..2), rest.splitn(10, ' ').nth(9)),
+            "? " => (Some("??"), Some(rest)),
+            _ => continue,
+        };
+        let (Some(code), Some(path)) = (code, path) else {
+            continue;
+        };
+        let mut letters = code.chars().map(|c| if c == '.' { ' ' } else { c });
+        let x = letters.next().unwrap_or(' ');
+        let y = letters.next().unwrap_or(' ');
+        status.changes.record(x, y);
+        if status.changed_paths.len() < MAX_CHANGED_PATHS {
+            status.changed_paths.push(ChangedPath {
+                code: format!("{x}{y}"),
+                path: path.to_string(),
+            });
+        }
+    }
+    saw_branch_header.then_some(status)
+}
+
+/// Porcelain v1 (`git status --porcelain`) for git older than 2.11: counts
+/// and paths only; the branch comes from separate calls.
+fn parse_porcelain_v1(raw: &str) -> (ChangeCounts, Vec<ChangedPath>) {
+    let mut counts = ChangeCounts::default();
+    let mut paths = Vec::new();
+    for line in raw.lines() {
+        let mut chars = line.chars();
+        let (Some(x), Some(y)) = (chars.next(), chars.next()) else {
+            continue;
+        };
+        if x == ' ' && y == ' ' {
+            continue;
+        }
+        counts.record(x, y);
+        if paths.len() < MAX_CHANGED_PATHS {
+            paths.push(ChangedPath {
+                code: format!("{x}{y}"),
+                path: line.get(3..).unwrap_or_default().to_string(),
+            });
+        }
+    }
+    (counts, paths)
+}
+
+/// Branch, upstream and changes for `workspace` from one git call (two on a
+/// git without porcelain v2). `None` outside a repository or without git.
+/// This is the whole cost of the engine's per-turn git line.
+#[must_use]
+pub fn probe_workspace_status(workspace: &Path) -> Option<PorcelainStatus> {
+    crate::project_context::find_git_root(workspace)?;
+    let raw = git_output(
+        workspace,
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+            "--untracked-files=normal",
+        ],
+    )
+    .ok();
+    if let Some(status) = raw.as_deref().and_then(parse_porcelain_v2) {
+        return Some(status);
+    }
+    legacy_workspace_status(workspace)
+}
+
+/// The pre-2.11 path: the three calls porcelain v2 replaced.
+fn legacy_workspace_status(workspace: &Path) -> Option<PorcelainStatus> {
+    let raw = git_output(
+        workspace,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )
+    .ok()?;
+    let (changes, changed_paths) = parse_porcelain_v1(&raw);
+    let head = git_output(workspace, &["symbolic-ref", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let oid = git_output(workspace, &["rev-parse", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut status = PorcelainStatus {
+        head,
+        oid,
+        changes,
+        changed_paths,
+        ..PorcelainStatus::default()
+    };
+    if let Ok(counts) = git_output(
+        workspace,
+        &["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
+    ) {
+        let mut parts = counts.split_whitespace();
+        if let (Some(behind), Some(ahead)) = (parts.next(), parts.next()) {
+            status.behind = behind.parse().unwrap_or(0);
+            status.ahead = ahead.parse().unwrap_or(0);
+            status.upstream = Some("@{upstream}".to_string());
+        }
+    }
+    Some(status)
+}
+
+/// `branch | 2 staged, 1 modified` — the composer badge and the engine's
+/// per-turn git line, from a status probe.
+#[must_use]
+pub fn status_line(status: &PorcelainStatus) -> Option<String> {
+    Some(format!(
+        "{} | {}",
+        status.branch_label()?,
+        status.changes.summary()
+    ))
+}
+
+/// [`status_line`] from a cached snapshot. `None` when the snapshot has not
+/// found a repository.
+#[must_use]
+pub fn context_line(snap: &GitStatusSnapshot) -> Option<String> {
+    let branch = snap.branch.as_deref()?;
+    snap.root.as_ref()?;
+    let branch = if snap.detached {
+        format!("detached:{branch}")
+    } else {
+        branch.to_string()
+    };
+    Some(format!("{branch} | {}", snap.changes.summary()))
+}
+
+fn parse_recent_commits(raw: &str) -> Vec<RecentCommit> {
+    raw.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\u{1f}');
+            Some(RecentCommit {
+                hash: parts.next()?.trim().to_string(),
+                subject: parts.next()?.trim().to_string(),
+                when: parts.next().unwrap_or_default().trim().to_string(),
+            })
+        })
+        .filter(|commit| !commit.hash.is_empty())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,29 +394,30 @@ fn snapshot_is_stale(snap: &GitStatusSnapshot, workspace: &Path) -> bool {
         || snap.probed_workspace.as_deref() != Some(workspace)
 }
 
-pub fn refresh_if_stale(workspace: &Path) {
-    let stale = cache()
+/// Returns the snapshot for `workspace`: the cached one while fresh, else a
+/// new probe (which also becomes the cache).
+pub fn refresh_if_stale(workspace: &Path) -> GitStatusSnapshot {
+    let cached = cache()
         .lock()
-        .map(|g| snapshot_is_stale(&g, workspace))
-        .unwrap_or(true);
-    if !stale {
-        return;
+        .ok()
+        .filter(|g| !snapshot_is_stale(g, workspace))
+        .map(|g| g.clone());
+    if let Some(snap) = cached {
+        return snap;
     }
-    let snap = probe_status(workspace);
-    if let Ok(mut guard) = cache().lock() {
-        *guard = snap;
-    }
+    force_refresh(workspace)
 }
 
 /// Force a refresh (e.g. after checkout / worktree create).
-pub fn force_refresh(workspace: &Path) {
+pub fn force_refresh(workspace: &Path) -> GitStatusSnapshot {
     let snap = probe_status(workspace);
     if let Ok(mut guard) = cache().lock() {
-        *guard = snap;
+        *guard = snap.clone();
     }
+    snap
 }
 
-fn probe_status(workspace: &Path) -> GitStatusSnapshot {
+pub(crate) fn probe_status(workspace: &Path) -> GitStatusSnapshot {
     let mut snap = GitStatusSnapshot {
         fetched_at: Some(Instant::now()),
         probed_workspace: Some(workspace.to_path_buf()),
@@ -130,42 +436,44 @@ fn probe_status(workspace: &Path) -> GitStatusSnapshot {
     }
 
     // Resolve git root.
-    let root = git_output(workspace, &["rev-parse", "--show-toplevel"])
-        .ok()
-        .map(|s| PathBuf::from(s.trim()));
-    let Some(root) = root else {
-        snap.error = Some("not a git repository".into());
-        return snap;
+    let root = match git_output(workspace, &["rev-parse", "--show-toplevel"]) {
+        Ok(root) => PathBuf::from(root.trim()),
+        Err(error) => {
+            snap.error = Some(if error.contains("not a git repository") {
+                "not a git repository".into()
+            } else {
+                format!("git unavailable: {}", error.trim())
+            });
+            return snap;
+        }
     };
     snap.root = Some(root.clone());
-    snap.repository_name = repository_name(&root);
+    let (repository_name, is_linked_worktree) = repository_identity(&root);
+    snap.repository_name = repository_name;
+    snap.is_linked_worktree = is_linked_worktree;
 
-    // Branch (symbolic-ref first, then short HEAD for detached).
-    snap.branch = git_output(&root, &["symbolic-ref", "--short", "HEAD"])
-        .ok()
-        .or_else(|| git_output(&root, &["rev-parse", "--short", "HEAD"]).ok())
-        .map(|s| s.trim().to_string());
+    // Branch, upstream, ahead/behind and every changed path: one call.
+    if let Some(status) = probe_workspace_status(&root) {
+        snap.detached = status.head.is_none();
+        snap.branch = status
+            .head
+            .clone()
+            .or_else(|| status.oid.as_deref().map(|oid| short_oid(oid).to_string()));
+        snap.has_upstream = status.upstream.is_some();
+        snap.ahead = status.ahead;
+        snap.behind = status.behind;
+        snap.dirty = !status.changes.is_clean();
+        snap.changes = status.changes;
+        snap.changed_paths = status.changed_paths;
+    }
 
     // The forge slug (`owner/name`), reusing the remote-control probe rather
     // than parsing `origin` a second time. Rides this cached probe so the
     // topbar never shells out per frame.
     snap.remote_slug = crate::remote_control::observed_git_repo(&root);
 
-    // Dirty: porcelain status (empty = clean).
-    if let Ok(status) = git_output(&root, &["status", "--porcelain"]) {
-        snap.dirty = !status.trim().is_empty();
-    }
-
-    // Ahead/behind vs upstream (best-effort).
-    if let Ok(counts) = git_output(
-        &root,
-        &["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
-    ) {
-        let mut parts = counts.split_whitespace();
-        if let (Some(behind), Some(ahead)) = (parts.next(), parts.next()) {
-            snap.behind = behind.parse().unwrap_or(0);
-            snap.ahead = ahead.parse().unwrap_or(0);
-        }
+    if let Ok(log) = git_output(&root, &["log", RECENT_COMMITS, "--format=%h%x1f%s%x1f%cr"]) {
+        snap.recent_commits = parse_recent_commits(&log);
     }
 
     // Worktrees.
@@ -224,9 +532,29 @@ fn git_output(cwd: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn repository_name(worktree_root: &Path) -> Option<String> {
-    let common_dir = git_output(worktree_root, &["rev-parse", "--git-common-dir"]).ok()?;
-    repository_name_from_common_dir(worktree_root, Path::new(common_dir.trim()))
+/// The repository's name (from the common git directory, so a linked
+/// worktree names its repository) and whether this checkout is a linked
+/// worktree, from one `rev-parse`.
+fn repository_identity(worktree_root: &Path) -> (Option<String>, bool) {
+    let Ok(paths) = git_output(
+        worktree_root,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    ) else {
+        return (None, false);
+    };
+    let mut lines = paths.lines().map(str::trim);
+    let (Some(git_dir), Some(common_dir)) = (lines.next(), lines.next()) else {
+        return (None, false);
+    };
+    (
+        repository_name_from_common_dir(worktree_root, Path::new(common_dir)),
+        git_dir != common_dir,
+    )
 }
 
 fn repository_name_from_common_dir(worktree_root: &Path, common_dir: &Path) -> Option<String> {
@@ -472,6 +800,137 @@ locked
         assert_eq!(
             repository_name_from_common_dir(Path::new("/repo"), Path::new(".git")).as_deref(),
             Some("repo")
+        );
+    }
+
+    #[test]
+    fn porcelain_v2_carries_branch_upstream_divergence_and_every_change() {
+        let raw = [
+            "# branch.oid 1234567890abcdef1234567890abcdef12345678",
+            "# branch.head main",
+            "# branch.upstream origin/main",
+            "# branch.ab +2 -1",
+            "1 M. N... 100644 100644 100644 aaa bbb src/lib.rs",
+            "1 .M N... 100644 100644 100644 aaa bbb docs/a file.md",
+            "2 R. N... 100644 100644 100644 aaa bbb R100 new.rs",
+            "old.rs",
+            "u UU N... 100644 100644 100644 100644 aaa bbb ccc conflict.rs",
+            "? scratch.txt",
+            "! target",
+            "",
+        ]
+        .join("\0");
+        let status = parse_porcelain_v2(&raw).expect("porcelain v2");
+        assert_eq!(status.head.as_deref(), Some("main"));
+        assert_eq!(status.upstream.as_deref(), Some("origin/main"));
+        assert_eq!((status.ahead, status.behind), (2, 1));
+        assert_eq!(
+            status.changes,
+            ChangeCounts {
+                staged: 3,
+                modified: 2,
+                untracked: 1,
+                conflicts: 1,
+            }
+        );
+        let paths = status
+            .changed_paths
+            .iter()
+            .map(|path| (path.code.as_str(), path.path.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                ("M ", "src/lib.rs"),
+                (" M", "docs/a file.md"),
+                ("R ", "new.rs"),
+                ("UU", "conflict.rs"),
+                ("??", "scratch.txt"),
+            ]
+        );
+        assert_eq!(
+            status_line(&status).as_deref(),
+            Some("main | 3 staged, 2 modified, 1 untracked, 1 conflicts")
+        );
+    }
+
+    #[test]
+    fn porcelain_v2_detached_and_unborn_heads() {
+        let detached =
+            parse_porcelain_v2("# branch.oid 1234567890abcdef\0# branch.head (detached)\0")
+                .expect("v2");
+        assert_eq!(detached.head, None);
+        assert_eq!(
+            status_line(&detached).as_deref(),
+            Some("detached:1234567 | clean")
+        );
+        let unborn =
+            parse_porcelain_v2("# branch.oid (initial)\0# branch.head main\0").expect("v2");
+        assert_eq!(unborn.oid, None);
+        assert_eq!(status_line(&unborn).as_deref(), Some("main | clean"));
+        // Porcelain v1 (a git too old for v2) has no branch header: the
+        // caller falls back to the old calls.
+        assert_eq!(parse_porcelain_v2(" M src/lib.rs\n?? new.rs\n"), None);
+        let (counts, paths) = parse_porcelain_v1(" M src/lib.rs\n?? new.rs\n");
+        assert_eq!((counts.modified, counts.untracked), (1, 1));
+        assert_eq!(paths[1].path, "new.rs");
+    }
+
+    #[test]
+    fn recent_commits_parse_the_unit_separated_log() {
+        let commits = parse_recent_commits("abc1234\u{1f}fix: a thing\u{1f}3 hours ago\nbad\n");
+        assert_eq!(
+            commits,
+            [RecentCommit {
+                hash: "abc1234".to_string(),
+                subject: "fix: a thing".to_string(),
+                when: "3 hours ago".to_string(),
+            }]
+        );
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let mut all = vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ];
+        all.extend_from_slice(args);
+        git_output(dir, &all).expect("git");
+    }
+
+    /// One probe of a real repository: branch, changes, commits, and the
+    /// badge string, through the single porcelain v2 status call.
+    #[test]
+    fn a_probe_of_a_real_repository_fills_the_git_view() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git(repo, &["init", "--initial-branch=main"]);
+        std::fs::write(repo.join("tracked.txt"), "one\n").unwrap();
+        git(repo, &["add", "tracked.txt"]);
+        git(repo, &["commit", "-m", "first commit"]);
+        std::fs::write(repo.join("tracked.txt"), "two\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+
+        let snap = probe_status(repo);
+        assert_eq!(snap.error, None);
+        assert_eq!(snap.branch.as_deref(), Some("main"));
+        assert!(!snap.detached && !snap.has_upstream && !snap.is_linked_worktree);
+        assert_eq!((snap.changes.modified, snap.changes.untracked), (1, 1));
+        assert!(snap.dirty);
+        assert_eq!(snap.recent_commits.len(), 1);
+        assert_eq!(snap.recent_commits[0].subject, "first commit");
+        assert_eq!(
+            context_line(&snap).as_deref(),
+            Some("main | 1 modified, 1 untracked")
+        );
+        // The engine's per-turn line reads the same parser and formatter.
+        assert_eq!(
+            crate::tui::workspace_context::collect(repo).as_deref(),
+            Some("main | 1 modified, 1 untracked")
         );
     }
 }

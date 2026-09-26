@@ -1439,6 +1439,18 @@ async fn submit_decided_composer_input(
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+/// Whether the git probe may run this tick: whenever the workspace-context
+/// refresh may, and also during a live turn or agent run while the Git view
+/// is the one showing (#6565). The probe is off-thread, on a 2s TTL, and
+/// takes no optional locks, so running it mid-turn cannot block the user's
+/// own git.
+pub(crate) fn git_probe_allowed(app: &App, workspace_context_refresh_allowed: bool) -> bool {
+    workspace_context_refresh_allowed
+        || (app.work_surface.panel == crate::tui::work_surface::RailPanel::Git
+            && app.work_surface.effective_placement()
+                != crate::tui::work_surface::WorkSurfacePlacement::Off)
+}
+
 pub(crate) async fn run_event_loop(
     terminal: &mut AppTerminal,
     app: &mut App,
@@ -4377,8 +4389,9 @@ pub(crate) async fn run_event_loop(
             !app.is_loading && !has_running_agents && !app.is_compacting && !app.is_purging;
         workspace_context::refresh_if_needed(app, now, allow_workspace_context_refresh);
         // Native git chrome: at most one background probe per cache TTL, never
-        // on the render path and never while a turn is live.
-        if allow_workspace_context_refresh {
+        // on the render path. While a turn is live it waits, unless the Git
+        // view is showing: that view is the live repository state (#6565).
+        if git_probe_allowed(app, allow_workspace_context_refresh) {
             static GIT_PROBE_LOCK: std::sync::OnceLock<std::sync::Mutex<Option<Instant>>> =
                 std::sync::OnceLock::new();
             let slot = GIT_PROBE_LOCK.get_or_init(|| std::sync::Mutex::new(None));

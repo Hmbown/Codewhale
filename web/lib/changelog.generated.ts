@@ -98,9 +98,10 @@ export const CHANGELOG: ChangelogRelease[] = [
           "A queued agent says why it is waiting, for example when launches are throttled after provider rate limits, and when its time budget ends (#6277).",
           "Stopping an agent that writes files keeps and names the work it had changed, as a budget stop already did (#5529).",
           "workflow(fleet:) runs Fleets saved from the Fleet UI, and finds workspace Fleets under .codewhale/fleets.",
-          "The runtime API can stop a delegated agent run from the desktop."
+          "The runtime API can stop a delegated agent run from the desktop.",
+          "The dock's GIT, FILES and NOTES views are real. GIT shows the branch and where it stands against its upstream, the changes (with their paths one Enter away), linked worktrees and the last five commits, and it keeps updating during a turn while it is open. It says \"not a git repository\" only when that is true. FILES lists the files this session edited, with their size, and the files it read. NOTES lists your /note notes. The git badge, the Git view and the model's git line…"
         ],
-        "itemCount": 5
+        "itemCount": 6
       },
       {
         "heading": "Plugins",

@@ -2386,6 +2386,9 @@ pub struct App {
     /// instead of inside the draw closure (#3908) — tens of ms per frame on
     /// NFS/SSHFS/cloud-synced homes otherwise.
     pub memory_size_hint: Option<String>,
+    /// The workspace notes (`/note`), refreshed with the workspace context
+    /// off the render path; the dock's NOTES view lists them (#6565).
+    pub workspace_notes: Vec<String>,
     /// Cached background tasks for sidebar rendering.
     pub task_panel: Vec<TaskPanelEntry>,
     pub task_panel_session_id: Option<String>,

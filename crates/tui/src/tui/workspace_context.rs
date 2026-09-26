@@ -1,12 +1,13 @@
 //! Per-workspace git context shown in the composer header.
 //!
-//! The TUI shows a "branch | clean/N modified/…" badge sourced from
-//! `git status` and `git rev-parse`. To avoid spawning git on every
-//! render, the result is cached and only refreshed every
-//! `REFRESH_SECS` seconds. The refresh prefers spawn-blocking on the
-//! current Tokio runtime; tests and non-async callers fall through to
-//! a synchronous call.
+//! The TUI shows a "branch | clean/N modified/…" badge. It is derived from
+//! the one cached git probe ([`crate::tui::git_status`]) rather than a git
+//! query of its own, so the badge, the Git view and the chrome never run two
+//! `git status` processes for the same tick (#6565). The badge is re-read
+//! every `REFRESH_SECS` seconds; the read takes the probe's cached snapshot
+//! and only probes when that snapshot is stale.
 
+#[cfg(test)]
 use crate::dependencies::{ExternalTool, Git};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -23,30 +24,29 @@ pub(crate) struct WorkspaceContextSnapshot {
     pub workspace: std::path::PathBuf,
     pub context: Option<String>,
     pub is_linked_worktree: bool,
+    /// The workspace notes (`/note`), read off the render path with the git
+    /// context on the same TTL, for the dock's NOTES view.
+    pub notes: Vec<String>,
 }
 
-fn collect_snapshot(workspace: &Path) -> WorkspaceContextSnapshot {
-    let context = collect(workspace);
-    let is_linked_worktree = context.is_some()
-        && run_git(
-            workspace,
-            &[
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-dir",
-                "--git-common-dir",
-            ],
-        )
-        .ok()
-        .is_some_and(|paths| {
-            let mut paths = paths.lines();
-            matches!((paths.next(), paths.next(), paths.next()),
-                (Some(git_dir), Some(common_dir), None) if git_dir != common_dir)
-        });
+/// Read the badge from the shared git probe: its cached snapshot while that
+/// is fresh, or a new probe. `force` re-probes regardless, for an explicit
+/// refresh after something that may have changed the tree.
+fn collect_snapshot(workspace: &Path, force: bool) -> WorkspaceContextSnapshot {
+    let snap = if force {
+        crate::tui::git_status::force_refresh(workspace)
+    } else {
+        crate::tui::git_status::refresh_if_stale(workspace)
+    };
+    let current = snap.probed_workspace.as_deref() == Some(workspace);
     WorkspaceContextSnapshot {
         workspace: workspace.to_path_buf(),
-        context,
-        is_linked_worktree,
+        context: current
+            .then(|| crate::tui::git_status::context_line(&snap))
+            .flatten(),
+        is_linked_worktree: current && snap.is_linked_worktree,
+        notes: crate::commands::read_notes(&crate::commands::notes_path(workspace))
+            .unwrap_or_default(),
     }
 }
 
@@ -56,11 +56,13 @@ fn apply_snapshot(app: &mut App, snapshot: WorkspaceContextSnapshot) {
     }
     if app.workspace_context != snapshot.context
         || app.workspace_is_linked_worktree != snapshot.is_linked_worktree
+        || app.workspace_notes != snapshot.notes
     {
         app.needs_redraw = true;
     }
     app.workspace_context = snapshot.context;
     app.workspace_is_linked_worktree = snapshot.is_linked_worktree;
+    app.workspace_notes = snapshot.notes;
 }
 
 /// Pull a fresh workspace context from disk if the cached value is
@@ -68,6 +70,10 @@ fn apply_snapshot(app: &mut App, snapshot: WorkspaceContextSnapshot) {
 /// drains any pending async result into `app.workspace_context` first
 /// so the render pass sees the latest value (#399 S1).
 pub(super) fn refresh_if_needed(app: &mut App, now: Instant, allow_refresh: bool) {
+    refresh_inner(app, now, allow_refresh, false);
+}
+
+fn refresh_inner(app: &mut App, now: Instant, allow_refresh: bool, force: bool) {
     // Completion is distinct from a missing result: losing a repository must
     // clear a stale branch, and an old workspace's refresh must not replace it.
     let completed = app
@@ -106,7 +112,7 @@ pub(super) fn refresh_if_needed(app: &mut App, now: Instant, allow_refresh: bool
         let ctx = app.workspace_context_cell.clone();
         let workspace = app.workspace.clone();
         handle.spawn_blocking(move || {
-            let result = collect_snapshot(&workspace);
+            let result = collect_snapshot(&workspace, force);
             if let Ok(mut guard) = ctx.lock() {
                 *guard = Some(result);
             }
@@ -114,7 +120,7 @@ pub(super) fn refresh_if_needed(app: &mut App, now: Instant, allow_refresh: bool
     } else {
         // No runtime — run synchronously so tests and one-shot callers
         // still get a result immediately.
-        let snapshot = collect_snapshot(&app.workspace);
+        let snapshot = collect_snapshot(&app.workspace, force);
         apply_snapshot(app, snapshot);
     }
     app.workspace_context_refreshed_at = Some(now);
@@ -159,51 +165,18 @@ pub(super) fn refresh_now(app: &mut App, now: Instant) {
         *cell = None;
     }
     app.workspace_context_refreshed_at = None;
-    refresh_if_needed(app, now, true);
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct ChangeSummary {
-    staged: usize,
-    modified: usize,
-    untracked: usize,
-    conflicts: usize,
-}
-
-impl ChangeSummary {
-    fn is_clean(&self) -> bool {
-        self.staged == 0 && self.modified == 0 && self.untracked == 0 && self.conflicts == 0
-    }
+    refresh_inner(app, now, true, true);
 }
 
 /// Build the human-readable workspace context string ("branch | status")
-/// from `git rev-parse` + `git status`. Returns `None` if the workspace
-/// is not a git repository or git itself is unavailable.
+/// from one `git status --porcelain=v2 --branch` call, through the same
+/// parser and formatter the Git view uses. Returns `None` if the workspace is
+/// not a git repository or git itself is unavailable. The engine's per-turn
+/// git line reads this.
 pub(crate) fn collect(workspace: &Path) -> Option<String> {
-    let branch = branch(workspace)?;
-    let summary = change_summary(workspace)?;
-
-    let mut parts = Vec::new();
-    if summary.staged > 0 {
-        parts.push(format!("{} staged", summary.staged));
-    }
-    if summary.modified > 0 {
-        parts.push(format!("{} modified", summary.modified));
-    }
-    if summary.untracked > 0 {
-        parts.push(format!("{} untracked", summary.untracked));
-    }
-    if summary.conflicts > 0 {
-        parts.push(format!("{} conflicts", summary.conflicts));
-    }
-
-    let status = if summary.is_clean() {
-        "clean".to_string()
-    } else {
-        parts.join(", ")
-    };
-
-    Some(format!("{branch} | {status}"))
+    crate::tui::git_status::probe_workspace_status(workspace)
+        .as_ref()
+        .and_then(crate::tui::git_status::status_line)
 }
 
 pub(crate) fn branch_from_context(context: &str) -> Option<&str> {
@@ -294,63 +267,7 @@ pub(crate) fn status_workspace_name(workspace: &Path, is_linked_worktree: bool) 
     leaf
 }
 
-pub(super) fn branch(workspace: &Path) -> Option<String> {
-    let branch = run_git(workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
-    let branch = branch.trim().to_string();
-    if branch == "HEAD" || branch.is_empty() {
-        let short_hash = run_git(workspace, &["rev-parse", "--short", "HEAD"]).ok()?;
-        let short_hash = short_hash.trim();
-        if short_hash.is_empty() {
-            return None;
-        }
-        return Some(format!("detached:{short_hash}"));
-    }
-    Some(branch)
-}
-
-fn change_summary(workspace: &Path) -> Option<ChangeSummary> {
-    let status = run_git(
-        workspace,
-        &["status", "--short", "--untracked-files=normal"],
-    )
-    .ok()?;
-
-    if status.trim().is_empty() {
-        return Some(ChangeSummary::default());
-    }
-
-    let mut summary = ChangeSummary::default();
-    for line in status.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let mut chars = line.chars();
-        let staged = chars.next()?;
-        let modified = chars.next().unwrap_or(' ');
-
-        if staged == ' ' && modified == ' ' {
-            continue;
-        }
-        if staged == '?' && modified == '?' {
-            summary.untracked = summary.untracked.saturating_add(1);
-            continue;
-        }
-
-        if staged == 'U' || modified == 'U' {
-            summary.conflicts = summary.conflicts.saturating_add(1);
-        }
-        if staged != ' ' && staged != '?' {
-            summary.staged = summary.staged.saturating_add(1);
-        }
-        if modified != ' ' && modified != '?' {
-            summary.modified = summary.modified.saturating_add(1);
-        }
-    }
-
-    Some(summary)
-}
-
+#[cfg(test)]
 fn run_git(workspace: &Path, args: &[&str]) -> std::io::Result<String> {
     let output = Git::output(args, workspace)?;
     if !output.status.success() {
@@ -479,9 +396,9 @@ mod tests {
             &["worktree", "add", "-b", "feature", linked.to_str().unwrap()],
         )
         .unwrap();
-        let ordinary = collect_snapshot(&main);
+        let ordinary = collect_snapshot(&main, false);
         assert!(!ordinary.is_linked_worktree);
-        let linked_snapshot = collect_snapshot(&linked);
+        let linked_snapshot = collect_snapshot(&linked, false);
         assert!(linked_snapshot.is_linked_worktree);
         assert_eq!(
             linked_snapshot
@@ -491,7 +408,9 @@ mod tests {
             Some("feature")
         );
         run_git(&linked, &["checkout", "--detach"]).unwrap();
-        let detached = collect_snapshot(&linked);
+        // The badge reads the shared probe's cache; a checkout forces it.
+        crate::tui::git_status::force_refresh(&linked);
+        let detached = collect_snapshot(&linked, false);
         assert!(detached.is_linked_worktree);
         assert!(
             detached
@@ -503,7 +422,7 @@ mod tests {
         );
         let outside = root.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
-        let missing = collect_snapshot(&outside);
+        let missing = collect_snapshot(&outside, false);
         assert!(missing.context.is_none());
         assert!(!missing.is_linked_worktree);
     }

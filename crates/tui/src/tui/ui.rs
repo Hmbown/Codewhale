@@ -1010,6 +1010,15 @@ async fn execute_command_input(
     }
 
     let result = commands::execute(input, app);
+    // The NOTES view reads the notes file off the render path on the
+    // workspace-context tick; a `/note` change refreshes it at once (#6565).
+    if input
+        .split_whitespace()
+        .next()
+        .is_some_and(|command| command.eq_ignore_ascii_case("/note"))
+    {
+        workspace_context::refresh_now(app, Instant::now());
+    }
     // After /logout: clear the in-memory api_key fields so the next
     // onboarding round entering a new key doesn't see the stale value
     // (#343). The on-disk side is handled by clear_api_key() inside

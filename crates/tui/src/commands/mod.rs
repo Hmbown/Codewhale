@@ -54,6 +54,7 @@ pub use traits::CommandInfo;
 /// `/fleet add` and the picker's ⇧F share these gates; the UI applies them
 /// against the live `Config`.
 pub(crate) use groups::core::fleet::{fleet_catalog_rejection, fleet_provider_rejection};
+pub(crate) use groups::memory::{notes_path, read_notes};
 pub use groups::project::share;
 
 // Voice capture plumbing shared with the hotbar and the UI event loop.
