@@ -131,7 +131,20 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
     if mode == "work-timeout" {
         // A partly consumed original deadline leaves time to persist the
         // missing-coverage receipt after the in-flight call is abandoned.
-        spec.runtime_profile.wall_deadline_ms = Some(epoch_millis_now() + 2_000);
+        //
+        // The hand-back window is the reserve `wall_deadlines` carves off the
+        // hard deadline: `wall_time_secs * 100ms`. The shared 5s budget made
+        // that only 500ms, which had to cover the digest artifact, the
+        // unreported-usage state write, the pre-report checkpoint and the
+        // loopback connect before the report reached the server. On Windows
+        // CI it did not fit, so the report fell back without reaching the
+        // server (2 requests, not 3). A 20s budget reserves 2s. The work
+        // deadline lands 2s in (more headroom than before for the first two
+        // calls), and the step API timeout below is longer than that, so the
+        // in-flight call is still abandoned by wall time, not by a step
+        // timeout.
+        spec.runtime_profile.wall_time_secs = Some(20);
+        spec.runtime_profile.wall_deadline_ms = Some(epoch_millis_now() + 4_000);
     }
     spec.launch_manifest = Some(serde_json::from_value(json!({
         "owner_session": "root", "child_id": "report-worker", "profile": spec.runtime_profile,
@@ -154,6 +167,10 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
     runtime.accept_edits = false;
     runtime.step_api_timeout = if mode == "timeout" {
         Duration::from_millis(100)
+    } else if mode == "work-timeout" {
+        // Past the 2s work deadline, and bounding the held hand-back call
+        // no tighter than the 4s hard deadline already does.
+        Duration::from_secs(5)
     } else if timeout_case {
         Duration::from_secs(2)
     } else {
