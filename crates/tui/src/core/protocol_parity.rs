@@ -698,6 +698,7 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             spawn_depth,
             model,
             route_source,
+            display_name,
         } => wire::EventMsg::AgentSpawned {
             thread_id,
             session_id,
@@ -709,6 +710,7 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             spawn_depth: *spawn_depth,
             model: model.clone(),
             route_source: route_source.clone(),
+            display_name: display_name.clone(),
         },
         Event::AgentProgress {
             owner_session_id,
@@ -742,6 +744,7 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             // Child usage stays off the wire: no protocol client consumes
             // it, and metrics reads the persisted runtime payload (#6315).
             usage: _,
+            display_name,
         } => wire::EventMsg::AgentComplete {
             thread_id,
             session_id,
@@ -754,6 +757,7 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             parent_run_id: parent_run_id.clone(),
             spawn_depth: *spawn_depth,
             continuable: *continuable,
+            display_name: display_name.clone(),
         },
         Event::SubAgentFollowUp {
             owner_session_id,
@@ -1264,6 +1268,7 @@ mod tests {
             (None, None),
         ] {
             let event = Event::AgentComplete {
+                display_name: None,
                 owner_session_id: "owner".into(),
                 id: "worker".into(),
                 result: "Completed successfully".into(),

@@ -127,6 +127,19 @@ pub fn resolve_candidate_install<'a>(
         };
     }
     if let Some(plugin) = registry.get(&candidate.name) {
+        if plugin.scope == crate::plugins::types::PluginScope::Builtin {
+            // A shipped bundle (Computer Use): the published "install"
+            // command must say so, not read as a failure (B5). The catalog
+            // entry still never replaces it.
+            return CatalogInstallResolution::AlreadyPresent {
+                plugin,
+                reason: format!(
+                    "'{}' is built into Codewhale, so there is nothing to install; this catalog entry does not replace it. Review it with /plugin show {}.",
+                    plugin.name(),
+                    plugin.id.as_str()
+                ),
+            };
+        }
         return CatalogInstallResolution::AlreadyPresent {
             plugin,
             reason: format!(

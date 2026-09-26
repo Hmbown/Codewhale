@@ -12,6 +12,13 @@ updates:
         patterns:
           - "windows"
           - "windows-*"
+    ignore:
+      # rusty_alloc 2.x does not compile on macOS: its unix backend passes
+      # `&mut u8` where macOS libc's `mincore` expects `*mut c_char` (seen on
+      # #6599). The dependency is opt-in behind the `rusty-alloc` feature.
+      # Drop this once upstream fixes the macOS signature.
+      - dependency-name: "rusty_alloc-api"
+        versions: [">= 2"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

@@ -97,31 +97,61 @@ pub(super) fn create_isolated_worktree(
         .unwrap_or("HEAD")
         .to_string();
     let worktree_path = resolve_worktree_path(&repo_root, &branch, request.path.as_ref())?;
-    if let Some(parent) = worktree_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
-            ToolError::execution_failed(format!(
-                "Failed to create worktree parent '{}': {err}",
-                parent.display()
-            ))
-        })?;
-    }
-
-    let path_arg = worktree_path.to_string_lossy().to_string();
-    let args = vec![
-        "worktree".to_string(),
-        "add".to_string(),
-        "-b".to_string(),
+    // One worktree implementation: the Runtime lane's (#4176). It creates the
+    // parent directory and captures git output instead of inheriting the TUI.
+    codewhale_lane::provision_worktree(&codewhale_lane::WorktreeProvision {
+        repo_root: repo_root.clone(),
         branch,
-        path_arg,
-        base_ref,
-    ];
-    run_git_checked(&repo_root, &args, "create sub-agent worktree")?;
+        path: worktree_path.clone(),
+        base_ref: Some(base_ref),
+    })
+    .map_err(|err| {
+        ToolError::execution_failed(format!("Failed to create sub-agent worktree: {err:#}"))
+    })?;
     worktree_path.canonicalize().map_err(|err| {
         ToolError::execution_failed(format!(
             "Created worktree path '{}' could not be resolved: {err}",
             worktree_path.display()
         ))
     })
+}
+
+/// Remove a finished worker's isolated worktree (and its merged branch) when
+/// the worker changed nothing in it. `changed` is the delivery-evidence
+/// inventory: `None` means git could not answer, and nothing is removed.
+/// Removal goes through the lane implementation, which only ever deletes a
+/// path git itself lists as a linked worktree (#5824).
+pub(super) fn remove_unchanged_worktree(
+    worktree: &Path,
+    changed: Option<&std::collections::BTreeSet<String>>,
+) -> bool {
+    if !changed.is_some_and(std::collections::BTreeSet::is_empty) || !worktree.exists() {
+        return false;
+    }
+    // The delivery inventory sees tracked and untracked paths but not ignored
+    // ones, and removal is forced. A fresh worktree holds no ignored files, so
+    // any (a report, a build output) was written by the worker: keep it.
+    let pristine = Git::output(
+        &[
+            "status",
+            "--porcelain",
+            "--ignored",
+            "--untracked-files=all",
+            "-z",
+        ],
+        worktree,
+    )
+    .is_ok_and(|output| output.status.success() && output.stdout.is_empty());
+    if !pristine {
+        return false;
+    }
+    if let Err(err) = codewhale_lane::remove_worktree_if_expired(worktree, Some(0), None) {
+        tracing::debug!(
+            "kept unchanged sub-agent worktree {}: {err:#}",
+            worktree.display()
+        );
+    }
+    !worktree.exists()
 }
 
 pub(super) fn git_repo_root(workspace: &Path) -> Result<PathBuf, ToolError> {

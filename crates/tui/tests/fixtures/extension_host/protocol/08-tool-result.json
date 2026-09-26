@@ -1,0 +1,20 @@
+{
+  "direction": "host_to_core",
+  "valid": true,
+  "frame": {
+    "jsonrpc": "2.0",
+    "id": 7,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"python\":\"/p\"}"
+        }
+      ],
+      "is_error": false,
+      "structured": {
+        "python": "/p"
+      }
+    }
+  }
+}

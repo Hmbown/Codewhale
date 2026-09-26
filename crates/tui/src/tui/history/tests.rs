@@ -2694,6 +2694,148 @@ fn first_file_line_reference_returns_one_match_and_resolves_it() {
     assert_eq!(line, 12);
 }
 
+/// The forms tools and models print: rustc's `-->` locator with a column,
+/// a backticked reference, and one inside a sentence with punctuation.
+#[test]
+fn file_line_reference_reads_common_forms_on_one_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("src/a.rs"), "fn a() {}\n").unwrap();
+    let expected = Some((workspace.join("src/a.rs"), 12));
+
+    for line in [
+        "  --> src/a.rs:12:5",
+        "see `src/a.rs:12` for the loop",
+        "the bug is in (src/a.rs:12), again.",
+        "src/a.rs:12: error: mismatched types",
+        "./src/a.rs:12",
+    ] {
+        assert_eq!(
+            super::file_line_reference(line, workspace),
+            expected,
+            "{line:?}"
+        );
+    }
+    assert_eq!(super::file_line_reference("src/a.rs:0", workspace), None);
+}
+
+/// Model output is not trusted to name a file: an absolute path outside the
+/// workspace and a `../` escape both used to open in `$EDITOR`.
+#[test]
+fn file_line_reference_refuses_paths_outside_the_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("ws");
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("src/in.rs"), "fn a() {}\n").unwrap();
+    let outside = root.path().join("outside.rs");
+    std::fs::write(&outside, "secret\n").unwrap();
+
+    let absolute_outside = format!("{}:3", outside.display());
+    assert_eq!(
+        super::file_line_reference(&absolute_outside, &workspace),
+        None
+    );
+    assert_eq!(
+        super::file_line_reference("../outside.rs:3", &workspace),
+        None
+    );
+    assert_eq!(
+        super::first_file_line_reference(
+            &format!("{absolute_outside}\n../outside.rs:1\n"),
+            &workspace
+        ),
+        None
+    );
+
+    let absolute_inside = format!("{}:4", workspace.join("src/in.rs").display());
+    assert_eq!(
+        super::file_line_reference(&absolute_inside, &workspace),
+        Some((workspace.join("src/in.rs"), 4)),
+        "an absolute path inside the workspace still opens"
+    );
+}
+
+/// A link inside the workspace passed the text-only check and `is_file()`
+/// followed it, so `vendor -> <outside>` or `notes.md -> <outside file>` in
+/// model output offered "Open in editor" on a file outside the workspace.
+#[cfg(unix)]
+#[test]
+fn file_line_reference_refuses_links_out_of_the_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("ws");
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.rs"), "secret\n").unwrap();
+    std::fs::write(workspace.join("src/in.rs"), "fn a() {}\n").unwrap();
+    std::os::unix::fs::symlink(&outside, workspace.join("vendor")).unwrap();
+    std::os::unix::fs::symlink(outside.join("secret.rs"), workspace.join("notes.rs")).unwrap();
+    // A link that stays inside is still a link: refused, not followed.
+    std::os::unix::fs::symlink(workspace.join("src"), workspace.join("alias")).unwrap();
+
+    for line in ["vendor/secret.rs:1", "notes.rs:1", "alias/in.rs:1"] {
+        assert_eq!(
+            super::file_line_reference(line, &workspace),
+            None,
+            "{line:?}"
+        );
+    }
+    assert_eq!(
+        super::workspace_file(&workspace, "src"),
+        None,
+        "a directory"
+    );
+    assert_eq!(
+        super::file_line_reference("src/in.rs:2", &workspace),
+        Some((workspace.join("src/in.rs"), 2))
+    );
+}
+
+/// The two escapes the review named: a directory link to `/` and links into
+/// an `.ssh` directory. The `.ssh` here is one the test creates outside the
+/// workspace with real files in it, so a follow-the-link check would find
+/// them and resolve; the test does not depend on the host's own keys.
+#[cfg(unix)]
+#[test]
+fn file_line_reference_refuses_links_to_root_and_ssh() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = &dir.path().join("ws");
+    std::fs::create_dir_all(workspace).unwrap();
+    std::os::unix::fs::symlink("/", workspace.join("rootfs")).unwrap();
+    let ssh = dir.path().join("home/.ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    std::fs::write(ssh.join("id_ed25519"), "PRIVATE KEY\n").unwrap();
+    std::fs::write(ssh.join("config"), "Host *\n").unwrap();
+    std::os::unix::fs::symlink(ssh.join("id_ed25519"), workspace.join("key.rs")).unwrap();
+    std::os::unix::fs::symlink(&ssh, workspace.join("ssh")).unwrap();
+    assert!(workspace.join("key.rs").is_file(), "the file link resolves");
+    assert!(
+        workspace.join("ssh/config").is_file(),
+        "the dir link resolves"
+    );
+
+    for line in [
+        "rootfs/etc/hosts:1",
+        "./rootfs/etc/hosts:1",
+        "key.rs:1",
+        "ssh/config:1",
+        "ssh/id_ed25519:1",
+    ] {
+        assert_eq!(
+            super::file_line_reference(line, workspace),
+            None,
+            "{line:?}"
+        );
+    }
+    let absolute = workspace.join("rootfs/etc/hosts");
+    assert_eq!(
+        super::workspace_file(workspace, absolute.to_str().unwrap()),
+        None,
+        "an absolute path through the link"
+    );
+}
+
 #[test]
 fn first_file_line_reference_skips_unresolvable_and_malformed_rows() {
     let dir = tempfile::tempdir().unwrap();

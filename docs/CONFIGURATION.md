@@ -2062,11 +2062,12 @@ reasoning contract, and all four membership ids omit generic sampling fields.
   default_selection = "allow_once"
   ```
 - `[approval] timeout_seconds` (integer, optional): bound how long an
-  interactive approval card may wait. When the window elapses the card
-  resolves to **deny** — fail-closed, matching the external approval path —
-  and the transcript records that the bound denied the call, not the
-  operator. Omitted or `0` waits indefinitely, which stays the interactive
-  default; values above 24h clamp with a warning (#6101).
+  approval may wait — the TUI card and the Runtime API approvals the desktop
+  app and web use alike. When the window elapses the call is refused
+  (fail-closed) and recorded as a timeout, not as the operator's denial.
+  Omitted or `0` waits indefinitely, which is the default everywhere: no
+  approval is ever denied on your behalf unless you set this. Values above
+  24h clamp with a warning (#6101).
 
   ```toml
   [approval]
@@ -2946,10 +2947,10 @@ schema (`minItems` / `maxItems`), its model-visible description, and the
 payload validator. A rejected payload names the key to raise, so the model can
 either resize the batch or tell the user which setting to change.
 
-### User-input / approval wait timeout
+### User-input wait timeout
 
-Questions from `request_user_input` and approval decisions wait a bounded
-time and then cancel with a timeout (#6003). The default is 300 seconds.
+Questions from `request_user_input` wait a bounded time and then cancel with
+a timeout (#6003). The default is 300 seconds.
 Raise it when you step away or read carefully, or set `0` to wait forever
 (overnight automation, long human review). Headless `exec` runs have no
 responder, so `request_user_input` is withheld there by default:
@@ -2960,9 +2961,9 @@ the model reports the tool absent and finishes instead of stalling.
 user_input_timeout_seconds = 300   # default 300; 0 disables the timeout; clamped to 86400 (24h)
 ```
 
-The one key governs both the interactive question wait and the Runtime
-approval-decision wait, and the wait is this table's only user-facing clock —
-wall-clock and stream protections elsewhere are unaffected.
+This key governs question waits only. Approvals have their own clock,
+`[approval] timeout_seconds`, which waits indefinitely unless you set it.
+Wall-clock and stream protections elsewhere are unaffected.
 
 ## Feature Flags
 

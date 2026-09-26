@@ -202,6 +202,7 @@ pub(super) fn make_worker_spec(worker_id: &str, workspace: PathBuf) -> AgentWork
         worker_id: worker_id.to_string(),
         run_id: worker_id.to_string(),
         parent_run_id: None,
+        workflow_run_id: None,
         session_name: Some(worker_id.to_string()),
         objective: "inspect the repo".to_string(),
         role: Some("explorer".to_string()),
@@ -5844,7 +5845,9 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
         "offset",
         "profile",
         "prompt",
+        "remote",
         "resume_from",
+        "runtime",
         "thinking",
         "type",
         "until",
@@ -11581,6 +11584,68 @@ fn create_isolated_worktree_creates_branch_checkout_outside_parent_repo() {
 }
 
 #[test]
+fn unchanged_isolated_worktree_is_removed_and_changed_one_is_kept() {
+    let repo = init_subagent_git_repo();
+    let worktree_home = tempdir().expect("worktree home");
+    let make = |name: &str| {
+        create_isolated_worktree(
+            repo.path(),
+            &SubAgentWorktreeRequest {
+                branch: Some(format!("codex/agent-{name}")),
+                path: Some(worktree_home.path().join(name)),
+                base_ref: None,
+            },
+            Some(name),
+            &FleetRole::Builder,
+        )
+        .expect("worktree should be created")
+    };
+    let branch_exists = |name: &str| {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/codex/agent-{name}"))
+            .current_dir(repo.path())
+            .status()
+            .expect("git rev-parse")
+            .success()
+    };
+
+    let clean = make("clean");
+    let empty = std::collections::BTreeSet::new();
+    assert!(worktree::remove_unchanged_worktree(&clean, Some(&empty)));
+    assert!(!clean.exists(), "unchanged worktree is removed");
+    assert!(!branch_exists("clean"), "its merged branch is deleted too");
+
+    let changed = make("changed");
+    let touched = std::collections::BTreeSet::from(["src/lib.rs".to_string()]);
+    assert!(!worktree::remove_unchanged_worktree(
+        &changed,
+        Some(&touched)
+    ));
+    assert!(changed.exists(), "a worktree with changes is kept");
+
+    let unknown = make("unknown");
+    assert!(!worktree::remove_unchanged_worktree(&unknown, None));
+    assert!(unknown.exists(), "no evidence means no removal");
+    assert!(branch_exists("unknown"));
+
+    // An ignored file is invisible to the delivery inventory but was still
+    // written by the worker, so the worktree is kept.
+    let ignored = make("ignored");
+    std::fs::write(repo.path().join(".git/info/exclude"), "scratch/\n").expect("exclude");
+    std::fs::create_dir_all(ignored.join("scratch")).expect("scratch dir");
+    std::fs::write(ignored.join("scratch/report.md"), "findings").expect("ignored file");
+    assert!(!worktree::remove_unchanged_worktree(&ignored, Some(&empty)));
+    assert!(ignored.join("scratch/report.md").exists());
+
+    // Never deletes a directory git does not list as a linked worktree.
+    let plain = worktree_home.path().join("plain");
+    std::fs::create_dir_all(&plain).expect("plain dir");
+    assert!(!worktree::remove_unchanged_worktree(&plain, Some(&empty)));
+    assert!(plain.exists());
+}
+
+#[test]
 fn create_isolated_worktree_rejects_invalid_branch_as_input() {
     let repo = init_subagent_git_repo();
     let worktree_home = tempdir().expect("worktree home");
@@ -15842,6 +15907,82 @@ fn terminal_results_excluding_returns_only_current_root_undelivered_agents() {
 
     let delivered = HashSet::from(["agent_root_done".to_string()]);
     assert!(manager.terminal_results_excluding(&delivered).is_empty());
+}
+
+/// The 09-23 session shape: a workflow spawned from the root turn launched
+/// five children whose `parent_run_id` was empty, so the terminal synthesis
+/// re-injected every child report after the workflow receipt had already
+/// carried them. The workflow driver owns those results; a direct child's
+/// result still reaches the parent turn.
+#[test]
+fn workflow_children_are_never_synthesized_into_the_parent_turn() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 4);
+    let current_boot = manager.current_session_boot_id.clone();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    for id in ["agent_direct_done", "agent_workflow_done"] {
+        let mut agent = SubAgent::new(
+            id.to_string(),
+            FleetRole::Worker,
+            id.to_string(),
+            make_assignment(),
+            "deepseek-v4-flash".to_string(),
+            None,
+            None,
+            input_tx.clone(),
+            tmp.path().to_path_buf(),
+            current_boot.clone(),
+        );
+        agent.status = SubAgentStatus::Completed;
+        agent.result = Some(format!("{id} report"));
+        manager.agents.insert(agent.id.clone(), agent);
+    }
+    manager.register_worker(make_worker_spec(
+        "agent_direct_done",
+        tmp.path().to_path_buf(),
+    ));
+    let mut workflow_spec = make_worker_spec("agent_workflow_done", tmp.path().to_path_buf());
+    assert!(
+        workflow_spec.parent_run_id.is_none(),
+        "spawned from the root"
+    );
+    workflow_spec.workflow_run_id = Some("workflow_d08d912f".to_string());
+    manager.register_worker(workflow_spec);
+
+    let none_delivered = HashSet::new();
+    let results = manager.terminal_results_excluding(&none_delivered);
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.agent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["agent_direct_done"],
+        "only the direct child is the parent turn's to receive"
+    );
+    assert!(manager.may_transform_next_parent_request_inner(None, &none_delivered));
+    let direct_delivered = HashSet::from(["agent_direct_done".to_string()]);
+    assert!(
+        !manager.may_transform_next_parent_request_inner(None, &direct_delivered),
+        "a settled workflow child must not hold the parent request open"
+    );
+}
+
+#[test]
+fn worker_spec_workflow_run_id_is_optional_on_disk() {
+    let mut spec = make_worker_spec("agent_wf", PathBuf::from("/tmp/ws"));
+    let legacy = serde_json::to_value(&spec).expect("serialize");
+    assert!(
+        legacy.get("workflow_run_id").is_none(),
+        "a direct child writes the same record shape as before"
+    );
+    let parsed: AgentWorkerSpec = serde_json::from_value(legacy).expect("legacy record loads");
+    assert_eq!(parsed.workflow_run_id, None);
+
+    spec.workflow_run_id = Some("workflow_1234abcd".to_string());
+    let value = serde_json::to_value(&spec).expect("serialize");
+    assert_eq!(value["workflow_run_id"], "workflow_1234abcd");
+    let parsed: AgentWorkerSpec = serde_json::from_value(value).expect("round trip");
+    assert_eq!(parsed.workflow_run_id.as_deref(), Some("workflow_1234abcd"));
 }
 
 #[tokio::test]

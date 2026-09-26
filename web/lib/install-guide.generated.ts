@@ -1,7 +1,7 @@
 // Generated from docs/INSTALL.md by scripts/derive-install.mjs. Do not edit.
 
 export const INSTALL_GUIDE = {
-  "sourceHash": "158b2b791f3194810c4288e2dbade45c4f637ae1868156b313cfc7308d0edb46",
+  "sourceHash": "33a7e5e5074245e38781997f0411a532b0a9744dd23e75b3412e87d2c7589aa1",
   "anchors": [
     "installing-codewhale",
     "60-second-quickstart-linux-or-macos",
@@ -238,7 +238,7 @@ export const INSTALL_GUIDE = {
     },
     {
       "kind": "html",
-      "text": "<p>Run <code>brew trust hmbown/deepseek-tui</code> first, or use the full name above.</p>\n<p>Tested with Homebrew 7.0.6: the install took 73 s. The formula is version\n0.10.0 and downloads the official release binaries, so there&#39;s no compile. It\nprovides <strong>both</strong> <code>codewhale</code> and <code>codew</code>, and depends on <code>node</code>, which pulled\nin 31 bottles (~560 MB) on Linux.</p>\n<ul>\n<li><strong>Upgrade:</strong> <code>brew upgrade codewhale</code>. (<code>codewhale update</code> refuses, and\nsuggests migrating.)</li>\n<li><strong>Uninstall:</strong> <code>brew uninstall codewhale &amp;&amp; brew untap Hmbown/deepseek-tui</code>.\nThis also autoremoves node and the other dependencies it pulled in. Homebrew&#39;s\ndownload cache (<code>~/.cache/Homebrew</code>, ~330 MB) stays until\n<code>brew cleanup --prune=all</code>.</li>\n</ul>\n<h3 id=\"nix-partially-tested\">Nix: partially tested</h3>\n"
+      "text": "<p>Run <code>brew trust hmbown/deepseek-tui</code> first, or use the full name above.</p>\n<p>Tested with Homebrew 7.0.6 against the v0.10.0 tap formula: the install took\n73 s. The tap formula tracks the latest release and downloads the official\nrelease binaries, so there&#39;s no compile. It provides <strong>both</strong> <code>codewhale</code> and\n<code>codew</code>. The <code>Hmbown/deepseek-tui</code> tap formula also depends on <code>node</code>, which\npulled in 31 bottles (~560 MB) on Linux. That <code>node</code> dependency belongs to\nthis tap formula only. The core TUI runs without Node; Computer Use and the JS\nexecution tool use it when it is on PATH.</p>\n<ul>\n<li><strong>Upgrade:</strong> <code>brew upgrade codewhale</code>. (<code>codewhale update</code> refuses, and\nsuggests migrating.)</li>\n<li><strong>Uninstall:</strong> <code>brew uninstall codewhale &amp;&amp; brew untap Hmbown/deepseek-tui</code>.\nThis also autoremoves the tap&#39;s node dependency and anything else it pulled\nin. Homebrew&#39;s\ndownload cache (<code>~/.cache/Homebrew</code>, ~330 MB) stays until\n<code>brew cleanup --prune=all</code>.</li>\n</ul>\n<h3 id=\"nix-partially-tested\">Nix: partially tested</h3>\n"
     },
     {
       "kind": "code",

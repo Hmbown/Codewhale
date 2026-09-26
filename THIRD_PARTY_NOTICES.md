@@ -37,3 +37,30 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## OpenAI Codex (`codex-rs`) — Apache-2.0
+
+`crates/tui/src/tui/frame_rate_limiter.rs` is adapted from Codex's TUI draw-rate
+limiter, `codex-rs/tui/src/tui/frame_rate_limiter.rs`. It was simplified for a
+poll-based render loop; the file header records the change.
+
+Upstream: <https://github.com/openai/codex>
+
+```
+Copyright 2025 OpenAI
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+The full Apache License 2.0 text ships in this repository at
+`patches/unicode-width-0.2.2/LICENSE-APACHE`.

@@ -92,6 +92,7 @@ use coord::{
 
 pub mod advisor;
 mod budget_handback;
+mod cloud_proposal;
 pub mod coord;
 mod delivery;
 mod governor;
@@ -119,8 +120,12 @@ pub use coord::{
 };
 #[allow(unused_imports)]
 pub use mailbox::{Mailbox, MailboxEnvelope, MailboxMessage, MailboxReceiver};
+pub(crate) use naming::explicit_nickname;
 use naming::generated_whale_name_base;
 pub(crate) use naming::localized_whale_display_names;
+pub(crate) use naming::subagent_display_name;
+pub(crate) use naming::subagent_result_display_name;
+pub(crate) use naming::subagent_role_label;
 #[allow(unused_imports)] // compatibility path; some consumers exist only in test builds today
 pub use naming::{
     WHALE_NICKNAMES, assign_unique_whale_name_in_locale, whale_name_for_id_in_locale,
@@ -804,6 +809,13 @@ pub struct AgentWorkerSpec {
     pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<String>,
+    /// Workflow run that launched this child, stamped before the worker is
+    /// registered. Its terminal result belongs to that run's driver, so the
+    /// parent turn must never have it synthesized a second time. Kept apart
+    /// from `parent_run_id`, which the lineage walk and manifest owner check
+    /// read. Absent on records written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
     pub objective: String,
@@ -1534,6 +1546,16 @@ fn default_subagent_artifacts(run_id: &str) -> Vec<AgentRunArtifactRef> {
     ]
 }
 
+/// Whether a settled child's result is the parent turn's to receive.
+///
+/// A nested child reports to its own parent agent, and a workflow child
+/// reports to its run's driver, which folds the result into the one workflow
+/// receipt. Synthesizing either into the root turn delivered the same report
+/// twice and billed it twice.
+fn delivers_to_parent_turn(spec: &AgentWorkerSpec) -> bool {
+    spec.parent_run_id.is_none() && spec.workflow_run_id.is_none()
+}
+
 fn normalize_worker_spec(mut spec: AgentWorkerSpec) -> AgentWorkerSpec {
     if spec.run_id.is_empty() {
         spec.run_id = spec.worker_id.clone();
@@ -1787,6 +1809,8 @@ pub(crate) struct SubAgentSpawnOptions {
     /// Checkpoint resume: preserve the interrupted child's runtime posture
     /// instead of rebuilding it from the caller's role.
     pub preserve_runtime_profile: Option<WorkerRuntimeProfile>,
+    /// Workflow run that owns this child; recorded on the worker spec.
+    pub workflow_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2343,6 +2367,7 @@ impl SubAgentTerminalDeliveryContext {
                     spawn_depth: Some(result.spawn_depth),
                     continuable: Some(subagent_checkpoint_is_continuable(result)),
                     usage: result.usage.clone(),
+                    display_name: Some(subagent_result_display_name(result)),
                 },
             );
         }
@@ -6147,6 +6172,14 @@ impl SubAgentManager {
             write_perm: record.spec.runtime_profile.permissions.write,
             deliverables,
             allowed,
+            // Only an interrupted worker with a continuable checkpoint can be
+            // resumed in the same workspace; every other terminal state is final.
+            remove_worktree_if_unchanged: record
+                .spec
+                .launch_manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.worktree)
+                && !matches!(result.status, SubAgentStatus::Interrupted(_)),
         })
     }
 
@@ -7214,6 +7247,7 @@ impl SubAgentManager {
             worker_id: agent_id.clone(),
             run_id: agent_id.clone(),
             parent_run_id: Some("parent_session".to_string()),
+            workflow_run_id: None,
             session_name: Some(name.to_string()),
             objective: "test".to_string(),
             role: None,
@@ -7763,6 +7797,7 @@ impl SubAgentManager {
             worker_id: agent_id.clone(),
             run_id: agent_id.clone(),
             parent_run_id: runtime.parent_agent_id.clone(),
+            workflow_run_id: options.workflow_run_id.clone(),
             session_name: Some(agent.session_name.clone()),
             objective: assignment.objective.clone(),
             role: assignment.role.clone(),
@@ -7888,6 +7923,16 @@ impl SubAgentManager {
                 // honestly absent rather than guessed. The model — the half
                 // that determines billing — is present either way.
                 route_source: None,
+                display_name: Some(subagent_display_name(
+                    &agent_id,
+                    agent.nickname.as_deref(),
+                    Some(agent.session_name.as_str()),
+                    &subagent_role_label(
+                        options.child_route.as_ref(),
+                        agent.assignment.role.as_deref(),
+                        &agent.agent_type,
+                    ),
+                )),
             });
         }
 
@@ -7997,7 +8042,7 @@ impl SubAgentManager {
             .filter(|agent| {
                 self.worker_records
                     .get(&agent.id)
-                    .is_none_or(|record| record.spec.parent_run_id.is_none())
+                    .is_none_or(|record| delivers_to_parent_turn(&record.spec))
             })
             .filter(|agent| !delivered_ids.contains(&agent.id))
             .map(|agent| self.snapshot_for_listing(agent))
@@ -8035,7 +8080,7 @@ impl SubAgentManager {
                 && self
                     .worker_records
                     .get(&agent.id)
-                    .is_none_or(|record| record.spec.parent_run_id.is_none())
+                    .is_none_or(|record| delivers_to_parent_turn(&record.spec))
                 && !delivered_ids.contains(&agent.id)
         })
     }
@@ -10079,6 +10124,16 @@ impl ToolSpec for AgentTool {
                     "type": "string",
                     "description": "The focused task to give the worker. A read-only role needs no write scope; a write-capable role defaults to the parent workspace unless narrowed with write_roots."
                 },
+                "runtime": {
+                    "type": "string",
+                    "enum": ["local", "cloud"],
+                    "description": "cloud only proposes a cloud PR job; nothing runs until the person types /dispatch confirm <id>. Never confirm it yourself."
+                },
+                "remote": {
+                    "type": "string",
+                    "enum": ["github", "cnb", "gitee"],
+                    "description": "cloud: PR forge."
+                },
                 "detached": {
                     "type": "boolean",
                     "description": "Default children continue after ordinary parent turn completion and remain explicitly cancellable. true additionally opts this subtree out of parent-turn cancellation; its own budgets still apply."
@@ -10263,6 +10318,11 @@ impl ToolSpec for AgentTool {
                 | AgentToolAction::Peek
                 | AgentToolAction::Wait,
             ) => ApprovalRequirement::Auto,
+            // A cloud proposal spawns and spends nothing; the person's
+            // `/dispatch confirm` is its gate.
+            Ok(AgentToolAction::Start) if cloud_proposal::is_cloud_start(input) => {
+                ApprovalRequirement::Auto
+            }
             Ok(AgentToolAction::Start) if start_requests_read_only_role(input) => {
                 ApprovalRequirement::Auto
             }
@@ -10315,7 +10375,17 @@ impl ToolSpec for AgentTool {
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let action = parse_agent_tool_action(&input)?;
         match action {
-            AgentToolAction::Start => {}
+            AgentToolAction::Start => {
+                if cloud_proposal::parse_start_runtime(&input)?
+                    == cloud_proposal::StartRuntime::Cloud
+                {
+                    return cloud_proposal::propose_cloud_run(
+                        &input,
+                        &context.workspace,
+                        self.runtime.spawn_depth,
+                    );
+                }
+            }
             AgentToolAction::Roster => {
                 let mut runtime = self.runtime.clone();
                 refresh_spawn_route_sources(&mut runtime);
@@ -11316,7 +11386,14 @@ async fn spawn_subagent_from_input(
             model: Some(effective_model),
             model_route: Some(model_route),
             child_route: Some(child_route),
-            nickname: None,
+            // A workflow child goes by its task label everywhere: the label is
+            // its explicit nickname, so every snapshot, event and host reads
+            // the same name (#6565).
+            nickname: workflow_identity
+                .and_then(|identity| identity.workflow_task_label.as_deref())
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .map(str::to_string),
             fork_context,
             max_output_tokens: spawn_request
                 .max_output_tokens
@@ -11331,6 +11408,7 @@ async fn spawn_subagent_from_input(
             checkpoint_continuation: false,
             claim_pre_namespaced: false,
             preserve_runtime_profile: None,
+            workflow_run_id: workflow_identity.map(|identity| identity.workflow_run_id.clone()),
         },
         precomputed_delivery_evidence,
     );
@@ -11612,6 +11690,15 @@ pub(crate) async fn spawn_workflow_task(
     // Suggest-level file edits for write-capable roles. Shell / network / MCP
     // still require parent auto-approve (or fail closed).
     runtime.accept_edits = true;
+    // Prefer the identity values the driver stamped; fall back to task options.
+    // The label is resolved before the spawn so the child carries it as its
+    // name from the first event on (#6565).
+    let mut identity = identity;
+    identity.workflow_task_label = identity
+        .workflow_task_label
+        .take()
+        .filter(|label| !label.trim().is_empty())
+        .or(request_label);
     let (result, mut metadata) = spawn_subagent_from_input(
         input,
         manager,
@@ -11620,11 +11707,7 @@ pub(crate) async fn spawn_workflow_task(
         Some(&identity),
     )
     .await?;
-    // Prefer the identity values the driver stamped; fall back to task options.
-    let workflow_task_label = identity
-        .workflow_task_label
-        .filter(|label| !label.trim().is_empty())
-        .or(request_label);
+    let workflow_task_label = identity.workflow_task_label;
     let workflow_phase_id = identity
         .workflow_phase_id
         .filter(|phase| !phase.trim().is_empty())
@@ -12167,10 +12250,20 @@ async fn ensure_worker_delivery_verified(
         };
         inputs
     };
-    let verification =
-        tokio::task::spawn_blocking(move || delivery::compute_delivery_verification(&inputs))
-            .await
-            .ok();
+    let verification = tokio::task::spawn_blocking(move || {
+        let mut verification = delivery::compute_delivery_verification(&inputs);
+        if inputs.remove_worktree_if_unchanged {
+            let changed = inputs.evidence.changed_paths(&inputs.workspace);
+            if worktree::remove_unchanged_worktree(&inputs.workspace, changed.as_ref()) {
+                verification
+                    .summary
+                    .push_str(" The worker's isolated worktree changed nothing and was removed.");
+            }
+        }
+        verification
+    })
+    .await
+    .ok();
     let Some(verification) = verification else {
         return;
     };

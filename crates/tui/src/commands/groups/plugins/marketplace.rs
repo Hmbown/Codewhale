@@ -200,6 +200,12 @@ fn install(
                 PluginMutationOutcome::NetworkDenied(host) => {
                     CommandResult::error(network_denied_message(&host))
                 }
+                PluginMutationOutcome::NoChange => CommandResult::message(format!(
+                    "`{}` is built into Codewhale, so there is nothing to install. \
+                     Review it with /plugin show {}.",
+                    escape_review_text(candidate_name),
+                    escape_review_text(&receipt.name)
+                )),
                 _ => CommandResult::message(format!(
                     "Installed `{}` from marketplace `{}`.",
                     escape_review_text(candidate_name),

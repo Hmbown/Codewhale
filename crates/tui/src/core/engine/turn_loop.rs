@@ -2137,7 +2137,17 @@ impl Engine {
                 normalize_schema_json_containers(&mut tool.input, schema);
             }
 
-            if !final_text.is_empty() {
+            // A zero-tool turn (plain `exec`) has no tool channel, yet a model
+            // can still answer with nothing but a tool call written as text
+            // (DeepSeek's DSML). The stream filter strips the markup and leaves
+            // at most whitespace, which is not an answer: persisting it would
+            // end the run "successfully" on a blank line, and re-requesting
+            // only reproduces the call. It is failed once below, by name.
+            let zero_tool_text_call = zero_tool_turn
+                && tool_uses.is_empty()
+                && final_text.trim().is_empty()
+                && contains_fake_tool_wrapper(&current_text_raw);
+            if !final_text.is_empty() && !zero_tool_text_call {
                 content_blocks.push(ContentBlock::Text {
                     text: final_text,
                     cache_control: None,
@@ -2648,6 +2658,7 @@ impl Engine {
                 }
 
                 if no_sendable_assistant_content
+                    && !zero_tool_text_call
                     && has_provider_reasoning
                     && should_fail_no_sendable_content(
                         tool_uses.is_empty(),
@@ -2716,6 +2727,7 @@ impl Engine {
                 // the identical request, the second carries the request-scoped
                 // nudge, and after that the turn fails visibly below.
                 let empty_clean_stop = no_sendable_assistant_content
+                    && !zero_tool_text_call
                     && !has_provider_reasoning
                     && stream_errors == 0
                     && stop_reason.is_some()
@@ -2774,7 +2786,10 @@ impl Engine {
                         false,
                     )
                 {
-                    let message = if has_provider_reasoning
+                    let message = if zero_tool_text_call {
+                        "Model answered only with a tool call, and this turn offers no tools."
+                            .to_string()
+                    } else if has_provider_reasoning
                         && stop_reason_is_output_limit(stop_reason.as_deref())
                     {
                         format!(

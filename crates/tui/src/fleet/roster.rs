@@ -9,9 +9,11 @@
 //!   consultant/custom — is seeded here, #5285),
 //! - `[fleet.profiles]` entries from config.toml,
 //! - personal `$CODEWHALE_HOME/agents/*.toml` profile files,
-//! - workspace `.codewhale/agents/*.toml` profile files.
+//! - workspace `.codewhale/agents/*.toml` profile files,
+//! - Claude Code agent files (`.claude/agents/*.md`, then `~/.claude/agents`),
+//!   which only fill ids no other layer defines.
 //!
-//! Precedence is Workspace > Personal > Config > Plugin > BuiltIn, merged by id. Loading never
+//! Precedence is Workspace > Personal > Config > Plugin > BuiltIn > Claude Code, merged by id. Loading never
 //! fails the session: an unreadable workspace profile dir degrades to the
 //! built-in + config layers with a log line.
 //!
@@ -38,13 +40,14 @@ use codewhale_config::{
 };
 
 use super::profile::{
-    AgentProfile, AgentProfileLoadIssue, load_agent_profiles_from_dir_tolerant,
+    AgentProfile, AgentProfileLoadIssue, CLAUDE_AGENT_DIR, claude_user_agent_dir,
+    load_agent_profiles_from_dir_tolerant, load_claude_agent_profiles_from_dir,
     load_plugin_agent_profiles_from_component, load_workspace_agent_profiles_tolerant,
     personal_agent_profile_dir,
 };
 
 /// Which layer a roster member came from. Higher layers override lower ones
-/// by id (Workspace > Personal > Config > Plugin > BuiltIn).
+/// by id (Workspace > Personal > Config > Plugin > BuiltIn > ClaudeCode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileOrigin {
@@ -53,6 +56,9 @@ pub enum ProfileOrigin {
     Config,
     Personal,
     Workspace,
+    /// A Claude Code agent file (`.claude/agents/*.md` or `~/.claude/agents`).
+    /// Lowest precedence: it never displaces a Codewhale definition.
+    ClaudeCode,
 }
 
 impl std::fmt::Display for ProfileOrigin {
@@ -63,6 +69,7 @@ impl std::fmt::Display for ProfileOrigin {
             Self::Config => "config",
             Self::Personal => "personal",
             Self::Workspace => "project",
+            Self::ClaudeCode => "claude",
         })
     }
 }
@@ -121,11 +128,12 @@ pub struct MultiLayerProfile {
 
 fn origin_precedence(origin: ProfileOrigin) -> u8 {
     match origin {
-        ProfileOrigin::Workspace => 4,
-        ProfileOrigin::Personal => 3,
-        ProfileOrigin::Config => 2,
-        ProfileOrigin::Plugin => 1,
-        ProfileOrigin::BuiltIn => 0,
+        ProfileOrigin::Workspace => 5,
+        ProfileOrigin::Personal => 4,
+        ProfileOrigin::Config => 3,
+        ProfileOrigin::Plugin => 2,
+        ProfileOrigin::BuiltIn => 1,
+        ProfileOrigin::ClaudeCode => 0,
     }
 }
 
@@ -206,6 +214,7 @@ impl FleetRoster {
             fleet_config,
             workspace,
             personal_dir.as_deref(),
+            claude_user_agent_dir().as_deref(),
             project_agent_profiles_enabled(),
             None,
         )
@@ -223,6 +232,7 @@ impl FleetRoster {
             fleet_config,
             workspace,
             personal_dir.as_deref(),
+            claude_user_agent_dir().as_deref(),
             project_agent_profiles_enabled(),
             Some(plugins),
         )
@@ -238,6 +248,7 @@ impl FleetRoster {
             fleet_config,
             workspace,
             personal_dir,
+            None,
             include_workspace_profiles,
             None,
         )
@@ -247,6 +258,7 @@ impl FleetRoster {
         fleet_config: &FleetConfigToml,
         workspace: &Path,
         personal_dir: Option<&Path>,
+        claude_user_dir: Option<&Path>,
         include_workspace_profiles: bool,
         plugins: Option<&crate::plugins::PluginRegistry>,
     ) -> Self {
@@ -356,6 +368,34 @@ impl FleetRoster {
                         "fleet roster: skipping workspace agent profiles: {err:#}"
                     );
                 }
+            }
+        }
+
+        // Claude Code agent files come last and only fill ids nobody else
+        // defined. The project copy (trusted project config only) is read
+        // before `~/.claude/agents`, matching Claude Code's own precedence.
+        let claude_dirs = include_workspace_profiles
+            .then(|| workspace.join(CLAUDE_AGENT_DIR))
+            .into_iter()
+            .chain(claude_user_dir.map(Path::to_path_buf));
+        for dir in claude_dirs {
+            match load_claude_agent_profiles_from_dir(&dir) {
+                Ok((profiles, issues)) => {
+                    for issue in &issues {
+                        tracing::warn!(
+                            dir = %dir.display(),
+                            "fleet roster: skipping Claude agent file: {issue}"
+                        );
+                    }
+                    profile_load_issues.extend(issues);
+                    for member in profiles {
+                        record_shadow(fill_member(&built_ins, &mut extras, member), &mut shadowed);
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    dir = %dir.display(),
+                    "fleet roster: skipping Claude agent files: {err:#}"
+                ),
             }
         }
 
@@ -743,6 +783,32 @@ pub fn layers_from_parts(member: &AgentProfile, shadowed: &[ShadowedProfile]) ->
 fn record_shadow(displaced: Option<ShadowedProfile>, shadowed: &mut Vec<ShadowedProfile>) {
     if let Some(shadow) = displaced {
         shadowed.push(shadow);
+    }
+}
+
+/// Add a lowest-precedence `member` only when no layer already defines its id.
+/// A collision keeps the existing member and records the ignored copy.
+fn fill_member(
+    built_ins: &[AgentProfile],
+    extras: &mut Vec<AgentProfile>,
+    member: AgentProfile,
+) -> Option<ShadowedProfile> {
+    let existing = built_ins
+        .iter()
+        .chain(extras.iter())
+        .find(|existing| existing.id.trim().eq_ignore_ascii_case(member.id.trim()));
+    match existing {
+        Some(existing) => Some(ShadowedProfile {
+            id: existing.id.clone(),
+            shadowed_origin: member.origin,
+            shadowed_source: member.source,
+            winner_origin: existing.origin,
+            winner_source: existing.source.clone(),
+        }),
+        None => {
+            extras.push(member);
+            None
+        }
     }
 }
 
@@ -1346,8 +1412,143 @@ mod tests {
         assert!(roster.get("nonexistent").is_none());
     }
 
+    fn write_claude_agent(dir: &Path, filename: &str, contents: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(filename), contents).unwrap();
+    }
+
+    #[test]
+    fn claude_agents_fill_gaps_at_lowest_precedence() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("ws");
+        let project_claude = workspace.join(".claude/agents");
+        let user_claude = tmp.path().join("home/.claude/agents");
+        write_claude_agent(
+            &project_claude,
+            "code-reviewer.md",
+            "---\nname: code-reviewer\ndescription: Reviews diffs\ntools: Read, Grep, Glob\nmodel: sonnet\ncolor: blue\n---\nYou review code.\n",
+        );
+        write_claude_agent(
+            &project_claude,
+            "reviewer.md",
+            "---\nname: reviewer\ndescription: would replace the built-in\n---\nNope.\n",
+        );
+        write_claude_agent(
+            &project_claude,
+            "bypass.md",
+            "---\nname: bypass\ndescription: x\npermissionMode: bypassPermissions\n---\nbody\n",
+        );
+        write_claude_agent(
+            &user_claude,
+            "code-reviewer.md",
+            "---\nname: code-reviewer\ndescription: personal copy\n---\nPersonal.\n",
+        );
+        write_claude_agent(
+            &user_claude,
+            "test-writer.md",
+            "---\nname: test-writer\ndescription: Writes tests\ntools: Read, Write, Bash\n---\nWrite tests.\n",
+        );
+        write_workspace_profile(
+            &workspace,
+            "writer.toml",
+            "id = \"writer\"\nbase_role = \"implement\"\n",
+        );
+
+        let roster = FleetRoster::load_with_personal_dir_and_plugins(
+            &FleetConfigToml::default(),
+            &workspace,
+            None,
+            Some(&user_claude),
+            true,
+            None,
+        );
+
+        let reviewer = roster.get("code-reviewer").expect("project Claude agent");
+        assert_eq!(reviewer.origin, ProfileOrigin::ClaudeCode);
+        assert_eq!(reviewer.source, project_claude.join("code-reviewer.md"));
+        assert_eq!(reviewer.description.as_deref(), Some("Reviews diffs"));
+        assert_eq!(reviewer.profile.role.name, "explore");
+        assert_eq!(
+            reviewer.profile.role.instructions.as_deref(),
+            Some("You review code.")
+        );
+        assert_eq!(reviewer.profile.model, None, "Claude model aliases inherit");
+        assert_eq!(
+            reviewer.profile.permissions,
+            FleetProfilePermissions::default()
+        );
+
+        let writer = roster.get("test-writer").expect("user Claude agent");
+        assert_eq!(writer.profile.role.name, "implement");
+        assert!(!writer.profile.permissions.allow_shell);
+        assert!(!writer.profile.permissions.trust);
+
+        // Built-ins and Codewhale files always win; the Claude copy is logged.
+        let builtin = roster.get("reviewer").unwrap();
+        assert_eq!(builtin.origin, ProfileOrigin::BuiltIn);
+        assert!(
+            roster
+                .shadowed()
+                .iter()
+                .any(|shadow| shadow.id == "reviewer"
+                    && shadow.shadowed_origin == ProfileOrigin::ClaudeCode
+                    && shadow.winner_origin == ProfileOrigin::BuiltIn)
+        );
+        assert!(
+            roster
+                .shadowed()
+                .iter()
+                .any(|shadow| shadow.id == "code-reviewer"
+                    && shadow.shadowed_source == user_claude.join("code-reviewer.md"))
+        );
+        assert_eq!(
+            roster.get("writer").unwrap().origin,
+            ProfileOrigin::Workspace
+        );
+
+        // Unmapped frontmatter is a visible load issue, not a silent load.
+        assert!(roster.get("bypass").is_none());
+        assert!(roster.resolve_member("bypass").is_err());
+        assert!(
+            roster
+                .profile_load_issues()
+                .iter()
+                .any(|issue| issue.id == "bypass" && issue.detail.contains("permissionmode"))
+        );
+        // A lowest-precedence failure never blocks a higher layer.
+        assert!(roster.resolve_member("reviewer").unwrap().is_some());
+    }
+
+    #[test]
+    fn untrusted_project_skips_project_claude_agents_only() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("ws");
+        let user_claude = tmp.path().join("home/.claude/agents");
+        write_claude_agent(
+            &workspace.join(".claude/agents"),
+            "project-agent.md",
+            "---\nname: project-agent\ndescription: p\n---\nbody\n",
+        );
+        write_claude_agent(
+            &user_claude,
+            "user-agent.md",
+            "---\nname: user-agent\ndescription: u\n---\nbody\n",
+        );
+        let roster = FleetRoster::load_with_personal_dir_and_plugins(
+            &FleetConfigToml::default(),
+            &workspace,
+            None,
+            Some(&user_claude),
+            false,
+            None,
+        );
+        assert!(roster.get("project-agent").is_none());
+        assert!(roster.get("user-agent").is_some());
+    }
+
     #[test]
     fn origin_labels_are_stable() {
+        assert_eq!(ProfileOrigin::ClaudeCode.to_string(), "claude");
         assert_eq!(ProfileOrigin::BuiltIn.to_string(), "built-in");
         assert_eq!(ProfileOrigin::Config.to_string(), "config");
         assert_eq!(ProfileOrigin::Personal.to_string(), "personal");

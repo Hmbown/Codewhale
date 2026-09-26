@@ -28,18 +28,19 @@ pub(super) fn render_bundle_detail(
     let unsupported = if detail.unsupported_labels.is_empty() {
         "none".to_string()
     } else {
-        detail.unsupported_labels.join(", ")
+        display_component_labels(&detail.unsupported_labels)
     };
     let active_components = if detail.active {
         let labels = &detail.supported_labels;
         if labels.is_empty() {
             "none".to_string()
         } else {
-            labels.join(", ")
+            display_component_labels(labels)
         }
     } else {
         "none".to_string()
     };
+    let extension_host = crate::plugins::activation::extension_host_policy_enabled();
     let (content_hash, capability_hash) = if include_hashes {
         (
             detail.content_hash.as_str(),
@@ -76,16 +77,37 @@ pub(super) fn render_bundle_detail(
         .collect::<Vec<_>>();
     let _ = write!(
         output,
-        "\nCompatibility: {}\nActive components: [{active_components}]\nInactive components: [{unsupported}]\nQualified skills: [{}]\nActivation boundary: trust stages the exact reviewed content but does not activate it; enable rebuilds this workspace's Skills, MCP, Commands, Agents, and Hooks immediately. Every plugin command dispatch, Agent spawn, Hook process start, Skill use, and MCP call rechecks current authority. LSP, native, filesystem-roots, and lifecycle-mutation stay inventoried and inactive.",
+        "\nCompatibility: {}\nActive components: [{active_components}]\nInactive components: [{unsupported}]\nQualified skills: [{}]\nActivation boundary: trust stages the exact reviewed content but does not activate it; enable rebuilds this workspace's Skills, MCP, Commands, Agents, and Hooks immediately. Every plugin command dispatch, Agent spawn, Hook process start, Skill use, and MCP call rechecks current authority. {}",
         detail.compatibility,
         if skills.is_empty() {
             "none".to_string()
         } else {
             skills.join(", ")
+        },
+        if extension_host {
+            "Native host code (JavaScript) runs in the experimental extension host with your user permissions (sandboxed where the OS sandbox is available); extension tools are never auto-approved by the plugin itself, and each call needs approval under your approval mode. LSP, filesystem-roots, and lifecycle-mutation stay inventoried and inactive."
+        } else {
+            "LSP, native, filesystem-roots, and lifecycle-mutation stay inventoried and inactive."
         }
     );
     append_diagnostics(presentation, &mut output, &detail.diagnostics);
     output
+}
+
+/// Component labels for review text. With the experimental extension host
+/// on, `native` is shown by what it is; with it off the text is unchanged.
+/// The hashed label itself (`PluginActivationCapability::as_str`) never
+/// changes.
+fn display_component_labels(labels: &[String]) -> String {
+    let extension_host = crate::plugins::activation::extension_host_policy_enabled();
+    labels
+        .iter()
+        .map(|label| match label.as_str() {
+            "native" if extension_host => "native (host code: JavaScript)",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn render_permissions(detail: &PluginDetail) -> String {

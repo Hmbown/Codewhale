@@ -1236,6 +1236,21 @@ exec_policy = true
                         # (#4196). On by default; the agent decides when to spend
                         # the extra reasoning, so cost is only incurred on demand.
                         # Set false to remove it from the model's tool catalog.
+# extension_host = false # EXPERIMENTAL. Run reviewed plugins' `native` host code
+                        # (TypeScript/JavaScript, Cordis/DSH plugin model) in a
+                        # Node.js sidecar. Tools only in this phase; every
+                        # extension tool always asks for approval. On macOS
+                        # the host runs under Seatbelt (no network, no reads of
+                        # ~/.codewhale secrets/credentials/config/sessions,
+                        # writes only to its data dir and temp dirs); on Linux
+                        # and Windows it runs with your user permissions.
+                        # Toggling this changes the plugin activation policy,
+                        # so every plugin must be re-reviewed afterwards.
+
+# [extension_host]
+# node = "/usr/local/bin/node"  # Node.js ^22.19 || >=24. Tried first; otherwise
+#                               # every `node` on PATH is tried in order and the
+#                               # first that runs and meets the floor is used.
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Vision Model Configuration (optional)

@@ -483,6 +483,7 @@ pub fn fleet_task_to_worker_spec_with_profiles(
         worker_id: worker_id.to_string(),
         run_id: run_id.to_string(),
         parent_run_id: None,
+        workflow_run_id: None,
         session_name: Some(session_name),
         objective,
         role,
@@ -1573,6 +1574,7 @@ fn profile_origin_label(origin: crate::fleet::roster::ProfileOrigin) -> &'static
         crate::fleet::roster::ProfileOrigin::Config => "config",
         crate::fleet::roster::ProfileOrigin::Personal => "personal",
         crate::fleet::roster::ProfileOrigin::Workspace => "workspace",
+        crate::fleet::roster::ProfileOrigin::ClaudeCode => "claude",
     }
 }
 
@@ -4778,6 +4780,7 @@ mod tests {
             worker_id: "w1".to_string(),
             run_id: "r1".to_string(),
             parent_run_id: None,
+            workflow_run_id: None,
             session_name: None,
             objective: "test".to_string(),
             role: None,
@@ -4809,6 +4812,7 @@ mod tests {
             worker_id: "w1".to_string(),
             run_id: "r1".to_string(),
             parent_run_id: None,
+            workflow_run_id: None,
             session_name: None,
             objective: "test".to_string(),
             role: None,
@@ -4919,6 +4923,7 @@ mod tests {
             worker_id: "w1".to_string(),
             run_id: "r1".to_string(),
             parent_run_id: None,
+            workflow_run_id: None,
             session_name: None,
             objective: "do the thing".to_string(),
             role: None,

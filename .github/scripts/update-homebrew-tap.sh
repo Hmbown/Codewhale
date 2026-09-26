@@ -9,7 +9,8 @@
 #   TAG       – git tag, e.g. "v0.8.31"
 #   MANIFEST  – path to codewhale-artifacts-sha256.txt
 #   TAP_REPO  – owner/repo of the Homebrew tap
-#   TOKEN     – PAT with contents:write on TAP_REPO (optional; skips if unset)
+#   TOKEN     – PAT with contents:write on TAP_REPO (required unless
+#               FORMULA_OUTPUT renders locally for contract tests)
 #   FORMULA_OUTPUT – optional local render path used by contract tests
 #   FORMULA_LEGACY_OUTPUT – optional local render path for the alias formula
 
@@ -20,8 +21,8 @@ set -euo pipefail
 : "${TAP_REPO:?}"
 
 if [ -z "${TOKEN:-}" ] && [ -z "${FORMULA_OUTPUT:-}" ]; then
-  echo "No Homebrew tap token configured; skipping."
-  exit 0
+  echo "::error::No Homebrew tap token (TOKEN) configured; refusing to skip the tap update." >&2
+  exit 1
 fi
 
 VERSION="${TAG#v}"

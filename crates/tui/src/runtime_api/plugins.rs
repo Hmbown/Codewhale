@@ -516,6 +516,7 @@ async fn run_registry_mutation(
     *state.mcp_pool.lock().await = None;
 
     let fresh = registry_for_state(state);
+    crate::extension_host::plugins_changed(Arc::clone(&fresh));
     let Some(plugin) = fresh.get(selector) else {
         return Ok(PluginActionResponse {
             name: selector.to_string(),

@@ -45,14 +45,14 @@ use codewhale_command_contract::facets::{
     PluginMarketplaceCandidate, PluginMarketplaceCatalog, PluginMarketplaceInstallPlan,
     PluginMarketplaceState, PluginMcpServerDetail, PluginMcpTransport, PluginMutationOutcome,
     PluginMutationReceipt, PluginSuggestion, PluginSummary, ProjectGoalState, ProjectGoalStatus,
-    ProjectShareProjection, RelayProjection, RemoteLink, RemoteOpenOutcome, RemoteRegistryOutcome,
-    RemoteSkillEntry, RemoteStartInfo, ResumeImportReceipt, ResumeSource, ReviewOutcome,
-    SessionArchiveReceipt, SessionBranchOutcome, SessionForkFromReceipt, SessionForkReceipt,
-    SessionNewReceipt, SessionSaveReceipt, SessionSyncPayload, SessionTitleReceipt,
-    SkillActivationError, SkillActivationOutcome, SkillBundledTier, SkillEntry,
-    SkillMutationOutcome, SkillMutationReceipt, SkillRecommendation, SkillRegistryProjection,
-    SkillSourceKind, SkillSyncEntry, SkillSyncOutcome, SkillTargetScope, SnapshotEntry,
-    TitleReport, TitleSource, TodoProjection, TreeBodyProjection,
+    RelayProjection, RemoteLink, RemoteOpenOutcome, RemoteRegistryOutcome, RemoteSkillEntry,
+    RemoteStartInfo, ResumeImportReceipt, ResumeSource, ReviewOutcome, SessionArchiveReceipt,
+    SessionBranchOutcome, SessionForkFromReceipt, SessionForkReceipt, SessionNewReceipt,
+    SessionSaveReceipt, SessionSyncPayload, SessionTitleReceipt, SkillActivationError,
+    SkillActivationOutcome, SkillBundledTier, SkillEntry, SkillMutationOutcome,
+    SkillMutationReceipt, SkillRecommendation, SkillRegistryProjection, SkillSourceKind,
+    SkillSyncEntry, SkillSyncOutcome, SkillTargetScope, SnapshotEntry, TitleReport, TitleSource,
+    TodoProjection, TreeBodyProjection,
 };
 use codewhale_command_contract::facets::{
     CommandSessionExportContext, ConversationExportProjection, ExportBlock, ExportMessage,
@@ -2449,16 +2449,6 @@ impl CommandProjectContext for ProjectAdapter<'_> {
         Ok(())
     }
 
-    fn share_projection(&self) -> ProjectShareProjection {
-        let app = self.host.app.borrow();
-        ProjectShareProjection {
-            history_is_empty: app.history.is_empty(),
-            history_len: app.history.len(),
-            model: app.model.clone(),
-            mode_label: app.mode.label().to_string(),
-        }
-    }
-
     fn goal_state(&self) -> ProjectGoalState {
         let app = self.host.app.borrow();
         let pending_controls = !app.pending_goal_controls.is_empty();
@@ -4208,9 +4198,21 @@ impl CommandPluginContext for PluginAdapter<'_> {
                 ..
             } => spec,
             crate::plugins::marketplace::document::CatalogInstallResolution::AlreadyPresent {
+                plugin,
                 reason,
-                ..
             } => {
+                // Installing a bundle Codewhale ships succeeds as a no-op
+                // (B5); any other occupied name stays a refusal.
+                if plugin.scope == crate::plugins::types::PluginScope::Builtin {
+                    return Ok(PluginMutationReceipt {
+                        name: plugin.id.as_str().to_string(),
+                        path: None,
+                        content_hash: Some(plugin.content_hash.clone()),
+                        installed_content_hash: None,
+                        outcome:
+                            codewhale_command_contract::facets::PluginMutationOutcome::NoChange,
+                    });
+                }
                 return Err(escape_review_text(&reason));
             }
             crate::plugins::marketplace::document::CatalogInstallResolution::Unsupported {
@@ -5040,43 +5042,6 @@ mod tests {
             assert!(!project.lsp_enabled());
         }
         assert!(!app.lsp_enabled);
-    }
-
-    #[test]
-    fn project_adapter_share_projection_maps_history_model_and_mode() {
-        let mut app = test_app();
-        app.model = "deepseek-v4-pro".to_string();
-        app.mode = codewhale_config::AppMode::Agent;
-        let mut bundle = app.command_contexts();
-        let project = bundle
-            .parts()
-            .project
-            .expect("project facet must be present");
-
-        // Empty history → empty share branch.
-        let share = project.share_projection();
-        assert!(share.history_is_empty);
-        assert_eq!(share.history_len, 0);
-
-        // Populated history → length and labels match host exactly.
-        app.history.push(crate::tui::history::HistoryCell::User {
-            content: "hello".to_string(),
-        });
-        app.history
-            .push(crate::tui::history::HistoryCell::Assistant {
-                content: "world".to_string(),
-                streaming: false,
-            });
-        let mut bundle = app.command_contexts();
-        let project = bundle
-            .parts()
-            .project
-            .expect("project facet must be present");
-        let share = project.share_projection();
-        assert!(!share.history_is_empty);
-        assert_eq!(share.history_len, 2);
-        assert_eq!(share.model, "deepseek-v4-pro");
-        assert_eq!(share.mode_label, codewhale_config::AppMode::Agent.label());
     }
 
     #[test]

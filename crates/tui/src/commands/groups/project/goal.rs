@@ -317,7 +317,7 @@ fn goal_contextual(contexts: CommandContexts<'_>, arg: Option<&str>) -> CommandR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codewhale_command_contract::facets::{CommandProjectContext, ProjectShareProjection};
+    use codewhale_command_contract::facets::CommandProjectContext;
 
     /// Deterministic fake project facet over portable values only.
     struct FakeProject;
@@ -335,15 +335,6 @@ mod tests {
 
         fn lsp_set(&mut self, _enabled: bool) -> Result<(), String> {
             Ok(())
-        }
-
-        fn share_projection(&self) -> ProjectShareProjection {
-            ProjectShareProjection {
-                history_is_empty: true,
-                history_len: 0,
-                model: String::new(),
-                mode_label: String::new(),
-            }
         }
 
         fn goal_state(&self) -> ProjectGoalState {
