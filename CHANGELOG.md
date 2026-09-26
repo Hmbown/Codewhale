@@ -64,6 +64,13 @@ quieter, and Fleet runs can be checked before they spend anything.
 - The context meter, the point where Codewhale makes room, preflight,
   `/context` and turn receipts show one pressure number instead of disagreeing
   ([#6407](https://github.com/Hmbown/Codewhale/pull/6407)).
+- When Codewhale makes room, the note it leaves for the next turn is written in
+  its own words, under fixed headings: the objective, the user's corrections,
+  permissions and limits, changed files, what is still running and the checks
+  left. A message that quotes the note's opening words now stays in the
+  conversation instead of being dropped. If the summary request itself is too
+  large, older history is dropped but the previous note is kept, and making
+  room stops rather than write a new note without it.
 - Continuing a conversation that is already open no longer adds a second
   thread, and a fork keeps its own session file, so autosave on one side no
   longer leaves the other unloadable

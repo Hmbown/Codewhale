@@ -7,10 +7,13 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const MARKERS = [
-  "Another language model started to solve this problem",
-  "Conversation Summary (Auto-Generated)",
-];
+// Mirrors compaction.rs: a new checkpoint is the handoff-note header block
+// plus the provenance block; only the two legacy markers match by substring,
+// because older checkpoints may lack provenance.
+const MARKER = "Codewhale handoff note";
+const LEGACY_V2_MARKER = "Another language model started to solve this problem";
+const LEGACY_MARKERS = [LEGACY_V2_MARKER, "Conversation Summary (Auto-Generated)"];
+const PROVENANCE = "<!-- codewhale.compaction-checkpoint.v1 -->";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const matrix = JSON.parse(
@@ -27,9 +30,22 @@ function userTextOf(message) {
   return text || null;
 }
 
+function isWireCheckpoint(message) {
+  const blocks = message.content ?? [];
+  if (message.role !== "user" || blocks.length !== 2) return false;
+  const [header, provenance] = blocks;
+  return (
+    header.type === "text" &&
+    provenance.type === "text" &&
+    provenance.text === PROVENANCE &&
+    (header.text.startsWith(MARKER) || header.text.startsWith(LEGACY_V2_MARKER))
+  );
+}
+
 function isCheckpoint(message) {
+  if (isWireCheckpoint(message)) return true;
   const text = userTextOf(message);
-  return Boolean(text && MARKERS.some((marker) => text.includes(marker)));
+  return Boolean(text && LEGACY_MARKERS.some((marker) => text.includes(marker)));
 }
 
 function isPlainUserText(message) {

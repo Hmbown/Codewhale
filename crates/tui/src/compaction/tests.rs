@@ -13,7 +13,7 @@ fn strip_compaction_summaries_removes_only_summary_blocks() {
     };
     let summary = SystemBlock {
         block_type: "text".to_string(),
-        text: format!("{COMPACTION_SUMMARY_MARKER} and its body"),
+        text: format!("{LEGACY_V2_COMPACTION_SUMMARY_MARKER} and its body"),
         cache_control: None,
     };
     let legacy = SystemBlock {
@@ -43,6 +43,16 @@ fn strip_compaction_summaries_removes_only_summary_blocks() {
         strip_compaction_summaries(Some(&SystemPrompt::Text("plain".to_string()))),
         Some(SystemPrompt::Text("plain".to_string()))
     );
+    // Host text that quotes the new marker outside the carrier delimiters is
+    // project instruction, not a checkpoint: nothing is truncated or extracted.
+    let quoted = SystemPrompt::Text(format!(
+        "stable base prompt\nRead the {COMPACTION_SUMMARY_MARKER} before resuming.\nmore rules"
+    ));
+    assert_eq!(
+        strip_compaction_summaries(Some(&quoted)),
+        Some(quoted.clone())
+    );
+    assert!(extract_compaction_summary(Some(&quoted)).is_none());
 }
 
 #[test]
@@ -293,12 +303,12 @@ fn successor_floor_counts_retained_user_messages_not_tool_results() {
 }
 
 /// #5956: with no `[compaction] summary_instructions` configured, the
-/// summarizer prompt must stay byte-identical to the pre-#5956 constant.
+/// summarizer prompt is exactly the handoff body plus the language contract.
 #[test]
 fn compact_prompt_without_operator_instructions_is_unchanged() {
     assert_eq!(
         compact_prompt(None, None),
-        format!("{COMPACT_PROMPT} {COMPACTION_LANGUAGE_CONTRACT}")
+        format!("{} {COMPACTION_LANGUAGE_CONTRACT}", compact_prompt_body())
     );
     // Whitespace-only is unset, not an empty section.
     assert_eq!(
@@ -309,7 +319,8 @@ fn compact_prompt_without_operator_instructions_is_unchanged() {
     assert_eq!(
         compact_prompt(Some("the flaky test"), None),
         format!(
-            "{COMPACT_PROMPT} {COMPACTION_LANGUAGE_CONTRACT}\n\nThe user asked this compaction to focus on: the flaky test"
+            "{} {COMPACTION_LANGUAGE_CONTRACT}\n\nThe user asked this handoff to focus on: the flaky test",
+            compact_prompt_body()
         )
     );
 }
@@ -323,7 +334,7 @@ fn compact_prompt_appends_operator_instructions_before_focus() {
         Some("Always restate open decisions."),
     );
 
-    assert!(prompt.starts_with(COMPACT_PROMPT));
+    assert!(prompt.starts_with(&compact_prompt_body()));
     assert!(prompt.contains(OPERATOR_INSTRUCTIONS_HEADER));
     assert!(prompt.contains("Always restate open decisions."));
     assert!(prompt.contains(OPERATOR_INSTRUCTIONS_FOOTER));
@@ -439,4 +450,234 @@ fn receipt_clause_reports_the_effective_compaction_tuning() {
         ..CompactionCoverage::default()
     };
     assert!(!prune_only.receipt_clause().contains("verbatim user budget"));
+}
+
+/// Both summarizer requests ask for the same layout, the fold-in rule and the
+/// focus line, and neither is the text the note itself opens with.
+#[test]
+fn handoff_prompts_share_sections_fold_in_and_focus() {
+    let first = compact_prompt(Some("the flaky test"), None);
+    let retry = compact_quality_retry_prompt(Some("the flaky test"), None);
+    for prompt in [&first, &retry] {
+        for (heading, _) in HANDOFF_SECTIONS {
+            assert!(
+                prompt.contains(&format!("\n## {heading} - ")),
+                "{heading}: {prompt}"
+            );
+        }
+        assert!(prompt.contains(HANDOFF_FOLD_IN_RULE), "{prompt}");
+        assert!(
+            prompt.ends_with("The user asked this handoff to focus on: the flaky test"),
+            "{prompt}"
+        );
+        assert!(prompt.contains(COMPACTION_LANGUAGE_CONTRACT));
+        assert!(!prompt.contains(COMPACTION_SUMMARY_MARKER));
+        assert!(!prompt.contains(LEGACY_V2_COMPACTION_SUMMARY_MARKER));
+    }
+    assert!(first.starts_with(COMPACT_PROMPT_OPENING));
+    // Headings come in the documented order.
+    let positions = HANDOFF_SECTIONS
+        .iter()
+        .map(|(heading, _)| first.find(&format!("\n## {heading} - ")).expect(heading))
+        .collect::<Vec<_>>();
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+/// The note opens with the marker, restates no authority and ends with the
+/// continuation line, so detection and the resume contract stay intact.
+#[test]
+fn handoff_note_opens_with_marker_and_closes_with_continuation() {
+    let note = build_compaction_summary_block_text(
+        "## Objective\nShip it",
+        "\n\nUser-pinned anchors (verbatim):\nno force-push",
+    );
+    assert!(note.starts_with(COMPACTION_SUMMARY_MARKER));
+    assert!(note.starts_with(SUMMARY_HEADER));
+    assert!(note.contains("## Objective\nShip it"));
+    assert!(note.contains("no force-push"));
+    assert!(note.ends_with(SUMMARY_CLOSING));
+    assert!(!note.contains(LEGACY_V2_COMPACTION_SUMMARY_MARKER));
+}
+
+fn text_message(role: Role, text: &str) -> Message {
+    Message {
+        role,
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+    }
+}
+
+/// A user message that quotes the new marker is ordinary user text: it is
+/// retained, kept by restore, and never mistaken for a checkpoint.
+#[test]
+fn user_quote_of_new_marker_is_not_a_checkpoint() {
+    let quote = text_message(
+        Role::User,
+        &format!("What is in the {COMPACTION_SUMMARY_MARKER}? {COMPACTION_SUMMARY_MARKER}."),
+    );
+    let header_quote = text_message(
+        Role::User,
+        &build_compaction_summary_block_text("pasted by the user", ""),
+    );
+    for message in [&quote, &header_quote] {
+        assert!(!is_compaction_checkpoint_message(message));
+        assert!(!is_wire_compaction_checkpoint_message(message));
+    }
+
+    let retained = retained_user_messages(&[quote.clone(), header_quote.clone()], 10_000);
+    assert_eq!(retained, vec![quote.clone(), header_quote.clone()]);
+
+    let summary = SystemPrompt::Text(build_compaction_summary_block_text("Summary", ""));
+    let history = vec![
+        quote.clone(),
+        compaction_checkpoint_message(&summary),
+        header_quote.clone(),
+    ];
+    let restored = restore_compaction_checkpoint(history.clone(), Some(&summary));
+    assert_eq!(restored, history);
+
+    // Without a typed checkpoint the legacy cleanup runs, and it still keeps
+    // both quotes because the new marker is never matched by substring.
+    let restored = restore_compaction_checkpoint(vec![quote.clone(), header_quote.clone()], None);
+    assert_eq!(restored, vec![quote, header_quote]);
+}
+
+/// A checkpoint saved with the previous header and the provenance block is
+/// still a wire checkpoint: it keeps its boundary on restore and is replaced,
+/// not stacked, by the next pass.
+#[test]
+fn legacy_v2_checkpoint_with_provenance_is_recognised_and_replaced() {
+    let old = compaction_checkpoint_message(&SystemPrompt::Text(format!(
+        "{LEGACY_V2_COMPACTION_SUMMARY_MARKER} and produced a summary.\n\nold work"
+    )));
+    assert!(is_wire_compaction_checkpoint_message(&old));
+    assert!(is_compaction_checkpoint_message(&old));
+
+    let later = text_message(Role::User, "a later turn");
+    let fresh = SystemPrompt::Text(build_compaction_summary_block_text("new work", ""));
+    let restored = restore_compaction_checkpoint(
+        vec![text_message(Role::User, "before"), old, later.clone()],
+        Some(&fresh),
+    );
+    assert_eq!(restored.len(), 3);
+    assert!(is_wire_compaction_checkpoint_message(&restored[1]));
+    assert!(
+        user_text_of(&restored[1]).is_some_and(|text| text.starts_with(COMPACTION_SUMMARY_MARKER))
+    );
+    assert_eq!(restored[2], later);
+
+    let first = vec![
+        text_message(Role::User, "Run the suite now."),
+        text_message(Role::Assistant, "Rerunning."),
+        compaction_checkpoint_message(&SystemPrompt::Text(format!(
+            "{LEGACY_V2_COMPACTION_SUMMARY_MARKER}: first handoff"
+        ))),
+    ];
+    let replaced = last_round::build_replacement_history(
+        &first,
+        &build_compaction_summary_block_text("second handoff", ""),
+        None,
+        COMPACT_RETAINED_USER_MESSAGE_MAX_TOKENS,
+    )
+    .expect("replacement");
+    let checkpoints = replaced
+        .iter()
+        .filter(|message| is_compaction_checkpoint_message(message))
+        .collect::<Vec<_>>();
+    assert_eq!(checkpoints.len(), 1, "{replaced:?}");
+    assert!(user_text_of(checkpoints[0]).is_some_and(|text| text.contains("second handoff")));
+}
+
+/// Single-block messages carrying either legacy marker predate provenance and
+/// still count as checkpoints.
+#[test]
+fn legacy_single_block_markers_still_count_as_checkpoints() {
+    for marker in [
+        LEGACY_COMPACTION_SUMMARY_MARKER,
+        LEGACY_V2_COMPACTION_SUMMARY_MARKER,
+    ] {
+        let legacy = text_message(Role::User, &format!("{marker}\nold summary"));
+        assert!(is_compaction_checkpoint_message(&legacy), "{marker}");
+        assert!(!is_wire_compaction_checkpoint_message(&legacy), "{marker}");
+    }
+}
+
+fn tool_call(id: &str) -> Message {
+    Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "Bash".to_string(),
+            input: serde_json::json!({"command": "ls"}),
+            caller: None,
+            thought_signature: None,
+        }],
+    }
+}
+
+fn tool_output(id: &str) -> Message {
+    Message {
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: "ok".to_string(),
+            is_error: None,
+            content_blocks: None,
+        }],
+    }
+}
+
+/// An over-window retry drops history on both sides of the previous note but
+/// never the note or the handoff instruction, and stops once only those two
+/// (plus nothing droppable) remain.
+#[test]
+fn overflow_retry_keeps_the_previous_note_and_the_instruction() {
+    let note = compaction_checkpoint_message(&SystemPrompt::Text(
+        build_compaction_summary_block_text("previous note", ""),
+    ));
+    let instruction = text_message(Role::User, &compact_prompt(None, None));
+    let mut messages = vec![
+        text_message(Role::User, "older request"),
+        note.clone(),
+        tool_call("after"),
+        tool_output("after"),
+        text_message(Role::User, "latest request"),
+        instruction.clone(),
+    ];
+
+    assert!(drop_oldest_history_messages(&mut messages));
+    assert_eq!(messages[0], note);
+    assert_eq!(messages.len(), 5);
+
+    // The call right after the kept note goes, and its orphaned result with it.
+    assert!(drop_oldest_history_messages(&mut messages));
+    assert_eq!(
+        messages,
+        vec![
+            note.clone(),
+            text_message(Role::User, "latest request"),
+            instruction.clone()
+        ]
+    );
+
+    assert!(drop_oldest_history_messages(&mut messages));
+    assert_eq!(messages, vec![note.clone(), instruction.clone()]);
+
+    // Only the note and the instruction remain: nothing changes and the
+    // caller fails the pass instead of summarizing without the note.
+    assert!(!drop_oldest_history_messages(&mut messages));
+    assert_eq!(messages, vec![note, instruction.clone()]);
+
+    // Without a checkpoint the old floor holds: one history message stays.
+    let mut plain = vec![text_message(Role::User, "only"), instruction.clone()];
+    assert!(!drop_oldest_history_messages(&mut plain));
+    assert_eq!(plain.len(), 2);
+
+    // A user quote of the marker is ordinary history and can be dropped.
+    let quote = text_message(Role::User, COMPACTION_SUMMARY_MARKER);
+    let mut quoted = vec![quote, text_message(Role::User, "later"), instruction];
+    assert!(drop_oldest_history_messages(&mut quoted));
+    assert_eq!(quoted[0], text_message(Role::User, "later"));
 }

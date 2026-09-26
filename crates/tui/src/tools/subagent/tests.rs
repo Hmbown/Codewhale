@@ -18163,7 +18163,7 @@ async fn compacting_child_chat_client(
                             "total_tokens": prompt + completion
                         })
                     };
-                    let message = if wire.contains("context checkpoint compaction") {
+                    let message = if wire.contains(crate::compaction::COMPACT_PROMPT_OPENING) {
                         summaries.fetch_add(1, Ordering::SeqCst);
                         return Json(json!({
                             "id": format!("chatcmpl-compact-{attempt}"),
