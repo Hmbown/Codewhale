@@ -174,7 +174,9 @@ fn model_only_rows_use_namespaced_keys_and_preserve_unpriced_facts() {
         assert_eq!(row.source, source);
         assert!(rows.iter().all(|row| {
             row.cost.is_none()
-                && row.cost_source.is_none()
+                // A MiMo row's price is withheld by a Codewhale correction.
+                && (row.cost_source.is_none()
+                    || matches!(row.cost_source, Some(CatalogSource::CodewhaleBundled { .. })))
                 && !row.default_for_provider
                 && row.reasoning_options.is_empty()
         }));
@@ -1386,4 +1388,319 @@ fn stepfun_bundled_coding_models_preserve_default_and_plan_pricing_boundary() {
         serde_json::json!(["low", "high"])
     );
     assert_eq!(march.limit.as_ref().unwrap().output, None);
+}
+
+// ---- Codewhale corrections (#6396) -------------------------------------
+
+const LIVE_CORRECTION_FIXTURE: &str = r#"{
+  "providers": {
+    "xiaomi": {
+      "id": "xiaomi",
+      "models": {
+        "mimo-v2.6-pro": {
+          "id": "mimo-v2.6-pro",
+          "modalities": { "input": ["text", "image"], "output": ["text"] },
+          "limit": { "context": 1048576, "output": 131072 },
+          "cost": { "input": 0.435, "output": 0.87, "cache_read": 0.0036 }
+        }
+      }
+    },
+    "alibaba-token-plan": {
+      "id": "alibaba-token-plan",
+      "models": {
+        "qwen3.8-max": {
+          "id": "qwen3.8-max",
+          "limit": { "context": 1000000, "output": 131072 },
+          "cost": { "input": 0, "output": 0, "cache_read": 0, "cache_write": 0 }
+        }
+      }
+    },
+    "deepseek": {
+      "id": "deepseek",
+      "models": {
+        "deepseek-v4-pro": {
+          "id": "deepseek-v4-pro",
+          "limit": { "context": 1000000, "output": 393216 },
+          "cost": { "input": 0.435, "output": 0.87 }
+        }
+      }
+    },
+    "anthropic": {
+      "id": "anthropic",
+      "models": {
+        "claude-opus-5": {
+          "id": "claude-opus-5",
+          "limit": { "context": 1000000, "output": 128000 },
+          "cost": { "input": 5, "output": 25 }
+        }
+      }
+    }
+  }
+}"#;
+
+fn live_corrected_rows() -> Vec<CatalogOffering> {
+    let catalog = ModelsDevCatalog::parse_json(LIVE_CORRECTION_FIXTURE).expect("fixture parses");
+    live_offerings_from_models_dev(&catalog, 1_700_000_000)
+}
+
+fn codewhale_source() -> CatalogSource {
+    CatalogSource::CodewhaleBundled {
+        revision: corrections::bundled_corrections().revision.clone(),
+    }
+}
+
+#[test]
+fn committed_corrections_parse_and_name_rows_codewhale_carries() {
+    let parsed = corrections::CatalogCorrections::parse(corrections::CATALOG_CORRECTIONS_JSON)
+        .expect("committed corrections are valid");
+    let seed = bundled_offerings_from_models_dev(bundled_models_dev_catalog());
+    for rule in &parsed.providers {
+        assert!(
+            seed.iter().any(|row| row.provider == rule.provider),
+            "provider rule {} names no seed provider",
+            rule.provider
+        );
+    }
+    for correction in &parsed.models {
+        let fact = &correction.fact;
+        find(&seed, &fact.provider, &fact.id);
+    }
+}
+
+#[test]
+fn live_refresh_cannot_undo_a_withheld_price() {
+    let rows = live_corrected_rows();
+    for (provider, model) in [
+        ("xiaomi-mimo", "mimo-v2.6-pro"),
+        ("modelstudio-token-plan", "qwen3.8-max"),
+        ("deepseek", "deepseek-v4-pro"),
+    ] {
+        let row = find(&rows, provider, model);
+        assert_eq!(row.cost, None, "{provider}/{model} keeps no flat price");
+        assert!(
+            matches!(row.source, CatalogSource::ModelsDevLive { .. }),
+            "a corrected row stays on its own layer"
+        );
+        assert_eq!(row.pricing_source(), &codewhale_source());
+        assert_eq!(
+            row.to_offering().pricing,
+            crate::route::PricingSku::UnknownOrStale,
+            "{provider}/{model} must read as unknown, never as a rate or free"
+        );
+    }
+    // Facts the correction does not touch stay the live layer's.
+    let mimo = find(&rows, "xiaomi-mimo", "mimo-v2.6-pro");
+    assert_eq!(
+        mimo.modalities_source(),
+        &CatalogSource::ModelsDevLive {
+            fetched_at: 1_700_000_000
+        }
+    );
+    assert_eq!(
+        mimo.to_offering().capabilities.image_input,
+        crate::route::CapabilityState::Supported
+    );
+    assert_eq!(mimo.limit.as_ref().and_then(|l| l.context), Some(1_048_576));
+
+    // Rows no correction names are untouched.
+    let claude = find(&rows, "anthropic", "claude-opus-5");
+    assert!(matches!(claude.source, CatalogSource::ModelsDevLive { .. }));
+    assert_eq!(claude.cost.as_ref().and_then(|c| c.input), Some(5.0));
+}
+
+#[test]
+fn deepseek_output_limit_correction_holds_live_and_yields_to_signed_facts() {
+    let rows = live_corrected_rows();
+    let row = find(&rows, "deepseek", "deepseek-v4-pro").clone();
+    assert_eq!(row.limit.as_ref().and_then(|l| l.output), Some(384_000));
+    assert_eq!(row.to_offering().limits.output_tokens, Some(384_000));
+
+    let key = row.merge_key();
+    let mut map = BTreeMap::from([(key.clone(), row)]);
+    let facts = crate::cloud_facts::ScopedFacts {
+        facts_version: 1,
+        key_id: "cwf-test-only".into(),
+        models: vec![crate::cloud_facts::ModelFact {
+            provider: key.0.clone(),
+            id: key.1.clone(),
+            max_output: Some(393_216),
+            pricing: Some(crate::cloud_facts::PricingFact {
+                input_per_m: Some(0.435),
+                output_per_m: Some(0.87),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    crate::cloud_facts::catalog_patch::apply_model_patches(&mut map, &facts, 1);
+    let signed = &map[&key];
+    assert!(matches!(signed.source, CatalogSource::CloudFacts { .. }));
+    assert_eq!(signed.limit.as_ref().and_then(|l| l.output), Some(393_216));
+    assert!(matches!(
+        signed.to_offering().pricing,
+        crate::route::PricingSku::Token { .. }
+    ));
+}
+
+#[test]
+fn offline_seed_rows_carry_the_same_corrections() {
+    let rows = bundled_catalog_offerings();
+    let deepseek = find(&rows, "deepseek", "deepseek-v4-pro");
+    assert_eq!(deepseek.source, CatalogSource::Bundled);
+    assert_eq!(deepseek.pricing_source(), &codewhale_source());
+    assert_eq!(deepseek.cost, None);
+    assert_eq!(
+        deepseek.limit.as_ref().and_then(|l| l.output),
+        Some(384_000)
+    );
+    // The seed still owns the modality statement, so its low trust holds.
+    assert_eq!(deepseek.modalities_source(), &CatalogSource::Bundled);
+    assert_eq!(deepseek.modalities_source, None);
+
+    let claude = find(&rows, "anthropic", "claude-opus-5");
+    assert_eq!(claude.source, CatalogSource::Bundled);
+}
+
+#[test]
+fn corrections_never_add_or_hide_rows() {
+    let parsed = corrections::CatalogCorrections::parse(
+        r#"{
+          "revision": "test",
+          "models": [
+            { "provider": "nobody", "id": "ghost", "context_window": 9000, "reason": "r" }
+          ]
+        }"#,
+    )
+    .expect("valid");
+    let mut rows = bundled_offerings_from_models_dev(bundled_models_dev_catalog());
+    let before = rows.len();
+    parsed.apply_to(&mut rows);
+    assert_eq!(rows.len(), before);
+    assert!(!rows.iter().any(|row| row.wire_model_id == "ghost"));
+
+    for (json, why) in [
+        (
+            r#"{"revision":"t","models":[{"provider":"p","id":"m","op":"hide","pricing_withheld":"x"}]}"#,
+            "hide",
+        ),
+        (
+            r#"{"revision":"t","models":[{"provider":"p","id":"m","allow_unlisted":true,"context_window":1,"reason":"x"}]}"#,
+            "allow_unlisted",
+        ),
+        (
+            r#"{"revision":"t","models":[{"provider":"p","id":"m","max_output":1}]}"#,
+            "missing reason",
+        ),
+        (
+            r#"{"revision":"t","models":[{"provider":"p","id":"m","reason":"x"}]}"#,
+            "changes nothing",
+        ),
+        (
+            r#"{"revision":"t","models":[{"provider":"p","id":"m","note":"n","pricing_withheld":"x"}]}"#,
+            "annotation",
+        ),
+        (
+            r#"{"revision":"t","providers":[{"provider":"p","pricing_withheld":""}]}"#,
+            "empty provider reason",
+        ),
+        (r#"{"revision":"","models":[]}"#, "empty revision"),
+    ] {
+        assert!(
+            corrections::CatalogCorrections::parse(json).is_err(),
+            "{why} must be refused"
+        );
+    }
+}
+
+#[test]
+fn pricing_withheld_round_trips_and_older_payloads_still_parse() {
+    let fact = crate::cloud_facts::ModelFact {
+        provider: "p".into(),
+        id: "m".into(),
+        pricing_withheld: Some("tiered".into()),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&fact).expect("serializes");
+    assert!(json.contains("pricing_withheld"));
+    let back: crate::cloud_facts::ModelFact = serde_json::from_str(&json).expect("parses");
+    assert_eq!(back, fact);
+
+    let older: crate::cloud_facts::ModelFact =
+        serde_json::from_str(r#"{"provider":"p","id":"m","context_window":9000}"#)
+            .expect("payload without the field parses");
+    assert_eq!(older.pricing_withheld, None);
+    let plain = serde_json::to_string(&older).expect("serializes");
+    assert!(!plain.contains("pricing_withheld"));
+}
+
+#[test]
+fn reasoning_controls_correction_holds_on_a_live_row() {
+    let catalog = ModelsDevCatalog::parse_json(
+        r#"{
+          "providers": {
+            "xai": {
+              "id": "xai",
+              "models": {
+                "grok-4.6": {
+                  "id": "grok-4.6",
+                  "reasoning": true,
+                  "reasoning_options": [
+                    { "type": "effort", "values": ["low", "medium", "high", "xhigh"] }
+                  ]
+                }
+              }
+            }
+          }
+        }"#,
+    )
+    .expect("fixture parses");
+    let rows = live_offerings_from_models_dev(&catalog, 1);
+    let grok = find(&rows, "xai", "grok-4.6");
+    assert_eq!(
+        grok.reasoning_options[0]
+            .get("default")
+            .and_then(serde_json::Value::as_str),
+        Some("high"),
+        "Codewhale's documented default survives a live refresh"
+    );
+    assert!(matches!(grok.source, CatalogSource::ModelsDevLive { .. }));
+
+    // A signed annotation already on the row is kept alongside the controls.
+    let mut row = grok.clone();
+    row.reasoning_options
+        .push(serde_json::json!({ "cloud_facts": { "op": "upsert" } }));
+    let key = row.merge_key();
+    let mut map = BTreeMap::from([(key.clone(), row)]);
+    let options = vec![serde_json::json!({ "type": "effort", "values": ["high"] })];
+    crate::cloud_facts::catalog_patch::apply_model_patches(
+        &mut map,
+        &crate::cloud_facts::ScopedFacts {
+            facts_version: 1,
+            key_id: "cwf-test-only".into(),
+            models: vec![crate::cloud_facts::ModelFact {
+                provider: key.0.clone(),
+                id: key.1.clone(),
+                reasoning_options: Some(options.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        1,
+    );
+    let patched = &map[&key].reasoning_options;
+    assert_eq!(patched[0], options[0]);
+    assert!(
+        patched
+            .iter()
+            .any(|value| value.get("cloud_facts").is_some())
+    );
+
+    assert!(
+        corrections::CatalogCorrections::parse(
+            r#"{"revision":"t","models":[{"provider":"p","id":"m","reasoning_options":[]}]}"#
+        )
+        .is_err(),
+        "a reasoning correction needs a reason"
+    );
 }

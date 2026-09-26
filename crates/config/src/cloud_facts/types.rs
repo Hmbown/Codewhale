@@ -93,8 +93,20 @@ pub struct ModelFact {
     pub max_output: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<PricingFact>,
+    /// Why no price should be shown for this row. When set, the row's price
+    /// is cleared (and `pricing` is ignored), so the route reports an unknown
+    /// price instead of a flat rate that would mislead: a tiered rate, a plan
+    /// that bills quota rather than tokens, or keys whose billing surface the
+    /// catalog cannot tell apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_withheld: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
+    /// Replacement reasoning controls in the Models.dev `reasoning_options`
+    /// shape (effort ladders, thinking modes, defaults), for a row whose
+    /// upstream controls do not match what the route accepts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_options: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

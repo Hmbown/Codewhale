@@ -63,7 +63,7 @@ export const CHANGELOG: ChangelogRelease[] = [
           "web.run retries a refused page once with a browser user agent, and one site's failure no longer fails the whole call or drops its search results.",
           "Hooks treat bash, Bash and exec_shell as one tool in tool_name conditions, so the documented example fires."
         ],
-        "itemCount": 20
+        "itemCount": 21
       },
       {
         "heading": "Removed",

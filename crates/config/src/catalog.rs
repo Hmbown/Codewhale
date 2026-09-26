@@ -10,8 +10,8 @@
 //!
 //! ```text
 //! bundled Models.dev snapshot         (legacy seed, not competing truth)
-//!   < bundled Codewhale catalog       (Codewhale-owned offline snapshot)
 //!   < live Models.dev                 (public catalog, external enrichment)
+//!   < Codewhale corrections           (bundled field patches, see [`corrections`])
 //!   < signed cloud facts              (curated correction, off by default)
 //!   < live provider `/v1/models`      (credential-scoped workspace list)
 //!   < config.toml / user overrides
@@ -52,6 +52,7 @@ use crate::models_dev::{ModelsDevCatalog, ModelsDevCost, ModelsDevLimit, ModelsD
 use crate::route::{ModelId, ProviderId, ProviderModelOffering, RouteLimits, WireModelId};
 
 pub mod configured;
+pub mod corrections;
 
 /// Provenance of a catalog row. Drives layer precedence and UI provenance.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +86,10 @@ pub enum CatalogSource {
     ModelsDevLive { fetched_at: u64 },
     /// `config.toml` `[providers.*]` override (layer 30).
     ConfigOverride,
-    /// Codewhale-owned bundled catalog snapshot (offline authority seed).
+    /// A Codewhale correction ([`corrections`]) owns this price (set or
+    /// withheld). Corrections rank above both Models.dev layers, bundled and
+    /// live, and below signed cloud facts, which may still correct them. Used
+    /// as a `cost_source`: a corrected row keeps its own `source`.
     CodewhaleBundled { revision: String },
     /// Signed field patch, below provider-owned rows and explicit overrides.
     ///
@@ -287,11 +291,14 @@ pub fn bundled_models_dev_catalog() -> &'static ModelsDevCatalog {
 /// Bundled-layer [`CatalogOffering`] rows from the offline snapshot (#4188).
 ///
 /// Lowest-precedence catalog layer: every text-chat row from
-/// [`BUNDLED_MODELS_DEV_JSON`], tagged [`CatalogSource::Bundled`]. Live Models.dev
-/// rows override these on `(provider, wire_model_id)` when available.
+/// [`BUNDLED_MODELS_DEV_JSON`], tagged [`CatalogSource::Bundled`], with
+/// Codewhale's [`corrections`] applied. Live Models.dev rows override these on
+/// `(provider, wire_model_id)` when available.
 #[must_use]
 pub fn bundled_catalog_offerings() -> Vec<CatalogOffering> {
-    bundled_offerings_from_models_dev(bundled_models_dev_catalog())
+    let mut rows = bundled_offerings_from_models_dev(bundled_models_dev_catalog());
+    corrections::bundled_corrections().apply_to(&mut rows);
+    rows
 }
 
 /// Hydrate bundled [`CatalogOffering`] rows from a parsed Models.dev catalog.
@@ -317,6 +324,8 @@ pub fn bundled_offerings_from_models_dev(catalog: &ModelsDevCatalog) -> Vec<Cata
 /// is tagged [`CatalogSource::ModelsDevLive`] with the fetch timestamp, so a
 /// refresh lands on layer 10: above the bundled seed it supersedes, below the
 /// signed cloud layer that may correct it, and far below a provider roster.
+/// Codewhale's [`corrections`] are applied here as they are to the seed, so a
+/// refresh cannot undo one.
 /// Provider keys are normalized onto CodeWhale [`crate::ProviderKind`] ids when
 /// an alias match exists (`moonshotai` → `moonshot`, `togetherai` → `together`,
 /// `zhipuai` → `zai`, …); unknown Models.dev providers keep their upstream id so
@@ -334,7 +343,10 @@ pub fn live_offerings_from_models_dev(
     catalog: &ModelsDevCatalog,
     fetched_at: u64,
 ) -> Vec<CatalogOffering> {
-    offerings_from_models_dev(catalog, CatalogSource::ModelsDevLive { fetched_at }, true)
+    let mut rows =
+        offerings_from_models_dev(catalog, CatalogSource::ModelsDevLive { fetched_at }, true);
+    corrections::bundled_corrections().apply_to(&mut rows);
+    rows
 }
 
 fn offerings_from_models_dev(
@@ -743,8 +755,9 @@ impl CatalogSnapshot {
 ///
 /// ```text
 ///  0 bundled              committed models.dev-shaped snapshot
-///  5 codewhale bundled    Codewhale-owned offline snapshot
 /// 10 live models.dev      models.dev refresh
+/// 12 codewhale            bundled corrections, applied as rows 0 and 10
+///                         are hydrated (see [`corrections`])
 /// 15 cloud facts          verified field patches (default off)
 /// 20 provider             per-provider /v1/models refresh
 /// 30 config               config.toml [providers.*] overrides
@@ -764,7 +777,6 @@ impl CatalogSnapshot {
 #[derive(Debug, Clone, Default)]
 pub struct CatalogCompiler {
     bundled: Vec<CatalogOffering>,
-    codewhale_bundled: Vec<CatalogOffering>,
     models_dev_live: Vec<CatalogOffering>,
     cloud_facts: Option<(crate::cloud_facts::ScopedFacts, u64)>,
     provider_live: Vec<CatalogOffering>,
@@ -862,12 +874,7 @@ impl CatalogCompiler {
     #[must_use]
     pub fn compile(self) -> CatalogSnapshot {
         let mut merged: BTreeMap<(String, String), CatalogOffering> = BTreeMap::new();
-        for row in self
-            .bundled
-            .into_iter()
-            .chain(self.codewhale_bundled)
-            .chain(self.models_dev_live)
-        {
+        for row in self.bundled.into_iter().chain(self.models_dev_live) {
             merged.insert(row.merge_key(), row);
         }
         if let Some((facts, fetched_at)) = self.cloud_facts {
