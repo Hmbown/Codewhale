@@ -24,22 +24,38 @@
 //!   POST /v1/git/branch    — `{ "name": "…", "create"?: bool }`
 //!
 //! Mutations answer with the command output tail plus a refreshed workspace
-//! status so the client re-renders in one round trip. The caller holds the
-//! operator token; the repository's own hooks run for `commit` exactly as
-//! they would for the user's terminal.
+//! status and the full `current` detail so the client re-renders in one
+//! round trip. The caller holds the operator token; the repository's own
+//! hooks run for `commit` exactly as they would for the user's terminal.
+//!
+//! Preconditions (#6647): the detail read carries `head_oid`, `index_token`,
+//! a whole-tree `revision` and a per-row `files[].rev`. Stage, unstage,
+//! discard and commit accept an optional `expect` built from those values;
+//! when the repository no longer matches, the route answers 409
+//! `git_state_changed` with the current detail and writes nothing. Every
+//! path in this module — request paths, `files[].path`, `expect.files`
+//! keys — is workspace-relative; the one translation from git's
+//! repository-root frame is [`workspace_frame_path`].
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Query, State};
-use serde::{Deserialize, Serialize};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::dependencies::{ExternalTool as _, Git};
 
-use super::workspace::{canonical_workspace, collect_workspace_status, relative_request_path};
+use super::workspace::{
+    FILE_SERVE_MAX_BYTES, canonical_workspace, collect_workspace_status, content_revision,
+    relative_request_path,
+};
 use super::{ApiError, RuntimeApiState};
 
 /// Generous bound for local git work on very large repositories.
@@ -64,6 +80,13 @@ const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const MAX_COMMIT_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_BRANCH_NAME_BYTES: usize = 256;
 const MAX_PATH_ARGS: usize = 512;
+/// Per-read bound on working-tree bytes hashed for `files[].rev`. Rows past
+/// the budget get a stat fingerprint (`s-` token) instead of a content digest
+/// (`c-` token), so a large untracked tree cannot turn a status poll into
+/// gigabytes of reads. A token names its mode, and a precondition check
+/// recomputes in that mode, so the budget never causes a spurious 409.
+const REV_CONTENT_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+const REV_CONTENT_BUDGET_FILES: usize = 4_096;
 
 // ---------------------------------------------------------------------------
 // git invocation
@@ -178,6 +201,8 @@ fn run_git_sync(workspace: &FsPath, args: &[&str]) -> Result<String, ApiError> {
 
 #[derive(Debug, Serialize)]
 struct GitFileEntry {
+    /// Workspace-relative, like every other path on this surface. A
+    /// collapsed untracked directory keeps git's trailing `/`.
     path: String,
     /// Raw porcelain v1 index (X) and worktree (Y) columns.
     index: String,
@@ -187,8 +212,14 @@ struct GitFileEntry {
     /// Leading human state: modified / added / deleted / renamed /
     /// typechange / untracked / conflicted / ignored.
     status: &'static str,
+    /// Rename/copy source, when it lies inside the workspace.
     #[serde(skip_serializing_if = "Option::is_none")]
     old_path: Option<String>,
+    /// Opaque per-row precondition token: this row's index entries plus the
+    /// working-tree state of every file it covers (a rename's source and
+    /// every file under a collapsed untracked directory included).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rev: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -197,7 +228,15 @@ pub(super) struct GitStatusDetailResponse {
     workspace: PathBuf,
     branch: Option<String>,
     detached: bool,
+    /// Abbreviated HEAD for display. Preconditions use `head_oid`.
     head: Option<String>,
+    /// Full HEAD commit id; null on an unborn branch (or when `index_token`
+    /// is null because the tokens could not be computed).
+    head_oid: Option<String>,
+    /// Opaque token for the whole index (every stage entry, repository-wide).
+    index_token: Option<String>,
+    /// Opaque token for the whole tree: HEAD, the index and every row.
+    revision: Option<String>,
     ahead: Option<u32>,
     behind: Option<u32>,
     staged: usize,
@@ -226,6 +265,9 @@ fn collect_git_status_detail(workspace: &FsPath) -> Result<GitStatusDetailRespon
         branch: status.branch.clone(),
         detached: false,
         head: status.head,
+        head_oid: None,
+        index_token: None,
+        revision: None,
         ahead: status.ahead,
         behind: status.behind,
         staged: status.staged,
@@ -244,10 +286,15 @@ fn collect_git_status_detail(workspace: &FsPath) -> Result<GitStatusDetailRespon
             .as_deref()
             .is_some_and(|branch| branch.starts_with("detached@"));
 
+    let frame = RepoFrame::read(workspace).ok();
+    let prefix = frame.as_ref().map_or("", |frame| frame.prefix.as_str());
     // `-z` keeps paths verbatim: one NUL-terminated `XY <path>` record each,
     // with renames/copies carrying the source path in the following record.
+    let mut outside = Vec::new();
     if let Ok(porcelain) = run_git_sync(workspace, &["status", "--porcelain=v1", "-z"]) {
-        detail.files = parse_porcelain(&porcelain);
+        let (inside, beyond) = split_by_workspace(parse_porcelain(&porcelain), prefix);
+        detail.files = inside;
+        outside = beyond;
     }
     if let Ok(branches) = run_git_sync(workspace, &["branch", "--format=%(refname:short)"]) {
         detail.branches = branches
@@ -265,9 +312,24 @@ fn collect_git_status_detail(workspace: &FsPath) -> Result<GitStatusDetailRespon
             .map(str::to_string)
             .collect();
     }
+    // Tokens are best-effort on the read: a repository whose configuration
+    // cannot be read safely still gets its status, just no preconditions
+    // (`index_token: null` tells the client not to send any).
+    if let Some(frame) = frame
+        && let Ok(tokens) = compute_tokens(workspace, &frame, &mut detail.files, &outside)
+    {
+        detail.head_oid = tokens.head_oid;
+        detail.index_token = Some(tokens.index_token);
+        detail.revision = Some(tokens.revision);
+    } else {
+        for entry in &mut detail.files {
+            entry.rev = None;
+        }
+    }
     Ok(detail)
 }
 
+/// Porcelain rows in git's frame: paths are relative to the repository root.
 fn parse_porcelain(porcelain: &str) -> Vec<GitFileEntry> {
     let mut entries = Vec::new();
     let mut records = porcelain.split('\0').peekable();
@@ -292,9 +354,433 @@ fn parse_porcelain(porcelain: &str) -> Vec<GitFileEntry> {
             staged: !matches!(index, ' ' | '?' | '!'),
             status: porcelain_status(index, worktree),
             old_path,
+            rev: None,
         });
     }
     entries
+}
+
+/// Move repository-root rows into the workspace frame. Rows outside a
+/// subdirectory workspace cannot be addressed by a workspace-relative write,
+/// so they leave `files[]`; they still feed the whole-tree `revision` (as
+/// `root path + XY`) because `stage all` and `commit` reach them.
+fn split_by_workspace(
+    rows: Vec<GitFileEntry>,
+    prefix: &str,
+) -> (Vec<GitFileEntry>, Vec<(String, String)>) {
+    let mut inside = Vec::new();
+    let mut outside = Vec::new();
+    for mut row in rows {
+        match workspace_frame_path(prefix, &row.path) {
+            Some(path) => {
+                row.path = path;
+                row.old_path = row
+                    .old_path
+                    .as_deref()
+                    .and_then(|old| workspace_frame_path(prefix, old));
+                inside.push(row);
+            }
+            None => outside.push((row.path, format!("{}{}", row.index, row.worktree))),
+        }
+    }
+    (inside, outside)
+}
+
+/// The one translation from git's repository-root frame to the workspace
+/// frame. `None` means the path lies outside the workspace.
+fn workspace_frame_path(prefix: &str, root_path: &str) -> Option<String> {
+    let path = root_path.strip_prefix(prefix)?;
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+/// A row path as a precondition key: git's collapsed-directory `dir/` and a
+/// request's `dir` name the same thing.
+fn normalized_row_path(path: &str) -> &str {
+    path.trim_end_matches('/')
+}
+
+// ---------------------------------------------------------------------------
+// Precondition tokens (#6647)
+// ---------------------------------------------------------------------------
+
+/// Hardened one-shot read for token material: the review command, so
+/// fsmonitor, filters, hooks and replace-objects cannot run (or alter what
+/// the token sees) during a precondition read.
+fn review_sync(cwd: &FsPath, args: &[&str]) -> Result<std::process::Output, ApiError> {
+    let mut command = Git::review_command(cwd)
+        .map_err(|error| ApiError::internal(format!("git is unavailable: {error}")))?;
+    command
+        .args(args)
+        .output()
+        .map_err(|error| ApiError::internal(format!("failed to run git: {error}")))
+}
+
+fn review_sync_ok(cwd: &FsPath, args: &[&str]) -> Result<Vec<u8>, ApiError> {
+    let output = review_sync(cwd, args)?;
+    if !output.status.success() {
+        return Err(ApiError::internal(format!(
+            "git {} failed: {}",
+            args.iter()
+                .find(|arg| !arg.starts_with("--"))
+                .copied()
+                .unwrap_or(""),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(output.stdout)
+}
+
+/// Where the workspace sits inside its repository.
+struct RepoFrame {
+    toplevel: PathBuf,
+    /// `sub/dir/` for a subdirectory workspace, empty at the root.
+    prefix: String,
+}
+
+impl RepoFrame {
+    fn read(workspace: &FsPath) -> Result<Self, ApiError> {
+        let output = review_sync_ok(
+            workspace,
+            &["rev-parse", "--show-toplevel", "--show-prefix"],
+        )?;
+        let text = String::from_utf8_lossy(&output);
+        let mut lines = text.lines();
+        let toplevel = lines
+            .next()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .ok_or_else(|| ApiError::internal("git rev-parse returned no toplevel"))?;
+        Ok(Self {
+            toplevel: PathBuf::from(toplevel),
+            prefix: lines
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('\n')
+                .to_string(),
+        })
+    }
+}
+
+/// Full HEAD commit id, `None` on an unborn branch.
+fn head_oid(workspace: &FsPath) -> Result<Option<String>, ApiError> {
+    let output = review_sync(workspace, &["rev-parse", "--verify", "-q", "HEAD^{commit}"])?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!oid.is_empty()).then_some(oid))
+}
+
+/// The semantic index (mode, blob, stage, path — never the stat cache that
+/// `git status` rewrites), read once from the repository root with no
+/// pathspec so it covers every entry, including unmerged stages and entries
+/// outside a subdirectory workspace.
+struct IndexSnapshot {
+    token: String,
+    /// Workspace-frame path → that path's raw `ls-files --stage` records.
+    by_path: BTreeMap<String, Vec<u8>>,
+}
+
+impl IndexSnapshot {
+    fn read(frame: &RepoFrame) -> Result<Self, ApiError> {
+        let raw = review_sync_ok(&frame.toplevel, &["ls-files", "--stage", "-z"])?;
+        let mut by_path: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for record in raw.split(|byte| *byte == 0).filter(|r| !r.is_empty()) {
+            let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+                continue;
+            };
+            let root_path = String::from_utf8_lossy(&record[tab + 1..]);
+            if let Some(path) = workspace_frame_path(&frame.prefix, &root_path) {
+                let slot = by_path.entry(path).or_default();
+                slot.extend_from_slice(record);
+                slot.push(0);
+            }
+        }
+        Ok(Self {
+            token: content_revision(&raw),
+            by_path,
+        })
+    }
+
+    /// Records at `member` or anywhere below it, in path order.
+    fn records_under<'a>(&'a self, member: &'a str) -> impl Iterator<Item = (&'a str, &'a [u8])> {
+        self.by_path
+            .range::<str, _>((
+                std::ops::Bound::Included(member),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(move |(path, _)| path.starts_with(member))
+            .filter(move |(path, _)| is_at_or_under(path, member))
+            .map(|(path, records)| (path.as_str(), records.as_slice()))
+    }
+}
+
+fn is_at_or_under(path: &str, member: &str) -> bool {
+    path == member
+        || path
+            .strip_prefix(member)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RevMode {
+    /// Working-tree files are identified by a sha256 of their bytes (the
+    /// Files routes' content revision). Files above the serving limit fall
+    /// back to size + mtime.
+    Content,
+    /// Every file is identified by size + mtime (past the read budget).
+    Stat,
+}
+
+impl RevMode {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Content => "c-",
+            Self::Stat => "s-",
+        }
+    }
+
+    fn of_token(token: &str) -> Self {
+        if token.starts_with("s-") {
+            Self::Stat
+        } else {
+            Self::Content
+        }
+    }
+}
+
+/// One member path of a row (the row itself, or a rename's source) with
+/// everything its token covers.
+struct MemberListing {
+    member: String,
+    index_records: Vec<u8>,
+    /// Workspace-frame files whose working-tree state is part of the token.
+    files: BTreeSet<String>,
+}
+
+fn list_member(
+    workspace: &FsPath,
+    index: &IndexSnapshot,
+    member: &str,
+) -> Result<MemberListing, ApiError> {
+    let mut listing = MemberListing {
+        member: member.to_string(),
+        index_records: Vec::new(),
+        files: BTreeSet::new(),
+    };
+    for (path, records) in index.records_under(member) {
+        listing.index_records.extend_from_slice(records);
+        listing.files.insert(path.to_string());
+    }
+    // A path beyond a symlinked directory is not part of this repository's
+    // worktree; never read through the link.
+    if has_linked_ancestor(workspace, member) {
+        return Ok(listing);
+    }
+    match std::fs::symlink_metadata(workspace.join(member)) {
+        Ok(metadata) if metadata.is_dir() => {
+            // Untracked files below a directory (a collapsed `dir/` row, or a
+            // directory named in a request): exactly what `git add dir`
+            // would pick up, with the same ignore rules.
+            let others = review_sync_ok(
+                workspace,
+                &[
+                    "--literal-pathspecs",
+                    "ls-files",
+                    "-z",
+                    "--others",
+                    "--exclude-standard",
+                    "--",
+                    member,
+                ],
+            )?;
+            for path in others.split(|byte| *byte == 0).filter(|p| !p.is_empty()) {
+                listing
+                    .files
+                    .insert(String::from_utf8_lossy(path).into_owned());
+            }
+        }
+        Ok(_) => {
+            listing.files.insert(member.to_string());
+        }
+        Err(_) => {}
+    }
+    Ok(listing)
+}
+
+fn has_linked_ancestor(workspace: &FsPath, member: &str) -> bool {
+    let mut current = workspace.to_path_buf();
+    let mut parts = member.split('/').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+fn stat_fingerprint(metadata: &std::fs::Metadata) -> String {
+    let mtime_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    format!("stat:{}:{mtime_ns}", metadata.len())
+}
+
+/// A file's working-tree identity. Links are never followed.
+fn worktree_fingerprint(workspace: &FsPath, path: &str, mode: RevMode) -> String {
+    let full = workspace.join(path);
+    let metadata = match std::fs::symlink_metadata(&full) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return "absent".into(),
+        Err(error) => return format!("unreadable:{:?}", error.kind()),
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return match std::fs::read_link(&full) {
+            Ok(target) => format!("link:{}", target.to_string_lossy()),
+            Err(error) => format!("unreadable:{:?}", error.kind()),
+        };
+    }
+    if file_type.is_dir() {
+        return "dir".into();
+    }
+    if !file_type.is_file() {
+        return "other".into();
+    }
+    if mode == RevMode::Stat || metadata.len() > FILE_SERVE_MAX_BYTES {
+        return stat_fingerprint(&metadata);
+    }
+    match std::fs::read(&full) {
+        Ok(bytes) => content_revision(&bytes),
+        Err(error) => format!("unreadable:{:?}", error.kind()),
+    }
+}
+
+fn members_of(path: &str, old_path: Option<&str>) -> Vec<String> {
+    let mut members = BTreeSet::new();
+    members.insert(normalized_row_path(path).to_string());
+    if let Some(old) = old_path {
+        members.insert(normalized_row_path(old).to_string());
+    }
+    members.into_iter().collect()
+}
+
+fn row_rev(workspace: &FsPath, listings: &[MemberListing], mode: RevMode) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"cw-git-rev-1\0");
+    for listing in listings {
+        hasher.update(b"member\0");
+        hasher.update(listing.member.as_bytes());
+        hasher.update(b"\0index\0");
+        hasher.update(&listing.index_records);
+        hasher.update(b"\0worktree\0");
+        for file in &listing.files {
+            hasher.update(file.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(worktree_fingerprint(workspace, file, mode).as_bytes());
+            hasher.update(b"\0");
+        }
+    }
+    format!("{}{}", mode.tag(), hex(&hasher.finalize()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Running content-hash budget for one read.
+#[derive(Default)]
+struct RevBudget {
+    bytes: u64,
+    files: usize,
+}
+
+impl RevBudget {
+    /// Content mode while the whole row still fits; otherwise stat mode for
+    /// the whole row (a token has exactly one mode).
+    fn choose(&mut self, workspace: &FsPath, listings: &[MemberListing]) -> RevMode {
+        let mut bytes = 0u64;
+        let mut files = 0usize;
+        for file in listings.iter().flat_map(|listing| listing.files.iter()) {
+            if let Ok(metadata) = std::fs::symlink_metadata(workspace.join(file))
+                && metadata.is_file()
+                && metadata.len() <= FILE_SERVE_MAX_BYTES
+            {
+                bytes += metadata.len();
+                files += 1;
+            }
+        }
+        if self.bytes + bytes <= REV_CONTENT_BUDGET_BYTES
+            && self.files + files <= REV_CONTENT_BUDGET_FILES
+        {
+            self.bytes += bytes;
+            self.files += files;
+            RevMode::Content
+        } else {
+            RevMode::Stat
+        }
+    }
+}
+
+struct GitTokens {
+    head_oid: Option<String>,
+    index_token: String,
+    revision: String,
+}
+
+fn compute_tokens(
+    workspace: &FsPath,
+    frame: &RepoFrame,
+    files: &mut [GitFileEntry],
+    outside: &[(String, String)],
+) -> Result<GitTokens, ApiError> {
+    let head_oid = head_oid(workspace)?;
+    let index = IndexSnapshot::read(frame)?;
+    let mut budget = RevBudget::default();
+    for entry in files.iter_mut() {
+        let listings = members_of(&entry.path, entry.old_path.as_deref())
+            .iter()
+            .map(|member| list_member(workspace, &index, member))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mode = budget.choose(workspace, &listings);
+        entry.rev = Some(row_rev(workspace, &listings, mode));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"cw-git-revision-1\0");
+    hasher.update(head_oid.as_deref().unwrap_or("unborn").as_bytes());
+    hasher.update(b"\0");
+    hasher.update(index.token.as_bytes());
+    hasher.update(b"\0");
+    let mut rows: Vec<&GitFileEntry> = files.iter().collect();
+    rows.sort_by(|a, b| a.path.cmp(&b.path));
+    for row in rows {
+        hasher.update(row.path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(row.rev.as_deref().unwrap_or("").as_bytes());
+        hasher.update(b"\0");
+    }
+    let mut outside: Vec<&(String, String)> = outside.iter().collect();
+    outside.sort();
+    for (root_path, xy) in outside {
+        hasher.update(b"outside\0");
+        hasher.update(root_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(xy.as_bytes());
+        hasher.update(b"\0");
+    }
+    Ok(GitTokens {
+        head_oid,
+        index_token: index.token,
+        revision: hex(&hasher.finalize()),
+    })
 }
 
 fn porcelain_status(index: char, worktree: char) -> &'static str {
@@ -332,6 +818,9 @@ pub(super) async fn git_changes(
         "staged": detail.staged,
         "unstaged": detail.unstaged,
         "untracked": detail.untracked,
+        "head_oid": detail.head_oid,
+        "index_token": detail.index_token,
+        "revision": detail.revision,
         "files": detail.files,
     })))
 }
@@ -590,25 +1079,6 @@ pub(super) async fn git_graph(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct GitPathsRequest {
-    #[serde(default)]
-    paths: Vec<String>,
-    /// Stage/unstage may take the whole tree; discard cannot.
-    #[serde(default)]
-    all: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct GitCommitRequest {
-    message: String,
-    /// Also stage tracked modifications (`git commit -a`).
-    #[serde(default)]
-    all: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct GitPushRequest {
     remote: Option<String>,
     #[serde(default)]
@@ -624,7 +1094,328 @@ pub(super) struct GitBranchRequest {
     create: bool,
 }
 
-fn mutation_response(workspace: &FsPath, run: GitRun) -> Result<Json<Value>, ApiError> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GitPathsRequest {
+    #[serde(default)]
+    paths: Vec<String>,
+    /// Stage/unstage may take the whole tree; discard cannot.
+    #[serde(default)]
+    all: bool,
+    /// Optional preconditions (#6647); absent keeps the unchecked behaviour.
+    #[serde(default)]
+    expect: Option<GitExpect>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GitCommitRequest {
+    message: String,
+    /// Also stage tracked modifications (`git commit -a`).
+    #[serde(default)]
+    all: bool,
+    #[serde(default)]
+    expect: Option<GitExpect>,
+}
+
+/// What the client last read. Each present field is checked; an absent
+/// field is not. `head: null` means "HEAD must be unborn".
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GitExpect {
+    #[serde(default, deserialize_with = "present")]
+    head: Option<Option<String>>,
+    #[serde(default)]
+    index: Option<String>,
+    #[serde(default)]
+    revision: Option<String>,
+    #[serde(default)]
+    files: Option<BTreeMap<String, String>>,
+}
+
+/// Distinguishes an explicit `null` (`Some(None)`) from an absent field.
+fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+/// A validated precondition, normalized (trimmed, lowercase hex, workspace-
+/// relative file keys).
+#[derive(Debug, Default)]
+struct Preconditions {
+    head: Option<Option<String>>,
+    index: Option<String>,
+    revision: Option<String>,
+    files: Option<BTreeMap<String, String>>,
+}
+
+impl Preconditions {
+    fn is_empty(&self) -> bool {
+        self.head.is_none()
+            && self.index.is_none()
+            && self.revision.is_none()
+            && self.files.is_none()
+    }
+}
+
+fn normalized_hex(raw: &str, lengths: &[usize], field: &str) -> Result<String, ApiError> {
+    let value = raw.trim().to_ascii_lowercase();
+    if lengths.contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(value)
+    } else {
+        Err(ApiError::bad_request(format!(
+            "expect.{field} must be a token read from GET /v1/git"
+        )))
+    }
+}
+
+/// Where the preconditions are being applied, for the rules that differ.
+enum ExpectTarget<'a> {
+    /// Stage/unstage/discard with explicit, validated paths.
+    Paths(&'a [String]),
+    /// Stage/unstage of the whole tree.
+    AllPaths,
+    Commit,
+}
+
+/// Validate `expect` before any lock or git call; every failure is a 400 and
+/// nothing is written.
+fn validate_expect(
+    expect: Option<GitExpect>,
+    target: ExpectTarget<'_>,
+) -> Result<Preconditions, ApiError> {
+    let Some(expect) = expect else {
+        return Ok(Preconditions::default());
+    };
+    let head = match expect.head {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(raw)) => Some(Some(normalized_hex(&raw, &[40, 64], "head")?)),
+    };
+    let index = expect
+        .index
+        .map(|raw| normalized_hex(&raw, &[64], "index"))
+        .transpose()?;
+    let revision = expect
+        .revision
+        .map(|raw| normalized_hex(&raw, &[64], "revision"))
+        .transpose()?;
+    let files = match (expect.files, target) {
+        (None, _) => None,
+        (Some(_), ExpectTarget::Commit) => {
+            return Err(ApiError::bad_request(
+                "expect.files applies to path operations; use expect.index or expect.revision for commit",
+            ));
+        }
+        (Some(_), ExpectTarget::AllPaths) => {
+            return Err(ApiError::bad_request(
+                "use expect.revision for whole-tree operations",
+            ));
+        }
+        (Some(raw), ExpectTarget::Paths(paths)) => {
+            let mut files = BTreeMap::new();
+            for (key, token) in raw {
+                let path = relative_request_path(&key, false)?
+                    .to_string_lossy()
+                    .into_owned();
+                let token = token.trim().to_ascii_lowercase();
+                let valid = token.len() == 66
+                    && (token.starts_with("c-") || token.starts_with("s-"))
+                    && token[2..].bytes().all(|byte| byte.is_ascii_hexdigit());
+                if !valid {
+                    return Err(ApiError::bad_request(format!(
+                        "expect.files[{path}] must be the rev read from GET /v1/git"
+                    )));
+                }
+                if files.insert(path.clone(), token).is_some() {
+                    return Err(ApiError::bad_request(format!(
+                        "expect.files names {path} twice"
+                    )));
+                }
+            }
+            let requested: BTreeSet<&str> = paths.iter().map(String::as_str).collect();
+            let guarded: BTreeSet<&str> = files.keys().map(String::as_str).collect();
+            if requested != guarded {
+                let missing: Vec<&str> = requested.difference(&guarded).copied().collect();
+                let extra: Vec<&str> = guarded.difference(&requested).copied().collect();
+                return Err(ApiError::bad_request(format!(
+                    "expect.files must name exactly the requested paths (missing: [{}]; extra: [{}])",
+                    missing.join(", "),
+                    extra.join(", ")
+                )));
+            }
+            Some(files)
+        }
+    };
+    Ok(Preconditions {
+        head,
+        index,
+        revision,
+        files,
+    })
+}
+
+/// A git-route failure. Ordinary failures keep the shared [`ApiError`]
+/// envelope; the precondition and busy answers add a machine `code` and
+/// fields a client acts on.
+pub(super) enum GitWriteError {
+    Api(ApiError),
+    Coded {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+        extra: serde_json::Map<String, Value>,
+    },
+}
+
+impl From<ApiError> for GitWriteError {
+    fn from(error: ApiError) -> Self {
+        Self::Api(error)
+    }
+}
+
+impl IntoResponse for GitWriteError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Api(error) => error.into_response(),
+            Self::Coded {
+                status,
+                code,
+                message,
+                mut extra,
+            } => {
+                extra.insert(
+                    "error".to_string(),
+                    json!({ "message": message, "status": status.as_u16(), "code": code }),
+                );
+                (status, Json(Value::Object(extra))).into_response()
+            }
+        }
+    }
+}
+
+fn busy_error() -> GitWriteError {
+    GitWriteError::Coded {
+        status: StatusCode::CONFLICT,
+        code: "git_busy",
+        message:
+            "Another Git write from this runtime is still running. Try again when it finishes."
+                .to_string(),
+        extra: serde_json::Map::new(),
+    }
+}
+
+/// Compare the preconditions with the repository as it is now. Runs on a
+/// blocking thread under the write lock.
+fn check_preconditions(
+    workspace: &FsPath,
+    expect: &Preconditions,
+) -> Result<Result<(), GitWriteError>, ApiError> {
+    let mut stale: Vec<&'static str> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    let mut stale_paths: Vec<String> = Vec::new();
+    let frame = RepoFrame::read(workspace)?;
+
+    if let Some(expected) = &expect.head {
+        let current = head_oid(workspace)?;
+        if &current != expected {
+            stale.push("head");
+            parts.push(match (expected, &current) {
+                (None, Some(_)) => "HEAD is no longer unborn".to_string(),
+                (Some(_), None) => "HEAD is now unborn".to_string(),
+                _ => "HEAD moved".to_string(),
+            });
+        }
+    }
+    let index = if expect.index.is_some() || expect.files.is_some() {
+        Some(IndexSnapshot::read(&frame)?)
+    } else {
+        None
+    };
+    if let (Some(expected), Some(index)) = (&expect.index, &index)
+        && &index.token != expected
+    {
+        stale.push("index");
+        parts.push("the index changed".to_string());
+    }
+    if let (Some(files), Some(index)) = (&expect.files, &index) {
+        // A rename row's token also covers its source path; recover that
+        // pairing from the current status, as the read did.
+        let porcelain = run_git_sync(workspace, &["status", "--porcelain=v1", "-z"])?;
+        let (rows, _) = split_by_workspace(parse_porcelain(&porcelain), &frame.prefix);
+        let sources: BTreeMap<String, String> = rows
+            .iter()
+            .filter_map(|row| {
+                row.old_path
+                    .as_deref()
+                    .map(|old| (normalized_row_path(&row.path).to_string(), old.to_string()))
+            })
+            .collect();
+        for (path, expected) in files {
+            let listings = members_of(path, sources.get(path).map(String::as_str))
+                .iter()
+                .map(|member| list_member(workspace, index, member))
+                .collect::<Result<Vec<_>, _>>()?;
+            let current = row_rev(workspace, &listings, RevMode::of_token(expected));
+            if &current != expected {
+                stale_paths.push(path.clone());
+            }
+        }
+        if !stale_paths.is_empty() {
+            stale.push("files");
+            parts.push(match stale_paths.as_slice() {
+                [one] => format!("{one} changed"),
+                many => {
+                    let shown: Vec<&str> = many.iter().take(3).map(String::as_str).collect();
+                    let more = many.len().saturating_sub(shown.len());
+                    if more == 0 {
+                        format!("{} files changed: {}", many.len(), shown.join(", "))
+                    } else {
+                        format!(
+                            "{} files changed: {} and {more} more",
+                            many.len(),
+                            shown.join(", ")
+                        )
+                    }
+                }
+            });
+        }
+    }
+    let mut current = None;
+    if let Some(expected) = &expect.revision {
+        let detail = collect_git_status_detail(workspace)?;
+        if detail.revision.as_deref() != Some(expected.as_str()) {
+            stale.push("revision");
+            parts.push("the working tree or index changed".to_string());
+        }
+        current = Some(detail);
+    }
+    if stale.is_empty() {
+        return Ok(Ok(()));
+    }
+    let current = match current {
+        Some(detail) => detail,
+        None => collect_git_status_detail(workspace)?,
+    };
+    let mut extra = serde_json::Map::new();
+    extra.insert("stale".to_string(), json!(stale));
+    extra.insert("stale_paths".to_string(), json!(stale_paths));
+    extra.insert(
+        "current".to_string(),
+        serde_json::to_value(current)
+            .map_err(|_| ApiError::internal("git status serialization failed"))?,
+    );
+    Ok(Err(GitWriteError::Coded {
+        status: StatusCode::CONFLICT,
+        code: "git_state_changed",
+        message: format!(
+            "The repository changed since it was read ({}). Nothing was written; refresh and review again.",
+            parts.join("; ")
+        ),
+        extra,
+    }))
+}
+
+async fn mutation_response(workspace: &FsPath, run: GitRun) -> Result<Json<Value>, ApiError> {
     if !run.status_success {
         let tail = output_tail(&run);
         return Err(ApiError::bad_request(if tail.is_empty() {
@@ -633,16 +1424,49 @@ fn mutation_response(workspace: &FsPath, run: GitRun) -> Result<Json<Value>, Api
             tail
         }));
     }
+    let output = output_tail(&run);
+    let workspace = workspace.to_path_buf();
+    let (status, current) = tokio::task::spawn_blocking(move || {
+        (
+            collect_workspace_status(&workspace),
+            collect_git_status_detail(&workspace),
+        )
+    })
+    .await
+    .map_err(|_| ApiError::internal("git status failed"))?;
     Ok(Json(json!({
         "ok": true,
-        "output": output_tail(&run),
-        "status": collect_workspace_status(workspace),
+        "output": output,
+        "status": status,
+        "current": current?,
     })))
 }
 
+/// The shared check-then-write path. The per-runtime lock makes the check
+/// and the write atomic with respect to this server's other git writes (two
+/// app windows on one runtime); a second writer gets `git_busy` instead of
+/// waiting behind a long hook. External processes are outside the lock —
+/// see docs/RUNTIME_API.md for that window.
+async fn guarded_write(
+    state: &RuntimeApiState,
+    expect: Preconditions,
+    args: Vec<String>,
+) -> Result<Json<Value>, GitWriteError> {
+    let _guard = state.git_writes.try_lock().map_err(|_| busy_error())?;
+    let workspace = canonical_workspace(&state.workspace)?;
+    require_repo(&workspace)?;
+    if !expect.is_empty() {
+        let root = workspace.clone();
+        tokio::task::spawn_blocking(move || check_preconditions(&root, &expect))
+            .await
+            .map_err(|_| ApiError::internal("git precondition check failed"))???;
+    }
+    Ok(mutation_response(&workspace, git_write(&workspace, args).await?).await?)
+}
+
 /// Validate and collect pathspecs. Every path is workspace-relative with no
-/// `.`/`..`/`.git` components and is passed after `--`, so it can never be
-/// read as an option.
+/// `.`/`..`/`.git` components and is passed after `--` with
+/// `--literal-pathspecs`, so it can never be read as an option or a glob.
 fn validated_paths(request: &GitPathsRequest, allow_all: bool) -> Result<Vec<String>, ApiError> {
     if request.all && !allow_all {
         return Err(ApiError::bad_request(
@@ -671,76 +1495,92 @@ fn validated_paths(request: &GitPathsRequest, allow_all: bool) -> Result<Vec<Str
         .collect()
 }
 
+/// Validated paths plus their preconditions.
+fn paths_and_expect(
+    request: GitPathsRequest,
+    allow_all: bool,
+) -> Result<(bool, Vec<String>, Preconditions), ApiError> {
+    let paths = validated_paths(&request, allow_all)?;
+    let target = if request.all {
+        ExpectTarget::AllPaths
+    } else {
+        ExpectTarget::Paths(&paths)
+    };
+    let expect = validate_expect(request.expect, target)?;
+    Ok((request.all, paths, expect))
+}
+
+/// `git --literal-pathspecs <subcommand…> -- <paths>`.
+fn literal_path_args(subcommand: &[&str], paths: Vec<String>) -> Vec<String> {
+    let mut args = vec!["--literal-pathspecs".to_string()];
+    args.extend(subcommand.iter().map(|arg| arg.to_string()));
+    args.push("--".to_string());
+    args.extend(paths);
+    args
+}
+
 pub(super) async fn git_stage(
     State(state): State<RuntimeApiState>,
     Json(request): Json<GitPathsRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let workspace = canonical_workspace(&state.workspace)?;
-    require_repo(&workspace)?;
-    let paths = validated_paths(&request, true)?;
-    let mut args = vec!["add".to_string()];
-    if request.all {
-        args.push("--all".to_string());
-    }
-    if !paths.is_empty() {
-        args.push("--".to_string());
-        args.extend(paths);
-    }
-    mutation_response(&workspace, git_write(&workspace, args).await?)
+) -> Result<Json<Value>, GitWriteError> {
+    let (all, paths, expect) = paths_and_expect(request, true)?;
+    let args = if all {
+        vec!["add".to_string(), "--all".to_string()]
+    } else {
+        literal_path_args(&["add"], paths)
+    };
+    guarded_write(&state, expect, args).await
 }
 
 pub(super) async fn git_unstage(
     State(state): State<RuntimeApiState>,
     Json(request): Json<GitPathsRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let workspace = canonical_workspace(&state.workspace)?;
-    require_repo(&workspace)?;
-    let paths = validated_paths(&request, true)?;
-    let mut args = vec!["restore".to_string(), "--staged".to_string()];
-    if request.all {
-        args.push(":/".to_string());
-    }
-    if !paths.is_empty() {
-        args.push("--".to_string());
-        args.extend(paths);
-    }
-    mutation_response(&workspace, git_write(&workspace, args).await?)
+) -> Result<Json<Value>, GitWriteError> {
+    let (all, paths, expect) = paths_and_expect(request, true)?;
+    let args = if all {
+        // `:/` is pathspec magic for the repository root, so this one form
+        // cannot run under --literal-pathspecs.
+        vec![
+            "restore".to_string(),
+            "--staged".to_string(),
+            ":/".to_string(),
+        ]
+    } else {
+        literal_path_args(&["restore", "--staged"], paths)
+    };
+    guarded_write(&state, expect, args).await
 }
 
 pub(super) async fn git_discard(
     State(state): State<RuntimeApiState>,
     Json(request): Json<GitPathsRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let workspace = canonical_workspace(&state.workspace)?;
-    require_repo(&workspace)?;
-    let paths = validated_paths(&request, false)?;
-    let mut args = vec!["checkout".to_string(), "--".to_string()];
-    args.extend(paths);
-    mutation_response(&workspace, git_write(&workspace, args).await?)
+) -> Result<Json<Value>, GitWriteError> {
+    let (_, paths, expect) = paths_and_expect(request, false)?;
+    guarded_write(&state, expect, literal_path_args(&["checkout"], paths)).await
 }
 
 pub(super) async fn git_commit(
     State(state): State<RuntimeApiState>,
     Json(request): Json<GitCommitRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, GitWriteError> {
     let message = request.message.trim();
     if message.is_empty() {
-        return Err(ApiError::bad_request("message is required"));
+        return Err(ApiError::bad_request("message is required").into());
     }
     if message.len() > MAX_COMMIT_MESSAGE_BYTES {
         return Err(ApiError::bad_request(format!(
             "message must be at most {MAX_COMMIT_MESSAGE_BYTES} bytes"
-        )));
+        ))
+        .into());
     }
-    let workspace = canonical_workspace(&state.workspace)?;
-    require_repo(&workspace)?;
+    let expect = validate_expect(request.expect, ExpectTarget::Commit)?;
     let mut args = vec!["commit".to_string()];
     if request.all {
         args.push("--all".to_string());
     }
     args.push("--message".to_string());
     args.push(message.to_string());
-    mutation_response(&workspace, git_write(&workspace, args).await?)
+    guarded_write(&state, expect, args).await
 }
 
 pub(super) async fn git_push(
@@ -777,17 +1617,22 @@ pub(super) async fn git_push(
     } else if let Some(remote) = remote {
         args.push(remote);
     }
-    mutation_response(&workspace, git_write(&workspace, args).await?)
+    // Push stays outside the write lock: it crosses the network under a
+    // 120 s bound and only moves a remote ref, never the index or worktree.
+    mutation_response(&workspace, git_write(&workspace, args).await?).await
 }
 
 pub(super) async fn git_branch(
     State(state): State<RuntimeApiState>,
     Json(request): Json<GitBranchRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, GitWriteError> {
     let name = request.name.trim();
     if name.is_empty() || name.len() > MAX_BRANCH_NAME_BYTES {
-        return Err(ApiError::bad_request("name is required"));
+        return Err(ApiError::bad_request("name is required").into());
     }
+    // Switching rewrites the worktree and index, so it shares the lock with
+    // stage/discard/commit.
+    let _guard = state.git_writes.try_lock().map_err(|_| busy_error())?;
     let workspace = canonical_workspace(&state.workspace)?;
     require_repo(&workspace)?;
     // `check-ref-format --branch` is the ref authority — it rejects option
@@ -802,12 +1647,261 @@ pub(super) async fn git_branch(
     )
     .await?;
     if !check.status_success {
-        return Err(ApiError::bad_request("name is not a valid branch"));
+        return Err(ApiError::bad_request("name is not a valid branch").into());
     }
     let mut args = vec!["switch".to_string()];
     if request.create {
         args.push("--create".to_string());
     }
     args.push(name.to_string());
-    mutation_response(&workspace, git_write(&workspace, args).await?)
+    Ok(mutation_response(&workspace, git_write(&workspace, args).await?).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn git(dir: &FsPath, args: &[&str]) {
+        let output = Git::output(args, dir).expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "user.email", "git-rev@example.test"]);
+        git(dir, &["config", "user.name", "Git Rev Test"]);
+        git(dir, &["config", "core.autocrlf", "false"]);
+        fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(dir, &["add", "a.txt"]);
+        git(dir, &["commit", "-q", "-m", "initial"]);
+        tmp
+    }
+
+    fn rev(workspace: &FsPath, path: &str) -> String {
+        let frame = RepoFrame::read(workspace).unwrap();
+        let index = IndexSnapshot::read(&frame).unwrap();
+        let listings: Vec<_> = members_of(path, None)
+            .iter()
+            .map(|member| list_member(workspace, &index, member).unwrap())
+            .collect();
+        row_rev(workspace, &listings, RevMode::Content)
+    }
+
+    fn index_token(workspace: &FsPath) -> String {
+        IndexSnapshot::read(&RepoFrame::read(workspace).unwrap())
+            .unwrap()
+            .token
+    }
+
+    #[test]
+    fn row_rev_tracks_content_index_and_deletion_but_not_touch() {
+        let tmp = repo();
+        let ws = tmp.path();
+        fs::write(ws.join("a.txt"), "two\n").unwrap();
+        let modified = rev(ws, "a.txt");
+        assert!(
+            modified.starts_with("c-") && modified.len() == 66,
+            "{modified}"
+        );
+        assert_eq!(rev(ws, "a.txt"), modified, "deterministic");
+
+        // Touching without changing bytes keeps the content token.
+        let file = fs::File::options()
+            .write(true)
+            .open(ws.join("a.txt"))
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(90))
+            .unwrap();
+        drop(file);
+        assert_eq!(rev(ws, "a.txt"), modified, "touch is not a change");
+
+        fs::write(ws.join("a.txt"), "three\n").unwrap();
+        let rewritten = rev(ws, "a.txt");
+        assert_ne!(rewritten, modified, "content change");
+
+        git(ws, &["add", "a.txt"]);
+        let staged = rev(ws, "a.txt");
+        assert_ne!(staged, rewritten, "staging changes the index part");
+
+        fs::remove_file(ws.join("a.txt")).unwrap();
+        assert_ne!(rev(ws, "a.txt"), staged, "deletion reads as absent");
+    }
+
+    #[test]
+    fn collapsed_untracked_directory_rev_covers_files_inside() {
+        let tmp = repo();
+        let ws = tmp.path();
+        fs::create_dir_all(ws.join("dir/deep")).unwrap();
+        fs::write(ws.join("dir/deep/x.rs"), "x\n").unwrap();
+        let detail = collect_git_status_detail(ws).unwrap();
+        let row = detail
+            .files
+            .iter()
+            .find(|row| row.path == "dir/")
+            .expect("collapsed dir row");
+        let before = row.rev.clone().unwrap();
+        assert_eq!(rev(ws, "dir"), before, "dir and dir/ are one key");
+        fs::write(ws.join("dir/deep/x.rs"), "y\n").unwrap();
+        assert_ne!(rev(ws, "dir"), before);
+        fs::write(ws.join("dir/deep/x.rs"), "x\n").unwrap();
+        fs::write(ws.join("dir/new.rs"), "n\n").unwrap();
+        assert_ne!(rev(ws, "dir"), before, "a new file under the row");
+    }
+
+    #[test]
+    fn index_token_ignores_stat_refresh_and_tracks_real_changes() {
+        let tmp = repo();
+        let ws = tmp.path();
+        let before = index_token(ws);
+        let file = fs::File::options()
+            .write(true)
+            .open(ws.join("a.txt"))
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(90))
+            .unwrap();
+        drop(file);
+        git(ws, &["status", "--porcelain"]);
+        git(ws, &["update-index", "--refresh"]);
+        assert_eq!(index_token(ws), before, "stat refresh is not a change");
+        fs::write(ws.join("b.txt"), "b\n").unwrap();
+        git(ws, &["add", "b.txt"]);
+        assert_ne!(index_token(ws), before);
+    }
+
+    #[test]
+    fn rename_row_rev_covers_the_source_path() {
+        let tmp = repo();
+        let ws = tmp.path();
+        git(ws, &["mv", "a.txt", "b.txt"]);
+        let detail = collect_git_status_detail(ws).unwrap();
+        let row = detail.files.iter().find(|row| row.path == "b.txt").unwrap();
+        assert_eq!(row.old_path.as_deref(), Some("a.txt"));
+        let before = row.rev.clone().unwrap();
+        // Recreating the source in the worktree changes what a stage of the
+        // rename would record.
+        fs::write(ws.join("a.txt"), "resurrected\n").unwrap();
+        let detail = collect_git_status_detail(ws).unwrap();
+        let after = detail
+            .files
+            .iter()
+            .find(|row| row.path == "b.txt")
+            .and_then(|row| row.rev.clone())
+            .unwrap();
+        assert_ne!(after, before);
+    }
+
+    #[test]
+    fn subdirectory_workspace_reports_workspace_relative_rows() {
+        let tmp = repo();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/in.txt"), "in\n").unwrap();
+        git(root, &["add", "sub/in.txt"]);
+        git(root, &["commit", "-q", "-m", "sub"]);
+        fs::write(root.join("sub/in.txt"), "changed\n").unwrap();
+        fs::write(root.join("a.txt"), "outside change\n").unwrap();
+        let ws = root.join("sub").canonicalize().unwrap();
+        let detail = collect_git_status_detail(&ws).unwrap();
+        let paths: Vec<&str> = detail.files.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["in.txt"],
+            "workspace frame, outside rows dropped"
+        );
+        assert_eq!(
+            detail.files[0].rev.as_deref(),
+            Some(rev(&ws, "in.txt").as_str())
+        );
+        // The whole-tree revision still sees the change outside the
+        // workspace, because stage-all and commit reach it.
+        let before = detail.revision.clone().unwrap();
+        fs::write(root.join("a.txt"), "outside change again\n").unwrap();
+        git(root, &["add", "a.txt"]);
+        let after = collect_git_status_detail(&ws).unwrap().revision.unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn expect_validation_rules() {
+        let parse = |value: Value| serde_json::from_value::<GitExpect>(value);
+        let paths = vec!["a.txt".to_string()];
+        let rev = format!("c-{}", "a".repeat(64));
+
+        // Absent head is unchecked; explicit null means unborn.
+        let unchecked =
+            validate_expect(Some(parse(json!({})).unwrap()), ExpectTarget::Commit).unwrap();
+        assert!(unchecked.is_empty());
+        let unborn = validate_expect(
+            Some(parse(json!({ "head": null })).unwrap()),
+            ExpectTarget::Commit,
+        )
+        .unwrap();
+        assert_eq!(unborn.head, Some(None));
+        let upper = validate_expect(
+            Some(parse(json!({ "head": "A".repeat(40) })).unwrap()),
+            ExpectTarget::Commit,
+        )
+        .unwrap();
+        assert_eq!(upper.head, Some(Some("a".repeat(40))));
+
+        for bad in [
+            json!({ "head": "abc" }),
+            json!({ "head": "g".repeat(40) }),
+            json!({ "index": "a".repeat(40) }),
+            json!({ "revision": "zz" }),
+        ] {
+            assert!(
+                validate_expect(Some(parse(bad.clone()).unwrap()), ExpectTarget::Commit).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(parse(json!({ "heads": null })).is_err(), "unknown key");
+
+        let files = |map: Value| parse(json!({ "files": map })).unwrap();
+        assert!(
+            validate_expect(Some(files(json!({ "a.txt": rev }))), ExpectTarget::Commit).is_err()
+        );
+        assert!(
+            validate_expect(Some(files(json!({ "a.txt": rev }))), ExpectTarget::AllPaths).is_err()
+        );
+        assert!(
+            validate_expect(Some(files(json!({}))), ExpectTarget::Paths(&paths)).is_err(),
+            "missing a requested path"
+        );
+        assert!(
+            validate_expect(
+                Some(files(json!({ "a.txt": rev, "b.txt": rev }))),
+                ExpectTarget::Paths(&paths)
+            )
+            .is_err(),
+            "extra path"
+        );
+        assert!(
+            validate_expect(
+                Some(files(json!({ "a.txt": "a".repeat(64) }))),
+                ExpectTarget::Paths(&paths)
+            )
+            .is_err(),
+            "rev without a mode"
+        );
+        let ok = validate_expect(
+            Some(files(json!({ "./a.txt/": rev }))),
+            ExpectTarget::Paths(&paths),
+        );
+        // `./` is refused by the shared path confinement, like request paths.
+        assert!(ok.is_err());
+        let ok = validate_expect(
+            Some(files(json!({ "a.txt/": rev }))),
+            ExpectTarget::Paths(&paths),
+        )
+        .unwrap();
+        assert_eq!(ok.files.unwrap().keys().collect::<Vec<_>>(), vec!["a.txt"]);
+    }
 }

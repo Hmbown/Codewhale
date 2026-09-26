@@ -220,6 +220,10 @@ pub struct RuntimeApiState {
     /// The computer this Engine runs on: display socket, human control
     /// lease, device client tokens and `computer.*` events (§3.3).
     computer: computer_display::ComputerState,
+    /// Serializes this runtime's git writes (stage/unstage/discard/commit/
+    /// branch) so a precondition check and its write are atomic with respect
+    /// to other windows on the same server (#6647).
+    git_writes: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     compat_stream_test_hook: Option<tokio::sync::mpsc::UnboundedSender<CompatStreamTestPoint>>,
 }
@@ -1048,6 +1052,7 @@ pub async fn run_http_server(
         mcp_pool: Arc::new(Mutex::new(None)),
         lsp_manager: Arc::new(std::sync::OnceLock::new()),
         computer: computer_display::ComputerState::from_env(),
+        git_writes: Arc::new(tokio::sync::Mutex::new(())),
         #[cfg(test)]
         compat_stream_test_hook: None,
     };
@@ -10331,6 +10336,7 @@ base_url = "http://127.0.0.1:9/v1"
             mcp_pool: Arc::new(Mutex::new(None)),
             lsp_manager: Arc::new(std::sync::OnceLock::new()),
             computer: computer_display::ComputerState::from_env(),
+            git_writes: Arc::new(tokio::sync::Mutex::new(())),
             compat_stream_test_hook: None,
         };
         let router = build_router(state.clone());

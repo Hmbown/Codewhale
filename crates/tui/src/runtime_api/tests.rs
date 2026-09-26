@@ -1252,6 +1252,7 @@ async fn build_test_server(
             Arc::new(cell)
         },
         computer: super::computer_display::ComputerState::from_env(),
+        git_writes: Arc::new(tokio::sync::Mutex::new(())),
         compat_stream_test_hook: overrides.compat_stream_test_hook,
     };
     let app = build_router(state);
@@ -18820,6 +18821,322 @@ async fn git_routes_drive_a_real_workspace_repo() -> Result<()> {
             .status();
         assert_eq!(status, want, "{route} {body}");
     }
+
+    handle.abort();
+    Ok(())
+}
+
+/// #6647: optional preconditions on git writes. A matching `expect` writes;
+/// a stale HEAD, index or file answers 409 `git_state_changed` with the
+/// current state and writes nothing; no `expect` keeps the old behaviour.
+#[tokio::test]
+async fn git_write_preconditions_reject_stale_state() -> Result<()> {
+    use crate::dependencies::{ExternalTool as _, Git};
+
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let git = |args: &[&str]| {
+        let output = Git::output(args, &workspace)?;
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok::<_, anyhow::Error>(String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    git(&["init", "-b", "main"])?;
+    git(&["config", "user.email", "runtime-api@example.test"])?;
+    git(&["config", "user.name", "Runtime API Test"])?;
+    git(&["config", "core.autocrlf", "false"])?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("git-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("git test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+    let read = || async {
+        client
+            .get(format!("{base}/v1/git"))
+            .bearer_auth("git-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await
+            .map_err(anyhow::Error::from)
+    };
+    let post = |route: &'static str, body: Value| {
+        let request = client
+            .post(format!("{base}{route}"))
+            .bearer_auth("git-token")
+            .json(&body);
+        async move {
+            let response = request.send().await?;
+            let status = response.status();
+            // Axum's own extractor rejections (422) answer in plain text.
+            let text = response.text().await?;
+            let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
+            Ok::<_, anyhow::Error>((status, body))
+        }
+    };
+    let rev_of = |detail: &Value, path: &str| -> String {
+        detail["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == path)
+            .and_then(|row| row["rev"].as_str())
+            .unwrap_or_else(|| panic!("no rev for {path} in {detail}"))
+            .to_string()
+    };
+
+    // (g) Unborn: head null matches a fresh repository, then goes stale.
+    fs::write(workspace.join("tracked.txt"), "v1\n")?;
+    let detail = read().await?;
+    assert_eq!(detail["head_oid"], Value::Null);
+    assert_eq!(detail["index_token"].as_str().unwrap().len(), 64);
+    let (status, staged) = post(
+        "/v1/git/stage",
+        json!({ "paths": ["tracked.txt"], "expect": { "head": null, "files": { "tracked.txt": rev_of(&detail, "tracked.txt") } } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{staged}");
+    let (status, body) = post(
+        "/v1/git/commit",
+        json!({ "message": "initial", "expect": { "head": null, "index": staged["current"]["index_token"] } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        "/v1/git/commit",
+        json!({ "message": "again", "all": true, "expect": { "head": null } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "git_state_changed");
+    assert_eq!(body["stale"], json!(["head"]));
+
+    // (a) The read exposes every token.
+    fs::write(workspace.join("new.rs"), "fn main() {}\n")?;
+    let detail = read().await?;
+    let head = detail["head_oid"].as_str().unwrap().to_string();
+    assert_eq!(head.len(), 40);
+    assert!(head.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(detail["index_token"].as_str().unwrap().len(), 64);
+    assert_eq!(detail["revision"].as_str().unwrap().len(), 64);
+    for row in detail["files"].as_array().unwrap() {
+        assert!(
+            row["rev"].as_str().is_some_and(|rev| rev.len() == 66),
+            "{row}"
+        );
+    }
+    let changes: Value = client
+        .get(format!("{base}/v1/changes"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(changes["index_token"], detail["index_token"]);
+    assert_eq!(changes["revision"], detail["revision"]);
+    assert_eq!(changes["files"], detail["files"]);
+
+    // (b) Matching preconditions: stage, then commit chained from `current`.
+    let (status, staged) = post(
+        "/v1/git/stage",
+        json!({ "paths": ["new.rs"], "expect": { "head": head, "files": { "new.rs": rev_of(&detail, "new.rs") } } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{staged}");
+    assert_eq!(staged["status"]["staged"], 1);
+    assert_ne!(staged["current"]["index_token"], detail["index_token"]);
+    let (status, committed) = post(
+        "/v1/git/commit",
+        json!({ "message": "add new.rs", "expect": { "head": head, "index": staged["current"]["index_token"] } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert_eq!(git(&["rev-parse", "HEAD~1"])?.trim(), head);
+    let head = committed["current"]["head_oid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // (c) A file rewritten after the read is not staged.
+    fs::write(workspace.join("new2.rs"), "one\n")?;
+    let detail = read().await?;
+    fs::write(workspace.join("new2.rs"), "two\n")?;
+    let index_before = git(&["ls-files", "--stage"])?;
+    let (status, body) = post(
+        "/v1/git/stage",
+        json!({ "paths": ["new2.rs"], "expect": { "head": head, "files": { "new2.rs": rev_of(&detail, "new2.rs") } } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "git_state_changed");
+    assert_eq!(body["error"]["status"], 409);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("new2.rs changed"),
+        "{body}"
+    );
+    assert_eq!(body["stale"], json!(["files"]));
+    assert_eq!(body["stale_paths"], json!(["new2.rs"]));
+    assert_ne!(
+        rev_of(&body["current"], "new2.rs"),
+        rev_of(&detail, "new2.rs")
+    );
+    assert_eq!(
+        git(&["ls-files", "--stage"])?,
+        index_before,
+        "nothing staged"
+    );
+
+    // (d) Discard never destroys an edit made after the read.
+    fs::write(workspace.join("tracked.txt"), "v2\n")?;
+    let detail = read().await?;
+    fs::write(workspace.join("tracked.txt"), "v2\nexternal edit\n")?;
+    let (status, body) = post(
+        "/v1/git/discard",
+        json!({ "paths": ["tracked.txt"], "expect": { "head": head, "files": { "tracked.txt": rev_of(&detail, "tracked.txt") } } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["stale_paths"], json!(["tracked.txt"]));
+    assert_eq!(
+        fs::read_to_string(workspace.join("tracked.txt"))?,
+        "v2\nexternal edit\n"
+    );
+    // The refreshed token from `current` then discards exactly that state.
+    let (status, body) = post(
+        "/v1/git/discard",
+        json!({ "paths": ["tracked.txt"], "expect": { "files": { "tracked.txt": rev_of(&body["current"], "tracked.txt") } } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fs::read_to_string(workspace.join("tracked.txt"))?, "v1\n");
+
+    // (e) Stale HEAD: an external commit lands between read and commit.
+    let detail = read().await?;
+    fs::write(workspace.join("other.txt"), "o\n")?;
+    git(&["add", "other.txt"])?;
+    git(&["commit", "-m", "external"])?;
+    let external = git(&["rev-parse", "HEAD"])?.trim().to_string();
+    fs::write(workspace.join("mine.txt"), "m\n")?;
+    git(&["add", "mine.txt"])?;
+    let (status, body) = post(
+        "/v1/git/commit",
+        json!({ "message": "mine", "expect": { "head": detail["head_oid"] } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["stale"].as_array().unwrap().contains(&json!("head")));
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("HEAD moved")
+    );
+    assert_eq!(git(&["rev-parse", "HEAD"])?.trim(), external);
+    assert_eq!(body["current"]["head_oid"], external.as_str());
+
+    // (f) Stale index: an external `git add` after the read.
+    let detail = read().await?;
+    let count_before = git(&["rev-list", "--count", "HEAD"])?;
+    fs::write(workspace.join("sneak.txt"), "s\n")?;
+    git(&["add", "sneak.txt"])?;
+    let (status, body) = post(
+        "/v1/git/commit",
+        json!({ "message": "mine", "expect": { "head": detail["head_oid"], "index": detail["index_token"] } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["stale"], json!(["index"]));
+    assert_eq!(git(&["rev-list", "--count", "HEAD"])?, count_before);
+
+    // Whole-tree revision guards stage-all against an unseen file.
+    let detail = read().await?;
+    fs::write(workspace.join("late.txt"), "late\n")?;
+    let (status, body) = post(
+        "/v1/git/stage",
+        json!({ "all": true, "expect": { "revision": detail["revision"] } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["stale"], json!(["revision"]));
+    assert!(!git(&["ls-files"])?.contains("late.txt"));
+    let (status, body) = post(
+        "/v1/git/stage",
+        json!({ "all": true, "expect": { "revision": body["current"]["revision"] } }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(git(&["ls-files"])?.contains("late.txt"));
+
+    // Literal pathspecs: `*` names a file called `*`, never a glob.
+    fs::write(workspace.join("glob-a.txt"), "a\n")?;
+    git(&["restore", "--staged", ":/"])?;
+    let (status, body) = post("/v1/git/stage", json!({ "paths": ["glob-*"] })).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(!git(&["diff", "--cached", "--name-only"])?.contains("glob-a.txt"));
+
+    // (h) Absent preconditions, and an empty `expect`, keep working.
+    let (status, body) = post("/v1/git/stage", json!({ "paths": ["glob-a.txt"] })).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        "/v1/git/unstage",
+        json!({ "paths": ["glob-a.txt"], "expect": {} }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // (i) Malformed preconditions are refused before git runs.
+    let detail = read().await?;
+    for (route, body, want) in [
+        (
+            "/v1/git/commit",
+            json!({ "message": "m", "expect": { "head": "abc" } }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/stage",
+            json!({ "paths": ["glob-a.txt", "mine.txt"], "expect": { "files": { "glob-a.txt": rev_of(&detail, "glob-a.txt") } } }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/commit",
+            json!({ "message": "m", "expect": { "files": { "glob-a.txt": rev_of(&detail, "glob-a.txt") } } }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/stage",
+            json!({ "all": true, "expect": { "files": { "glob-a.txt": rev_of(&detail, "glob-a.txt") } } }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/stage",
+            json!({ "paths": ["glob-a.txt"], "expect": { "unknown": 1 } }),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let (status, response) = post(route, body.clone()).await?;
+        assert_eq!(status, want, "{route} {body}: {response}");
+        if status == StatusCode::BAD_REQUEST {
+            assert_eq!(response["error"]["status"], 400);
+            assert!(response["error"]["message"].is_string());
+        }
+    }
+    assert!(!git(&["diff", "--cached", "--name-only"])?.contains("glob-a.txt"));
 
     handle.abort();
     Ok(())

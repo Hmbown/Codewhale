@@ -1389,13 +1389,32 @@ also how a client sees model-spawned work.
   resolved.
 
 **Git** (workspace repository operations, APPS-106)
-- `GET /v1/git` — status detail: `git_repo`, `branch`, `head`,
+- `GET /v1/git` — status detail: `git_repo`, `branch`, `head`
+  (abbreviated, for display), `head_oid`, `index_token`, `revision`,
   `ahead`/`behind`, counts, per-file porcelain `files[]`
-  (`{path, index, worktree, staged, status, old_path?}`), `branches`,
-  `remotes`
-- `GET /v1/changes` — the same porcelain `files[]` projection minus repo
-  chrome (branches/remotes): one authority, so the change list can never
-  disagree with the status read
+  (`{path, index, worktree, staged, status, old_path?, rev}`), `branches`,
+  `remotes`. `files[].path` and `old_path` are workspace-relative, the same
+  frame the write routes take; in a workspace that is a subdirectory of its
+  repository, rows outside the workspace are not listed (the counts stay
+  repository-wide). The precondition tokens are opaque:
+  - `head_oid` — the full HEAD commit id; `null` on an unborn branch
+  - `index_token` — the whole index (mode, blob, stage and path of every
+    entry, repository-wide). A stat-only refresh by `git status` does not
+    change it. `null` means the tokens could not be computed and a client
+    should send no `expect`
+  - `files[].rev` — one row: its index entries plus the working-tree state
+    of every file it covers (a rename's source, every file under a
+    collapsed untracked `dir/`). Working-tree files are identified by a
+    sha256 of their bytes (`c-…`), or by size and modification time for a
+    file over 16 MiB. A read hashes at most 64 MiB / 4,096 files; rows past
+    that budget carry a size-and-mtime token (`s-…`), and a check
+    recomputes in the mode the token names
+  - `revision` — the whole tree: `head_oid`, `index_token`, every row's
+    `rev`, and the status of rows outside a subdirectory workspace
+- `GET /v1/changes` — the same porcelain `files[]` projection plus
+  `head_oid`, `index_token` and `revision`, minus repo chrome
+  (branches/remotes): one authority, so the change list can never disagree
+  with the status read
 - `GET /v1/diff?path=` — one file's unified `diff` against `base` (`HEAD`,
   or the empty tree on an unborn branch — which reads staged adds as new
   files). Covers staged+unstaged in one patch; `truncated` reports the
@@ -1412,19 +1431,70 @@ also how a client sees model-spawned work.
 - `POST /v1/git/stage` `{ "paths": [...] }` or `{ "all": true }`;
   `POST /v1/git/unstage` same; `POST /v1/git/discard` `{ "paths": [...] }`
   (tracked paths only — no `all`, an untracked path fails closed);
-  `POST /v1/git/commit` `{ "message", "all"? }`; `POST /v1/git/push`
+  `POST /v1/git/commit` `{ "message", "all"? }`; stage, unstage, discard
+  and commit also take an optional `expect` (below); `POST /v1/git/push`
   `{ "remote"?, "set_upstream"? }`; `POST /v1/git/branch`
   `{ "name", "create"? }`
 
 Reads run through the hardened review command (filters, fsmonitor, hooks,
-lazy fetches and replace-objects neutralized); writes run through the
-non-interactive command path (`GIT_TERMINAL_PROMPT=0`, BatchMode ssh) so a
-credential or host-key prompt can never hang a request. Path lists are
-workspace-relative under the same confinement as the file routes (traversal
-→ 400, `.git` → 403), passed after `--` with literal pathspecs. Mutations
-answer `{ok, output, status}` with the refreshed status, so a client
-re-reads nothing after an operation. A workspace that is not a repository
-answers `404`.
+lazy fetches and replace-objects neutralized), and so do the precondition
+token reads; writes run through the non-interactive command path
+(`GIT_TERMINAL_PROMPT=0`, BatchMode ssh) so a credential or host-key prompt
+can never hang a request. Path lists are workspace-relative under the same
+confinement as the file routes (traversal → 400, `.git` → 403), passed after
+`--` under `--literal-pathspecs`, so `src/*` names a file called `*` and is
+never a glob. (Unstage of the whole tree uses the `:/` root pathspec.)
+Mutations answer `{ok, output, status, current}`: the refreshed status and
+the full `GET /v1/git` detail, so a client re-reads nothing after an
+operation and can chain the next write from fresh tokens. A workspace that
+is not a repository answers `404`.
+
+*Preconditions.* Stage, unstage, discard and commit accept
+`expect: { head?, index?, revision?, files? }`, built from the last
+`GET /v1/git`. Each present field is checked and an absent one is not;
+`head: null` means "HEAD must still be unborn". Without `expect` (or with
+`expect: {}`) a write behaves exactly as before. Recommended use:
+
+| Operation | `expect` |
+| --- | --- |
+| stage / unstage `paths` | `{head, files: {path: rev}}` |
+| stage / unstage `all` | `{head, revision}` |
+| discard (always — it destroys edits) | `{head, files: {path: rev}}` |
+| commit | `{head, index}` |
+| commit `all` | `{head, revision}` |
+
+Malformed preconditions answer `400` before anything runs: `head` must be a
+40- or 64-hex id or `null`; `index` and `revision` 64 hex; `files` values a
+`rev`. `files` keys (workspace-relative; `dir/` and `dir` are the same key)
+must name exactly the requested paths, so no path is left unguarded by
+accident. `files` is refused with `all: true` (use `revision`) and on
+commit. An unknown key inside `expect` is rejected like any other unknown
+field. When the repository no longer matches, the route writes nothing and
+answers `409`:
+
+```json
+{ "error": { "message": "The repository changed since it was read (HEAD moved; src/a.rs changed). Nothing was written; refresh and review again.",
+             "status": 409, "code": "git_state_changed" },
+  "stale": ["head", "files"], "stale_paths": ["src/a.rs"],
+  "current": { "...": "the GET /v1/git detail" } }
+```
+
+`stale` lists the components that moved (`head`, `index`, `files`,
+`revision`); `stale_paths` the `files` keys whose `rev` changed. A client
+re-renders from `current`, keeps the user's selection, and asks again.
+
+Stage, unstage, discard, commit and branch from one runtime are serialized,
+so a check and its write are atomic with respect to that runtime's other
+windows; a second concurrent write answers `409` with
+`error.code: "git_busy"` rather than queueing behind a long commit hook.
+Push is not serialized: it only moves a remote ref and can wait on the
+network for up to 120 s. The lock does not cover processes outside this
+runtime — a terminal, an editor, or Codewhale's own agent tools — which can
+still change the repository in the moment between the check and git taking
+`index.lock`; a truly concurrent git write then fails on git's own
+`index.lock` (a `400` carrying git's message). A compare-and-swap commit via
+`commit-tree` and `update-ref` would close that window but skip the
+repository's hooks, which a Review-sheet commit must run, so it is not used.
 
 **Diagnostics** (read-only logs, crashes, process — APPS-103)
 - `GET /v1/logs` → `{sources: [{dir, files: [{name, size, modified}]}]}` —

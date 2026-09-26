@@ -26,6 +26,16 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Added
 
+- Runtime API: git stage, unstage, discard and commit accept optional
+  `expect` preconditions (full HEAD id, an index token, per-file `rev`, or a
+  whole-tree `revision`, all read from `GET /v1/git`). When the repository
+  changed since the client read it, the write does nothing and answers 409
+  `git_state_changed` with the current state, so a Review sheet can no
+  longer stage bytes, discard edits or commit an index the user never saw.
+  Requests without `expect` behave as before. Path writes now use literal
+  pathspecs, as the docs already said, and `files[].path` is
+  workspace-relative in a subdirectory workspace
+  ([#6647](https://github.com/Hmbown/Codewhale/issues/6647)).
 - Runtime API: `POST /v1/threads/{id}/fork-at-turn` forks a thread at a named
   user turn, keeping that turn and every turn before it. The receipt matches
   `/undo` and returns the first dropped prompt so a client can put it back in
