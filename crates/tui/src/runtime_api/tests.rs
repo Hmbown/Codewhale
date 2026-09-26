@@ -5813,19 +5813,173 @@ async fn session_create_from_completed_thread_saves_messages() -> Result<()> {
     );
     assert_eq!(detail["messages"][1]["role"], "assistant");
 
-    let manual_title: serde_json::Value = client
+    // Export is idempotent (#6144): a second POST updates the thread's own
+    // document in place instead of minting another one and leaving the first
+    // unreferenced.
+    let documents_before = std::fs::read_dir(root.join("sessions"))?
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .count();
+    let again = client
         .post(format!("http://{addr}/v1/sessions"))
         .json(&json!({
             "thread_id": thread_id,
             "title": "Manual saved title"
         }))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
+    assert_eq!(again.status(), StatusCode::OK);
+    let manual_title: serde_json::Value = again.json().await?;
     assert_eq!(manual_title["title"], "Manual saved title");
-    assert_ne!(manual_title["session_id"], saved_session_handle);
+    assert_eq!(manual_title["session_id"], saved_session_handle);
+    let documents_after = std::fs::read_dir(root.join("sessions"))?
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .count();
+    assert_eq!(documents_after, documents_before);
+    assert_eq!(
+        session_manager
+            .load_session(&saved_session_handle)?
+            .metadata
+            .title,
+        "Manual saved title"
+    );
+    assert_eq!(
+        runtime_threads.get_thread(&thread_id).await?.session_id,
+        Some(saved_session_handle.clone())
+    );
+
+    // Deleting the document unbinds the thread, which keeps its turns.
+    let deleted = client
+        .delete(format!("http://{addr}/v1/sessions/{saved_session_handle}"))
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        runtime_threads.get_thread(&thread_id).await?.session_id,
+        None
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+/// A crash between saving the exported document and binding the thread left
+/// that document unreferenced, and the retry minted another. The export id is
+/// derived from the thread, so the retry finds and binds the one it wrote.
+#[tokio::test]
+async fn session_export_retry_after_a_crash_binds_the_document_it_wrote() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-export-retry-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let thread = runtime_threads
+        .create_thread(crate::runtime_threads::CreateThreadRequest {
+            workspace: Some(root.join("workspace")),
+            ..Default::default()
+        })
+        .await?;
+    let messages = [
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "export me".to_string(),
+                cache_control: None,
+            }],
+        },
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "exported".to_string(),
+                cache_control: None,
+            }],
+        },
+    ];
+    runtime_threads
+        .seed_thread_from_messages(&thread.id, &messages)
+        .await?;
+    // The first attempt got as far as the document, then died.
+    let expected_id = crate::runtime_threads::thread_session_id(&thread.id);
+    let manager = crate::session_manager::SessionManager::new(sessions_dir.clone())?;
+    manager.save_session(
+        &crate::session_manager::create_saved_session_with_id_and_mode(
+            expected_id.clone(),
+            &messages,
+            "deepseek-v4-pro",
+            &root,
+            0,
+            None,
+            None,
+        ),
+    )?;
+    assert_eq!(
+        runtime_threads.get_thread(&thread.id).await?.session_id,
+        None
+    );
+
+    let retry = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&json!({ "thread_id": thread.id }))
+        .send()
+        .await?;
+    assert_eq!(retry.status(), StatusCode::OK);
+    let retry: serde_json::Value = retry.json().await?;
+    assert_eq!(retry["session_id"], expected_id);
+    assert_eq!(
+        runtime_threads.get_thread(&thread.id).await?.session_id,
+        Some(expected_id.clone())
+    );
+    let documents = manager.list_sessions()?;
+    assert_eq!(documents.len(), 1, "no duplicate document: {documents:?}");
+
+    // Another thread may not rebind itself onto this thread's document.
+    let other = runtime_threads
+        .create_thread(crate::runtime_threads::CreateThreadRequest {
+            workspace: Some(root.join("workspace")),
+            ..Default::default()
+        })
+        .await?;
+    let conflict = client
+        .put(format!("http://{addr}/v1/sessions"))
+        .json(&json!({ "thread_id": other.id, "session_id": expected_id }))
+        .send()
+        .await?;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        runtime_threads.get_thread(&other.id).await?.session_id,
+        None
+    );
+
+    // A session another process holds open cannot be deleted from here. The
+    // lease is an OS lock on its own open file description, which is exactly
+    // what a second process holding it looks like.
+    let lease_path = sessions_dir
+        .join(".late-usage")
+        .join(format!("{expected_id}.live"));
+    std::fs::create_dir_all(lease_path.parent().unwrap())?;
+    let lease = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lease_path)?;
+    assert!(crate::runtime_threads::try_lock_file_exclusive(&lease)?);
+    let refused = client
+        .delete(format!("http://{addr}/v1/sessions/{expected_id}"))
+        .send()
+        .await?;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert!(manager.session_document_exists(&expected_id));
+    drop(lease);
+    let deleted = client
+        .delete(format!("http://{addr}/v1/sessions/{expected_id}"))
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
 
     handle.abort();
     Ok(())

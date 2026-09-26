@@ -798,17 +798,111 @@ pub struct ThreadRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SavedSessionCheckpoint {
     pub covered_turn_id: Option<String>,
+    /// Fingerprint of the document's first `messages_len` messages.
     pub messages_sha256: String,
+    /// How many leading document messages the fingerprint covers (#6144).
+    ///
+    /// The document is the conversation's own record, and other writers
+    /// append to it legitimately — a TUI autosave of the same id, a later
+    /// `PUT /v1/sessions`. A fingerprint of the *whole* document turned every
+    /// such append into "changed after this thread's checkpoint" and stranded
+    /// the thread. Fingerprinting a prefix keeps the thread's history exact
+    /// (document prefix + its own later turns) while the document grows.
+    /// `None` is a checkpoint written before this field; it is migrated on
+    /// read by finding the prefix its whole-document fingerprint names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages_len: Option<usize>,
     /// A backtracked fork may retain only a prefix of the verified snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_messages: Option<usize>,
 }
 
 fn session_messages_sha256(messages: &[Message]) -> Result<String> {
-    Ok(Sha256::digest(serde_json::to_vec(messages)?)
+    Ok(hex_digest(Sha256::digest(serde_json::to_vec(messages)?)))
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect())
+        .collect()
+}
+
+/// How many leading `messages` the checkpoint's fingerprint covers, or `None`
+/// when no prefix of this document is the one the thread was bound to.
+///
+/// A checkpoint with `messages_len` is checked directly. A legacy one
+/// fingerprinted the whole document at bind time, and the document may have
+/// grown since, so every prefix is a candidate. `serde_json` writes a slice as
+/// `[` + elements joined by `,` + `]`, so one pass that serializes each message
+/// once can fingerprint every prefix — no quadratic re-serialization.
+fn checkpoint_prefix_len(
+    checkpoint: &SavedSessionCheckpoint,
+    messages: &[Message],
+) -> Result<Option<usize>> {
+    if let Some(len) = checkpoint.messages_len {
+        if len > messages.len() {
+            return Ok(None);
+        }
+        return Ok(
+            (session_messages_sha256(&messages[..len])? == checkpoint.messages_sha256)
+                .then_some(len),
+        );
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"[");
+    let close = |hasher: &Sha256| hex_digest(hasher.clone().chain_update(b"]").finalize());
+    if close(&hasher) == checkpoint.messages_sha256 {
+        return Ok(Some(0));
+    }
+    for (index, message) in messages.iter().enumerate() {
+        if index > 0 {
+            hasher.update(b",");
+        }
+        hasher.update(serde_json::to_vec(message)?);
+        if close(&hasher) == checkpoint.messages_sha256 {
+            return Ok(Some(index + 1));
+        }
+    }
+    Ok(None)
+}
+
+/// A thread's saved-session binding no longer describes any readable
+/// document: the document is gone, or its prefix is not the one the thread
+/// was bound to. The thread still owns its turns, so the binding is dropped
+/// (with a receipt) and the thread hydrates from them instead of failing.
+#[derive(Debug)]
+pub(crate) struct StaleSessionBinding {
+    pub(crate) reason: String,
+}
+
+impl std::fmt::Display for StaleSessionBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for StaleSessionBinding {}
+
+/// The session document a Runtime thread writes under when nothing bound it
+/// to one yet (#6144).
+///
+/// A Runtime thread's engine used to mint a random conversation id every time
+/// it was loaded, so everything it kept under its session directory —
+/// compaction transfers, background-shell evidence, truncation spills — went
+/// to a directory no document would ever name, and even the thread lost it at
+/// the next load. Exporting the thread (`POST /v1/sessions`) minted yet
+/// another id. Deriving the id from the thread makes all three agree, and
+/// makes the export idempotent: a retry after a crash between "save the
+/// document" and "bind the checkpoint" finds the document it already wrote.
+pub(crate) fn thread_session_id(thread_id: &str) -> String {
+    let digest = Sha256::digest(format!("codewhale-thread-session-v1:{thread_id}").as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes)
+        .into_uuid()
+        .to_string()
 }
 
 /// The prompt text a user-role message contributes to a history comparison,
@@ -2543,7 +2637,21 @@ impl RuntimeThreadStore {
     }
 
     pub fn list_threads(&self) -> Result<Vec<ThreadRecord>> {
+        let (threads, skipped) = self.list_threads_lenient()?;
+        for skipped in skipped {
+            tracing::warn!(target: "runtime", "skipped an unreadable thread record: {skipped}");
+        }
+        Ok(threads)
+    }
+
+    /// Every readable thread, plus a description of each record that could
+    /// not be read. One corrupt record used to fail the whole thread rail
+    /// (#6144 P7); it is now skipped and reported instead. A record from a
+    /// newer schema is still refused outright — skipping it would hide work
+    /// a newer build owns.
+    pub fn list_threads_lenient(&self) -> Result<(Vec<ThreadRecord>, Vec<String>)> {
         let mut out = Vec::new();
+        let mut skipped = Vec::new();
         let threads_dir = checked_existing_runtime_store_dir(&self.threads_dir)?;
         for entry in fs::read_dir(&threads_dir)
             .with_context(|| format!("Failed to read {}", threads_dir.display()))?
@@ -2553,10 +2661,18 @@ impl RuntimeThreadStore {
             if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
-            let raw = read_store_file(&path)
-                .with_context(|| format!("Failed to read {}", path.display()))?;
-            let thread: ThreadRecord = serde_json::from_str(&raw)
-                .with_context(|| format!("Failed to parse {}", path.display()))?;
+            let thread: ThreadRecord = match read_store_file(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))
+                .and_then(|raw| {
+                    serde_json::from_str(&raw)
+                        .with_context(|| format!("Failed to parse {}", path.display()))
+                }) {
+                Ok(thread) => thread,
+                Err(error) => {
+                    skipped.push(format!("{error:#}"));
+                    continue;
+                }
+            };
             if thread.schema_version > MAX_SUPPORTED_RUNTIME_SCHEMA_VERSION {
                 bail!(
                     "Thread schema v{} is newer than supported v{}",
@@ -2567,7 +2683,7 @@ impl RuntimeThreadStore {
             out.push(thread);
         }
         out.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
-        Ok(out)
+        Ok((out, skipped))
     }
 
     pub fn list_turns_for_thread(&self, thread_id: &str) -> Result<Vec<TurnRecord>> {
@@ -4952,6 +5068,228 @@ pub struct RuntimeThreadManager {
     snapshot_test_hook: Arc<parking_lot::Mutex<Option<mpsc::UnboundedSender<SnapshotTestPoint>>>>,
     #[cfg(test)]
     replay_test_hook: Arc<parking_lot::Mutex<Option<mpsc::UnboundedSender<ReplayTestPoint>>>>,
+}
+
+impl RuntimeStoreBinding {
+    /// The binding a host that opened `data_dir` would have recorded: its
+    /// canonical root and the scope derived from the store's owner. A store
+    /// whose owner was never written has no scope an automation could pin.
+    pub(crate) fn for_store_dir(data_dir: &Path) -> Result<Self> {
+        let root = checked_runtime_store_root(data_dir.to_path_buf())?;
+        let execution_scope = match read_store_file(&root.join(AGENT_MAIL_OWNER_FILE)) {
+            Ok(raw) => {
+                let owner: RuntimeStoreOwner = serde_json::from_str(&raw)?;
+                runtime_execution_scope(&owner.owner_id, &root.join(EVENT_TRANSACTION_LOCK_FILE))
+            }
+            Err(_) if !root.join(AGENT_MAIL_OWNER_FILE).exists() => String::new(),
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            data_dir: root,
+            execution_scope,
+        })
+    }
+
+    /// Take this store's process-owner lock for maintenance, or `None` when
+    /// a live process holds it (#6144).
+    ///
+    /// Holding the same lock a host takes in `open_inner` is what makes the
+    /// maintenance exact: while it is held no process can open the store, so
+    /// an emptiness read cannot race new work, and a move cannot pull the
+    /// store out from under an opener — the opener fails its lock instead.
+    /// Unconfined paths and non-directories are refused.
+    pub(crate) fn try_hold(&self) -> Result<Option<HeldRuntimeStore>> {
+        anyhow::ensure!(
+            self.is_confined_session_store()?,
+            "Runtime store {} is outside the sessions directory",
+            self.data_dir.display()
+        );
+        anyhow::ensure!(
+            self.data_dir.is_dir(),
+            "Runtime store {} is not a directory",
+            self.data_dir.display()
+        );
+        let lock = RuntimeProcessOwnerLock::try_acquire_file(
+            &self.data_dir.join(RUNTIME_PROCESS_OWNER_LOCK_FILE),
+            true,
+        )?;
+        Ok(lock.map(|lock| HeldRuntimeStore {
+            binding: self.clone(),
+            _lock: lock,
+        }))
+    }
+}
+
+/// A Runtime store held under its process-owner lock by maintenance —
+/// session reconcile, or the switch/delete that just stopped binding it.
+pub(crate) struct HeldRuntimeStore {
+    binding: RuntimeStoreBinding,
+    _lock: RuntimeProcessOwnerLock,
+}
+
+/// One thread recovered from a store no document references.
+pub(crate) struct RecoverableThread {
+    pub(crate) thread: ThreadRecord,
+    pub(crate) messages: Vec<Message>,
+}
+
+impl HeldRuntimeStore {
+    pub(crate) fn binding(&self) -> &RuntimeStoreBinding {
+        &self.binding
+    }
+
+    /// Why this store must be kept, or `None` when it holds nothing: the same
+    /// "nothing to lose" test a session switch applies before adopting it,
+    /// read while no process can add work.
+    pub(crate) fn keep_reason(&self) -> Result<Option<String>> {
+        if let Some(dir) = self.binding.first_durable_work_dir()? {
+            return Ok(Some(format!("holds work in `{dir}`")));
+        }
+        if self.binding.has_scope_pinned_automation()? {
+            return Ok(Some("an automation is pinned to it".to_string()));
+        }
+        Ok(None)
+    }
+
+    /// Move the store to `destination`, still holding its lock, so no opener
+    /// can race the move. Nothing is unlinked.
+    pub(crate) fn move_to(self, destination: &Path) -> Result<()> {
+        anyhow::ensure!(
+            !destination.exists(),
+            "set-aside destination {} already exists",
+            destination.display()
+        );
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        fs::rename(&self.binding.data_dir, destination).with_context(|| {
+            format!(
+                "Failed to move Runtime store {} to {}",
+                self.binding.data_dir.display(),
+                destination.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    fn open_store(&self) -> Result<RuntimeThreadStore> {
+        RuntimeThreadStore::open(self.binding.data_dir.clone())
+    }
+
+    /// Threads in this store that name no session document, with their
+    /// history rebuilt from their own turns. Threads with no turns carry no
+    /// conversation to recover and are left out.
+    pub(crate) fn recoverable_threads(&self) -> Result<Vec<RecoverableThread>> {
+        let store = self.open_store()?;
+        let (threads, _) = store.list_threads_lenient()?;
+        let mut out = Vec::new();
+        for thread in threads {
+            if thread.session_id.is_some() {
+                continue;
+            }
+            let turns = store.list_turns_for_thread(&thread.id)?;
+            if turns.is_empty() {
+                continue;
+            }
+            let turn_ids: Vec<String> = turns.iter().map(|turn| turn.id.clone()).collect();
+            let items = store.list_items_for_turns_map(&turn_ids)?;
+            let messages =
+                RuntimeThreadManager::reconstruct_messages_from_turns_with(&turns, &items)?;
+            if messages.is_empty() {
+                continue;
+            }
+            out.push(RecoverableThread { thread, messages });
+        }
+        Ok(out)
+    }
+
+    /// Bind `thread_id` to the document just written for it, covering every
+    /// turn the document was rebuilt from.
+    pub(crate) fn bind_recovered_thread(
+        &self,
+        thread_id: &str,
+        session: &crate::session_manager::SavedSession,
+    ) -> Result<()> {
+        let store = self.open_store()?;
+        let _thread_mutation = store.thread_mutation.lock();
+        let mut thread = store.load_thread(thread_id)?;
+        thread.session_id = Some(session.metadata.id.clone());
+        thread.saved_session_checkpoint = Some(SavedSessionCheckpoint {
+            covered_turn_id: thread.latest_turn_id.clone(),
+            messages_sha256: session_messages_sha256(&session.messages)?,
+            messages_len: Some(session.messages.len()),
+            retained_messages: None,
+        });
+        thread.updated_at = Utc::now();
+        store.save_thread(&thread)
+    }
+
+    /// Unbind threads whose session document no longer exists (#6144 R4).
+    /// `exists` answers for a session id; a thread whose document is present
+    /// is untouched — its checkpoint is verified (and migrated) when it loads.
+    pub(crate) fn unbind_threads_without_documents(
+        &self,
+        exists: impl Fn(&str) -> bool,
+    ) -> Result<usize> {
+        if !self.binding.data_dir.join("threads").is_dir() {
+            return Ok(0);
+        }
+        let store = self.open_store()?;
+        let (threads, _) = store.list_threads_lenient()?;
+        let mut unbound = 0;
+        for thread in threads {
+            let Some(session_id) = thread.session_id.as_deref() else {
+                continue;
+            };
+            if exists(session_id) {
+                continue;
+            }
+            unbound += unbind_session_threads_in_store(
+                &store,
+                &self.binding.data_dir,
+                session_id,
+                "its session document no longer exists",
+            )?;
+        }
+        Ok(unbound)
+    }
+}
+
+/// Clear `session_id` (and its checkpoint) on every thread in `store` that
+/// names it, recording each old binding in the reconcile receipts.
+fn unbind_session_threads_in_store(
+    store: &RuntimeThreadStore,
+    store_dir: &Path,
+    session_id: &str,
+    reason: &str,
+) -> Result<usize> {
+    let _thread_mutation = store.thread_mutation.lock();
+    let (threads, _) = store.list_threads_lenient()?;
+    let mut unbound = 0;
+    for mut thread in threads {
+        if thread.session_id.as_deref() != Some(session_id) {
+            continue;
+        }
+        crate::session_reconcile::record_thread_unbound(store_dir, &thread, reason);
+        thread.session_id = None;
+        thread.saved_session_checkpoint = None;
+        thread.updated_at = Utc::now();
+        store.save_thread(&thread)?;
+        unbound += 1;
+    }
+    Ok(unbound)
+}
+
+/// Try to take an exclusive OS lock on `file` without blocking: `Ok(true)`
+/// when acquired (released when the file closes), `Ok(false)` when another
+/// open file description holds it.
+pub(crate) fn try_lock_file_exclusive(file: &File) -> std::io::Result<bool> {
+    match RuntimeProcessOwnerLock::try_lock_exclusive(file) {
+        Ok(()) => Ok(true),
+        Err(error) if RuntimeProcessOwnerLock::is_contention(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Debug)]
@@ -8892,6 +9230,7 @@ impl RuntimeThreadManager {
             thread.saved_session_checkpoint = Some(SavedSessionCheckpoint {
                 covered_turn_id: thread.latest_turn_id.clone(),
                 messages_sha256,
+                messages_len: Some(session.messages.len()),
                 retained_messages: None,
             });
             thread.updated_at = Utc::now();
@@ -8998,12 +9337,29 @@ impl RuntimeThreadManager {
     /// exactly when the first one is busy — is where the duplicates came from.
     /// A client that lands on one has to treat its composer as steering rather
     /// than as a new turn (`start_turn` refuses a busy thread by design).
+    /// Another unarchived thread in this store bound to `session_id`.
+    pub(crate) fn thread_bound_to_session(
+        &self,
+        session_id: &str,
+        except_thread_id: &str,
+    ) -> Option<String> {
+        self.store
+            .list_threads()
+            .ok()?
+            .into_iter()
+            .find(|thread| {
+                !thread.archived
+                    && thread.id != except_thread_id
+                    && thread.session_id.as_deref() == Some(session_id)
+            })
+            .map(|thread| thread.id)
+    }
+
     pub(crate) fn thread_holding_session(
         &self,
         session_id: &str,
         session: &crate::session_manager::SavedSession,
     ) -> Option<ThreadRecord> {
-        let expected = session_messages_sha256(&session.messages).ok()?;
         // Store order is newest-first, so the first match is the newest binding
         // and the one a client most likely means.
         for thread in self.store.list_threads().ok()? {
@@ -9011,7 +9367,10 @@ impl RuntimeThreadManager {
                 continue;
             }
             if let Some(checkpoint) = thread.saved_session_checkpoint.as_ref()
-                && checkpoint.messages_sha256 != expected
+                && !matches!(
+                    checkpoint_prefix_len(checkpoint, &session.messages),
+                    Ok(Some(_))
+                )
             {
                 continue;
             }
@@ -9117,6 +9476,7 @@ impl RuntimeThreadManager {
         forked.saved_session_checkpoint = Some(SavedSessionCheckpoint {
             covered_turn_id,
             messages_sha256,
+            messages_len: Some(stored.len()),
             retained_messages: None,
         });
         Ok(())
@@ -9149,7 +9509,7 @@ impl RuntimeThreadManager {
         // `saved_transcript_is_compacted`.
         let fork_prefix = if saved_transcript_is_compacted(&source_turns, &items_by_turn) {
             Some((
-                self.reconstruct_messages_from_turns_with(&source_turns, &items_by_turn)?,
+                Self::reconstruct_messages_from_turns_with(&source_turns, &items_by_turn)?,
                 source_turns.len(),
             ))
         } else {
@@ -9519,7 +9879,7 @@ impl RuntimeThreadManager {
             } else if covered <= cutoff_turn_idx {
                 Some(messages.len())
             } else {
-                let kept_messages = self.reconstruct_messages_from_turns_with(
+                let kept_messages = Self::reconstruct_messages_from_turns_with(
                     &source_turns[..cutoff_turn_idx],
                     &items_by_turn,
                 )?;
@@ -9551,7 +9911,7 @@ impl RuntimeThreadManager {
                             None => messages.len(),
                             Some(dropped_turn) => {
                                 let dropped_prompt = projected_user_texts(
-                        &self.reconstruct_messages_from_turns_with(
+                        &Self::reconstruct_messages_from_turns_with(
                             std::slice::from_ref(dropped_turn),
                             &items_by_turn,
                         )?,
@@ -9578,7 +9938,7 @@ impl RuntimeThreadManager {
             let (prefix, covered_turns) = match retained_messages {
                 Some(retained) => (messages[..retained].to_vec(), kept_turns),
                 None => (
-                    self.reconstruct_messages_from_turns_with(
+                    Self::reconstruct_messages_from_turns_with(
                         &source_turns[..cutoff_turn_idx],
                         &items_by_turn,
                     )?,
@@ -9599,6 +9959,17 @@ impl RuntimeThreadManager {
                     match &source.saved_session_checkpoint {
                         Some(checkpoint) => checkpoint.messages_sha256.clone(),
                         None => session_messages_sha256(&messages)?,
+                    }
+                },
+                // The fingerprint's own extent: the rebuilt prefix, the
+                // source checkpoint's (a legacy `None` migrates on read), or
+                // the whole verified legacy document.
+                messages_len: if compacted {
+                    Some(prefix.len())
+                } else {
+                    match &source.saved_session_checkpoint {
+                        Some(checkpoint) => checkpoint.messages_len,
+                        None => Some(messages.len()),
                     }
                 },
                 retained_messages: Some(prefix.len()),
@@ -12097,7 +12468,16 @@ impl RuntimeThreadManager {
                 model: route_model.clone(),
                 active_route_limits: route_limits,
                 workspace: thread.workspace.clone(),
-                session_id: None,
+                // The conversation this thread writes under: its bound
+                // document, or the id its export will use. A fresh random id
+                // per engine load scattered its artifacts into directories no
+                // document names, and lost them at the next load (#6144).
+                session_id: Some(
+                    thread
+                        .session_id
+                        .clone()
+                        .unwrap_or_else(|| thread_session_id(&thread.id)),
+                ),
                 subagent_state_root: None,
                 plugin_registry: thread_plugin_registry.clone(),
                 allow_shell: thread.allow_shell,
@@ -12459,11 +12839,108 @@ impl RuntimeThreadManager {
 
     fn restore_thread_messages(&self, thread: &ThreadRecord) -> Result<Vec<Message>> {
         let turns = self.store.list_turns_for_thread(&thread.id)?;
-        let (mut messages, covered) = self
-            .saved_session_prefix(thread, &turns)?
-            .unwrap_or_default();
+        let (mut messages, covered) = match self.saved_session_prefix(thread, &turns) {
+            Ok(prefix) => prefix.unwrap_or_default(),
+            Err(error) => {
+                let Some(stale) = error.downcast_ref::<StaleSessionBinding>() else {
+                    return Err(error);
+                };
+                // The binding describes no readable document. The thread's
+                // own turns are its history; drop the dead link (keeping it
+                // in a receipt) instead of stranding the thread (#6144).
+                self.unbind_stale_session(thread, &stale.reason)?;
+                (Vec::new(), 0)
+            }
+        };
         messages.extend(self.reconstruct_messages_from_turns(&turns[covered..])?);
         Ok(messages)
+    }
+
+    /// Drop `thread`'s saved-session binding when the stored record still
+    /// carries exactly the binding that was found stale, and record the old
+    /// binding in the session reconcile receipts.
+    fn unbind_stale_session(&self, thread: &ThreadRecord, reason: &str) -> Result<()> {
+        let _thread_mutation = self.store.thread_mutation.lock();
+        let mut stored = self.store.load_thread(&thread.id)?;
+        if stored.session_id != thread.session_id
+            || stored.saved_session_checkpoint != thread.saved_session_checkpoint
+        {
+            return Ok(());
+        }
+        crate::session_reconcile::record_thread_unbound(
+            &self.session_store_binding().data_dir,
+            &stored,
+            reason,
+        );
+        stored.session_id = None;
+        stored.saved_session_checkpoint = None;
+        stored.updated_at = Utc::now();
+        self.store.save_thread(&stored)
+    }
+
+    /// Unbind every thread in this store that names `session_id` (#6144).
+    /// Called when that document is deleted: the threads keep their turns and
+    /// hydrate from them instead of failing with "Cannot read saved session".
+    pub(crate) fn unbind_session_threads(&self, session_id: &str) -> Result<usize> {
+        unbind_session_threads_in_store(
+            &self.store,
+            &self.session_store_binding().data_dir,
+            session_id,
+            "the session document was deleted",
+        )
+    }
+
+    /// Give a legacy `session_id`-only link the checkpoint its projection
+    /// match just established. Best effort, like [`Self::record_checkpoint_len`].
+    fn record_legacy_checkpoint(
+        &self,
+        thread: &ThreadRecord,
+        messages: &[Message],
+        turns: &[TurnRecord],
+        covered: usize,
+    ) {
+        let Ok(messages_sha256) = session_messages_sha256(messages) else {
+            return;
+        };
+        let _thread_mutation = self.store.thread_mutation.lock();
+        let Ok(mut stored) = self.store.load_thread(&thread.id) else {
+            return;
+        };
+        if stored.session_id != thread.session_id || stored.saved_session_checkpoint.is_some() {
+            return;
+        }
+        stored.saved_session_checkpoint = Some(SavedSessionCheckpoint {
+            covered_turn_id: covered
+                .checked_sub(1)
+                .and_then(|index| turns.get(index))
+                .map(|turn| turn.id.clone()),
+            messages_sha256,
+            messages_len: Some(messages.len()),
+            retained_messages: None,
+        });
+        if let Err(error) = self.store.save_thread(&stored) {
+            tracing::debug!(thread_id = %thread.id, %error, "migrated legacy checkpoint was not saved");
+        }
+    }
+
+    /// Record a migrated legacy checkpoint's prefix length, so the prefix
+    /// search runs once. Best effort: a failed write only repeats the search.
+    fn record_checkpoint_len(&self, thread: &ThreadRecord, len: usize) {
+        let _thread_mutation = self.store.thread_mutation.lock();
+        let Ok(mut stored) = self.store.load_thread(&thread.id) else {
+            return;
+        };
+        if stored.session_id != thread.session_id
+            || stored.saved_session_checkpoint != thread.saved_session_checkpoint
+        {
+            return;
+        }
+        if let Some(checkpoint) = stored.saved_session_checkpoint.as_mut() {
+            checkpoint.messages_len = Some(len);
+        }
+        if let Err(error) = self.store.save_thread(&stored) {
+            tracing::debug!(thread_id = %thread.id, %error, "migrated checkpoint length was not saved");
+        }
     }
 
     fn saved_session_prefix(
@@ -12474,16 +12951,41 @@ impl RuntimeThreadManager {
         let Some(session_id) = thread.session_id.as_deref() else {
             return Ok(None);
         };
-        let session = crate::session_manager::default_sessions_dir()
+        let loaded = crate::session_manager::default_sessions_dir()
             .and_then(crate::session_manager::SessionManager::new)
-            .and_then(|manager| manager.resume_session(session_id).map(|recovery| recovery.session))
-            .with_context(|| format!("Cannot read saved session {session_id}; restore that session file before resuming thread {}", thread.id))?;
-        let covered = if let Some(checkpoint) = &thread.saved_session_checkpoint {
-            if checkpoint.messages_sha256 != session_messages_sha256(&session.messages)? {
-                bail!(
-                    "Saved session {session_id} changed after this thread's checkpoint; re-import it into a separate thread to preserve both histories"
-                );
+            .and_then(|manager| {
+                manager
+                    .resume_session(session_id)
+                    .map(|recovery| recovery.session)
+            });
+        let mut session = match loaded {
+            Ok(session) => session,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StaleSessionBinding {
+                    reason: format!("saved session {session_id} no longer exists"),
+                }
+                .into());
             }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Cannot read saved session {session_id}; restore that session file before resuming thread {}", thread.id));
+            }
+        };
+        let covered = if let Some(checkpoint) = &thread.saved_session_checkpoint {
+            let Some(len) = checkpoint_prefix_len(checkpoint, &session.messages)? else {
+                return Err(StaleSessionBinding {
+                    reason: format!(
+                        "Saved session {session_id} changed after this thread's checkpoint: its first messages are no longer the ones this thread was bound to"
+                    ),
+                }
+                .into());
+            };
+            if checkpoint.messages_len.is_none() {
+                self.record_checkpoint_len(thread, len);
+            }
+            // Messages past the prefix were appended to the document by its
+            // own conversation after this thread's checkpoint; the thread's
+            // history is the prefix plus its own later turns.
+            session.messages.truncate(len);
             match checkpoint.covered_turn_id.as_deref() {
                 Some(id) => turns.iter().position(|turn| turn.id == id)
                     .map(|index| index + 1)
@@ -12507,7 +13009,7 @@ impl RuntimeThreadManager {
                     break;
                 }
                 prefix.extend(session_recovery_projection(
-                    &self.reconstruct_messages_from_turns_with(
+                    &Self::reconstruct_messages_from_turns_with(
                         std::slice::from_ref(turn),
                         &items_by_turn,
                     )?,
@@ -12518,7 +13020,20 @@ impl RuntimeThreadManager {
                     break;
                 }
             }
-            covered.with_context(|| format!("Saved session {session_id} has no verifiable Runtime checkpoint; keep both histories and re-import the saved session into a separate thread"))?
+            match covered {
+                Some(covered) => {
+                    // Migrate the legacy link to a prefix checkpoint so this
+                    // projection walk runs once, not on every load.
+                    self.record_legacy_checkpoint(thread, &session.messages, turns, covered);
+                    covered
+                }
+                None => {
+                    return Err(StaleSessionBinding {
+                        reason: format!("Saved session {session_id} has no verifiable Runtime checkpoint: no prefix of this thread's turns matches it"),
+                    }
+                    .into());
+                }
+            }
         };
         let mut messages = session.messages;
         if let Some(retained) = thread
@@ -12542,11 +13057,10 @@ impl RuntimeThreadManager {
         // caller with several turns — the fork alignment below, a legacy
         // saved-session link — paid one scan per turn.
         let items_by_turn = self.prepared_items_for_turns(turns)?;
-        self.reconstruct_messages_from_turns_with(turns, &items_by_turn)
+        Self::reconstruct_messages_from_turns_with(turns, &items_by_turn)
     }
 
     fn reconstruct_messages_from_turns_with(
-        &self,
         turns: &[TurnRecord],
         items_by_turn: &HashMap<String, Vec<TurnItemRecord>>,
     ) -> Result<Vec<Message>> {

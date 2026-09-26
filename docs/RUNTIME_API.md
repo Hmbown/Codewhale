@@ -631,6 +631,15 @@ a TLS or verified transport boundary.
 - `POST /v1/sessions/{id}/resume-thread`
 - `GET /v1/sessions/{id}/artifacts` and `GET /v1/sessions/{id}/artifacts/{artifact_id}?offset=&limit=`
   (see workspace files and session artifacts above)
+- `POST /v1/sessions` (`{ "thread_id": string, "title"?: string }`) exports a
+  thread as a saved session. It is idempotent: the thread's own document is
+  updated in place (`200`), and a thread without one gets a document whose id
+  is derived from the thread (`201`), so a retry never makes a duplicate.
+- `PUT /v1/sessions` (`{ "thread_id"?: string, "session_id"?: string }`) saves
+  a thread's live conversation. Naming a `session_id` that another thread is
+  bound to returns `409 Conflict`.
+- `GET /v1/sessions/repair` returns the last session-store repair summary, or
+  `null` if none has run
 
 Sessions and threads answer the same `include_archived` / `archived_only` pair
 with the same meaning, and `search` is the same fuzzy match (title, id,
@@ -667,9 +676,20 @@ archive notion.
 
 While a session is open in an interactive Codewhale process, that process holds
 the authoritative copy in memory and rewrites the whole document on its next
-autosave. `PATCH` therefore fails closed on it with `409 Conflict` rather than
-writing something that would be silently reverted. Change it in the terminal
-instead. A standalone `codewhale web` holds nothing open and is never blocked.
+autosave. `PATCH`, `PUT` and `DELETE` therefore fail closed on it with
+`409 Conflict` rather than writing something that would be silently reverted.
+Change it in the terminal instead. The open process holds a lock on the
+session (`sessions/.late-usage/<id>.live`), so this holds whether the request
+reaches the API inside that process or a separate `codewhale serve`.
+
+The session store is repaired in the background at each launch and each
+`codewhale serve` start. The repair gives a "Recovered:" session to each thread
+in a Runtime store that no session is bound to. It unbinds threads whose session
+document is gone; they then load from their own turns. It moves unreadable
+documents, empty unbound stores, and old artifact directories that no session
+names to `sessions/.set-aside/<run>/`, and writes a `MANIFEST.jsonl` there.
+Nothing is deleted. `GET /v1/sessions/repair` and `codewhale doctor` report the
+last run; `codewhale doctor --repair-sessions [--dry-run]` runs one on demand.
 
 `GET /v1/sessions/{id}?peek=true` returns a bounded, redacted, read-only view
 instead of the transcript: at most 12 entries of at most 400 characters each
@@ -2093,6 +2113,7 @@ its result rather than dropped. It answers with the worker record:
 | Get session | `GET /v1/sessions/{id}` |
 | Rename / archive session | `PATCH /v1/sessions/{id}` |
 | Delete session | `DELETE /v1/sessions/{id}` |
+| Session store repair summary | `GET /v1/sessions/repair` |
 | Resume into thread | `POST /v1/sessions/{id}/resume-thread` |
 | Create thread | `POST /v1/threads` |
 | List threads | `GET /v1/threads` |

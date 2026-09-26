@@ -449,16 +449,50 @@ pub(super) async fn create_session_from_thread(
     let manager = SessionManager::new(state.sessions_dir.clone())
         .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
     let total_tokens = total_tokens_from_thread_detail(&detail);
-    let session_handle = uuid::Uuid::new_v4().to_string();
-    let mut session = create_saved_session_with_id_and_mode(
-        session_handle.clone(),
-        &messages,
-        &detail.thread.model,
-        &detail.thread.workspace,
-        total_tokens,
-        None,
-        Some(&detail.thread.mode),
-    );
+    // Export is idempotent (#6144). Every POST used to mint a fresh document
+    // and rebind the thread to it, so each re-export left the previous
+    // document unreferenced, and a crash between the save and the bind below
+    // left the new one unreferenced too. The thread's own document is
+    // updated in place; a thread with none gets the id derived from it —
+    // the one its engine already writes artifacts under — so a retry after
+    // such a crash finds and binds the document it already wrote.
+    let session_handle = detail
+        .thread
+        .session_id
+        .clone()
+        .filter(|id| manager.session_document_exists(id))
+        .unwrap_or_else(|| crate::runtime_threads::thread_session_id(&detail.thread.id));
+    if manager.is_session_live_anywhere(&session_handle) {
+        return Err(map_session_err(
+            &session_handle,
+            crate::session_manager::live_session_conflict(&session_handle),
+            "export",
+        ));
+    }
+    let existing = match manager.load_session(&session_handle) {
+        Ok(existing) => Some(existing),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(map_session_err(&session_handle, error, "read")),
+    };
+    let created = existing.is_none();
+    let mut session = match existing {
+        Some(existing) => {
+            let mut updated =
+                crate::session_manager::update_session(existing, &messages, total_tokens, None);
+            updated.metadata.model = detail.thread.model.clone();
+            updated.metadata.mode = Some(detail.thread.mode.clone());
+            updated
+        }
+        None => create_saved_session_with_id_and_mode(
+            session_handle.clone(),
+            &messages,
+            &detail.thread.model,
+            &detail.thread.workspace,
+            total_tokens,
+            None,
+            Some(&detail.thread.mode),
+        ),
+    };
     {
         let config = state.runtime_threads.read_config();
         stamp_session_provider_from_thread(&config, &detail, &mut session.metadata).map_err(
@@ -498,7 +532,11 @@ pub(super) async fn create_session_from_thread(
         })?;
 
     Ok((
-        StatusCode::CREATED,
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
         Json(CreateSessionResponse {
             session_id: session_handle,
             thread_id: detail.thread.id,
@@ -809,6 +847,41 @@ pub(super) async fn save_current_session(
     let manager = SessionManager::new(state.sessions_dir.clone())
         .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
 
+    // A document another thread is bound to is that thread's conversation.
+    // Rebinding this thread onto it would leave the other thread's checkpoint
+    // describing a document it no longer owns (#6144). A thread already bound
+    // to the same document (a legacy shared link) keeps saving to it.
+    if let Some(requested) = req.session_id.as_deref() {
+        let own = state
+            .runtime_threads
+            .get_thread(&thread_id)
+            .await
+            .map_err(map_thread_err)?;
+        if own.session_id.as_deref() != Some(requested)
+            && let Some(other) = state
+                .runtime_threads
+                .thread_bound_to_session(requested, &thread_id)
+        {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: format!(
+                    "Session '{requested}' belongs to thread {other}; save this thread without a session_id, or into its own session"
+                ),
+            });
+        }
+    }
+    let target_id = req
+        .session_id
+        .clone()
+        .unwrap_or_else(|| snapshot.session_id.clone());
+    if manager.is_session_live_anywhere(&target_id) {
+        return Err(map_session_err(
+            &target_id,
+            crate::session_manager::live_session_conflict(&target_id),
+            "save",
+        ));
+    }
+
     // Build or update the session, mirroring TUI's `build_session_snapshot`.
     // Only `io::ErrorKind::NotFound` falls back to creating a new session;
     // other I/O errors (e.g. PermissionDenied) are propagated so callers
@@ -935,10 +1008,32 @@ pub(super) async fn delete_session(
 ) -> Result<StatusCode, ApiError> {
     let manager = SessionManager::new(state.sessions_dir.clone())
         .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+    // Deleting a document an interactive session holds open would be undone
+    // by its next autosave, in whichever process holds it.
+    if manager.is_session_live_anywhere(&id) {
+        return Err(map_session_err(
+            &id,
+            crate::session_manager::live_session_conflict(&id),
+            "delete",
+        ));
+    }
     manager
         .delete_session(&id)
         .map_err(|e| map_session_err(&id, e, "delete"))?;
+    // Threads bound to the document keep their turns; drop the dead link so
+    // they load from those instead of failing (#6144).
+    if let Err(error) = state.runtime_threads.unbind_session_threads(&id) {
+        tracing::warn!(session_id = %id, %error, "deleted session's threads were not unbound");
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /v1/sessions/repair`: what the last session-store repair did (#6144).
+/// `null` when none has completed.
+pub(super) async fn get_session_repair(
+    State(state): State<RuntimeApiState>,
+) -> Json<Option<crate::session_reconcile::ReconcileSummary>> {
+    Json(crate::session_reconcile::last_run(&state.sessions_dir))
 }
 
 pub(super) fn session_to_detail(session: SavedSession) -> SessionDetailResponse {

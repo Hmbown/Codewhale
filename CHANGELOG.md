@@ -51,6 +51,23 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Fixed
 
+- Saved sessions no longer go orphaned, and existing orphans are repaired at
+  launch. Deleting a session now sets aside the Runtime store it was actually
+  bound to, and switching a conversation to another host's store sets aside the
+  store it left, unless another session still uses that store or it holds
+  work. Exporting a thread (`POST /v1/sessions`) updates the thread's own
+  document instead of creating a new one each time. A thread whose document was
+  appended to elsewhere keeps loading. A thread whose document was deleted or
+  rewritten loads from its own turns instead of failing, and threads write
+  their files under the session they belong to. Each launch and `codewhale
+  serve` repairs the store in the background: a store holding threads with no
+  session gets a "Recovered:" session for each thread, and unreadable
+  documents, unused empty stores and old files no session names move to
+  `sessions/.set-aside/` with a manifest. Nothing is deleted. `codewhale doctor`
+  reports the last repair, and `codewhale doctor --repair-sessions [--dry-run]`
+  runs one now. `PUT` and `DELETE /v1/sessions` refuse a session that another
+  Codewhale process has open
+  ([#6144](https://github.com/Hmbown/Codewhale/issues/6144)).
 - `codewhale exec --auto` no longer exits 141 with no output when a child
   it writes to, such as a stdio MCP server, closes its pipe early. Headless
   exec now ignores SIGPIPE while it runs, as the interactive TUI already did,

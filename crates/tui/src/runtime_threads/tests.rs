@@ -280,28 +280,226 @@ mod recovery {
             }],
         };
         sessions.save_session(&changed)?;
-        assert!(
+        // A rewritten prefix is real divergence. The thread no longer strands
+        // on it (#6144): the dead binding is dropped, kept in a receipt, and
+        // the thread hydrates from its own turns.
+        let from_turns = manager.restore_thread_messages(&thread)?;
+        assert_eq!(
+            from_turns.len(),
             manager
-                .restore_thread_messages(&thread)
-                .unwrap_err()
-                .to_string()
-                .contains("changed after this thread's checkpoint")
+                .reconstruct_messages_from_turns(&manager.store.list_turns_for_thread(&thread.id)?)?
+                .len()
         );
+        let stored = manager.store.load_thread(&thread.id)?;
+        assert_eq!(stored.session_id, None);
+        assert_eq!(stored.saved_session_checkpoint, None);
+        let receipts = std::fs::read_to_string(
+            dir.path()
+                .join("runtime")
+                .join(crate::session_reconcile::THREAD_UNBIND_RECEIPTS_FILE),
+        )?;
+        assert!(receipts.contains("thread_unbound"), "{receipts}");
+        assert!(receipts.contains(&saved.metadata.id), "{receipts}");
         // The source saving new content is precisely what used to break the
         // fork: both threads named this file, so the source's save rewrote the
         // bytes under the fork's checkpoint.
         assert_eq!(manager.restore_thread_messages(&fork)?, messages);
-        assert!(
-            manager
-                .restore_thread_messages(&legacy)
-                .unwrap_err()
-                .to_string()
-                .contains("no verifiable Runtime checkpoint")
-        );
-        assert!(manager.get_engine(&thread.id).await.is_err());
-        assert!(manager.active.lock().await.engines.is_empty());
+        // A legacy link that no longer matches loads from turns, too; it only
+        // unbinds when the stored record still carries that same link.
+        assert!(manager.restore_thread_messages(&legacy).is_ok());
         sessions.save_session(&saved)?;
         assert_eq!(manager.restore_thread_messages(&thread)?, expected);
+        Ok(())
+    }
+
+    fn msg(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    /// #6144 P4: the checkpoint covers a prefix. The document's own
+    /// conversation appending to it (a TUI autosave of the same id, a later
+    /// PUT) used to strand the thread with "changed after this thread's
+    /// checkpoint"; now the thread keeps exactly its prefix plus its own turns.
+    /// A legacy whole-document checkpoint is migrated on its first read.
+    #[tokio::test]
+    async fn appended_document_keeps_the_thread_on_its_checkpoint_prefix() -> Result<()> {
+        let _env = crate::test_support::lock_test_env();
+        let dir = tempfile::tempdir()?;
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+        let manager = RuntimeThreadManager::open(
+            config(),
+            dir.path().to_path_buf(),
+            test_manager_config(dir.path().join("runtime")),
+        )?;
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let prefix = vec![
+            msg(Role::User, "first"),
+            msg(Role::Assistant, "first answer"),
+        ];
+        manager
+            .seed_thread_from_messages(&thread.id, &prefix)
+            .await?;
+        let sessions = crate::session_manager::SessionManager::new(
+            crate::session_manager::default_sessions_dir()?,
+        )?;
+        let mut document = crate::session_manager::create_saved_session_with_id_and_mode(
+            Uuid::new_v4().to_string(),
+            &prefix,
+            &thread.model,
+            dir.path(),
+            0,
+            None,
+            Some("agent"),
+        );
+        sessions.save_session(&document)?;
+        {
+            let _admission = manager.session_checkpoint_guard().await;
+            manager
+                .set_thread_session_checkpoint(&thread.id, &document)
+                .await?;
+        }
+        let bound = manager.get_thread(&thread.id).await?;
+        assert_eq!(
+            bound
+                .saved_session_checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.messages_len),
+            Some(2)
+        );
+
+        // The document's conversation moves on; so does the thread.
+        document.messages.extend([
+            msg(Role::User, "elsewhere"),
+            msg(Role::Assistant, "elsewhere answer"),
+        ]);
+        sessions.save_session(&document)?;
+        let tail = vec![msg(Role::User, "thread tail")];
+        manager.seed_thread_from_messages(&thread.id, &tail).await?;
+        let mut expected = prefix.clone();
+        expected.extend(tail);
+        assert_eq!(manager.restore_thread_messages(&bound)?, expected);
+
+        // A checkpoint written before `messages_len` fingerprints the whole
+        // document as it was at bind time; the prefix search finds it and the
+        // length is written back.
+        let mut legacy = manager.store.load_thread(&thread.id)?;
+        legacy
+            .saved_session_checkpoint
+            .as_mut()
+            .expect("checkpoint")
+            .messages_len = None;
+        manager.store.save_thread(&legacy)?;
+        assert_eq!(manager.restore_thread_messages(&legacy)?, expected);
+        assert_eq!(
+            manager
+                .store
+                .load_thread(&thread.id)?
+                .saved_session_checkpoint
+                .and_then(|checkpoint| checkpoint.messages_len),
+            Some(2)
+        );
+
+        // P5: the document is deleted. The thread unbinds and loads from turns.
+        sessions.delete_session(&document.metadata.id)?;
+        let orphaned = manager.store.load_thread(&thread.id)?;
+        let from_turns = manager.restore_thread_messages(&orphaned)?;
+        assert_eq!(from_turns.len(), 3, "{from_turns:?}");
+        assert_eq!(manager.store.load_thread(&thread.id)?.session_id, None);
+        Ok(())
+    }
+
+    /// The legacy prefix search must agree with `serde_json`'s own encoding
+    /// of a slice, for every prefix length.
+    #[test]
+    fn checkpoint_prefix_search_matches_slice_fingerprints() -> Result<()> {
+        let messages = vec![
+            msg(Role::User, "a"),
+            msg(Role::Assistant, "b \"quoted\" \u{1F40B}"),
+            msg(Role::User, "c"),
+        ];
+        for len in 0..=messages.len() {
+            let checkpoint = SavedSessionCheckpoint {
+                covered_turn_id: None,
+                messages_sha256: session_messages_sha256(&messages[..len])?,
+                messages_len: None,
+                retained_messages: None,
+            };
+            assert_eq!(checkpoint_prefix_len(&checkpoint, &messages)?, Some(len));
+            let exact = SavedSessionCheckpoint {
+                messages_len: Some(len),
+                ..checkpoint
+            };
+            assert_eq!(checkpoint_prefix_len(&exact, &messages)?, Some(len));
+        }
+        let diverged = SavedSessionCheckpoint {
+            covered_turn_id: None,
+            messages_sha256: session_messages_sha256(&[msg(Role::User, "other")])?,
+            messages_len: Some(1),
+            retained_messages: None,
+        };
+        assert_eq!(checkpoint_prefix_len(&diverged, &messages)?, None);
+        Ok(())
+    }
+
+    /// #6144 P9: a Runtime thread's engine writes under the id its export will
+    /// use, not a fresh random id per load that no document ever names.
+    #[tokio::test]
+    async fn runtime_thread_engine_uses_the_thread_session_id() -> Result<()> {
+        let _env = crate::test_support::lock_test_env();
+        let dir = tempfile::tempdir()?;
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+        let manager = RuntimeThreadManager::open(
+            config(),
+            dir.path().to_path_buf(),
+            test_manager_config(dir.path().join("runtime")),
+        )?;
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let engine = manager.get_engine(&thread.id).await?;
+        let snapshot = engine.get_session_snapshot().await?;
+        assert_eq!(snapshot.session_id, thread_session_id(&thread.id));
+        assert_eq!(thread_session_id(&thread.id), thread_session_id(&thread.id));
+        assert_ne!(
+            thread_session_id(&thread.id),
+            thread_session_id("thr_other")
+        );
+        close_engines(&manager).await?;
+        Ok(())
+    }
+
+    /// #6144 P7: one corrupt thread record no longer fails the whole rail.
+    #[tokio::test]
+    async fn one_corrupt_thread_record_does_not_fail_the_listing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let manager = RuntimeThreadManager::open(
+            config(),
+            dir.path().to_path_buf(),
+            test_manager_config(dir.path().join("runtime")),
+        )?;
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        std::fs::write(
+            dir.path()
+                .join("runtime")
+                .join("threads")
+                .join("thr_torn.json"),
+            b"{\"id\": ",
+        )?;
+        let (threads, skipped) = manager.store.list_threads_lenient()?;
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, thread.id);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(manager.store.list_threads()?.len(), 1);
         Ok(())
     }
 

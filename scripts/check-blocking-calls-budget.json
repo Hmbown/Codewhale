@@ -375,6 +375,9 @@
   "crates/tui/src/session_manager.rs": {
     "path_canonicalize": 2
   },
+  "crates/tui/src/session_reconcile.rs": {
+    "path_canonicalize": 3
+  },
   "crates/tui/src/settings.rs": {
     "std_fs": 4
   },

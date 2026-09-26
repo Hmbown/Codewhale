@@ -1238,7 +1238,7 @@ pub(crate) fn build_session_snapshot(
     // "the TUI holds the authoritative copy", which is exactly the condition
     // the conflict protects. A session that has never been snapshotted has no
     // in-memory state to lose, so leaving it unclaimed is correct, not a gap.
-    crate::session_manager::set_live_session(Some(&session.metadata.id));
+    manager.claim_live_session(&session.metadata.id);
     Ok(session)
 }
 
