@@ -63,7 +63,7 @@ export const CHANGELOG: ChangelogRelease[] = [
           "\"Allow for this conversation\" records a grant for that tool and argument class instead of switching the whole thread to Full Access, so the call you just approved is no longer failed by a Permissions change. An approval also survives a Permissions change that only widens what is allowed, grants end when a thread is archived or deleted, and web.run open grants are scoped by host. Full Access covers MCP tools that declare themselves destructive in every host, including…",
           "web.run retries a refused page once with a browser user agent, and one site's failure no longer fails the whole call or drops its search results."
         ],
-        "itemCount": 21
+        "itemCount": 22
       },
       {
         "heading": "Removed",
