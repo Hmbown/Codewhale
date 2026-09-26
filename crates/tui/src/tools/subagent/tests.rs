@@ -24784,6 +24784,9 @@ mod readonly_shell_6015 {
             .collect()
     }
 
+    // Only the unix-gated tests build a git fixture; ungated, Windows
+    // `-D warnings` rejects this helper as dead code.
+    #[cfg(unix)]
     fn git(workspace: &Path, args: &[&str]) {
         let status = Command::new("git")
             .args(args)
