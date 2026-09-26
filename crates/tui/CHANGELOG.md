@@ -141,6 +141,10 @@ quieter, and Fleet runs can be checked before they spend anything.
   catalog row offers an on/off switch next to its effort tiers keeps Off in
   `/effort` and Ctrl+T instead of rounding it up
   ([#6396](https://github.com/Hmbown/Codewhale/issues/6396)).
+- Cost estimates for GPT-5.6 and GPT-5.6 Sol use OpenAI's current rates of
+  $4 input, $0.40 cached input and $20 output per million tokens. They were
+  still at the older $5, $0.50 and $30
+  ([#6396](https://github.com/Hmbown/Codewhale/issues/6396)).
 
 ### Removed
 
