@@ -51,6 +51,11 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Fixed
 
+- Hooks: `tool_call_after` on a Runtime API thread now sets
+  `DEEPSEEK_TOOL_EXIT_CODE` for a shell command, as it already did in the TUI,
+  so `exit_code` conditions match there too. The Runtime API path passed no
+  exit code at all
+  ([#6582](https://github.com/Hmbown/Codewhale/issues/6582)).
 - A top-level `base_url` or `api_key` in `config.toml` now means one thing
   everywhere. Every reader used its own rule for which routes inherited it,
   which is how a DeepSeek endpoint became the Xiaomi MiMo route's and failed
