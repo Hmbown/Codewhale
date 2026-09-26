@@ -1171,24 +1171,26 @@ fn runtime_event_process_child_helper() {
                 .expect("event writer count must be numeric");
             std::fs::write(&signal, b"ready").expect("announce ready event writer");
             wait_for_runtime_event_test_file(&start, "writer start barrier");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build event writer runtime");
-            runtime.block_on(async {
-                for index in 0..count {
-                    store
-                        .append_event(
-                            &thread_id,
-                            None,
-                            None,
-                            "process.event",
-                            json!({ "worker": worker, "index": index }),
-                        )
-                        .await
-                        .expect("append cross-process Runtime event");
-                }
-            });
+            // The same transaction `append_event` runs, with a lock budget
+            // sized for contention rather than the interactive 5 s default.
+            // The claim here is that sequences never collide across
+            // processes; four writers each fsyncing eight appends on a loaded
+            // CI runner have starved one polling writer past 5 s (macOS and
+            // Windows), which failed the run without any duplicate sequence.
+            // 25 s stays inside the parent's 30 s wait, so a genuinely stuck
+            // lock still fails here with its own message.
+            for index in 0..count {
+                store
+                    .append_event_transaction(
+                        thread_id.clone(),
+                        None,
+                        None,
+                        "process.event".to_string(),
+                        json!({ "worker": worker, "index": index }),
+                        Duration::from_secs(25),
+                    )
+                    .expect("append cross-process Runtime event");
+            }
         }
         "holder" => {
             store
