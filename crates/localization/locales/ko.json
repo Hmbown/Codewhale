@@ -2012,6 +2012,8 @@
   "AgentFocusPlaceholder": "{agent}에게 메시지 · Esc로 메인으로",
   "AgentFocusNoTranscript": "{agent}의 대화 기록이 아직 없습니다. 워커가 메시지를 주고받으면 여기에 표시됩니다.",
   "AgentFocusOmitted": "이전 메시지 {count}개가 메모리 내 기록에서 생략되었습니다.",
+  "AgentFocusResult": "결과",
+  "AgentFocusStopReason": "중지된 이유",
   "AgentFocusFollowUpDelivered": "{agent}에게 대기열에 넣었습니다. 다음 라운드에서 읽습니다.",
   "AgentFocusFollowUpQueued": "{agent} 대기열",
   "AgentFocusFollowUpContinued": "{agent}은(는) 이미 완료되어 새 포크({target})에서 계속합니다. 이 화면은 이제 그 포크를 따라갑니다.",

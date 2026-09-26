@@ -31,7 +31,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
           package-manager-cache: false
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable 2026-07-18
         with:
@@ -69,8 +69,13 @@ jobs:
           echo "sha=${actual}" >> "${GITHUB_OUTPUT}"
           echo "version=${workspace_version}" >> "${GITHUB_OUTPUT}"
       - name: Check version and OHOS release contracts
+        # --require-dated-release, as auto-tag.yml and release.yml run it:
+        # release.yml only accepts an RC receipt for the exact tag SHA, so an
+        # RC on an undated "Unreleased candidate" changelog could never
+        # authorize a release. Fail here, before the long parity and artifact
+        # builds, instead of at tag time.
         run: |
-          ./scripts/release/check-versions.sh
+          ./scripts/release/check-versions.sh --require-dated-release
           ./scripts/release/check-ohos-deps.sh
       - name: Reconfirm clean source snapshot
         run: git diff --exit-code

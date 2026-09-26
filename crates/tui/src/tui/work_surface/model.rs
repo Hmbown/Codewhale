@@ -769,10 +769,16 @@ fn agents_view_rows(app: &mut App) -> Vec<WorkRow> {
             std::borrow::Cow::Borrowed(worker_status_label(receipt.status))
         };
         let activity = receipt.activity.clone().unwrap_or_default();
+        // The same name every other surface shows for this worker (#6565).
+        let name = app
+            .agent_label_map
+            .get(&receipt.worker_id)
+            .cloned()
+            .unwrap_or_else(|| receipt.display_name.clone());
         retained.push(WorkRow {
             id,
             mark: receipt.state.glyph(),
-            label: receipt.display_name.clone(),
+            label: name.clone(),
             detail: if activity.is_empty() {
                 status.to_string()
             } else {
@@ -788,7 +794,7 @@ fn agents_view_rows(app: &mut App) -> Vec<WorkRow> {
                 agent_id: receipt.worker_id.clone(),
             }),
             agent: Some(AgentRowFacts {
-                role_label: receipt.display_name.clone(),
+                role_label: name,
                 status: status.to_string(),
                 objective: activity,
                 elapsed_secs: receipt.millis.map(|millis| millis / 1_000),
@@ -1671,13 +1677,26 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
                 })
                 .or_else(|| app.agent_label_map.get(&agent.agent_id).cloned());
             let terminal = agent_is_terminal(agent, meta);
-            let objective = summarize_assignment(&agent.assignment.objective);
+            // A finished agent's row says what it produced, not what it was
+            // asked (#6565): the headline of its result, or why it stopped.
+            // Enter opens the full text.
+            let objective = terminal
+                .then(|| crate::tui::agent_focus::settled_headline(app, &agent.agent_id))
+                .flatten()
+                .unwrap_or_else(|| summarize_assignment(&agent.assignment.objective));
             let mut facts = vec![status.to_string(), objective.clone()];
-            // Quiet completion (#36): a finished agent keeps its one-line
-            // status and objective; in-flight metadata (current tool, step
-            // counters, file tallies) is working state, not a receipt, and
-            // must not linger as a spawn-metadata dump after the run ends.
-            if !terminal {
+            // Quiet completion (#36): in-flight metadata (current tool, step
+            // counters) is working state, not a receipt, and must not linger
+            // after the run ends. What it changed is the receipt, so a
+            // finished row keeps its file count.
+            if terminal {
+                if let Some(files) = meta
+                    .map(|meta| meta.files_touched)
+                    .filter(|count| *count > 0)
+                {
+                    facts.push(format!("{files} files changed"));
+                }
+            } else {
                 facts.extend(live_activity_facts(app, &agent.agent_id));
             }
             AgentRowSeed {
@@ -2997,7 +3016,9 @@ mod tests {
                 role: Some("builder".to_string()),
             },
             model: "test-model".to_string(),
-            nickname: Some("Blue Whale".to_string()),
+            nickname: Some(crate::tools::subagent::whale_name_for_id_in_locale(
+                agent_id, "en",
+            )),
             status: SubAgentStatus::Running,
             worker_status: None,
             runtime_permissions: None,
@@ -3026,6 +3047,7 @@ mod tests {
             state,
             status,
             activity: None,
+            outcome: None,
             millis: Some(3_000),
             input_tokens: None,
             output_tokens: None,
@@ -3345,7 +3367,10 @@ mod tests {
                 .clone()
         };
         assert_eq!(label("agent_named_lane"), "branch-triage");
-        assert_eq!(label("agent_plain_lane"), "Blue Whale");
+        assert_eq!(
+            label("agent_plain_lane"),
+            crate::tools::subagent::whale_name_for_id_in_locale("agent_plain_lane", "en")
+        );
     }
 
     #[test]

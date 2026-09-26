@@ -405,6 +405,71 @@ fn write_atomic_with_permissions(
     contents: &[u8],
     #[cfg_attr(not(unix), allow(unused_variables))] permission_policy: AtomicWritePermissions,
 ) -> std::io::Result<()> {
+    write_atomic_scoped(path, contents, permission_policy, AtomicWriteScope::Single)
+}
+
+/// Whether one write also pays its directory's costs, or a batch pays them
+/// once for the whole set — see [`write_atomic_batch`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtomicWriteScope {
+    /// Sweep this directory for stale temp files and fsync it: what a single
+    /// write should do, and what every caller of `write_atomic` gets.
+    Single,
+    /// Leave both to the caller. Used only by [`write_atomic_batch`].
+    Batch,
+}
+
+/// Write many files, and pay each directory's costs once.
+///
+/// Every [`write_atomic`] call sweeps its directory for stale temp files and
+/// fsyncs that directory, which is exactly right for one record at a time. A
+/// caller publishing a thousand records into one directory pays that thousand
+/// times, though, and the sweep is the same answer every time: scanning a
+/// store directory of tens of thousands of entries per file is minutes of work
+/// that buys nothing (measured: 22 ms per item write, 34 s for one fork's
+/// clone).
+///
+/// The batch sweeps each directory once, writes every file with the same
+/// atomic replace and per-file data sync, and fsyncs each directory once at
+/// the end. Per-file durability is unchanged; only the per-file directory work
+/// is hoisted out of the loop.
+///
+/// Ordering is still the caller's job: a batch that publishes a graph of
+/// records must write its commit record last, as the single-write callers do.
+pub fn write_atomic_batch(files: &[(PathBuf, Vec<u8>)]) -> std::io::Result<()> {
+    let mut parents: Vec<&Path> = Vec::new();
+    for (path, _) in files {
+        if let Some(parent) = path.parent()
+            && !parents.contains(&parent)
+        {
+            parents.push(parent);
+        }
+    }
+    for parent in &parents {
+        if is_codewhale_owned_state_dir(parent) {
+            sweep_stale_atomic_write_temps(parent);
+        }
+    }
+    for (path, contents) in files {
+        write_atomic_scoped(
+            path,
+            contents,
+            AtomicWritePermissions::Private,
+            AtomicWriteScope::Batch,
+        )?;
+    }
+    for parent in &parents {
+        sync_directory(parent);
+    }
+    Ok(())
+}
+
+fn write_atomic_scoped(
+    path: &Path,
+    contents: &[u8],
+    #[cfg_attr(not(unix), allow(unused_variables))] permission_policy: AtomicWritePermissions,
+    scope: AtomicWriteScope,
+) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -452,7 +517,9 @@ fn write_atomic_with_permissions(
     // Reclaim our own strays before adding another (see the function docs).
     // Private permission policy is also used for user-chosen destinations
     // such as `/save <path>`; only sweep Codewhale-owned state/config dirs.
-    if permission_policy == AtomicWritePermissions::Private && is_codewhale_owned_state_dir(parent)
+    if permission_policy == AtomicWritePermissions::Private
+        && scope == AtomicWriteScope::Single
+        && is_codewhale_owned_state_dir(parent)
     {
         sweep_stale_atomic_write_temps(parent);
     }
@@ -496,11 +563,20 @@ fn write_atomic_with_permissions(
     // itself durable — otherwise a power loss right after the rename can lose
     // it even though the file data was synced, silently dropping a
     // crash-recovery checkpoint. Best-effort: not all platforms permit
-    // opening a directory for sync, so a failure here is not fatal.
+    // opening a directory for sync, so a failure here is not fatal. A batch
+    // hoists this to one sync per directory (see `write_atomic_batch`).
+    if scope == AtomicWriteScope::Single {
+        sync_directory(parent);
+    }
+    Ok(())
+}
+
+/// Best-effort directory sync: not all platforms permit opening a directory
+/// for sync, so a failure here is never fatal.
+fn sync_directory(parent: &Path) {
     if let Ok(dir) = std::fs::File::open(parent) {
         let _ = dir.sync_all();
     }
-    Ok(())
 }
 
 /// True when `dir` is under `$CODEWHALE_HOME` / `~/.codewhale`, or the ambient
@@ -1020,6 +1096,54 @@ mod atomic_write_tests {
         assert!(path.exists());
         let read = fs::read_to_string(&path).expect("read");
         assert_eq!(read.as_bytes(), content);
+    }
+
+    /// A batch writes every file, and pays the directory's hygiene once.
+    ///
+    /// The per-file path sweeps the directory for stale temp files and fsyncs
+    /// it on every call; a fork publishing hundreds of cloned items paid that
+    /// hundreds of times (22 ms of directory scan each, 34 s for one fork).
+    /// What must not change: every file lands with its content, a stray temp
+    /// file is still reclaimed, and none of ours is left behind.
+    #[test]
+    fn write_atomic_batch_writes_every_file_and_sweeps_the_directory() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (product, _guards) = seal_product_home(tmp.path());
+
+        let stray = product.join(".tmpCCCCCC");
+        std::fs::write(&stray, b"stranded by a SIGKILL").expect("write stray");
+        age_past_the_threshold(&stray);
+
+        let files: Vec<(PathBuf, Vec<u8>)> = (0..5)
+            .map(|index| {
+                (
+                    product.join(format!("item_{index}.json")),
+                    format!("{{\"index\":{index}}}").into_bytes(),
+                )
+            })
+            .collect();
+        super::write_atomic_batch(&files).expect("batch write");
+
+        for (path, contents) in &files {
+            assert_eq!(
+                std::fs::read(path).expect("read back"),
+                *contents,
+                "{}",
+                path.display()
+            );
+        }
+        assert!(
+            !stray.exists(),
+            "the batch sweeps the directory it writes into"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&product)
+            .expect("read dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| super::is_stray_atomic_write_temp_name(name))
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
     }
 
     #[test]

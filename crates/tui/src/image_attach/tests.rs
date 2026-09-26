@@ -412,6 +412,32 @@ fn a_supported_or_unknown_route_keeps_its_images() {
 }
 
 #[test]
+fn offline_seed_route_for_a_vision_model_keeps_the_image() {
+    // #6396: the bundled seed lists Claude as text-only. An offline cold
+    // start resolves the route from that seed alone; the image must still go.
+    let route = codewhale_config::route::RouteResolver::new()
+        .resolve(&codewhale_config::route::RouteRequest {
+            explicit_provider: Some(codewhale_config::ProviderKind::Anthropic),
+            model_selector: Some(codewhale_config::route::LogicalModelRef::from(
+                "claude-opus-5",
+            )),
+            saved_provider_model: None,
+            base_url_override: None,
+            limit_overrides: Vec::new(),
+        })
+        .expect("bundled Anthropic route resolves offline");
+    let mut messages = vec![message_with_image("data:image/png;base64,QUJD")];
+
+    let stripped = strip_images_when_unsupported(
+        &mut messages,
+        route.capabilities().image_input,
+        "claude-opus-5",
+    );
+
+    assert_eq!(stripped, 0);
+}
+
+#[test]
 fn stripping_replaces_every_image_across_every_message() {
     let mut messages = vec![
         message_with_image("data:image/png;base64,AAAA"),

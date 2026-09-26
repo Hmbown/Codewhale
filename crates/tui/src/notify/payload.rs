@@ -30,7 +30,7 @@
 //!   preview of the assistant's own reply. Unchanged in spirit from the
 //!   previous behavior; now bounded and redacted.
 //! - [`NotificationKind::SubagentTerminal`] — localized status headline,
-//!   the sub-agent id as detail, and a preview of the child's summary
+//!   the sub-agent's display name as detail, and a preview of the child's summary
 //!   line.
 //! - [`NotificationKind::ApprovalNeeded`] — headline plus the *tool name*.
 //!   Never the tool description or arguments: an approval prompt fires
@@ -134,10 +134,15 @@ impl NotificationPayload {
         Self::new(NotificationKind::TurnComplete, headline, None)
     }
 
-    /// Sub-agent reached a terminal status. `detail` is the agent id.
+    /// Sub-agent reached a terminal status. `detail` is the agent's display
+    /// name, the one every other surface shows.
     #[must_use]
-    pub fn subagent_terminal(headline: &str, agent_id: &str) -> Self {
-        Self::new(NotificationKind::SubagentTerminal, headline, Some(agent_id))
+    pub fn subagent_terminal(headline: &str, agent_name: &str) -> Self {
+        Self::new(
+            NotificationKind::SubagentTerminal,
+            headline,
+            Some(agent_name),
+        )
     }
 
     /// A tool call needs approval. Only the tool *name* is disclosed —

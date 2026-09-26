@@ -30,7 +30,7 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Contributors",
         "items": [
-          "@gaord — let undo roll back files for the turn it is undoing (#6483), stopped resume and fork from duplicating threads and sessions (#6406), and exposed user-defined provider routes to native clients (#6404).",
+          "@gaord — let a client fork a thread at a named turn (#6580), let undo roll back files for the turn it is undoing (#6483), stopped resume and fork from duplicating threads and sessions (#6406), and exposed user-defined provider routes to native clients (#6404).",
           "@Lstarsky0 — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine (#6405, #6417, #6499, #6574), tightened the Chinese-branching ceiling to 18 (#6403), and made Fleet publish without a two-link window (#6431).",
           "@aboimpinto — restored a green Linux full-workspace test gate without loosening any test (#6581).",
           "@dajiaohuang — codewhale config set checks a known setting's value against its schema type before saving it (#6568).",
@@ -41,10 +41,11 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Added",
         "items": [
+          "Runtime API: POST /v1/threads/{id}/fork-at-turn forks a thread at a named user turn, keeping that turn and every turn before it. The receipt matches /undo and returns the first dropped prompt so a client can put it back in the composer. Naming the turn replaces a client-computed depth, which could fork the wrong prefix. The fork leaves the workspace and any running turn untouched (#6580, thanks @gaord).",
           "Official model routing: /router (also /model router) sets up the Auto router with presets: Jev (TypeSafe's decision model, via OpenRouter or a TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes one test call before it saves, /status shows the router's choice, cost and latency, and a failing router is shown as failing (#6525).",
           "Code mode composes MCP and plugin tools and is on by default: execute_tools programs can call MCP tools, and each nested call passes the same approval gate as a direct call, pausing the program for approval when needed. Every nested call keeps its receipt, including calls that finish before a deadline, and code_mode = false turns it off. codewhale mcp list and codewhale doctor warn when a user MCP server duplicates the built-in Computer Use bundle (#6562, #6509)."
         ],
-        "itemCount": 2
+        "itemCount": 3
       },
       {
         "heading": "Fixed",
@@ -62,7 +63,7 @@ export const CHANGELOG: ChangelogRelease[] = [
           "web.run retries a refused page once with a browser user agent, and one site's failure no longer fails the whole call or drops its search results.",
           "Hooks treat bash, Bash and exec_shell as one tool in tool_name conditions, so the documented example fires."
         ],
-        "itemCount": 20
+        "itemCount": 21
       },
       {
         "heading": "Removed",
@@ -99,9 +100,10 @@ export const CHANGELOG: ChangelogRelease[] = [
           "Stopping an agent that writes files keeps and names the work it had changed, as a budget stop already did (#5529).",
           "workflow(fleet:) runs Fleets saved from the Fleet UI, and finds workspace Fleets under .codewhale/fleets.",
           "The runtime API can stop a delegated agent run from the desktop.",
+          "A finished agent's answer is no longer cut off. Its row and its completion notification show the first sentence of its result instead of a ## Summary heading or its last tool, and opening the agent shows the whole result, or the full reason it stopped, even when no transcript was captured. Each agent also has one name: a workflow task's label or its dispatch name appears on the rows, the notification and the runtime API alike, never its internal id (#6565).",
           "The dock's GIT, FILES and NOTES views are real. GIT shows the branch and where it stands against its upstream, the changes (with their paths one Enter away), linked worktrees and the last five commits, and it keeps updating during a turn while it is open. It says \"not a git repository\" only when that is true. FILES lists the files this session edited, with their size, and the files it read. NOTES lists your /note notes. The git badge, the Git view and the model's git line…"
         ],
-        "itemCount": 6
+        "itemCount": 7
       },
       {
         "heading": "Plugins",

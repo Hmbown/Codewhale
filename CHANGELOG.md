@@ -18,7 +18,7 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Contributors
 
-- **[@gaord](https://github.com/gaord)** — let undo roll back files for the turn it is undoing ([#6483](https://github.com/Hmbown/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/Hmbown/Codewhale/pull/6406)), and exposed user-defined provider routes to native clients ([#6404](https://github.com/Hmbown/Codewhale/pull/6404)).
+- **[@gaord](https://github.com/gaord)** — let a client fork a thread at a named turn ([#6580](https://github.com/Hmbown/Codewhale/pull/6580)), let undo roll back files for the turn it is undoing ([#6483](https://github.com/Hmbown/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/Hmbown/Codewhale/pull/6406)), and exposed user-defined provider routes to native clients ([#6404](https://github.com/Hmbown/Codewhale/pull/6404)).
 - **[@Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)).
 - **[@aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test ([#6581](https://github.com/Hmbown/Codewhale/pull/6581)).
 - **[@dajiaohuang](https://github.com/dajiaohuang)** — `codewhale config set` checks a known setting's value against its schema type before saving it ([#6568](https://github.com/Hmbown/Codewhale/pull/6568)).
@@ -26,6 +26,13 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Added
 
+- Runtime API: `POST /v1/threads/{id}/fork-at-turn` forks a thread at a named
+  user turn, keeping that turn and every turn before it. The receipt matches
+  `/undo` and returns the first dropped prompt so a client can put it back in
+  the composer. Naming the turn replaces a client-computed depth, which could
+  fork the wrong prefix. The fork leaves the workspace and any running turn
+  untouched
+  ([#6580](https://github.com/Hmbown/Codewhale/pull/6580), thanks @gaord).
 - Official model routing: `/router` (also `/model router`) sets up the Auto
   router with presets: Jev (TypeSafe's decision model, via OpenRouter or a
   TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes
@@ -128,6 +135,12 @@ quieter, and Fleet runs can be checked before they spend anything.
   marked `[rlm_query incomplete: …]` instead of an empty string, its model
   calls appear in the parent turn's record, and its history is no longer
   trimmed ([#6511](https://github.com/Hmbown/Codewhale/issues/6511)).
+- Starting without a network connection no longer drops images you attach to a
+  model that accepts them. The offline model list lagged behind providers and
+  listed Claude and others as text-only; it can now only say a model takes
+  images, never that it refuses them, and a provider that does refuse gets one
+  resend without the image and a message saying so
+  ([#6396](https://github.com/Hmbown/Codewhale/issues/6396)).
 
 ### Removed
 
@@ -193,6 +206,13 @@ quieter, and Fleet runs can be checked before they spend anything.
 - `workflow(fleet:)` runs Fleets saved from the Fleet UI, and finds
   workspace Fleets under `.codewhale/fleets`.
 - The runtime API can stop a delegated agent run from the desktop.
+- A finished agent's answer is no longer cut off. Its row and its completion
+  notification show the first sentence of its result instead of a
+  `## Summary` heading or its last tool, and opening the agent shows the whole
+  result, or the full reason it stopped, even when no transcript was captured.
+  Each agent also has one name: a workflow task's label or its dispatch name
+  appears on the rows, the notification and the runtime API alike, never its
+  internal id ([#6565](https://github.com/Hmbown/Codewhale/issues/6565)).
 - The dock's GIT, FILES and NOTES views are real. GIT shows the branch and
   where it stands against its upstream, the changes (with their paths one
   Enter away), linked worktrees and the last five commits, and it keeps
