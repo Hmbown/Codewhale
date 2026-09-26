@@ -1,0 +1,21 @@
+{
+  "source": "crates/tui/tests/cucumber/launch_card_pty.rs::website_current_terminal_capture",
+  "command": "QA_LAUNCH_CAPTURE_DIR=<dir> scripts/dev-cargo.sh test -p codewhale-tui --features long-running-tests --test cucumber website_current_terminal_capture -- --ignored",
+  "binaryVersion": "0.10.0 (dev)",
+  "baseCommit": "5765d80278f7184d187fa6682ba96b403a006523",
+  "capturedAt": "2026-09-25",
+  "conditions": {
+    "theme": "underwater (default; no theme override)",
+    "motion": "NO_ANIMATIONS=1 (no reveal, fish or bubbles)",
+    "workspace": "~/my-project inside a sealed HOME",
+    "provider": "none connected; explored offline via Ctrl+O; no network probes",
+    "colorterm": "truecolor"
+  },
+  "frames": [
+    { "file": "website-provider-picker-100x24.json", "state": "first-run provider picker" },
+    { "file": "website-home-100x24.json", "state": "home after first run, with the onboarding starter prompt" },
+    { "file": "website-composer-100x24.json", "state": "new session with a typed, unsent prompt" },
+    { "file": "website-help-100x24.json", "state": "/help overlay" }
+  ],
+  "schema": "{rows, cols, cells: [row][col] -> {x, text, fg, bg, flags}}; fg/bg are null (terminal default), a 0-255 palette index, or [r,g,b]; flags are rio-vt style bits (see crates/tui/tests/support/qa_harness/frame.rs capture_cells)"
+}
