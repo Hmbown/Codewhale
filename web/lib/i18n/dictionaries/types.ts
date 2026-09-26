@@ -295,6 +295,13 @@ export interface DocsShellDict {
   noteLabel: string;
   /** Accessible name of a page's table of contents. */
   onThisPage: string;
+
+  // --- session recording panel (components/session-media.tsx) ---
+  /** Shown in place of a recording that has not been made yet. */
+  mediaPendingNote: string;
+  mediaPlanLink: string;
+  mediaGifFallback: string;
+  mediaTranscript: string;
 }
 
 /**
