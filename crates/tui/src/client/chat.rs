@@ -6619,25 +6619,39 @@ mod image_block_wire_tests {
 
     #[test]
     fn quoted_compaction_marker_does_not_reorder_user_wire_messages() {
+        // The current marker, and the legacy one older sessions still carry.
+        for marker in [
+            crate::compaction::COMPACTION_SUMMARY_MARKER,
+            crate::compaction::LEGACY_V2_COMPACTION_SUMMARY_MARKER,
+        ] {
+            let quote = format!("Please explain: {marker}");
+            let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+                {"role":"user","content":[{"type":"text","text":"First question"}]},
+                {"role":"assistant","content":[{"type":"text","text":"First answer"}]},
+                {"role":"user","content":[{"type":"text","text":quote}]},
+                {"role":"assistant","content":[{"type":"text","text":"It introduces a summary."}]},
+                {"role":"user","content":[{"type":"text","text":"Follow-up question"}]}
+            ]))
+            .unwrap();
+            let wire = build_chat_messages(None, &messages, "gpt-4o");
+            let roles: Vec<&str> = wire
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect();
+            assert_eq!(roles, ["user", "assistant", "user", "assistant", "user"]);
+            assert_eq!(wire[0]["content"], "First question");
+            assert_eq!(wire[2]["content"], quote);
+            assert_eq!(wire[4]["content"], "Follow-up question");
+        }
         let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
             {"role":"user","content":[{"type":"text","text":"First question"}]},
             {"role":"assistant","content":[{"type":"text","text":"First answer"}]},
-            {"role":"user","content":[{"type":"text","text":"Please explain: Another language model started to solve this problem"}]},
+            {"role":"user","content":[{"type":"text","text":"placeholder"}]},
             {"role":"assistant","content":[{"type":"text","text":"It introduces a summary."}]},
             {"role":"user","content":[{"type":"text","text":"Follow-up question"}]}
-        ])).unwrap();
-        let wire = build_chat_messages(None, &messages, "gpt-4o");
-        let roles: Vec<&str> = wire
-            .iter()
-            .map(|message| message["role"].as_str().unwrap())
-            .collect();
-        assert_eq!(roles, ["user", "assistant", "user", "assistant", "user"]);
-        assert_eq!(wire[0]["content"], "First question");
-        assert_eq!(
-            wire[2]["content"],
-            "Please explain: Another language model started to solve this problem"
-        );
-        assert_eq!(wire[4]["content"], "Follow-up question");
+        ]))
+        .unwrap();
+        let roles = ["user", "assistant", "user", "assistant", "user"];
 
         let quoted_exact_header = crate::compaction::build_compaction_summary_block_text(
             "This text was pasted by a user",

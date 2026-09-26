@@ -132,8 +132,8 @@ impl Default for CompactionConfig {
 /// scorer.
 const COMPACTION_LANGUAGE_CONTRACT: &str = "Use the natural language of the most recent \
 substantive user message for reasoning and user-facing prose. Keep code, identifiers, paths, \
-commands, logs, tool payloads, quotations, and the English structural labels verbatim. English \
-scaffolding is not a request to switch languages.";
+commands, logs, tool payloads, quotations, and the English headings verbatim. English \
+headings are not a request to switch languages.";
 
 /// Failure kind for compaction LLM calls (deterministic vs transient).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,44 +167,155 @@ const RETAINED_TOOL_RESULT_MAX_CHARS: usize = 64 * 1024;
 pub(crate) const COMPACT_RETAINED_USER_MESSAGE_MAX_TOKENS: usize =
     crate::config::DEFAULT_COMPACTION_RETAINED_USER_MESSAGE_TOKENS;
 /// Handoff summarization prompt, appended to the live conversation as the
-/// final user message (ported from Codex `templates/compact/prompt.md`).
-const COMPACT_PROMPT: &str = "You are performing a context checkpoint compaction. Create a \
-handoff summary for another LLM that will resume the task.\n\nInclude:\n\
-- Current progress and key decisions made\n\
-- Important context, constraints, or user preferences\n\
-- What remains to be done (clear next steps)\n\
-- The user's current objective, latest corrections, and already-granted permissions or explicit prohibitions\n\
-- Active commands, task and session handles, changed files, and the exact verification still needed\n\
-- Any critical data, examples, or references needed to continue (exact file paths, commands, and error text)\n\n\
-Be concise, structured, and focused on helping the next LLM seamlessly continue the work. Do not call tools.\n\
-Summarize the task, not the checkpoint machinery: do not mention compaction, checkpoints, or \
-context management, and do not carry forward meta-commentary about them (e.g. \"context intact\") \
-from earlier turns.";
+/// final user message. The headings are requested, not enforced:
+/// `validate_compaction_summary` only rejects corrupt output, so a provider
+/// that drifts from the layout still produces a usable note.
+pub(crate) const COMPACT_PROMPT_OPENING: &str = "Write a handoff note so this session's work can \
+continue after its earlier turns are condensed to make room.";
 
-/// Preamble for the one conversation-history checkpoint created by compaction.
-/// This intentionally follows Codex's `templates/compact/summary_prefix.md`:
-/// the checkpoint is a user-history item, never standing system-prompt prose.
-const SUMMARY_HEADER: &str = "Another language model started to solve this problem and produced \
-a summary of its thinking process. You also have access to the state of the tools that were used \
-by that language model. Use this to build on the work that has already been done and avoid \
-duplicating work. Here is the summary produced by the other language model, use the information \
-in this summary to assist with your own analysis:";
+/// The note's layout, shared by the first request and the quality retry.
+/// Each entry is a heading and what belongs under it.
+const HANDOFF_SECTIONS: [(&str, &str); 10] = [
+    (
+        "Objective",
+        "what the user wants now, in their words where it matters; say if the goal changed and \
+what replaced it.",
+    ),
+    (
+        "User direction",
+        "corrections, preferences and decisions, newest last; quote exactly anything the user \
+corrected or insisted on.",
+    ),
+    (
+        "Permissions and limits",
+        "what the user explicitly allowed (pushing, deleting, spending, contacting someone) and \
+what they ruled out. Record only what the user said; never infer a permission.",
+    ),
+    (
+        "Done",
+        "finished work with evidence: commands and results, commits, test counts. Separate \
+verified from assumed.",
+    ),
+    (
+        "Changed files",
+        "each path and its state: edited, created or deleted; committed or not; which branch.",
+    ),
+    (
+        "Still running",
+        "shell commands, servers and ports started in this session that may still be live, each \
+with the command or ID that checks or stops it. Leave agents out; their status is reported \
+separately.",
+    ),
+    (
+        "Verification left",
+        "exact commands or checks still needed, and the last failure verbatim.",
+    ),
+    (
+        "Open questions",
+        "what waits on the user or is undecided, and what it blocks.",
+    ),
+    (
+        "Next action",
+        "the one next step, concrete enough to start without rereading history.",
+    ),
+    (
+        "Reference",
+        "exact paths, identifiers, URLs, values and short snippets the work depends on.",
+    ),
+];
 
-/// Detection marker for committed compaction-summary text: the stable first
-/// sentence of [`SUMMARY_HEADER`]. `engine/context.rs` restores summaries by
-/// the same marker on session load.
-pub const COMPACTION_SUMMARY_MARKER: &str = "Another language model started to solve this problem";
-/// Marker written by pre-v0.9.6 compaction; sessions saved under the old
-/// format must still be recognized so their summary is replaced, not stacked.
+const HANDOFF_FOLD_IN_RULE: &str = "If the history already holds an earlier handoff note, fold \
+it in: carry forward what is still true, update what later work changed, and drop what is \
+finished or superseded. Keep quoted user wording exact rather than paraphrasing it again. Do not \
+copy the note's opening or closing lines or the user-pinned anchors; Codewhale adds those itself.";
+
+const HANDOFF_CLOSING_RULE: &str = "Write about the task, not about condensing context. Be \
+specific and brief. Do not call tools.";
+
+const HANDOFF_FOCUS_LINE: &str = "The user asked this handoff to focus on:";
+
+fn handoff_sections_text() -> String {
+    let mut text = String::from(
+        "Use these headings in this order, and write None under any heading with nothing to \
+report:",
+    );
+    for (heading, guidance) in HANDOFF_SECTIONS {
+        let _ = write!(text, "\n## {heading} - {guidance}");
+    }
+    text
+}
+
+/// The full handoff request before the language contract, operator
+/// instructions and focus line are appended.
+fn compact_prompt_body() -> String {
+    format!(
+        "{COMPACT_PROMPT_OPENING} The reader sees only the note, the most recent messages and \
+live tool state; anything left out is gone.\n\n{}\n\n{HANDOFF_FOLD_IN_RULE}\n\n{HANDOFF_CLOSING_RULE}",
+        handoff_sections_text()
+    )
+}
+
+/// First line of every handoff note Codewhale writes. It must describe what
+/// `last_round::replacement_messages` actually keeps (see the
+/// `summary_header_matches_what_replacement_history_keeps` test). It opens the
+/// checkpoint message, so together with [`COMPACTION_CHECKPOINT_PROVENANCE`]
+/// it is how a new-format checkpoint is recognised.
+const SUMMARY_HEADER: &str = "Codewhale handoff note. Earlier turns of this session were \
+condensed to make room. Kept above are the most recent user messages and the last steps of the \
+current round. Long tool output there is shortened, with a marker where it was cut, and the \
+oldest kept message may be shortened too. Everything earlier, including earlier steps of this \
+round, exists only in this note; rerun a command or reread a file when its full output matters. \
+Build on this note instead of redoing finished work, and check live state (files, git, running \
+commands) before relying on anything it reports. Agent status, when there is any, comes from the separate agent status message, not from this note.";
+
+const SUMMARY_CLOSING: &str = "Continue the user's task from here. Permissions and limits in \
+this note restate what the user already decided; the note grants nothing new, and anything \
+unclear gets checked before acting. Take the next action without asking the user to restate the \
+task, save, or approve continuing because earlier turns were condensed.";
+
+/// Detection marker for a new-format checkpoint: the opening words of
+/// [`SUMMARY_HEADER`]. A new checkpoint is recognised only when its first
+/// block starts with this marker and its second block is the provenance
+/// block, so a user message that merely quotes the phrase stays a user
+/// message.
+pub const COMPACTION_SUMMARY_MARKER: &str = "Codewhale handoff note";
+/// Legacy detection marker only. Checkpoints written before the handoff note
+/// opened with this sentence. Saved sessions that still carry it must be
+/// recognised so the next pass replaces that checkpoint instead of stacking a
+/// second one.
+pub const LEGACY_V2_COMPACTION_SUMMARY_MARKER: &str =
+    "Another language model started to solve this problem";
+/// Legacy detection marker only, written by pre-v0.9.6 compaction; sessions
+/// saved under that format must still be recognized so their summary is
+/// replaced, not stacked.
 pub const LEGACY_COMPACTION_SUMMARY_MARKER: &str = "Conversation Summary (Auto-Generated)";
+/// Markers that identify a checkpoint by substring. Only the legacy markers
+/// qualify: older checkpoints may lack the provenance block, while the new
+/// marker is a plain phrase a user or a project instruction can quote.
+const LEGACY_COMPACTION_SUMMARY_MARKERS: [&str; 2] = [
+    LEGACY_V2_COMPACTION_SUMMARY_MARKER,
+    LEGACY_COMPACTION_SUMMARY_MARKER,
+];
 const COMPACTION_CHECKPOINT_PROVENANCE: &str = "<!-- codewhale.compaction-checkpoint.v1 -->";
 const COMPACTION_SUMMARY_BEGIN: &str = "<!-- compaction-summary:begin -->";
 const COMPACTION_SUMMARY_END: &str = "<!-- compaction-summary:end -->";
 
-/// Whether a system-prompt text block is a committed compaction summary.
-#[must_use]
-pub fn is_compaction_summary_text(text: &str) -> bool {
-    text.contains(COMPACTION_SUMMARY_MARKER) || text.contains(LEGACY_COMPACTION_SUMMARY_MARKER)
+/// Whether text carries a legacy checkpoint marker anywhere in it.
+fn is_legacy_compaction_summary_text(text: &str) -> bool {
+    LEGACY_COMPACTION_SUMMARY_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// Byte offset of the earliest legacy marker in `text`. New-format carriers
+/// are always wrapped in the begin/end delimiters, so a bare new marker in a
+/// system prompt is host text (for example a project instruction quoting it)
+/// and must not truncate the prompt.
+fn legacy_summary_start(text: &str) -> Option<usize> {
+    LEGACY_COMPACTION_SUMMARY_MARKERS
+        .iter()
+        .filter_map(|marker| text.find(marker))
+        .min()
 }
 
 fn summary_section(text: &str) -> Option<&str> {
@@ -225,10 +336,7 @@ fn strip_summary_text(mut text: String) -> Option<String> {
             });
         text.replace_range(begin..end, "");
     }
-    if let Some(marker) = text
-        .find(COMPACTION_SUMMARY_MARKER)
-        .or_else(|| text.find(LEGACY_COMPACTION_SUMMARY_MARKER))
-    {
+    if let Some(marker) = legacy_summary_start(&text) {
         text.truncate(marker);
     }
     let text = text.trim().to_string();
@@ -243,11 +351,7 @@ pub fn extract_compaction_summary(prompt: Option<&SystemPrompt>) -> Option<Syste
     match prompt? {
         SystemPrompt::Text(text) => summary_section(text)
             .map(str::to_string)
-            .or_else(|| {
-                text.find(COMPACTION_SUMMARY_MARKER)
-                    .or_else(|| text.find(LEGACY_COMPACTION_SUMMARY_MARKER))
-                    .map(|start| text[start..].trim().to_string())
-            })
+            .or_else(|| legacy_summary_start(text).map(|start| text[start..].trim().to_string()))
             .map(SystemPrompt::Text),
         SystemPrompt::Blocks(blocks) => {
             let blocks = blocks
@@ -256,10 +360,7 @@ pub fn extract_compaction_summary(prompt: Option<&SystemPrompt>) -> Option<Syste
                     let text = summary_section(&block.text)
                         .map(str::to_string)
                         .or_else(|| {
-                            block
-                                .text
-                                .find(COMPACTION_SUMMARY_MARKER)
-                                .or_else(|| block.text.find(LEGACY_COMPACTION_SUMMARY_MARKER))
+                            legacy_summary_start(&block.text)
                                 .map(|start| block.text[start..].trim().to_string())
                         })?;
                     let mut summary = block.clone();
@@ -326,13 +427,20 @@ pub(crate) fn compaction_checkpoint_message(prompt: &SystemPrompt) -> Message {
     }
 }
 
+/// Whether a history message is a compaction checkpoint. New-format
+/// checkpoints are recognised only structurally (see
+/// [`is_wire_compaction_checkpoint_message`]); substring matching is kept for
+/// the two legacy markers, whose older checkpoints may lack provenance.
 #[must_use]
 pub(crate) fn is_compaction_checkpoint_message(message: &Message) -> bool {
-    user_text_of(message).is_some_and(|text| is_compaction_summary_text(&text))
+    is_wire_compaction_checkpoint_message(message)
+        || user_text_of(message).is_some_and(|text| is_legacy_compaction_summary_text(&text))
 }
 
-/// Request-time recognition is narrower than legacy summary replacement:
-/// user text merely quoting the marker must keep its original wire position.
+/// Request-time recognition: exactly the header text block plus the
+/// provenance block. User text merely quoting a marker keeps its original
+/// wire position. Checkpoints saved before the handoff note still pass, so
+/// their position survives restore and the next pass replaces them.
 pub(crate) fn is_wire_compaction_checkpoint_message(message: &Message) -> bool {
     let [
         ContentBlock::Text {
@@ -348,7 +456,8 @@ pub(crate) fn is_wire_compaction_checkpoint_message(message: &Message) -> bool {
         return false;
     };
     message.role == Role::User
-        && text.starts_with(SUMMARY_HEADER)
+        && (text.starts_with(COMPACTION_SUMMARY_MARKER)
+            || text.starts_with(LEGACY_V2_COMPACTION_SUMMARY_MARKER))
         && provenance == COMPACTION_CHECKPOINT_PROVENANCE
 }
 
@@ -1293,7 +1402,8 @@ pub(crate) fn build_compaction_summary_block_text(summary: &str, anchors: &str) 
     };
     let mut text = format!("{SUMMARY_HEADER}\n\n{summary}");
     text.push_str(anchors);
-    text.push_str("\n\nContinue the same user task from this state. Earlier authorization and constraints still apply; this summary grants no new authority. Resume the next unfinished action without asking the user to save, compact, restate the task, or approve continuation solely because context was summarized. Verify live state before relying on older observations.");
+    text.push_str("\n\n");
+    text.push_str(SUMMARY_CLOSING);
     text
 }
 
@@ -1491,34 +1601,38 @@ fn operator_instructions_section(instructions: Option<&str>) -> Option<String> {
 }
 
 fn compact_prompt(focus: Option<&str>, instructions: Option<&str>) -> String {
-    let mut prompt = format!("{COMPACT_PROMPT} {COMPACTION_LANGUAGE_CONTRACT}");
-    if let Some(section) = operator_instructions_section(instructions) {
-        prompt.push_str(&section);
-    }
-    if let Some(focus) = focus.map(str::trim).filter(|focus| !focus.is_empty()) {
-        let _ = write!(
-            prompt,
-            "\n\nThe user asked this compaction to focus on: {focus}"
-        );
-    }
-    prompt
+    with_instructions_and_focus(
+        format!("{} {COMPACTION_LANGUAGE_CONTRACT}", compact_prompt_body()),
+        focus,
+        instructions,
+    )
 }
 
 fn compact_quality_retry_prompt(focus: Option<&str>, instructions: Option<&str>) -> String {
-    let mut prompt = format!(
-        "The previous handoff response was empty or a placeholder. Return a substantive factual \
-continuation handoff. State the user objective, completed and current work, hard constraints, verified \
-evidence, unresolved failures, and the single next action. Do not refuse, call tools, discuss \
-checkpoint machinery, or return a placeholder. {COMPACTION_LANGUAGE_CONTRACT}"
-    );
+    with_instructions_and_focus(
+        format!(
+            "The previous reply was empty or a placeholder, so there is still no handoff note. \
+Write it now, with real content from this session under each heading.\n\n{}\n\n\
+{HANDOFF_FOLD_IN_RULE}\n\n{HANDOFF_CLOSING_RULE} Do not refuse or return a placeholder. \
+{COMPACTION_LANGUAGE_CONTRACT}",
+            handoff_sections_text()
+        ),
+        focus,
+        instructions,
+    )
+}
+
+/// Standing operator instructions first, then the one-off `/compact <focus>`.
+fn with_instructions_and_focus(
+    mut prompt: String,
+    focus: Option<&str>,
+    instructions: Option<&str>,
+) -> String {
     if let Some(section) = operator_instructions_section(instructions) {
         prompt.push_str(&section);
     }
     if let Some(focus) = focus.map(str::trim).filter(|focus| !focus.is_empty()) {
-        let _ = write!(
-            prompt,
-            "\n\nThe user asked this compaction to focus on: {focus}"
-        );
+        let _ = write!(prompt, "\n\n{HANDOFF_FOCUS_LINE} {focus}");
     }
     prompt
 }
@@ -1560,21 +1674,41 @@ fn validate_compaction_summary(summary: &str) -> Result<()> {
 }
 
 /// Drop the oldest history message before retrying an over-window summary
-/// request (Codex parity: `history.remove_first_item()`), plus any tool
-/// results the removal orphans — strict providers reject unpaired results.
-fn drop_oldest_history_messages(messages: &mut Vec<Message>) {
-    if messages.len() <= 1 {
-        return;
+/// request, plus any tool results the removal orphans (strict providers
+/// reject unpaired results). `messages` ends with the handoff instruction.
+///
+/// The newest checkpoint is never dropped: it carries the previous handoff
+/// note, and without it the fold-in has nothing to carry forward, so user
+/// corrections and limits would vanish without notice. Returns `false`, having
+/// changed nothing, when no other history message can go and at least one
+/// would remain; the caller then fails the pass instead of summarizing
+/// without the note.
+fn drop_oldest_history_messages(messages: &mut Vec<Message>) -> bool {
+    let instruction = messages.len().saturating_sub(1);
+    let history = &messages[..instruction];
+    let mut keep = history
+        .iter()
+        .rposition(is_wire_compaction_checkpoint_message);
+    let Some(index) = (0..instruction).find(|&index| Some(index) != keep) else {
+        return false;
+    };
+    if history.len() <= 1 {
+        return false;
     }
-    messages.remove(0);
-    while messages.len() > 1
-        && messages[0]
-            .content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+    messages.remove(index);
+    if keep.is_some_and(|keep_at| keep_at > index) {
+        keep = keep.map(|keep_at| keep_at - 1);
+    }
+    while index + 1 < messages.len()
+        && Some(index) != keep
+        && messages[index].content.iter().any(is_orphaned_result_block)
     {
-        messages.remove(0);
+        messages.remove(index);
+        if keep.is_some_and(|keep_at| keep_at > index) {
+            keep = keep.map(|keep_at| keep_at - 1);
+        }
     }
+    true
 }
 
 /// The summary request for one compaction pass: the parent turn's exact
@@ -1678,12 +1812,19 @@ async fn create_summary(
         let cost_scope = crate::cost_status::scope_token();
         let response = match client.create_message(request).await {
             Ok(response) => response,
-            Err(err) if is_context_window_error(&err) && request_messages.len() > 2 => {
+            Err(err) if is_context_window_error(&err) => {
+                if !drop_oldest_history_messages(&mut request_messages) {
+                    logging::warn(
+                        "Compaction summary input is over the context window with nothing \
+                         left to drop but the previous handoff note; the pass fails instead \
+                         of losing that note",
+                    );
+                    return Err(err);
+                }
                 logging::warn(format!(
                     "Compaction summary input over the context window ({err}); \
-                     dropping the oldest history item and retrying"
+                     dropped the oldest history item and retrying"
                 ));
-                drop_oldest_history_messages(&mut request_messages);
                 continue;
             }
             Err(err) => return Err(err),
@@ -1838,7 +1979,7 @@ mod tests {
         let legacy = Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
-                text: format!("{COMPACTION_SUMMARY_MARKER}\nold summary"),
+                text: format!("{LEGACY_V2_COMPACTION_SUMMARY_MARKER}\nold summary"),
                 cache_control: None,
             }],
         };
@@ -2386,7 +2527,7 @@ mod tests {
         };
         let text = &blocks[0].text;
         assert!(text.contains(FIXED_SUMMARY));
-        assert!(text.contains("Another language model"));
+        assert!(text.starts_with(COMPACTION_SUMMARY_MARKER));
 
         // Replacement history keeps older user turns, then the open round
         // verbatim (user + assistant + tools), then one checkpoint.
@@ -2748,7 +2889,7 @@ mod tests {
         else {
             panic!("retry instruction must be text");
         };
-        assert!(text.contains("previous handoff response was empty"));
+        assert!(text.contains("previous reply was empty or a placeholder"));
         drop(requests);
 
         assert_eq!(

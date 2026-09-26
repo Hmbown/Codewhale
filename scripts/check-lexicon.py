@@ -234,8 +234,6 @@ RUST_ALLOW: dict[str, dict[str, set[str]]] = {
     },
     "crates/tui/src/compaction.rs": {
         "--- Additional instructions from the operator": {"operator"},
-        "You are performing a context checkpoint": {"compaction"},
-        "\\n\\nThe user asked this compaction": {"compaction"},
     },
 }
 
