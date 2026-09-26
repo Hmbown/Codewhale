@@ -921,11 +921,18 @@ impl NetworkRead {
 
 /// The network reads in a command the agent read-only grammar admits, one
 /// entry per host, judged segment by segment so a pipeline or chain cannot
-/// hide one. A command the grammar refuses reports none: it never runs as a
-/// classifier-approved read.
+/// hide one. Leading `cd <dir> &&` prefixes are removed first, the same way
+/// the shell gates move them into the working directory, so the command is
+/// judged as it will run. A command the grammar still refuses reports none:
+/// it never runs as a classifier-approved read.
 #[must_use]
 pub fn readonly_network_reads(command: &str) -> Vec<NetworkRead> {
-    let Ok(segments) = agent_readonly_verdict(command) else {
+    let mut command = command.to_string();
+    // Each pass removes one leading `cd`, so this terminates.
+    while let Some((_, rest)) = split_leading_cd(&command) {
+        command = rest;
+    }
+    let Ok(segments) = agent_readonly_verdict(&command) else {
         return Vec::new();
     };
     let mut reads = Vec::new();
@@ -2896,6 +2903,16 @@ mod tests {
         assert_eq!(
             readonly_network_reads("gh pr view 1; npm view x; gh pr list"),
             vec![NetworkRead::GitHub, NetworkRead::Npm]
+        );
+        // A leading `cd` is moved into the working directory by the gates,
+        // so the read behind it is still a network read.
+        assert_eq!(
+            readonly_network_reads("cd . && gh pr view 1"),
+            vec![NetworkRead::GitHub]
+        );
+        assert_eq!(
+            readonly_network_reads("cd a && cd b && npm view x"),
+            vec![NetworkRead::Npm]
         );
         for command in [
             "git status",

@@ -1213,7 +1213,13 @@ fn fleet_authority_intersects_readonly_github_bash_with_network_ceiling() {
 
     // #6015: a network read cannot hide inside a pipeline or chain, and npm
     // registry reads need the same grant.
-    for command in ["gh pr view 1 | head", "ls && gh issue list", "npm view x"] {
+    for command in [
+        "gh pr view 1 | head",
+        "ls && gh issue list",
+        "npm view x",
+        "cd . && gh pr view 1",
+        "cd sub && npm view x",
+    ] {
         let input = json!({"action": "run", "command": command});
         enforce_tool_authority("Bash", &input, &shell, &networked)
             .unwrap_or_else(|error| panic!("{command}: {error}"));

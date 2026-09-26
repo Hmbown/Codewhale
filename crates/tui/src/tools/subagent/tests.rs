@@ -20513,6 +20513,10 @@ fn a_network_denied_child_cannot_address_a_remote_location_through_any_tool() {
         ("bash", json!({"command": "gh pr view 1 | head"})),
         ("bash", json!({"command": "ls && gh issue list"})),
         ("bash", json!({"command": "npm view x | head"})),
+        // A leading `cd` is moved into `cwd` before the command runs, so the
+        // read behind it is judged too.
+        ("bash", json!({"command": "cd . && gh pr view 1"})),
+        ("bash", json!({"command": "cd sub && npm view x"})),
     ] {
         assert!(
             reject_network_reaching_input(name, &input).is_err(),
