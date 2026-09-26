@@ -467,9 +467,11 @@ fn empty_view_hint(panel: RailPanel) -> &'static str {
         RailPanel::Tasks => "no to-dos yet",
         RailPanel::Background => "nothing running in the background",
         RailPanel::Files => "no files touched this session",
-        RailPanel::Notepad => "Enter to write a note",
+        RailPanel::Notepad => "/note add <text> to keep a note",
         RailPanel::Context => "context budget unknown",
-        RailPanel::Git => "not a git repository",
+        // The Git view always paints its own state row ("reading git
+        // status…", "not a git repository", "git unavailable: …").
+        RailPanel::Git => "reading git status…",
         RailPanel::Price => "no priced turns yet",
     }
 }

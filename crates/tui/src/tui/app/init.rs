@@ -1109,6 +1109,7 @@ impl App {
             workspace_context_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             workspace_context_refreshed_at: None,
             memory_size_hint: None,
+            workspace_notes: Vec::new(),
             task_panel: Vec::new(),
             task_panel_session_id: None,
             task_panel_unavailable: false,

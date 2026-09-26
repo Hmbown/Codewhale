@@ -42,8 +42,9 @@ fn note(workspace: &Path, content: Option<&str>) -> CommandResult {
 
 /// Resolve the notes file. An existing `.codewhale` notes file is preferred;
 /// otherwise the `.deepseek` notes path is used (D3 — the fallback stays
-/// handler-owned through standard filesystem operations).
-fn notes_path(workspace: &Path) -> PathBuf {
+/// handler-owned through standard filesystem operations). The dock's NOTES
+/// view reads the same file through this resolver (#6565).
+pub(crate) fn notes_path(workspace: &Path) -> PathBuf {
     let primary = workspace.join(".codewhale").join("notes.md");
     if primary.exists() {
         return primary;
@@ -180,7 +181,7 @@ fn append_note(notes_path: &Path, note_content: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn read_notes(notes_path: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn read_notes(notes_path: &Path) -> Result<Vec<String>, String> {
     match fs::read_to_string(notes_path) {
         Ok(content) => Ok(parse_notes(&content)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),

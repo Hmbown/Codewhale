@@ -63,7 +63,7 @@ export const CHANGELOG: ChangelogRelease[] = [
           "web.run retries a refused page once with a browser user agent, and one site's failure no longer fails the whole call or drops its search results.",
           "Hooks treat bash, Bash and exec_shell as one tool in tool_name conditions, so the documented example fires."
         ],
-        "itemCount": 20
+        "itemCount": 21
       },
       {
         "heading": "Removed",
@@ -100,9 +100,10 @@ export const CHANGELOG: ChangelogRelease[] = [
           "Stopping an agent that writes files keeps and names the work it had changed, as a budget stop already did (#5529).",
           "workflow(fleet:) runs Fleets saved from the Fleet UI, and finds workspace Fleets under .codewhale/fleets.",
           "The runtime API can stop a delegated agent run from the desktop.",
-          "A finished agent's answer is no longer cut off. Its row and its completion notification show the first sentence of its result instead of a ## Summary heading or its last tool, and opening the agent shows the whole result, or the full reason it stopped, even when no transcript was captured. Each agent also has one name: a workflow task's label or its dispatch name appears on the rows, the notification and the runtime API alike, never its internal id (#6565)."
+          "A finished agent's answer is no longer cut off. Its row and its completion notification show the first sentence of its result instead of a ## Summary heading or its last tool, and opening the agent shows the whole result, or the full reason it stopped, even when no transcript was captured. Each agent also has one name: a workflow task's label or its dispatch name appears on the rows, the notification and the runtime API alike, never its internal id (#6565).",
+          "The dock's GIT, FILES and NOTES views are real. GIT shows the branch and where it stands against its upstream, the changes (with their paths one Enter away), linked worktrees and the last five commits, and it keeps updating during a turn while it is open. It says \"not a git repository\" only when that is true. FILES lists the files this session edited, with their size, and the files it read. NOTES lists your /note notes. The git badge, the Git view and the model's git line…"
         ],
-        "itemCount": 6
+        "itemCount": 7
       },
       {
         "heading": "Plugins",

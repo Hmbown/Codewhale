@@ -336,6 +336,10 @@ pub struct WorkSurfaceState {
     /// clears it and the dock goes back to showing whichever work view has
     /// content.
     pub explicit_view: bool,
+    /// The settled file activity `project()` computed this frame for the
+    /// TASKS view. The FILES view and its tab badge read it, so the history
+    /// is scanned once per frame, not once per view (#6565).
+    pub(super) file_activity: SettledFileActivity,
     pub top_height: u16,
     pub side_width: u16,
     pub(super) resizing: bool,
@@ -429,6 +433,7 @@ impl WorkSurfaceState {
             effective_placement: placement,
             panel: RailPanel::default(),
             explicit_view: false,
+            file_activity: SettledFileActivity::default(),
             top_height: top_height.clamp(TOP_HEIGHT_MIN, TOP_HEIGHT_MAX),
             side_width: side_width.clamp(SIDE_WIDTH_MIN, SIDE_WIDTH_MAX),
             resizing: false,
@@ -605,6 +610,7 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
     let agents = agent_rows(app);
     let coordination = coordination_row(app);
     let activity = settled_file_activity(app);
+    app.work_surface.file_activity = activity.clone();
     let capture = app.runtime_services.work.as_ref().map(|work| {
         work.try_capture(app.current_session_id.as_deref())
             .map(|snapshot| snapshot.map(|snapshot| snapshot.graph))
@@ -1093,7 +1099,17 @@ pub(super) struct SettledFileActivity {
     search: Vec<String>,
     pub(super) write: Vec<String>,
     pub(super) mutations: Vec<FileMutationReceipt>,
-    inline_diff_mode: InlineDiffMode,
+    pub(super) inline_diff_mode: InlineDiffMode,
+}
+
+impl std::fmt::Debug for SettledFileActivity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettledFileActivity")
+            .field("read", &self.read.len())
+            .field("write", &self.write.len())
+            .field("mutations", &self.mutations.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SettledFileActivity {
@@ -2199,7 +2215,10 @@ fn activity_rows(activity: SettledFileActivity) -> Vec<RankedWorkRow> {
     aggregate_activity_row(&activity).into_iter().collect()
 }
 
-fn settled_mutation_body(receipts: &[FileMutationReceipt], mode: InlineDiffMode) -> String {
+pub(super) fn settled_mutation_body(
+    receipts: &[FileMutationReceipt],
+    mode: InlineDiffMode,
+) -> String {
     let Some(receipt) = receipts.last() else {
         return String::new();
     };

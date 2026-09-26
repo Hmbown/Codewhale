@@ -61,6 +61,8 @@ use tool_output::{render_exec_output_mode, render_tool_output_mode, wrap_plain_l
 #[cfg(test)]
 use agent_activity::extract_agent_id;
 pub use file_mutation::FileMutationReceipt;
+#[cfg(test)]
+pub use file_mutation::{FileMutationFile, FileMutationOutcome};
 pub use plan::PlanUpdateCell;
 #[cfg(test)]
 use thinking::extract_reasoning_summary;

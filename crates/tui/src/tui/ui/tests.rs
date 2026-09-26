@@ -9301,6 +9301,7 @@ async fn apply_loaded_session_resets_workspace_runtime_state() {
     app.workspace_context = Some("old workspace context".to_string());
     if let Ok(mut cell) = old_context_cell.lock() {
         *cell = Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            notes: Vec::new(),
             workspace: app.workspace.clone(),
             context: Some("old workspace context".to_string()),
             is_linked_worktree: false,
@@ -18195,6 +18196,9 @@ fn workspace_context_refresh_respects_ttl_before_requerying_git() {
         .expect("initial refresh should populate context");
 
     std::fs::write(repo.path().join("dirty.txt"), "dirty").expect("write dirty marker");
+    // #6565: the badge reads the shared git probe, which the chrome tick
+    // keeps fresh; stand in for that tick.
+    crate::tui::git_status::force_refresh(repo.path());
 
     let before_ttl = start + Duration::from_secs(crate::tui::workspace_context::REFRESH_SECS - 1);
     crate::tui::workspace_context::refresh_if_needed(&mut app, before_ttl, true);
@@ -18426,6 +18430,7 @@ fn workspace_context_discards_old_workspace_results_and_clears_missing_git() {
     app.workspace_context_refreshed_at = Some(Instant::now());
     *app.workspace_context_cell.lock().unwrap() =
         Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            notes: Vec::new(),
             workspace: app.workspace.join("old-workspace"),
             context: Some("stale | clean".into()),
             is_linked_worktree: false,
@@ -18439,6 +18444,7 @@ fn workspace_context_discards_old_workspace_results_and_clears_missing_git() {
     app.needs_redraw = false;
     *app.workspace_context_cell.lock().unwrap() =
         Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            notes: Vec::new(),
             workspace: app.workspace.clone(),
             context: None,
             is_linked_worktree: false,
@@ -18458,6 +18464,7 @@ fn workspace_context_drain_requests_redraw_when_context_changes() {
     {
         let mut cell = app.workspace_context_cell.lock().expect("context cell");
         *cell = Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            notes: Vec::new(),
             workspace: app.workspace.clone(),
             context: Some("feature/new | clean".to_string()),
             is_linked_worktree: false,
@@ -30939,4 +30946,17 @@ fn workflow_task_label_is_the_one_name_for_that_agent() {
         app.agent_given_name("agent_wf2").as_deref(),
         Some("audit docs")
     );
+}
+
+#[test]
+fn the_git_probe_keeps_running_through_a_turn_while_the_git_view_shows() {
+    // #6565: the probe froze for the whole of every turn, so the Git view
+    // went stale exactly while background work was changing the tree.
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.work_surface.panel = crate::tui::work_surface::RailPanel::Tasks;
+    assert!(!super::event_loop::git_probe_allowed(&app, false));
+    app.work_surface.panel = crate::tui::work_surface::RailPanel::Git;
+    assert!(super::event_loop::git_probe_allowed(&app, false));
+    assert!(super::event_loop::git_probe_allowed(&app, true));
 }
