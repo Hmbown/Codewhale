@@ -702,8 +702,12 @@ fn pricing_for_model_at(model: &str, now: DateTime<Utc>) -> Option<ModelPricing>
 
 fn known_pricing_for_model(model_lower: &str) -> Option<ModelPricing> {
     let explicit = match model_lower {
+        // GPT-5.6 Sol short-context (<=272K) rates, re-verified 2026-09-26
+        // against the model page (Input / Cached / Output); `gpt-5.6` is the
+        // alias that routes to Sol:
+        // https://developers.openai.com/api/docs/models/gpt-5.6-sol
         "openai/gpt-5.6" | "openai/gpt-5.6-sol" | "gpt-5.6" | "gpt-5.6-sol" => {
-            Some(usd_only_pricing(0.50, 5.00, 30.00))
+            Some(usd_only_pricing(0.40, 4.00, 20.00))
         }
         // GPT-5.6 Terra / Luna short-context (<=272K) rates, re-verified
         // 2026-08-17 against the model pages (Input / Cached / Output):
@@ -3947,6 +3951,57 @@ mod tests {
         assert_eq!(pricing.usd.cache_write, CacheWritePolicy::Rate(0.375));
     }
 
+    /// The offline seed's price and the reviewed provider-owned table must
+    /// agree wherever both price a row: the route audit reads a catalog rate
+    /// before the hand table, so a disagreement silently changes the offline
+    /// estimate (#6396). A deliberate difference belongs in
+    /// `catalog_corrections.json`, which this reads through.
+    #[test]
+    fn bundled_seed_prices_agree_with_provider_owned_table() {
+        let at = Utc.with_ymd_and_hms(2026, 9, 26, 12, 0, 0).unwrap();
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let mut checked = 0;
+        let mut mismatches = Vec::new();
+        for row in codewhale_config::catalog::bundled_catalog_offerings() {
+            let Some(cost) = row.cost.as_ref() else {
+                continue;
+            };
+            let Some(provider) = ApiProvider::parse(&row.provider) else {
+                continue;
+            };
+            let Some(hand) = provider_owned_hand_pricing_at(provider, &row.wire_model_id, at)
+            else {
+                continue;
+            };
+            checked += 1;
+            let usd = &hand.usd;
+            let pairs = [
+                ("input", cost.input, usd.input_cache_miss_per_million),
+                ("output", cost.output, usd.output_per_million),
+                (
+                    "cache_read",
+                    cost.cache_read,
+                    usd.input_cache_hit_per_million,
+                ),
+            ];
+            for (field, seed, table) in pairs {
+                if let Some(seed) = seed
+                    && !close(seed, table)
+                {
+                    mismatches.push(format!(
+                        "{}/{} {field}: seed {seed} vs table {table}",
+                        row.provider, row.wire_model_id
+                    ));
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "no bundled row has a provider-owned table price"
+        );
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
     #[test]
     fn curated_usd_only_models_have_pricing_and_accrue_cost() {
         let usage = Usage {
@@ -3985,7 +4040,8 @@ mod tests {
             ("gpt-5.5", 0.50, 5.00, 30.00),
             // GPT-5.5 Pro has no cached-input discount: cache-hit == input.
             ("gpt-5.5-pro", 30.00, 30.00, 180.00),
-            ("gpt-5.6-sol", 0.50, 5.00, 30.00),
+            ("gpt-5.6", 0.40, 4.00, 20.00),
+            ("gpt-5.6-sol", 0.40, 4.00, 20.00),
             ("gpt-5.6-terra", 0.20, 2.00, 12.00),
             ("gpt-5.6-luna", 0.02, 0.20, 1.20),
             ("gpt-5-codex", 0.125, 1.25, 10.00),

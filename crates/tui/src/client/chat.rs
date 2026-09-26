@@ -118,8 +118,11 @@ fn apply_xai_grok_reasoning_effort(
         return;
     };
     let model = model.trim().to_ascii_lowercase();
+    // The bundled row with Codewhale's corrections applied (#6396): the raw
+    // seed row carries Models.dev's ladder, which lists an effort control for
+    // grok-4.3 that xAI does not document.
     let Some(row) =
-        codewhale_config::catalog::bundled_models_dev_catalog().provider_model("xai", &model)
+        crate::provider_lake::bundled_catalog_offering_for_model(ApiProvider::Xai, &model)
     else {
         return;
     };

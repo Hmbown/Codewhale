@@ -4551,12 +4551,17 @@ fn catalog_picker_efforts(provider: ApiProvider, wire_model: &str) -> Option<Vec
     let offering = catalog_offering_for_model(provider, wire_model)?;
     let mut efforts = Vec::new();
     let mut saw_effort_list = false;
+    let mut has_toggle = false;
     for option in &offering.reasoning_options {
         let option_type = option
             .get("type")
             .and_then(|value| value.as_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+        if option_type == "toggle" {
+            has_toggle = true;
+            continue;
+        }
         // Prefer explicit effort lists; also accept thinking-mode lists whose
         // values map onto our tiers (adaptive→auto, disabled→off, always_on→max).
         if option_type != "effort" && option_type != "thinking" {
@@ -4579,6 +4584,11 @@ fn catalog_picker_efforts(provider: ApiProvider, wire_model: &str) -> Option<Vec
     }
     if !saw_effort_list || efforts.is_empty() {
         return None;
+    }
+    // A Models.dev `toggle` beside the ladder means reasoning can also be
+    // switched off (#6396).
+    if has_toggle && !efforts.contains(&ReasoningEffort::Off) {
+        efforts.insert(0, ReasoningEffort::Off);
     }
     // Always offer Auto when the catalog published discrete tiers so the
     // operator can still leave the choice to the route default. Do not invent

@@ -1141,7 +1141,7 @@ fn default_resolver_yields_real_facts_from_bundled_catalog() {
         .resolve(&req(Some(ProviderKind::Moonshot), Some("kimi-k3")))
         .expect("Moonshot kimi-k3 should resolve from the bundled catalog");
     assert_eq!(kimi_k3.limits().context_tokens, Some(1_048_576));
-    assert_eq!(kimi_k3.limits().output_tokens, Some(131_072));
+    assert_eq!(kimi_k3.limits().output_tokens, Some(1_048_576));
 
     // With the #3085 pricing keystone present on the release branch, the asset's
     // provider-scoped `cost` now projects onto the candidate via
@@ -1151,7 +1151,7 @@ fn default_resolver_yields_real_facts_from_bundled_catalog() {
     let glm51 = r
         .resolve(&req(Some(ProviderKind::Zai), Some("glm-5.1")))
         .expect("Z.ai glm-5.1 should resolve from the bundled catalog");
-    assert_eq!(glm51.limits().context_tokens, Some(202_752));
+    assert_eq!(glm51.limits().context_tokens, Some(200_000));
     assert!(matches!(
         glm51.pricing(),
         Some(super::candidate::PricingSku::Token { .. })
@@ -1240,7 +1240,7 @@ fn openrouter_qwen37_plus_aliases_use_exact_catalog_wire_identity() {
             .resolve(&req(Some(ProviderKind::Openrouter), Some(requested)))
             .expect("OpenRouter Qwen 3.7 Plus route should resolve");
         assert_eq!(route.wire_model_id().as_str(), "qwen/qwen3.7-plus");
-        assert!(!route.limits().has_known_limit());
+        assert_eq!(route.limits().context_tokens, Some(1_000_000));
         assert!(matches!(
             route.pricing(),
             Some(super::candidate::PricingSku::Token {

@@ -134,6 +134,17 @@ quieter, and Fleet runs can be checked before they spend anything.
   Codewhale records for Grok, MiniMax, Qwen 3.8 Max, Muse Spark and Step 3.5
   (defaults, always-on thinking, extra effort tiers) survive the refresh
   ([#6396](https://github.com/Hmbown/Codewhale/issues/6396)).
+- The offline model list is now generated from Models.dev instead of edited by
+  hand, so a fresh install without network sees the same limits, image
+  support and reasoning controls as an online one. Claude, GPT-5.5, Kimi and
+  several OpenRouter models now show image input offline, and a model whose
+  catalog row offers an on/off switch next to its effort tiers keeps Off in
+  `/effort` and Ctrl+T instead of rounding it up
+  ([#6396](https://github.com/Hmbown/Codewhale/issues/6396)).
+- Cost estimates for GPT-5.6 and GPT-5.6 Sol use OpenAI's current rates of
+  $4 input, $0.40 cached input and $20 output per million tokens. They were
+  still at the older $5, $0.50 and $30
+  ([#6396](https://github.com/Hmbown/Codewhale/issues/6396)).
 
 ### Removed
 

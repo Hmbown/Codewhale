@@ -2547,7 +2547,9 @@ mod tests {
             crate::config::ZAI_GLM_5_3_MODEL,
             "GLM-5.3 must resolve to its own id"
         );
-        assert_eq!(route_53.reasoning_effort, Some(ReasoningEffort::High));
+        // GLM-5.3 publishes its own ladder (low/high/max) instead of 5.2's, so
+        // low reaches the wire (#6396).
+        assert_eq!(route_53.reasoning_effort, Some(ReasoningEffort::Low));
     }
 
     #[tokio::test]
