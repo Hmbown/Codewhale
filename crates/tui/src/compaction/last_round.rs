@@ -556,6 +556,63 @@ mod tests {
         )))
     }
 
+    /// The handoff header tells the next turn what survived. It must match
+    /// what the replacement history keeps: only the last steps of a long
+    /// round, with long tool output shortened and marked.
+    #[test]
+    fn summary_header_matches_what_replacement_history_keeps() {
+        let long_output = "x".repeat(LAST_ROUND_TOOL_RESULT_MAX_CHARS * 2);
+        let original = vec![
+            msg("user", "Fix the build."),
+            tool_use("first", "Bash", json!({"command": "cargo check"})),
+            tool_result("first", "first step output"),
+            tool_use("second", "Bash", json!({"command": "cargo build"})),
+            tool_result("second", "second step output"),
+            tool_use("third", "Bash", json!({"command": "cargo test"})),
+            tool_result("third", &long_output),
+        ];
+        let kept = replacement_messages(&original, 20_000);
+        let kept_ids: Vec<String> = kept.iter().flat_map(tool_result_ids).collect();
+        assert_eq!(kept_ids, ["second", "third"], "earlier steps are dropped");
+        assert!(
+            kept.iter()
+                .any(|m| user_text_of(m).as_deref() == Some("Fix the build."))
+        );
+        let shortened = kept
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == "third" => Some(content.clone()),
+                _ => None,
+            })
+            .expect("the last tool result is kept");
+        assert!(shortened.len() < long_output.len());
+        assert!(shortened.starts_with("[tool result retained-history truncated from"));
+
+        let header = crate::compaction::SUMMARY_HEADER;
+        assert!(
+            header.contains("last steps of the current round"),
+            "{header}"
+        );
+        assert!(
+            header.contains("including earlier steps of this round"),
+            "{header}"
+        );
+        assert!(
+            header.contains("Long tool output there is shortened"),
+            "{header}"
+        );
+        assert!(
+            header.contains("with a marker where it was cut"),
+            "{header}"
+        );
+        assert!(!header.contains("as they were"), "{header}");
+    }
+
     #[test]
     fn coverage_floor_rejects_a_replacement_that_drops_last_round_tools() {
         let original = vec![

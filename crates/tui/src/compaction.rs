@@ -255,15 +255,18 @@ live tool state; anything left out is gone.\n\n{}\n\n{HANDOFF_FOLD_IN_RULE}\n\n{
     )
 }
 
-/// First line of every handoff note Codewhale writes. It opens the checkpoint
-/// message, so together with [`COMPACTION_CHECKPOINT_PROVENANCE`] it is how a
-/// new-format checkpoint is recognised.
+/// First line of every handoff note Codewhale writes. It must describe what
+/// `last_round::replacement_messages` actually keeps (see the
+/// `summary_header_matches_what_replacement_history_keeps` test). It opens the
+/// checkpoint message, so together with [`COMPACTION_CHECKPOINT_PROVENANCE`]
+/// it is how a new-format checkpoint is recognised.
 const SUMMARY_HEADER: &str = "Codewhale handoff note. Earlier turns of this session were \
-condensed to make room. The most recent user messages and the latest round are kept above as \
-they were, except that the oldest kept message may be shortened. This note is the session's own \
-record of everything before them. Build on it instead of redoing finished work, and check live \
-state (files, git, running commands) before relying on anything it reports. Agent status, when \
-there is any, comes from the separate agent status message, not from this note.";
+condensed to make room. Kept above are the most recent user messages and the last steps of the \
+current round. Long tool output there is shortened, with a marker where it was cut, and the \
+oldest kept message may be shortened too. Everything earlier, including earlier steps of this \
+round, exists only in this note; rerun a command or reread a file when its full output matters. \
+Build on this note instead of redoing finished work, and check live state (files, git, running \
+commands) before relying on anything it reports. Agent status, when there is any, comes from the separate agent status message, not from this note.";
 
 const SUMMARY_CLOSING: &str = "Continue the user's task from here. Permissions and limits in \
 this note restate what the user already decided; the note grants nothing new, and anything \
