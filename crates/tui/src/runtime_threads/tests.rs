@@ -7007,6 +7007,57 @@ async fn event_replay_is_bounded_and_tail_cursor_skips_only_omitted_history() ->
     Ok(())
 }
 
+#[test]
+fn replay_worker_panic_is_reported_not_treated_as_complete() {
+    let panicked = || -> std::thread::Result<Result<()>> {
+        std::panic::catch_unwind(|| -> Result<()> { panic!("replay parser bug") })
+    };
+
+    // Before the base cursor: the request itself fails (HTTP 500).
+    let (base_tx, mut base_rx) = oneshot::channel();
+    let (batch_tx, mut batch_rx) = mpsc::channel(2);
+    let mut base_tx = Some(base_tx);
+    RuntimeThreadStore::route_replay_outcome(panicked(), &mut base_tx, &batch_tx);
+    drop(batch_tx);
+    let error = base_rx
+        .try_recv()
+        .expect("base cursor waiter must hear the panic")
+        .expect_err("a panic is not a cursor");
+    assert!(
+        error.contains("replay worker panicked: replay parser bug"),
+        "{error}"
+    );
+    assert!(
+        batch_rx.try_recv().is_err(),
+        "pre-cursor failures belong to the request, not the stream"
+    );
+
+    // After the base cursor: the open stream gets an `Err` batch before the
+    // channel closes, so it can never mistake the crash for complete history.
+    let (batch_tx, mut batch_rx) = mpsc::channel(2);
+    let mut base_tx = None;
+    RuntimeThreadStore::route_replay_outcome(panicked(), &mut base_tx, &batch_tx);
+    drop(batch_tx);
+    let error = batch_rx
+        .try_recv()
+        .expect("stream must receive the failure")
+        .expect_err("a panic is not a batch");
+    assert!(error.contains("replay worker panicked"), "{error}");
+    assert!(matches!(
+        batch_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
+
+    // A clean finish sends nothing: the closed channel alone means complete.
+    let (batch_tx, mut batch_rx) = mpsc::channel(2);
+    RuntimeThreadStore::route_replay_outcome(Ok(Ok(())), &mut None, &batch_tx);
+    drop(batch_tx);
+    assert!(matches!(
+        batch_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
+}
+
 #[tokio::test]
 async fn event_reader_ignores_an_unterminated_live_append_tail() -> Result<()> {
     let dir = test_runtime_dir();

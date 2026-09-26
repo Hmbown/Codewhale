@@ -805,9 +805,16 @@ enum FleetAlertAdapterArg {
 /// terminated-by-signal exit (no code, no terminal restore, no `session_end`).
 /// After this function returns, the signals are armed.
 fn spawn_signal_cleanup_task() {
-    let signals = TerminatingSignals::register();
+    let mut signals = TerminatingSignals::register();
     tokio::spawn(async move {
         let exit_code = signals.wait().await;
+        // A serving Runtime API gets a bounded window to end its open event
+        // streams with a typed `stream.end`, so clients can tell a Runtime
+        // that stopped from a dropped connection. A second signal skips it.
+        tokio::select! {
+            () = runtime_api::drain_for_signal_exit() => {}
+            _ = signals.wait() => {}
+        }
         // If we get here a fatal signal arrived. Restore the terminal
         // and exit. A second signal during cleanup re-enters this
         // path and aborts via `std::process::exit` directly.
@@ -901,7 +908,7 @@ impl TerminatingSignals {
     /// Resolve with 128 + signal number for whichever arrives first. The
     /// fallback never-resolving future keeps `select!` well-typed when a
     /// stream failed to register.
-    async fn wait(mut self) -> i32 {
+    async fn wait(&mut self) -> i32 {
         tokio::select! {
             _ = async { match self.sigint.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending::<()>().await, } } => 130,
             _ = async { match self.sigterm.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending::<()>().await, } } => 143,
@@ -926,7 +933,7 @@ impl TerminatingSignals {
         }
     }
 
-    async fn wait(mut self) -> i32 {
+    async fn wait(&mut self) -> i32 {
         match self.ctrl_c.as_mut() {
             Some(s) => {
                 s.recv().await;

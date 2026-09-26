@@ -953,6 +953,8 @@ struct TestServerOverrides {
     plugin_discovery: Option<Arc<crate::plugins::PluginDiscoveryContext>>,
     /// Pre-seeded workspace LSP manager (test transports, disabled configs).
     lsp_manager: Option<Arc<crate::lsp::LspManager>>,
+    /// Stops the server through the product's own graceful-shutdown path.
+    shutdown: Option<RuntimeServerShutdown>,
 }
 
 async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
@@ -1067,10 +1069,14 @@ fn spawn_product_stack_server(
     runtime_token: Option<String>,
     mobile_enabled: bool,
     workspace: PathBuf,
-    overrides: TestServerOverrides,
+    mut overrides: TestServerOverrides,
     env_ticket: Option<crate::test_support::EnvScopeTicket>,
     setup_tx: oneshot::Sender<Result<Option<TestServerSetup>>>,
 ) {
+    let shutdown = overrides
+        .shutdown
+        .get_or_insert_with(RuntimeServerShutdown::default)
+        .clone();
     std::thread::Builder::new()
         .name("runtime-api-test-server".to_string())
         .stack_size(crate::CODEWHALE_MAIN_STACK_BYTES)
@@ -1108,13 +1114,7 @@ fn spawn_product_stack_server(
                         let listener =
                             TcpListener::from_std(listener).expect("register test listener");
                         tokio::select! {
-                            _ = async {
-                                let _ = axum::serve(
-                                    listener,
-                                    app.into_make_service_with_connect_info::<SocketAddr>(),
-                                )
-                                .await;
-                            } => {}
+                            _ = serve_runtime_api(listener, app, shutdown) => {}
                             _ = shutdown_rx => {}
                         }
                     }
@@ -1252,6 +1252,7 @@ async fn build_test_server(
             Arc::new(cell)
         },
         computer: super::computer_display::ComputerState::from_env(),
+        shutdown: overrides.shutdown.clone().unwrap_or_default(),
         compat_stream_test_hook: overrides.compat_stream_test_hook,
     };
     let app = build_router(state);
@@ -4533,6 +4534,7 @@ async fn event_handoff_replays_and_dedupes_interaction_prompts_without_a_gap() -
         backlog_rx,
         live,
         false,
+        CancellationToken::new(),
     )
     .take(2);
     let body =
@@ -4600,6 +4602,7 @@ async fn pet_stream_progress_drains_queued_answers_before_becoming_live() -> Res
         rx,
         live,
         true,
+        CancellationToken::new(),
     )
     .take(4);
     let body = tokio::time::timeout(
@@ -4616,13 +4619,13 @@ async fn pet_stream_progress_drains_queued_answers_before_becoming_live() -> Res
     assert_eq!(frames.len(), 4);
     assert_eq!(
         frames[0].1,
-        json!({"event":"stream.progress","thread_id":thread.id,"seq":initial,"state":"replaying"})
+        json!({"schema_version":RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,"event":"stream.progress","kind":"stream.progress","thread_id":thread.id,"seq":initial,"state":"replaying"})
     );
     assert_eq!(frames[1].1["seq"], required.seq);
     assert_eq!(frames[2].1["seq"], answered.seq);
     assert_eq!(
         frames[3].1,
-        json!({"event":"stream.progress","thread_id":thread.id,"seq":answered.seq,"state":"live"})
+        json!({"schema_version":RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,"event":"stream.progress","kind":"stream.progress","thread_id":thread.id,"seq":answered.seq,"state":"live"})
     );
     assert_eq!(
         runtime_threads
@@ -4702,6 +4705,7 @@ async fn pet_stream_progress_returns_to_replay_while_recovering_broadcast_lag() 
         backlog,
         live,
         true,
+        CancellationToken::new(),
     ));
     assert_eq!(
         sse_frame_payload(stream.next().await.unwrap().unwrap()).await?["state"],
@@ -4749,6 +4753,413 @@ async fn pet_stream_progress_returns_to_replay_while_recovering_broadcast_lag() 
             .len(),
         2
     );
+    handle.abort();
+    Ok(())
+}
+
+/// One rendered frame of a thread event stream: its SSE `id:` (if any), event
+/// name and JSON payload.
+type RenderedThreadFrame = (Option<String>, String, Value);
+
+fn parse_thread_frame(raw: &str) -> Result<RenderedThreadFrame> {
+    let id = raw
+        .lines()
+        .find_map(|line| line.strip_prefix("id:"))
+        .map(|id| id.trim().to_string());
+    let (event, payload) = parse_sse_frame(raw)?;
+    Ok((id, event, payload))
+}
+
+/// Renders a thread event stream that must end on its own; a hang fails.
+async fn render_thread_stream(
+    stream: impl futures_util::Stream<Item = Result<SseEvent, Infallible>> + Send + 'static,
+) -> Result<Vec<RenderedThreadFrame>> {
+    let body = tokio::time::timeout(
+        ci_scaled(Duration::from_secs(5)),
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX),
+    )
+    .await
+    .context("a server-ended thread stream must close by itself")??;
+    String::from_utf8(body.to_vec())?
+        .split("\n\n")
+        .filter(|raw| !raw.trim().is_empty())
+        .map(parse_thread_frame)
+        .collect()
+}
+
+/// Reads an HTTP thread stream to EOF; a hang fails.
+async fn read_thread_stream_to_eof(
+    response: reqwest::Response,
+) -> Result<Vec<RenderedThreadFrame>> {
+    let body = tokio::time::timeout(ci_scaled(Duration::from_secs(10)), response.text())
+        .await
+        .context("the server must close the stream after stream.end")??;
+    body.split("\n\n")
+        .filter(|raw| !raw.trim().is_empty() && !raw.trim_start().starts_with(':'))
+        .map(parse_thread_frame)
+        .collect()
+}
+
+async fn next_thread_frame<S>(stream: &mut S) -> Result<Value>
+where
+    S: futures_util::Stream<Item = Result<SseEvent, Infallible>> + Unpin,
+{
+    let Ok(event) = tokio::time::timeout(ci_scaled(Duration::from_secs(5)), stream.next())
+        .await
+        .context("thread stream stalled")?
+        .context("thread stream ended without stream.end")?;
+    sse_frame_payload(event).await
+}
+
+fn expected_stream_end(thread_id: &str, reason: &str, last_seq: u64) -> Value {
+    json!({
+        "schema_version": RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,
+        "event": "stream.end",
+        "kind": "stream.end",
+        "thread_id": thread_id,
+        "reason": reason,
+        "last_seq": last_seq,
+        "retryable": true,
+    })
+}
+
+#[tokio::test]
+async fn replay_failure_ends_stream_at_last_delivered_seq_and_resumes_from_it() -> Result<()> {
+    let (addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for stream end acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .context("thread creation should emit an event")?
+        .seq;
+    let first = runtime_threads
+        .emit_event_for_test(&thread.id, None, "item.completed", json!({"n": 1}))
+        .await?;
+    let second = runtime_threads
+        .emit_event_for_test(&thread.id, None, "item.completed", json!({"n": 2}))
+        .await?;
+
+    // History delivers two events, then the durable read fails mid-replay.
+    let (backlog_tx, backlog) = mpsc::channel(2);
+    backlog_tx
+        .send(Ok(vec![first.clone(), second.clone()]))
+        .await?;
+    backlog_tx.send(Err("disk read failed".to_string())).await?;
+    drop(backlog_tx);
+    let (_live_tx, live) = tokio::sync::broadcast::channel(4);
+    let frames = render_thread_stream(replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial,
+        backlog,
+        live,
+        false,
+        CancellationToken::new(),
+    ))
+    .await?;
+
+    assert_eq!(frames.len(), 3, "unexpected frames: {frames:?}");
+    assert_eq!(frames[0].0, Some(first.seq.to_string()));
+    assert_eq!(frames[0].2["previous_seq"], initial);
+    assert_eq!(frames[1].0, Some(second.seq.to_string()));
+    let (end_id, end_name, end_payload) = &frames[2];
+    assert_eq!(end_name, "stream.end");
+    assert_eq!(
+        end_id, &None,
+        "stream.end must not move a browser's Last-Event-ID"
+    );
+    assert_eq!(
+        end_payload,
+        &expected_stream_end(&thread.id, "replay_failed", second.seq),
+        "no seq, no error text: only the reason and the resume cursor"
+    );
+
+    // The resume rule: reconnect with since_seq = last_seq, or let a browser
+    // resend its Last-Event-ID; both land on the next event exactly once.
+    let third = runtime_threads
+        .emit_event_for_test(&thread.id, None, "item.completed", json!({"n": 3}))
+        .await?;
+    let last_seq = end_payload["last_seq"].as_u64().context("last_seq")?;
+    let client = crate::tls::reqwest_client();
+    for request in [
+        client.get(format!(
+            "http://{addr}/v1/threads/{}/events?since_seq={last_seq}",
+            thread.id
+        )),
+        client
+            .get(format!("http://{addr}/v1/threads/{}/events", thread.id))
+            .header("Last-Event-ID", last_seq.to_string()),
+    ] {
+        let resumed = request.send().await?.error_for_status()?;
+        let (id, _event, payload) = parse_thread_frame(&read_first_sse_frame(resumed).await?)?;
+        assert_eq!(payload["seq"], third.seq);
+        assert_eq!(payload["previous_seq"], last_seq);
+        assert_eq!(id, Some(third.seq.to_string()));
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_failure_over_http_sends_stream_end_then_eof() -> Result<()> {
+    let (addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for stream end acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    // A newline-terminated malformed record: the journal read fails closed
+    // after the stream has already been answered with 200.
+    let path = runtime_threads.events_path_for_test(&thread.id)?;
+    let mut journal = fs::OpenOptions::new().append(true).open(&path)?;
+    std::io::Write::write_all(&mut journal, b"{malformed-but-terminated}\n")?;
+    drop(journal);
+
+    let response = crate::tls::reqwest_client()
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?since_seq=0",
+            thread.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codewhale-stream-end")
+            .context("every stream advertises its explicit end")?,
+        "1"
+    );
+    let frames = read_thread_stream_to_eof(response).await?;
+    // The failing batch is discarded whole, so nothing was delivered and the
+    // resume cursor is the requested one.
+    assert_eq!(
+        frames,
+        vec![(
+            None,
+            "stream.end".to_string(),
+            expected_stream_end(&thread.id, "replay_failed", 0)
+        )]
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn catch_up_failure_ends_stream_with_catch_up_failed() -> Result<()> {
+    let (_addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for stream end acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .context("thread creation should emit an event")?
+        .seq;
+    let (backlog_tx, backlog) = mpsc::channel(1);
+    drop(backlog_tx);
+    let (live_tx, live) = tokio::sync::broadcast::channel(1);
+    let mut stream = Box::pin(replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial,
+        backlog,
+        live,
+        false,
+        CancellationToken::new(),
+    ));
+    let delivered = runtime_threads
+        .emit_event_for_test(&thread.id, None, "item.completed", json!({"n": 1}))
+        .await?;
+    live_tx.send(delivered.clone())?;
+    assert_eq!(next_thread_frame(&mut stream).await?["seq"], delivered.seq);
+
+    // Two sends into a one-slot channel lag the receiver, forcing a durable
+    // catch-up; a closed replay hook makes that re-read fail.
+    let (hook_tx, hook_rx) = mpsc::unbounded_channel();
+    drop(hook_rx);
+    runtime_threads.set_replay_test_hook(hook_tx);
+    for n in [2, 3] {
+        let event = runtime_threads
+            .emit_event_for_test(&thread.id, None, "item.completed", json!({"n": n}))
+            .await?;
+        live_tx.send(event)?;
+    }
+    assert_eq!(
+        next_thread_frame(&mut stream).await?,
+        expected_stream_end(&thread.id, "catch_up_failed", delivered.seq)
+    );
+    assert!(
+        tokio::time::timeout(ci_scaled(Duration::from_secs(5)), stream.next())
+            .await?
+            .is_none(),
+        "stream.end is the last frame"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn closed_live_source_still_ends_stream_explicitly() -> Result<()> {
+    // Unreachable in the product while the stream holds the manager that owns
+    // the sender; pinned so no future ownership change can make it silent.
+    let (_addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for stream end acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .context("thread creation should emit an event")?
+        .seq;
+    let (backlog_tx, backlog) = mpsc::channel(1);
+    drop(backlog_tx);
+    let (live_tx, live) = tokio::sync::broadcast::channel(4);
+    let event = runtime_threads
+        .emit_event_for_test(&thread.id, None, "item.completed", json!({"n": 1}))
+        .await?;
+    live_tx.send(event.clone())?;
+    drop(live_tx);
+    let frames = render_thread_stream(replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial,
+        backlog,
+        live,
+        false,
+        CancellationToken::new(),
+    ))
+    .await?;
+    assert_eq!(frames.len(), 2, "unexpected frames: {frames:?}");
+    assert_eq!(frames[0].2["seq"], event.seq);
+    assert_eq!(
+        frames[1].2,
+        expected_stream_end(&thread.id, "runtime_shutdown", event.seq)
+    );
+    handle.abort();
+    Ok(())
+}
+
+/// A deliberate stop goes through the product's serve path: the open stream
+/// gets `stream.end {runtime_shutdown}` at its cursor, then the server drains.
+#[tokio::test]
+async fn runtime_shutdown_ends_open_streams_through_graceful_serve() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-stream-end-{}", Uuid::new_v4()));
+    let shutdown = RuntimeServerShutdown::default();
+    let (addr, runtime_threads, handle) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            root.clone(),
+            root.join("sessions"),
+            None,
+            false,
+            root.join("workspace"),
+            TestServerOverrides {
+                shutdown: Some(shutdown.clone()),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+        .context("Runtime socket unavailable for shutdown acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let event = runtime_threads
+        .emit_event_for_test(&thread.id, None, "item.completed", json!({"n": 1}))
+        .await?;
+    let response = crate::tls::reqwest_client()
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?since_seq=0&progress=true",
+            thread.id
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
+    let collector = tokio::spawn(collect_sse_frames(response, frame_tx));
+    // Wait until the stream is live, so shutdown interrupts a healthy stream.
+    tokio::time::timeout(ci_scaled(Duration::from_secs(5)), async {
+        while let Some((name, payload)) = frame_rx.recv().await {
+            if name == "stream.progress" && payload["state"] == "live" {
+                return;
+            }
+        }
+    })
+    .await
+    .context("stream never went live")?;
+
+    assert!(
+        shutdown.drain(ci_scaled(Duration::from_secs(10))).await,
+        "the server must drain once its streams have ended"
+    );
+    let frames = tokio::time::timeout(ci_scaled(Duration::from_secs(5)), collector)
+        .await
+        .context("stream stayed open after shutdown")???;
+    let ends = frames
+        .iter()
+        .filter(|(name, _)| name == "stream.end")
+        .count();
+    assert_eq!(
+        ends, 1,
+        "exactly one stream.end, and only at the end: {frames:?}"
+    );
+    let (name, payload) = frames.last().context("no frames")?;
+    assert_eq!(name, "stream.end");
+    assert_eq!(
+        payload,
+        &expected_stream_end(&thread.id, "runtime_shutdown", event.seq)
+    );
+
+    handle.abort();
+    let _ = fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_events_pre_stream_failures_are_http_errors_not_sse() -> Result<()> {
+    let (addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for stream error acceptance")?;
+    let client = crate::tls::reqwest_client();
+    let missing = client
+        .get(format!("http://{addr}/v1/threads/thr_missing/events"))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert!(
+        missing
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json")),
+        "an unknown thread is a JSON error, never an event stream"
+    );
+    assert!(missing.headers().get("x-codewhale-stream-end").is_none());
+    let body: Value = missing.json().await?;
+    assert!(body.to_string().contains("thr_missing"), "{body}");
+
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let too_long = client
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?replay_limit={}",
+            thread.id,
+            MAX_RUNTIME_EVENT_REPLAY_TAIL + 1
+        ))
+        .send()
+        .await?;
+    assert_eq!(too_long.status(), StatusCode::BAD_REQUEST);
     handle.abort();
     Ok(())
 }

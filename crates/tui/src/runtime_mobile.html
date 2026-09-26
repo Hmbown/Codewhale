@@ -271,6 +271,10 @@
       threadId: "",
       activeTurnId: "",
       source: null,
+      // Seq of the last journal event shown for this thread: the resume
+      // cursor. Frames at or below it are replays and are skipped.
+      lastSeq: 0,
+      retryDelay: 750,
       eventCount: 0,
       requestProof: "",
       streamTicket: ""
@@ -563,6 +567,8 @@
     async function selectThread(id, title) {
       state.threadId = id;
       state.activeTurnId = "";
+      state.lastSeq = 0;
+      state.retryDelay = 750;
       state.eventCount = 0;
       $("event-count").textContent = "0 events";
       $("active-title").textContent = title || id;
@@ -572,12 +578,41 @@
       await loadThreads();
     }
 
-    async function openThreadEvents(id) {
+    // What the Runtime said when it ended the stream on purpose (`stream.end`).
+    function streamEndStatus(reason) {
+      switch (reason) {
+        case "replay_failed":
+          return "Runtime could not read this conversation's history \u2014 retrying";
+        case "catch_up_failed":
+          return "Runtime fell behind and could not catch up \u2014 retrying";
+        case "runtime_shutdown":
+          return "Runtime is shutting down \u2014 reconnecting";
+        default:
+          return "Runtime ended the event stream \u2014 reconnecting";
+      }
+    }
+
+    // Reconnect from `cursor` (undefined: nothing shown yet, open fresh) after
+    // a bounded backoff that resets once a stream opens.
+    function scheduleResume(id, cursor) {
+      const delay = state.retryDelay;
+      state.retryDelay = Math.min(state.retryDelay * 2, 15000);
+      window.setTimeout(() => {
+        if (state.threadId === id) {
+          openThreadEvents(id, cursor).catch((err) => setStatus(err.message, "bad"));
+        }
+      }, delay);
+    }
+
+    // `resumeFrom` undefined opens the newest tail; a number resumes after it,
+    // so a reconnect never replays (and duplicates) what is already shown.
+    async function openThreadEvents(id, resumeFrom) {
       const streamTicket = await takeStreamTicket();
-      const query = new URLSearchParams({
-        since_seq: "0",
-        replay_limit: String(MAX_VISIBLE_EVENTS)
-      });
+      const query = new URLSearchParams(
+        resumeFrom === undefined
+          ? { since_seq: "0", replay_limit: String(MAX_VISIBLE_EVENTS) }
+          : { since_seq: String(resumeFrom) }
+      );
       if (streamTicket) query.set(MOBILE_STREAM_TICKET_QUERY, streamTicket);
       const source = new EventSource(
         "/v1/threads/" + encodeURIComponent(id) + "/events?" + query.toString()
@@ -601,22 +636,44 @@
       ];
       for (const name of names) {
         source.addEventListener(name, (ev) => {
+          if (state.source !== source) return;
           let data = {};
           try { data = JSON.parse(ev.data || "{}"); } catch (_) {}
+          if (Number.isSafeInteger(data.seq)) {
+            if (data.seq <= state.lastSeq) return;
+            state.lastSeq = data.seq;
+          }
           if (data.turn_id) state.activeTurnId = data.turn_id;
           appendEvent(name, data);
         });
       }
-      source.onopen = () => setStatus("Connected", "ok");
+      // The Runtime ended the stream on purpose; `last_seq` is where to resume.
+      source.addEventListener("stream.end", (ev) => {
+        if (state.source !== source || state.threadId !== id) return;
+        source.close();
+        let data = {};
+        try { data = JSON.parse(ev.data || "{}"); } catch (_) {}
+        if (Number.isSafeInteger(data.last_seq)) {
+          state.lastSeq = Math.max(state.lastSeq, data.last_seq);
+        }
+        if (data.retryable !== true) {
+          setStatus("Runtime closed this conversation's event stream; reopen the thread", "bad");
+          return;
+        }
+        setStatus(streamEndStatus(data.reason), "warn");
+        scheduleResume(id, state.lastSeq);
+      });
+      source.onopen = () => {
+        state.retryDelay = 750;
+        setStatus("Connected", "ok");
+      };
+      // No `stream.end`: the connection dropped (network, proxy, or a Runtime
+      // that exited without warning). Resume from what is already shown.
       source.onerror = () => {
         if (state.source !== source || state.threadId !== id) return;
         source.close();
-        setStatus("Event stream disconnected; reconnecting", "warn");
-        window.setTimeout(() => {
-          if (state.threadId === id) {
-            openThreadEvents(id).catch((err) => setStatus(err.message, "bad"));
-          }
-        }, 750);
+        setStatus("Connection lost; reconnecting", "warn");
+        scheduleResume(id, state.lastSeq > 0 ? state.lastSeq : resumeFrom);
       };
     }
 

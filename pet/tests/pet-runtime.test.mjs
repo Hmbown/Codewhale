@@ -54,6 +54,30 @@ test('Runtime shutdown closes an idle SSE body after garbage collection', { time
   assert.equal(code, 0, log); assert.ok(closed, 'The server must see the reader disconnect');
 });
 
+test('a Runtime stream.end resumes from its cursor and reports what Runtime said', { timeout: 10_000 }, async t => {
+  const cursors = [], reports = [], responses = new Set();
+  const frame = value => `data: ${JSON.stringify(value)}\n\n`;
+  const server = createServer((req, res) => {
+    cursors.push(new URL(req.url, 'http://local').searchParams.get('since_seq')); responses.add(res);
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-codewhale-event-progress': '1', 'x-codewhale-stream-end': '1' });
+    if (cursors.length === 1) {
+      res.write(frame({ event: 'stream.progress', state: 'replaying', thread_id: 'fixture', seq: 0 }));
+      res.write(frame({ seq: 4, previous_seq: 0, event: 'thread.updated', thread_id: 'fixture', timestamp: new Date().toISOString(), payload: {} }));
+      res.end(frame({ schema_version: 1, event: 'stream.end', kind: 'stream.end', thread_id: 'fixture', reason: 'runtime_shutdown', last_seq: 4, retryable: true }));
+    } else {
+      res.write(frame({ event: 'stream.progress', state: 'live', thread_id: 'fixture', seq: 4 }));
+    }
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const input = await followRuntime({ baseUrl: `http://127.0.0.1:${server.address().port}`, threadId: 'fixture', report: m => reports.push(m) });
+  t.after(async () => { await input.close(); for (const res of responses) res.destroy(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+  for (let i = 0; !input.connected && i < 300; i++) await delay(10);
+  assert.equal(input.connected, true);
+  assert.equal(input.cursor, 4);
+  assert.deepEqual(cursors, ['0', '4'], 'resume from stream.end last_seq, never from zero');
+  assert.deepEqual(reports, ['Runtime input paused: Runtime is shutting down; reconnecting from the last cursor.']);
+});
+
 test('the CLI follows real Runtime SSE envelopes through disconnect and cursor recovery, recording no prompt content', { timeout: 20_000 }, async t => {
   let sequence = 0, connections = 0, stream, pulse;
   const requests = [], responses = new Set();

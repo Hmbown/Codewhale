@@ -220,8 +220,94 @@ pub struct RuntimeApiState {
     /// The computer this Engine runs on: display socket, human control
     /// lease, device client tokens and `computer.*` events (§3.3).
     computer: computer_display::ComputerState,
+    /// Fires when the server stops on purpose, so open thread event streams
+    /// end with a typed `stream.end` rather than a bare EOF.
+    shutdown: RuntimeServerShutdown,
     #[cfg(test)]
     compat_stream_test_hook: Option<tokio::sync::mpsc::UnboundedSender<CompatStreamTestPoint>>,
+}
+
+/// How the Runtime API server stops on purpose.
+///
+/// `requested` fires once the server decides to stop: the listener stops
+/// accepting, idle connections close, and every open thread event stream sends
+/// `stream.end {reason: "runtime_shutdown"}` and finishes. `stopped` fires once
+/// `serve_runtime_api` has drained every connection.
+#[derive(Clone, Default)]
+pub(crate) struct RuntimeServerShutdown {
+    requested: CancellationToken,
+    stopped: CancellationToken,
+}
+
+impl RuntimeServerShutdown {
+    /// Ask the server to stop and wait at most `deadline` for it to drain.
+    /// Returns whether it drained in time; a long-lived response that does not
+    /// watch `requested` (a turn or Fleet stream) can hold it to the deadline.
+    pub(crate) async fn drain(&self, deadline: Duration) -> bool {
+        self.requested.cancel();
+        tokio::time::timeout(deadline, self.stopped.cancelled())
+            .await
+            .is_ok()
+    }
+}
+
+/// Serve `app` until `shutdown` is requested, then drain gracefully so the
+/// final frames of open streams reach their clients before connections close.
+async fn serve_runtime_api(
+    listener: TcpListener,
+    app: Router,
+    shutdown: RuntimeServerShutdown,
+) -> std::io::Result<()> {
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown.requested.clone().cancelled_owned())
+    .await;
+    shutdown.stopped.cancel();
+    result
+}
+
+/// The serving Runtime API, for the process signal handler (`lib.rs`), which
+/// exits the process on a terminating signal. Without this it would cut every
+/// open stream mid-connection, indistinguishable from a network drop.
+static SIGNAL_SHUTDOWN: std::sync::Mutex<Option<RuntimeServerShutdown>> =
+    std::sync::Mutex::new(None);
+
+/// How long a terminating signal waits for open streams to say goodbye. A
+/// second signal skips the wait.
+const SIGNAL_SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
+
+/// Clears `SIGNAL_SHUTDOWN` when the server that registered it returns.
+struct SignalShutdownRegistration;
+
+impl SignalShutdownRegistration {
+    fn register(shutdown: &RuntimeServerShutdown) -> Self {
+        if let Ok(mut slot) = SIGNAL_SHUTDOWN.lock() {
+            *slot = Some(shutdown.clone());
+        }
+        Self
+    }
+}
+
+impl Drop for SignalShutdownRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = SIGNAL_SHUTDOWN.lock() {
+            *slot = None;
+        }
+    }
+}
+
+/// Called by the process signal handler before it exits: stop the serving
+/// Runtime API (if any) and give its open streams a bounded window to send
+/// their final `stream.end` frame.
+pub(crate) async fn drain_for_signal_exit() {
+    let shutdown = SIGNAL_SHUTDOWN.lock().ok().and_then(|slot| slot.clone());
+    if let Some(shutdown) = shutdown
+        && !shutdown.drain(SIGNAL_SHUTDOWN_DRAIN).await
+    {
+        tracing::warn!("Runtime API did not drain within the signal shutdown window");
+    }
 }
 
 #[cfg(test)]
@@ -1024,6 +1110,7 @@ pub async fn run_http_server(
     let skill_state = SkillStateStore::load_default()
         .context("load persistent Skill activation state for Runtime API")?;
     let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers);
+    let shutdown = RuntimeServerShutdown::default();
     let state = RuntimeApiState {
         config: Arc::new(parking_lot::RwLock::new(config.clone())),
         workspace,
@@ -1048,6 +1135,7 @@ pub async fn run_http_server(
         mcp_pool: Arc::new(Mutex::new(None)),
         lsp_manager: Arc::new(std::sync::OnceLock::new()),
         computer: computer_display::ComputerState::from_env(),
+        shutdown: shutdown.clone(),
         #[cfg(test)]
         compat_stream_test_hook: None,
     };
@@ -1108,12 +1196,11 @@ pub async fn run_http_server(
             auth = auth_enabled,
         );
     }
-    let serve_result = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .map_err(|e| anyhow!("Runtime API server error: {e}"));
+    let signal_registration = SignalShutdownRegistration::register(&shutdown);
+    let serve_result = serve_runtime_api(listener, app, shutdown)
+        .await
+        .map_err(|e| anyhow!("Runtime API server error: {e}"));
+    drop(signal_registration);
     scheduler_cancel.cancel();
     scheduler_handle.abort();
     task_manager.shutdown_and_wait().await?;
@@ -6708,6 +6795,7 @@ async fn stream_thread_events(
         replay.batches,
         live,
         query.progress,
+        state.shutdown.requested.clone(),
     );
 
     let mut response = Sse::new(stream)
@@ -6717,6 +6805,12 @@ async fn stream_thread_events(
                 .text("keepalive"),
         )
         .into_response();
+    // Every server-initiated end of this stream is a `stream.end` frame. The
+    // header lets a client tell that EOF without one is transport loss, which
+    // an older Runtime cannot promise.
+    response
+        .headers_mut()
+        .insert("x-codewhale-stream-end", HeaderValue::from_static("1"));
     if query.progress {
         response
             .headers_mut()
@@ -6725,53 +6819,156 @@ async fn stream_thread_events(
     Ok(response)
 }
 
+/// Opt-in transport frame at the existing journal cursor. It carries the same
+/// envelope identity (`schema_version`, `event`, `kind`, `thread_id`) as the
+/// journal and `stream.end`, but never a journal `seq` of its own.
 fn thread_stream_progress(thread_id: &str, seq: u64, live: bool) -> SseEvent {
     sse_json(
         "stream.progress",
         json!({
-            "event": "stream.progress", "thread_id": thread_id, "seq": seq,
+            "schema_version": RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,
+            "event": "stream.progress", "kind": "stream.progress",
+            "thread_id": thread_id, "seq": seq,
             "state": if live { "live" } else { "replaying" },
         }),
     )
+}
+
+/// Why the server ended a thread event stream it had already opened. Every
+/// server-initiated end is one of these, sent as the final `stream.end` frame;
+/// an EOF without that frame is the transport or the process dying, never the
+/// server choosing to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadStreamEnd {
+    /// The durable history read that feeds the opening replay failed.
+    ReplayFailed,
+    /// The durable re-read after broadcast lag could not be opened or failed.
+    CatchUpFailed,
+    /// The Runtime API server is stopping (a terminating signal).
+    RuntimeShutdown,
+}
+
+impl ThreadStreamEnd {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::ReplayFailed => "replay_failed",
+            Self::CatchUpFailed => "catch_up_failed",
+            Self::RuntimeShutdown => "runtime_shutdown",
+        }
+    }
+
+    /// Every current end is resumable from `last_seq`. The flag exists so the
+    /// client rule keys on it rather than on the reason list: a future
+    /// non-resumable end stops clients without a client change.
+    const fn retryable(self) -> bool {
+        match self {
+            Self::ReplayFailed | Self::CatchUpFailed | Self::RuntimeShutdown => true,
+        }
+    }
+}
+
+/// The final frame of a server-ended thread stream. It has no `seq` and no SSE
+/// `id:` because it is not a journal event: seq-keyed consumers skip it, and a
+/// browser `EventSource` keeps `Last-Event-ID` on the last real event.
+/// `last_seq` is exactly the `since_seq` that resumes without loss or repeats.
+/// The underlying error stays in the server log; it can carry store paths.
+fn thread_stream_end(thread_id: &str, end: ThreadStreamEnd, last_seq: u64) -> SseEvent {
+    sse_json(
+        "stream.end",
+        json!({
+            "schema_version": RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,
+            "event": "stream.end", "kind": "stream.end",
+            "thread_id": thread_id, "reason": end.reason(),
+            "last_seq": last_seq, "retryable": end.retryable(),
+        }),
+    )
+}
+
+/// The journal frame for `event` on this thread's stream, advancing the
+/// connection cursor. `None` for another thread's event or one already sent.
+fn thread_journal_frame(
+    thread_id: &str,
+    last_seq: &mut u64,
+    event: crate::runtime_threads::RuntimeEventRecord,
+) -> Option<SseEvent> {
+    if event.thread_id != thread_id || event.seq <= *last_seq {
+        return None;
+    }
+    let previous_seq = std::mem::replace(last_seq, event.seq);
+    let event_name = event.event.clone();
+    Some(
+        sse_json(
+            &event_name,
+            runtime_event_payload_with_previous(event, previous_seq),
+        )
+        .id(last_seq.to_string()),
+    )
+}
+
+type ThreadReplayBatches = tokio::sync::mpsc::Receiver<
+    std::result::Result<Vec<crate::runtime_threads::RuntimeEventRecord>, String>,
+>;
+
+enum ThreadReplayStep {
+    Events(Vec<crate::runtime_threads::RuntimeEventRecord>),
+    Complete,
+    Failed(String),
+    Shutdown,
+}
+
+/// The next durable-history batch, unless the server starts stopping first.
+async fn next_thread_replay_step(
+    shutdown: &CancellationToken,
+    batches: &mut ThreadReplayBatches,
+) -> ThreadReplayStep {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => ThreadReplayStep::Shutdown,
+        batch = batches.recv() => match batch {
+            None => ThreadReplayStep::Complete,
+            Some(Ok(events)) => ThreadReplayStep::Events(events),
+            Some(Err(error)) => ThreadReplayStep::Failed(error),
+        },
+    }
 }
 
 fn replay_live_thread_events(
     runtime_threads: SharedRuntimeThreadManager,
     thread_id: String,
     mut last_seq: u64,
-    mut backlog: tokio::sync::mpsc::Receiver<
-        std::result::Result<Vec<crate::runtime_threads::RuntimeEventRecord>, String>,
-    >,
+    mut backlog: ThreadReplayBatches,
     mut live: tokio::sync::broadcast::Receiver<crate::runtime_threads::RuntimeEventRecord>,
     progress: bool,
+    shutdown: CancellationToken,
 ) -> impl futures_util::Stream<Item = Result<SseEvent, Infallible>> {
+    // Every exit below is a `stream.end` followed by `return`; the live loop
+    // never breaks. An EOF this stream produces is therefore never silent.
     stream! {
         if progress { yield Ok(thread_stream_progress(&thread_id, last_seq, false)); }
-        while let Some(batch) = backlog.recv().await {
-            let events = match batch {
-                Ok(events) => events,
-                Err(error) => {
+        loop {
+            match next_thread_replay_step(&shutdown, &mut backlog).await {
+                ThreadReplayStep::Events(events) => {
+                    for event in events {
+                        if let Some(frame) = thread_journal_frame(&thread_id, &mut last_seq, event) {
+                            yield Ok(frame);
+                        }
+                    }
+                }
+                ThreadReplayStep::Complete => break,
+                ThreadReplayStep::Failed(error) => {
                     tracing::warn!(
                         thread_id = %thread_id,
                         last_seq,
                         %error,
                         "Failed to replay Runtime web event stream from durable history"
                     );
+                    yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::ReplayFailed, last_seq));
                     return;
                 }
-            };
-            for event in events {
-                if event.thread_id != thread_id || event.seq <= last_seq {
-                    continue;
+                ThreadReplayStep::Shutdown => {
+                    yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::RuntimeShutdown, last_seq));
+                    return;
                 }
-                let previous_seq = last_seq;
-                last_seq = event.seq;
-                let event_name = event.event.clone();
-                yield Ok(sse_json(
-                    &event_name,
-                    runtime_event_payload_with_previous(event, previous_seq),
-                )
-                .id(last_seq.to_string()));
             }
         }
 
@@ -6780,7 +6977,11 @@ fn replay_live_thread_events(
         // before declaring the observation current. These opt-in frames carry
         // transport progress, never new journal events or sequence numbers.
         let mut replaying = progress;
-        'live: loop {
+        loop {
+            if shutdown.is_cancelled() {
+                yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::RuntimeShutdown, last_seq));
+                return;
+            }
             let next = if replaying {
                 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
                 match live.try_recv() {
@@ -6793,20 +6994,21 @@ fn replay_live_thread_events(
                     Err(TryRecvError::Lagged(skipped)) => Err(RecvError::Lagged(skipped)),
                     Err(TryRecvError::Closed) => Err(RecvError::Closed),
                 }
-            } else { live.recv().await };
+            } else {
+                let received = tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => None,
+                    received = live.recv() => Some(received),
+                };
+                // Shutdown is answered by the check at the top of the loop.
+                let Some(received) = received else { continue };
+                received
+            };
             match next {
                 Ok(event) => {
-                    if event.thread_id != thread_id || event.seq <= last_seq {
-                        continue;
+                    if let Some(frame) = thread_journal_frame(&thread_id, &mut last_seq, event) {
+                        yield Ok(frame);
                     }
-                    let previous_seq = last_seq;
-                    last_seq = event.seq;
-                    let event_name = event.event.clone();
-                    yield Ok(sse_json(
-                        &event_name,
-                        runtime_event_payload_with_previous(event, previous_seq),
-                    )
-                    .id(last_seq.to_string()));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     if progress {
@@ -6829,13 +7031,21 @@ fn replay_live_thread_events(
                                 %error,
                                 "Failed to recover lagged Runtime web event stream from durable history"
                             );
-                            break 'live;
+                            yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::CatchUpFailed, last_seq));
+                            return;
                         }
                     };
-                    while let Some(batch) = recovered.recv().await {
-                        let events = match batch {
-                            Ok(events) => events,
-                            Err(error) => {
+                    loop {
+                        match next_thread_replay_step(&shutdown, &mut recovered).await {
+                            ThreadReplayStep::Events(events) => {
+                                for event in events {
+                                    if let Some(frame) = thread_journal_frame(&thread_id, &mut last_seq, event) {
+                                        yield Ok(frame);
+                                    }
+                                }
+                            }
+                            ThreadReplayStep::Complete => break,
+                            ThreadReplayStep::Failed(error) => {
                                 tracing::warn!(
                                     thread_id = %thread_id,
                                     last_seq,
@@ -6843,25 +7053,22 @@ fn replay_live_thread_events(
                                     %error,
                                     "Failed to recover lagged Runtime web event stream from durable history"
                                 );
-                                break 'live;
+                                yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::CatchUpFailed, last_seq));
+                                return;
                             }
-                        };
-                        for event in events {
-                            if event.thread_id != thread_id || event.seq <= last_seq {
-                                continue;
-                            }
-                            let previous_seq = last_seq;
-                            last_seq = event.seq;
-                            let event_name = event.event.clone();
-                            yield Ok(sse_json(
-                                &event_name,
-                                runtime_event_payload_with_previous(event, previous_seq),
-                            )
-                            .id(last_seq.to_string()));
+                            // Answered by the check at the top of the live loop.
+                            ThreadReplayStep::Shutdown => break,
                         }
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                // The sender is owned by the `RuntimeThreadManager` this stream
+                // holds an `Arc` of, so it cannot close while the stream runs.
+                // If that ever changes, the live source is gone only because
+                // the Runtime is: say so rather than end silently.
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::RuntimeShutdown, last_seq));
+                    return;
+                }
             }
         }
     }
@@ -10331,6 +10538,7 @@ base_url = "http://127.0.0.1:9/v1"
             mcp_pool: Arc::new(Mutex::new(None)),
             lsp_manager: Arc::new(std::sync::OnceLock::new()),
             computer: computer_display::ComputerState::from_env(),
+            shutdown: RuntimeServerShutdown::default(),
             compat_stream_test_hook: None,
         };
         let router = build_router(state.clone());

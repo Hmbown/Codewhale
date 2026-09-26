@@ -1803,7 +1803,9 @@ pub(crate) struct RuntimeEventReplay {
     pub(crate) base_seq: u64,
     /// Filesystem parsing happens on the blocking pool and publishes bounded
     /// chunks through this small channel, applying backpressure instead of
-    /// allocating an unbounded backlog on a Tokio worker.
+    /// allocating an unbounded backlog on a Tokio worker. A closed channel
+    /// means history is complete; every failure, a worker panic included,
+    /// arrives as an `Err` batch first.
     pub(crate) batches: mpsc::Receiver<std::result::Result<Vec<RuntimeEventRecord>, String>>,
 }
 
@@ -3077,19 +3079,44 @@ impl RuntimeThreadStore {
         batch_tx: mpsc::Sender<std::result::Result<Vec<RuntimeEventRecord>, String>>,
     ) {
         let mut base_tx = Some(base_tx);
-        let result = match tail_limit {
+        // A panic here must not look like the end of history. Unwound, it
+        // would drop `batch_tx` with no `Err`, the stream would read the
+        // closed channel as "history complete", go live, and silently skip
+        // the rest — with no `previous_seq` gap any client could detect.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match tail_limit {
             Some(limit) => {
                 self.publish_tail_event_replay(thread_id, since_seq, limit, &mut base_tx, &batch_tx)
             }
             None => self.publish_full_event_replay(thread_id, since_seq, &mut base_tx, &batch_tx),
-        };
-        if let Err(error) = result {
-            let message = format!("{error:#}");
-            if let Some(base_tx) = base_tx.take() {
-                let _ = base_tx.send(Err(message));
-            } else {
-                let _ = batch_tx.blocking_send(Err(message));
+        }));
+        Self::route_replay_outcome(outcome, &mut base_tx, &batch_tx);
+    }
+
+    /// Deliver a replay worker's failure, including a panic, to whoever is
+    /// waiting: the request before the base cursor was sent (HTTP 500), the
+    /// open stream after it (`stream.end`). Success needs nothing: dropping
+    /// `batch_tx` is how the stream learns history is complete.
+    fn route_replay_outcome(
+        outcome: std::thread::Result<Result<()>>,
+        base_tx: &mut Option<oneshot::Sender<std::result::Result<u64, String>>>,
+        batch_tx: &mpsc::Sender<std::result::Result<Vec<RuntimeEventRecord>, String>>,
+    ) {
+        let message = match outcome {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => format!("{error:#}"),
+            Err(panic) => {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|detail| (*detail).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                format!("Runtime event replay worker panicked: {detail}")
             }
+        };
+        if let Some(base_tx) = base_tx.take() {
+            let _ = base_tx.send(Err(message));
+        } else {
+            let _ = batch_tx.blocking_send(Err(message));
         }
     }
 
@@ -7835,6 +7862,11 @@ impl RuntimeThreadManager {
     #[cfg(test)]
     pub(crate) fn set_snapshot_test_hook(&self, hook: mpsc::UnboundedSender<SnapshotTestPoint>) {
         *self.snapshot_test_hook.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn events_path_for_test(&self, thread_id: &str) -> Result<PathBuf> {
+        self.store.events_path(thread_id)
     }
 
     #[cfg(test)]
