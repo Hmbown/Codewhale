@@ -214,9 +214,9 @@ pub struct ExtensionItem {
     /// Reversible on/off toggle for the row (`e`): enable or disable a
     /// plugin or MCP server without leaving the panel.
     pub toggle: Option<ExtensionAction>,
-    /// Destructive removal for the row (`d` / Delete / right-click, armed and
-    /// confirmed in two steps). Only MCP servers offer it today; plugins keep
-    /// their reviewed uninstall flow.
+    /// Destructive removal for the row (`d` / Delete, or the row's
+    /// right-click menu; confirmed in two steps either way). Only MCP servers
+    /// offer it today; plugins keep their reviewed uninstall flow.
     pub remove: Option<ExtensionAction>,
 }
 
@@ -1549,8 +1549,8 @@ pub struct ExtensionsView {
     /// Last time `tick` asked the host for a fresh snapshot. Bounds the poll
     /// so a per-frame tick cannot turn into a rebuild every frame.
     last_poll: std::time::Instant,
-    /// Row id whose removal is armed. A second `d` / Delete / right-click on
-    /// the same row confirms; any navigation or Esc disarms.
+    /// Row id whose removal is armed. A second `d` / Delete on the same row
+    /// confirms; any navigation or Esc disarms.
     pending_remove: Option<String>,
 }
 
@@ -1681,7 +1681,7 @@ impl ExtensionsView {
         }
     }
 
-    /// `d` / Delete / right-click: arm removal on the first gesture, run the
+    /// `d` / Delete: arm removal on the first gesture, run the
     /// row's remove command on the second. Rows without a remove command
     /// ignore the gesture.
     fn remove_selected(&mut self) -> ViewAction {
@@ -1703,6 +1703,93 @@ impl ExtensionsView {
         }
         self.pending_remove = Some(id);
         ViewAction::None
+    }
+
+    /// The selected row's context menu: its own action, details, its on/off
+    /// switch and — last, behind an in-menu confirm — its removal. Only
+    /// what the row actually offers is listed.
+    fn row_menu(&self, column: u16, row: u16) -> Option<ViewEvent> {
+        use crate::tui::context_menu::ContextMenuEntry;
+        use crate::tui::views::{ContextMenuAction, ExtensionMenuVerb};
+
+        let item = self.selected_item()?;
+        let entry = |label: String, verb: ExtensionMenuVerb| {
+            ContextMenuEntry::new(
+                label,
+                String::new(),
+                ContextMenuAction::Extension {
+                    item_id: item.id.clone(),
+                    verb,
+                },
+            )
+        };
+        let details = tr(self.locale, MessageId::CtxMenuOpenDetails).into_owned();
+        let mut entries = Vec::new();
+        match &item.action {
+            Some(ExtensionAction::Command { label, .. }) => {
+                entries.push(entry(sentence_case(label), ExtensionMenuVerb::Activate).primary());
+                entries.push(entry(details, ExtensionMenuVerb::Details));
+            }
+            _ => entries.push(entry(details, ExtensionMenuVerb::Details).primary()),
+        }
+        if let Some(ExtensionAction::Command { label, .. }) = &item.toggle {
+            entries.push(entry(sentence_case(label), ExtensionMenuVerb::Toggle));
+        }
+        if let Some(ExtensionAction::Command { label, .. }) = &item.remove {
+            entries.push(
+                entry(
+                    format!("{}…", sentence_case(label)),
+                    ExtensionMenuVerb::Remove,
+                )
+                .confirm(tr(self.locale, MessageId::CtxMenuConfirmArmed))
+                .section_start(),
+            );
+        }
+        Some(ViewEvent::OpenContextMenu {
+            title: item.label.clone(),
+            entries,
+            column,
+            row,
+        })
+    }
+
+    /// Run a row-menu verb on the row with `item_id`. The menu closed before
+    /// this runs and a poll may have rebuilt the list meanwhile, so the row
+    /// is found again by id rather than by index. `None` when it is gone.
+    pub(crate) fn run_menu_verb(
+        &mut self,
+        item_id: &str,
+        verb: crate::tui::views::ExtensionMenuVerb,
+    ) -> Option<ViewAction> {
+        use crate::tui::views::ExtensionMenuVerb;
+
+        let index = self
+            .visible_entries()
+            .iter()
+            .position(|entry| matches!(entry, VisibleEntry::Item(_, item) if item.id == item_id))?;
+        self.selected[self.active_tab.index()] = index;
+        self.pending_remove = None;
+        Some(match verb {
+            ExtensionMenuVerb::Activate => self.activate_selected(),
+            ExtensionMenuVerb::Toggle => self.toggle_selected(),
+            ExtensionMenuVerb::Details => {
+                let item = self.selected_item()?;
+                ViewAction::Emit(ViewEvent::OpenTextPager {
+                    title: item.label.clone(),
+                    content: format!("{}\n\n{}\n\n{}", item.state, item.description, item.detail),
+                })
+            }
+            // Confirmed in the menu; the command's own result is the receipt.
+            ExtensionMenuVerb::Remove => match &self.selected_item()?.remove {
+                Some(ExtensionAction::Command { command, .. }) => {
+                    ViewAction::Emit(ViewEvent::ExecutePanelCommand {
+                        command: command.clone(),
+                        pager_title: None,
+                    })
+                }
+                _ => ViewAction::None,
+            },
+        })
     }
 
     fn activate_selected(&mut self) -> ViewAction {
@@ -1965,9 +2052,11 @@ impl ModalView for ExtensionsView {
                 self.move_selection(1);
                 return ViewAction::None;
             }
-            // Right-click on a row selects it and arms (then confirms) its
-            // removal, the same two-step gesture as `d`.
+            // Right-click on a row selects it and opens that row's menu. It
+            // used to arm (then run) the row's removal, so two right-clicks
+            // deleted an extension with no menu ever shown.
             MouseEventKind::Down(MouseButton::Right) => {
+                self.pending_remove = None;
                 let row = self
                     .hits
                     .borrow()
@@ -1976,15 +2065,13 @@ impl ModalView for ExtensionsView {
                     .find(|(rect, _)| rect.contains((mouse.column, mouse.row).into()))
                     .map(|(_, row)| *row);
                 let Some(row) = row else {
-                    self.pending_remove = None;
                     return ViewAction::None;
                 };
                 self.focus = ExtensionsFocus::List;
-                if self.selected[self.active_tab.index()] != row {
-                    self.pending_remove = None;
-                    self.selected[self.active_tab.index()] = row;
-                }
-                return self.remove_selected();
+                self.selected[self.active_tab.index()] = row;
+                return self
+                    .row_menu(mouse.column, mouse.row)
+                    .map_or(ViewAction::None, ViewAction::Emit);
             }
             MouseEventKind::Down(MouseButton::Left) => {}
             _ => return ViewAction::None,
@@ -2318,6 +2405,16 @@ impl ModalView for ExtensionsView {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+}
+
+/// Row action labels are lower-case verbs ("remove", "enable") written for
+/// the footer; a menu row starts with a capital.
+fn sentence_case(label: &str) -> String {
+    let mut chars = label.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -2809,6 +2906,75 @@ mod tests {
         // Land on the item, not its group heading.
         view.selected[ExtensionsTab::Plugins.index()] = 1;
         view
+    }
+
+    /// T10: right-click used to arm the row's removal and a second one ran
+    /// it, with no menu ever shown. It now opens the row's menu; removal is
+    /// its last entry, behind the menu's own confirm, and only the confirmed
+    /// entry emits the remove command.
+    #[test]
+    fn right_click_opens_a_row_menu_instead_of_removing() {
+        let mut view = view_on_item(ExtensionAction::Command {
+            label: "enable".into(),
+            command: "/mcp enable demo".into(),
+            disposition: RowActionDisposition::InPlace,
+        });
+        {
+            let item = &mut view.snapshot.tabs[ExtensionsTab::Plugins.index()].groups[0].items[0];
+            item.toggle = Some(ExtensionAction::Command {
+                label: "disable".into(),
+                command: "/mcp disable demo".into(),
+                disposition: RowActionDisposition::InPlace,
+            });
+            item.remove = Some(ExtensionAction::Command {
+                label: "remove".into(),
+                command: "/mcp remove demo".into(),
+                disposition: RowActionDisposition::InPlace,
+            });
+        }
+        let area = Rect::new(0, 0, 100, 30);
+        view.render(area, &mut Buffer::empty(area));
+        let hit = view
+            .hits
+            .borrow()
+            .rows
+            .iter()
+            .find(|(_, row)| *row == 1)
+            .map(|(rect, _)| *rect)
+            .expect("the item row is painted");
+        let right_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: hit.x + 1,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        for _ in 0..2 {
+            let ViewAction::Emit(ViewEvent::OpenContextMenu { title, entries, .. }) =
+                view.handle_mouse(right_click)
+            else {
+                panic!("right-click must open the row menu");
+            };
+            assert_eq!(title, "row");
+            let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
+            assert_eq!(labels, ["Enable", "Open details", "Disable", "Remove…"]);
+            assert!(entries[0].primary);
+            let remove = entries.last().unwrap();
+            assert!(remove.confirm_label.is_some(), "removal is confirmed");
+            assert!(view.pending_remove.is_none(), "right-click arms nothing");
+        }
+
+        match view.run_menu_verb("row", crate::tui::views::ExtensionMenuVerb::Remove) {
+            Some(ViewAction::Emit(ViewEvent::ExecutePanelCommand { command, .. })) => {
+                assert_eq!(command, "/mcp remove demo");
+            }
+            other => panic!("the confirmed entry removes the row, got {other:?}"),
+        }
+        assert!(
+            view.run_menu_verb("gone", crate::tui::views::ExtensionMenuVerb::Remove)
+                .is_none(),
+            "a row that left the list is reported, not guessed at"
+        );
     }
 
     /// The defect: every row closed the panel and dropped its command into

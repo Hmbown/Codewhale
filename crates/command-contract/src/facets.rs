@@ -132,23 +132,6 @@ pub enum ProjectGoalStatus {
     Blocked,
 }
 
-/// Portable session-share projection (FEAT-021 D1).
-///
-/// Carries only the emptiness/length and the model/mode labels the live
-/// `/share` handler consumes. The session history itself, exporter I/O, and
-/// all `App` state stay host-side.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectShareProjection {
-    /// Whether the session history is empty (drives the empty-share error).
-    pub history_is_empty: bool,
-    /// Session history length used in the export message and action.
-    pub history_len: usize,
-    /// Current model label.
-    pub model: String,
-    /// Current operating-mode label.
-    pub mode_label: String,
-}
-
 /// Portable goal projection (FEAT-021 D1).
 ///
 /// Carries the visible goal state, the effective pending-control view, and the
@@ -203,8 +186,6 @@ pub trait CommandProjectContext {
     fn lsp_enabled(&self) -> bool;
     /// `/lsp` set: enable or disable LSP diagnostics.
     fn lsp_set(&mut self, enabled: bool) -> Result<(), String>;
-    /// `/share` projection: session emptiness, length, model, and mode label.
-    fn share_projection(&self) -> ProjectShareProjection;
     /// `/goal` projection: visible and effective goal state.
     fn goal_state(&self) -> ProjectGoalState;
 }

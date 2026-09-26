@@ -271,7 +271,7 @@ fn copy_to_clipboard(
 /// itself was already copied once at the facet boundary (F3); cloning the
 /// payloads again here would be an avoidable extra copy of every tool input and
 /// structured result.
-fn render_conversation(projection: ConversationExportProjection) -> String {
+pub(in crate::commands) fn render_conversation(projection: ConversationExportProjection) -> String {
     let ConversationExportProjection {
         metadata,
         transcript,

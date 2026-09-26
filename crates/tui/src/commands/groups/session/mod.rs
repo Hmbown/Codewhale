@@ -3,7 +3,7 @@
 
 mod branch;
 mod compact;
-mod export;
+pub(in crate::commands) mod export;
 mod fork;
 mod load;
 mod new;

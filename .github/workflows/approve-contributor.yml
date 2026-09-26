@@ -4,18 +4,28 @@ on:
   issue_comment:
     types: [created]
 
-permissions:
-  contents: write
-  issues: write
-  pull-requests: write
-
-concurrency:
-  group: contribution-gate-approval
-  cancel-in-progress: false
+permissions: {}
 
 jobs:
   approve:
+    # Cheap pre-filter before any token is minted: this workflow fires on
+    # every issue comment, but only a maintainer's lgtm/lgtmi command does
+    # anything. Expression string comparisons are case-insensitive; the
+    # script below still performs the exact trimmed-command match.
+    if: >-
+      contains(github.event.comment.body, 'lgtm')
+      && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    # Job-level so skipped runs never enter the group: a workflow-level group
+    # let any unrelated comment queue and cancel a pending approval run.
+    concurrency:
+      group: contribution-gate-approval
+      cancel-in-progress: false
     steps:
       - name: Open allowlist update PR
         uses: actions/github-script@v9

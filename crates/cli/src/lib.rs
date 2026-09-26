@@ -320,7 +320,7 @@ Forwarded serve options:
       --web                 Start the embedded loopback-only browser client
       --qr                  Show a QR code for the mobile URL (requires --mobile)
       --acp                 Start ACP server over stdio for editor clients
-      --host <HOST>         Bind host (default 127.0.0.1; --mobile defaults to 0.0.0.0)
+      --host <HOST>         Bind host (default 127.0.0.1; --mobile is loopback-only)
       --port <PORT>         Bind port [default: 7878]
       --workers <WORKERS>   Background task worker count (1-8)
       --cors-origin <URL>   Additional CORS origin to allow (repeatable)
@@ -362,7 +362,7 @@ New integrations should prefer `codewhale app-server`.")]
     #[command(after_help = "\
 Transports:
   codewhale app-server --http              Full HTTP/SSE runtime API (/v1/*) on 127.0.0.1:7878
-  codewhale app-server --mobile            Runtime API + phone control page (binds 0.0.0.0)
+  codewhale app-server --mobile            Runtime API + phone control page (127.0.0.1 only)
   codewhale app-server --stdio             JSON-RPC control transport over stdio (no listener)
   codewhale app-server                     Legacy in-process app-server HTTP on 127.0.0.1:8787
 
@@ -1805,8 +1805,8 @@ struct AppServerArgs {
     /// Show a QR code for the mobile URL in the terminal (requires --mobile).
     #[arg(long, requires = "mobile")]
     qr: bool,
-    /// Bind host. Defaults to 127.0.0.1; with --mobile and no host, binds
-    /// 0.0.0.0 so LAN devices can reach the mobile page.
+    /// Bind host. Defaults to 127.0.0.1. --mobile is loopback-only: it does
+    /// not widen the bind, and a non-loopback mobile bind is rejected.
     #[arg(long)]
     host: Option<String>,
     /// Bind port. Defaults to 7878 for --http/--mobile (the runtime API) and
@@ -7160,7 +7160,7 @@ verbosity = "project-imported"
         };
         let argv = app_server_serve_passthrough(&args);
         let as_str: Vec<&str> = argv.iter().map(String::as_str).collect();
-        // No host/port forwarded → serve applies its own --mobile 0.0.0.0 default.
+        // No host/port forwarded → serve applies its own loopback default.
         // No auth token is injected from the environment into child argv.
         assert_eq!(as_str, vec!["serve", "--mobile", "--qr"]);
     }

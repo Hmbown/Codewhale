@@ -106,6 +106,9 @@ pub fn apply_model_patches(
                 if let Some(row) = rows.get_mut(&key) {
                     // A capability patch must not refresh or relabel inherited prices.
                     let inherited_price_source = row.pricing_source().clone();
+                    // Patches never restate modalities, so their authority
+                    // stays with the layer that did.
+                    row.modalities_source = Some(row.modalities_source().clone());
                     patch_fields(row, patch);
                     row.cost_source = Some(if patch.pricing.is_some() {
                         source.clone()

@@ -157,7 +157,7 @@ use super::slash_menu::{
     apply_slash_menu_selection, partial_inline_skill_mention_at_cursor,
     try_autocomplete_slash_command, visible_slash_menu_entries,
 };
-use super::views::{ConfigView, ContextMenuAction, HelpView, ModalKind, ViewAction, ViewEvent};
+use super::views::{ConfigView, HelpView, ModalKind, ViewAction, ViewEvent};
 use super::widgets::pending_input_preview::{ContextPreviewItem, PendingInputPreview};
 use super::widgets::{ChatWidget, ComposerWidget, Renderable};
 

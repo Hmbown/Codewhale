@@ -64,6 +64,7 @@ Editing the message you're about to send.
 | `Cmd-V` / `Ctrl-Shift-V`    | Terminal-local paste (arrives as bracketed paste when supported) |
 | `Ctrl-V`                    | Direct graphical clipboard paste; rich composer content becomes Markdown |
 | `Ctrl-Y`                    | Yank (paste) from kill buffer                           |
+| `Ctrl-X`                    | Cut the selection. The text is deleted only when a native clipboard confirmed the copy; over SSH or tmux, where only the terminal clipboard (OSC 52) takes it and never confirms, the text is copied and kept |
 | `↑` / `↓`                   | Cycle composer history (also selects popup/attachment items) |
 | `Shift-↑` / `Shift-↓`       | Browse conversation history                              |
 | `Ctrl-P` / `Ctrl-N`         | Navigate slash-command menu entries; `Ctrl-P` opens the file picker when the menu is empty |
@@ -206,7 +207,7 @@ The mouse is a first-class input. Every row here is wired in
 | Wheel up / down      | Scroll the transcript; over the composer, move the cursor a line at a time |
 | Click                | Activate the row, chip, or tool block under the pointer |
 | Drag                 | Select transcript text, or drag the scrollbar       |
-| Right click          | Open context actions for paste, selection, message details, context, and help |
+| Right click          | Act on what is under the pointer: copy, paste, open details or a `file:line` in your editor, focus or stop an agent. Letters and digits shown in the menu run their row. A stop is confirmed in place: the first Enter or click arms it, and Enter or a click after the double-click window runs it. A letter only arms it, and the second click of a double-click is ignored |
 
 Hover feedback follows the same rule: anything that responds to a click
 highlights under the pointer. A row that highlights but does nothing, or acts

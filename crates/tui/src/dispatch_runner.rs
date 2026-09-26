@@ -881,6 +881,14 @@ mod tests {
     };
     use std::sync::Arc;
 
+    #[test]
+    fn summary_line_redacts_machine_tokens() {
+        let token = "cwc_key_0123456789abcdef01234567_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let summary = summary_line(&format!("done with {token}"));
+        assert!(!summary.contains("AAAAAAAA"));
+        assert!(summary.contains("[redacted]"));
+    }
+
     fn fixture_patch() -> PatchReceipt {
         PatchReceipt {
             base_branch: "main".to_string(),

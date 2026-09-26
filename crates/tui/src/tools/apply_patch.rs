@@ -913,7 +913,7 @@ fn parse_hunk_header<'a, I>(
     lines: &mut std::iter::Peekable<I>,
 ) -> Result<Hunk, ToolError>
 where
-    I: Iterator<Item = &'a str>,
+    I: Iterator<Item = &'a str> + Clone,
 {
     // Parse @@ -old_start,old_count +new_start,new_count @@
     let parts: Vec<&str> = header.split_whitespace().collect();
@@ -932,22 +932,42 @@ where
     // Parse hunk lines
     let mut hunk_lines = Vec::new();
     let expected_lines = old_count.max(new_count) + old_count.min(new_count);
+    let mut old_remaining = old_count;
+    let mut new_remaining = new_count;
 
     for _ in 0..expected_lines * 2 {
+        // `--- ` opens the next file section once this hunk's counts are
+        // spent, or when `+++ ` follows (a header after a miscounted hunk).
+        // Otherwise it is a removed line whose text starts `-- `. Reading it
+        // as a removal unconditionally glued a second section for the same
+        // file onto the first hunk (B7).
+        let next_file_header = {
+            let mut ahead = lines.clone();
+            ahead.next().is_some_and(|line| line.starts_with("--- "))
+                && ((old_remaining == 0 && new_remaining == 0)
+                    || ahead.next().is_some_and(|line| line.starts_with("+++ ")))
+        };
+        if next_file_header {
+            break;
+        }
         // Allow for more lines than expected
         match lines.peek() {
             Some(line) if line.starts_with("@@") => break,
             Some(line) if line.starts_with('-') => {
                 hunk_lines.push(HunkLine::Remove(line[1..].to_string()));
+                old_remaining = old_remaining.saturating_sub(1);
                 lines.next();
             }
             Some(line) if line.starts_with('+') => {
                 hunk_lines.push(HunkLine::Add(line[1..].to_string()));
+                new_remaining = new_remaining.saturating_sub(1);
                 lines.next();
             }
             Some(line) if line.starts_with(' ') || line.is_empty() => {
                 let content = if line.is_empty() { "" } else { &line[1..] };
                 hunk_lines.push(HunkLine::Context(content.to_string()));
+                old_remaining = old_remaining.saturating_sub(1);
+                new_remaining = new_remaining.saturating_sub(1);
                 lines.next();
             }
             Some(line)
@@ -961,6 +981,8 @@ where
             Some(line) if !line.starts_with('\\') => {
                 // Treat as context line without leading space
                 hunk_lines.push(HunkLine::Context((*line).to_string()));
+                old_remaining = old_remaining.saturating_sub(1);
+                new_remaining = new_remaining.saturating_sub(1);
                 lines.next();
             }
             Some(_) => {
@@ -1215,7 +1237,12 @@ fn build_pending_writes_from_patches(
     context: &ToolContext,
     fuzz: usize,
 ) -> Result<(Vec<PendingWrite>, PatchStatsExt), ToolError> {
-    let mut pending = Vec::new();
+    let mut pending: Vec<PendingWrite> = Vec::new();
+    // Where each file's write already sits in `pending`: a second section for
+    // the same file applies on top of the first instead of re-reading the
+    // disk and silently dropping the earlier hunks (B7).
+    let mut pending_index: std::collections::HashMap<PathBuf, usize> =
+        std::collections::HashMap::new();
     let mut stats = PatchStatsExt::default();
     stats.stats.files_total = file_patches.len();
 
@@ -1228,6 +1255,41 @@ fn build_pending_writes_from_patches(
         }
 
         let resolved = context.resolve_path(&file_patch.path)?;
+        if let Some(&index) = pending_index.get(&resolved) {
+            let Some(current) = pending[index].content.clone() else {
+                return Err(ToolError::invalid_input(format!(
+                    "Patch has a section for `{}` after a section that deletes it; merge them into one section.",
+                    file_patch.path
+                )));
+            };
+            let mut lines: Vec<String> = current.lines().map(String::from).collect();
+            let apply_stats =
+                apply_hunks_to_lines(&mut lines, &file_patch.hunks, fuzz, &file_patch.path)?;
+            stats.stats.hunks_applied += apply_stats.hunks_applied;
+            stats.stats.hunks_total += file_patch.hunks.len();
+            stats.stats.fuzz_used += apply_stats.fuzz_used;
+            stats.stats.hunks_with_fuzz += apply_stats.hunks_with_fuzz;
+            stats.stats.hunks_relocated += apply_stats.hunks_relocated;
+            if let Some(summary) = stats
+                .file_summaries
+                .iter_mut()
+                .rev()
+                .find(|summary| summary.path == file_patch.path)
+            {
+                summary.hunks += file_patch.hunks.len();
+                summary.hunks_applied += apply_stats.hunks_applied;
+                summary.fuzz_used += apply_stats.fuzz_used;
+                summary.hunks_with_fuzz += apply_stats.hunks_with_fuzz;
+                summary.hunks_relocated += apply_stats.hunks_relocated;
+                summary.deleted |= file_patch.delete_after;
+                summary.created &= !file_patch.delete_after;
+            }
+            pending[index].content = (!file_patch.delete_after)
+                .then(|| reassemble_preserving_newlines(&lines, &current));
+            // One file, however many sections: count it once.
+            stats.stats.files_total = stats.stats.files_total.saturating_sub(1);
+            continue;
+        }
         let original = if resolved.exists() {
             Some(read_file_content(&resolved)?)
         } else {
@@ -1277,6 +1339,7 @@ fn build_pending_writes_from_patches(
             deleted: file_patch.delete_after,
         });
 
+        pending_index.insert(resolved.clone(), pending.len());
         if file_patch.delete_after {
             pending.push(PendingWrite {
                 path: resolved,
@@ -1677,6 +1740,12 @@ mod tests {
     /// text, so the model's next patch context matches the bytes on disk.
     #[tokio::test]
     async fn patch_normalizes_rust_in_an_already_clean_file() {
+        // Warm the `rustfmt` proxy first: on a cold CI runner the first rustup
+        // shim launch alone can exceed the formatter's 5s budget, which skips
+        // normalization (by design) and fails this test for the wrong reason.
+        let _ = std::process::Command::new("rustfmt")
+            .arg("--version")
+            .output();
         let tmp = tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let file = tmp.path().join("clean.rs");
@@ -3041,5 +3110,42 @@ diff --git a/two.txt b/two.txt
 
         assert!(err.to_string().contains("does not exist"), "{err}");
         assert!(!tmp.path().join("absent.txt").exists());
+    }
+
+    /// B7: two sections for the same file both land; the second applies on
+    /// top of the first instead of re-reading the disk and dropping it.
+    #[tokio::test]
+    async fn two_sections_for_one_file_apply_both() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        fs::write(tmp.path().join("f.txt"), "a1\na2\na3\nmid\nb1\nb2\nb3\n").expect("write");
+        let patch = r"--- a/f.txt
++++ b/f.txt
+@@ -1,3 +1,3 @@
+ a1
+-a2
++A2
+ a3
+--- a/f.txt
++++ b/f.txt
+@@ -5,3 +5,3 @@
+ b1
+-b2
++B2
+ b3
+";
+        let result = ApplyPatchTool
+            .execute(json!({"patch": patch}), &ctx)
+            .await
+            .expect("execute");
+        assert!(result.success, "{}", result.content);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("f.txt")).expect("read"),
+            "a1\nA2\na3\nmid\nb1\nB2\nb3\n"
+        );
+        let summary = parse_patch_result(result);
+        assert_eq!(summary.files_total, 1, "one file, two sections");
+        assert_eq!(summary.files_applied, 1);
+        assert_eq!(summary.hunks_applied, 2);
     }
 }

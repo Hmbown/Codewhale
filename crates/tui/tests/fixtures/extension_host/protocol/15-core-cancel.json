@@ -1,0 +1,11 @@
+{
+  "direction": "core_to_host",
+  "valid": true,
+  "frame": {
+    "jsonrpc": "2.0",
+    "method": "$/cancel",
+    "params": {
+      "id": 4
+    }
+  }
+}

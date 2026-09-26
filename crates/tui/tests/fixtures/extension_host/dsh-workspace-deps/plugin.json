@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "dsh-workspace-deps",
+  "version": "0.1.0",
+  "description": "Test fixture: the published DSH load_workspace_dependencies plugin, loaded unmodified by the Codewhale extension host.",
+  "license": "MIT",
+  "extensions": {
+    "net.codewhale": {
+      "native": {
+        "path": "index.mjs"
+      }
+    }
+  }
+}
