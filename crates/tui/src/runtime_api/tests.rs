@@ -9024,6 +9024,9 @@ async fn thread_summary_search_does_not_scan_the_whole_store_per_thread() -> Res
     let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
         return Ok(());
     };
+    // Settle the server's startup item-index warm-up, so the read counts below
+    // measure this route and not a background pass over the directory.
+    runtime_threads.warm_item_index()?;
     let client = crate::tls::reqwest_client();
 
     const THREADS: usize = 8;
@@ -9127,21 +9130,26 @@ async fn thread_summary_search_does_not_scan_the_whole_store_per_thread() -> Res
     Ok(())
 }
 
-/// The default listing carries no `search`, and it must read the store once
-/// rather than once per row.
+/// The default listing carries no `search`, and it must not walk the items
+/// directory at all.
 ///
 /// This route used to call `get_thread_detail` for every row, and detail is a
 /// whole-store walk: `list_turns_for_thread` scans every turn record and
 /// `list_items_for_turns_map` scans every item record, because an item's
 /// filename carries only the item id. Listing `T` threads therefore cost
 /// `T x (all_turns + all_items)` reads — seconds-per-thread, and the reason a
-/// 72-thread rail went blank. The bound asserted here is one pass per
-/// directory, so any return to a per-row detail read fails loudly.
+/// 72-thread rail went blank. The next fix made that one pass per directory,
+/// and the one after it read each row's preview out of the row's own newest
+/// turn, so no item file is read by directory walk at all. The bound asserted
+/// here is that zero, so any return to a store-wide item read fails loudly.
 #[tokio::test]
-async fn thread_summary_listing_reads_the_store_once_not_once_per_thread() -> Result<()> {
+async fn thread_summary_listing_never_walks_the_items_directory() -> Result<()> {
     let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
         return Ok(());
     };
+    // Settle the server's startup item-index warm-up, so the read counts below
+    // measure this route and not a background pass over the directory.
+    runtime_threads.warm_item_index()?;
     let client = crate::tls::reqwest_client();
 
     const THREADS: usize = 8;
@@ -9194,21 +9202,21 @@ async fn thread_summary_listing_reads_the_store_once_not_once_per_thread() -> Re
     );
     assert_eq!(
         turn_files, total_turns,
-        "the page must scan the turns directory exactly once: read {turn_files} of \
+        "the page still reads every turn record exactly once: read {turn_files} of \
          {total_turns} turn files, while reading one thread's detail per row would have \
          been {per_thread_file_reads} reads in total"
     );
     assert_eq!(
-        item_files, total_items,
-        "the page must scan the items directory exactly once: read {item_files} of \
-         {total_items} item files, while reading one thread's detail per row would have \
-         been {per_thread_file_reads} reads in total"
+        item_files, 0,
+        "a page must not read the items directory at all: read {item_files} item files, \
+         while one pass over the directory would have been {total_items} and one detail \
+         read per row {per_thread_file_reads}"
     );
     assert!(
         rows.iter().all(|row| row["preview"]
             .as_str()
             .is_some_and(|preview| preview.contains(PREVIEW_TOKEN))),
-        "one pass must still fill every row's preview; got {listed}"
+        "reading each row's own turn must still fill every preview; got {listed}"
     );
     assert!(
         rows.iter()

@@ -1920,6 +1920,15 @@ pub struct RuntimeThreadStore {
     /// the queue; this guard prevents concurrent replay/wake requests from
     /// starting more than one turn for the same message.
     mail_mutation: Arc<parking_lot::Mutex<()>>,
+    /// Turn id -> item ids, filled by one items-directory read and kept
+    /// current by the item writers; see [`Self::item_ids_for_turns`].
+    item_index: Arc<parking_lot::RwLock<ItemIndex>>,
+    /// Serializes the one items-directory read that fills `item_index`. Held
+    /// across the whole read, so a caller that arrives while it runs waits for
+    /// its result instead of repeating it — and so an item writer can tell
+    /// whether a read is running by probing it. A writer never holds it, so a
+    /// running turn's write is never behind a store-wide read.
+    item_index_seed: Arc<parking_lot::Mutex<()>>,
     /// Files read by whole-directory turn scans (`list_all_turns`). Shared
     /// across store clones so a `spawn_blocking` snapshot still counts against
     /// the manager the test holds. Per-store so parallel tests do not collide.
@@ -1934,6 +1943,23 @@ pub struct RuntimeThreadStore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RuntimeStoreOwner {
     owner_id: String,
+}
+
+/// Every item id the store holds, grouped by turn.
+///
+/// An item's filename carries the item id and nothing else, so a reader that
+/// wants one thread's items has no way to ask the filesystem for them: the only
+/// answer is to read every item record. This makes that whole-directory read a
+/// one-time cost per store instead of a per-request one.
+#[derive(Debug, Default)]
+struct ItemIndex {
+    /// `None` until the items directory has been read once.
+    by_turn: Option<HashMap<String, Vec<String>>>,
+    /// Item writes that landed while the directory read was running and may
+    /// therefore have been missed by it. Drained into `by_turn` when it is
+    /// published. Only writes that race a read are recorded; see
+    /// [`RuntimeThreadStore::note_item_in_index`].
+    pending: Vec<(String, String)>,
 }
 
 impl RuntimeThreadStore {
@@ -1978,6 +2004,8 @@ impl RuntimeThreadStore {
             turn_mutation: Arc::new(parking_lot::ReentrantMutex::new(())),
             goal_mutation: Arc::new(parking_lot::Mutex::new(())),
             mail_mutation: Arc::new(parking_lot::Mutex::new(())),
+            item_index: Arc::new(parking_lot::RwLock::new(ItemIndex::default())),
+            item_index_seed: Arc::new(parking_lot::Mutex::new(())),
             #[cfg(test)]
             turn_dir_files_read: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
@@ -2419,7 +2447,9 @@ impl RuntimeThreadStore {
                 &item.id,
                 &path,
             )
-        })
+        })?;
+        self.note_item_in_index(&item.turn_id, &item.id);
+        Ok(())
     }
 
     /// Publish many items at once, paying the items directory's costs once.
@@ -2442,7 +2472,11 @@ impl RuntimeThreadStore {
             files.push((path, payload.into_bytes()));
         }
         crate::utils::write_atomic_batch(&files)
-            .with_context(|| format!("Failed to write {} store items", files.len()))
+            .with_context(|| format!("Failed to write {} store items", files.len()))?;
+        for item in items {
+            self.note_item_in_index(&item.turn_id, &item.id);
+        }
+        Ok(())
     }
 
     fn remove_turn(&self, turn_id: &str) -> Result<()> {
@@ -2676,6 +2710,79 @@ impl RuntimeThreadStore {
 
         let wanted: HashSet<&str> = turn_ids.iter().map(String::as_str).collect();
         let mut out: HashMap<String, Vec<TurnItemRecord>> = HashMap::new();
+        for (turn_id, item_ids) in self.item_ids_for_turns(&wanted)? {
+            for item_id in item_ids {
+                // An index entry whose file is gone contributes nothing, which
+                // is what the directory walk this replaced reported too.
+                if !self.item_path(&item_id)?.exists() {
+                    continue;
+                }
+                let item = self.load_item(&item_id)?;
+                out.entry(turn_id.clone()).or_default().push(item);
+            }
+        }
+
+        for items in out.values_mut() {
+            sort_turn_items_by_start(items);
+        }
+        Ok(out)
+    }
+
+    /// The item ids this store holds for each of `turn_ids`, from the one
+    /// items-directory read [`Self::ensure_item_index`] performs.
+    fn item_ids_for_turns(&self, turn_ids: &HashSet<&str>) -> Result<HashMap<String, Vec<String>>> {
+        self.ensure_item_index()?;
+        let index = self.item_index.read();
+        let by_turn = index
+            .by_turn
+            .as_ref()
+            .context("item index must be published before it is read")?;
+        Ok(turn_ids
+            .iter()
+            .filter_map(|turn_id| {
+                by_turn
+                    .get(*turn_id)
+                    .map(|item_ids| ((*turn_id).to_string(), item_ids.clone()))
+            })
+            .collect())
+    }
+
+    /// Read the items directory once, and never again for this store.
+    ///
+    /// An item's filename carries the item id and nothing else, so the only way
+    /// to learn which items a turn has is to read every item record. Both
+    /// callers used to do exactly that per request: [`Self::get_thread_detail`]
+    /// (`GET /v1/threads/{id}`, one walk per thread opened) and the fork
+    /// preparation whose items the transcript rebuild reads. On the store this
+    /// was measured against — 61,441 items, 294MB, 140 threads — one walk costs
+    /// ~1.4s warm and 6.7s cold, and it was the whole of a thread's open time; a
+    /// median thread holds 272 items, so reading the ones it needs is ~7ms.
+    ///
+    /// The walk is not parallelizable either, which is why this reads once
+    /// instead of reading harder: sixteen concurrent `cat` streams of the same
+    /// 61k files finished in 3.6s against 2.1s for one, and four in 1.5s. The
+    /// cost is the per-file syscall, not the bytes.
+    ///
+    /// The read runs under the seed guard and outside the index guard, so a
+    /// writer never waits for it. A write that lands while the read runs may or
+    /// may not be in the directory snapshot it takes, so the writer records that
+    /// write and the published map drains the records. A write with no read
+    /// running records nothing: its file is already on disk, so the next read
+    /// finds it in the directory itself.
+    fn ensure_item_index(&self) -> Result<()> {
+        if self.item_index.read().by_turn.is_some() {
+            return Ok(());
+        }
+
+        // One read at a time. A caller that finds the read already running
+        // waits here and then takes the map it produced, rather than reading
+        // the same directory a second time.
+        let _seed = self.item_index_seed.lock();
+        if self.item_index.read().by_turn.is_some() {
+            return Ok(());
+        }
+
+        let mut by_turn: HashMap<String, Vec<String>> = HashMap::new();
         let items_dir = checked_existing_runtime_store_dir(&self.items_dir)?;
         for entry in fs::read_dir(&items_dir)
             .with_context(|| format!("Failed to read {}", items_dir.display()))?
@@ -2689,51 +2796,180 @@ impl RuntimeThreadStore {
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let raw = read_store_file(&path).with_context(|| {
-                RuntimeStoreRecordFailure::new(
-                    RuntimeStoreOperation::Read,
-                    RuntimeStoreRecordKind::Item,
-                    &item_id,
-                    &path,
-                )
-            })?;
             #[cfg(test)]
             self.item_dir_files_read
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let item: TurnItemRecord = serde_json::from_str(&raw).with_context(|| {
-                RuntimeStoreRecordFailure::new(
-                    RuntimeStoreOperation::Parse,
-                    RuntimeStoreRecordKind::Item,
-                    &item_id,
-                    &path,
-                )
-            })?;
-            if item.schema_version > MAX_SUPPORTED_RUNTIME_SCHEMA_VERSION {
-                bail!(
-                    "Item schema v{} is newer than supported v{}",
-                    item.schema_version,
-                    MAX_SUPPORTED_RUNTIME_SCHEMA_VERSION
-                );
+            let item = self.load_item(&item_id)?;
+            by_turn.entry(item.turn_id).or_default().push(item.id);
+        }
+
+        let mut index = self.item_index.write();
+        for (turn_id, item_id) in std::mem::take(&mut index.pending) {
+            let item_ids = by_turn.entry(turn_id).or_default();
+            if !item_ids.contains(&item_id) {
+                item_ids.push(item_id);
             }
-            if matches!(
-                item.schema_version,
-                IMAGE_RUNTIME_SCHEMA_VERSION | OUTPUT_LIMIT_RUNTIME_SCHEMA_VERSION
-            ) && item.kind == TurnItemKind::UserMessage
-            {
-                item.user_content()?;
+        }
+        index.by_turn = Some(by_turn);
+        Ok(())
+    }
+
+    /// Keep the item index current across an item write.
+    ///
+    /// The two writers ([`Self::save_item`] and [`Self::save_items_batch`]) are
+    /// the only paths that can put an item in this store, so this is what makes
+    /// the index exact rather than a snapshot: a reader sees every item the
+    /// directory would have shown it, including the late ones
+    /// [`Self::attach_item_to_turn`] deliberately leaves out of a settled turn's
+    /// `item_ids`.
+    fn note_item_in_index(&self, turn_id: &str, item_id: &str) {
+        // Probing the seed guard says whether a directory read is running, and
+        // the guard is dropped immediately: this call must never wait behind
+        // one. The item this follows is already on disk, so a read that starts
+        // later finds it in the directory; only a read that is *already*
+        // running may have passed the file, and only that case is recorded —
+        // which is what keeps this queue finite in a process that writes items
+        // without ever reading them.
+        let read_in_flight = self.item_index_seed.try_lock().is_none();
+        let mut index = self.item_index.write();
+        if index.by_turn.is_none() {
+            if read_in_flight {
+                index
+                    .pending
+                    .push((turn_id.to_string(), item_id.to_string()));
             }
-            if wanted.contains(item.turn_id.as_str()) {
-                out.entry(item.turn_id.clone()).or_default().push(item);
+            return;
+        }
+        // The runtime saves one item id many times (in progress, then
+        // completed or failed), and a write that raced the directory read may
+        // already be in the map from that read. An id is listed once per turn.
+        let item_ids = index
+            .by_turn
+            .as_mut()
+            .expect("checked above")
+            .entry(turn_id.to_string())
+            .or_default();
+        if !item_ids.iter().any(|known| known == item_id) {
+            item_ids.push(item_id.to_string());
+        }
+    }
+
+    /// The newest message text for each row of the thread list, read from the
+    /// thread's own newest turn.
+    ///
+    /// A row shows the newest message of the newest turn that has one. That
+    /// used to be answered by [`Self::newest_message_text_by_turn`] over every
+    /// turn of every listed thread, and that call walks the whole items
+    /// directory — an item filename carries only the item id, never its turn.
+    /// A page of 100 threads out of a 140-thread store therefore read all
+    /// 58,048 item records to fill 100 previews: ~1.4s per summary, on every
+    /// summary, measured 2026-09-26 against the 658MB store, which is the
+    /// wait the rail's spinner was covering.
+    ///
+    /// A turn record carries its own `item_ids`, so one turn's newest message
+    /// can be read directly, and the walk below stops at the first thread turn
+    /// that yields one. The page measured above resolves all 100 previews from
+    /// 165 item files — it reads the tail of each row's newest turn and
+    /// nothing else.
+    ///
+    /// The choice of turn is the one the batch read made: newest first, an
+    /// older turn only when the newer ones hold no message text at all.
+    fn newest_message_text_by_thread(
+        &self,
+        turns_by_thread: &HashMap<String, Vec<TurnRecord>>,
+    ) -> Result<HashMap<String, String>> {
+        let mut previews: HashMap<String, String> = HashMap::new();
+        // A turn written before `item_ids` existed cannot be read by id: only a
+        // scan of the items directory can find it. Those turns are collected
+        // so the scan runs once for the page rather than once per turn, and the
+        // thread's walk resumes from the turn it stopped on.
+        let mut legacy_turn_ids: Vec<String> = Vec::new();
+        let mut legacy_stops: Vec<(&str, usize)> = Vec::new();
+
+        for (thread_id, turns) in turns_by_thread {
+            let mut walked = turns.len();
+            while walked > 0 {
+                walked -= 1;
+                let turn = &turns[walked];
+                if turn.item_ids.is_empty() {
+                    // This turn and every turn older than it are legacy, and
+                    // both need the same directory scan: hand them all over at
+                    // once instead of scanning per turn.
+                    for turn in &turns[..=walked] {
+                        legacy_turn_ids.push(turn.id.clone());
+                    }
+                    legacy_stops.push((thread_id.as_str(), walked));
+                    break;
+                }
+                if let Some(text) = self.newest_message_text_in_turn(turn)? {
+                    previews.insert(thread_id.clone(), text);
+                    break;
+                }
             }
         }
 
-        for items in out.values_mut() {
-            sort_turn_items_by_start(items);
+        if !legacy_turn_ids.is_empty() {
+            let legacy = self.newest_message_text_by_turn(&legacy_turn_ids)?;
+            for (thread_id, walked) in legacy_stops {
+                let turns = &turns_by_thread[thread_id];
+                if let Some(text) = turns[..=walked]
+                    .iter()
+                    .rev()
+                    .find_map(|turn| legacy.get(&turn.id).cloned())
+                {
+                    previews.insert(thread_id.to_string(), text);
+                }
+            }
         }
-        Ok(out)
+
+        Ok(previews)
+    }
+
+    /// The newest message text `turn` appended, read from the turn's own item
+    /// list instead of from a scan of the items directory.
+    ///
+    /// A turn appends its items in order, so the last message item it wrote is
+    /// the newest message it has: what follows that message is a status,
+    /// reasoning, file-change or tool record, never another message. Walking
+    /// the ids from the tail therefore ends within the handful of files between
+    /// the end of the turn and its last message, where reading the turn whole
+    /// would read every item it ever wrote.
+    ///
+    /// Selection agrees with [`Self::newest_message_text_by_turn`] on every
+    /// turn of the 658MB / 58k-item store this was measured against (538 turns,
+    /// 3,537 message items, 2026-09-26): non-message items never win and an
+    /// empty message is skipped rather than reported. The comparison that call
+    /// makes is on `started_at`, and append order is timestamp order because
+    /// the runtime writes each item as its turn produces it.
+    fn newest_message_text_in_turn(&self, turn: &TurnRecord) -> Result<Option<String>> {
+        for item_id in turn.item_ids.iter().rev() {
+            // A turn can name an item whose file was since removed; the
+            // directory walk this replaced never saw such an id, so it must
+            // not fail the whole summary page either.
+            if !self.item_path(item_id)?.exists() {
+                continue;
+            }
+            let item = self.load_item(item_id)?;
+            if !matches!(
+                item.kind,
+                TurnItemKind::AgentMessage | TurnItemKind::UserMessage
+            ) {
+                continue;
+            }
+            let text = item.detail.unwrap_or(item.summary);
+            if text.trim().is_empty() {
+                continue;
+            }
+            return Ok(Some(text));
+        }
+        Ok(None)
     }
 
     /// The newest agent/user message text in each requested turn, in one pass.
+    ///
+    /// This is the directory-scan fallback: the thread summary reads previews
+    /// through [`Self::newest_message_text_by_thread`], and reaches this call
+    /// only for turns whose record predates `item_ids`.
     ///
     /// [`Self::list_items_for_turns_map`] materializes every item of every
     /// requested turn. The thread summary needs only the last user/agent
@@ -8075,6 +8311,19 @@ impl RuntimeThreadManager {
         Ok(())
     }
 
+    /// Read the store's item index ahead of the read that needs it.
+    ///
+    /// Opening a thread is the first thing every client asks for and the last
+    /// thing the store can answer cheaply: a reader has to learn which items
+    /// each turn owns, and nothing but a pass over the whole items directory can
+    /// tell it, because an item's filename carries the item id and not its turn.
+    /// That pass is the same one every open used to pay. Paid here, while the
+    /// Runtime API is starting and no client is waiting, it is paid once
+    /// instead. See [`RuntimeThreadStore::ensure_item_index`].
+    pub(crate) fn warm_item_index(&self) -> Result<()> {
+        self.store.ensure_item_index()
+    }
+
     /// The [`ThreadListFacts`] for every id in `thread_ids`, read in one pass.
     ///
     /// `GET /v1/threads/summary` used to call [`Self::get_thread_detail`] once
@@ -8105,7 +8354,7 @@ impl RuntimeThreadManager {
 
         let store = self.store.clone();
         let scanned = wanted.clone();
-        let (turns_by_thread, preview_by_turn) = tokio::task::spawn_blocking(move || {
+        let (turns_by_thread, preview_by_thread) = tokio::task::spawn_blocking(move || {
             // One turns scan, grouped by thread. `list_all_turns` sorts by
             // `created_at`, so each group keeps ascending turn order and a
             // group's last element is the newest turn — the same turn a
@@ -8119,15 +8368,11 @@ impl RuntimeThreadManager {
                         .push(turn);
                 }
             }
-            // One items scan covering every turn of those threads, keeping
-            // only the message text that could be a row's preview.
-            let turn_ids: Vec<String> = turns_by_thread
-                .values()
-                .flatten()
-                .map(|turn| turn.id.clone())
-                .collect();
-            let preview_by_turn = store.newest_message_text_by_turn(&turn_ids)?;
-            Ok::<_, anyhow::Error>((turns_by_thread, preview_by_turn))
+            // The preview is read from each row's own newest turn, not from a
+            // page-wide scan of every item record: see
+            // `newest_message_text_by_thread` for what that cost and why.
+            let preview_by_thread = store.newest_message_text_by_thread(&turns_by_thread)?;
+            Ok::<_, anyhow::Error>((turns_by_thread, preview_by_thread))
         })
         .await
         .context("Runtime thread list scan task failed")??;
@@ -8136,14 +8381,10 @@ impl RuntimeThreadManager {
         for thread_id in &wanted {
             let turns = turns_by_thread.get(thread_id);
             let latest_turn = turns.and_then(|turns| turns.last());
-            // Newest turn first: the scan already picked the newest message
-            // within each turn, so the first turn holding one is the message a
-            // per-thread detail read would have found.
-            let preview = turns
-                .into_iter()
-                .flatten()
-                .rev()
-                .find_map(|turn| preview_by_turn.get(&turn.id).cloned());
+            // Newest turn first, resolved by the walk inside
+            // `newest_message_text_by_thread`: the first turn holding a message
+            // is the message a per-thread detail read would have found.
+            let preview = preview_by_thread.get(thread_id).cloned();
             let (pending_approvals, pending_user_inputs) =
                 self.pending_requests_for_thread(thread_id);
             facts.insert(
