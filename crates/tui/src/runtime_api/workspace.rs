@@ -232,7 +232,7 @@ pub(super) const FILE_READ_LIMIT_DEFAULT: usize = 256 * 1024;
 pub(super) const FILE_READ_LIMIT_MAX: usize = 4 * 1024 * 1024;
 /// Files above this size are not served at all: the revision is a digest of
 /// the whole file, and a Files browser should not page through larger blobs.
-const FILE_SERVE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const FILE_SERVE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const FILE_WRITE_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// Request-body ceiling for the write route: the content cap plus headroom for
 /// base64 expansion and the JSON envelope, so an oversized `content` reaches

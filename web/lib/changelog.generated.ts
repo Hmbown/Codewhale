@@ -41,11 +41,12 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Added",
         "items": [
+          "Runtime API: git stage, unstage, discard and commit accept optional expect preconditions (full HEAD id, an index token, per-file rev, or a whole-tree revision, all read from GET /v1/git). When the repository changed since the client read it, the write does nothing and answers 409 git_state_changed with the current state, so a Review sheet can no longer stage bytes, discard edits or commit an index the user never saw. Requests without expect behave as before. Path writes now…",
           "Runtime API: POST /v1/threads/{id}/fork-at-turn forks a thread at a named user turn, keeping that turn and every turn before it. The receipt matches /undo and returns the first dropped prompt so a client can put it back in the composer. Naming the turn replaces a client-computed depth, which could fork the wrong prefix. The fork leaves the workspace and any running turn untouched (#6580, thanks @gaord).",
           "Official model routing: /router (also /model router) sets up the Auto router with presets: Jev (TypeSafe's decision model, via OpenRouter or a TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes one test call before it saves, /status shows the router's choice, cost and latency, and a failing router is shown as failing (#6525).",
           "Code mode composes MCP and plugin tools and is on by default: execute_tools programs can call MCP tools, and each nested call passes the same approval gate as a direct call, pausing the program for approval when needed. Every nested call keeps its receipt, including calls that finish before a deadline, and code_mode = false turns it off. codewhale mcp list and codewhale doctor warn when a user MCP server duplicates the built-in Computer Use bundle (#6562, #6509)."
         ],
-        "itemCount": 3
+        "itemCount": 4
       },
       {
         "heading": "Fixed",
@@ -63,7 +64,7 @@ export const CHANGELOG: ChangelogRelease[] = [
           "web.run retries a refused page once with a browser user agent, and one site's failure no longer fails the whole call or drops its search results.",
           "Hooks treat bash, Bash and exec_shell as one tool in tool_name conditions, so the documented example fires."
         ],
-        "itemCount": 20
+        "itemCount": 21
       },
       {
         "heading": "Removed",

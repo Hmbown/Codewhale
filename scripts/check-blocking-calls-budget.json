@@ -335,6 +335,9 @@
   "crates/tui/src/runtime_api/diagnostics.rs": {
     "std_fs": 5
   },
+  "crates/tui/src/runtime_api/git.rs": {
+    "std_fs": 5
+  },
   "crates/tui/src/runtime_api/lsp.rs": {
     "path_canonicalize": 1
   },
