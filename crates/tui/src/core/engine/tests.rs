@@ -16608,47 +16608,6 @@ async fn unchanged_compaction_config_is_acknowledged_silently() {
     run.abort();
 }
 
-/// A host resync carries no workspace root; the engine's own must survive
-/// it, or compaction stops re-stating the user's `/anchor` file after every
-/// resume or model switch. Only a moved switch counts as news.
-#[test]
-fn host_compaction_resync_keeps_the_workspace_and_reports_only_the_switch() {
-    let workspace = std::path::PathBuf::from("/work/space");
-    let mut live = crate::compaction::CompactionConfig {
-        enabled: true,
-        workspace: Some(workspace.clone()),
-        ..Default::default()
-    };
-    let resync = crate::compaction::CompactionConfig {
-        enabled: true,
-        model: "resynced-model".to_string(),
-        effective_context_window: Some(64_000),
-        workspace: None,
-        ..Default::default()
-    };
-    assert!(!apply_host_compaction_config(&mut live, resync));
-    assert_eq!(live.model, "resynced-model", "the resync is applied");
-    assert_eq!(live.effective_context_window, Some(64_000));
-    assert_eq!(live.workspace.as_ref(), Some(&workspace));
-
-    let mut switched_off = live.clone();
-    switched_off.enabled = false;
-    switched_off.workspace = None;
-    assert!(apply_host_compaction_config(&mut live, switched_off));
-    assert!(!live.enabled);
-    assert_eq!(live.workspace.as_ref(), Some(&workspace));
-
-    let elsewhere = std::path::PathBuf::from("/other/root");
-    let mut explicit = live.clone();
-    explicit.workspace = Some(elsewhere.clone());
-    assert!(!apply_host_compaction_config(&mut live, explicit));
-    assert_eq!(
-        live.workspace.as_ref(),
-        Some(&elsewhere),
-        "a host that names a workspace still owns it"
-    );
-}
-
 #[tokio::test]
 async fn change_mode_op_updates_current_mode_and_emits_status() {
     let tmp = tempdir().expect("tempdir");

@@ -1276,25 +1276,6 @@ enum McpConnectRefresh {
     Force,
 }
 
-/// Apply a host's compaction config to the engine's live one and report
-/// whether the automatic-compaction switch moved.
-///
-/// Hosts build this config from route and model state and never carry the
-/// workspace root: `Engine::new` fills it in so compaction can re-state the
-/// user's `/anchor` file. A host resync must not erase it, or every resume
-/// and model switch would silently stop re-stating anchors.
-fn apply_host_compaction_config(
-    live: &mut crate::compaction::CompactionConfig,
-    mut incoming: crate::compaction::CompactionConfig,
-) -> bool {
-    if incoming.workspace.is_none() {
-        incoming.workspace = live.workspace.take();
-    }
-    let switched = live.enabled != incoming.enabled;
-    *live = incoming;
-    switched
-}
-
 impl Engine {
     /// Surface the snapshots-disabled notice a blocking snapshot task parked
     /// (#5930). Called at turn boundaries; each session gets its own notice.
@@ -3215,8 +3196,8 @@ impl Engine {
                         // a real error in the footer (U1) and the "Resumed:"
                         // receipt a session restore had just shown.
                         let enabled = config.enabled;
-                        let switched =
-                            apply_host_compaction_config(&mut self.config.compaction, config);
+                        let switched = self.config.compaction.enabled != enabled;
+                        self.config.compaction = config;
                         if switched {
                             let _ = self
                                 .tx_event

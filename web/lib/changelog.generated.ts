@@ -48,7 +48,7 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Fixed",
         "items": [
-          "Resuming a session keeps its \"Resumed:\" confirmation on screen instead of replacing it with \"Make room automatically: on\" when nothing was switched, and /anchor files are still re-stated after compaction once a session has been resumed or its model changed.",
+          "Resuming a session keeps its \"Resumed:\" confirmation on screen instead of replacing it with \"Make room automatically: on\" when nothing was switched.",
           "The installation page is generated from docs/INSTALL.md, so the website and the guide can no longer disagree; broken anchors and unsafe links fail the build (#6450).",
           "codewhale config set refuses a value of the wrong type for a known setting (a word for an on/off switch, text for a number, a choice outside the list) instead of saving it (#6568, thanks @dajiaohuang).",
           "A turn that stops producing output now reports itself: the turn loop records its phase and last progress, and an overdue phase surfaces instead of hanging silently until the stream idle timeout. A delegated agent's final result is never dropped when the host is busy, so a finished child no longer leaves a ghost Running row behind (#6184).",
