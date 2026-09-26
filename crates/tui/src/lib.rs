@@ -137,6 +137,7 @@ mod skills;
 mod sleep_guard;
 mod snapshot;
 mod startup_trace;
+mod superfast;
 mod task_manager;
 mod telemetry_notice;
 #[cfg(test)]
