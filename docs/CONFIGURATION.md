@@ -3332,6 +3332,14 @@ Until a confirmation exists, the effective mode is always `"enabled"`:
   always-on redaction regardless of this switch; the opt-out exists so the
   model can quote file bytes for exact edits, not to relax stored state.
 
+The config value itself is forgiving: `true`/`false`, `"on"`/`"off"`, and
+`"enabled"`/`"disabled"` (any casing) all parse, with `false`/`"off"` meaning
+`"disabled"`.
+
+A confirmed opt-out still sends your configured API keys to the provider you
+are already talking to. Only use it when the model must read and edit files
+that contain real credentials.
+
 ### Stored sessions
 
 The masking runs once, when tool output enters the transcript, so saved
@@ -3359,11 +3367,3 @@ codewhale sessions scrub-secrets --apply  # rewrite the affected files
 so it never loses a concurrent save. A session that is still open can write
 its in-memory copy back on its next save, so close open sessions first, and
 rotate any credential that was exposed — masking a stored copy cannot un-leak it.
-
-The config value itself is forgiving: `true`/`false`, `"on"`/`"off"`, and
-`"enabled"`/`"disabled"` (any casing) all parse, with `false`/`"off"` meaning
-`"disabled"`.
-
-A confirmed opt-out still sends your configured API keys to the provider you
-are already talking to. Only use it when the model must read and edit files
-that contain real credentials.
