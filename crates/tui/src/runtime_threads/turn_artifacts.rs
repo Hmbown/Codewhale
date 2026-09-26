@@ -1,0 +1,577 @@
+//! Typed artifact references on runtime turns and items.
+//!
+//! A turn's artifacts are what it left behind that a client can open: files
+//! a tool created or changed in the workspace, tool output that spilled to
+//! the session artifact directory, and media a tool produced. Each is named
+//! by a [`TurnArtifactRef`] carrying path, kind, size and revision, so a
+//! Preview surface can show "what this turn produced" without scanning.
+//!
+//! Facts come from where the bytes were written, never from re-reading the
+//! disk later: file tools and `apply_patch` record `size`/`sha256` in their
+//! `mutation.files[]` receipt, spills record `artifact_digest`, and media
+//! publication records `sha256`. This module only parses those receipts and
+//! confines every path; there is no second artifact store.
+
+use std::path::{Component, Path, PathBuf};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Hard ceiling on refs parsed from one tool result. A patch touching more
+/// files than this is still applied; the extra refs are simply not listed.
+pub(crate) const MAX_ITEM_ARTIFACTS: usize = 1_000;
+
+/// What kind of thing the reference names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnArtifactKind {
+    /// A file in the thread workspace; `path` is workspace-relative.
+    File,
+    /// Tool output spilled to the session artifact directory; `path` is
+    /// session-relative (`artifacts/art_<call>.txt`).
+    ToolOutput,
+    /// Media a tool returned, published immutably under the session.
+    Media,
+}
+
+/// How a file changed. Only set on `kind = file`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeKind {
+    Created,
+    Updated,
+    Deleted,
+    Renamed,
+}
+
+/// Which receipt produced the reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnArtifactSource {
+    /// A file tool's `mutation` receipt (write/edit/apply_patch).
+    ToolMutation,
+    /// A large tool result spilled to a session artifact.
+    ToolOutputSpill,
+    /// A tool's media publication.
+    ToolMedia,
+    /// The workspace snapshot delta between the turn's pre-turn and
+    /// post-turn snapshots. This is everything that changed in the workspace
+    /// while the turn ran, which includes writes by shell commands and
+    /// sub-agents but also by anything else writing the same workspace at the
+    /// same time (an editor, another thread, a background job).
+    WorkspaceChangedDuringTurn,
+}
+
+/// One thing a turn (or one tool call inside it) produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnArtifactRef {
+    /// URL-safe id, stable within the turn: `file_<32 hex>` for a file (a
+    /// digest of its path), the spill's `art_<call>` id, or the media
+    /// `art_image_<sha256>` handle.
+    pub id: String,
+    pub kind: TurnArtifactKind,
+    /// `kind = file`: workspace-relative with `/` separators.
+    /// `tool_output`/`media`: session-relative (`artifacts/...`).
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<FileChangeKind>,
+    /// The old path of a renamed file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
+    /// Byte size of the content this reference names. `None` when deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// SHA-256 (lowercase hex) of the whole content: the same value the
+    /// workspace file read reports as `revision`. `None` when deleted or too
+    /// large to hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// Exact media type, for `kind = media`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// Owning artifact session, for `tool_output`/`media`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    pub source: TurnArtifactSource,
+    /// A snapshot id `POST /v1/threads/{id}/file-revert` accepts for this
+    /// file on this thread. Present only when that call can succeed: the
+    /// snapshot exists and is tagged with the thread's bound session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_snapshot_id: Option<String>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// Identity of the tool call a set of refs is parsed for.
+pub(crate) struct ToolArtifactContext<'a> {
+    pub item_id: &'a str,
+    pub tool_call_id: &'a str,
+    pub tool_name: &'a str,
+    /// The thread workspace every file path is confined to.
+    pub workspace: &'a Path,
+    /// The thread's bound saved-session id. A restore point is published
+    /// only when the snapshot is tagged with exactly this session.
+    pub bound_session_id: Option<&'a str>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+/// The stable ref id for a workspace file path.
+pub(crate) fn file_artifact_id(path: &str) -> String {
+    let digest = crate::hashing::sha256_hex(path.as_bytes());
+    format!("file_{}", &digest[..32])
+}
+
+pub(crate) fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Normalize a tool-supplied path into a workspace-relative display path.
+///
+/// Accepts a relative path or an absolute one inside the workspace (either
+/// as given or canonicalized: tools resolve against the configured path,
+/// which may itself traverse a symlink such as macOS `/var`). Refuses `..`,
+/// empty, non-UTF-8, anything outside, and `.git` (never served).
+pub(crate) fn confined_workspace_path(workspace: &Path, raw: &str) -> Option<String> {
+    let rel = crate::snapshot::workspace_relative_path(workspace, raw).or_else(|| {
+        let canonical = workspace.canonicalize().ok()?;
+        crate::snapshot::workspace_relative_path(&canonical, raw)
+    })?;
+    relative_display(&rel)
+}
+
+fn relative_display(rel: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        let name = name.to_str()?;
+        if name == ".git" {
+            return None;
+        }
+        parts.push(name);
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// A session-relative artifact path: relative, `/`-separated, under
+/// `artifacts/`, with no `.`/`..` components.
+pub(crate) fn confined_session_artifact_path(raw: &str) -> Option<String> {
+    if raw.contains('\\') {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        return None;
+    }
+    let display = relative_display(&path)?;
+    display
+        .split('/')
+        .next()
+        .is_some_and(|first| first == crate::artifacts::ARTIFACTS_DIR_NAME)
+        .then_some(display)
+}
+
+fn is_safe_artifact_id(id: &str) -> bool {
+    id.starts_with("art_")
+        && id.len() <= 200
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn change_kind(outcome: &str) -> Option<FileChangeKind> {
+    match outcome {
+        "created" => Some(FileChangeKind::Created),
+        "updated" => Some(FileChangeKind::Updated),
+        "deleted" => Some(FileChangeKind::Deleted),
+        _ => None,
+    }
+}
+
+fn written_facts(entry: &Value) -> (Option<u64>, Option<String>) {
+    let size = entry.get("size").and_then(Value::as_u64);
+    let revision = entry
+        .get("sha256")
+        .and_then(Value::as_str)
+        .filter(|digest| is_sha256_hex(digest))
+        .map(str::to_owned);
+    (size, revision)
+}
+
+/// Parse the artifact references a tool result's metadata describes.
+///
+/// Three receipts are read: `mutation.files[]`/`mutation.renames[]` (file
+/// tools), the spill keys `artifact_id`/`artifact_session_id`/
+/// `artifact_relative_path`/`artifact_byte_size`/`artifact_digest`, and
+/// `tool_media[]`. Anything that is not confined — an absolute or `..`
+/// path, a path outside the workspace, an invalid session id — yields no
+/// reference rather than a reference a client could be misled by.
+pub(crate) fn artifact_refs_from_tool_metadata(
+    metadata: &Value,
+    context: &ToolArtifactContext<'_>,
+) -> Vec<TurnArtifactRef> {
+    let mut refs = Vec::new();
+    let base = |id: String, kind, path: String, source| TurnArtifactRef {
+        id,
+        kind,
+        path,
+        change: None,
+        previous_path: None,
+        size: None,
+        revision: None,
+        content_type: None,
+        session_id: None,
+        item_id: Some(context.item_id.to_owned()),
+        tool_call_id: Some(context.tool_call_id.to_owned()),
+        tool_name: Some(context.tool_name.to_owned()),
+        source,
+        restore_snapshot_id: None,
+        recorded_at: context.recorded_at,
+    };
+
+    // A `tool:<call>` restore point is usable only on a thread bound to the
+    // session the snapshot is tagged with; file-revert refuses otherwise.
+    let restore_snapshot_id = metadata
+        .get("restore_snapshot_id")
+        .and_then(Value::as_str)
+        .filter(|id| crate::snapshot::SnapshotId::is_well_formed(id))
+        .filter(|_| {
+            let tag = metadata
+                .get("restore_snapshot_session_id")
+                .and_then(Value::as_str);
+            tag.is_some() && tag == context.bound_session_id
+        })
+        .map(str::to_owned);
+
+    if let Some(mutation) = metadata.get("mutation") {
+        for entry in mutation
+            .get("files")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(change) = entry
+                .get("outcome")
+                .and_then(Value::as_str)
+                .and_then(change_kind)
+            else {
+                continue;
+            };
+            let Some(path) = entry
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|raw| confined_workspace_path(context.workspace, raw))
+            else {
+                continue;
+            };
+            let mut reference = base(
+                file_artifact_id(&path),
+                TurnArtifactKind::File,
+                path,
+                TurnArtifactSource::ToolMutation,
+            );
+            reference.change = Some(change);
+            if change != FileChangeKind::Deleted {
+                (reference.size, reference.revision) = written_facts(entry);
+            }
+            reference.restore_snapshot_id = restore_snapshot_id.clone();
+            refs.push(reference);
+        }
+        for entry in mutation
+            .get("renames")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let confine = |key: &str| {
+                entry
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(|raw| confined_workspace_path(context.workspace, raw))
+            };
+            let (Some(from), Some(to)) = (confine("from"), confine("to")) else {
+                continue;
+            };
+            let mut reference = base(
+                file_artifact_id(&to),
+                TurnArtifactKind::File,
+                to,
+                TurnArtifactSource::ToolMutation,
+            );
+            reference.change = Some(FileChangeKind::Renamed);
+            reference.previous_path = Some(from);
+            (reference.size, reference.revision) = written_facts(entry);
+            reference.restore_snapshot_id = restore_snapshot_id.clone();
+            refs.push(reference);
+        }
+    }
+
+    if let (Some(artifact_id), Some(session_id), Some(path)) = (
+        metadata
+            .get("artifact_id")
+            .and_then(Value::as_str)
+            .filter(|id| is_safe_artifact_id(id)),
+        metadata
+            .get("artifact_session_id")
+            .and_then(Value::as_str)
+            .filter(|id| crate::artifacts::is_valid_session_id(id)),
+        metadata
+            .get("artifact_relative_path")
+            .and_then(Value::as_str)
+            .and_then(confined_session_artifact_path),
+    ) {
+        let mut reference = base(
+            artifact_id.to_owned(),
+            TurnArtifactKind::ToolOutput,
+            path,
+            TurnArtifactSource::ToolOutputSpill,
+        );
+        reference.session_id = Some(session_id.to_owned());
+        reference.size = metadata.get("artifact_byte_size").and_then(Value::as_u64);
+        reference.revision = metadata
+            .get("artifact_digest")
+            .and_then(Value::as_str)
+            .filter(|digest| is_sha256_hex(digest))
+            .map(str::to_owned);
+        refs.push(reference);
+    }
+
+    for media in metadata
+        .get("tool_media")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(handle) = media
+            .get("artifact_id")
+            .and_then(Value::as_str)
+            .filter(|id| id.strip_prefix("art_image_").is_some_and(is_sha256_hex))
+        else {
+            continue;
+        };
+        let Some(session_id) = media
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|id| crate::artifacts::is_valid_session_id(id))
+        else {
+            continue;
+        };
+        let mut reference = base(
+            handle.to_owned(),
+            TurnArtifactKind::Media,
+            format!("{}/{handle}.image", crate::artifacts::ARTIFACTS_DIR_NAME),
+            TurnArtifactSource::ToolMedia,
+        );
+        reference.session_id = Some(session_id.to_owned());
+        reference.size = media.get("byte_size").and_then(Value::as_u64);
+        reference.revision = media
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|digest| is_sha256_hex(digest))
+            .map(str::to_owned);
+        reference.content_type = media
+            .get("media_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        refs.push(reference);
+    }
+
+    refs.truncate(MAX_ITEM_ARTIFACTS);
+    refs
+}
+
+/// The legacy `artifact_refs: Vec<PathBuf>` projection.
+///
+/// Clients pinned to the older contract read these as workspace-relative
+/// file paths (the desktop Preview does), so only existing workspace files
+/// belong here: never a spill or media path, never a deleted file.
+pub(crate) fn legacy_artifact_refs(refs: &[TurnArtifactRef]) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for reference in refs {
+        if reference.kind != TurnArtifactKind::File
+            || reference.change == Some(FileChangeKind::Deleted)
+        {
+            continue;
+        }
+        let path = PathBuf::from(&reference.path);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const SNAPSHOT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn context<'a>(workspace: &'a Path, bound: Option<&'a str>) -> ToolArtifactContext<'a> {
+        ToolArtifactContext {
+            item_id: "item_1",
+            tool_call_id: "call_1",
+            tool_name: "apply_patch",
+            workspace,
+            bound_session_id: bound,
+            recorded_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn mutation_receipt_yields_confined_file_refs_with_written_facts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let digest = crate::hashing::sha256_hex(b"new\n");
+        let absolute = workspace.path().join("src/abs.rs");
+        let metadata = json!({
+            "mutation": {
+                "files": [
+                    { "path": "src/lib.rs", "outcome": "updated", "size": 4, "sha256": digest },
+                    { "path": absolute.to_str().unwrap(), "outcome": "created", "size": 4, "sha256": digest },
+                    { "path": "gone.txt", "outcome": "deleted", "size": 9, "sha256": digest },
+                    // Forged or unconfined paths never become refs.
+                    { "path": "../escape.txt", "outcome": "created" },
+                    { "path": "/etc/passwd", "outcome": "updated" },
+                    { "path": ".git/config", "outcome": "updated" },
+                    { "path": "odd.txt", "outcome": "exploded" },
+                    { "path": "bad-digest.txt", "outcome": "created", "size": 1, "sha256": "sha256:nothex" }
+                ],
+                "renames": [{ "from": "old.txt", "to": "new.txt", "size": 4, "sha256": digest }]
+            },
+            "restore_snapshot_id": SNAPSHOT,
+            "restore_snapshot_session_id": "sess-1",
+        });
+        let refs =
+            artifact_refs_from_tool_metadata(&metadata, &context(workspace.path(), Some("sess-1")));
+        let paths: Vec<&str> = refs.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "src/lib.rs",
+                "src/abs.rs",
+                "gone.txt",
+                "bad-digest.txt",
+                "new.txt"
+            ]
+        );
+        let lib = &refs[0];
+        assert_eq!(lib.kind, TurnArtifactKind::File);
+        assert_eq!(lib.id, file_artifact_id("src/lib.rs"));
+        assert_eq!(lib.change, Some(FileChangeKind::Updated));
+        assert_eq!(lib.size, Some(4));
+        assert_eq!(lib.revision.as_deref(), Some(digest.as_str()));
+        assert_eq!(lib.source, TurnArtifactSource::ToolMutation);
+        assert_eq!(lib.restore_snapshot_id.as_deref(), Some(SNAPSHOT));
+        assert_eq!(lib.item_id.as_deref(), Some("item_1"));
+        assert_eq!(lib.tool_call_id.as_deref(), Some("call_1"));
+        // Deleted entries carry no size or revision even if a receipt did.
+        assert_eq!(refs[2].change, Some(FileChangeKind::Deleted));
+        assert_eq!((refs[2].size, refs[2].revision.as_deref()), (None, None));
+        // A malformed digest is dropped, not passed through.
+        assert_eq!(refs[3].revision, None);
+        let renamed = &refs[4];
+        assert_eq!(renamed.change, Some(FileChangeKind::Renamed));
+        assert_eq!(renamed.previous_path.as_deref(), Some("old.txt"));
+
+        // The legacy projection holds only live workspace paths.
+        assert_eq!(
+            legacy_artifact_refs(&refs),
+            ["src/lib.rs", "src/abs.rs", "bad-digest.txt", "new.txt"]
+                .map(PathBuf::from)
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn restore_point_is_published_only_for_the_bound_session_tag() {
+        let workspace = tempfile::tempdir().unwrap();
+        let metadata = |tag: Option<&str>| {
+            let mut value = json!({
+                "mutation": { "files": [{ "path": "a.txt", "outcome": "created" }] },
+                "restore_snapshot_id": SNAPSHOT,
+            });
+            if let Some(tag) = tag {
+                value["restore_snapshot_session_id"] = json!(tag);
+            }
+            value
+        };
+        let restore = |value: &Value, bound| {
+            artifact_refs_from_tool_metadata(value, &context(workspace.path(), bound))[0]
+                .restore_snapshot_id
+                .clone()
+        };
+        assert_eq!(
+            restore(&metadata(Some("sess-1")), Some("sess-1")).as_deref(),
+            Some(SNAPSHOT)
+        );
+        // Tagged with another (e.g. a random engine) session: file-revert
+        // would refuse it, so it is not advertised.
+        assert_eq!(restore(&metadata(Some("random")), Some("sess-1")), None);
+        // Unbound threads cannot file-revert at all.
+        assert_eq!(restore(&metadata(Some("sess-1")), None), None);
+        assert_eq!(restore(&metadata(None), Some("sess-1")), None);
+    }
+
+    #[test]
+    fn spill_and_media_receipts_yield_session_refs_and_forgeries_yield_none() {
+        let workspace = tempfile::tempdir().unwrap();
+        let digest = crate::hashing::sha256_hex(b"output");
+        let handle = format!("art_image_{digest}");
+        let metadata = json!({
+            "artifact_id": "art_call_1",
+            "artifact_session_id": "sess-abc",
+            "artifact_relative_path": "artifacts/art_call_1.txt",
+            "artifact_byte_size": 6,
+            "artifact_digest": digest,
+            "tool_media": [
+                { "session_id": "sess-abc", "artifact_id": handle, "media_type": "image/png",
+                  "byte_size": 10, "sha256": digest },
+                { "session_id": "../x", "artifact_id": handle },
+                { "session_id": "sess-abc", "artifact_id": "art_image_short" }
+            ],
+        });
+        let refs = artifact_refs_from_tool_metadata(&metadata, &context(workspace.path(), None));
+        assert_eq!(refs.len(), 2, "{refs:?}");
+        let spill = &refs[0];
+        assert_eq!(spill.kind, TurnArtifactKind::ToolOutput);
+        assert_eq!(spill.id, "art_call_1");
+        assert_eq!(spill.path, "artifacts/art_call_1.txt");
+        assert_eq!(spill.session_id.as_deref(), Some("sess-abc"));
+        assert_eq!(spill.size, Some(6));
+        assert_eq!(spill.revision.as_deref(), Some(digest.as_str()));
+        assert_eq!(spill.source, TurnArtifactSource::ToolOutputSpill);
+        let media = &refs[1];
+        assert_eq!(media.kind, TurnArtifactKind::Media);
+        assert_eq!(media.path, format!("artifacts/{handle}.image"));
+        assert_eq!(media.content_type.as_deref(), Some("image/png"));
+        assert!(legacy_artifact_refs(&refs).is_empty());
+
+        for (key, forged) in [
+            ("artifact_relative_path", json!("/abs/artifacts/x.txt")),
+            ("artifact_relative_path", json!("artifacts/../../escape")),
+            ("artifact_relative_path", json!("elsewhere/x.txt")),
+            ("artifact_session_id", json!("../other")),
+            ("artifact_id", json!("not-an-artifact")),
+        ] {
+            let mut value = metadata.clone();
+            value[key] = forged.clone();
+            value.as_object_mut().unwrap().remove("tool_media");
+            assert!(
+                artifact_refs_from_tool_metadata(&value, &context(workspace.path(), None))
+                    .is_empty(),
+                "{key}={forged} must not become a ref"
+            );
+        }
+    }
+}

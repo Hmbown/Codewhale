@@ -1573,8 +1573,15 @@ pub struct TurnItemRecord {
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    /// Legacy projection of `artifacts`: workspace-relative paths of the
+    /// files this item created, changed or renamed (never deleted files,
+    /// spills or media). Derived only by `legacy_artifact_refs`.
     #[serde(default)]
     pub artifact_refs: Vec<PathBuf>,
+    /// What this item produced, as typed references. The authority for a
+    /// single tool call's artifacts; the turn aggregate is merged from these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<TurnArtifactRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9967,6 +9974,7 @@ impl RuntimeThreadManager {
                     detail: Some(turn_seed.user_text.clone()),
                     metadata: None,
                     artifact_refs: Vec::new(),
+                    artifacts: Vec::new(),
                     started_at: Some(item_at),
                     ended_at: Some(item_at),
                 };
@@ -9999,6 +10007,7 @@ impl RuntimeThreadManager {
                             detail: Some(text.clone()),
                             metadata: None,
                             artifact_refs: Vec::new(),
+                            artifacts: Vec::new(),
                             started_at: Some(item_at),
                             ended_at: Some(item_at),
                         })?;
@@ -10019,6 +10028,7 @@ impl RuntimeThreadManager {
                             detail: Some(thinking.clone()),
                             metadata: None,
                             artifact_refs: Vec::new(),
+                            artifacts: Vec::new(),
                             started_at: Some(item_at),
                             ended_at: Some(item_at),
                         })?;
@@ -10056,6 +10066,7 @@ impl RuntimeThreadManager {
                                 .clone(),
                             )),
                             artifact_refs: Vec::new(),
+                            artifacts: Vec::new(),
                             started_at: Some(item_at),
                             ended_at: Some(item_at),
                         })?;
@@ -10092,6 +10103,7 @@ impl RuntimeThreadManager {
                             detail: Some(content.clone()),
                             metadata: Some(Value::Object(metadata)),
                             artifact_refs: Vec::new(),
+                            artifacts: Vec::new(),
                             started_at: Some(item_at),
                             ended_at: Some(item_at),
                         })?;
@@ -11306,6 +11318,7 @@ impl RuntimeThreadManager {
             detail: input_source.item_detail(&prompt),
             metadata: input_source.item_metadata(),
             artifact_refs: Vec::new(),
+            artifacts: Vec::new(),
             started_at: Some(now),
             ended_at: Some(now),
         };
@@ -11610,6 +11623,7 @@ impl RuntimeThreadManager {
             detail: Some(prompt.clone()),
             metadata: None,
             artifact_refs: Vec::new(),
+            artifacts: Vec::new(),
             started_at: Some(now),
             ended_at: None,
         };
@@ -12097,7 +12111,14 @@ impl RuntimeThreadManager {
                 model: route_model.clone(),
                 active_route_limits: route_limits,
                 workspace: thread.workspace.clone(),
-                session_id: None,
+                // A bound thread's engine runs under the bound session id from
+                // its first turn. Snapshots are tagged with the engine session,
+                // and file-revert accepts only restore points tagged with the
+                // thread's bound session; before this, a first turn (which
+                // skips SyncSession) tagged them with a random id, so every
+                // restore point it took was refused. Unbound threads keep the
+                // engine-generated id.
+                session_id: thread.session_id.clone(),
                 subagent_state_root: None,
                 plugin_registry: thread_plugin_registry.clone(),
                 allow_shell: thread.allow_shell,
@@ -12774,6 +12795,7 @@ impl RuntimeThreadManager {
             metadata: (visibility == crate::core::events::StatusVisibility::Internal)
                 .then(|| json!({ "visibility": visibility.as_str() })),
             artifact_refs: Vec::new(),
+            artifacts: Vec::new(),
             started_at: Some(Utc::now()),
             ended_at: Some(Utc::now()),
         };
@@ -12839,6 +12861,14 @@ impl RuntimeThreadManager {
         // final TurnComplete receipt. Goal settlement uses it to mirror the
         // engine's own `update_goal` precondition for continuation.
         let mut turn_tool_catalog: Option<Vec<codewhale_core::request::Tool>> = None;
+        // Every file path in a tool receipt is confined to the thread
+        // workspace, and a restore point is published only for the session
+        // the thread is bound to.
+        let (artifact_workspace, artifact_bound_session) = self
+            .store
+            .load_thread(&thread_id)
+            .map(|thread| (thread.workspace, thread.session_id))
+            .unwrap_or_else(|_| (self.workspace.clone(), None));
 
         loop {
             let event = if let Some(event) = pending_event.take() {
@@ -12976,6 +13006,7 @@ impl RuntimeThreadManager {
                         detail: Some(String::new()),
                         metadata: None,
                         artifact_refs: Vec::new(),
+                        artifacts: Vec::new(),
                         started_at: Some(Utc::now()),
                         ended_at: None,
                     };
@@ -13049,6 +13080,7 @@ impl RuntimeThreadManager {
                         detail: Some(String::new()),
                         metadata: None,
                         artifact_refs: Vec::new(),
+                        artifacts: Vec::new(),
                         started_at: Some(Utc::now()),
                         ended_at: None,
                     };
@@ -13139,6 +13171,7 @@ impl RuntimeThreadManager {
                             meta
                         }),
                         artifact_refs: Vec::new(),
+                        artifacts: Vec::new(),
                         started_at: Some(Utc::now()),
                         ended_at: None,
                     };
@@ -13282,6 +13315,22 @@ impl RuntimeThreadManager {
                                         obj.insert("tool_result_for".to_string(), json!(id));
                                         obj.insert("is_error".to_string(), json!(!output.success));
                                     }
+                                    // Failed calls count too: a large error
+                                    // output spills like any other.
+                                    let refs = turn_artifacts::artifact_refs_from_tool_metadata(
+                                        &meta,
+                                        &turn_artifacts::ToolArtifactContext {
+                                            item_id: &item_id,
+                                            tool_call_id: &id,
+                                            tool_name: &name,
+                                            workspace: &artifact_workspace,
+                                            bound_session_id: artifact_bound_session.as_deref(),
+                                            recorded_at: now,
+                                        },
+                                    );
+                                    item.artifact_refs =
+                                        turn_artifacts::legacy_artifact_refs(&refs);
+                                    item.artifacts = refs;
                                     item.metadata = Some(meta);
                                 }
                             }
@@ -13346,6 +13395,7 @@ impl RuntimeThreadManager {
                         detail: Some(message.clone()),
                         metadata: Some(json!({ "compaction_id": id })),
                         artifact_refs: Vec::new(),
+                        artifacts: Vec::new(),
                         started_at: Some(Utc::now()),
                         ended_at: None,
                     };
@@ -13479,6 +13529,7 @@ impl RuntimeThreadManager {
                         detail: Some(message),
                         metadata: None,
                         artifact_refs: Vec::new(),
+                        artifacts: Vec::new(),
                         started_at: Some(Utc::now()),
                         ended_at: Some(Utc::now()),
                     };
@@ -13514,6 +13565,7 @@ impl RuntimeThreadManager {
                         detail: Some(message),
                         metadata: None,
                         artifact_refs: Vec::new(),
+                        artifacts: Vec::new(),
                         started_at: Some(Utc::now()),
                         ended_at: Some(Utc::now()),
                     };
@@ -13560,6 +13612,7 @@ impl RuntimeThreadManager {
                         detail: Some(message),
                         metadata: None,
                         artifact_refs: Vec::new(),
+                        artifacts: Vec::new(),
                         started_at: Some(Utc::now()),
                         ended_at: Some(Utc::now()),
                     };
@@ -13629,6 +13682,7 @@ impl RuntimeThreadManager {
                         detail: Some(message),
                         metadata: None,
                         artifact_refs: Vec::new(),
+                        artifacts: Vec::new(),
                         started_at: Some(Utc::now()),
                         ended_at: Some(Utc::now()),
                     };
@@ -14153,6 +14207,7 @@ impl RuntimeThreadManager {
                             "omitted_tool_count": omitted_tool_count,
                         })),
                         artifact_refs: Vec::new(),
+                        artifacts: Vec::new(),
                         started_at: Some(Utc::now()),
                         ended_at: Some(Utc::now()),
                     };
@@ -14181,6 +14236,7 @@ impl RuntimeThreadManager {
                         detail: Some(message),
                         metadata: None,
                         artifact_refs: Vec::new(),
+                        artifacts: Vec::new(),
                         started_at: Some(Utc::now()),
                         ended_at: Some(Utc::now()),
                     };
@@ -14403,6 +14459,7 @@ impl RuntimeThreadManager {
                 detail: Some(EMPTY_TURN_REASON.to_string()),
                 metadata: None,
                 artifact_refs: Vec::new(),
+                artifacts: Vec::new(),
                 started_at: Some(Utc::now()),
                 ended_at: Some(Utc::now()),
             };
@@ -15517,6 +15574,9 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
         Err(err) => Err(err).with_context(|| format!("Failed to remove {}", path.display())),
     }
 }
+
+mod turn_artifacts;
+pub use turn_artifacts::TurnArtifactRef;
 
 #[cfg(test)]
 mod tests;

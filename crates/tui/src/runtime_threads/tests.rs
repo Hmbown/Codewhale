@@ -6149,6 +6149,7 @@ fn sample_item(turn_id: &str, item_id: &str, status: TurnItemLifecycleStatus) ->
         detail: None,
         metadata: None,
         artifact_refs: Vec::new(),
+        artifacts: Vec::new(),
         started_at: Some(Utc::now()),
         ended_at: None,
     }
@@ -16095,6 +16096,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         detail: None,
         metadata: None,
         artifact_refs: Vec::new(),
+        artifacts: Vec::new(),
         started_at: Some(started_at),
         ended_at: Some(started_at + chrono::Duration::seconds(1)),
     };
@@ -16108,6 +16110,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         detail: None,
         metadata: None,
         artifact_refs: Vec::new(),
+        artifacts: Vec::new(),
         started_at: Some(started_at),
         ended_at: None,
     };
@@ -16121,6 +16124,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         detail: None,
         metadata: None,
         artifact_refs: Vec::new(),
+        artifacts: Vec::new(),
         started_at: None,
         ended_at: None,
     };
@@ -16338,6 +16342,7 @@ fn seed_turns_with_user_messages(
             detail: Some((*text).to_string()),
             metadata: None,
             artifact_refs: Vec::new(),
+            artifacts: Vec::new(),
             started_at: Some(created_at),
             ended_at: Some(created_at),
         })?;
@@ -16351,6 +16356,7 @@ fn seed_turns_with_user_messages(
             detail: Some(format!("reply {offset}")),
             metadata: None,
             artifact_refs: Vec::new(),
+            artifacts: Vec::new(),
             started_at: Some(created_at),
             ended_at: Some(created_at),
         })?;
@@ -16577,6 +16583,7 @@ async fn fork_at_user_turn_receipt_skips_a_compaction_turn_after_the_anchor() ->
         detail: Some("summary of first and second".to_string()),
         metadata: None,
         artifact_refs: Vec::new(),
+        artifacts: Vec::new(),
         started_at: Some(compaction_at),
         ended_at: Some(compaction_at),
     })?;
@@ -17141,6 +17148,7 @@ fn restart_rebuild_restores_tool_call_identity_from_persisted_items() -> Result<
         detail: Some("read the readme".to_string()),
         metadata: None,
         artifact_refs: Vec::new(),
+        artifacts: Vec::new(),
         started_at: Some(now),
         ended_at: Some(now),
     };
@@ -17162,6 +17170,7 @@ fn restart_rebuild_restores_tool_call_identity_from_persisted_items() -> Result<
             "is_error": false,
         })),
         artifact_refs: Vec::new(),
+        artifacts: Vec::new(),
         started_at: Some(now),
         ended_at: Some(now),
     };
@@ -17264,6 +17273,7 @@ fn restart_rebuild_keeps_in_flight_tool_call_identity() -> Result<()> {
             "tool_input": r#"{"path":"README.md"}"#,
         })),
         artifact_refs: Vec::new(),
+        artifacts: Vec::new(),
         started_at: Some(now),
         ended_at: None,
     };
@@ -17347,6 +17357,7 @@ fn restart_rebuild_skips_steers_the_engine_never_delivered() -> Result<()> {
         detail: Some(text.to_string()),
         metadata: None,
         artifact_refs: Vec::new(),
+        artifacts: Vec::new(),
         started_at: Some(now),
         ended_at: Some(now),
     };
@@ -17442,6 +17453,7 @@ fn restart_rebuild_skips_legacy_tool_items_without_identity() -> Result<()> {
         detail: Some("hello".to_string()),
         metadata: None,
         artifact_refs: Vec::new(),
+        artifacts: Vec::new(),
         started_at: Some(now),
         ended_at: Some(now),
     };
@@ -17455,6 +17467,7 @@ fn restart_rebuild_skips_legacy_tool_items_without_identity() -> Result<()> {
         detail: Some("old output".to_string()),
         metadata: None,
         artifact_refs: Vec::new(),
+        artifacts: Vec::new(),
         started_at: Some(now),
         ended_at: Some(now),
     };
@@ -19357,5 +19370,176 @@ async fn runtime_tool_completion_fires_after_and_error_hooks() -> Result<()> {
         ],
         "{text}"
     );
+    Ok(())
+}
+
+/// A completed file-tool call carries typed artifact refs on its durable item
+/// and on the live `item.completed` payload; the legacy `artifact_refs`
+/// projection holds only the workspace paths, and a spill yields a
+/// tool-output ref.
+#[tokio::test]
+async fn tool_completion_items_carry_typed_artifact_refs() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let workspace = dir.path().join("workspace");
+    fs::create_dir(&workspace)?;
+    let manager = test_manager(dir.path().join("runtime"))?;
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace.clone()),
+            auto_approve: Some(true),
+            trust_mode: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "write things".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
+    let digest = crate::hashing::sha256_hex(b"# out\n");
+    harness
+        .tx_event
+        .send(EngineEvent::TurnStarted {
+            turn_id: turn.id.clone(),
+            created_at: Utc::now(),
+            route: None,
+        })
+        .await?;
+    for (call, name) in [("call_write", "apply_patch"), ("call_shell", "exec_shell")] {
+        harness
+            .tx_event
+            .send(EngineEvent::ToolCallStarted {
+                id: call.to_string(),
+                name: name.to_string(),
+                input: json!({}),
+            })
+            .await?;
+    }
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallComplete {
+            id: "call_write".to_string(),
+            name: "apply_patch".to_string(),
+            result: Ok(
+                crate::tools::spec::ToolResult::success("ok").with_metadata(json!({
+                    "mutation": {
+                        "files": [
+                            { "path": "out.md", "outcome": "created", "size": 6, "sha256": digest },
+                            { "path": "old.md", "outcome": "deleted" },
+                            { "path": "../escape.md", "outcome": "created" }
+                        ],
+                        "renames": []
+                    }
+                })),
+            ),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallComplete {
+            id: "call_shell".to_string(),
+            name: "exec_shell".to_string(),
+            // A failed call's large output spills too.
+            result: Ok(
+                crate::tools::spec::ToolResult::error("boom").with_metadata(json!({
+                    "artifact_id": "art_call_shell",
+                    "artifact_session_id": "engine-session",
+                    "artifact_relative_path": "artifacts/art_call_shell.txt",
+                    "artifact_byte_size": 6,
+                    "artifact_digest": digest,
+                })),
+            ),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    let turn = wait_for_terminal_turn(&manager, &turn.id).await?;
+
+    let items = turn
+        .item_ids
+        .iter()
+        .map(|id| manager.store.load_item(id))
+        .collect::<Result<Vec<_>>>()?;
+    let write = items
+        .iter()
+        .find(|item| {
+            item.metadata
+                .as_ref()
+                .is_some_and(|m| m["tool_use_id"] == "call_write")
+        })
+        .expect("write item");
+    assert_eq!(
+        write
+            .artifacts
+            .iter()
+            .map(|r| (r.path.as_str(), r.change))
+            .collect::<Vec<_>>(),
+        [
+            ("out.md", Some(turn_artifacts::FileChangeKind::Created)),
+            ("old.md", Some(turn_artifacts::FileChangeKind::Deleted)),
+        ]
+    );
+    assert_eq!(
+        write.artifacts[0].revision.as_deref(),
+        Some(digest.as_str())
+    );
+    assert_eq!(
+        write.artifacts[0].item_id.as_deref(),
+        Some(write.id.as_str())
+    );
+    assert_eq!(write.artifact_refs, vec![PathBuf::from("out.md")]);
+
+    let shell = items
+        .iter()
+        .find(|item| {
+            item.metadata
+                .as_ref()
+                .is_some_and(|m| m["tool_use_id"] == "call_shell")
+        })
+        .expect("shell item");
+    assert_eq!(shell.status, TurnItemLifecycleStatus::Failed);
+    assert_eq!(shell.artifacts.len(), 1);
+    assert_eq!(
+        shell.artifacts[0].kind,
+        turn_artifacts::TurnArtifactKind::ToolOutput
+    );
+    assert_eq!(
+        shell.artifacts[0].session_id.as_deref(),
+        Some("engine-session")
+    );
+    assert!(
+        shell.artifact_refs.is_empty(),
+        "spill paths are not workspace paths"
+    );
+
+    // The live item events carry the same refs.
+    let events = manager.events_since(&thread.id, None)?;
+    let live = events
+        .iter()
+        .find(|event| {
+            event.event == "item.completed" && event.item_id.as_deref() == Some(write.id.as_str())
+        })
+        .expect("write item.completed");
+    assert_eq!(live.payload["item"]["artifacts"][0]["path"], "out.md");
+    assert_eq!(live.payload["item"]["artifact_refs"], json!(["out.md"]));
     Ok(())
 }

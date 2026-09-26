@@ -496,6 +496,7 @@ fn messages_from_thread_detail_batches_tool_results() {
             detail: detail.map(str::to_string),
             metadata,
             artifact_refs: Vec::new(),
+            artifacts: Vec::new(),
             started_at: Some(now),
             ended_at: Some(now),
         }
@@ -9274,6 +9275,7 @@ fn seed_summary_search_transcript(
                 detail: Some(text),
                 metadata: None,
                 artifact_refs: Vec::new(),
+                artifacts: Vec::new(),
                 started_at: Some(created_at),
                 ended_at: Some(created_at),
             })?;

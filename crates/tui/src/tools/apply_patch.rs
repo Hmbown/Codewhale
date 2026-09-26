@@ -724,7 +724,7 @@ fn build_mutation_metadata(pending: &[PendingWrite], summaries: &[FileSummary]) 
         let Some(old_content) = deleted.original.as_deref() else {
             continue;
         };
-        let Some((create_index, (_, create_summary))) = pending
+        let Some((create_index, (created, create_summary))) = pending
             .iter()
             .zip(summaries)
             .enumerate()
@@ -738,10 +738,17 @@ fn build_mutation_metadata(pending: &[PendingWrite], summaries: &[FileSummary]) 
         };
         matched.insert(delete_index);
         matched.insert(create_index);
-        renames.push(json!({
+        // The destination's bytes are the ones this call wrote, so a rename
+        // carries the same size/sha256 facts as a created or updated file.
+        let mut rename = json!({
             "from": delete_summary.path,
             "to": create_summary.path,
-        }));
+        });
+        if let Some(content) = created.content.as_deref() {
+            rename["size"] = json!(content.len());
+            rename["sha256"] = json!(crate::hashing::sha256_hex(content.as_bytes()));
+        }
+        renames.push(rename);
     }
 
     let mut files = Vec::new();
@@ -756,7 +763,17 @@ fn build_mutation_metadata(pending: &[PendingWrite], summaries: &[FileSummary]) 
         } else {
             "updated"
         };
-        files.push(json!({ "path": summary.path, "outcome": outcome }));
+        // Deleted entries carry neither size nor sha256: no bytes were written.
+        let written = pending
+            .get(index)
+            .and_then(|write| write.content.as_deref())
+            .filter(|_| !summary.deleted)
+            .map(str::as_bytes);
+        files.push(crate::tools::file::mutation_file_entry(
+            &summary.path,
+            outcome,
+            written,
+        ));
     }
 
     let mut diff_parts = Vec::new();
@@ -1705,6 +1722,18 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// The receipt entry a created/updated file must carry: its size and
+    /// SHA-256 are those of the bytes now on disk.
+    fn on_disk_receipt(root: &std::path::Path, path: &str, outcome: &str) -> Value {
+        let bytes = fs::read(root.join(path)).expect("receipt target exists");
+        json!({
+            "path": path,
+            "outcome": outcome,
+            "size": bytes.len(),
+            "sha256": crate::hashing::sha256_hex(&bytes),
+        })
+    }
+
     fn parse_patch_result(result: ToolResult) -> PatchResult {
         serde_json::from_str(&result.content).expect("patch result json")
     }
@@ -2089,7 +2118,7 @@ diff --git a/same.txt b/same.txt
         let mutation = &result.metadata.as_ref().unwrap()["mutation"];
         assert_eq!(
             mutation["files"],
-            json!([{ "path": "test.txt", "outcome": "updated" }])
+            json!([on_disk_receipt(tmp.path(), "test.txt", "updated")])
         );
         assert!(
             mutation["diff"]
@@ -2173,7 +2202,7 @@ diff --git a/same.txt b/same.txt
         let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
         assert_eq!(
             mutation["files"],
-            json!([{ "path": "test.txt", "outcome": "updated" }])
+            json!([on_disk_receipt(tmp.path(), "test.txt", "updated")])
         );
         assert!(
             mutation["diff"]
@@ -2212,7 +2241,7 @@ diff --git a/same.txt b/same.txt
         let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
         assert_eq!(
             mutation["files"],
-            json!([{ "path": "new_file.txt", "outcome": "created" }])
+            json!([on_disk_receipt(tmp.path(), "new_file.txt", "created")])
         );
         assert!(
             mutation["diff"]
@@ -2257,8 +2286,8 @@ diff --git a/same.txt b/same.txt
         assert_eq!(
             metadata["mutation"]["files"],
             json!([
-                { "path": "one.txt", "outcome": "updated" },
-                { "path": "two.txt", "outcome": "created" }
+                on_disk_receipt(tmp.path(), "one.txt", "updated"),
+                on_disk_receipt(tmp.path(), "two.txt", "created")
             ])
         );
         let mutation_diff = metadata["mutation"]["diff"]
@@ -2479,14 +2508,22 @@ diff --git a/delete.txt b/delete.txt
         assert_eq!(
             mutation["files"],
             json!([
-                { "path": "update.txt", "outcome": "updated" },
-                { "path": "create.txt", "outcome": "created" },
+                on_disk_receipt(tmp.path(), "update.txt", "updated"),
+                on_disk_receipt(tmp.path(), "create.txt", "created"),
+                // A deleted entry carries neither size nor sha256.
                 { "path": "delete.txt", "outcome": "deleted" }
             ])
         );
+        // The rename carries the destination's written bytes.
+        let renamed = fs::read(tmp.path().join("new.txt")).expect("renamed bytes");
         assert_eq!(
             mutation["renames"],
-            json!([{ "from": "old.txt", "to": "new.txt" }])
+            json!([{
+                "from": "old.txt",
+                "to": "new.txt",
+                "size": renamed.len(),
+                "sha256": crate::hashing::sha256_hex(&renamed),
+            }])
         );
         let exact = mutation["diff"].as_str().expect("exact mutation diff");
         assert!(exact.contains("rename from old.txt"), "{exact}");

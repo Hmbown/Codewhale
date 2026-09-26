@@ -141,6 +141,116 @@ fn snapshot_notice_precedes_first_provider_call_and_is_owned_by_session() {
     drop(runtime);
 }
 
+/// A file-mutating call's result names the `tool:<call>` snapshot taken just
+/// before it ran, tagged with the engine session, so a host can offer the
+/// exact restore point for that write. A read-only call names none.
+#[test]
+fn file_mutation_result_names_its_restore_snapshot() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    let _env = lock_test_env();
+    let root = tempdir().unwrap();
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let _user_home = EnvVarGuard::set("HOME", root.path());
+    let _user_profile = EnvVarGuard::set("USERPROFILE", root.path());
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("README.md"), "fixture\n").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let config = Config::default();
+        let client = std::sync::Arc::new(MockLlmClient::new(vec![
+            canned::tool_call_turn(
+                "call-write",
+                "File",
+                r#"{"action":"write","path":"out.md","content":"out\n"}"#,
+            ),
+            canned::tool_call_turn(
+                "call-read",
+                "File",
+                r#"{"action":"read","path":"README.md"}"#,
+            ),
+            canned::simple_text_turn("done"),
+        ]));
+        let (engine, handle) = Engine::new_with_model_client(
+            EngineConfig {
+                session_id: Some("session-restore".into()),
+                snapshots_enabled: true,
+                snapshots_max_workspace_bytes: 0,
+                ..deterministic_engine_config(&workspace)
+            },
+            &config,
+            client,
+        );
+        let run = tokio::spawn(engine.run());
+        let Op::SendMessage(mut spec) =
+            external_user_message_op("write out.md", AppMode::Agent, &config)
+        else {
+            unreachable!("external_user_message_op builds a SendMessage");
+        };
+        spec.auto_approve = true;
+        spec.trust_mode = true;
+        spec.approval_mode = ApprovalMode::Bypass;
+        handle.send(Op::SendMessage(spec)).await.unwrap();
+
+        let mut completions = HashMap::new();
+        let mut rx = handle.rx_event.write().await;
+        while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+            .await
+            .expect("turn events")
+        {
+            match event {
+                Event::ToolCallComplete { id, result, .. } => {
+                    completions.insert(id, result.expect("tool result"));
+                }
+                Event::TurnComplete { status, error, .. } => {
+                    assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        drop(rx);
+
+        let write = completions.get("call-write").expect("write completed");
+        assert!(write.success, "{write:?}");
+        let metadata = write.metadata.as_ref().expect("write metadata");
+        let snapshot_id = metadata["restore_snapshot_id"]
+            .as_str()
+            .expect("restore snapshot id");
+        assert_eq!(metadata["restore_snapshot_session_id"], "session-restore");
+        let repo = crate::snapshot::SnapshotRepo::open_existing(&workspace)
+            .unwrap()
+            .expect("snapshot repo");
+        let snapshot = repo
+            .list(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.id.as_str() == snapshot_id)
+            .expect("named snapshot exists");
+        assert_eq!(snapshot.label, "tool:call-write");
+        assert_eq!(snapshot.session_id.as_deref(), Some("session-restore"));
+
+        let read = completions.get("call-read").expect("read completed");
+        assert!(
+            read.metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.get("restore_snapshot_id").is_none()),
+            "a read takes no restore point: {read:?}"
+        );
+
+        handle.send(Op::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .unwrap()
+            .unwrap();
+    });
+    // Await the owned blocking post-turn snapshots before restoring test home.
+    drop(runtime);
+}
+
 #[test]
 fn preview_request_error_preserves_non_semantic_context_chain() {
     let error = anyhow::Error::msg("root cause").context("request preparation failed");

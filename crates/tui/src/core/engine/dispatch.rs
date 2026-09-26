@@ -338,6 +338,24 @@ impl ToolApprovalStamp {
     }
 }
 
+/// Name the `tool:<call>` snapshot taken just before this call ran, and the
+/// session that snapshot is tagged with. `POST /v1/threads/{id}/file-revert`
+/// accepts exactly this id, but only for a thread bound to that session, so a
+/// host must compare the tag before advertising the restore point.
+pub(super) fn stamp_tool_result_restore_point(
+    result: &mut ToolResult,
+    snapshot_id: &str,
+    snapshot_session_id: &str,
+) {
+    let metadata = result.metadata.get_or_insert_with(|| json!({}));
+    if !metadata.is_object() {
+        let prior = std::mem::replace(metadata, json!({}));
+        metadata["_prior"] = prior;
+    }
+    metadata["restore_snapshot_id"] = json!(snapshot_id);
+    metadata["restore_snapshot_session_id"] = json!(snapshot_session_id);
+}
+
 pub(super) fn stamp_tool_result_approval(result: &mut ToolResult, approval: ToolApprovalStamp) {
     let approval_metadata = json!({
         "required": true,

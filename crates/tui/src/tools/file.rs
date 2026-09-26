@@ -612,12 +612,28 @@ fn check_file_operation_cancelled(context: &ToolContext) -> Result<(), ToolError
     Ok(())
 }
 
+/// One `mutation.files[]` receipt entry. `size` and `sha256` describe the
+/// exact bytes this call wrote, recorded where they were written so a turn's
+/// artifact reference never has to re-read (and race) the disk. `sha256` is
+/// plain lowercase hex: the same value `GET /v1/workspace/files/read` reports
+/// as `revision`.
+pub(crate) fn mutation_file_entry(path: &str, outcome: &str, written: Option<&[u8]>) -> Value {
+    let mut entry = json!({ "path": path, "outcome": outcome });
+    if let Some(bytes) = written {
+        entry["size"] = json!(bytes.len());
+        entry["sha256"] = json!(crate::hashing::sha256_hex(bytes));
+    }
+    entry
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn contract_mutation_result(
     context: &ToolContext,
     file_path: &Path,
     requested_path: &str,
     before: &str,
     after: &str,
+    written: &[u8],
     outcome: &str,
     summary: String,
 ) -> ToolResult {
@@ -628,7 +644,7 @@ async fn contract_mutation_result(
         "lsp_diagnostics": diagnostics,
         "mutation": {
             "diff": make_unified_diff(requested_path, before, after),
-            "files": [{ "path": requested_path, "outcome": outcome }],
+            "files": [mutation_file_entry(requested_path, outcome, Some(written))],
             "renames": []
         }
     }))
@@ -1539,6 +1555,7 @@ impl WriteFileTool {
             path_str,
             prior_contents.as_ref(),
             &written,
+            written.as_bytes(),
             outcome,
             format!("Successfully wrote {utf16_units} bytes to {path_str}"),
         )
@@ -1689,7 +1706,7 @@ impl ToolSpec for WriteFileTool {
             "event": "file.mutation",
             "mutation": {
                 "diff": receipt_diff,
-                "files": [{ "path": path_str, "outcome": outcome }],
+                "files": [mutation_file_entry(path_str, outcome, Some(written.as_bytes()))],
                 "renames": []
             }
         })))
@@ -2247,7 +2264,7 @@ impl EditFileTool {
         } else {
             final_content.clone().into_bytes()
         };
-        run_blocking_write_atomic(&file_path, bytes).await?;
+        run_blocking_write_atomic(&file_path, bytes.clone()).await?;
         check_file_operation_cancelled(context)?;
         context.note_file_read(&file_path);
         drop(mutation_guard);
@@ -2258,6 +2275,7 @@ impl EditFileTool {
             path_str,
             &raw,
             &final_content,
+            &bytes,
             "updated",
             format!(
                 "Successfully replaced {} block(s) in {path_str}.",
@@ -2557,7 +2575,7 @@ impl ToolSpec for EditFileTool {
             "event": "file.mutation",
             "mutation": {
                 "diff": receipt_diff,
-                "files": [{ "path": path_str, "outcome": "updated" }],
+                "files": [mutation_file_entry(path_str, "updated", Some(updated.as_bytes()))],
                 "renames": []
             }
         })))

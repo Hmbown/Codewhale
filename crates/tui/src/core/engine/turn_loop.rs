@@ -8,6 +8,7 @@
 use super::dispatch::{
     FLEET_FINAL_REPORT_NOTICE, FLEET_NO_PROGRESS_STOP, FLEET_STRATEGY_SWITCH_NOTICE,
     FleetDenialAction, FleetDenialBatch, FleetDenialGuard, normalize_schema_json_containers,
+    stamp_tool_result_restore_point,
 };
 use super::*;
 use crate::core::authority::{ToolPermission, resolve_tool_permission};
@@ -4470,6 +4471,10 @@ impl Engine {
                     // state before file-modifying tools execute so `/undo` can
                     // revert the most recent write_file/edit_file/apply_patch.
                     // See `should_pre_tool_snapshot` for the gating rationale (#3292).
+                    // The id is kept: it is this call's exact restore point, and
+                    // the result receipt names it (with the session it is tagged
+                    // with) so a host can offer file-revert for the write.
+                    let mut restore_point: Option<(String, String)> = None;
                     if should_pre_tool_snapshot(
                         self.config.snapshots_enabled,
                         result_override.is_some(),
@@ -4480,10 +4485,14 @@ impl Engine {
                         let tid = tool_id.clone();
                         let cap = self.config.snapshots_max_workspace_bytes;
                         let sid = self.session.id.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
+                        let tagged_session = sid.clone();
+                        restore_point = tokio::task::spawn_blocking(move || {
                             crate::core::turn::pre_tool_snapshot(&ws, &tid, cap, Some(&sid))
                         })
-                        .await;
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|id| (id, tagged_session));
                         self.emit_pending_snapshot_notices().await;
                     }
 
@@ -4569,6 +4578,16 @@ impl Engine {
                         && let Ok(tool_result) = result.as_mut()
                     {
                         stamp_tool_result_approval(&mut tool_result.result, approval_stamp);
+                    }
+                    if let Some((snapshot_id, snapshot_session)) = restore_point.as_ref()
+                        && !cancelled_before_completion
+                        && let Ok(tool_result) = result.as_mut()
+                    {
+                        stamp_tool_result_restore_point(
+                            &mut tool_result.result,
+                            snapshot_id,
+                            snapshot_session,
+                        );
                     }
 
                     let original_content_digest = result
