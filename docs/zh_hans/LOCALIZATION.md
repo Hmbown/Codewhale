@@ -3,12 +3,12 @@
 > 英文原文：[LOCALIZATION.md](../LOCALIZATION.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-26。
 
-Codewhale 已发布、正在构建、已排期或明确搁置的每个区域设置（locale），都以本文档为准。
+凡 Codewhale 已发布、正在构建、已排期或明确搁置的区域设置（locale），都以本文档为准。
 
 > **范围说明（2026-07-12）：** 本矩阵覆盖三个层面——TUI 语言包
 > （`crates/localization/locales/`）、已翻译的 README（仓库根目录），以及网站（`web/`）。
 > 三者发布节奏不同，所以同一个区域设置可能在某个层面已**发布**、在另一个层面还是
-> **已排期**；下面每个层面各有一张表，那张表只讲自己层面的事实。网站注册表是
+> **已排期**；下面每个层面各有一张表，每张表只讲自己层面的事实。网站注册表是
 > `web/lib/i18n/config.ts`（`ALL_LOCALES`）：区域设置切换器和路由生成都从它派生。
 >
 > 文档翻译**不属于**区域设置层面：它们放在 `docs/zh_hans/` 和 `docs/id/` 下，
@@ -62,8 +62,8 @@ Codewhale 已发布、正在构建、已排期或明确搁置的每个区域设�
 `ALL_LOCALES`——只有这一个注册表，不再另建一套分类。**partial** 的区域设置照样有路由，
 也能在切换器里选中，只是带一个可见的 `(partial)` 标记；它们的词典
 （`web/lib/i18n/dictionaries/<code>/`）覆盖共用的界面框架
-（masthead、nav、mobile menu、theme toggle、live ticker、footer、switcher）和首页，
-并由 `npm run check:locales` 与 `web/lib/i18n/dictionaries.test.ts` 要求
+（masthead、nav、mobile menu、theme toggle、live ticker、footer、switcher）和首页。
+这些词典由 `npm run check:locales` 与 `web/lib/i18n/dictionaries.test.ts` 要求
 与英文参照键完全对等。这个范围之外的一切都渲染英文页面文案——这是有意设计的回退，
 屏幕上绝不会出现词典的键名。
 
@@ -78,13 +78,13 @@ Codewhale 已发布、正在构建、已排期或明确搁置的每个区域设�
 词典——不要在它旁边再加 `gt-next`。`web/gt-catalog/[locale].json` 是本地的
 JSON 交换格式（先做 `en` + 已上线的 `zh`）。`npm run i18n:gt -- export` 从词典
 导出 catalog；`check`（挂在 `check:locales` 上）要求两者一致；`import` 只把审阅过的
-JSON 写回网站的词典 TS。除非环境里设了 BYOK 的 `GT_API_KEY` 和 `GT_PROJECT_ID`，
-否则 `translate` 一律失败关闭——这两个值绝不能提交，也绝不要把这份配置指向
-`crates/localization/locales`，更不要用它包裹模型补全。`gt generate` 不用：
+JSON 写回网站的词典 TS。`translate` 一律失败关闭，除非环境里设好 BYOK 的
+`GT_API_KEY` 和 `GT_PROJECT_ID`——这两个值绝不能提交，也绝不要把这份配置指向
+`crates/localization/locales`，更不要用它包裹模型补全。`gt generate` 不使用：
 它是框架的 JSX 扫描器，不是 JSON catalog 工具。参照形状：**`ChromeDict` 52 个键、
 `HomeDict` 62 个键。** 双语次级导航标签、masthead 的印章与期号行、ticker 的 live 标签，
 以及按区域设置取值的 `Intl` 日期标记，都是词典的值——
-不会出现某个区域设置意外渲染出另一种语言文字的情况。
+不会有哪个区域设置意外渲染出另一种语言的文字。
 
 | 区域设置 | 代码 | 状态 | 备注 |
 |--------|------|--------|-------|
@@ -106,8 +106,8 @@ JSON 写回网站的词典 TS。除非环境里设了 BYOK 的 `GT_API_KEY` 和 
 
 每个 partial 区域设置都带完整的 52/62 键集（见 `npm run check:locales`）；
 界面框架和首页是真正翻译过的，不是英文直接透传——非英文语言包里只要有成句的英文取值，
-`dictionaries.test.ts` 就会失败。v0.9.4 新增的字符串按各自语言包其余部分的同一标准
-机翻，并且**等待母语者审核**，与上面 TUI 语言包的情况一致。
+`dictionaries.test.ts` 就会失败。v0.9.4 新增的字符串，机翻标准与各自语言包其余部分
+相同，并且**等待母语者审核**——这一点与上面的 TUI 语言包一致。
 
 partial 区域设置在网站上还差的范围（下一波）：首页之外的逐页正文，以及
 `generateMetadata` 的标题和描述；`web/lib/content/` 下 `{ en, zh }` 的共享内容模块；
@@ -160,8 +160,8 @@ partial 区域设置在网站上还差的范围（下一波）：首页之外的
 
 ## 如何新增一个区域设置
 
-下面三个层面都对某个区域设置处理完——要么发布它，要么在本矩阵里给它一行明确的
-`planned`/`partial`/`deferred`——它才算“加好了”。
+只有下面三个层面都处理完——要么发布该区域设置，要么在本矩阵里给它一行明确的
+`planned`/`partial`/`deferred`——一个区域设置才算“加好了”。
 
 ### 1. TUI 语言包
 
@@ -171,7 +171,7 @@ partial 区域设置在网站上还差的范围（下一波）：首页之外的
 2. 在 `crates/localization/src/lib.rs` 里加上 `Locale` 枚举变体，以及它的
    `tag`/`translation_target_name`/`parse_locale`/`shipped`/`shipped_complete` 分支，
    并在测试模块里加上 `include_str!` 分支。
-3. 把手写枚举区域设置的地方接上。`locale` 设置项是
+3. 还要把仍然手写枚举区域设置的地方都接上。`locale` 设置项是
    `crates/config/src/settings_schema.rs` 里的一行普通字符串，由
    `normalize_configured_locale` 校验（它复用第 2 步的 `parse_locale`）；`/config`
    的取值列表（`crates/tui/src/tui/views/mod.rs` 里的 `config_choice_values`）和提示文字
@@ -184,14 +184,14 @@ partial 区域设置在网站上还差的范围（下一波）：首页之外的
    （`crates/tui/src/tui/onboarding/language.rs`）加一条 `LANGUAGE_OPTIONS` 条目；
    不加的话，它的 `picker_offers_every_shipped_locale` 测试会失败。有几个
    “不泄漏英文”的测试（例如 `status_picker.rs` 和 `tool_card.rs` 里的）显式列出了
-   区域设置；语言包补齐后，把新 tag 加进去。
+   区域设置；语言包补齐后，记得把新 tag 加进去。
 4. 运行 `python3 scripts/check-tui-locale-parity.py` 和
    `cargo test -p codewhale-tui localization`。
 5. 如果语言包必须带着缺口发布，就声明它是 partial：不要放进 `shipped_complete()`，
    在 `is_partial_pack()` 里标出，并把 tag 连同跟踪 issue 加进
    `scripts/check-tui-locale-parity.py` 的 `PARTIAL_PACKS`。目前没有任何语言包是 partial——
    `PARTIAL_PACKS` 是空的，`is_partial_pack()` 对每个已发布区域设置都返回 false——
-   所以要重新打开英文回退这条路，只有新增条目这一种方式。
+   也就是说，要重新打开英文回退这条路，只有新增条目这一个办法。
 
 ### 2. README
 
@@ -205,7 +205,7 @@ partial 区域设置在网站上还差的范围（下一波）：首页之外的
 
 1. 在 `web/lib/i18n/config.ts` 的 `ALL_LOCALES` 里新增或切换区域设置条目——
    切换器、路由、中间件、站点地图和 hreflang 都从它派生，所以不必单独改切换器。
-   如果某个区域设置先发布了界面框架加首页的词典范围、还没做到全页面对等，
+   如果某个区域设置先只发布到“界面框架 + 首页”的词典范围，还没做到全页面对等，
    就用 `partial` 状态。
 2. 按照英文参照的形状（`dictionaries/en/`）新建
    `web/lib/i18n/dictionaries/<code>/chrome.ts` 和 `home.ts`。
@@ -221,7 +221,7 @@ partial 区域设置在网站上还差的范围（下一波）：首页之外的
 
 ### 加利西亚语（`gl`）和巴斯克语（`eu`）——2026-07-25，见 #4749
 
-这份评估与加泰罗尼亚语语言包（#4749 / #4788）一起做，那份提案问的是：
+这份评估是连同加泰罗尼亚语语言包（#4749 / #4788）一起做的；那份提案问的是：
 加利西亚语和巴斯克语算不算“价值相当的欧洲新增项”，值不值得放在同一波发布。
 
 **结论：两者都搁置。** 理由：
@@ -229,7 +229,7 @@ partial 区域设置在网站上还差的范围（下一波）：首页之外的
 - #4788 支持加泰罗尼亚语的理由很具体：它“有着格外深厚的软件本地化传统和活跃的
   志愿者社区”——这是审校人力上的论据，不是市场规模上的。这个论据搬不过来：
   加利西亚语和巴斯克语的本地化社区明显更小，给它们做语言包，
-  发出去也找不到现实的母语者审核路径。
+  发出去也没有现实路径找到母语者来审核。
 - 加利西亚语使用者已经有可用的降级方案：已发布的 `es-419` 语言包
   （`pt-BR` 在词汇上也很接近）。巴斯克语是孤立语言，没有邻近语言可以顶上——
   三者之中，它的逐字符串审校成本最高，机翻的巴斯克语也最不可信。
@@ -241,7 +241,7 @@ partial 区域设置在网站上还差的范围（下一波）：首页之外的
 （约 8–12k 词），再加上一项长期义务：英文一改，就要同步重译每个受影响的字符串——
 对等门禁会把静默漂移变成 CI 失败，所以没人维护的语言包比没有更糟。没有任何社区成员
 提过对 gl 或 eu 的需求（没有 issue、没有 PR、也没有人提交翻译），而 gl/eu 的基础 tag
-一旦有推动者出现，当天就能干净地通过 `web/middleware.ts` 路由。我们不会发布拿不到
+已经能干净地通过 `web/middleware.ts` 路由——只等推动者出现。我们不会发布拿不到
 母语审核的语言包，也不会为没发布的语言包做宣传。
 
 等这两种语言出现母语者推动者，或者 v0.9.2 之后加泰罗尼亚语的采用情况显示出需求，

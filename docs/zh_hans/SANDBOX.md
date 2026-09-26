@@ -4,7 +4,7 @@
 > 最后与英文同步日期（last synced with English revision）：2026-09-26。
 
 Codewhale 可以执行由模型提出的 shell 命令。审批策略、感知工作区的工具，
-以及操作系统层面的命令包装器，是三套彼此独立的控制手段：一次审批不等于沙箱，
+以及操作系统层面的命令包装器，这三套是彼此独立的控制手段：一次审批不等于沙箱，
 选择 `workspace-write` 也不代表当前平台真的提供了可用的操作系统包装器。
 
 本文只描述已经接入命令执行路径的行为。至于执行到达这条边界之前会先经过哪些
@@ -21,13 +21,12 @@ Codewhale 可以执行由模型提出的 shell 命令。审批策略、感知工
 | 兼容 OpenSandbox 的服务 | 任何受支持的主机 | `sandbox_backend = "opensandbox"` | 外部执行路径 |
 
 仓库里有一个 seccomp 实现模块，还有一份面向未来的 Windows 辅助程序契约
-（helper contract）。两者都没有接入子命令的启动流程，所以 Codewhale 不会把它们
-当作生效中的沙箱对外声明。只有沙箱源码，不能证明某条命令真的
-被限制过。
+（helper contract）。两者都没有接入子命令的启动流程，所以 Codewhale 不会对外声明它们
+是生效中的沙箱。光有沙箱源码，不能证明某条命令真的被限制过。
 
 ## macOS：Seatbelt
 
-Codewhale 用一个最小 profile 探测 `/usr/bin/sandbox-exec`。探测通过，
+Codewhale 用一个最小 profile 探测 `/usr/bin/sandbox-exec`。当探测通过、
 并且选定的 `SandboxPolicy` 要求沙箱时，子命令外面会套上一层生成的
 Seatbelt profile。
 
@@ -38,7 +37,7 @@ Seatbelt profile。
 - 只有在策略允许时才放开网络访问。
 
 探测失败，或 `sandbox-exec` 不可用时，Codewhale 会报告未启用操作系统沙箱，
-并直接启动命令、不套 Seatbelt 包装器；这条回退路径上也不会打任何 Seatbelt 标记。
+直接启动命令，不套 Seatbelt 包装器。这条回退路径上也不会打任何 Seatbelt 标记。
 
 ## Linux：需要主动启用的 bubblewrap
 
@@ -69,25 +68,25 @@ prefer_bwrap = true
 
 沙箱总会拿到私有的 `/dev`（全新的设备节点，所以 `>/dev/null` 照常可用）、
 私有的 `/proc`，以及 tmpfs 挂载的 `/tmp`（#5410）。还有两个可选的顶层配置项
-可以扩展挂载：`bwrap_ro_roots`（把额外的主机路径以只读方式 bind mount 进来，
-最后才应用，因此能够收窄策略允许写入的路径）和 `bwrap_dev_roots`（把主机的
-字符/块设备节点以读写方式 bind mount 进来；目录一律不予采纳）。路径不存在时
+可以扩展挂载：`bwrap_ro_roots` 把额外的主机路径以只读方式 bind mount 进来，
+最后才应用，因此能够收窄策略允许写入的路径；`bwrap_dev_roots` 把主机的
+字符/块设备节点以读写方式 bind mount 进来，目录一律不予采纳。路径不存在时
 静默跳过。
 
 这样，子进程看到的是一个只读的根视图。在 `workspace-write` 下，每一个安全且
 确实存在的策略根都会以读写方式挂载：工作目录、配置的额外根目录、未被排除的
-`/tmp` 和 `TMPDIR`，以及经过校验的 Git worktree 元数据根。已存在的
-`.codewhale` 和 `.deepseek` 子路径会在其可写父目录之后重新挂为只读。不存在的
+`/tmp` 和 `TMPDIR`，以及经过校验的 Git worktree 元数据根。已经存在的
+`.codewhale` 和 `.deepseek` 子路径，会在可写父目录挂好之后重新挂为只读。不存在的
 路径、非目录路径以及 `/`，都不会被提升为可写挂载。
 
-在 `read-only` 下没有任何可写绑定，工作目录仍然处在只读根视图之内。
+在 `read-only` 下没有任何可写绑定，所以工作目录仍留在只读根视图里。
 `--unshare-all` 默认隔离网络命名空间；只有当策略中的 `network_access` 为 true
 时，Codewhale 才补上 `--share-net`。`danger-full-access` 和 `external-sandbox`
 完全绕过本地包装器。
 
 如果用户没有主动启用，或者 `/usr/bin/bwrap` 不存在、不可执行，Codewhale 会
-报告 `none`，并在没有 Linux 操作系统包装器的情况下启动命令。这里没有"只打个
-标记"就当成另一种 Linux 沙箱的回退做法。
+报告 `none`，直接启动命令，不带任何 Linux 操作系统包装器。这里没有回退做法：
+不会只打个标记，就把它当成另一种 Linux 沙箱。
 
 如果这套主动启用的方案适合你的工作流，请另行安装 bubblewrap：
 
@@ -100,7 +99,7 @@ Codewhale 不自带 bubblewrap。
 ## Windows：不声明任何操作系统沙箱
 
 Windows 上的命令路径目前报告未启用操作系统沙箱。源码树里有一份面向未来的辅助
-程序契约，用于清理 Job Object 进程树，但它没有接入选择逻辑，也不能被描述成
+程序契约，用于清理 Job Object 进程树，但它没有接入选择逻辑，也不能说成
 下面任何一种能力：
 
 - 只读文件系统或 workspace-write 的强制执行；
@@ -117,14 +116,14 @@ Windows 主机的权限和审批策略仍然适用，但它们不是 Codewhale �
 启动继续进行。这些控制可以降低进程被窥探、权限被提升以及产生 core dump 的风险；
 它们不为子命令建立文件系统或网络隔离，也不会被列为沙箱后端。
 
-唯一的例外是启动姿态（posture）本身：当启动沙箱模式解析为
+唯一的例外是启动姿态（posture）本身。当启动沙箱模式解析为
 `danger-full-access`（通过 `CODEWHALE_SANDBOX_MODE` 或配置文件里的
 `sandbox_mode` 键）时，Codewhale 会跳过 `PR_SET_NO_NEW_PRIVS`，好让
 `sudo`/`su`/setuid 辅助程序能在 agent shell 里照常工作（#5723）——
 "full access" 就是这个意思。任何更窄的启动姿态都会保留该标志作为纵深防御，
 而 `CODEWHALE_NO_NEW_PRIVS` 可以双向覆盖姿态（#5413）：假值一律跳过该标志，
-真值一律设置它。该标志对进程树不可逆，所以只能在启动时决定；会话内单次调用的
-沙箱升级无法解除它。
+真值一律设置它。该标志对整个进程树都不可逆，所以只能在启动时决定；会话内单次调用升级沙箱，
+也无法解除它。
 
 ## 外部 OpenSandbox 执行
 
@@ -156,7 +155,7 @@ sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-acc
   跳过 `PR_SET_NO_NEW_PRIVS` 进程加固标志，让 `sudo`/setuid 工作流继续可用
   （#5723）；见上面的进程加固一节。
 - `external-sandbox` 表示执行已经在外部隔离，因此不再套第二层本地包装器。
-- 没有选中任何包装器时，shell 命令就在没有 Codewhale 操作系统隔离的情况下运行。
+- 没有选中任何包装器时，shell 命令运行时就没有 Codewhale 的操作系统隔离。
   审批规则和感知工作区的原生文件工具仍是彼此独立的控制手段。
 
 `sandbox_mode` 和外部后端都有规范的环境变量覆盖方式：
@@ -171,19 +170,19 @@ sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-acc
 ## 诊断与失败归因
 
 `codewhale setup --status`、`codewhale doctor`、`codewhale doctor --json` 以及
-`diagnostics` 工具，都会在应用解析后的 bubblewrap 偏好之后，报告本地可用的
+`diagnostics` 工具，都会先应用解析后的 bubblewrap 偏好，再报告本地可用的
 包装器。只要某条命令的策略不要求沙箱，它仍然可以绕过这个包装器。在 Linux 上，
 仅仅找到某个与沙箱相关的系统调用或源码模块，并不会让 `sandbox_available`
 变成 true。
 
 拒绝归因刻意做得很保守：
 
-- Seatbelt 使用它自己那套特定于包装器的拒绝模式。
-- Bubblewrap 的设置错误必须以 `bwrap:` 开头；来自 bwrap 文件系统视图的只读
+- Seatbelt 用的是它自己那套包装器专属的拒绝模式。
+- Bubblewrap 的设置错误必须以 `bwrap:` 开头；bwrap 文件系统视图报出的只读
   文件系统错误，也能标识出这条边界。
 - 子命令报出的通用 `Permission denied` 或 `Operation not permitted`，
   本身不能证明是 Codewhale 的沙箱挡下了它。
-- 未在沙箱中运行的命令失败，永远不会被标成沙箱拒绝。
+- 没在沙箱中运行的命令一旦失败，永远不会被标成沙箱拒绝。
 
 ## 局限
 
@@ -191,7 +190,7 @@ sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-acc
   出现的竞态而失败。
 - 如果配置的可写根不存在、不是目录，或规范化之后等于 `/`，bubblewrap 会忽略它；
   路径也可能在策略解析与包装器启动之间消失。
-- Seatbelt profile 在运行时生成，必须针对它需要支持的那些命令实测。
+- Seatbelt profile 在运行时生成，必须拿它要支持的那些命令实测过。
 - Windows 上目前没有任何本地包装器对外声明。
 - 外部沙箱后端的安全性，只取决于它所配置的服务。
 - 没有任何沙箱能防住内核漏洞，也不能覆盖所有资源耗尽攻击与侧信道攻击。

@@ -11,8 +11,8 @@
 > [Automatic Workflows](../AUTOMATIC_WORKFLOWS.md)。
 
 Workflow 只有一条运行时边界：编写好的源码先转换成类型化的 Rust `WorkflowSpec`，
-再由 Rust 校验 IR，最后由调度器/无头 worker 运行时执行叶子节点。编写语言不会因此
-获得隐藏权限去掌控文件、shell、网络、提供商（provider）、取消操作或 TUI 状态。
+再由 Rust 校验 IR，最后由调度器/无头 worker 运行时执行叶子节点。编写语言也拿不到
+隐藏权限，无法支配文件、shell、网络、提供商（provider）、取消操作或 TUI 状态。
 
 `workflow` 工具上保留的兼容启动方式：
 
@@ -23,9 +23,10 @@ Workflow 只有一条运行时边界：编写好的源码先转换成类型化�
 | `source_path` | 工作区中已检入的 `.workflow.js` / `.workflow.ts` |
 
 给子任务分配角色之前，先用 `agent(action="roster")` 查看已保存的 Fleet 模型和角色。
-原生 plan 子任务接受 `model` 指定已保存的候选模型，也接受 `role`/`profile` 指定
-已保存的分配方案。具名的 Exact Fleet 会把成员的模型路线固定下来，拒绝按步骤覆盖模型。plan 子任务还接受 `cwd`，即相对于仓库的工作目录——在多仓库工作区里这是
-必需的，好让子代理（以及 worktree 隔离）落到正确的仓库，与 `task({cwd})` 的行为
+原生 plan 子任务可以用 `model` 指定已保存的候选模型，也可以用 `role`/`profile`
+指定保存好的分配方案。具名的 Exact Fleet 会把成员的模型路线固定下来，拒绝按步骤覆盖模型。
+plan 子任务还接受 `cwd`，也就是相对于仓库的工作目录。多仓库工作区里 `cwd` 是
+必需的，有了它，子代理（以及 worktree 隔离）才能落到正确的仓库，行为与 `task({cwd})`
 一致。
 
 想看到从 fleet 任务规格一路走到 Workflow 编写与监控的完整演练，见
@@ -52,7 +53,7 @@ Workflow 脚本**只是协调者**。它自己没有文件系统，也没有 she
 - 按工作需要规划规模，让主机去排队和收敛。
   这些上限是强制约束，不是提前压缩一份合法计划的理由。
 
-主机侧有哪些按失败关闭（fail closed）的接口，见 Workflow 的 JS 沙箱测试。
+主机侧按失败关闭（fail closed）的表面清单，见 Workflow 的 JS 沙箱测试。
 
 ## 语言选择
 
@@ -95,19 +96,19 @@ export default workflow({
 `WorkflowNode` JSON IR 同样有效。
 
 `agent` 节点可以声明 `"profile": "reviewer"`，按某个具名的 fleet 名册 profile
-来运行。这个名字在编译期会被去掉首尾空白并转成小写，而且必须是单个 token
+来运行。编译期会去掉这个名字的首尾空白并转成小写，而且它必须是单个 token
 （不能有空白、引号或 `=`）；已保存的名册在派发时才解析，agent 上显式写出的字段
 会覆盖 profile 的默认值。
 
 运行时的 `task()` 也接受 `cwd`，指向一个已存在的、相对于仓库的工作目录。
-当工作流从多仓库工作区启动，而子代理又需要 shell 或文件访问时，这个参数是必需的。
+工作流从多仓库工作区启动、子代理又需要 shell 或文件访问时，就必须带上这个参数。
 `cwd` 由主机校验，不授予写权限；子代理需要独立检出时，应当同时设置
 `worktree: true`。
 
 编译器会拒绝 `import`、`require`、`fetch`、`process`、`Deno`、`Bun`、
 `child_process`、文件读写、`eval`、`async`、`await` 这类带副作用的写法。
 这是刻意比 JavaScript 更严格：工作流源码只是一种熟悉的声明格式，不是第二个执行
-运行时。这些被禁的副作用并不是对整次运行都禁止——把它们放进子 worker 里，
+运行时。这些副作用只是不让写进脚本，整次运行并没有禁止它们——放进子 worker 里就行，
 那里有完整的工具表面，脚本只管协调。
 
 ## 验证
@@ -124,15 +125,15 @@ export default workflow({
 Workflow 负责计划本身：阶段、分支、循环、归约器和中间结果。fleet 负责持久名册、
 成员身份、语义角色，以及保存下来的提供商/模型绑定或继承关系。Runtime 负责
 工具姿态（tool posture）、启动并发、租约、心跳、日志、回执，以及恢复/停止/重启
-控制。换句话说，工作流负责挑选 fleet 成员并监控它们在 Runtime 上的运行；
-它不是执行者，因为脚本本身没有 shell 也没有文件系统——副作用都发生在 worker 里。
+控制。换句话说，工作流负责挑选 fleet 成员并监控它们在 Runtime 上的运行。
+它本身不是执行者：脚本没有 shell，也没有文件系统，副作用都发生在 worker 里。
 
 在 Workflow IR 被降到选定的 worker 之前，Workflow 到 Runtime 的启动校验会先套上
 一个保守的默认形态：
 
 - 单次 Workflow 运行最多 1,000 个 worker 代理；
-- 同时最多 16 个活 worker 代理；规模更大时会排队（阻塞）在主机按运行设立的并发
-  门禁上，等到有空位后，再通过 fleet 选择、通过 Runtime 执行；
+- 同时最多 16 个活 worker 代理；数量更多时会在主机按运行设立的并发门禁上排队（阻塞），
+  等空出位置后，再经 fleet 选择、由 Runtime 执行；
 - Workflow IR 的结构嵌套不超过 5 层；
 - Runtime 的子级委派默认 3 层，另有可选择启用的 8 层硬上限；这份执行预算与
   Workflow IR 的形态无关；
@@ -147,11 +148,11 @@ DeepSeek 预设可以为编排者推荐 `deepseek-v4-pro`，为就近的 worker 
 ## 实验性搜索是 Workflow 的一个选项
 
 实验性搜索把现成的 best-of-N 做法推广开来，而不新增产品模式、调度器或子代理 API。
-提议中的搜索规格（search spec）会在准入之前固定目标、基线、模型请求与解析后的
-版本、公开证据、评估器哈希、硬门禁、评分规则、预算、写入范围、轮次，以及
-"仅评审"的集成策略；目前它是设计，不是已发布的代码。
+提议中的搜索规格（search spec）会在准入前固定以下内容：
+目标、基线、模型请求与解析后的版本、公开证据、评估器哈希、硬门禁、评分规则、预算、
+写入范围、轮次，以及"仅评审"的集成策略；目前它是设计，不是已发布的代码。
 
 当前的 JS 起步模板通过 `strategy: "search"` 支持结构化生成和只读评审。由 Runtime
 掌管的命令门禁、隐藏评估、基准评分和干净基线重放，都是明确留待接入的主机接缝；
-候选方案自己的评判永远不能升级为评估器的真相。见
+候选方案自己给出的评判，永远不能当成评估器的真相。见
 [Workflow Experimental Search](../WORKFLOW_EXPERIMENTAL_SEARCH.md)。

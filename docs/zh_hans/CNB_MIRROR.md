@@ -4,9 +4,9 @@
 > 最后与英文同步日期（last synced with English revision）：2026-09-26。
 
 `cnb.cool/codewhale.net/codewhale` 是这个 GitHub 仓库的单向镜像，服务那些
-GitHub 慢或无法访问的网络环境（主要是中国大陆）。镜像会收到推送到 `main` 的
-每一次推送、第一方发布工作用到的每个 `fix/*`、`rebrand/*` 和 `work/v*` 分支，
-以及每个 `v*` 发布标签。
+GitHub 慢或无法访问的网络环境（主要是中国大陆）。镜像会收到：`main` 的每一次
+推送，第一方发布工作用到的每个 `fix/*`、`rebrand/*` 和 `work/v*` 分支，以及
+每个 `v*` 发布标签。
 
 ## 来源
 
@@ -14,7 +14,7 @@ GitHub 慢或无法访问的网络环境（主要是中国大陆）。镜像会�
 `github.com/Hmbown/CodeWhale`。CNB 镜像是 `Sync to CNB` 工作流维护的只读副本，
 它存在的唯一目的，是服务 GitHub 被 GFW 封锁或连接缓慢的用户。
 
-每个 CNB 发布都附带 `codewhale-artifacts-sha256.txt` —— 一份 CNB 构建的
+每个 CNB 发布都附带 `codewhale-artifacts-sha256.txt`，这是 CNB 构建的
 Linux x64 二进制的 SHA256 清单，由 GitHub 上打标签的同一个源码提交生成。
 （CNB 从源码构建，所以这些校验和对应的是 CNB 构建的产物，不是 GitHub 的发布
 资产。）用它校验下载下来的二进制文件：
@@ -149,14 +149,14 @@ GitHub 仍是 macOS/Windows 的权威发布矩阵。
 
 在 Linux x64 上，`codewhale update` 会在下载任何大文件之前先选好资产来源。
 确定目标标签后，它会**同时**向 GitHub Releases 和 CNB release 请求该标签的
-`codewhale-artifacts-sha256.txt`，并采用第一个返回、且清单里列出
-`codewhale-linux-x64` 的来源。落后者返回的结果会被丢弃。
+`codewhale-artifacts-sha256.txt`。哪个来源先应答、而且清单里列出了
+`codewhale-linux-x64`，就采用哪个；晚到一方的应答会被丢弃。
 
 这依赖三个性质：
 
-- **清单就是探针。** 它只有几百字节，所以被封锁或响应缓慢的来源，大约在自己
-  连接失败的那点时间里就已经出局 —— 用户不必干等一个卡住的多兆字节资产下载，
-  也没有任何超时替用户做选择。
+- **清单就是探针。** 它只有几百字节，所以被封锁或响应缓慢的来源，大约在它自己
+  连接失败的那一刻就已经出局。用户不必干等一个卡住的多兆字节资产下载，也
+  没有任何超时替用户做选择。
 - **清单和二进制来自同一个来源。** CNB 从打标签的那份源码自行构建产物（musl 静态，
   不是 GitHub 的 glibc 构建），所以两份清单描述的是不同的字节，不能互换。
   胜出的来源同时提供两者；校验和不匹配时更新直接失败，不会退回给输的一方。
@@ -170,11 +170,11 @@ GitHub 仍是 macOS/Windows 的权威发布矩阵。
 其他所有目标平台都只有一个权威来源：CNB 只发布 Linux x64，别的都不发，
 所以 macOS、Windows、Android 和 Linux arm64 不会与 CNB 竞争；Linux riscv64
 仍明确不支持。不过所有受支持的自更新路径都要求校验和：选中的来源必须为确切
-平台的二进制文件发布一条有效的 `codewhale-artifacts-sha256.txt` 记录，
+平台上那个二进制文件发布一条有效的 `codewhale-artifacts-sha256.txt` 记录，
 否则 `codewhale update` 会在下载该二进制文件之前停下。没有未经验证的安装回退。
 
 设置 `CODEWHALE_RELEASE_BASE_URL`（或它的旧别名）或 `CODEWHALE_USE_CNB_MIRROR`
-会完全关闭来源选择：显式指定的来源就按指定的用，包括它自己的校验和清单，
+会完全关闭来源选择：显式指定了哪个来源，就用哪个，包括它自己的校验和清单；
 其中 `CODEWHALE_RELEASE_BASE_URL` 优先于 `CODEWHALE_USE_CNB_MIRROR`。
 
 ### 手动路径
@@ -185,8 +185,8 @@ GitHub 仍是 macOS/Windows 的权威发布矩阵。
   ```bash
   cargo install --git https://cnb.cool/codewhale.net/codewhale --tag vX.Y.Z codewhale-cli --locked
   ```
-  当前的 `codewhale` 二进制文件在进程内运行 TUI。想要那个可选短命令的 Cargo
-  用户，可以在它旁边加一个 `codew` 符号链接；不需要另外安装 `codewhale-tui`。
+  当前的 `codewhale` 二进制文件在进程内运行 TUI。Cargo 用户如果想要那个可选的
+  短命令，可以在它旁边加一个 `codew` 符号链接；不需要另外安装 `codewhale-tui`。
   Linux 构建期依赖（Debian/Ubuntu 上的 `build-essential`、`pkg-config`、
   `libdbus-1-dev`）是必需项 —— 参见
   [INSTALL.md](./INSTALL.md#4-通过-cargo-安装任何-tier-1-rust-目标)。
@@ -195,9 +195,9 @@ GitHub 仍是 macOS/Windows 的权威发布矩阵。
   从 `vX.Y.Z` 的 CNB release 下载 `codewhale-linux-x64`、`codew-linux-x64` 和
   `codewhale-artifacts-sha256.txt`，然后对照清单校验二进制文件。发布的
   `codewhale-tui-linux-x64` 文件是给旧客户端用的桥接文件，当前安装不需要它。
-  在 Linux x64 和 OpenHarmony x64 上，npm 包装器会就确切的包版本并发探测该
-  CNB 校验和清单与 GitHub Releases，并锁定第一个 HTTP 响应和清单都校验通过的
-  来源 —— 它不会等待缓慢的 GitHub 二进制下载。设 `CODEWHALE_USE_CNB_MIRROR=1`
+  在 Linux x64 和 OpenHarmony x64 上，npm 包装器会针对确切的包版本，同时探测
+  该 CNB 校验和清单与 GitHub Releases，然后锁定第一个 HTTP 响应和清单都校验
+  通过的来源；它不会等待缓慢的 GitHub 二进制下载。设 `CODEWHALE_USE_CNB_MIRROR=1`
   可以只走 CNB，设 `CODEWHALE_RELEASE_BASE_URL` 可以跳过这场竞争。其他平台
   必须用 GitHub，或用完整的 `CODEWHALE_RELEASE_BASE_URL` 镜像。
 

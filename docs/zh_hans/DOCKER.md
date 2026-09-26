@@ -49,8 +49,8 @@ docker run --rm -it \
 - 用户状态应放在挂载到 `/home/codewhale/.codewhale` 的数据卷里
 
 这个默认值是有意为之。想保持最小信任边界，就继续用它。如果某个项目需要
-`apt-get`、编译工具链、Node/Python 包管理器、自定义 CA 证书，或 Docker 内其他
-类主机环境的配置，请单独构建一个显式的工具箱镜像，而不要改动默认镜像的约定。
+`apt-get`、编译工具链、Node/Python 包管理器、自定义 CA 证书，或者 Docker 里
+其他类似主机的环境，请另外构建一个显式的工具箱镜像，不要改动默认镜像的约定。
 
 ## 可选：工具箱/自定义镜像
 
@@ -66,8 +66,8 @@ docker build -f docs/examples/Dockerfile.toolbox \
   -t codewhale-toolbox:my-project .
 ```
 
-`latest` 只用于一次性测试。共享项目请把 `CODEWHALE_IMAGE` 固定住，新增软件包
-要像改动其他开发环境一样走审阅。
+`latest` 只用于一次性测试。共享项目请把 `CODEWHALE_IMAGE` 固定住；新增软件包
+要走审阅，就像改动其他开发环境一样。
 
 用同一套工作区和状态挂载运行工具箱镜像：
 
@@ -83,10 +83,10 @@ docker run --rm -it \
 ```
 
 在这个可选镜像里，Codewhale 可以用 `sudo apt-get update`、
-`sudo apt-get install -y <package>` 这类命令。想要可重复的容器，就把这些包烤进
-工具箱 Dockerfile，而不要让长期运行的容器慢慢漂移。
+`sudo apt-get install -y <package>` 这类命令。想要可重复的容器，就把这些包固化进
+工具箱 Dockerfile，别让长期运行的容器慢慢漂移。
 
-不要把 API 密钥、SSH 私钥或其他密钥烤进自定义镜像。API 密钥在运行时传入；
+不要把 API 密钥、SSH 私钥或其他密钥固化进自定义镜像。API 密钥在运行时传入；
 SSH 材料要显式挂载，最好只读，并且只给真正需要它的项目。
 
 ### Compose 工具箱模板
@@ -134,7 +134,7 @@ docker run --rm -it \
 ## 项目引导脚本
 
 Codewhale 不会自动执行 `.codewhale/setup.sh`，也不会自动执行旧版的
-`.deepseek/setup.sh`。如果你留着这类文件当本地项目配方，请显式运行它。
+`.deepseek/setup.sh`。如果你留着这类文件当本地的项目配方，就显式运行它。
 团队共用的环境，优先用提交进仓库的项目脚本或工具箱 Dockerfile，这样环境
 可以被审阅和重建。
 
@@ -155,7 +155,7 @@ docker run --rm -it \
 
 ## 自定义 CA 证书与代理
 
-面对企业代理、dev-sidecar 或自签名的内部服务，最好把受信任的 CA 证书烤进
+企业代理、dev-sidecar、自签名内部服务这类场景，最好把受信任的 CA 证书固化进
 自定义工具箱镜像：
 
 ```dockerfile
@@ -217,8 +217,8 @@ docker run --rm -it \
 
 挂载 `/home/codewhale/.codewhale`，让会话、配置、技能、记忆和离线队列在容器
 重启后依然保留。镜像里也保留 `/home/codewhale/.deepseek` 以兼容旧版本。
-Docker 管理的具名卷是最稳妥的默认选择，因为 Docker 创建它时给的属主就是容器
-可写的：
+Docker 管理的具名卷是最稳妥的默认选择，因为 Docker 创建它时，会把属主设成
+容器能写入的那个用户：
 
 ```bash
 -v codewhale-home:/home/codewhale/.codewhale
@@ -227,8 +227,8 @@ Docker 管理的具名卷是最稳妥的默认选择，因为 Docker 创建它�
 不挂载这个卷，容器每次启动都是全新的。
 
 如果改为绑定挂载主机上已有的目录，镜像会以非 root 的 `codewhale` 用户运行，
-UID/GID 为 `1000:1000`。挂载的目录必须对该用户可写，否则启动时在
-`.codewhale/tasks` 下创建运行时目录会失败。在 Linux 主机上，要么用上面的具名卷，
+UID/GID 为 `1000:1000`。挂载的目录必须对该用户可写，否则启动时创建
+`.codewhale/tasks` 下的运行时目录可能会失败。在 Linux 主机上，要么用上面的具名卷，
 要么显式准备好绑定挂载：
 
 ```bash
@@ -247,7 +247,7 @@ docker run --rm -it \
 ## 非交互 / 流水线用法
 
 stdin 不是 TTY 时，`codewhale` 会退到调度器的一次性模式（`codewhale -c "…"`）。
-把提示词通过 stdin 传进去：
+把提示词用 stdin 传进去：
 
 ```bash
 echo "Explain the Cargo.toml in structured English." | \
@@ -273,10 +273,10 @@ docker buildx build --platform linux/amd64,linux/arm64 -t codewhale .
 需要的 DBus 开发头文件。首次打开会运行 `cargo build --locked`，并安装
 rust-analyzer 和其他编辑器扩展。
 
-源码检出仍从主机挂载。Codewhale 状态和 Cargo 构建产物改用 Docker 具名卷，
-所以当 VS Code 无法提供 POSIX 风格的 `HOME` 变量时（尤其是 Windows）这套配置
-依然可用，构建也不会通过 Windows 绑定挂载写入成千上万个小文件。改动
-Dev Container 配置后要重建容器。
+源码检出仍从主机挂载。Codewhale 状态和 Cargo 构建产物改用 Docker 具名卷。
+这样一来，就算 VS Code 提供不了 POSIX 风格的 `HOME` 变量（Windows 上尤其
+如此），这套配置照样能用，构建也不会经由 Windows 绑定挂载写入数千个小
+文件。改动 Dev Container 配置后要重建容器。
 
 ## 发布状态
 

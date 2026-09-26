@@ -13,8 +13,8 @@ Fleet 和 Workflow 设计上要配合使用，但解决的是问题的不同部�
 **默认的产品路径：** 用自然语言提需求。规模小或耦合紧密的工作，Operate 会在
 当前姿态下直接处理。多步委派使用一份精简的 Workflow 计划：具名步骤、依赖、
 受限范围和完成检查；结果与证据传递给需要它们的步骤。一个受限的独立任务可以
-直接用后台代理（agent）。要继续同一个代理的工作，用 `followup`。后台运行时输入框仍然
-可用，普通的多代理工作也不需要工作流文件。详见：
+直接用后台代理（agent）。要继续同一个代理的工作，用 `followup`。后台任务运行期间，
+输入框依然可用，普通的多代理工作也不需要工作流文件。详见：
 [Automatic Workflows](../AUTOMATIC_WORKFLOWS.md)。
 
 本教程讲的是**手动**的 fleet 任务规范 / 入库 Workflow 路径，面向需要持久宿主
@@ -41,17 +41,17 @@ codewhale fleet init
 /fleet setup
 ```
 
-选一个角色，决定这份配置是继承操作者路由还是固定某个提供商（provider）/模型，选择配置
+选一个角色，决定这份配置是继承操作者路由，还是固定某个提供商（provider）/模型，再选配置
 放在哪里（**This project** → `.codewhale/agents/<role>.toml`，或
 **Personal** → `$CODEWHALE_HOME/agents/<role>.toml`，跨仓库可用，但同 id 的
 项目配置仍是优先级更高的覆盖项），然后审阅确切的文件、权限/工具/路由姿态，
 并保存。保存控件会写明它的效果（"Save to this project" /
-"Save as Personal profile"），替换已有文件时总会再要一次确认。fleet 任务规范
+"Save as Personal profile"），替换已有文件时，一定会再确认一次。fleet 任务规范
 可以用 `worker.agent_profile` 或更短的 `worker.profile` 别名引用任一解析出的
 配置。
 
 这样，fleet 定义就是跨仓库的，而不是某个运行中会话的管辖范围。多仓库操作请从
-共享父工作区启动 Codewhale。配置可用并不等于授予文件系统访问权；会话的工作区、
+共享父工作区启动 Codewhale。配置能用，不等于已经拿到文件系统访问权；会话的工作区、
 显式受信任路径、信任模式和权限姿态仍然拥有最终决定权。
 
 ## 2. 编写 fleet 任务规范
@@ -59,7 +59,7 @@ codewhale fleet init
 `codewhale fleet run` 接受 JSON 或 TOML。入库的
 `docs/examples/fleet-dogfood.toml` 是贴近真实场景的手动冒烟示例；下面的 JSON
 展示同样的编写形态，包含一个只读 reviewer 和一个受限的文档笔记 worker。
-实时的 Runtime 策略控制密钥与信任；fleet 身份两者都不携带。
+密钥与信任由 Runtime 的实时策略控制，fleet 身份两个都不带。
 
 ```json
 {
@@ -143,7 +143,7 @@ codewhale fleet init
 | `retry_policy`, `timeout_seconds`, `budget` | 重试与预算控制。 |
 
 不要在新建的 fleet 任务规范里写 `security_policy` 或 worker 的 `trust_level`。
-这些旧字段只对旧的账本回放仍然可读，新运行的校验会拒绝它们。项目信任、
+这些旧字段只有回放旧账本时还能读，新运行的校验会拒绝它们。项目信任、
 文件系统/网络可达范围、密钥、审批、沙箱和工具权限，都是 Runtime 的策略输入。
 
 ## 3. 启动并监控 fleet
@@ -173,7 +173,7 @@ codewhale fleet stop --all
 ```
 
 `resume` 用于 manager 退出、笔记本休眠或租约过期之后的重启恢复。它会回放账本，
-对过期的工作对账，但不会创建新的运行。
+把过期的工作对账处理掉，但不会创建新的运行。
 
 ## 4. 编写 Workflow
 
@@ -233,8 +233,8 @@ export default workflow({
 fleet 名册配置；显式的 agent 字段会覆盖配置里的默认值。
 
 面向模型的 `workflow` 工具可以用内联源码或 `source_path` 启动、运行、检查或
-取消一个工作流。当 Codewhale 走这条路径时，如果该工作流会启动多个 worker 或
-改动文件，先让它展示计划。
+取消一个工作流。当 Codewhale 走这条路径时，要是该工作流会启动多个 worker 或
+改动文件，就先让它把计划展示出来。
 
 ## 5. 自然语言入口
 
@@ -251,5 +251,5 @@ them.
 对工作流，请让 Codewhale 起草一个 `.workflow.js` 文件、展示计划，
 并且只在批准之后再走 workflow 工具路径。
 
-这一步审阅是有意设计的。它让提供商路由、DeepSeek 或其他模型支持、可写路径、
-网络访问和密钥使用都保持显式，然后才启动持久 worker。
+这一步审阅是有意设计的。它会在启动持久 worker 之前，把提供商路由、DeepSeek 或其他
+模型支持、可写路径、网络访问和密钥使用都摆到明面上。

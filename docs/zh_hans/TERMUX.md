@@ -17,8 +17,8 @@ Codewhale 为 [Termux](https://termux.dev) 提供 Android arm64 的构建与发�
 让命令装进 `$PREFIX/bin`。已经直接安装过的，用 `codewhale update` 更新；
 由包管理器安装的文件，仍归包管理器管。
 
-如果某个发行版没有兼容的 Android 归档，或者你在验证自己从源码构建的产物，
-Termux 里还可以用 Cargo 作为预览期的备选方案：
+如果某个发行版没有兼容的 Android 归档，或者你想验证自己从源码构建的产物，
+Termux 里还有 Cargo 这个预览期备选方案：
 
 ```sh
 pkg install -y rust clang pkg-config make git
@@ -39,31 +39,31 @@ macOS/Linux 通用的 Web 安装脚本不是 Android 的安装途径。
    [Android 应用沙箱](https://source.android.com/docs/security/app-sandbox)
    与 [Termux 文件系统布局](https://github.com/termux/termux-packages/wiki/Termux-file-system-layout)。
 2. **Codewhale 的逐命令沙箱后端**——Seatbelt（macOS）或需要手动开启的
-   bubblewrap 封装（Linux）能进一步限制子命令可以访问什么。
+   bubblewrap 封装（Linux）能进一步限制子命令可访问的范围。
    Android 上 Codewhale 目前不提供这一层。
 3. **Codewhale 自身的门禁**——工作区信任、审批提示、`allow_shell`/`disallowed-tools`，
-   以及文件工具的权限系统。这些走的是跨平台应用代码路径；
-   它们在 Android 上的行为还需要下文跟踪的真机 QA。
+   以及文件工具的权限系统。这些都跑在跨平台的应用代码路径上；
+   它们在 Android 上的行为仍待下文跟踪的真机 QA 验证。
 
 ### Codewhale 沙箱后端：无
 
 Codewhale 现有的 Seatbelt 与 Linux bubblewrap 集成都不面向 Android。
 因此在 Android 上，`codewhale doctor --json` 报告的沙箱状态是
-`{"available": false, "kind": null}`。这个状态说的是缺少 Codewhale 额外的子进程沙箱，
+`{"available": false, "kind": null}`。这个状态说的是 Codewhale 那层额外的子进程沙箱不存在，
 并不代表 Android 或 Termux 没有操作系统层面的隔离。
 
 - Android 上 `get_platform_sandbox()` 返回 `None`。
 - Android 构建里没有编入任何 Linux 专用的 bubblewrap 封装——它受
   `#[cfg(target_os = "linux")]` 约束，而 Rust 把 `android` 视作与 `linux` 不同的目标。
 - Shell 命令仍在 Termux 的 Android 应用边界内，但不会受到 Codewhale 特有的
-  文件系统收窄限制。凡是 Termux 能访问的位置，包括用户授予的共享存储，
+  文件系统收窄限制。凡是 Termux 能访问的位置——包括用户授予的共享存储——
   都要当作你批准的命令也可能访问到的地方。
 
 ### 审批：依然生效
 
 Codewhale 的审批系统（针对高风险操作的交互式提示、`allow_shell`、
 `--disallowed-tools`）实现在应用层，与操作系统沙箱无关。Android 代码路径已经存在，
-但它的交互行为仍需 #4242 跟踪的真机 QA。
+但它的交互行为仍待 #4242 跟踪的真机 QA 验证。
 
 ### 密钥存储：基于文件
 
@@ -72,7 +72,7 @@ Codewhale 的 Termux/原生构建没有受支持的操作系统密钥环后端
 [Android Keystore](https://developer.android.com/privacy-and-security/keystore)）。
 所以它回退到**基于文件的密钥存储**：`~/.codewhale/secrets/`（Termux 主目录）下的
 明文 JSON 文件，只靠 `0600` 文件权限保护——它们**落盘时不加密**。
-在单用户 Termux 上，这与 `~/.ssh` 私钥所用的 Unix 权限模式相同；落盘同样不加密。
+在单用户 Termux 上，这与 `~/.ssh` 私钥的 Unix 权限模式相同；落盘同样不加密。
 
 - 通过设置向导、`/provider` 或 `codewhale auth set` 保存的密钥会写进
   `~/.codewhale/config.toml`，并镜像到 `~/.codewhale/secrets/secrets.json`。
@@ -94,7 +94,7 @@ Android 上，`codewhale update` 索取的是 `codewhale-android-arm64` 发布�
 | Codewhale 密钥环后端 | ❌ 不可用 | 回退到基于文件的密钥存储 |
 | 审批 / 门禁 | ⚠️ 已实现 | 待真机 QA |
 | 文件工具 | ⚠️ 已实现 | 待真机 QA |
-| 自更新 | ⚠️ 已实现发布文件选择 | 待发布文件与真机 QA |
+| 自更新 | ⚠️ 已实现发布文件选择 | 发布文件与真机 QA 都待验证 |
 | Shell 执行 | ⚠️ 仅有应用边界 | 没有 Codewhale 特有的收窄；待运行时 QA |
 
 ## 相关 issue

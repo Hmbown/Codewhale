@@ -4,9 +4,9 @@
 > 最后与英文同步日期（last synced with English revision）：2026-09-26。
 
 这篇文档记录实测数据：Codewhale 的构建和测试各要多久，为了让贡献者的开发循环
-更快改了什么，哪些又推迟了。数字来自一台机器（Apple Silicon，14 核，rustc 1.97.0，
+更快做了哪些改动，哪些又推迟了。数字来自一台机器（Apple Silicon，14 核，rustc 1.97.0，
 Xcode 26.2 `ld-1230`），采集时还跑着另外四个 cargo 任务（1 分钟负载均值 10–27，
-每个数字旁边都记了当时的负载），所以把它们当作前后对比的相对证据，不要当基准测试结果。
+每个数字旁边都记了当时的负载），所以把这些数字当作前后对比的相对证据，不要当基准测试结果。
 
 > 拆分计划：[TUI_DECONSTRUCTION.md](../design/TUI_DECONSTRUCTION.md) 记录了 9 月 9 日的
 > 源码审计和当前建议的抽取顺序。下面的测量都是历史数据；B3 和“推迟”两处的候选清单
@@ -31,7 +31,7 @@ Xcode 26.2 `ld-1230`），采集时还跑着另外四个 cargo 任务（1 分钟
 - `crates/tui` 约有 74.6 万行 Rust（其中 60.9 万行非测试代码，13.7 万行内联测试
   分布在 488 个 `#[cfg(test)]` 模块里，另有 1.06 万个 `#[test]`/`#[tokio::test]`
   函数）。它按一个 crate 编译，所以这个 crate 的前端就是每次构建的关键路径，
-  而每次单元测试都会带上 `cfg(test)` 重新编译它。
+  而每跑一次单元测试，都要带上 `cfg(test)` 把它重新编译一遍。
 - 依赖已经精简过了（`reqwest` 用 rustls-no-provider，`image` 只要 png，
   `syntect` 用 default-fancy，`rmcp` 不带默认特性，`mimalloc` 不带默认特性）。
   `cargo tree -d` 只报常规重复（`toml` 0.8/1.1、`thiserror` 1/2、`strum` 0.27/0.28、
@@ -40,13 +40,13 @@ Xcode 26.2 `ld-1230`），采集时还跑着另外四个 cargo 任务（1 分钟
   `rusty-alloc` cargo 特性会把它换成纯 Rust 重写的 `rusty_alloc`（#5872）。用
   `cargo build -p codewhale-cli --no-default-features --features rusty-alloc`
   （或 `-p codewhale-tui`）可以排除 mimalloc 及其 C 构建依赖。Cargo 特性是叠加的：
-  只写 `--features rusty-alloc` 时默认的 mimalloc 依赖依然在，即使分配工作已经
-  交给 Rust 分配器。这样做能去掉分配器的 C 构建路径；其他原生依赖可能仍然需要
-  C 工具链。两个分配器特性都不开时，用标准库的系统分配器。
+  只写 `--features rusty-alloc` 时，即使分配工作已经交给 Rust 分配器，默认的
+  mimalloc 依赖依然在。这样做能去掉分配器的 C 构建路径；其他原生依赖可能仍然
+  需要 C 工具链。两个分配器特性都不开时，用标准库的系统分配器。
 - `[profile.dev] debug = "line-tables-only"` 已经设好了（#5246），macOS 上 Cargo
   也已经使用 `split-debuginfo = unpacked`。
 - `target/debug` 会超过 50 GB，但那是不同特性集和不同 worktree 长期累积的结果；
-  全新一次的测试构建约 7 GB。
+  一次全新的测试构建约 7 GB。
 
 ## A0 回执（commit 533c530b + 封闭性修复；空 target 目录）
 
@@ -70,11 +70,11 @@ a0-incremental-lib-test-timing.html、a0-llvm-lines-top40.txt）。
 3.2 s，`syn` 3.1 s，`rio-vt` 3.1 s，`regex-automata` 3.0 s。增量报告里只有一个
 非零单元：`codewhale-tui` 库测试 20.8 s。所以日常要交的“税”就是 tui crate 自己，
 大致一半花在前端（check --tests 14 s），一半花在代码生成加链接（合计 28 s）；
-依赖和链接器都不是耗时所在。
+耗时不在依赖和链接器上。
 
 `cargo llvm-lines -p codewhale-tui --lib`：**8,138,810 行、223,052 份副本**。
 最大的单个函数是 `rust_i18n` 后端闭包（`_RUST_I18N_BACKEND::{closure#0}`，
-311,782 行，单它一个就占这个 crate 的 3.8 %——15 个语言包被 `i18n!` 宏编译进
+311,782 行，单它一个就占了这个 crate 的 3.8 %——`i18n!` 宏把这 15 个语言包都编译进
 一个 match），接着是 `run_event_loop` 2.7 万行、`Engine::run_turn` 2.6 万行、
 `RuntimeThreadManager::monitor_turn` 1.6 万行，然后是 `Config`/`ProvidersConfig`/
 `Settings` 的 serde `Deserialize` 展开（各 5–6 千行，每个 toml 反序列化器都有
@@ -86,7 +86,7 @@ a0-incremental-lib-test-timing.html、a0-llvm-lines-top40.txt）。
 `fancy-regex`、`jsonschema`、`jsonschema-regex`、`referencing` 报警，另外还报了
 过期的 `jni`/`jni-sys`/`redox_syscall` 跳过项。原因：工作区把 `jsonschema` 的 pin
 提到了 0.49，而 `schemaui` 0.12（含最新的 0.12.4）仍然要求 `^0.46`。把工作区
-pin 回 0.46 这一线，第二套 jsonschema 依赖栈就消失了（**685** 个包；deny bans
+pin 改回 0.46 系列，第二套 jsonschema 依赖栈就消失了（**685** 个包；deny bans
 和 advisories 都干净；`--locked` 能解析；codewhale-workflow-js 的 61 个测试和
 tui 的 schema 测试都通过）。冷启动省下的就是那两个重复单元（单元时间约 9 s，
 墙钟约 3 s）。
@@ -102,7 +102,7 @@ tui 的 schema 测试都通过）。冷启动省下的就是那两个重复单�
 | 一个共享的 `CARGO_TARGET_DIR`（已被另一个 worktree 预热） | 121 s | 188 s | 依赖复用；工作区里每个 crate 都要重编（按路径做键）；没观察到等锁；target 14 GB |
 | 每个工作区各自的 `build.build-dir = ".../{workspace-path-hash}"` 加共享的预热 `sccache`（`CARGO_INCREMENTAL=0`） | 107 s | 161 s | sccache 命中率 73.6 %（337 个 Rust 依赖单元全命中；125 次未命中都是工作区 crate）；每个工作区 2.7 GB build 目录加 483 MB 缓存；*填充*缓存的那条命令本身耗时 108 s / 157 s CPU |
 
-每种拓扑里墙钟时间都由 tui crate 决定；这些拓扑买到的是 CPU（约 50 %），
+每种拓扑里，墙钟时间都由 tui crate 决定；这些拓扑换来的是 CPU 的节省（约 50 %），
 而在多份 checkout 同时构建时，省 CPU 才是关键。推荐的用户级
 `~/.cargo/config.toml`（两个根路径按需调整）：
 
@@ -127,9 +127,9 @@ build-dir + sccache 拓扑，所以新 worktree 仍然要往 `./target` 里做�
 
 | 类别 | 改了什么 | 它不是什么 |
 | --- | --- | --- |
-| **编译期** | `scripts/dev-test.sh` / `scripts/dev-cargo.sh` 会设置 `CARGO_BUILD_BUILD_DIR=$CODEWHALE_CACHE_ROOT/build/{workspace-path-hash}`，这样并发的 worktree 就不会抢同一个 Cargo 锁。残留的 `./target`（拆分 build-dir 后 Cargo 仍会往那里写 `CACHEDIR.TAG`）**不会**让隔离失效；如果你确实想留着 `./target`，用 `CODEWHALE_DEV_CACHE=local`。低于 1.91 的 Cargo 会退回按工作区设置 `CARGO_TARGET_DIR`。 | 不能缩小 rustc 编译单元。工作区 crate 照样重编。 |
+| **编译期** | `scripts/dev-test.sh` / `scripts/dev-cargo.sh` 会设置 `CARGO_BUILD_BUILD_DIR=$CODEWHALE_CACHE_ROOT/build/{workspace-path-hash}`，这样并发的 worktree 就不会抢同一个 Cargo 锁。残留的 `./target`（拆分 build-dir 后 Cargo 仍会往那里写 `CACHEDIR.TAG`）**不会**让隔离失效；如果你确实想留着 `./target`，用 `CODEWHALE_DEV_CACHE=local`。Cargo 低于 1.91 时，会退回按工作区设置 `CARGO_TARGET_DIR`。 | 不能缩小 rustc 编译单元。工作区 crate 照样重编。 |
 | **编译期（sccache）** | 只有在增量已经关闭（`CARGO_INCREMENTAL=0` 或 `CODEWHALE_SCCACHE=1`）**且** `sccache` 在 `PATH` 上时，才设置 `RUSTC_WRAPPER=sccache` 和 `SCCACHE_DIR=$CODEWHALE_CACHE_ROOT/sccache/<rustc-commit>`。 | 日常增量循环里不启用。sccache 缓存不了增量单元；包装这类构建只会增加开销，命中率 0%。sccache 缺失时只打印一句回退说明，不算错误。 |
-| **测试运行时** | 装了 `cargo-nextest` 时，`scripts/dev-test.sh` 用 `cargo nextest run`（`CODEWHALE_DEV_NEXTEST=0` 强制走 libtest）。二进制不变；每个测试一个进程。重试次数保持 0。`RUST_MIN_STACK=16MiB` 在未设置时导出。 | 不是编译优化。nextest 不跑 doctest；`cargo test --doc` 仍是单独的门禁。 |
+| **测试运行时** | 装了 `cargo-nextest` 时，`scripts/dev-test.sh` 用 `cargo nextest run`（`CODEWHALE_DEV_NEXTEST=0` 强制走 libtest）。二进制不变；每个测试一个进程。重试次数保持 0。`RUST_MIN_STACK=16MiB` 未设置时会导出。 | 不是编译优化。nextest 不跑 doctest；`cargo test --doc` 仍是单独的门禁。 |
 | **易用性** | `--list` 和路径映射覆盖每个工作区 crate（`app-server`、`workflow-js` 等）。`scripts/dev-cache.sh --status` / `--self-check` 会打印当前拓扑。 | 不改变产品行为。 |
 
 默认值里不含任何机器专属的绝对路径：
@@ -151,13 +151,13 @@ CARGO_INCREMENTAL=0 scripts/dev-cargo.sh test -p codewhale-config --lib --locked
 
 ### 辅助脚本验证（2026-08-15，本 worktree）
 
-记录于其他支线放开机器之后（负载 3.2–5.6）。rustc 1.97.0，cargo 1.97.0，
+记录于其他支线让出机器之后（负载 3.2–5.6）。rustc 1.97.0，cargo 1.97.0，
 sccache 0.17.0。这次运行把 `CODEWHALE_CACHE_ROOT` 设成卷内的一个覆盖路径；
 没有删任何缓存或 target。
 
 对这个 worktree，Cargo 把 `{workspace-path-hash}` 展开成 `build/d4/96565f96fb3682`。
 第一次隔离执行 `codewhale-config` 的 `--no-run` 时创建了一个占位的 `./target`
-（`CACHEDIR.TAG`）；把它当成预热过的传统 target，会让下一条命令重新编译进
+（`CACHEDIR.TAG`）；如果把它当成预热过的传统 target，下一条命令就会重新编译进
 `./target`（8.65 s）。现在除非设置 `CODEWHALE_DEV_CACHE=local` 或 `0`，辅助脚本
 都会保持隔离。
 
@@ -196,7 +196,7 @@ sccache 缺失会走回退。`--list` 覆盖每个工作区 crate。
 ### A3/A4（已测量，未采用）
 
 前端和代码生成在 tui 单元里大致各占一半（增量 14 s / 14 s）；链接器只占其中
-一小部分，而依赖在首次构建后就已经预热，所以 `[profile.dev.package."*"] opt-level = 1`
+一小部分，而依赖在首次构建后就已经预热。所以 `[profile.dev.package."*"] opt-level = 1`
 （配对结果见上）、`-Wl,-dead_strip` 和其他 `RUSTFLAGS` 都不进仓库（它们会作用到
 发布的 profile 上）；macOS 上 `split-debuginfo` 已经是 `unpacked`。
 
@@ -221,9 +221,9 @@ sccache 缺失会走回退。`--list` 覆盖每个工作区 crate。
 lib 和 lib test 两个单元与 CLI 一起排进并发队列，这正是社区成员在 Windows 上为
 OHOS 交叉编译时报告的“两个各占约 4 GB 的 rustc 进程”（不同系统对 RSS 的统计
 方式不同，形状是一样的）。内联测试模块给这个 crate 的峰值再加约 2 GB（+33 %）；
-两个方向上的推手都是泛型膨胀（810 万行 LLVM、`rust_i18n` 闭包 31.2 万行、
-config 结构体的 serde `Deserialize` 展开）。减少代码生成单元用一点峰值换掉
-大量墙钟时间，默认不采用。
+峰值和时间两头都被泛型膨胀推高（810 万行 LLVM、`rust_i18n` 闭包 31.2 万行、
+config 结构体的 serde `Deserialize` 展开）。减少代码生成单元，峰值降得不多，
+墙钟时间却涨得很多，默认不采用。
 
 ### 低内存构建配方（内存小于 16 GB 的机器、交叉构建）
 
@@ -252,8 +252,8 @@ runtime_api/tests.rs 9.1 千 / 151）分别引用 crate 内部项 826 / 226 / 62
 `crate::test_support::{EnvVarGuard, lock_test_env}`、
 `core::engine::mock_engine_handle`、`crate::tui::app::App` 等），而 codewhale-tui
 库总共只对外暴露四个 `pub` 项。它们全是白盒测试；除非把模块树公开，否则一个都
-搬不到 `crates/tui/tests/` 去——而本支线被明确要求不要这么做。这个方案本可以
-换来的收益——测试模块给 lib-test 单元加上的约 2 GB / 约 35 s——需要先做一个决定：
+搬不到 `crates/tui/tests/` 去——而本支线接到的要求就是不要这么做。这个方案本可以
+换来的收益是测试模块给 lib-test 单元加上的约 2 GB / 约 35 s；但要拿到它，先得做一个决定：
 要么提供 `#[doc(hidden)] pub mod test_api`（为黑盒测试子集用到的那约 30 个符号
 提供一个有意公开、不稳定的接口），要么接受单元测试套件留在 crate 内部。
 这里只做记录，没有动手。
@@ -269,7 +269,7 @@ runtime_api/tests.rs 9.1 千 / 151）分别引用 crate 内部项 826 / 226 / 62
 
 合起来只占这个 crate 74.6 万行里的约 900 行：依赖方向理顺了，但 tui 单元的时间
 和内存暂时看不出可测量的变化（上面那个 8.0 GB 的 lib-test 峰值是在这些迁移之后
-采样的）。没有迁移的项以及原因：`ReasoningEffort`——它的实现要拿到 TUI 自己
+采样的）。没有迁移的项以及原因：`ReasoningEffort`——它的实现要用到 TUI 自己
 定义的 `ApiProvider`（`crates/tui/src/config.rs`），还要调用
 `crate::config::is_exact_*_k3_route` / `crate::provider_lake`，所以必须先迁
 `ApiProvider`（见下面 B3）；`approval/policy.rs`（风险分类）依赖 `command_safety`
@@ -310,13 +310,13 @@ TUI-DOG-017）——保持原样。
      用 `client::{CodewhaleClient, PreparedOutboundRequest, canonical_json,
      parse_usage, is_reasoning_replay_placeholder, redact_url_for_display}`。
    所以第 1 条是全部前提：先把 `ApiProvider`、精确路由辅助函数和提供商常量
-   移进 codewhale-config，然后再重新测量 `tools` 和 `core` 这两个循环。
-5. **作为第 4 条中可落地的那部分完成。** `models` + `model_catalog` →
+   移进 codewhale-config，然后再重新测量 `tools` 和 `core` 这两处的循环依赖。
+5. **已落地，属于第 4 条中可做的那部分。** `models` + `model_catalog` →
    `codewhale-models`（1,835 行，140 个调用方文件）。它们在依赖主干上正好位于
-   `client` 下面，彼此之间只有一条生产依赖边，对 TUI 其余部分则没有，而 `models`
-   本来就已经有一半是在给 `codewhale_core::{request, role}` 做 re-export 门面。
-6. 然后是 `fleet/`、`tools/`、`core/engine`——各自按它的测试本来就遵守的 crate
-   边界切分，用 A0 表格来测量。
+   `client` 下面，彼此之间只有一条生产依赖边，对 TUI 其余部分则没有依赖边；
+   而 `models` 本来就已经有一半是在给 `codewhale_core::{request, role}` 做 re-export 门面。
+6. 然后是 `fleet/`、`tools/`、`core/engine`——切开的位置就是它们的测试本来就遵守的
+   crate 边界，测量用 A0 表格。
 
 ## 每台机器只跑一个构建
 
@@ -325,30 +325,30 @@ TUI-DOG-017）——保持原样。
 自带的锁是按 target 目录分的，所以两个代理（agent）往不同的 target 目录构建时依然会并发
 跑起来，把内存吃光。第二个构建会等待，并打印出锁在谁手里。设置
 `CODEWHALE_BUILD_LOCK=0` 可以跳过锁，设置 `CODEWHALE_BUILD_LOCK_FILE` 可以指定
-锁文件。如果同一台机器上的自托管 CI runner 的 `.env` 把
-`CODEWHALE_BUILD_LOCK_FILE` 指向同一个路径，它也会参与这把锁：于是 macOS Test
+锁文件。同一台机器上如果跑着自托管 CI runner，而它的 `.env` 把
+`CODEWHALE_BUILD_LOCK_FILE` 指向同一个路径，runner 也会参与这把锁：于是 macOS Test
 任务从第一次测试构建一直持锁到任务结束。这把锁是建议性的：绕过这些脚本直接
-启动 Cargo 不会取锁；在没有 `fcntl` 的平台上（Windows）会打印警告后不加锁构建。
+启动 Cargo 不会取锁；在没有 `fcntl` 的平台上（Windows），会先打印一条警告，然后不加锁构建。
 
 ## 本支线改了什么
 
 1. **`scripts/dev-cache.sh` / `scripts/dev-cargo.sh` 启用了从
-   `scripts/dev-test.sh` 实测出来的隔离 build-dir 拓扑。** 新 worktree 不再往
-   私有的冷 `./target` 里编译，除非停用辅助脚本。sccache 按需启用，且受增量
+   `scripts/dev-test.sh` 实测出来的隔离 build-dir 拓扑。** 除非停用辅助脚本，新
+   worktree 不再往私有的冷 `./target` 里编译。sccache 按需启用，且受增量
    开关限制。脚本自检位于 `scripts/dev-cache.test.sh` 和
    `scripts/dev-test.sh --self-check`（`scripts/dev-test.test.sh` 已在
    `d64b9429b7` 中移除）。
 2. **`cargo nextest` 已支持并有文档**（`.config/nextest.toml`）。测试二进制不变，
    每个测试一个进程，所以 tui 单元测试套件在这台机器上约 100 s 跑完，而不是
-   约 270 s；慢测试或卡住的测试会被点名，而不是把整个二进制拖住。PTY 二进制
-   被钉死为一次只跑一个测试（它要操作伪终端和共享的 mock 服务器；现在它靠
-   进程内互斥锁串行，而 nextest 的“每测试一进程”模型本来会绕过这把锁），
-   会启动真实 `codewhale` 可执行文件的集成二进制则限制最多四个测试并发，这样
-   它的 30 s 启动预算在满负载机器上也能撑住。
+   约 270 s；慢测试或卡住的测试会直接报出名字，而不是把整个二进制拖住。PTY 二进制
+   固定为一次只跑一个测试（它要操作伪终端和共享的 mock 服务器；现在它靠
+   进程内互斥锁串行，而 nextest 的“每测试一进程”模型本来会绕过这把锁）；
+   而会启动真实 `codewhale` 可执行文件的集成二进制，则限制最多四个测试并发，
+   这样它的 30 s 启动预算在满负载机器上也能撑住。
    `cargo test --workspace --all-features --locked` 仍是权威门禁；nextest 是
    本地循环。
-3. **有三个测试依赖执行顺序**，只是因为同一进程里另一个测试先安装了 rustls
-   加密提供器（crypto provider）才通过：
+3. **有三个测试依赖执行顺序**——它们能通过，只是因为同一进程里另一个测试先
+   安装了 rustls 加密提供商（crypto provider）：
    `codewhale-tui mcp::sse::endpoint_tests::message_before_endpoint_is_rejected_instead_of_buffered`、
    `codewhale-app-server tests::failed_config_set_keeps_the_stdio_bridge`，以及
    `tests::successful_config_set_still_invalidates_the_stdio_bridge`。现在每个
@@ -364,9 +364,9 @@ TUI-DOG-017）——保持原样。
   配对测量，连续执行，target 布局相同：从空 target 冷启动
   `cargo test -p codewhale-tui --lib --no-run` 从 148 s 变成 193 s
   （user 347 s → 778 s）；nextest 下的 tui 单元测试套件从 96 s 变成 81 s；
-  增量重建没变化。测试快约 15 %，换来冷构建贵 2.2 倍，对第一次想构建 Codewhale
-  的人来说不值。主要反复跑测试的贡献者可以在本地自行启用：把这张表加到用户级
-  `~/.cargo/config.toml` 的 `[profile.dev.package."*"]` 段里。
+  增量重建没变化。测试快约 15 %，代价却是冷构建贵 2.2 倍，对第一次想构建 Codewhale
+  的人来说不划算。如果贡献者平时主要是反复跑测试，可以自行在本地启用：把这段
+  配置加到用户级 `~/.cargo/config.toml` 的 `[profile.dev.package."*"]` 段里。
 - 在仓库的 `.cargo/config.toml` 里加额外的 `RUSTFLAGS`/链接器参数
   （`-no_deduplicate`、替代链接器）。Rustflags 会作用到每个 profile，可能改变
   发布的二进制；macOS 的系统链接器已经是 `ld-prime`，而实测的增量链接开销就在
@@ -374,10 +374,10 @@ TUI-DOG-017）——保持原样。
 
 ## 推迟：拆分 `codewhale-tui`
 
-唯一还能改变这些数字形态的杠杆，是把 crate 拆开，让改动一个叶子模块不必重新
-类型检查 60 万行代码、也不必重新链接 357 MB 的测试二进制。按依赖顺序排列的
+唯一还能改变这些数字形态的杠杆，是把 crate 拆开，这样改动一个叶子模块时，
+不必重新类型检查 60 万行代码，也不必重新链接 357 MB 的测试二进制。按依赖顺序排列的
 机械式候选（每一个目前都只依赖 `codewhale-config`/`codewhale-paths` 加上第三方
-crate，而且今天都通过单一模块路径被使用）：
+crate，而且调用方今天也只通过单一模块路径使用它们）：
 
 | 候选 crate | 来自 | 为什么可以干净地切出去 | 需要 re-export 的调用方 |
 | --- | --- | --- | --- |
@@ -385,9 +385,9 @@ crate，而且今天都通过单一模块路径被使用）：
 | `codewhale-i18n` | `crates/localization/src/lib.rs` + `crates/localization/locales/*.json` | `rust_i18n::i18n!` 宏会把全部 15 个语言包编译进承载它的那个 crate；搬出去之后，只改语言包不再重编 TUI。`MessageId` 是普通枚举。 | `crate::localization` |
 | `codewhale-mcp-transport` | `crates/tui/src/mcp/{sse,stdio,external_import}.rs` | 已经在和 `codewhale-mcp` 通信；与 tui 的唯一耦合点是 reviewed-launch 绑定。 | `crate::mcp` |
 
-拆分的规矩：只做纯搬迁，在原路径上加 `pub use` re-export，不改行为，一个 PR
+拆分规则：只做纯搬迁，在原路径上加 `pub use` re-export，不改行为，一个 PR
 一个 crate，每个 PR 都用上面的表来测量（冷构建、增量构建、增量测试构建、
-`cargo test -p codewhale-tui --lib --no-run`）。预期收益：tui 前端耗时随移走的
+`cargo test -p codewhale-tui --lib --no-run`）。预期收益：tui 前端耗时会随搬走的
 行数一起下降；在这些模块的测试跟着搬走之前，测试二进制的链接时间不变。
 
 ## 可选加速项（非必需）
