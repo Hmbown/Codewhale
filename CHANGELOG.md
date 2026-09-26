@@ -43,6 +43,10 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Fixed
 
+- Resuming a session keeps its "Resumed:" confirmation on screen instead of
+  replacing it with "Make room automatically: on" when nothing was switched,
+  and `/anchor` files are still re-stated after compaction once a session has
+  been resumed or its model changed.
 - The installation page is generated from `docs/INSTALL.md`, so the website
   and the guide can no longer disagree; broken anchors and unsafe links fail
   the build ([#6450](https://github.com/Hmbown/Codewhale/pull/6450)).
