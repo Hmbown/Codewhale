@@ -2,11 +2,19 @@
 """Models.dev catalog refresh / snapshot automation for CodeWhale (#4117).
 
 Fetches the public Models.dev combined catalog, validates offline bundled seed
-shape, and supports OpenRouter public-listing inspection. The automation is
-intentionally validate/dry-run only: it never accepts, prints, or persists API
-keys / auth headers, and it does not write fetched JSON to disk.
+shape, supports OpenRouter public-listing inspection, and generates the offline
+seed (#6396). It never accepts, prints, or persists API keys / auth headers.
+The only thing it writes from fetched JSON is the seed lock: the rows the spec
+references, projected onto allowlisted fields with credential-shaped keys
+scrubbed. The raw document is never written.
 
 Usage examples:
+
+  # Regenerate the offline seed (see docs/CATALOG_REFRESH.md)
+  scripts/catalog_models_dev.py seed lock --dry-run   # review report only
+  scripts/catalog_models_dev.py seed lock             # pin upstream rows
+  scripts/catalog_models_dev.py seed render           # write the seed
+  scripts/catalog_models_dev.py seed render --check   # CI: seed == render
 
   # Dry-run: fetch + validate, print counts (no write)
   scripts/catalog_models_dev.py refresh
@@ -27,11 +35,15 @@ Environment:
 from __future__ import annotations
 
 import argparse
+import difflib
+import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -232,8 +244,7 @@ def cmd_refresh(args: argparse.Namespace) -> None:
     if args.write_cache or args.write:
         die(
             "disk writes are intentionally unsupported (secret-free by design); "
-            "use `snapshot --check PATH` to validate a local Models.dev-shaped file, "
-            "or `curl`/`CODEWHALE_MODELS_DEV_PATH` for staging"
+            "to update the offline seed use `seed lock` then `seed render`"
         )
     print("dry-run complete (no secrets; no disk write)")
 
@@ -326,119 +337,489 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
     if args.write or args.force_full:
         die(
             "disk writes are intentionally unsupported for this automation; "
-            "validate with --check, or stage a file outside this tool"
+            "the offline seed is generated: use `seed lock` then `seed render`"
         )
     print("dry-run complete (use --check PATH to validate an existing snapshot)")
 
 
-def _limit_fields(entry: Any) -> dict[str, Any]:
-    if not isinstance(entry, dict):
+# ---------------------------------------------------------------------------
+# Offline seed generator (#6396)
+#
+# The offline seed (crates/config/assets/models_dev.bundled.json) is generated,
+# never hand-edited:
+#
+#   spec  scripts/catalog/models_dev_seed.toml       what to carry (reviewed)
+#   lock  scripts/catalog/models_dev_seed.lock.json  upstream rows, pinned
+#   seed  crates/config/assets/models_dev.bundled.json  = render(spec, lock)
+#
+# `seed lock` is the only network step and the review step: it fetches
+# Models.dev, keeps only the rows the spec references (allowlisted fields,
+# credential-shaped keys scrubbed), and prints what changed. `seed render` is
+# offline and deterministic; CI runs `seed render --check`.
+#
+# The spec selects and maps; it never states a value that contradicts
+# upstream. Policy (a withheld price, a clamped limit) lives in the runtime
+# corrections file, crates/config/assets/catalog_corrections.json, so it
+# holds online as well as offline. The one additive exception is a `curated`
+# row for a model upstream does not list yet; `seed lock` fails once upstream
+# lists it, so a curated row can never shadow an upstream fact.
+# ---------------------------------------------------------------------------
+
+SEED_SPEC = Path("scripts/catalog/models_dev_seed.toml")
+SEED_LOCK = Path("scripts/catalog/models_dev_seed.lock.json")
+SEED_ASSET = Path("crates/config/assets/models_dev.bundled.json")
+CORRECTIONS_ASSET = Path("crates/config/assets/catalog_corrections.json")
+SEED_RENDER_COMMAND = "python3 scripts/catalog_models_dev.py seed render"
+
+# Exactly the fields crates/config/src/models_dev.rs reads, in render order.
+PROVIDER_MODEL_FIELDS = (
+    "id",
+    "base_model",
+    "name",
+    "family",
+    "default",
+    "attachment",
+    "reasoning",
+    "reasoning_options",
+    "interleaved",
+    "tool_call",
+    "structured_output",
+    "temperature",
+    "open_weights",
+    "modalities",
+    "limit",
+    "cost",
+)
+CANONICAL_MODEL_FIELDS = (
+    "id",
+    "name",
+    "family",
+    "attachment",
+    "reasoning",
+    "tool_call",
+    "structured_output",
+    "temperature",
+    "open_weights",
+    "modalities",
+    "limit",
+)
+NESTED_FIELDS = {
+    "limit": ("context", "input", "output"),
+    "modalities": ("input", "output"),
+    "cost": ("input", "output", "cache_read", "cache_write"),
+}
+# Mapping-only keys a spec model entry may carry. None of them restates an
+# upstream fact: `base_model` is Codewhale's canonical join, which upstream
+# provider rows do not carry.
+SPEC_MODEL_KEYS = {"id", "upstream_id", "from", "base_model", "curated"}
+SPEC_PROVIDER_KEYS = {"id", "upstream", "name", "api", "npm", "env", "doc", "default", "models"}
+SAFE_PUBLIC_TEXT = re.compile(r"^[A-Za-z0-9 ._:/()+\-]{0,64}$")
+
+
+def project_fields(row: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+    """Keep only allowlisted fields, in a fixed order, scrubbed."""
+    if not isinstance(row, dict):
         return {}
-    limit = entry.get("limit")
-    return limit if isinstance(limit, dict) else {}
-
-
-def _collect_limit_drift(
-    seed_value: Any,
-    upstream_value: Any,
-    path: str,
-    drift: list[str],
-) -> None:
-    seed_limit = _limit_fields(seed_value)
-    upstream_limit = _limit_fields(upstream_value)
-    for field in ("context", "output"):
-        bundled = seed_limit.get(field)
-        upstream = upstream_limit.get(field)
-        if bundled != upstream:
-            drift.append(
-                f"{path}: limit.{field} "
-                f"bundled={public_limit_value(bundled)} "
-                f"upstream={public_limit_value(upstream)}"
-            )
-
-
-def cmd_drift(args: argparse.Namespace) -> None:
-    """Diff the bundled seed against upstream for limit.output / limit.context.
-
-    Dry-run only: no API key, no disk write. Network access (unless
-    CODEWHALE_MODELS_DEV_PATH points at a local file) reads the public
-    Models.dev catalog. Wiring this as a CI gate is a maintainer decision and
-    is deliberately not activated here.
-    """
-    seed_path = Path(args.seed)
-    if not seed_path.is_file():
-        die(f"drift: missing bundled seed {seed_path}")
-    seed = load_json_bytes(seed_path.read_bytes(), str(seed_path))
-    ensure_models_dev_shape(seed, str(seed_path))
-
-    upstream, source, _is_local = load_models_dev_catalog()
-
-    drift: list[str] = []
-    missing_upstream: list[str] = []
-
-    seed_models = seed.get("models") or {}
-    upstream_models = upstream.get("models") or {}
-    if isinstance(seed_models, dict) and isinstance(upstream_models, dict):
-        for model_id in sorted(seed_models):
-            if model_id not in upstream_models:
-                missing_upstream.append(f"models.{model_id}")
+    out: dict[str, Any] = {}
+    for field in fields:
+        if field not in row or row[field] is None:
+            continue
+        value = scrub_secrets(row[field])
+        nested = NESTED_FIELDS.get(field)
+        if nested is not None:
+            if not isinstance(value, dict):
                 continue
-            _collect_limit_drift(
-                seed_models[model_id],
-                upstream_models[model_id],
-                f"models.{model_id}",
-                drift,
-            )
-
-    seed_providers = seed.get("providers") or {}
-    upstream_providers = upstream.get("providers") or {}
-    if isinstance(seed_providers, dict) and isinstance(upstream_providers, dict):
-        for provider_id in sorted(seed_providers):
-            seed_provider = seed_providers[provider_id]
-            seed_offerings = (
-                seed_provider.get("models") if isinstance(seed_provider, dict) else {}
-            )
-            if not isinstance(seed_offerings, dict):
+            value = {key: value[key] for key in nested if value.get(key) is not None}
+            if not value:
                 continue
-            upstream_provider = upstream_providers.get(provider_id)
-            upstream_offerings = (
-                upstream_provider.get("models")
-                if isinstance(upstream_provider, dict)
-                else {}
-            )
-            if not isinstance(upstream_offerings, dict):
-                upstream_offerings = {}
-            for model_id in sorted(seed_offerings):
-                path = f"providers.{provider_id}.models.{model_id}"
-                if model_id not in upstream_offerings:
-                    missing_upstream.append(path)
-                    continue
-                _collect_limit_drift(
-                    seed_offerings[model_id],
-                    upstream_offerings[model_id],
-                    path,
-                    drift,
+        out[field] = value
+    return out
+
+
+def public_value(value: Any) -> str:
+    """Format an upstream value for the review report without echoing secrets."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None or isinstance(value, (int, float)):
+        return public_limit_value(value)
+    if isinstance(value, str):
+        if SAFE_PUBLIC_TEXT.match(value) and not value.lower().startswith(("sk-", "bearer")):
+            return value
+        return "redacted"
+    if isinstance(value, list):
+        return "[" + ", ".join(public_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(
+            f"{public_value(key)}: {public_value(item)}" for key, item in value.items()
+        ) + "}"
+    return "redacted"
+
+
+def flatten(value: Any, prefix: str = "") -> dict[str, Any]:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            out.update(flatten(item, f"{prefix}.{key}" if prefix else str(key)))
+        return out
+    return {prefix: value}
+
+
+def load_seed_spec(path: Path) -> dict[str, Any]:
+    import tomllib
+
+    if not path.is_file():
+        die(f"seed spec missing: {path}")
+    try:
+        spec = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        die(f"{path}: invalid TOML ({exc})")
+    return normalize_seed_spec(spec, str(path))
+
+
+def normalize_seed_spec(spec: dict[str, Any], source: str) -> dict[str, Any]:
+    """Validate the spec and expand shorthand model entries."""
+    if not isinstance(spec.get("source"), dict) or not spec["source"].get("url"):
+        die(f"{source}: [source].url is required")
+    meta = spec.get("meta", {})
+    if not isinstance(meta, dict) or not all(isinstance(v, str) for v in meta.values()):
+        die(f"{source}: [meta] values must be strings")
+    curated: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in spec.get("curated", []):
+        key = (entry.get("provider", ""), entry.get("id", ""))
+        if not all(key) or not str(entry.get("reason", "")).strip():
+            die(f"{source}: curated rows need provider, id and a reason")
+        if not isinstance(entry.get("row"), dict):
+            die(f"{source}: curated {key[0]}/{key[1]} needs a [curated.row] table")
+        if key in curated:
+            die(f"{source}: curated {key[0]}/{key[1]} is listed twice")
+        curated[key] = entry
+    providers = []
+    seen_providers: set[str] = set()
+    for provider in spec.get("providers", []):
+        unknown = set(provider) - SPEC_PROVIDER_KEYS
+        pid = provider.get("id", "")
+        if unknown:
+            die(f"{source}: provider {pid} has unknown keys {sorted(unknown)}")
+        if not pid or pid in seen_providers:
+            die(f"{source}: provider ids must be present and unique ({pid!r})")
+        seen_providers.add(pid)
+        models = []
+        seen_models: set[str] = set()
+        for raw in provider.get("models", []):
+            entry = {"id": raw} if isinstance(raw, str) else dict(raw)
+            unknown = set(entry) - SPEC_MODEL_KEYS
+            if unknown:
+                die(
+                    f"{source}: {pid}/{entry.get('id')} has unknown keys {sorted(unknown)}; "
+                    "the spec maps rows, it never restates upstream values "
+                    "(policy goes in crates/config/assets/catalog_corrections.json)"
                 )
+            mid = entry.get("id", "")
+            if not mid or mid in seen_models:
+                die(f"{source}: {pid} model ids must be present and unique ({mid!r})")
+            seen_models.add(mid)
+            if entry.get("curated") and (pid, mid) not in curated:
+                die(f"{source}: {pid}/{mid} is marked curated but has no [[curated]] row")
+            if not entry.get("curated") and (pid, mid) in curated:
+                die(f"{source}: {pid}/{mid} has a [[curated]] row but is not marked curated")
+            models.append(entry)
+        defaults = [m["id"] for m in models if m["id"] == provider.get("default")]
+        if len(defaults) != 1:
+            die(f"{source}: provider {pid} must name exactly one default among its models")
+        providers.append({**provider, "upstream": provider.get("upstream", pid), "models": models})
+    used_curated = {
+        (p["id"], m["id"]) for p in providers for m in p["models"] if m.get("curated")
+    }
+    for key in curated:
+        if key not in used_curated:
+            die(f"{source}: curated {key[0]}/{key[1]} is not listed under its provider")
+    canonical = []
+    for entry in spec.get("canonical", []):
+        entry = {"key": entry} if isinstance(entry, str) else dict(entry)
+        if not entry.get("key"):
+            die(f"{source}: canonical entries need a key")
+        canonical.append({"key": entry["key"], "upstream": entry.get("upstream", entry["key"])})
+    return {
+        "source": spec["source"],
+        "meta": meta,
+        "providers": providers,
+        "curated": curated,
+        "canonical": canonical,
+    }
 
-    print(f"bundled seed: {seed_path}")
-    print(f"upstream: {public_source_label(source)}")
-    if missing_upstream:
-        print("removed upstream (bundled id no longer present):")
-        for path in missing_upstream:
-            print(f"  - {path}")
-    if drift:
-        print(f"limit drift detected ({len(drift)}):")
-        for path in drift:
-            print(f"  - {path}")
-        # Non-zero so a future CI gate can fail on drift; activating that gate
-        # is a maintainer decision.
-        die(
-            "bundled seed has drifted from upstream for limit.output / limit.context",
-            code=2,
+
+def upstream_ref(provider: dict[str, Any], model: dict[str, Any]) -> tuple[str, str]:
+    """The (upstream provider, upstream model id) a spec row projects."""
+    return (
+        model.get("from", provider["upstream"]),
+        model.get("upstream_id", model["id"]),
+    )
+
+
+def find_row(rows: dict[str, Any], model_id: str) -> tuple[str, Any] | None:
+    """Exact id first, then a unique case-insensitive match (`GLM-5.2` ~ `glm-5.2`)."""
+    if model_id in rows:
+        return model_id, rows[model_id]
+    matches = [key for key in rows if key.lower() == model_id.lower()]
+    if len(matches) == 1:
+        return matches[0], rows[matches[0]]
+    return None
+
+
+def build_seed_lock(
+    spec: dict[str, Any], upstream: dict[str, Any], raw: bytes, fetched_at: str
+) -> tuple[dict[str, Any], list[str]]:
+    """Project the spec's referenced upstream rows. Returns (lock, errors)."""
+    errors: list[str] = []
+    up_providers = upstream.get("providers") or {}
+    up_models = upstream.get("models") or {}
+    lock_providers: dict[str, dict[str, Any]] = {}
+    for provider in spec["providers"]:
+        for model in provider["models"]:
+            up_provider, up_id = upstream_ref(provider, model)
+            rows = (up_providers.get(up_provider) or {}).get("models") or {}
+            found = find_row(rows, up_id)
+            label = f"{provider['id']}/{model['id']}"
+            if model.get("curated"):
+                if found is not None:
+                    errors.append(
+                        f"{label}: curated, but upstream {up_provider} now lists "
+                        f"{found[0]}; drop the [[curated]] row and derive it"
+                    )
+                continue
+            if found is None:
+                errors.append(f"{label}: upstream {up_provider} does not list {up_id}")
+                continue
+            lock_providers.setdefault(up_provider, {})[found[0]] = project_fields(
+                found[1], PROVIDER_MODEL_FIELDS
+            )
+    lock_models: dict[str, Any] = {}
+    for entry in spec["canonical"]:
+        row = up_models.get(entry["upstream"])
+        if row is None:
+            errors.append(f"canonical {entry['key']}: upstream does not list {entry['upstream']}")
+            continue
+        lock_models[entry["upstream"]] = project_fields(row, CANONICAL_MODEL_FIELDS)
+    lock = {
+        "source": {
+            "url": spec["source"]["url"],
+            "fetched_at": fetched_at,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        },
+        "models": dict(sorted(lock_models.items())),
+        "providers": {
+            key: dict(sorted(rows.items())) for key, rows in sorted(lock_providers.items())
+        },
+    }
+    return lock, errors
+
+
+def seed_lock_report(
+    spec: dict[str, Any],
+    old_lock: dict[str, Any] | None,
+    new_lock: dict[str, Any],
+    upstream: dict[str, Any],
+    corrections: dict[str, Any] | None,
+) -> list[str]:
+    """Human review lines for the PR body: what a re-lock changes."""
+    lines: list[str] = []
+    old_rows = flatten((old_lock or {}).get("providers", {}))
+    old_rows.update(flatten({"models": (old_lock or {}).get("models", {})}))
+    new_rows = flatten(new_lock.get("providers", {}))
+    new_rows.update(flatten({"models": new_lock.get("models", {})}))
+    changed = [
+        f"  {path}: {public_value(old_rows.get(path))} -> {public_value(new_rows.get(path))}"
+        for path in sorted(set(old_rows) | set(new_rows))
+        if old_rows.get(path) != new_rows.get(path)
+    ]
+    lines.append(f"field changes: {len(changed)}")
+    lines.extend(changed)
+
+    if corrections:
+        stale = stale_corrections(spec, new_lock, corrections)
+        lines.append(f"stale corrections (upstream now agrees; delete them): {len(stale)}")
+        lines.extend(f"  {line}" for line in stale)
+
+    referenced = {
+        upstream_ref(p, m)[0]: set() for p in spec["providers"] for m in p["models"]
+    }
+    for provider in spec["providers"]:
+        for model in provider["models"]:
+            up_provider, _ = upstream_ref(provider, model)
+            referenced[up_provider].update(new_lock["providers"].get(up_provider, {}))
+    new_upstream: list[str] = []
+    for up_provider, carried in sorted(referenced.items()):
+        rows = ((upstream.get("providers") or {}).get(up_provider) or {}).get("models") or {}
+        extra = sorted(set(rows) - carried)
+        if extra:
+            shown = ", ".join(public_value(model) for model in extra[:8])
+            more = f" (+{len(extra) - 8} more)" if len(extra) > 8 else ""
+            new_upstream.append(f"  {up_provider}: {len(extra)} not carried: {shown}{more}")
+    lines.append("upstream models not carried (information only):")
+    lines.extend(new_upstream or ["  none"])
+    return lines
+
+
+def stale_corrections(
+    spec: dict[str, Any], lock: dict[str, Any], corrections: dict[str, Any]
+) -> list[str]:
+    """Corrections whose patched value upstream now states itself."""
+    rows_by_provider: dict[str, dict[str, Any]] = {}
+    for provider in spec["providers"]:
+        rows = rows_by_provider.setdefault(provider["id"], {})
+        for model in provider["models"]:
+            up_provider, up_id = upstream_ref(provider, model)
+            found = find_row(lock["providers"].get(up_provider, {}), up_id)
+            if found is not None:
+                rows[model["id"]] = found[1]
+    stale: list[str] = []
+    for rule in corrections.get("providers", []):
+        rows = rows_by_provider.get(rule.get("provider"), {})
+        if rows and not any(row.get("cost") for row in rows.values()):
+            stale.append(f"{rule['provider']}: pricing_withheld, but no carried row has a price")
+    for fix in corrections.get("models", []):
+        row = rows_by_provider.get(fix.get("provider"), {}).get(fix.get("id"))
+        if row is None:
+            continue
+        limit = row.get("limit") or {}
+        label = f"{fix['provider']}/{fix['id']}"
+        if "max_output" in fix and limit.get("output") == fix["max_output"]:
+            stale.append(f"{label}: max_output {fix['max_output']} equals upstream")
+        if "context_window" in fix and limit.get("context") == fix["context_window"]:
+            stale.append(f"{label}: context_window {fix['context_window']} equals upstream")
+        if "pricing_withheld" in fix and not row.get("cost"):
+            stale.append(f"{label}: pricing_withheld, but upstream lists no price")
+        if "reasoning_options" in fix and row.get("reasoning_options") == fix["reasoning_options"]:
+            stale.append(f"{label}: reasoning_options equal upstream")
+    return stale
+
+
+def render_seed(spec: dict[str, Any], lock: dict[str, Any]) -> str:
+    """Render the offline seed from spec + lock. Pure and deterministic."""
+    errors: list[str] = []
+    providers_out: dict[str, Any] = {}
+    row_count = 0
+    for provider in spec["providers"]:
+        models_out: dict[str, Any] = {}
+        for model in provider["models"]:
+            key = (provider["id"], model["id"])
+            up_provider, up_id = upstream_ref(provider, model)
+            locked = find_row(lock["providers"].get(up_provider, {}), up_id)
+            if model.get("curated"):
+                if locked is not None:
+                    errors.append(f"{key[0]}/{key[1]}: curated row also present in the lock")
+                    continue
+                row = project_fields(spec["curated"][key]["row"], PROVIDER_MODEL_FIELDS)
+            elif locked is None:
+                errors.append(
+                    f"{key[0]}/{key[1]}: not in the lock (run `python3 scripts/catalog_models_dev.py seed lock`)"
+                )
+                continue
+            else:
+                row = dict(locked[1])
+            row["id"] = model["id"]
+            if model.get("base_model"):
+                row["base_model"] = model["base_model"]
+            row.pop("default", None)
+            if model["id"] == provider["default"]:
+                row["default"] = True
+            models_out[model["id"]] = project_fields(row, PROVIDER_MODEL_FIELDS)
+            row_count += 1
+        header = {"id": provider["id"]}
+        for field in ("name", "api", "npm", "doc", "env"):
+            if field in provider:
+                header[field] = provider[field]
+        providers_out[provider["id"]] = {**header, "models": models_out}
+    models_out = {}
+    for entry in spec["canonical"]:
+        row = lock["models"].get(entry["upstream"])
+        if row is None:
+            errors.append(f"canonical {entry['key']}: not in the lock")
+            continue
+        models_out[entry["key"]] = project_fields({**row, "id": entry["key"]}, CANONICAL_MODEL_FIELDS)
+    if errors:
+        die("seed render refused:\n  " + "\n  ".join(errors))
+    meta = dict(spec["meta"])
+    meta["generated_by"] = (
+        f"{SEED_RENDER_COMMAND} from {SEED_SPEC} and {SEED_LOCK}. "
+        "Do not edit this file by hand; see docs/CATALOG_REFRESH.md."
+    )
+    source = lock["source"]
+    meta["upstream"] = f"{source['url']} fetched {source['fetched_at']} sha256 {source['sha256']}"
+    meta["coverage"] = (
+        f"{len(providers_out)} providers, {row_count} provider model rows, "
+        f"{len(models_out)} canonical model entries."
+    )
+    document = {"_meta": meta, "models": models_out, "providers": providers_out}
+    ensure_models_dev_shape(document, "rendered seed")
+    return json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+
+
+def read_json_file(path: Path) -> Any:
+    if not path.is_file():
+        die(f"missing {path}")
+    return load_json_bytes(path.read_bytes(), str(path))
+
+
+def cmd_seed_lock(args: argparse.Namespace) -> None:
+    spec = load_seed_spec(Path(args.spec))
+    path_override = os.environ.get("CODEWHALE_MODELS_DEV_PATH", "").strip()
+    if path_override:
+        raw = Path(path_override).read_bytes()
+        source = f"file:{path_override}"
+    else:
+        url = os.environ.get("CODEWHALE_MODELS_DEV_URL", "").strip() or spec["source"]["url"]
+        raw = fetch_url(url)
+        source = f"url:{url}"
+    upstream = ensure_models_dev_shape(load_json_bytes(raw, source), source)
+    fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    new_lock, errors = build_seed_lock(spec, upstream, raw, fetched_at)
+    lock_path = Path(args.lock)
+    old_lock = read_json_file(lock_path) if lock_path.is_file() else None
+    corrections_path = Path(args.corrections)
+    corrections = read_json_file(corrections_path) if corrections_path.is_file() else None
+    print(f"upstream: {public_source_label(source)} sha256 {new_lock['source']['sha256']}")
+    for line in seed_lock_report(spec, old_lock, new_lock, upstream, corrections):
+        print(line)
+    if errors:
+        die("seed lock refused:\n  " + "\n  ".join(errors))
+    if args.dry_run:
+        print("dry-run: lock not written")
+        return
+    lock_path.write_text(json.dumps(new_lock, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"wrote {lock_path}; next: {SEED_RENDER_COMMAND}")
+
+
+def cmd_seed_render(args: argparse.Namespace) -> None:
+    spec = load_seed_spec(Path(args.spec))
+    lock = read_json_file(Path(args.lock))
+    rendered = render_seed(spec, lock)
+    target = Path(args.out)
+    if args.check:
+        current = target.read_text(encoding="utf-8") if target.is_file() else ""
+        if current == rendered:
+            print(f"ok: {target} matches {SEED_SPEC} + {SEED_LOCK}")
+            return
+        diff = list(
+            difflib.unified_diff(
+                current.splitlines(),
+                rendered.splitlines(),
+                fromfile=f"{target} (committed)",
+                tofile=f"{target} (rendered)",
+                lineterm="",
+            )
         )
-    if missing_upstream:
-        print("note: removed-upstream ids are reported above (non-fatal).")
-    print("no limit.output / limit.context drift")
+        for line in diff[:200]:
+            print(line)
+        if len(diff) > 200:
+            print(f"... {len(diff) - 200} more diff lines")
+        die(
+            f"{target} is not the rendered seed. It is generated: put the change in "
+            f"{SEED_SPEC} (selection/mapping) or {CORRECTIONS_ASSET} (policy), then run "
+            f"`{SEED_RENDER_COMMAND}`"
+        )
+    target.write_text(rendered, encoding="utf-8")
+    print(f"wrote {target}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -504,16 +885,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     snapshot.set_defaults(func=cmd_snapshot)
 
-    drift = sub.add_parser(
-        "drift",
-        help="Diff bundled seed against upstream for limit.output / limit.context",
+    seed = sub.add_parser(
+        "seed",
+        help="Generate the offline seed from the reviewed spec and a pinned lock",
     )
-    drift.add_argument(
-        "--seed",
-        default="crates/config/assets/models_dev.bundled.json",
-        help="Bundled seed path (default: crates/config/assets/models_dev.bundled.json)",
+    seed_sub = seed.add_subparsers(dest="seed_cmd", required=True)
+    lock = seed_sub.add_parser(
+        "lock",
+        help="Fetch upstream, pin the rows the spec references, print the review report",
     )
-    drift.set_defaults(func=cmd_drift)
+    lock.add_argument("--dry-run", action="store_true", help="Print the report; write nothing")
+    render = seed_sub.add_parser(
+        "render", help="Render the seed from spec + lock (offline, deterministic)"
+    )
+    render.add_argument(
+        "--check",
+        action="store_true",
+        help="Fail with a diff when the committed seed differs from the rendered one",
+    )
+    render.add_argument("--out", default=str(SEED_ASSET), help="Seed path to write or check")
+    for command in (lock, render):
+        command.add_argument("--spec", default=str(SEED_SPEC))
+        command.add_argument("--lock", default=str(SEED_LOCK))
+    lock.add_argument("--corrections", default=str(CORRECTIONS_ASSET))
+    lock.set_defaults(func=cmd_seed_lock)
+    render.set_defaults(func=cmd_seed_render)
     return p
 
 

@@ -458,6 +458,14 @@ jobs:
       - name: Check provider registry drift
         if: needs.changes.outputs.heavy == 'true'
         run: python3 scripts/check-provider-registry.py
+      - name: Check the offline model seed is generated
+        if: needs.changes.outputs.heavy == 'true'
+        # crates/config/assets/models_dev.bundled.json is rendered from
+        # scripts/catalog/models_dev_seed.toml and its lock (#6396). A hand edit
+        # fails here; docs/CATALOG_REFRESH.md has the regenerate steps.
+        run: |
+          python3 scripts/catalog_models_dev.py seed render --check
+          python3 -m unittest scripts/catalog_models_dev_test.py
       - name: Check command-contract prototype boundary
         if: needs.changes.outputs.heavy == 'true'
         # The runtime -> UI ratchet baseline is compared with the one at the
