@@ -4480,9 +4480,17 @@ impl Engine {
                         let tid = tool_id.clone();
                         let cap = self.config.snapshots_max_workspace_bytes;
                         let sid = self.session.id.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
+                        let taken = tokio::task::spawn_blocking(move || {
                             crate::core::turn::pre_tool_snapshot(&ws, &tid, cap, Some(&sid))
                         })
+                        .await
+                        .ok()
+                        .flatten();
+                        self.emit_snapshot_receipt(
+                            crate::snapshot::WorkspaceSnapshotKind::Tool,
+                            taken,
+                            Some(tool_id.as_str()),
+                        )
                         .await;
                         self.emit_pending_snapshot_notices().await;
                     }
@@ -4941,9 +4949,17 @@ impl Engine {
             let tid = nested_id.clone();
             let cap = self.config.snapshots_max_workspace_bytes;
             let sid = self.session.id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            let taken = tokio::task::spawn_blocking(move || {
                 crate::core::turn::pre_tool_snapshot(&ws, &tid, cap, Some(&sid))
             })
+            .await
+            .ok()
+            .flatten();
+            self.emit_snapshot_receipt(
+                crate::snapshot::WorkspaceSnapshotKind::Tool,
+                taken,
+                Some(nested_id.as_str()),
+            )
             .await;
             self.emit_pending_snapshot_notices().await;
         }

@@ -813,8 +813,8 @@ route.
 - `POST /v1/threads/{id}/compact` (manual compaction)
 - `POST /v1/threads/{id}/undo` - fork the thread with the last N turns removed (`{"depth": N}`, default 0 = last turn only); returns the forked thread plus `original_user_text` so a GUI can pre-populate the input box
 - `POST /v1/threads/{id}/fork-at-turn` - fork at one named user turn (`{"turn_id": "turn_…"}`, as `GET /v1/threads/{id}` reports it). The fork *keeps* that turn and every turn before it, and drops the turns after it; naming the last turn therefore keeps the whole conversation. The receipt is `/undo`'s (`thread`, `original_user_text`, `original_user_images`), carrying the *first dropped* user turn's prompt — what was asked next, even when a prompt-less turn such as a manual `/compact` sits between — so a client can put it back in the composer for editing. The source thread, its session document and the workspace are untouched, and there is no file rollback: a fork is a sibling conversation, and rewinding the workspace would rewind the branch left behind with it. Clients should name the turn instead of computing a `depth` — the transcript they render and the turn list this cuts are not the same list (steers, image-only prompts and injected handoffs each sit on one side only), and a client-side count that is off by one forks the wrong prefix while answering `201`. `400` when the turn is not a user turn of that thread.
-- `POST /v1/threads/{id}/patch-undo` - snapshot-based whole-workspace rollback followed by the same fork (`{"depth": N}`); returns `patch_result` (`files_restored`, `summary`, `snapshot_label`) alongside the forked thread. See [Workspace restore endpoints](#workspace-restore-endpoints) for the trust, admission and abort rules.
-- `POST /v1/threads/{id}/file-revert` - restore exactly one file from one named snapshot (`{"path", "snapshot_id", "expected_hash"}`); never forks the conversation. See [Workspace restore endpoints](#workspace-restore-endpoints).
+- `POST /v1/threads/{id}/patch-undo` - rolls back the files the dropped turns changed, then the same fork (`{"depth": N}`); returns `patch_result` (`files_restored`, `summary`, `snapshot_label`) alongside the forked thread. See [Workspace restore endpoints](#workspace-restore-endpoints) for ownership, the trust, admission and abort rules, and the `error.code` values of a refusal.
+- `POST /v1/threads/{id}/file-revert` - restore exactly one file from one restore point the thread owns (`{"path", "snapshot_id", "expected_hash"}`); never forks the conversation. See [Workspace restore endpoints](#workspace-restore-endpoints).
 - `POST /v1/threads/{id}/retry` - fork with the last N turns removed and immediately start a new turn (`{"depth": N, "prompt": "..."}`; `prompt` overrides the original user text, which is re-used when omitted)
 
 `POST /v1/threads/{id}/turns` accepts the same optional
@@ -1052,7 +1052,7 @@ admission rule and one safety net, and they differ in scope and trust.
 | Route | Scope | Trust | Forks the thread |
 | --- | --- | --- | --- |
 | `POST /v1/snapshots/{id}/restore` | whole server workspace | bearer token only (operator action) | no |
-| `POST /v1/threads/{id}/patch-undo` | whole thread workspace | thread `trust_mode` or `auto_approve` when files would change | yes |
+| `POST /v1/threads/{id}/patch-undo` | the files the dropped turns changed | thread `trust_mode` or `auto_approve` when files would change | yes |
 | `POST /v1/threads/{id}/file-revert` | exactly one regular file | thread `trust_mode` or `auto_approve`, always | no |
 
 **Admission.** A restore reserves the same admission the Runtime uses for
@@ -1070,6 +1070,33 @@ restore. A thread whose workspace directory is not available (unmounted
 volume, disconnected share, missing directory) is refused with `409` rather
 than treated as having nothing to restore.
 
+**Ownership.** A thread owns exactly the workspace restore points recorded on
+its own turns. While a turn runs, the engine reports each snapshot it takes —
+`pre_turn` before the turn, `tool` before each file-modifying tool call,
+`post_turn` when it ends (always before the turn settles) — and the Runtime
+appends it to the turn record's `workspace_snapshots`, in order:
+
+```json
+"workspace_snapshots": [
+  { "kind": "pre_turn", "snapshot_id": "<commit>", "tree_id": "<tree>", "session_id": "thr_1a2b3c4d" },
+  { "kind": "tool", "snapshot_id": "<commit>", "tree_id": "<tree>", "session_id": "thr_1a2b3c4d", "tool_call_id": "call_…" },
+  { "kind": "post_turn", "snapshot_id": "<commit>", "tree_id": "<tree>", "session_id": "thr_1a2b3c4d" }
+]
+```
+
+Each receipt is also published as a `turn.workspace_snapshot` event (payload:
+the receipt). The engine runs every Runtime thread under the thread's own id,
+across restarts and engine eviction, so `session_id` is the thread id for turns
+the thread ran itself; it does not follow the thread's saved-session binding
+(`PUT`/`POST /v1/sessions`, resume), which only names a document. A fork clones
+its source's turn records and so owns the restore points of the turns it
+inherited. Another thread's, or a TUI session's, snapshots in the same
+workspace are never candidates. `tree_id` is the durable identity: a prune
+rebuilds the side repo and rewrites every commit id but keeps each tree, and a
+restore point resolves only to a stored snapshot with the same tree, session
+tag and kind. Turns recorded before receipts existed, turns imported by
+`resume-thread`, and turns run with snapshots off or unavailable have none.
+
 **Safety net.** Every restore first records a `pre-restore:<target>` snapshot
 of the current workspace. That label is never a `/undo`, `patch-undo` or
 `file-revert` candidate, so the net does not change what later undos select.
@@ -1077,20 +1104,37 @@ For `file-revert` the backup is mandatory: if it cannot be written, or the
 requested file is excluded from it (for example by `.gitignore`), the request
 fails and nothing is changed.
 
-**`patch-undo`.** Selects the newest `tool:`/`pre-turn:` snapshot owned by the
-thread's own session whose tree differs from the workspace, restores the whole
-tree from it, then forks the conversation exactly as `/undo` does. `Ok` means
-either files were restored or there was provably nothing to restore (no bound
-session, or no differing session-owned snapshot); `files_restored` says which.
-When there is something to restore and the thread is not trusted, the whole
-undo aborts with `409` and neither files nor conversation change. Snapshot
-repository, listing or comparison failures abort with `500`, and an unavailable
-workspace directory aborts with `409`; both preserve the conversation, so a
-turn is never dropped while its file changes stay on disk.
-Depth and history are validated before any file changes. If the fork cannot be
-persisted after files were restored, the response is a `500` that names the
-restored snapshot; the original thread still holds the turn and the
-`pre-restore:` snapshot holds the previous files.
+**`patch-undo`.** Undoes whole turns. For each dropped turn's `pre_turn` →
+`post_turn` window, the paths that differ between the two snapshots are the
+turn's changes; each goes back to its content before the first dropped turn
+that changed it, and nothing else is touched, so later work by the user or
+another thread in the same workspace survives. (A write another process made
+to one of those paths *during* a dropped turn is indistinguishable from the
+turn's own and goes with it.) Then the conversation forks exactly as `/undo`
+does. `201` means either files were restored (`files_restored: true`, one
+`<action> <path>` line per file in `summary`, `snapshot_label` naming the
+pre-turn snapshot) or there was provably nothing to restore
+(`files_restored: false`): every dropped turn ran here without a tool call,
+changed no file, or its files are already back at their pre-turn content.
+Anything that cannot be restored aborts the whole undo with `409`, nothing is
+changed and no fork is published; `error.code` says why:
+
+| `error.code` | Meaning |
+| --- | --- |
+| `restore_point_unavailable` | a dropped turn that may have changed files has no complete recorded restore point (older record, imported by `resume-thread`, snapshots off, or the snapshot failed) |
+| `restore_point_pruned` | the restore point is no longer in the snapshot store |
+| `workspace_changed_since_turn` | a path the turns changed was changed afterwards (or between two dropped turns), or is not a regular file |
+| `restore_requires_trust` | there is something to restore and the thread is not in trusted mode or Full Access |
+| `workspace_unavailable` | the workspace directory is not available |
+
+For the first three a client can offer the conversation-only
+`POST /v1/threads/{id}/undo` instead, and `file-revert` for individual files.
+Snapshot repository, listing or comparison failures abort with `500` and also
+preserve the conversation, so a turn is never dropped while its file changes
+stay on disk. Depth and history are validated before any file changes. If the
+fork cannot be persisted after files were restored, the response is a `500`
+that names the restored snapshot; the original thread still holds the turn and
+the `pre-restore:` snapshot holds the previous files.
 
 **`file-revert`.** Request body:
 
@@ -1106,11 +1150,14 @@ restored snapshot; the original thread still holds the turn and the
   name is literal (brackets, spaces and glob characters are filename bytes;
   Git runs with `--literal-pathspecs`). It must name a regular file: directories,
   symlinks anywhere in the path, and `.git` components are `400`.
-- `snapshot_id`: the exact `tool:<call_id>` or `pre-turn:<n>` snapshot from the
-  change the user selected. Clients obtain ids from `GET /v1/snapshots` (labels
-  carry the tool call id) and must keep the selected change's identity; the
-  server never picks "the newest snapshot that differs", because an unrelated
-  newer snapshot can erase later user edits while leaving the tool's change.
+- `snapshot_id`: the exact `tool` or `pre_turn` restore point of the change
+  the user selected, from the thread's own turn records: a receipt's
+  `snapshot_id` or `tree_id` (for a tool call, the receipt whose
+  `tool_call_id` matches), or the current commit id `GET /v1/snapshots` lists
+  for it. It must be a restore point recorded on one of this thread's turns;
+  the server never picks "the newest snapshot that differs", because an
+  unrelated newer snapshot can erase later user edits while leaving the tool's
+  change.
 - `expected_hash`: `sha256:` of the current file bytes the client displayed,
   or `absent` when the client saw the file as deleted. It is checked before the
   safety backup and again immediately before the mutation.
@@ -1124,10 +1171,11 @@ Responses:
 - `400`: malformed `snapshot_id`/`expected_hash`, path outside the workspace,
   or a path that is not a regular file on either side.
 - `404`: unknown thread.
-- `409`: thread not in trusted mode or Full Access; no bound session; active
-  turn in an overlapping workspace; workspace directory not available;
-  snapshot unknown, owned by another session
-  or not a restore point (refresh the change record); file already matches the
+- `409`: thread not in trusted mode or Full Access; active turn in an
+  overlapping workspace; workspace directory not available; snapshot unknown,
+  pruned, not recorded on this thread's turns (another thread's or a TUI
+  session's), or not a restore point (refresh the change record); file already
+  matches the
   snapshot (nothing to revert); or the file changed after the reviewed
   `expected_hash` (refresh and review again). Nothing is changed in any of
   these cases.
@@ -1869,7 +1917,7 @@ Common event names: `thread.started`, `thread.forked`, `turn.started`,
 `approval.timeout`, `user_input.required`, `user_input.answered`,
 `user_input.canceled`, `tool_call.requested`, `tool_call.resolved`,
 `tool_call.timeout`, `tool_call.canceled`, `sandbox.denied`,
-`runtime.store_failure`.
+`turn.workspace_snapshot`, `runtime.store_failure`.
 
 `runtime.store_failure` is the runtime reporting a fault in the operator's own
 on-disk state: a thread, turn, or item record under the session's runtime

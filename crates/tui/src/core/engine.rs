@@ -39,6 +39,7 @@ use crate::route_runtime::resolve_runtime_route;
 use crate::route_runtime::{
     ResolvedRuntimeRoute, ValidatedRuntimeRoute, resolve_runtime_route_for_identity,
 };
+use crate::snapshot::{WorkspaceSnapshotKind, WorkspaceSnapshotRef};
 use crate::tools::goal::{
     GoalPauseReason, GoalSnapshot, GoalStatus, SharedGoalState, new_shared_goal_state,
 };
@@ -372,6 +373,16 @@ pub struct EngineConfig {
     /// first init. `0` disables the cap. Resolved from
     /// `[snapshots] max_workspace_gb` × 1 GB at engine construction.
     pub snapshots_max_workspace_bytes: u64,
+    /// Take the post-turn snapshot *before* `TurnComplete`, so its
+    /// `Event::WorkspaceSnapshotTaken` receipt belongs to the turn it closes.
+    ///
+    /// The Runtime API records every receipt on the turn that was running and
+    /// resolves turn-scoped undo from them; a receipt that arrived after
+    /// `TurnComplete` would land after the turn settled (or on the next turn,
+    /// or nowhere once the engine is evicted). Interactive hosts keep `false`:
+    /// the TUI does not record receipts and keeps the post-turn snapshot off
+    /// its input path (#234).
+    pub await_post_turn_snapshot: bool,
     /// Post-edit LSP diagnostics injection (#136). When `None`, the engine
     /// constructs a disabled manager so the field is always present.
     pub lsp_config: Option<crate::lsp::LspConfig>,
@@ -577,6 +588,7 @@ impl Default for EngineConfig {
             snapshots_enabled: true,
             snapshots_max_workspace_bytes:
                 crate::snapshot::DEFAULT_MAX_WORKSPACE_BYTES_FOR_SNAPSHOT,
+            await_post_turn_snapshot: false,
             lsp_config: None,
             runtime_services: RuntimeToolServices::default(),
             subagent_model_overrides: HashMap::new(),
@@ -2029,7 +2041,7 @@ impl Engine {
             let pre_cap = self.config.snapshots_max_workspace_bytes;
             let pre_prompt = snapshot_prompt.clone();
             let pre_sid = self.session.id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            let taken = tokio::task::spawn_blocking(move || {
                 pre_turn_snapshot(
                     &pre_workspace,
                     pre_seq,
@@ -2038,7 +2050,11 @@ impl Engine {
                     Some(&pre_sid),
                 )
             })
-            .await;
+            .await
+            .ok()
+            .flatten();
+            self.emit_snapshot_receipt(WorkspaceSnapshotKind::PreTurn, taken, None)
+                .await;
         }
 
         self.emit_pending_snapshot_notices().await;
@@ -2145,6 +2161,8 @@ impl Engine {
         if status == TurnOutcomeStatus::Interrupted {
             self.emit_interrupted_survivor_status().await;
         }
+        self.post_turn_snapshot_before_complete(&snapshot_prompt)
+            .await;
         drop(turn_control);
         let _ = self
             .tx_event
@@ -2159,21 +2177,76 @@ impl Engine {
             })
             .await;
 
-        if self.config.snapshots_enabled {
-            let post_workspace = self.session.workspace.clone();
-            let post_seq = self.turn_counter;
-            let post_cap = self.config.snapshots_max_workspace_bytes;
-            let post_sid = self.session.id.clone();
-            crate::utils::spawn_blocking_supervised("post-shell-turn-snapshot", move || {
-                post_turn_snapshot(
-                    &post_workspace,
-                    post_seq,
-                    post_cap,
-                    Some(&snapshot_prompt),
-                    Some(&post_sid),
-                );
-            });
+        self.post_turn_snapshot_after_complete("post-shell-turn-snapshot", snapshot_prompt);
+    }
+
+    /// Report a snapshot the engine just took for the running turn. `None`
+    /// (snapshot failed or was gated off) reports nothing: the host then has
+    /// no restore point for the turn and must say so rather than guess one.
+    pub(crate) async fn emit_snapshot_receipt(
+        &self,
+        kind: WorkspaceSnapshotKind,
+        taken: Option<crate::snapshot::TakenSnapshot>,
+        tool_call_id: Option<&str>,
+    ) {
+        let Some(taken) = taken else {
+            return;
+        };
+        let snapshot = WorkspaceSnapshotRef::new(kind, &taken, &self.session.id, tool_call_id);
+        let _ = self
+            .tx_event
+            .send(Event::WorkspaceSnapshotTaken { snapshot })
+            .await;
+    }
+
+    /// With [`EngineConfig::await_post_turn_snapshot`], take the post-turn
+    /// snapshot now — before `TurnComplete` — and report it.
+    async fn post_turn_snapshot_before_complete(&self, prompt: &str) {
+        if !(self.config.snapshots_enabled && self.config.await_post_turn_snapshot) {
+            return;
         }
+        let post_workspace = self.session.workspace.clone();
+        let post_seq = self.turn_counter;
+        let post_cap = self.config.snapshots_max_workspace_bytes;
+        let post_sid = self.session.id.clone();
+        let post_prompt = prompt.to_string();
+        let taken = tokio::task::spawn_blocking(move || {
+            post_turn_snapshot(
+                &post_workspace,
+                post_seq,
+                post_cap,
+                Some(&post_prompt),
+                Some(&post_sid),
+            )
+        })
+        .await
+        .ok()
+        .flatten();
+        self.emit_snapshot_receipt(WorkspaceSnapshotKind::PostTurn, taken, None)
+            .await;
+    }
+
+    /// Without [`EngineConfig::await_post_turn_snapshot`], take the post-turn
+    /// snapshot fire-and-forget: `TurnComplete` is already emitted, so the UI
+    /// is unblocked and the user can type / select / paste immediately
+    /// (#234). The git work proceeds on the blocking pool.
+    fn post_turn_snapshot_after_complete(&self, task: &'static str, prompt: String) {
+        if !self.config.snapshots_enabled || self.config.await_post_turn_snapshot {
+            return;
+        }
+        let post_workspace = self.session.workspace.clone();
+        let post_seq = self.turn_counter;
+        let post_cap = self.config.snapshots_max_workspace_bytes;
+        let post_sid = self.session.id.clone();
+        crate::utils::spawn_blocking_supervised(task, move || {
+            post_turn_snapshot(
+                &post_workspace,
+                post_seq,
+                post_cap,
+                Some(&prompt),
+                Some(&post_sid),
+            );
+        });
     }
 
     /// Apply a user/host mode-or-posture change to the live session.
@@ -5410,7 +5483,7 @@ impl Engine {
             let pre_seq = self.turn_counter;
             let pre_cap = self.config.snapshots_max_workspace_bytes;
             let pre_sid = self.session.id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            let taken = tokio::task::spawn_blocking(move || {
                 pre_turn_snapshot(
                     &pre_workspace,
                     pre_seq,
@@ -5419,7 +5492,11 @@ impl Engine {
                     Some(&pre_sid),
                 )
             })
-            .await;
+            .await
+            .ok()
+            .flatten();
+            self.emit_snapshot_receipt(WorkspaceSnapshotKind::PreTurn, taken, None)
+                .await;
         }
 
         self.emit_pending_snapshot_notices().await;
@@ -5759,6 +5836,8 @@ impl Engine {
                 .send(Event::ToolRequestSnapshot { snapshot })
                 .await;
         }
+        self.post_turn_snapshot_before_complete(&snapshot_prompt_post)
+            .await;
         drop(turn_control);
         // `event_sent` means the TurnComplete event reached the UI channel —
         // never that the user saw model output. (#6184: the old `delivered`
@@ -5784,27 +5863,9 @@ impl Engine {
             "engine turn completion settled"
         );
 
-        // Post-turn snapshot. Fire-and-forget: TurnComplete is already
-        // emitted, so the UI is unblocked and the user can type / select /
-        // paste immediately (#234). The git work proceeds on the blocking
-        // pool without forcing the engine loop to await it.
-        if self.config.snapshots_enabled {
-            // `snapshot_prompt_post` was cloned from `content` above,
-            // before `content` was moved into the session messages.
-            let post_workspace = self.session.workspace.clone();
-            let post_seq = self.turn_counter;
-            let post_cap = self.config.snapshots_max_workspace_bytes;
-            let post_sid = self.session.id.clone();
-            crate::utils::spawn_blocking_supervised("post-turn-snapshot", move || {
-                post_turn_snapshot(
-                    &post_workspace,
-                    post_seq,
-                    post_cap,
-                    Some(&snapshot_prompt_post),
-                    Some(&post_sid),
-                );
-            });
-        }
+        // Post-turn snapshot, unless it was already taken before
+        // TurnComplete (see `EngineConfig::await_post_turn_snapshot`).
+        self.post_turn_snapshot_after_complete("post-turn-snapshot", snapshot_prompt_post);
 
         // ── Background advisor watcher (#3982) ────────────────────────────
         // Fire-and-forget: TurnComplete is already emitted. The advisor
@@ -7821,8 +7882,15 @@ pub(crate) fn spawn_engine_with_authoritative_route_config(
     config: EngineConfig,
     api_config: &Config,
     authoritative_route_config: Arc<parking_lot::RwLock<Config>>,
+    model_client: Option<SharedModelClient>,
 ) -> (EngineHandle, tokio::task::JoinHandle<()>) {
-    let (mut engine, handle) = Engine::new(config, api_config);
+    // `model_client` replaces only the model I/O boundary (see
+    // `Engine::new_with_model_client`); hosts pass `None` for the provider
+    // client the route resolves.
+    let (mut engine, handle) = match model_client {
+        Some(client) => Engine::new_with_model_client(config, api_config, client),
+        None => Engine::new(config, api_config),
+    };
     engine.authoritative_route_config = Some(authoritative_route_config);
 
     let worker = spawn_supervised(

@@ -14,7 +14,7 @@
 //! snapshots.
 
 use crate::core::events::TurnRoute;
-use crate::snapshot::SnapshotRepo;
+use crate::snapshot::{SnapshotRepo, TakenSnapshot};
 use codewhale_models::Usage;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -616,15 +616,15 @@ pub(crate) fn parse_snapshot_label(label: &str) -> ParsedSnapshotLabel {
 /// turn, embedded in the snapshot label so `/restore` listings are
 /// human-readable.
 ///
-/// Returns the snapshot SHA on success, `None` on any error. Errors are
-/// logged at WARN; the turn loop must not block on this.
+/// Returns the snapshot (commit and tree) on success, `None` on any error.
+/// Errors are logged at WARN; the turn loop must not block on this.
 pub fn pre_turn_snapshot(
     workspace: &Path,
     turn_seq: u64,
     cap_bytes: u64,
     user_prompt: Option<&str>,
     session_id: Option<&str>,
-) -> Option<String> {
+) -> Option<TakenSnapshot> {
     snapshot_with_label(
         workspace,
         &format_snapshot_label("pre-turn", turn_seq, user_prompt),
@@ -639,14 +639,14 @@ pub fn pre_turn_snapshot(
 /// This enables surgical undo: `/undo` can restore to the most recent
 /// `tool:<call_id>` snapshot to revert just the last file write.
 ///
-/// Returns the snapshot SHA on success, `None` on any error. Errors are
-/// logged at WARN and are non-fatal.
+/// Returns the snapshot (commit and tree) on success, `None` on any error.
+/// Errors are logged at WARN and are non-fatal.
 pub fn pre_tool_snapshot(
     workspace: &Path,
     call_id: &str,
     cap_bytes: u64,
     session_id: Option<&str>,
-) -> Option<String> {
+) -> Option<TakenSnapshot> {
     snapshot_with_label(workspace, &format!("tool:{call_id}"), cap_bytes, session_id)
 }
 
@@ -658,7 +658,7 @@ pub fn post_turn_snapshot(
     cap_bytes: u64,
     user_prompt: Option<&str>,
     session_id: Option<&str>,
-) -> Option<String> {
+) -> Option<TakenSnapshot> {
     snapshot_with_label(
         workspace,
         &format_snapshot_label("post-turn", turn_seq, user_prompt),
@@ -672,18 +672,18 @@ fn snapshot_with_label(
     label: &str,
     cap_bytes: u64,
     session_id: Option<&str>,
-) -> Option<String> {
+) -> Option<TakenSnapshot> {
     match SnapshotRepo::open_or_init_with_cap(workspace, cap_bytes) {
         Ok(repo) => {
             // Undo that silently stops working is the failure this guards
             // (B2): a repaired history and a failing snapshot both reach the
             // user through the same notice as the gates, never only a log.
             let taken = repo.repair_broken_head().and_then(|repaired| {
-                repo.snapshot_with_session(label, session_id)
-                    .map(|id| (id, repaired))
+                repo.take_snapshot(label, session_id)
+                    .map(|taken| (taken, repaired))
             });
             let (id, repaired) = match taken {
-                Ok((id, repaired)) => (Some(id.into_string()), repaired),
+                Ok((taken, repaired)) => (Some(taken), repaired),
                 Err(e) => {
                     tracing::warn!(target: "snapshot", "snapshot '{label}' failed: {e}");
                     record_snapshot_notice(

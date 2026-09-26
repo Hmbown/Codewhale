@@ -545,6 +545,7 @@ pub(super) async fn resize_thread_job(
             return Err(ApiError {
                 status: StatusCode::CONFLICT,
                 message: "This job is no longer running".into(),
+                code: None,
             });
         }
         if guard.job_terminal_size(&job_id).is_none() {

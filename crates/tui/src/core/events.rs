@@ -281,6 +281,16 @@ pub enum Event {
         snapshot: crate::tool_inspection::ToolInspectionSnapshot,
     },
 
+    /// The engine took a workspace snapshot for the running turn: before it
+    /// (`pre_turn`), before one file-modifying tool call (`tool`), or after it
+    /// (`post_turn`). A host that records these on its turn records owns
+    /// exactly those restore points (see `crate::snapshot::WorkspaceSnapshotRef`).
+    /// With `EngineConfig::await_post_turn_snapshot` every receipt of a turn
+    /// arrives before its `TurnComplete`.
+    WorkspaceSnapshotTaken {
+        snapshot: crate::snapshot::WorkspaceSnapshotRef,
+    },
+
     /// Immutable billing route captured at CodeWhale's pre-permit application
     /// dispatch boundary, after request preparation. This is admission-time
     /// evidence, not proof of network delivery or provider invoice-time rates.

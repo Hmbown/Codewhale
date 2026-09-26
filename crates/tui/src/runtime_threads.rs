@@ -1207,6 +1207,17 @@ pub struct TurnRecord {
     /// turn queue; ordinary external-user turns leave it unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_mail_message_id: Option<String>,
+    /// Workspace snapshots the engine took while this turn ran, in the order
+    /// the engine reported them (one FIFO event channel, one consumer per
+    /// turn): the turn's `pre_turn` restore point, one `tool` snapshot before
+    /// each file-modifying tool call, and its `post_turn` state. A thread owns
+    /// exactly the restore points recorded on its own turns — a fork owns the
+    /// ones its cloned turns carry — and turn-scoped undo and file revert
+    /// resolve only these. Records written before this field existed, turns
+    /// imported from a saved session, and turns that ran with snapshots off
+    /// carry none, and so have no restore point.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_snapshots: Vec<crate::snapshot::WorkspaceSnapshotRef>,
 }
 
 impl TurnRecord {
@@ -1480,6 +1491,7 @@ fn settle_unaccepted_routed_usage(
             item_ids: Vec::new(),
             steer_count: 0,
             agent_mail_message_id: None,
+            workspace_snapshots: Vec::new(),
         }
     };
     append_initial_routed_usage_to_turn(&mut turn, batch);
@@ -4843,6 +4855,33 @@ pub(crate) struct PreparedThreadFork {
     /// it while preparing would leave an unreferenced document behind whenever
     /// the caller abandons the fork (a refused or failed file undo).
     own_session: Option<(String, Vec<Message>, Option<String>)>,
+    /// The turns the fork drops, oldest first, with the workspace restore
+    /// points each recorded: what a turn-scoped file undo rolls back.
+    dropped_turns: Vec<DroppedTurnSnapshots>,
+}
+
+impl PreparedThreadFork {
+    /// The turns this fork drops, oldest first.
+    pub(crate) fn dropped_turns(&self) -> &[DroppedTurnSnapshots] {
+        &self.dropped_turns
+    }
+}
+
+/// One turn a fork drops, as a turn-scoped file undo sees it.
+#[derive(Debug, Clone)]
+pub(crate) struct DroppedTurnSnapshots {
+    pub turn_id: String,
+    /// Whether the turn may have changed workspace files, and so needs a
+    /// restore point to be undone. Every change a turn makes goes through a
+    /// tool call (file tools, shell, sub-agents), so a turn this Runtime ran
+    /// (its record carries the policy receipt every accepted turn gets) with
+    /// no tool items provably changed nothing, as does an accounting-only
+    /// routing settlement or a record with no items at all. A turn imported
+    /// from a saved session proves nothing either way: saved documents need
+    /// not keep tool calls.
+    pub may_change_files: bool,
+    /// The restore points the engine reported for the turn, in order.
+    pub snapshots: Vec<crate::snapshot::WorkspaceSnapshotRef>,
 }
 
 /// Shared ownership of an existing task's join. A canceled drain drops only
@@ -4952,6 +4991,12 @@ pub struct RuntimeThreadManager {
     snapshot_test_hook: Arc<parking_lot::Mutex<Option<mpsc::UnboundedSender<SnapshotTestPoint>>>>,
     #[cfg(test)]
     replay_test_hook: Arc<parking_lot::Mutex<Option<mpsc::UnboundedSender<ReplayTestPoint>>>>,
+    /// Test seam: the model client every engine this manager builds uses in
+    /// place of the route's provider client. Everything else about the build
+    /// — `EngineConfig`, `SyncSession`, snapshots — is the production path.
+    #[cfg(test)]
+    test_model_client:
+        Arc<parking_lot::Mutex<Option<crate::core::model_client::SharedModelClient>>>,
 }
 
 #[derive(Debug)]
@@ -5585,6 +5630,8 @@ impl RuntimeThreadManager {
             snapshot_test_hook: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(test)]
             replay_test_hook: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(test)]
+            test_model_client: Arc::new(parking_lot::Mutex::new(None)),
         };
         manager.recover_interrupted_state()?;
         Ok(manager)
@@ -8853,6 +8900,30 @@ impl RuntimeThreadManager {
         Ok(())
     }
 
+    /// Every workspace restore point recorded on this thread's turns — the
+    /// snapshots the thread owns, including those its cloned (forked) turns
+    /// carry. Callers hold `thread_restore_guard`, so no turn is recording.
+    pub(crate) fn thread_workspace_snapshots(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<crate::snapshot::WorkspaceSnapshotRef>> {
+        Ok(self
+            .store
+            .list_turns_for_thread(thread_id)?
+            .into_iter()
+            .flat_map(|turn| turn.workspace_snapshots)
+            .collect())
+    }
+
+    /// Test seam: build every later engine with `client` as its model client.
+    #[cfg(test)]
+    pub(crate) fn set_test_model_client(
+        &self,
+        client: crate::core::model_client::SharedModelClient,
+    ) {
+        *self.test_model_client.lock() = Some(client);
+    }
+
     /// Test seam: mark or clear an active turn on an installed test engine so
     /// route-level tests can exercise restore admission.
     #[cfg(test)]
@@ -9465,6 +9536,29 @@ impl RuntimeThreadManager {
         // (a manual compaction, a routing settlement) that happens to sit
         // between them.
         debug_assert!(receipt_turn_idx.is_none_or(|idx| idx >= cutoff_turn_idx));
+        let dropped_turns = source_turns
+            .iter()
+            .skip(cutoff_turn_idx)
+            .map(|turn| {
+                let items = items_by_turn.get(&turn.id).map_or(&[][..], Vec::as_slice);
+                let ran_tools = items.iter().any(|item| {
+                    matches!(
+                        item.kind,
+                        TurnItemKind::ToolCall
+                            | TurnItemKind::FileChange
+                            | TurnItemKind::CommandExecution
+                    )
+                });
+                let ran_here = turn.permission_posture.is_some();
+                DroppedTurnSnapshots {
+                    turn_id: turn.id.clone(),
+                    may_change_files: !turn.routing_settlement
+                        && !items.is_empty()
+                        && (ran_tools || !ran_here),
+                    snapshots: turn.workspace_snapshots.clone(),
+                }
+            })
+            .collect();
         let dropped_turn = receipt_turn_idx.and_then(|idx| source_turns.get(idx));
         let dropped_turn_id = dropped_turn.map(|turn| turn.id.clone());
         let dropped_user_item = dropped_turn
@@ -9652,6 +9746,7 @@ impl RuntimeThreadManager {
             original_images,
             max_output_tokens,
             own_session,
+            dropped_turns,
         })
     }
 
@@ -10142,6 +10237,7 @@ impl RuntimeThreadManager {
                     item_ids,
                     steer_count: 0,
                     agent_mail_message_id: None,
+                    workspace_snapshots: Vec::new(),
                 })?;
 
                 thread.latest_turn_id = Some(turn_id);
@@ -11289,6 +11385,7 @@ impl RuntimeThreadManager {
             item_ids: Vec::new(),
             steer_count: 0,
             agent_mail_message_id: input_source.mail_message_id().map(str::to_string),
+            workspace_snapshots: Vec::new(),
         };
         append_initial_routed_usage_to_turn(&mut turn, &initial_routed_usage);
         // The engine's TurnComplete owns synchronous dropped coverage,
@@ -11783,6 +11880,7 @@ impl RuntimeThreadManager {
             item_ids: Vec::new(),
             steer_count: 0,
             agent_mail_message_id: None,
+            workspace_snapshots: Vec::new(),
         };
         let op = Op::CompactContext {
             id: compaction_id.clone(),
@@ -12097,7 +12195,19 @@ impl RuntimeThreadManager {
                 model: route_model.clone(),
                 active_route_limits: route_limits,
                 workspace: thread.workspace.clone(),
-                session_id: None,
+                // The engine runs every Runtime thread under the thread's own
+                // id, from its first turn and across every restart and LRU
+                // eviction. That id tags every workspace snapshot the engine
+                // takes; a generated id (what `None` meant here) changed on
+                // each rebuild and was recorded nowhere, so no later request
+                // could prove the thread owned its own snapshots (#6621). It
+                // is deliberately not `thread.session_id`: that names the
+                // saved-session document the thread is bound to, which save,
+                // resume and fork rebind, and the conversation's identity
+                // must not change when its document does. Ownership itself is
+                // the receipts recorded on the thread's turns
+                // (`TurnRecord::workspace_snapshots`).
+                session_id: Some(thread.id.clone()),
                 subagent_state_root: None,
                 plugin_registry: thread_plugin_registry.clone(),
                 allow_shell: thread.allow_shell,
@@ -12140,6 +12250,9 @@ impl RuntimeThreadManager {
                     .snapshots_config()
                     .max_workspace_gb
                     .saturating_mul(1024 * 1024 * 1024),
+                // Every snapshot receipt, post-turn included, must reach
+                // `monitor_turn` before the turn settles.
+                await_post_turn_snapshot: true,
                 lsp_config,
                 runtime_services: crate::tools::spec::RuntimeToolServices {
                     task_manager: self.task_manager.lock().upgrade(),
@@ -12243,10 +12356,15 @@ impl RuntimeThreadManager {
 
             // Verify the persisted history before spawning an Engine task.
             let session_messages = self.restore_thread_messages(&thread)?;
+            #[cfg(test)]
+            let model_client = self.test_model_client.lock().clone();
+            #[cfg(not(test))]
+            let model_client = None;
             let (engine, worker) = spawn_engine_with_authoritative_route_config(
                 engine_cfg,
                 &cfg,
                 Arc::clone(&self.config),
+                model_client,
             );
             {
                 let mut workers = self.engine_workers.lock();
@@ -12261,7 +12379,10 @@ impl RuntimeThreadManager {
             if !session_messages.is_empty() || sys_prompt.is_some() {
                 engine
                     .send(Op::SyncSession {
-                        session_id: thread.session_id.clone(),
+                        // Same identity the engine was built with: a
+                        // re-sync of the same conversation, never a
+                        // conversation boundary.
+                        session_id: Some(thread.id.clone()),
                         messages: session_messages,
                         system_prompt: sys_prompt,
                         system_prompt_override: thread.system_prompt.is_some(),
@@ -14235,6 +14356,41 @@ impl RuntimeThreadManager {
                             None,
                             "model.tools.snapshot",
                             json!({ "snapshot": snapshot, "projection_redacted": true }),
+                        )
+                        .await?;
+                    }
+                }
+                EngineEvent::WorkspaceSnapshotTaken { snapshot } => {
+                    // The restore point belongs to the turn this monitor
+                    // owns: snapshot receipts share the engine's FIFO
+                    // channel and, with `await_post_turn_snapshot`, all
+                    // arrive before this turn's TurnComplete. A receipt that
+                    // cannot be recorded leaves the turn without that
+                    // restore point, and patch-undo then refuses the turn
+                    // instead of guessing — so say it loudly, but do not fail
+                    // a turn whose work already happened.
+                    let recorded = {
+                        let _turn_mutation = self.store.turn_mutation.lock();
+                        self.store.load_turn(&turn_id).and_then(|mut turn| {
+                            turn.workspace_snapshots.push(snapshot.clone());
+                            self.store.save_turn(&turn)
+                        })
+                    };
+                    if let Err(err) = recorded {
+                        tracing::warn!(
+                            target: "snapshot",
+                            thread_id = %thread_id,
+                            turn_id = %turn_id,
+                            kind = ?snapshot.kind,
+                            "workspace snapshot receipt was not recorded; this turn has no such restore point: {err:#}"
+                        );
+                    } else {
+                        self.emit_event(
+                            &thread_id,
+                            Some(&turn_id),
+                            None,
+                            "turn.workspace_snapshot",
+                            serde_json::to_value(&snapshot)?,
                         )
                         .await?;
                     }

@@ -50,6 +50,7 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Fixed",
         "items": [
+          "Runtime API undo now restores the files of the turns it undoes, for every kind of thread. Before, a new thread's turns were not linked to their workspace snapshots, so patch-undo returned 201 and rewound the conversation but left the files changed, and file-revert refused. Each turn record now lists its snapshots in workspace_snapshots, the engine runs under the thread's own id across restarts, and a fork owns the turns it inherited. patch-undo restores only the files the…",
           "codewhale exec --auto no longer exits 141 with no output when a child it writes to, such as a stdio MCP server, closes its pipe early. Headless exec now ignores SIGPIPE while it runs, as the interactive TUI already did, and exec ... | head still ends quietly. One-shot codewhale exec no longer prints DeepSeek's raw <｜｜DSML｜｜ calls> tool-call markup as its answer: the markup is removed, and an answer that was only a tool call fails at once with the reason and a pointer to…",
           "The installation page is generated from docs/INSTALL.md, so the website and the guide can no longer disagree; broken anchors and unsafe links fail the build (#6450).",
           "codewhale config set refuses a value of the wrong type for a known setting (a word for an on/off switch, text for a number, a choice outside the list) instead of saving it (#6568, thanks @dajiaohuang).",
@@ -60,10 +61,9 @@ export const CHANGELOG: ChangelogRelease[] = [
           "Continuing a conversation that is already open no longer adds a second thread, and a fork keeps its own session file, so autosave on one side no longer leaves the other unloadable (#6406, thanks @gaord).",
           "Upgrading Codewhale no longer turns off the built-in Computer Use. Each build writes the built-in bundle to its own directory, so an upgrade used to present it as never reviewed and disabled. Now the review and enablement carry to the new build when its capabilities are unchanged. Changed capabilities show capabilities-changed and wait for review, and a revoked trust never carries (#6303).",
           "\"Allow for this conversation\" records a grant for that tool and argument class instead of switching the whole thread to Full Access, so the call you just approved is no longer failed by a Permissions change. An approval also survives a Permissions change that only widens what is allowed, grants end when a thread is archived or deleted, and web.run open grants are scoped by host. Full Access covers MCP tools that declare themselves destructive in every host, including…",
-          "web.run retries a refused page once with a browser user agent, and one site's failure no longer fails the whole call or drops its search results.",
-          "Hooks treat bash, Bash and exec_shell as one tool in tool_name conditions, so the documented example fires."
+          "web.run retries a refused page once with a browser user agent, and one site's failure no longer fails the whole call or drops its search results."
         ],
-        "itemCount": 20
+        "itemCount": 22
       },
       {
         "heading": "Removed",

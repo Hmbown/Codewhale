@@ -55,6 +55,79 @@ pub const DEFAULT_MAX_SNAPSHOTS: usize = 50;
 pub use repo::{
     DEFAULT_MAX_WORKSPACE_BYTES_FOR_SNAPSHOT, GATE_TOO_LARGE_MARKER, GATE_TOO_MANY_ENTRIES_MARKER,
     GATE_UNSAFE_LOCATION_MARKER, PathRestoreAction, PathRestoreOutcome, SIZE_WALK_MAX_ENTRIES,
-    Snapshot, SnapshotId, SnapshotRepo, WorkspaceGate, estimate_workspace_size_bounded,
-    workspace_relative_path,
+    Snapshot, SnapshotId, SnapshotRepo, TakenSnapshot, WorkspaceGate,
+    estimate_workspace_size_bounded, workspace_relative_path,
 };
+
+/// Which point of a turn a recorded workspace snapshot captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSnapshotKind {
+    /// Before the turn touched anything (`pre-turn:` label).
+    PreTurn,
+    /// Before one file-modifying tool call ran (`tool:<call_id>` label).
+    Tool,
+    /// After the turn finished (`post-turn:` label).
+    PostTurn,
+}
+
+impl WorkspaceSnapshotKind {
+    /// The label prefix the snapshot repo stores for this kind.
+    pub fn label_prefix(self) -> &'static str {
+        match self {
+            Self::PreTurn => "pre-turn:",
+            Self::Tool => "tool:",
+            Self::PostTurn => "post-turn:",
+        }
+    }
+}
+
+/// Receipt for one workspace snapshot an engine took on behalf of a turn.
+///
+/// The engine reports it (`Event::WorkspaceSnapshotTaken`) and the Runtime
+/// records it on the turn that was running, so a thread owns exactly the
+/// restore points recorded on its own turns — including the turns a fork
+/// inherited — regardless of which saved-session document the thread is
+/// bound to. `tree_id` is the durable identity: a prune rebuilds the side
+/// repo's commit chain and rewrites every commit id, but re-commits the same
+/// trees. `session_id` is the tag the snapshot was taken under; a restore
+/// point only resolves to a snapshot that still carries it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceSnapshotRef {
+    pub kind: WorkspaceSnapshotKind,
+    /// Commit id when the snapshot was taken. A later prune may rewrite it;
+    /// `tree_id` still resolves the snapshot then.
+    pub snapshot_id: String,
+    /// Root tree of the snapshot.
+    pub tree_id: String,
+    /// Session tag the snapshot was taken under.
+    pub session_id: String,
+    /// Tool call the snapshot preceded, for [`WorkspaceSnapshotKind::Tool`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl WorkspaceSnapshotRef {
+    pub fn new(
+        kind: WorkspaceSnapshotKind,
+        taken: &TakenSnapshot,
+        session_id: &str,
+        tool_call_id: Option<&str>,
+    ) -> Self {
+        Self {
+            kind,
+            snapshot_id: taken.id.as_str().to_string(),
+            tree_id: taken.tree.as_str().to_string(),
+            session_id: session_id.to_string(),
+            tool_call_id: tool_call_id.map(str::to_string),
+        }
+    }
+
+    /// Whether `snapshot` (a row of [`SnapshotRepo::list`]) is this restore
+    /// point: same tree, same session tag, same label kind.
+    pub fn matches(&self, snapshot: &Snapshot) -> bool {
+        snapshot.tree.as_str() == self.tree_id
+            && snapshot.session_id.as_deref() == Some(self.session_id.as_str())
+            && snapshot.label.starts_with(self.kind.label_prefix())
+    }
+}

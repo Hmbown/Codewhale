@@ -51,6 +51,17 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Fixed
 
+- Runtime API undo now restores the files of the turns it undoes, for every
+  kind of thread. Before, a new thread's turns were not linked to their
+  workspace snapshots, so `patch-undo` returned `201` and rewound the
+  conversation but left the files changed, and `file-revert` refused. Each
+  turn record now lists its snapshots in `workspace_snapshots`, the engine runs
+  under the thread's own id across restarts, and a fork owns the turns it
+  inherited. `patch-undo` restores only the files the undone turns changed,
+  including every write in a turn, and leaves later edits by the user or
+  another thread alone. When it cannot restore files it now refuses with `409`
+  and an `error.code` instead of returning `201`
+  ([#6621](https://github.com/Hmbown/Codewhale/issues/6621)).
 - `codewhale exec --auto` no longer exits 141 with no output when a child
   it writes to, such as a stdio MCP server, closes its pipe early. Headless
   exec now ignores SIGPIPE while it runs, as the interactive TUI already did,

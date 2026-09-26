@@ -436,6 +436,7 @@ pub(super) async fn create_session_from_thread(
             message: format!(
                 "Thread {thread_id} has a queued or active turn; wait for completion before saving as a session"
             ),
+            code: None,
         });
     }
 
@@ -855,13 +856,13 @@ pub(super) async fn save_current_session(
         }
     } else {
         // No session was named, so the conversation the thread is running
-        // answers it — and the engine's live conversation id *is* that
-        // conversation's identity: every `tool:` / `pre-turn:` workspace
-        // snapshot it took is tagged with it, and `patch-undo` /
-        // `file-revert` select snapshots by the thread's binding. Minting a
-        // third uuid here (what this used to do) left the thread bound to a
-        // document whose id owned none of those snapshots, so an undo forked
-        // the conversation and left every file on disk untouched.
+        // answers it: the document takes the engine's live conversation id,
+        // which for a Runtime thread is the thread's own id (see
+        // `ensure_engine_loaded`). Thread ids are unique in the store, so no
+        // other thread's document can already hold that name, and saving
+        // again rewrites this one document instead of collecting a new uuid
+        // per save. Snapshot ownership does not depend on this binding: a
+        // thread owns the restore points recorded on its turns.
         let mut session = crate::session_manager::create_saved_session_with_id_and_mode(
             snapshot.session_id.clone(),
             &snapshot.messages,
@@ -1035,6 +1036,7 @@ fn map_session_err(id: &str, err: std::io::Error, action: &str) -> ApiError {
         std::io::ErrorKind::ResourceBusy => ApiError {
             status: StatusCode::CONFLICT,
             message: err.to_string(),
+            code: None,
         },
         _ => ApiError::internal(format!("Failed to {action} session '{id}': {err}")),
     }

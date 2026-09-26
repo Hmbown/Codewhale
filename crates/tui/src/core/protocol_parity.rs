@@ -549,6 +549,11 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             session_id,
             snapshot: to_value(snapshot),
         },
+        Event::WorkspaceSnapshotTaken { snapshot } => wire::EventMsg::WorkspaceSnapshotTaken {
+            thread_id,
+            session_id,
+            snapshot: to_value(snapshot),
+        },
         Event::RouteDispatched { turn_id, route } => wire::EventMsg::RouteDispatched {
             thread_id,
             session_id,
@@ -1440,6 +1445,15 @@ mod tests {
                 error: Some("stopped".into()),
                 tool_catalog: None,
                 base_url: Some("https://example.invalid".into()),
+            },
+            Event::WorkspaceSnapshotTaken {
+                snapshot: crate::snapshot::WorkspaceSnapshotRef {
+                    kind: crate::snapshot::WorkspaceSnapshotKind::Tool,
+                    snapshot_id: "a".repeat(40),
+                    tree_id: "b".repeat(40),
+                    session_id: "thr_1".into(),
+                    tool_call_id: Some("c1".into()),
+                },
             },
             Event::RoutedTurnUsage {
                 usage: usage.clone(),
