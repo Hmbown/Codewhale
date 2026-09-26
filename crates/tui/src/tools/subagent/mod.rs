@@ -733,12 +733,14 @@ pub struct SubAgentResult {
     pub from_prior_session: bool,
     /// Milliseconds since this running agent last showed the manager any
     /// progress, at snapshot time: the same clock the heartbeat reads when it
-    /// auto-stops a stalled child (#6565). `None` once settled.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// auto-stops a stalled child (#6565). `None` once settled. Live-only,
+    /// like `started_at`: never serialized, so a model-visible listing and a
+    /// persisted record do not change every time they are read.
+    #[serde(skip)]
     pub idle_ms: Option<u64>,
     /// The heartbeat bound the manager enforces on that clock: a running
-    /// child idle this long is stopped. `None` once settled.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// child idle this long is stopped. `None` once settled. Live-only.
+    #[serde(skip)]
     pub heartbeat_timeout_ms: Option<u64>,
 }
 
