@@ -113,6 +113,7 @@ mod secrets;
 mod sessions;
 mod targets;
 mod terminal;
+mod turn_artifacts;
 mod voice;
 mod web;
 mod workspace;
@@ -1373,6 +1374,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route(
             "/v1/threads/{id}/turns/{turn_id}/steer",
             post(steer_thread_turn),
+        )
+        .route(
+            "/v1/threads/{id}/turns/{turn_id}/artifacts",
+            get(turn_artifacts::list_turn_artifacts),
         )
         .route(
             "/v1/threads/{id}/turns/{turn_id}/interrupt",

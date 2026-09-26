@@ -1938,6 +1938,8 @@ fn sample_turn(thread_id: &str, turn_id: &str, status: RuntimeTurnStatus) -> Tur
         item_ids: Vec::new(),
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
     }
 }
 
@@ -16166,6 +16168,8 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         item_ids: vec![completed_item.id.clone(), in_progress_item.id.clone()],
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
     })?;
     manager.store.save_turn(&TurnRecord {
         max_output_tokens: None,
@@ -16201,6 +16205,8 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         item_ids: vec![queued_item.id.clone()],
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
     })?;
     drop(manager);
 
@@ -16394,6 +16400,8 @@ fn seed_turns_with_user_messages(
             item_ids: vec![user_item_id, asst_item_id],
             steer_count: 0,
             agent_mail_message_id: None,
+            artifacts: Vec::new(),
+            workspace: None,
         })?;
         turn_ids.push(turn_id);
     }
@@ -17210,6 +17218,8 @@ fn restart_rebuild_restores_tool_call_identity_from_persisted_items() -> Result<
         item_ids: vec![user_item.id.clone(), call_item.id.clone()],
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
     })?;
 
     let turns = manager.store.list_turns_for_thread(&thread.id)?;
@@ -17312,6 +17322,8 @@ fn restart_rebuild_keeps_in_flight_tool_call_identity() -> Result<()> {
         item_ids: vec![call_item.id.clone()],
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
     })?;
 
     let turns = manager.store.list_turns_for_thread(&thread.id)?;
@@ -17409,6 +17421,8 @@ fn restart_rebuild_skips_steers_the_engine_never_delivered() -> Result<()> {
         item_ids: vec![delivered.id.clone(), dropped.id.clone(), pending.id.clone()],
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
     })?;
 
     let turns = manager.store.list_turns_for_thread(&thread.id)?;
@@ -17507,6 +17521,8 @@ fn restart_rebuild_skips_legacy_tool_items_without_identity() -> Result<()> {
         item_ids: vec![user_item.id.clone(), legacy_tool_item.id.clone()],
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
     })?;
 
     let turns = manager.store.list_turns_for_thread(&thread.id)?;
@@ -19541,5 +19557,396 @@ async fn tool_completion_items_carry_typed_artifact_refs() -> Result<()> {
         .expect("write item.completed");
     assert_eq!(live.payload["item"]["artifacts"][0]["path"], "out.md");
     assert_eq!(live.payload["item"]["artifact_refs"], json!(["out.md"]));
+    Ok(())
+}
+
+struct WorkspaceTurnFixture {
+    _env: crate::test_support::TestEnvLock,
+    _home: crate::test_support::EnvVarGuard,
+    dir: tempfile::TempDir,
+    workspace: PathBuf,
+    manager: RuntimeThreadManager,
+    thread: ThreadRecord,
+}
+
+async fn workspace_turn_fixture() -> Result<WorkspaceTurnFixture> {
+    let env = crate::test_support::lock_test_env();
+    let dir = tempfile::tempdir()?;
+    let home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path().join("home"));
+    let workspace = dir.path().join("workspace");
+    fs::create_dir(&workspace)?;
+    fs::write(workspace.join("README.md"), "fixture\n")?;
+    let manager = test_manager(dir.path().join("runtime"))?;
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace.clone()),
+            auto_approve: Some(true),
+            trust_mode: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    Ok(WorkspaceTurnFixture {
+        _env: env,
+        _home: home,
+        dir,
+        workspace,
+        manager,
+        thread,
+    })
+}
+
+/// Drive one scripted turn: a file-tool write with its receipt, a shell-style
+/// write with none, then the engine's snapshot pair and TurnComplete.
+async fn run_workspace_turn(
+    fixture: &WorkspaceTurnFixture,
+    pre_turn: crate::core::events::WorkspaceSnapshot,
+    post_turn: watch::Receiver<crate::core::events::WorkspaceSnapshot>,
+) -> Result<TurnRecord> {
+    let manager = &fixture.manager;
+    let mut harness = install_mock_engine(manager, &fixture.thread.id).await;
+    let turn = manager
+        .start_turn(
+            &fixture.thread.id,
+            StartTurnRequest {
+                prompt: "build the page".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
+    harness
+        .tx_event
+        .send(EngineEvent::TurnStarted {
+            turn_id: "engine-turn".to_string(),
+            created_at: Utc::now(),
+            route: None,
+        })
+        .await?;
+    fs::write(fixture.workspace.join("notes.md"), "# notes\n")?;
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallStarted {
+            id: "call_patch".to_string(),
+            name: "apply_patch".to_string(),
+            input: json!({}),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallComplete {
+            id: "call_patch".to_string(),
+            name: "apply_patch".to_string(),
+            result: Ok(
+                crate::tools::spec::ToolResult::success("ok").with_metadata(json!({
+                    "mutation": { "files": [{
+                        "path": "notes.md", "outcome": "created", "size": 8,
+                        "sha256": crate::hashing::sha256_hex(b"# notes\n"),
+                    }], "renames": [] }
+                })),
+            ),
+        })
+        .await?;
+    // A shell command's write: no receipt reaches the runtime.
+    fs::write(fixture.workspace.join("out.md"), "shell output\n")?;
+    harness
+        .tx_event
+        .send(EngineEvent::TurnWorkspaceSnapshots {
+            turn_id: "engine-turn".to_string(),
+            session_id: "engine-session".to_string(),
+            pre_turn,
+            post_turn,
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    wait_for_terminal_turn(manager, &turn.id).await
+}
+
+async fn wait_for_turn_workspace(
+    manager: &RuntimeThreadManager,
+    turn_id: &str,
+    state: TurnWorkspaceState,
+) -> Result<TurnRecord> {
+    let deadline = Instant::now() + TURN_SETTLEMENT_DEADLOCK_TIMEOUT;
+    loop {
+        let turn = manager.store.load_turn(turn_id)?;
+        if turn.workspace.as_ref().map(|w| w.state) == Some(state) {
+            return Ok(turn);
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "turn {turn_id} never reached {state:?}: {:?}",
+                turn.workspace
+            );
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The workspace delta between the engine's pre/post snapshots settles into
+/// the turn aggregate: a shell-written file appears with its revision next
+/// to the tool-written one, `turn.artifacts` is published, and the list
+/// route serves it only for the owning thread.
+#[tokio::test]
+async fn turn_workspace_delta_settles_shell_writes_into_the_aggregate() -> Result<()> {
+    let fixture = workspace_turn_fixture().await?;
+    let pre = crate::core::turn::pre_turn_snapshot(
+        &fixture.workspace,
+        1,
+        0,
+        None,
+        Some("engine-session"),
+    )
+    .map_err(|reason| anyhow!("pre-turn snapshot: {reason:?}"))?;
+    let (post_tx, post_rx) = watch::channel(crate::core::events::WorkspaceSnapshot::Pending);
+    let turn = run_workspace_turn(
+        &fixture,
+        crate::core::events::WorkspaceSnapshot::Taken(pre.clone()),
+        post_rx,
+    )
+    .await?;
+
+    // Terminal first, pending: the post-turn snapshot is still running.
+    let workspace = turn.workspace.clone().expect("workspace accounting");
+    assert_eq!(workspace.state, TurnWorkspaceState::Pending);
+    assert_eq!(
+        workspace.pre_turn_snapshot_id.as_deref(),
+        Some(pre.as_str())
+    );
+    assert_eq!(
+        turn.artifacts
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect::<Vec<_>>(),
+        ["notes.md"]
+    );
+
+    let post = crate::core::turn::post_turn_snapshot(
+        &fixture.workspace,
+        1,
+        0,
+        None,
+        Some("engine-session"),
+    )
+    .map_err(|reason| anyhow!("post-turn snapshot: {reason:?}"))?;
+    post_tx.send(crate::core::events::WorkspaceSnapshot::Taken(post.clone()))?;
+    let turn =
+        wait_for_turn_workspace(&fixture.manager, &turn.id, TurnWorkspaceState::Settled).await?;
+    let workspace = turn.workspace.clone().unwrap();
+    assert_eq!(
+        workspace.post_turn_snapshot_id.as_deref(),
+        Some(post.as_str())
+    );
+    let shell = turn
+        .artifacts
+        .iter()
+        .find(|r| r.path == "out.md")
+        .expect("shell-written file is reported");
+    assert_eq!(
+        shell.source,
+        turn_artifacts::TurnArtifactSource::WorkspaceChangedDuringTurn
+    );
+    assert_eq!(shell.change, Some(turn_artifacts::FileChangeKind::Created));
+    assert_eq!(
+        shell.revision.as_deref(),
+        Some(crate::hashing::sha256_hex(b"shell output\n").as_str())
+    );
+    assert_eq!(shell.size, Some(13));
+    // An unbound thread cannot file-revert, so no restore point is claimed.
+    assert_eq!(shell.restore_snapshot_id, None);
+    let notes = turn
+        .artifacts
+        .iter()
+        .find(|r| r.path == "notes.md")
+        .unwrap();
+    assert_eq!(
+        notes.source,
+        turn_artifacts::TurnArtifactSource::ToolMutation
+    );
+    assert_eq!(notes.tool_call_id.as_deref(), Some("call_patch"));
+
+    let events = fixture.manager.events_since(&fixture.thread.id, None)?;
+    let published = events
+        .iter()
+        .find(|event| event.event == "turn.artifacts")
+        .expect("turn.artifacts published");
+    assert_eq!(published.turn_id.as_deref(), Some(turn.id.as_str()));
+    assert_eq!(published.payload["workspace"]["state"], "settled");
+    let completed = events
+        .iter()
+        .find(|event| event.event == "turn.completed")
+        .expect("turn.completed");
+    assert_eq!(completed.payload["turn"]["workspace"]["state"], "pending");
+
+    let view = fixture
+        .manager
+        .turn_artifacts(&fixture.thread.id, &turn.id)
+        .await?
+        .expect("owning thread sees the turn");
+    assert_eq!(view.artifacts, turn.artifacts);
+    let other = fixture
+        .manager
+        .create_thread(CreateThreadRequest {
+            workspace: Some(fixture.workspace.clone()),
+            ..Default::default()
+        })
+        .await?;
+    assert!(
+        fixture
+            .manager
+            .turn_artifacts(&other.id, &turn.id)
+            .await?
+            .is_none(),
+        "a turn is served only through its own thread"
+    );
+    assert!(
+        fixture
+            .manager
+            .turn_artifacts(&fixture.thread.id, "turn_missing")
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+/// Snapshots off: the turn still lists what its tool receipts recorded, and
+/// says plainly why there is no workspace delta.
+#[tokio::test]
+async fn disabled_snapshots_leave_the_item_aggregate_with_a_reason() -> Result<()> {
+    let fixture = workspace_turn_fixture().await?;
+    let disabled = crate::core::events::WorkspaceSnapshot::Unavailable(
+        crate::core::events::SnapshotUnavailable::Disabled,
+    );
+    let (_post_tx, post_rx) = watch::channel(disabled.clone());
+    let turn = run_workspace_turn(&fixture, disabled, post_rx).await?;
+    let workspace = turn.workspace.clone().expect("workspace accounting");
+    assert_eq!(workspace.state, TurnWorkspaceState::Unavailable);
+    assert_eq!(
+        workspace.reason,
+        Some(TurnWorkspaceReason::SnapshotsDisabled)
+    );
+    assert_eq!(
+        turn.artifacts
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect::<Vec<_>>(),
+        ["notes.md"]
+    );
+    Ok(())
+}
+
+/// A post-turn snapshot that never resolves ends as `settlement_timeout`
+/// (the bound is shortened here), and the result is still published.
+#[tokio::test]
+async fn an_unresolved_post_turn_snapshot_times_out_honestly() -> Result<()> {
+    let fixture = workspace_turn_fixture().await?;
+    let pre = crate::core::turn::pre_turn_snapshot(&fixture.workspace, 1, 0, None, None)
+        .map_err(|reason| anyhow!("pre-turn snapshot: {reason:?}"))?;
+    let (_post_tx, post_rx) = watch::channel(crate::core::events::WorkspaceSnapshot::Pending);
+    let turn = run_workspace_turn(
+        &fixture,
+        crate::core::events::WorkspaceSnapshot::Taken(pre.clone()),
+        post_rx.clone(),
+    )
+    .await?;
+    fixture
+        .manager
+        .settle_turn_workspace(
+            &fixture.thread.id,
+            &turn.id,
+            TurnWorkspaceCapture {
+                snapshot_session_id: "engine-session".to_string(),
+                pre_turn: crate::core::events::WorkspaceSnapshot::Taken(pre),
+                post_turn: post_rx,
+            },
+            Duration::from_millis(50),
+        )
+        .await?;
+    let turn = fixture.manager.store.load_turn(&turn.id)?;
+    let workspace = turn.workspace.clone().unwrap();
+    assert_eq!(workspace.state, TurnWorkspaceState::Unavailable);
+    assert_eq!(
+        workspace.reason,
+        Some(TurnWorkspaceReason::SettlementTimeout)
+    );
+    assert_eq!(
+        turn.artifacts.len(),
+        1,
+        "item refs survive: {:?}",
+        turn.artifacts
+    );
+    let events = fixture.manager.events_since(&fixture.thread.id, None)?;
+    assert!(events.iter().any(|event| event.event == "turn.artifacts"
+        && event.payload["workspace"]["reason"] == "settlement_timeout"));
+    Ok(())
+}
+
+/// A turn left `pending` by a stopped Runtime is reconciled on startup to
+/// `runtime_restarted`, keeping its item-derived refs, never re-guessed.
+#[tokio::test]
+async fn a_pending_turn_workspace_is_reconciled_on_restart() -> Result<()> {
+    let fixture = workspace_turn_fixture().await?;
+    let mut turn = sample_turn(
+        &fixture.thread.id,
+        "turn_pending_ws",
+        RuntimeTurnStatus::Completed,
+    );
+    turn.ended_at = Some(Utc::now());
+    let pre = "0123456789abcdef0123456789abcdef01234567".to_string();
+    turn.workspace = Some(TurnWorkspaceArtifacts::pending(pre.clone()));
+    turn.artifacts = vec![TurnArtifactRef {
+        id: "art_call".into(),
+        kind: TurnArtifactKind::ToolOutput,
+        path: "artifacts/art_call.txt".into(),
+        change: None,
+        previous_path: None,
+        size: Some(1),
+        revision: None,
+        content_type: None,
+        session_id: Some("s".into()),
+        item_id: None,
+        tool_call_id: None,
+        tool_name: None,
+        source: turn_artifacts::TurnArtifactSource::ToolOutputSpill,
+        restore_snapshot_id: None,
+        recorded_at: Utc::now(),
+    }];
+    fixture.manager.store.save_turn(&turn)?;
+    let data_dir = fixture.dir.path().join("runtime");
+    let WorkspaceTurnFixture {
+        _env,
+        _home,
+        dir,
+        manager,
+        ..
+    } = fixture;
+    drop(manager);
+    let reopened = test_manager(data_dir)?;
+    let turn = reopened.store.load_turn("turn_pending_ws")?;
+    let workspace = turn.workspace.expect("workspace kept");
+    assert_eq!(workspace.state, TurnWorkspaceState::Unavailable);
+    assert_eq!(
+        workspace.reason,
+        Some(TurnWorkspaceReason::RuntimeRestarted)
+    );
+    assert_eq!(
+        workspace.pre_turn_snapshot_id.as_deref(),
+        Some(pre.as_str())
+    );
+    assert_eq!(turn.artifacts.len(), 1);
+    drop(dir);
     Ok(())
 }

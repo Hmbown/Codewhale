@@ -480,6 +480,8 @@ fn messages_from_thread_detail_batches_tool_results() {
         ],
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
     };
     let item = |id: &str,
                 kind: TurnItemKind,
@@ -7960,6 +7962,8 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
         item_ids: Vec::new(),
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
     };
     // Mirror `TurnRecord::persist_effective_route` (private to the runtime
     // threads module): persist the route envelope onto the turn so the
@@ -8155,6 +8159,8 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
         item_ids: Vec::new(),
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
     };
     turn.effective_provider = Some(ApiProvider::Openai.as_str().to_string());
     turn.effective_provider_id = Some(ApiProvider::Openai.as_str().to_string());
@@ -9315,6 +9321,8 @@ fn seed_summary_search_transcript(
             item_ids,
             steer_count: 0,
             agent_mail_message_id: None,
+            artifacts: Vec::new(),
+            workspace: None,
         })?;
         latest_turn_id = Some(turn_id);
     }

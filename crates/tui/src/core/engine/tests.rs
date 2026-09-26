@@ -196,6 +196,7 @@ fn file_mutation_result_names_its_restore_snapshot() {
         handle.send(Op::SendMessage(spec)).await.unwrap();
 
         let mut completions = HashMap::new();
+        let mut snapshot_pair = None;
         let mut rx = handle.rx_event.write().await;
         while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
             .await
@@ -205,6 +206,14 @@ fn file_mutation_result_names_its_restore_snapshot() {
                 Event::ToolCallComplete { id, result, .. } => {
                     completions.insert(id, result.expect("tool result"));
                 }
+                Event::TurnWorkspaceSnapshots {
+                    session_id,
+                    pre_turn,
+                    post_turn,
+                    ..
+                } => {
+                    snapshot_pair = Some((session_id, pre_turn, post_turn));
+                }
                 Event::TurnComplete { status, error, .. } => {
                     assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
                     break;
@@ -213,6 +222,33 @@ fn file_mutation_result_names_its_restore_snapshot() {
             }
         }
         drop(rx);
+
+        // The snapshot pair arrives before TurnComplete, so a host that stops
+        // reading there still gets it; the post-turn side resolves later.
+        let (session_id, pre_turn, mut post_turn) =
+            snapshot_pair.expect("snapshot pair precedes TurnComplete");
+        assert_eq!(session_id, "session-restore");
+        assert!(
+            matches!(pre_turn, WorkspaceSnapshot::Taken(_)),
+            "{pre_turn:?}"
+        );
+        let post = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let current = post_turn.borrow_and_update().clone();
+                if current != WorkspaceSnapshot::Pending {
+                    return current;
+                }
+                post_turn
+                    .changed()
+                    .await
+                    .expect("post-turn snapshot result");
+            }
+        })
+        .await
+        .expect("post-turn snapshot settles");
+        let WorkspaceSnapshot::Taken(post_id) = post else {
+            panic!("post-turn snapshot: {post:?}");
+        };
 
         let write = completions.get("call-write").expect("write completed");
         assert!(write.success, "{write:?}");
@@ -232,6 +268,25 @@ fn file_mutation_result_names_its_restore_snapshot() {
             .expect("named snapshot exists");
         assert_eq!(snapshot.label, "tool:call-write");
         assert_eq!(snapshot.session_id.as_deref(), Some("session-restore"));
+        let WorkspaceSnapshot::Taken(pre_id) = pre_turn else {
+            unreachable!()
+        };
+        let delta = repo
+            .diff_snapshots(
+                &crate::snapshot::SnapshotId::parse(&pre_id).unwrap(),
+                &crate::snapshot::SnapshotId::parse(&post_id).unwrap(),
+                100,
+            )
+            .unwrap();
+        assert_eq!(
+            delta
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["out.md"],
+            "the pair brackets exactly this turn's write"
+        );
 
         let read = completions.get("call-read").expect("read completed");
         assert!(

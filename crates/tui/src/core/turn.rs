@@ -13,7 +13,7 @@
 //! `/restore N` and the `revert_turn` tool both consume these
 //! snapshots.
 
-use crate::core::events::TurnRoute;
+use crate::core::events::{SnapshotUnavailable, TurnRoute};
 use crate::snapshot::SnapshotRepo;
 use codewhale_models::Usage;
 use std::path::Path;
@@ -616,15 +616,15 @@ pub(crate) fn parse_snapshot_label(label: &str) -> ParsedSnapshotLabel {
 /// turn, embedded in the snapshot label so `/restore` listings are
 /// human-readable.
 ///
-/// Returns the snapshot SHA on success, `None` on any error. Errors are
-/// logged at WARN; the turn loop must not block on this.
+/// Returns the snapshot SHA on success, or the gate/failure that prevented
+/// it. Errors are logged at WARN; the turn loop must not block on this.
 pub fn pre_turn_snapshot(
     workspace: &Path,
     turn_seq: u64,
     cap_bytes: u64,
     user_prompt: Option<&str>,
     session_id: Option<&str>,
-) -> Option<String> {
+) -> Result<String, SnapshotUnavailable> {
     snapshot_with_label(
         workspace,
         &format_snapshot_label("pre-turn", turn_seq, user_prompt),
@@ -647,7 +647,7 @@ pub fn pre_tool_snapshot(
     cap_bytes: u64,
     session_id: Option<&str>,
 ) -> Option<String> {
-    snapshot_with_label(workspace, &format!("tool:{call_id}"), cap_bytes, session_id)
+    snapshot_with_label(workspace, &format!("tool:{call_id}"), cap_bytes, session_id).ok()
 }
 
 /// Take a `post-turn:<seq>` workspace snapshot. Same failure model as
@@ -658,7 +658,7 @@ pub fn post_turn_snapshot(
     cap_bytes: u64,
     user_prompt: Option<&str>,
     session_id: Option<&str>,
-) -> Option<String> {
+) -> Result<String, SnapshotUnavailable> {
     snapshot_with_label(
         workspace,
         &format_snapshot_label("post-turn", turn_seq, user_prompt),
@@ -672,7 +672,7 @@ fn snapshot_with_label(
     label: &str,
     cap_bytes: u64,
     session_id: Option<&str>,
-) -> Option<String> {
+) -> Result<String, SnapshotUnavailable> {
     match SnapshotRepo::open_or_init_with_cap(workspace, cap_bytes) {
         Ok(repo) => {
             // Undo that silently stops working is the failure this guards
@@ -683,7 +683,7 @@ fn snapshot_with_label(
                     .map(|id| (id, repaired))
             });
             let (id, repaired) = match taken {
-                Ok((id, repaired)) => (Some(id.into_string()), repaired),
+                Ok((id, repaired)) => (id.into_string(), repaired),
                 Err(e) => {
                     tracing::warn!(target: "snapshot", "snapshot '{label}' failed: {e}");
                     record_snapshot_notice(
@@ -692,7 +692,7 @@ fn snapshot_with_label(
                         SnapshotsDisabledScope::Failing,
                         snapshot_failure_detail(&e),
                     );
-                    return None;
+                    return Err(SnapshotUnavailable::Failed);
                 }
             };
             clear_snapshots_disabled_status(workspace, session_id);
@@ -708,7 +708,7 @@ fn snapshot_with_label(
             if let Err(e) = repo.prune_keep_last_n(crate::snapshot::DEFAULT_MAX_SNAPSHOTS) {
                 tracing::warn!(target: "snapshot", "snapshot prune failed: {e}");
             }
-            id
+            Ok(id)
         }
         Err(e) => {
             // The first gated failure belongs to this session, even when other
@@ -718,7 +718,14 @@ fn snapshot_with_label(
             } else {
                 tracing::debug!(target: "snapshot", "snapshot repo init still failing: {e}");
             }
-            None
+            Err(match snapshot_gate_scope(&e) {
+                Some(SnapshotsDisabledScope::WorkspaceTooLarge) => {
+                    SnapshotUnavailable::WorkspaceTooLarge
+                }
+                Some(SnapshotsDisabledScope::TooManyFiles) => SnapshotUnavailable::TooManyFiles,
+                Some(SnapshotsDisabledScope::UnsafeLocation) => SnapshotUnavailable::UnsafeLocation,
+                _ => SnapshotUnavailable::Failed,
+            })
         }
     }
 }
@@ -876,16 +883,7 @@ fn maybe_notify_snapshots_disabled_once(
     cap_bytes: u64,
     error: &std::io::Error,
 ) -> bool {
-    let message = error.to_string();
-    // The gate markers are declared by the snapshot policy that produces them,
-    // so this stays one classifier rather than a second copy of the rules.
-    let scope = if message.contains(crate::snapshot::GATE_TOO_LARGE_MARKER) {
-        SnapshotsDisabledScope::WorkspaceTooLarge
-    } else if message.contains(crate::snapshot::GATE_TOO_MANY_ENTRIES_MARKER) {
-        SnapshotsDisabledScope::TooManyFiles
-    } else if message.contains(crate::snapshot::GATE_UNSAFE_LOCATION_MARKER) {
-        SnapshotsDisabledScope::UnsafeLocation
-    } else {
+    let Some(scope) = snapshot_gate_scope(error) else {
         // A real snapshot/data-loss error, not a gate: say snapshots are
         // failing and why, never a "snapshots are off" gate notice.
         return record_snapshot_notice(
@@ -901,6 +899,22 @@ fn maybe_notify_snapshots_disabled_once(
         _ => String::new(),
     };
     record_snapshot_notice(workspace, session_id, scope, limit)
+}
+
+/// Which gate refused a snapshot repo, or `None` for a real failure. The gate
+/// markers are declared by the snapshot policy that produces them, so this
+/// stays one classifier rather than a second copy of the rules.
+fn snapshot_gate_scope(error: &std::io::Error) -> Option<SnapshotsDisabledScope> {
+    let message = error.to_string();
+    if message.contains(crate::snapshot::GATE_TOO_LARGE_MARKER) {
+        Some(SnapshotsDisabledScope::WorkspaceTooLarge)
+    } else if message.contains(crate::snapshot::GATE_TOO_MANY_ENTRIES_MARKER) {
+        Some(SnapshotsDisabledScope::TooManyFiles)
+    } else if message.contains(crate::snapshot::GATE_UNSAFE_LOCATION_MARKER) {
+        Some(SnapshotsDisabledScope::UnsafeLocation)
+    } else {
+        None
+    }
 }
 
 /// One line of a snapshot error for the notice: the first line, bounded.
@@ -993,11 +1007,13 @@ mod snapshot_notice_tests {
         tracing::subscriber::with_default(subscriber, || {
             for session in ["session-a", "session-b"] {
                 for turn in 1..=3 {
-                    assert!(
-                        pre_turn_snapshot(&workspace, turn, 1024, None, Some(session)).is_none()
+                    assert_eq!(
+                        pre_turn_snapshot(&workspace, turn, 1024, None, Some(session)),
+                        Err(SnapshotUnavailable::WorkspaceTooLarge)
                     );
-                    assert!(
-                        post_turn_snapshot(&workspace, turn, 1024, None, Some(session)).is_none()
+                    assert_eq!(
+                        post_turn_snapshot(&workspace, turn, 1024, None, Some(session)),
+                        Err(SnapshotUnavailable::WorkspaceTooLarge)
                     );
                 }
             }
@@ -1046,7 +1062,7 @@ mod snapshot_notice_tests {
         let workspace = root.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         std::fs::write(workspace.join("small.txt"), b"tiny").unwrap();
-        assert!(pre_turn_snapshot(&workspace, 1, 1024 * 1024, None, Some("session")).is_some());
+        assert!(pre_turn_snapshot(&workspace, 1, 1024 * 1024, None, Some("session")).is_ok());
         assert!(snapshots_disabled_status(&workspace, Some("session")).is_none());
         assert!(take_snapshots_disabled_notices(&workspace, Some("session")).is_empty());
     }
@@ -1061,9 +1077,9 @@ mod snapshot_notice_tests {
         let workspace = root.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         std::fs::write(workspace.join("large.txt"), vec![b'x'; 4096]).unwrap();
-        assert!(pre_turn_snapshot(&workspace, 1, 1024, None, Some("session")).is_none());
+        assert!(pre_turn_snapshot(&workspace, 1, 1024, None, Some("session")).is_err());
         assert!(snapshots_disabled_status(&workspace, Some("session")).is_some());
-        assert!(pre_turn_snapshot(&workspace, 2, 0, None, Some("session")).is_some());
+        assert!(pre_turn_snapshot(&workspace, 2, 0, None, Some("session")).is_ok());
         assert!(snapshots_disabled_status(&workspace, Some("session")).is_none());
         assert!(take_snapshots_disabled_notices(&workspace, Some("session")).is_empty());
     }
@@ -1109,7 +1125,7 @@ mod snapshot_notice_tests {
         let workspace = root.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         std::fs::write(workspace.join("a.txt"), b"alpha").unwrap();
-        assert!(pre_turn_snapshot(&workspace, 1, 0, None, Some("session")).is_some());
+        assert!(pre_turn_snapshot(&workspace, 1, 0, None, Some("session")).is_ok());
         let repo = SnapshotRepo::open_or_init(&workspace).unwrap();
         repo.point_head_at_missing_commit_for_test();
         // With a reflog the repair recovers the last good commit silently
@@ -1119,7 +1135,7 @@ mod snapshot_notice_tests {
 
         std::fs::write(workspace.join("a.txt"), b"beta").unwrap();
         assert!(
-            post_turn_snapshot(&workspace, 1, 0, None, Some("session")).is_some(),
+            post_turn_snapshot(&workspace, 1, 0, None, Some("session")).is_ok(),
             "the snapshot succeeds after the repair"
         );
         let notices = take_snapshots_disabled_notices(&workspace, Some("session"));
@@ -1128,7 +1144,7 @@ mod snapshot_notice_tests {
         let line = notices[0].localize(codewhale_localization::Locale::En);
         assert!(line.contains("restarted"), "{line}");
         assert!(line.contains(&workspace.display().to_string()), "{line}");
-        assert!(pre_turn_snapshot(&workspace, 2, 0, None, Some("session")).is_some());
+        assert!(pre_turn_snapshot(&workspace, 2, 0, None, Some("session")).is_ok());
         assert!(
             take_snapshots_disabled_notices(&workspace, Some("session")).is_empty(),
             "a healthy history says nothing more"

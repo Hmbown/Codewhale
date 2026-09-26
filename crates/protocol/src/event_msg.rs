@@ -407,6 +407,21 @@ pub enum EventMsg {
         turn_id: String,
         route: TurnRoute,
     },
+    /// The turn's pre-turn workspace snapshot, sent just before
+    /// `turn_complete`. The post-turn snapshot is still running then and is
+    /// not part of this projection; the Runtime settles the pair itself.
+    TurnWorkspaceSnapshots {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_turn_snapshot_id: Option<String>,
+        /// Why there is no pre-turn snapshot (`snapshots_disabled`,
+        /// `workspace_too_large`, `too_many_files`, `unsafe_location`,
+        /// `snapshot_failed`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unavailable_reason: Option<String>,
+    },
     TurnComplete {
         thread_id: ThreadId,
         session_id: SessionId,
@@ -780,6 +795,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "turn_started",
     "tool_request_snapshot",
     "route_dispatched",
+    "turn_workspace_snapshots",
     "turn_complete",
     "turn_usage",
     "routed_turn_usage",
@@ -835,6 +851,7 @@ impl EventMsg {
             Self::TurnStarted { .. } => "turn_started",
             Self::ToolRequestSnapshot { .. } => "tool_request_snapshot",
             Self::RouteDispatched { .. } => "route_dispatched",
+            Self::TurnWorkspaceSnapshots { .. } => "turn_workspace_snapshots",
             Self::TurnComplete { .. } => "turn_complete",
             Self::TurnUsage { .. } => "turn_usage",
             Self::RoutedTurnUsage { .. } => "routed_turn_usage",
@@ -890,6 +907,7 @@ impl EventMsg {
             | Self::TurnStarted { thread_id, .. }
             | Self::ToolRequestSnapshot { thread_id, .. }
             | Self::RouteDispatched { thread_id, .. }
+            | Self::TurnWorkspaceSnapshots { thread_id, .. }
             | Self::TurnComplete { thread_id, .. }
             | Self::TurnUsage { thread_id, .. }
             | Self::RoutedTurnUsage { thread_id, .. }
@@ -945,6 +963,7 @@ impl EventMsg {
             | Self::TurnStarted { session_id, .. }
             | Self::ToolRequestSnapshot { session_id, .. }
             | Self::RouteDispatched { session_id, .. }
+            | Self::TurnWorkspaceSnapshots { session_id, .. }
             | Self::TurnComplete { session_id, .. }
             | Self::TurnUsage { session_id, .. }
             | Self::RoutedTurnUsage { session_id, .. }
@@ -1111,6 +1130,13 @@ mod tests {
                 session_id: s.clone(),
                 turn_id: "turn-1".into(),
                 route,
+            },
+            EventMsg::TurnWorkspaceSnapshots {
+                thread_id: t.clone(),
+                session_id: s.clone(),
+                turn_id: "turn-1".into(),
+                pre_turn_snapshot_id: Some("0".repeat(40)),
+                unavailable_reason: None,
             },
             EventMsg::TurnComplete {
                 thread_id: t.clone(),

@@ -411,6 +411,283 @@ pub(crate) fn legacy_artifact_refs(refs: &[TurnArtifactRef]) -> Vec<PathBuf> {
     paths
 }
 
+/// Ceiling on a turn's aggregate. The cut is reported, never silent.
+pub(crate) const MAX_TURN_ARTIFACTS: usize = 1_000;
+
+/// Where the turn's workspace-level accounting stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnWorkspaceState {
+    /// The turn ended; the post-turn snapshot or its diff is still running.
+    /// `artifacts` holds the item-derived refs until `turn.artifacts` lands.
+    Pending,
+    /// The pre/post snapshot delta is merged into `artifacts`.
+    Settled,
+    /// No delta will come; `reason` says why. `artifacts` holds what the
+    /// tool receipts recorded.
+    Unavailable,
+}
+
+/// Why a turn has no workspace delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnWorkspaceReason {
+    SnapshotsDisabled,
+    WorkspaceTooLarge,
+    TooManyFiles,
+    UnsafeLocation,
+    SnapshotFailed,
+    /// The turn ran no snapshot pair: a compaction or purge operation, or a
+    /// turn that ended before the engine reported one.
+    NotCaptured,
+    /// The Runtime restarted before the delta settled.
+    RuntimeRestarted,
+    /// The post-turn snapshot did not finish within the settlement bound.
+    SettlementTimeout,
+    /// The snapshots exist but diffing them failed.
+    DeltaFailed,
+}
+
+impl From<crate::core::events::SnapshotUnavailable> for TurnWorkspaceReason {
+    fn from(reason: crate::core::events::SnapshotUnavailable) -> Self {
+        use crate::core::events::SnapshotUnavailable;
+        match reason {
+            SnapshotUnavailable::Disabled => Self::SnapshotsDisabled,
+            SnapshotUnavailable::WorkspaceTooLarge => Self::WorkspaceTooLarge,
+            SnapshotUnavailable::TooManyFiles => Self::TooManyFiles,
+            SnapshotUnavailable::UnsafeLocation => Self::UnsafeLocation,
+            SnapshotUnavailable::Failed => Self::SnapshotFailed,
+        }
+    }
+}
+
+/// The workspace half of a turn's artifact accounting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnWorkspaceArtifacts {
+    pub state: TurnWorkspaceState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<TurnWorkspaceReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_turn_snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_turn_snapshot_id: Option<String>,
+    /// The aggregate was cut at `MAX_TURN_ARTIFACTS` (or the delta at its
+    /// own bound); `omitted` counts what is not listed.
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub omitted: u64,
+}
+
+impl TurnWorkspaceArtifacts {
+    pub(crate) fn unavailable(reason: TurnWorkspaceReason) -> Self {
+        Self {
+            state: TurnWorkspaceState::Unavailable,
+            reason: Some(reason),
+            pre_turn_snapshot_id: None,
+            post_turn_snapshot_id: None,
+            truncated: false,
+            omitted: 0,
+        }
+    }
+
+    pub(crate) fn pending(pre_turn_snapshot_id: String) -> Self {
+        Self {
+            state: TurnWorkspaceState::Pending,
+            reason: None,
+            pre_turn_snapshot_id: Some(pre_turn_snapshot_id),
+            post_turn_snapshot_id: None,
+            truncated: false,
+            omitted: 0,
+        }
+    }
+}
+
+/// A settled workspace delta, ready to merge.
+pub(crate) struct WorkspaceDelta {
+    pub refs: Vec<TurnArtifactRef>,
+    /// Item-reported paths that either snapshot contains. An item path in
+    /// neither snapshot is invisible to them (excluded or ignored), so the
+    /// delta's silence about it proves nothing and its item ref is kept.
+    pub tracked_item_paths: std::collections::HashSet<String>,
+    pub truncated: bool,
+    pub omitted: u64,
+}
+
+/// Convert a snapshot delta into turn refs. `restore_snapshot_id` is the
+/// pre-turn snapshot when file-revert would accept it for this thread.
+pub(crate) fn delta_refs(
+    delta: &crate::snapshot::SnapshotDelta,
+    restore_snapshot_id: Option<&str>,
+    recorded_at: DateTime<Utc>,
+) -> Vec<TurnArtifactRef> {
+    use crate::snapshot::DeltaChange;
+    delta
+        .entries
+        .iter()
+        .map(|entry| TurnArtifactRef {
+            id: file_artifact_id(&entry.path),
+            kind: TurnArtifactKind::File,
+            path: entry.path.clone(),
+            change: Some(match entry.change {
+                DeltaChange::Created => FileChangeKind::Created,
+                DeltaChange::Updated => FileChangeKind::Updated,
+                DeltaChange::Deleted => FileChangeKind::Deleted,
+                DeltaChange::Renamed => FileChangeKind::Renamed,
+            }),
+            previous_path: entry.previous_path.clone(),
+            size: entry.size,
+            revision: entry.sha256.clone(),
+            content_type: None,
+            session_id: None,
+            item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            source: TurnArtifactSource::WorkspaceChangedDuringTurn,
+            restore_snapshot_id: restore_snapshot_id.map(str::to_owned),
+            recorded_at,
+        })
+        .collect()
+}
+
+/// The merged turn aggregate.
+pub(crate) struct MergedTurnArtifacts {
+    pub artifacts: Vec<TurnArtifactRef>,
+    pub truncated: bool,
+    pub omitted: u64,
+}
+
+/// Fold one item file ref into the per-path net change.
+fn compose_file(
+    files: &mut std::collections::HashMap<String, TurnArtifactRef>,
+    next: &TurnArtifactRef,
+) {
+    let mut merged = next.clone();
+    if next.change == Some(FileChangeKind::Renamed) {
+        let source = next
+            .previous_path
+            .as_ref()
+            .and_then(|previous| files.remove(previous));
+        if let Some(source) = source {
+            merged.restore_snapshot_id = source.restore_snapshot_id.or(merged.restore_snapshot_id);
+            match source.change {
+                // A file this turn created and then moved is simply created.
+                Some(FileChangeKind::Created) => {
+                    merged.change = Some(FileChangeKind::Created);
+                    merged.previous_path = None;
+                }
+                // Renamed twice: the net rename is from the first origin.
+                Some(FileChangeKind::Renamed) => merged.previous_path = source.previous_path,
+                _ => {}
+            }
+            if merged.previous_path.as_deref() == Some(merged.path.as_str()) {
+                merged.change = Some(FileChangeKind::Updated);
+                merged.previous_path = None;
+            }
+        }
+        files.insert(merged.path.clone(), merged);
+        return;
+    }
+    let Some(previous) = files.remove(&next.path) else {
+        files.insert(merged.path.clone(), merged);
+        return;
+    };
+    merged.restore_snapshot_id = previous
+        .restore_snapshot_id
+        .clone()
+        .or(merged.restore_snapshot_id);
+    match (previous.change, next.change) {
+        // Created then deleted within the turn: nothing is left to show.
+        (Some(FileChangeKind::Created), Some(FileChangeKind::Deleted)) => return,
+        (Some(FileChangeKind::Created), _) => merged.change = Some(FileChangeKind::Created),
+        (Some(FileChangeKind::Renamed), Some(FileChangeKind::Deleted)) => {
+            // The file moved and then went away: its origin is what is gone.
+            let origin = previous.previous_path.clone().unwrap_or(previous.path);
+            merged.id = file_artifact_id(&origin);
+            merged.path = origin;
+            merged.previous_path = None;
+        }
+        (Some(FileChangeKind::Renamed), _) => {
+            merged.change = Some(FileChangeKind::Renamed);
+            merged.previous_path = previous.previous_path;
+        }
+        // Deleted then written again: the file existed before and still does.
+        (Some(FileChangeKind::Deleted), Some(FileChangeKind::Created)) => {
+            merged.change = Some(FileChangeKind::Updated);
+        }
+        _ => {}
+    }
+    files.insert(merged.path.clone(), merged);
+}
+
+/// The one place a turn's aggregate is computed.
+///
+/// Items are the authority for what each tool call produced. Tool output and
+/// media refs are always kept. File refs compose by item order (last writer
+/// wins; created+deleted drops, created+updated stays created, a rename
+/// folds its origin). When a settled `delta` exists it is authoritative for
+/// the net workspace change, size and revision of every path the snapshots
+/// can see; item provenance is copied onto the delta ref for the same path,
+/// and an item path the delta omits although the snapshots track it netted
+/// to no change and is dropped. Most recent first; capped.
+pub(crate) fn merge_turn_artifacts<'a>(
+    item_refs: impl IntoIterator<Item = &'a TurnArtifactRef>,
+    delta: Option<&WorkspaceDelta>,
+) -> MergedTurnArtifacts {
+    let mut outputs: Vec<TurnArtifactRef> = Vec::new();
+    let mut files = std::collections::HashMap::new();
+    for reference in item_refs {
+        if reference.kind == TurnArtifactKind::File {
+            compose_file(&mut files, reference);
+        } else {
+            outputs.retain(|existing| existing.id != reference.id);
+            outputs.push(reference.clone());
+        }
+    }
+    let (mut truncated, mut omitted) = (false, 0);
+    let mut artifacts = outputs;
+    match delta {
+        Some(delta) => {
+            truncated = delta.truncated;
+            omitted = delta.omitted;
+            for mut reference in delta.refs.iter().cloned() {
+                if let Some(item) = files.remove(&reference.path) {
+                    reference.item_id = item.item_id;
+                    reference.tool_call_id = item.tool_call_id;
+                    reference.tool_name = item.tool_name;
+                    reference.source = TurnArtifactSource::ToolMutation;
+                    reference.recorded_at = item.recorded_at;
+                    reference.restore_snapshot_id =
+                        reference.restore_snapshot_id.or(item.restore_snapshot_id);
+                }
+                artifacts.push(reference);
+            }
+            artifacts.extend(
+                files
+                    .into_values()
+                    .filter(|item| !delta.tracked_item_paths.contains(&item.path)),
+            );
+        }
+        None => artifacts.extend(files.into_values()),
+    }
+    artifacts.sort_by(|left, right| {
+        right
+            .recorded_at
+            .cmp(&left.recorded_at)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    if artifacts.len() > MAX_TURN_ARTIFACTS {
+        truncated = true;
+        omitted += (artifacts.len() - MAX_TURN_ARTIFACTS) as u64;
+        artifacts.truncate(MAX_TURN_ARTIFACTS);
+    }
+    MergedTurnArtifacts {
+        artifacts,
+        truncated,
+        omitted,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,5 +850,139 @@ mod tests {
                 "{key}={forged} must not become a ref"
             );
         }
+    }
+
+    fn file_ref(path: &str, change: FileChangeKind, revision: &str, at: i64) -> TurnArtifactRef {
+        TurnArtifactRef {
+            id: file_artifact_id(path),
+            kind: TurnArtifactKind::File,
+            path: path.to_string(),
+            change: Some(change),
+            previous_path: None,
+            size: Some(revision.len() as u64),
+            revision: Some(revision.to_string()),
+            content_type: None,
+            session_id: None,
+            item_id: Some(format!("item_{at}")),
+            tool_call_id: Some(format!("call_{at}")),
+            tool_name: Some("write".to_string()),
+            source: TurnArtifactSource::ToolMutation,
+            restore_snapshot_id: Some(format!("snap_{at}")),
+            recorded_at: DateTime::from_timestamp(at, 0).unwrap(),
+        }
+    }
+
+    fn by_path(merged: &MergedTurnArtifacts) -> Vec<(&str, Option<FileChangeKind>, Option<&str>)> {
+        let mut rows: Vec<_> = merged
+            .artifacts
+            .iter()
+            .map(|r| (r.path.as_str(), r.change, r.revision.as_deref()))
+            .collect();
+        rows.sort_by_key(|row| row.0);
+        rows
+    }
+
+    #[test]
+    fn item_refs_compose_by_order_without_a_delta() {
+        let mut renamed = file_ref("b.txt", FileChangeKind::Renamed, "r_b", 6);
+        renamed.previous_path = Some("a.txt".into());
+        let items = vec![
+            file_ref("new.txt", FileChangeKind::Created, "r1", 1),
+            file_ref("new.txt", FileChangeKind::Updated, "r2", 2),
+            file_ref("tmp.txt", FileChangeKind::Created, "t1", 3),
+            file_ref("tmp.txt", FileChangeKind::Deleted, "t2", 4),
+            file_ref("old.txt", FileChangeKind::Updated, "o1", 5),
+            file_ref("old.txt", FileChangeKind::Deleted, "o2", 5),
+            renamed,
+        ];
+        let merged = merge_turn_artifacts(&items, None);
+        assert_eq!(
+            by_path(&merged),
+            vec![
+                ("b.txt", Some(FileChangeKind::Renamed), Some("r_b")),
+                ("new.txt", Some(FileChangeKind::Created), Some("r2")),
+                ("old.txt", Some(FileChangeKind::Deleted), Some("o2")),
+            ]
+        );
+        let created = merged
+            .artifacts
+            .iter()
+            .find(|r| r.path == "new.txt")
+            .unwrap();
+        // The earliest restore point survives; provenance is the last writer.
+        assert_eq!(created.restore_snapshot_id.as_deref(), Some("snap_1"));
+        assert_eq!(created.item_id.as_deref(), Some("item_2"));
+        // Most recent first.
+        assert_eq!(merged.artifacts[0].path, "b.txt");
+        assert!(!merged.truncated);
+    }
+
+    #[test]
+    fn a_settled_delta_is_authoritative_for_visible_paths() {
+        let items = vec![
+            file_ref("edited.txt", FileChangeKind::Updated, "item_rev", 1),
+            // Written and then restored to its original bytes: net zero.
+            file_ref("reverted.txt", FileChangeKind::Updated, "x", 2),
+            // Under an excluded directory: the snapshots cannot see it.
+            file_ref("dist/app.js", FileChangeKind::Created, "js", 3),
+        ];
+        let mut shell = file_ref("out.md", FileChangeKind::Created, "shell_rev", 9);
+        shell.source = TurnArtifactSource::WorkspaceChangedDuringTurn;
+        shell.item_id = None;
+        shell.tool_call_id = None;
+        shell.tool_name = None;
+        let mut edited = file_ref("edited.txt", FileChangeKind::Updated, "delta_rev", 9);
+        edited.source = TurnArtifactSource::WorkspaceChangedDuringTurn;
+        edited.restore_snapshot_id = Some("pre".into());
+        let delta = WorkspaceDelta {
+            refs: vec![edited, shell],
+            tracked_item_paths: ["edited.txt", "reverted.txt"].map(String::from).into(),
+            truncated: false,
+            omitted: 0,
+        };
+        let merged = merge_turn_artifacts(&items, Some(&delta));
+        assert_eq!(
+            by_path(&merged),
+            vec![
+                ("dist/app.js", Some(FileChangeKind::Created), Some("js")),
+                (
+                    "edited.txt",
+                    Some(FileChangeKind::Updated),
+                    Some("delta_rev")
+                ),
+                ("out.md", Some(FileChangeKind::Created), Some("shell_rev")),
+            ]
+        );
+        let edited = merged
+            .artifacts
+            .iter()
+            .find(|r| r.path == "edited.txt")
+            .unwrap();
+        assert_eq!(edited.source, TurnArtifactSource::ToolMutation);
+        assert_eq!(edited.item_id.as_deref(), Some("item_1"));
+        assert_eq!(edited.restore_snapshot_id.as_deref(), Some("pre"));
+        let shell = merged
+            .artifacts
+            .iter()
+            .find(|r| r.path == "out.md")
+            .unwrap();
+        assert_eq!(shell.source, TurnArtifactSource::WorkspaceChangedDuringTurn);
+        assert_eq!(shell.item_id, None);
+    }
+
+    #[test]
+    fn the_aggregate_is_capped_and_says_so() {
+        let items: Vec<_> = (0..(MAX_TURN_ARTIFACTS as i64 + 5))
+            .map(|n| file_ref(&format!("f{n}.txt"), FileChangeKind::Created, "r", n))
+            .collect();
+        let merged = merge_turn_artifacts(&items, None);
+        assert_eq!(merged.artifacts.len(), MAX_TURN_ARTIFACTS);
+        assert!(merged.truncated);
+        assert_eq!(merged.omitted, 5);
+        // The newest writes are the ones kept.
+        assert_eq!(
+            merged.artifacts[0].path,
+            format!("f{}.txt", MAX_TURN_ARTIFACTS + 4)
+        );
     }
 }

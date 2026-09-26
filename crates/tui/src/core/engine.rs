@@ -76,7 +76,7 @@ use super::authority::agent_approval_mode_for_turn;
 use super::authority::{
     PolicyNarrowingEvent, TurnAuthority, effective_input_policy, shell_policy_for_mode,
 };
-use super::events::{Event, TurnOutcomeStatus, TurnRoute};
+use super::events::{Event, SnapshotUnavailable, TurnOutcomeStatus, TurnRoute, WorkspaceSnapshot};
 use super::ops::{
     McpManagerUpdate, Op, ProviderRuntimeStatus, SessionContextBudget, SessionSnapshot, TurnSpec,
     USER_SHELL_TOOL_ID_PREFIX, UserInputProvenance,
@@ -2023,23 +2023,7 @@ impl Engine {
             })
             .await;
 
-        if self.config.snapshots_enabled {
-            let pre_workspace = self.session.workspace.clone();
-            let pre_seq = self.turn_counter;
-            let pre_cap = self.config.snapshots_max_workspace_bytes;
-            let pre_prompt = snapshot_prompt.clone();
-            let pre_sid = self.session.id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                pre_turn_snapshot(
-                    &pre_workspace,
-                    pre_seq,
-                    pre_cap,
-                    Some(&pre_prompt),
-                    Some(&pre_sid),
-                )
-            })
-            .await;
-        }
+        let pre_turn_workspace = self.capture_pre_turn_workspace(&snapshot_prompt).await;
 
         self.emit_pending_snapshot_notices().await;
 
@@ -2146,6 +2130,8 @@ impl Engine {
             self.emit_interrupted_survivor_status().await;
         }
         drop(turn_control);
+        self.finish_turn_workspace_capture(turn_id, pre_turn_workspace, snapshot_prompt)
+            .await;
         let _ = self
             .tx_event
             .send(Event::TurnComplete {
@@ -2158,22 +2144,66 @@ impl Engine {
                 base_url: None,
             })
             .await;
+    }
 
-        if self.config.snapshots_enabled {
-            let post_workspace = self.session.workspace.clone();
-            let post_seq = self.turn_counter;
-            let post_cap = self.config.snapshots_max_workspace_bytes;
-            let post_sid = self.session.id.clone();
-            crate::utils::spawn_blocking_supervised("post-shell-turn-snapshot", move || {
-                post_turn_snapshot(
-                    &post_workspace,
-                    post_seq,
-                    post_cap,
-                    Some(&snapshot_prompt),
-                    Some(&post_sid),
-                );
-            });
+    /// Take this turn's `pre-turn:<seq>` snapshot on the blocking pool. The
+    /// result is kept: it is one side of the pair a host diffs to learn what
+    /// the turn changed, and the restore point file-revert accepts.
+    async fn capture_pre_turn_workspace(&self, prompt: &str) -> WorkspaceSnapshot {
+        if !self.config.snapshots_enabled {
+            return WorkspaceSnapshot::Unavailable(SnapshotUnavailable::Disabled);
         }
+        let workspace = self.session.workspace.clone();
+        let seq = self.turn_counter;
+        let cap = self.config.snapshots_max_workspace_bytes;
+        let prompt = prompt.to_string();
+        let session_id = self.session.id.clone();
+        tokio::task::spawn_blocking(move || {
+            pre_turn_snapshot(&workspace, seq, cap, Some(&prompt), Some(&session_id))
+        })
+        .await
+        .map_or(
+            WorkspaceSnapshot::Unavailable(SnapshotUnavailable::Failed),
+            WorkspaceSnapshot::from,
+        )
+    }
+
+    /// Start the `post-turn:<seq>` snapshot and report the turn's snapshot
+    /// pair. Called immediately before `TurnComplete` on every path that took
+    /// (or tried) a pre-turn snapshot. The snapshot itself runs on the
+    /// blocking pool and never delays `TurnComplete` (#234); the event's
+    /// receiver resolves when it finishes, and closes if the task dies.
+    async fn finish_turn_workspace_capture(
+        &self,
+        turn_id: String,
+        pre_turn: WorkspaceSnapshot,
+        prompt: String,
+    ) {
+        let (post_tx, post_rx) = tokio::sync::watch::channel(WorkspaceSnapshot::Pending);
+        if self.config.snapshots_enabled {
+            let workspace = self.session.workspace.clone();
+            let seq = self.turn_counter;
+            let cap = self.config.snapshots_max_workspace_bytes;
+            let session_id = self.session.id.clone();
+            crate::utils::spawn_blocking_supervised("post-turn-snapshot", move || {
+                let taken =
+                    post_turn_snapshot(&workspace, seq, cap, Some(&prompt), Some(&session_id));
+                let _ = post_tx.send(WorkspaceSnapshot::from(taken));
+            });
+        } else {
+            let _ = post_tx.send(WorkspaceSnapshot::Unavailable(
+                SnapshotUnavailable::Disabled,
+            ));
+        }
+        let _ = self
+            .tx_event
+            .send(Event::TurnWorkspaceSnapshots {
+                turn_id,
+                session_id: self.session.id.clone(),
+                pre_turn,
+                post_turn: post_rx,
+            })
+            .await;
     }
 
     /// Apply a user/host mode-or-posture change to the live session.
@@ -5399,28 +5429,9 @@ impl Engine {
         // Snapshot the workspace BEFORE we touch a single tool. Run the git
         // work on the blocking pool so the async runtime stays responsive;
         // failure is non-fatal (the helper logs at WARN).
-        if self.config.snapshots_enabled {
-            // Clone the user prompt now — `content` is moved into
-            // `user_text_message_with_turn_metadata_for_route` below, so we need
-            // a copy for both pre- and post-turn snapshot labels. The
-            // label carries a truncated first line so `/restore`
-            // listings are human-readable.
-            let snapshot_prompt = content.clone();
-            let pre_workspace = self.session.workspace.clone();
-            let pre_seq = self.turn_counter;
-            let pre_cap = self.config.snapshots_max_workspace_bytes;
-            let pre_sid = self.session.id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                pre_turn_snapshot(
-                    &pre_workspace,
-                    pre_seq,
-                    pre_cap,
-                    Some(&snapshot_prompt),
-                    Some(&pre_sid),
-                )
-            })
-            .await;
-        }
+        // The label carries a truncated first line of the prompt so
+        // `/restore` listings are human-readable.
+        let pre_turn_workspace = self.capture_pre_turn_workspace(&content).await;
 
         self.emit_pending_snapshot_notices().await;
 
@@ -5444,6 +5455,12 @@ impl Engine {
                 .tx_event
                 .send(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
                 .await;
+            self.finish_turn_workspace_capture(
+                turn.id.clone(),
+                pre_turn_workspace,
+                snapshot_prompt_post,
+            )
+            .await;
             let _ = self
                 .tx_event
                 .send(Event::TurnComplete {
@@ -5760,6 +5777,12 @@ impl Engine {
                 .await;
         }
         drop(turn_control);
+        self.finish_turn_workspace_capture(
+            turn.id.clone(),
+            pre_turn_workspace,
+            snapshot_prompt_post,
+        )
+        .await;
         // `event_sent` means the TurnComplete event reached the UI channel —
         // never that the user saw model output. (#6184: the old `delivered`
         // name was read as user-visible delivery on Interrupted turns that
@@ -5783,28 +5806,6 @@ impl Engine {
             event_sent = turn_complete_event_sent,
             "engine turn completion settled"
         );
-
-        // Post-turn snapshot. Fire-and-forget: TurnComplete is already
-        // emitted, so the UI is unblocked and the user can type / select /
-        // paste immediately (#234). The git work proceeds on the blocking
-        // pool without forcing the engine loop to await it.
-        if self.config.snapshots_enabled {
-            // `snapshot_prompt_post` was cloned from `content` above,
-            // before `content` was moved into the session messages.
-            let post_workspace = self.session.workspace.clone();
-            let post_seq = self.turn_counter;
-            let post_cap = self.config.snapshots_max_workspace_bytes;
-            let post_sid = self.session.id.clone();
-            crate::utils::spawn_blocking_supervised("post-turn-snapshot", move || {
-                post_turn_snapshot(
-                    &post_workspace,
-                    post_seq,
-                    post_cap,
-                    Some(&snapshot_prompt_post),
-                    Some(&post_sid),
-                );
-            });
-        }
 
         // ── Background advisor watcher (#3982) ────────────────────────────
         // Fire-and-forget: TurnComplete is already emitted. The advisor
