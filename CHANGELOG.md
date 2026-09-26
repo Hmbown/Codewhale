@@ -137,6 +137,12 @@ quieter, and Fleet runs can be checked before they spend anything.
   marked `[rlm_query incomplete: …]` instead of an empty string, its model
   calls appear in the parent turn's record, and its history is no longer
   trimmed ([#6511](https://github.com/Hmbown/Codewhale/issues/6511)).
+- Starting without a network connection no longer drops images you attach to a
+  model that accepts them. The offline model list lagged behind providers and
+  listed Claude and others as text-only; it can now only say a model takes
+  images, never that it refuses them, and a provider that does refuse gets one
+  resend without the image and a message saying so
+  ([#6396](https://github.com/Hmbown/Codewhale/issues/6396)).
 
 ### Removed
 

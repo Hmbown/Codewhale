@@ -196,6 +196,23 @@ pub fn image_input_support(modalities: Option<&ModelsDevModalities>) -> Capabili
     ))
 }
 
+/// [`image_input_support`] for a fact from a layer that may be stale.
+///
+/// A low-trust layer (the bundled offline seed) can say image input is
+/// supported, but its text-only rows only mean "not known": the seed lags the
+/// providers it describes, and treating its silence as a refusal would strip
+/// the user's images before the request is sent.
+#[must_use]
+pub fn image_input_support_for(
+    modalities: Option<&ModelsDevModalities>,
+    low_trust: bool,
+) -> CapabilityState {
+    match image_input_support(modalities) {
+        CapabilityState::Unsupported if low_trust => CapabilityState::Unknown,
+        state => state,
+    }
+}
+
 /// Provider-agnostic model facts from `models.json` / `catalog.models`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ModelsDevModel {
@@ -766,6 +783,36 @@ mod tests {
             })),
             CapabilityState::Supported
         );
+    }
+
+    #[test]
+    fn low_trust_text_only_rows_never_refuse_images() {
+        let text_only = ModelsDevModalities {
+            input: vec!["text".to_string()],
+            output: vec!["text".to_string()],
+        };
+        let vision = ModelsDevModalities {
+            input: vec!["text".to_string(), "image".to_string()],
+            output: vec!["text".to_string()],
+        };
+        assert_eq!(
+            image_input_support_for(Some(&text_only), true),
+            CapabilityState::Unknown
+        );
+        assert_eq!(
+            image_input_support_for(Some(&text_only), false),
+            CapabilityState::Unsupported
+        );
+        for low_trust in [true, false] {
+            assert_eq!(
+                image_input_support_for(Some(&vision), low_trust),
+                CapabilityState::Supported
+            );
+            assert_eq!(
+                image_input_support_for(None, low_trust),
+                CapabilityState::Unknown
+            );
+        }
     }
 
     #[test]
