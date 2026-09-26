@@ -72,9 +72,12 @@ fn check_gate_timeout(field: &str, ms: u64) -> Result<(), ToolError> {
         )))
     }
 }
-/// Bytes kept per stream while a gate runs. The gate result carries all of
-/// them; what the model sees is the engine's one recoverable budget (#6508).
-const MAX_GATE_CAPTURE_BYTES: usize = 1 << 20;
+/// Bytes of a gate stream kept in memory from its start, and from its end,
+/// once the stream is longer than both together. Every byte also goes to a
+/// session artifact, so the middle stays readable (#6508). What the model
+/// sees of the result is the engine's one recoverable budget.
+const GATE_CAPTURE_HEAD_BYTES: usize = 512 * 1024;
+const GATE_CAPTURE_TAIL_BYTES: usize = 512 * 1024;
 /// After a gate's own process exits, how long a helper it started may keep
 /// stdout/stderr open before the gate's process group is killed.
 const GATE_PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
@@ -204,6 +207,12 @@ struct GateResult {
     stderr: String,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    /// Session artifact (`art_<id>`) holding the whole stream when it was
+    /// longer than what the result keeps in memory (#6508).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdout_log_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stderr_log_ref: Option<String>,
     skipped_reason: Option<String>,
 }
 
@@ -461,7 +470,12 @@ impl ToolSpec for RunVerifiersTool {
         // Gates run as futures of this call, not detached blocking tasks: when
         // Stop drops the tool future, every running gate's process group is
         // killed with it instead of being orphaned.
-        let mut results = futures_util::future::join_all(gates.into_iter().map(run_gate)).await;
+        let mut results = futures_util::future::join_all(
+            gates
+                .into_iter()
+                .map(|gate| run_gate(gate, &context.state_namespace)),
+        )
+        .await;
         results.sort_by(|a, b| a.name.cmp(&b.name));
 
         let passed = results
@@ -525,7 +539,12 @@ pub(crate) async fn run_workflow_completion_gates(
         }));
     }
 
-    let mut results = futures_util::future::join_all(gates.into_iter().map(run_gate)).await;
+    let mut results = futures_util::future::join_all(
+        gates
+            .into_iter()
+            .map(|gate| run_gate(gate, &context.state_namespace)),
+    )
+    .await;
     results.sort_by(|a, b| a.name.cmp(&b.name));
 
     let passed = results
@@ -1166,7 +1185,7 @@ fn should_skip_dir_name(name: &str) -> bool {
     )
 }
 
-async fn run_gate(gate: VerifierGate) -> GateResult {
+async fn run_gate(gate: VerifierGate, session_id: &str) -> GateResult {
     let command = render_command(gate.program.as_deref(), &gate.args);
     if let Some(reason) = gate.skipped_reason {
         return GateResult {
@@ -1181,6 +1200,8 @@ async fn run_gate(gate: VerifierGate) -> GateResult {
             stderr: String::new(),
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_log_ref: None,
+            stderr_log_ref: None,
             skipped_reason: Some(reason),
         };
     }
@@ -1198,6 +1219,8 @@ async fn run_gate(gate: VerifierGate) -> GateResult {
             stderr: String::new(),
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_log_ref: None,
+            stderr_log_ref: None,
             skipped_reason: Some("verifier has no executable program".to_string()),
         };
     };
@@ -1235,6 +1258,8 @@ async fn run_gate(gate: VerifierGate) -> GateResult {
                 stderr: String::new(),
                 stdout_truncated: false,
                 stderr_truncated: false,
+                stdout_log_ref: None,
+                stderr_log_ref: None,
                 skipped_reason: Some(format!("{program} is not installed or not in PATH")),
             };
         }
@@ -1251,6 +1276,8 @@ async fn run_gate(gate: VerifierGate) -> GateResult {
                 stderr: format!("Failed to spawn verifier: {err}"),
                 stdout_truncated: false,
                 stderr_truncated: false,
+                stdout_log_ref: None,
+                stderr_log_ref: None,
                 skipped_reason: None,
             };
         }
@@ -1259,8 +1286,8 @@ async fn run_gate(gate: VerifierGate) -> GateResult {
     // kills the whole group.
     let mut group = GateProcessGroup::new(child.id());
 
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
+    let mut stdout = GateCapture::new(session_id, &gate.name, "stdout");
+    let mut stderr = GateCapture::new(session_id, &gate.name, "stderr");
     let mut exit: Option<std::io::Result<std::process::ExitStatus>> = None;
     let mut pipes_open = true;
     let mut timed_out = false;
@@ -1326,17 +1353,15 @@ async fn run_gate(gate: VerifierGate) -> GateResult {
         }
         None => None,
     };
-    let mut stderr_text = String::from_utf8_lossy(&stderr).into_owned();
+    let stdout = stdout.finish().await;
+    let stderr = stderr.finish().await;
+    let mut stderr_text = stderr.text;
     for note in notes {
         if !stderr_text.is_empty() && !stderr_text.ends_with('\n') {
             stderr_text.push('\n');
         }
         stderr_text.push_str(&note);
     }
-    let stdout_truncated = stdout.len() >= MAX_GATE_CAPTURE_BYTES;
-    let stderr_truncated = stderr.len() >= MAX_GATE_CAPTURE_BYTES;
-    let stdout = String::from_utf8_lossy(&stdout).into_owned();
-    let stderr = stderr_text;
     let passed = !timed_out && exit_status.is_some_and(|status| status.success());
     GateResult {
         name: gate.name,
@@ -1350,16 +1375,18 @@ async fn run_gate(gate: VerifierGate) -> GateResult {
         cwd: gate.cwd.display().to_string(),
         exit_code: exit_status.and_then(|status| status.code()),
         duration_ms: started.elapsed().as_millis() as u64,
-        stdout,
-        stderr,
-        stdout_truncated,
-        stderr_truncated,
+        stdout: stdout.text,
+        stderr: stderr_text,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+        stdout_log_ref: stdout.log_ref,
+        stderr_log_ref: stderr.log_ref,
         skipped_reason: None,
     }
 }
 
-/// Read a gate's pipe to EOF, keeping at most `MAX_GATE_CAPTURE_BYTES`.
-async fn read_capped<R>(pipe: Option<R>, buf: &mut Vec<u8>)
+/// Read a gate's pipe to EOF into `capture`.
+async fn read_capped<R>(pipe: Option<R>, capture: &mut GateCapture)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -1371,10 +1398,134 @@ where
     loop {
         match pipe.read(&mut chunk).await {
             Ok(0) | Err(_) => return,
-            Ok(n) => {
-                let room = MAX_GATE_CAPTURE_BYTES.saturating_sub(buf.len());
-                buf.extend_from_slice(&chunk[..n.min(room)]);
+            Ok(n) => capture.push(&chunk[..n]).await,
+        }
+    }
+}
+
+/// One gate stream: every byte while it fits in memory, then its first
+/// [`GATE_CAPTURE_HEAD_BYTES`] and a rolling last [`GATE_CAPTURE_TAIL_BYTES`],
+/// with every byte teed to a session artifact so nothing is lost.
+struct GateCapture {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    total: u64,
+    session_id: String,
+    artifact_id: String,
+    log: Option<tokio::fs::File>,
+    /// Opening or writing the log failed; the middle is gone, and the result
+    /// says so instead of naming a ref.
+    log_failed: bool,
+}
+
+/// What a gate stream contributes to its [`GateResult`].
+struct CapturedStream {
+    text: String,
+    truncated: bool,
+    log_ref: Option<String>,
+}
+
+impl GateCapture {
+    fn new(session_id: &str, gate_name: &str, stream: &str) -> Self {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        Self {
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            total: 0,
+            session_id: session_id.to_string(),
+            artifact_id: crate::artifacts::artifact_id_for_tool_call(&format!(
+                "gate_{gate_name}_{stream}_{}",
+                &id[..12]
+            )),
+            log: None,
+            log_failed: false,
+        }
+    }
+
+    fn overflowed(&self) -> bool {
+        self.total > (GATE_CAPTURE_HEAD_BYTES + GATE_CAPTURE_TAIL_BYTES) as u64
+    }
+
+    async fn push(&mut self, bytes: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        self.total += bytes.len() as u64;
+        if !self.overflowed() {
+            self.head.extend_from_slice(bytes);
+            return;
+        }
+        if self.log.is_none() && !self.log_failed {
+            // First overflow: everything so far is still in `head`. Save it,
+            // then keep only the head window in memory.
+            self.log = self.open_log().await;
+            self.log_failed = self.log.is_none();
+            let kept = std::mem::take(&mut self.head);
+            if let Some(log) = self.log.as_mut()
+                && log.write_all(&kept).await.is_err()
+            {
+                self.log = None;
+                self.log_failed = true;
             }
+            self.head = kept[..GATE_CAPTURE_HEAD_BYTES.min(kept.len())].to_vec();
+            self.tail
+                .extend(&kept[GATE_CAPTURE_HEAD_BYTES.min(kept.len())..]);
+        }
+        if let Some(log) = self.log.as_mut()
+            && log.write_all(bytes).await.is_err()
+        {
+            self.log = None;
+            self.log_failed = true;
+        }
+        if self.head.len() < GATE_CAPTURE_HEAD_BYTES {
+            let room = GATE_CAPTURE_HEAD_BYTES - self.head.len();
+            self.head.extend_from_slice(&bytes[..room.min(bytes.len())]);
+            self.tail.extend(&bytes[room.min(bytes.len())..]);
+        } else {
+            self.tail.extend(bytes);
+        }
+        let excess = self.tail.len().saturating_sub(GATE_CAPTURE_TAIL_BYTES);
+        self.tail.drain(..excess);
+    }
+
+    async fn open_log(&self) -> Option<tokio::fs::File> {
+        let relative = crate::artifacts::session_artifact_relative_path(&self.artifact_id);
+        let path = crate::artifacts::session_artifact_absolute_path(&self.session_id, &relative)?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.ok()?;
+        }
+        tokio::fs::File::create(&path).await.ok()
+    }
+
+    async fn finish(mut self) -> CapturedStream {
+        use tokio::io::AsyncWriteExt;
+        if !self.overflowed() {
+            return CapturedStream {
+                text: String::from_utf8_lossy(&self.head).into_owned(),
+                truncated: false,
+                log_ref: None,
+            };
+        }
+        let saved = match self.log.as_mut() {
+            Some(log) => log.flush().await.is_ok() && !self.log_failed,
+            None => false,
+        };
+        let omitted = self.total - (self.head.len() + self.tail.len()) as u64;
+        let middle = if saved {
+            format!(
+                "[{omitted} bytes omitted from the middle; the whole stream is artifact {}: read it with retrieve_tool_result]",
+                self.artifact_id
+            )
+        } else {
+            format!("[{omitted} bytes omitted from the middle; the full stream could not be saved]")
+        };
+        let tail: Vec<u8> = self.tail.into_iter().collect();
+        CapturedStream {
+            text: format!(
+                "{}\n\n{middle}\n\n{}",
+                String::from_utf8_lossy(&self.head),
+                String::from_utf8_lossy(&tail)
+            ),
+            truncated: true,
+            log_ref: saved.then_some(self.artifact_id),
         }
     }
 }
@@ -1435,6 +1586,71 @@ mod tests {
     use tempfile::tempdir;
 
     const BACKGROUND_COMPLETION_WAIT_MS: u64 = 30_000;
+
+    fn capture_stream(session_id: &str, content: &[u8]) -> CapturedStream {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let mut capture = GateCapture::new(session_id, "cargo test", "stdout");
+                for chunk in content.chunks(8192) {
+                    capture.push(chunk).await;
+                }
+                capture.finish().await
+            })
+    }
+
+    #[test]
+    fn gate_output_over_1mib_keeps_head_and_tail_and_writes_full_log() {
+        // #6508: the verifier kept only the first 1 MiB of a stream and
+        // dropped the end, where a failing gate reports its failure.
+        let home = tempdir().expect("tempdir");
+        crate::tools::truncate::with_test_home(home.path(), || {
+            let content = format!(
+                "FIRST LINE\n{}LAST LINE: test result: FAILED\n",
+                "gate output line\n".repeat(100_000)
+            );
+            assert!(content.len() > GATE_CAPTURE_HEAD_BYTES + GATE_CAPTURE_TAIL_BYTES);
+
+            let captured = capture_stream("session-6508", content.as_bytes());
+
+            assert!(captured.truncated);
+            assert!(captured.text.starts_with("FIRST LINE"));
+            assert!(captured.text.ends_with("LAST LINE: test result: FAILED\n"));
+            let reference = captured.log_ref.expect("full log ref");
+            assert!(captured.text.contains(&reference));
+            let path = crate::artifacts::session_artifact_absolute_path(
+                "session-6508",
+                &crate::artifacts::session_artifact_relative_path(&reference),
+            )
+            .expect("artifact path");
+            let log = fs::read(path).expect("full log");
+            assert_eq!(log.len(), content.len());
+            assert_eq!(log, content.as_bytes());
+        });
+    }
+
+    #[test]
+    fn gate_output_that_fits_is_kept_whole_without_a_log() {
+        let content = "short gate output\n".repeat(1_000);
+        let captured = capture_stream("session-6508", content.as_bytes());
+        assert!(!captured.truncated);
+        assert_eq!(captured.text, content);
+        assert!(captured.log_ref.is_none());
+    }
+
+    #[test]
+    fn gate_output_whose_log_cannot_be_saved_says_so() {
+        // An invalid session id has no artifact directory, so no ref is
+        // promised; head and tail are still kept.
+        let content = format!("HEAD\n{}TAIL\n", "x".repeat(1_200_000));
+        let captured = capture_stream("", content.as_bytes());
+        assert!(captured.truncated);
+        assert!(captured.log_ref.is_none());
+        assert!(captured.text.starts_with("HEAD"));
+        assert!(captured.text.ends_with("TAIL\n"));
+        assert!(captured.text.contains("the full stream could not be saved"));
+    }
 
     fn wait_for_completed_shell(
         manager: &mut crate::tools::shell::ShellManager,

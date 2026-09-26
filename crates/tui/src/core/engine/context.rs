@@ -419,9 +419,6 @@ fn compact_run_verifiers_result_for_context(raw: &str, budget: usize) -> Option<
             level.unwrap_or("?")
         ));
     }
-    if let Some(log_path) = json_text(&parsed, "log_path") {
-        lines.push(format!("log_path: {log_path}"));
-    }
 
     let shown = ordered.iter().take(VERIFIER_GATES_SHOWN);
     let detailed = shown
@@ -440,8 +437,13 @@ fn compact_run_verifiers_result_for_context(raw: &str, budget: usize) -> Option<
             .map(|code| format!(" exit={code}"))
             .unwrap_or_default();
         lines.push(format!("- {name} ({ecosystem}): {status}{exit}"));
-        if let Some(log_path) = json_text(gate, "log_path") {
-            lines.push(format!("  log_path: {log_path}"));
+        // A stream longer than the verifier keeps in memory is saved whole.
+        for stream in ["stdout", "stderr"] {
+            if let Some(reference) = json_text(gate, &format!("{stream}_log_ref")) {
+                lines.push(format!(
+                    "  full {stream}: retrieve_tool_result ref=\"{reference}\""
+                ));
+            }
         }
 
         let stdout = json_text(gate, "stdout");
