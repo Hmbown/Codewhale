@@ -1024,6 +1024,17 @@ pub async fn run_http_server(
     let skill_state = SkillStateStore::load_default()
         .context("load persistent Skill activation state for Runtime API")?;
     let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers);
+    // Opening a thread is every client's first read, and the store can only
+    // answer it after one pass over the whole items directory (an item's
+    // filename names the item, not its turn). Every open used to pay that pass;
+    // here it is paid once, while the server is starting and nobody is waiting
+    // for it. See [`RuntimeThreadStore::ensure_item_index`].
+    let warm_threads = runtime_threads.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = warm_threads.warm_item_index() {
+            tracing::warn!(%error, "thread item index warm-up failed");
+        }
+    });
     let state = RuntimeApiState {
         config: Arc::new(parking_lot::RwLock::new(config.clone())),
         workspace,
