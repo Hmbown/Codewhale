@@ -20,7 +20,6 @@ use super::spec::{
     optional_bool, optional_str, optional_u64,
 };
 
-const MAX_OUTPUT_CHARS: usize = 40_000;
 const DEFAULT_UNIFIED: u64 = 3;
 const MAX_UNIFIED: u64 = 50;
 
@@ -132,14 +131,12 @@ impl ToolSpec for GitStatusTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let content = stdout.into_owned();
 
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": git_ctx.working_dir,
             "pathspec": git_ctx.pathspec,
-            "truncated": truncated,
-            "omitted_chars": omitted_chars,
         })))
     }
 }
@@ -234,7 +231,7 @@ impl ToolSpec for GitDiffTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let content = stdout.into_owned();
 
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
@@ -242,8 +239,6 @@ impl ToolSpec for GitDiffTool {
             "pathspec": git_ctx.pathspec,
             "cached": cached,
             "unified": unified,
-            "truncated": truncated,
-            "omitted_chars": omitted_chars,
         })))
     }
 }
@@ -406,7 +401,6 @@ impl ToolSpec for GitCommitPlanTool {
         };
 
         let content = render_commit_plan(&repo_root, index_has_staged_changes, &commits);
-        let (content, truncated, omitted_chars) = truncate_with_note(&content, MAX_OUTPUT_CHARS);
         let metadata_commits: Vec<Value> = commits
             .iter()
             .enumerate()
@@ -430,8 +424,6 @@ impl ToolSpec for GitCommitPlanTool {
             "cycle_detected": false,
             "index_has_staged_changes": index_has_staged_changes,
             "commits": metadata_commits,
-            "truncated": truncated,
-            "omitted_chars": omitted_chars,
         })))
     }
 }
@@ -516,34 +508,6 @@ fn format_command(working_dir: &Path, args: &[String]) -> String {
     // `[String]::join` produces the same string as collecting `&str` first, so
     // join the slice directly and skip the intermediate `Vec<&str>` allocation.
     format!("git -C {} {}", working_dir.display(), args.join(" "))
-}
-
-fn truncate_with_note(text: &str, max_chars: usize) -> (String, bool, usize) {
-    if text.chars().count() <= max_chars {
-        return (text.to_string(), false, 0);
-    }
-    let end = char_boundary_index(text, max_chars);
-    let truncated = &text[..end];
-    let omitted_chars = text
-        .chars()
-        .count()
-        .saturating_sub(truncated.chars().count());
-    let note = format!(
-        "\n\n[output truncated to {max_chars} characters; {omitted_chars} characters omitted]"
-    );
-    (format!("{truncated}{note}"), true, omitted_chars)
-}
-
-fn char_boundary_index(text: &str, max_chars: usize) -> usize {
-    if max_chars == 0 {
-        return 0;
-    }
-    for (count, (idx, _)) in text.char_indices().enumerate() {
-        if count == max_chars {
-            return idx;
-        }
-    }
-    text.len()
 }
 
 // === Commit Split Specific Types & Helpers ===
@@ -1376,13 +1340,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn truncation_adds_note() {
-        let long = "a".repeat(MAX_OUTPUT_CHARS + 100);
-        let (truncated, did_truncate, omitted) = truncate_with_note(&long, MAX_OUTPUT_CHARS);
-        assert!(did_truncate);
-        assert!(omitted > 0);
-        assert!(truncated.contains("output truncated"));
+    #[tokio::test]
+    async fn git_diff_returns_a_large_diff_whole_with_its_last_file() {
+        // #6508: git_diff used to keep the first 40,000 characters, so a big
+        // diff silently lost its last files. Size is now the engine's one
+        // recoverable budget, not a per-tool cut.
+        if !git_available() {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        init_git_repo(tmp.path());
+        for name in ["a_first.txt", "z_last.txt"] {
+            fs::write(tmp.path().join(name), "base\n").expect("write");
+        }
+        commit_all(tmp.path(), "init");
+        fs::write(tmp.path().join("a_first.txt"), "big line\n".repeat(6_000)).expect("write");
+        fs::write(tmp.path().join("z_last.txt"), "LAST FILE CHANGE\n").expect("write");
+
+        let result = GitDiffTool
+            .execute(json!({}), &ToolContext::new(tmp.path()))
+            .await
+            .expect("diff");
+        assert!(result.success);
+        assert!(result.content.chars().count() > 40_000);
+        assert!(result.content.contains("+LAST FILE CHANGE"));
+        assert!(!result.content.contains("output truncated"));
     }
 
     // === Commit plan (#3999) ===

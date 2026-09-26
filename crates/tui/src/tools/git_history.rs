@@ -16,7 +16,6 @@ use super::spec::{
 };
 use crate::dependencies::ExternalTool;
 
-const MAX_OUTPUT_CHARS: usize = 40_000;
 const DEFAULT_LOG_MAX_COUNT: u64 = 20;
 const MAX_LOG_MAX_COUNT: u64 = 200;
 const DEFAULT_UNIFIED: u64 = 3;
@@ -131,7 +130,7 @@ impl ToolSpec for GitLogTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let content = stdout.into_owned();
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": git_ctx.working_dir,
@@ -140,8 +139,6 @@ impl ToolSpec for GitLogTool {
             "author": author,
             "since": since,
             "until": until,
-            "truncated": truncated,
-            "omitted_chars": omitted_chars,
         })))
     }
 }
@@ -253,7 +250,7 @@ impl ToolSpec for GitShowTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let content = stdout.into_owned();
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": git_ctx.working_dir,
@@ -262,8 +259,6 @@ impl ToolSpec for GitShowTool {
             "patch": patch,
             "stat": stat,
             "unified": if patch { Some(unified) } else { None },
-            "truncated": truncated,
-            "omitted_chars": omitted_chars,
         })))
     }
 }
@@ -387,7 +382,7 @@ impl ToolSpec for GitBlameTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let content = stdout.into_owned();
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": working_dir,
@@ -396,8 +391,6 @@ impl ToolSpec for GitBlameTool {
             "start_line": start_line,
             "max_lines": max_lines,
             "porcelain": porcelain,
-            "truncated": truncated,
-            "omitted_chars": omitted_chars,
         })))
     }
 }
@@ -520,14 +513,12 @@ impl ToolSpec for GitFetchTool {
         } else {
             format!("{stdout}\n{stderr}")
         };
-        let (content, truncated, omitted_chars) = truncate_with_note(&combined, MAX_OUTPUT_CHARS);
+        let content = combined;
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": git_ctx.working_dir,
             "remote": remote,
             "refspecs": refspecs,
-            "truncated": truncated,
-            "omitted_chars": omitted_chars,
         })))
     }
 }
@@ -635,7 +626,7 @@ impl ToolSpec for GitMergeTreeTool {
         }
 
         let conflicts = !output.status.success();
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let content = stdout.into_owned();
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": git_ctx.working_dir,
@@ -643,8 +634,6 @@ impl ToolSpec for GitMergeTreeTool {
             "theirs": theirs,
             "base": base,
             "conflicts": conflicts,
-            "truncated": truncated,
-            "omitted_chars": omitted_chars,
         })))
     }
 }
@@ -958,34 +947,6 @@ fn format_command(working_dir: &Path, args: &[String]) -> String {
     )
 }
 
-fn truncate_with_note(text: &str, max_chars: usize) -> (String, bool, usize) {
-    if text.chars().count() <= max_chars {
-        return (text.to_string(), false, 0);
-    }
-    let end = char_boundary_index(text, max_chars);
-    let truncated = &text[..end];
-    let omitted_chars = text
-        .chars()
-        .count()
-        .saturating_sub(truncated.chars().count());
-    let note = format!(
-        "\n\n[output truncated to {max_chars} characters; {omitted_chars} characters omitted]"
-    );
-    (format!("{truncated}{note}"), true, omitted_chars)
-}
-
-fn char_boundary_index(text: &str, max_chars: usize) -> usize {
-    if max_chars == 0 {
-        return 0;
-    }
-    for (count, (idx, _)) in text.char_indices().enumerate() {
-        if count == max_chars {
-            return idx;
-        }
-    }
-    text.len()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,6 +1018,37 @@ mod tests {
         assert!(result.success);
         assert!(result.content.contains("diff --git"));
         assert!(result.content.contains("+two"));
+    }
+
+    #[tokio::test]
+    async fn git_show_returns_a_large_patch_whole() {
+        // #6508: no 40,000-character per-tool cut; the end of the patch
+        // reaches the caller.
+        if !git_available() {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        init_git_repo(tmp.path());
+        fs::write(tmp.path().join("file.txt"), "one\n").expect("write");
+        commit_all(tmp.path(), "first");
+        fs::write(
+            tmp.path().join("file.txt"),
+            format!("{}FINAL LINE\n", "line of patch\n".repeat(4_000)),
+        )
+        .expect("write");
+        commit_all(tmp.path(), "second");
+
+        let result = GitShowTool
+            .execute(
+                json!({ "rev": "HEAD", "stat": false }),
+                &ToolContext::new(tmp.path()),
+            )
+            .await
+            .expect("execute");
+        assert!(result.success);
+        assert!(result.content.chars().count() > 40_000);
+        assert!(result.content.contains("+FINAL LINE"));
+        assert!(!result.content.contains("output truncated"));
     }
 
     #[tokio::test]

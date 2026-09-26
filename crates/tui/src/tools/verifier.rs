@@ -21,7 +21,6 @@ use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
 };
 
-const MAX_GATE_OUTPUT_CHARS: usize = 16_000;
 const DEFAULT_MAX_PYTHON_FILES: usize = 200;
 const MAX_CUSTOM_GATES: usize = 12;
 const BACKGROUND_GATE_TIMEOUT_MS: u64 = 600_000;
@@ -73,8 +72,8 @@ fn check_gate_timeout(field: &str, ms: u64) -> Result<(), ToolError> {
         )))
     }
 }
-/// Bytes kept per stream while a gate runs; the rendered result is further
-/// truncated to `MAX_GATE_OUTPUT_CHARS`.
+/// Bytes kept per stream while a gate runs. The gate result carries all of
+/// them; what the model sees is the engine's one recoverable budget (#6508).
 const MAX_GATE_CAPTURE_BYTES: usize = 1 << 20;
 /// After a gate's own process exits, how long a helper it started may keep
 /// stdout/stderr open before the gate's process group is killed.
@@ -1334,9 +1333,10 @@ async fn run_gate(gate: VerifierGate) -> GateResult {
         }
         stderr_text.push_str(&note);
     }
-    let (stdout, stdout_truncated) =
-        truncate_with_note(&String::from_utf8_lossy(&stdout), MAX_GATE_OUTPUT_CHARS);
-    let (stderr, stderr_truncated) = truncate_with_note(&stderr_text, MAX_GATE_OUTPUT_CHARS);
+    let stdout_truncated = stdout.len() >= MAX_GATE_CAPTURE_BYTES;
+    let stderr_truncated = stderr.len() >= MAX_GATE_CAPTURE_BYTES;
+    let stdout = String::from_utf8_lossy(&stdout).into_owned();
+    let stderr = stderr_text;
     let passed = !timed_out && exit_status.is_some_and(|status| status.success());
     GateResult {
         name: gate.name,
@@ -1425,36 +1425,6 @@ fn render_command(program: Option<&str>, args: &[String]) -> String {
     parts.push(program.unwrap_or("<unavailable>").to_string());
     parts.extend(args.iter().cloned());
     parts.join(" ")
-}
-
-fn truncate_with_note(text: &str, max_chars: usize) -> (String, bool) {
-    if text.chars().count() <= max_chars {
-        return (text.to_string(), false);
-    }
-    let end = char_boundary_index(text, max_chars);
-    let truncated = &text[..end];
-    let omitted_chars = text
-        .chars()
-        .count()
-        .saturating_sub(truncated.chars().count());
-    (
-        format!(
-            "{truncated}\n\n[output truncated to {max_chars} characters; {omitted_chars} characters omitted]"
-        ),
-        true,
-    )
-}
-
-fn char_boundary_index(text: &str, max_chars: usize) -> usize {
-    if max_chars == 0 {
-        return 0;
-    }
-    for (count, (idx, _)) in text.char_indices().enumerate() {
-        if count == max_chars {
-            return idx;
-        }
-    }
-    text.len()
 }
 
 #[cfg(test)]
