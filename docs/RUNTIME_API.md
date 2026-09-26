@@ -933,10 +933,8 @@ arguments only, never from model text ("Search the web for 'espresso'",
 Clients show it first and keep the raw arguments behind it.
 
 `"remember": true` on an `allow` records a **session grant** for that tool and
-argument class (the approval grouping key: a shell command family for a
-simple, known command such as `git status` — a compound, wrapper, interpreter
-or unrecognised command is granted as its full normalized command, and a
-shell interact or wait call as the exact call — a patch's file set, a `fetch_url` host, an MCP tool, a `web.run` action kind — for
+argument class (the approval grouping key: a shell command family, a patch's
+file set, a `fetch_url` host, an MCP tool, a `web.run` action kind — for
 `open`, the hosts it opened). Computer Use consent and `app_script` calls, and
 any tool without a class, are granted for the exact call only. A grant never
 changes the thread's permission posture. Later matching calls on the thread are
