@@ -228,6 +228,10 @@ pub struct ProviderPickerView {
     custom_provider_base_url: String,
     custom_provider_model: String,
     custom_provider_api_key_env: String,
+    /// Bundled descriptor the custom form was prefilled from, so the form can
+    /// show that host's credential console, docs and guidance (#6616). `None`
+    /// for a hand-entered host and the other prefilled local routes.
+    custom_provider_descriptor: Option<&'static ProviderDescriptor>,
     /// Pointer geometry for the two-pane picker (Slice D): provider-strip
     /// rows on the left, model rows on the right/under, recorded during
     /// render like the consent hitboxes below.
@@ -1799,6 +1803,7 @@ impl ProviderPickerView {
             custom_provider_base_url: String::new(),
             custom_provider_model: String::new(),
             custom_provider_api_key_env: String::new(),
+            custom_provider_descriptor: None,
             list_row_hitboxes: RefCell::new(Vec::new()),
             model_row_hitboxes: RefCell::new(Vec::new()),
             consent_row_hitboxes: RefCell::new(Vec::new()),
@@ -2449,6 +2454,7 @@ impl ProviderPickerView {
         self.custom_provider_base_url = base_url.to_string();
         self.custom_provider_model = model.to_string();
         self.custom_provider_api_key_env = api_key_env.to_string();
+        self.custom_provider_descriptor = None;
     }
 
     fn enter_custom_form(&mut self) {
@@ -2460,7 +2466,7 @@ impl ProviderPickerView {
     /// credential env var, so the only field left is which env var holds the
     /// key. Submitting writes `[providers.<id>]` through the same path a
     /// hand-entered custom provider uses.
-    fn enter_descriptor_form(&mut self, descriptor: &ProviderDescriptor) {
+    fn enter_descriptor_form(&mut self, descriptor: &'static ProviderDescriptor) {
         self.prefill_custom_form(
             &descriptor.id,
             &descriptor.base_url,
@@ -2468,6 +2474,7 @@ impl ProviderPickerView {
             &descriptor.api_key_env,
             CustomProviderField::ApiKeyEnv,
         );
+        self.custom_provider_descriptor = Some(descriptor);
     }
 
     fn enter_ds4_form(&mut self) {
@@ -4071,6 +4078,11 @@ impl ProviderPickerView {
             "API key env",
             "optional",
         );
+        if let Some(descriptor) = self.custom_provider_descriptor {
+            Paragraph::new(descriptor_help_lines(descriptor))
+                .wrap(Wrap { trim: true })
+                .render(layout[5], buf);
+        }
     }
 
     fn render_custom_form_field(
@@ -4982,6 +4994,9 @@ impl ModalView for ProviderPickerView {
             Stage::PlanTier => 10,
             Stage::StepfunBillingRoute => 11,
             Stage::Confirm => 10,
+            // A bundled descriptor adds its credential console, docs and
+            // guidance under the fields; the guidance sentence wraps.
+            Stage::CustomForm if self.custom_provider_descriptor.is_some() => 17,
             Stage::CustomForm => 12,
         };
         let popup_area = centered_modal_area(area, 120, preferred_height, 64, 8);
@@ -5067,6 +5082,37 @@ fn descriptor_dashboard_rows(
         .filter(|descriptor| !configured.iter().any(|id| descriptor.matches(id)))
         .map(|descriptor| descriptor_dashboard_row(descriptor, active, config, runtime_status))
         .collect()
+}
+
+/// Credential console, docs and guidance a bundled descriptor carries, in the
+/// same `Credentials:` / `Docs:` shape the built-in key-entry stage uses. A
+/// descriptor without a console falls back to its guidance on the
+/// `Credentials:` line, exactly as a built-in provider without one does.
+fn descriptor_help_lines(descriptor: &ProviderDescriptor) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(palette::TEXT_MUTED);
+    let mut lines = vec![Line::from("")];
+    match (&descriptor.credential_url, &descriptor.guidance) {
+        (Some(url), _) => lines.push(Line::from(Span::styled(
+            format!("Credentials: {url}"),
+            muted,
+        ))),
+        (None, Some(guidance)) => {
+            lines.push(Line::from(Span::styled(
+                format!("Credentials: {guidance}"),
+                muted,
+            )));
+        }
+        (None, None) => {}
+    }
+    if let Some(url) = &descriptor.docs_url {
+        lines.push(Line::from(Span::styled(format!("Docs: {url}"), muted)));
+    }
+    if descriptor.credential_url.is_some()
+        && let Some(guidance) = &descriptor.guidance
+    {
+        lines.push(Line::from(Span::styled(guidance.clone(), muted)));
+    }
+    lines
 }
 
 fn descriptor_dashboard_row(
@@ -5496,6 +5542,43 @@ mod tests {
         assert_eq!(rows.len(), 1, "the configured row wins");
         assert!(rows[0].is_configured);
         assert_eq!(rows[0].display_name, "groq (custom)");
+    }
+
+    /// #6616: a bundled descriptor's credential console, docs link and
+    /// guidance reach the user on the form that sets it up, in the same
+    /// `Credentials:` / `Docs:` shape the built-in key-entry stage uses.
+    /// A hand-entered custom host carries none of them.
+    #[test]
+    fn descriptor_form_shows_the_hosts_credential_docs_and_guidance() {
+        let _env = crate::test_support::lock_test_env();
+        let descriptor = provider_descriptor("aicraft").expect("aicraft descriptor");
+        let _key = crate::test_support::EnvVarGuard::remove(&descriptor.api_key_env);
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        picker.view = ProviderListView::Catalog;
+        picker.selected_idx = picker
+            .rows
+            .iter()
+            .position(|row| row.provider_id == descriptor.id)
+            .expect("an AICraft row");
+        picker.handle_key(key(KeyCode::Enter));
+        assert_eq!(picker.stage, Stage::CustomForm);
+
+        let rendered = render_text(&picker, 120, 24);
+        assert!(
+            rendered.contains("Credentials: https://aicraftapi.com/dashboard.html"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Docs: https://aicraftapi.com/docs.html#codewhale"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Store AICRAFT_API_KEY"), "{rendered}");
+
+        picker.enter_custom_form();
+        let rendered = render_text(&picker, 120, 24);
+        assert!(!rendered.contains("Credentials:"), "{rendered}");
+        assert!(!rendered.contains("aicraftapi.com"), "{rendered}");
     }
 
     /// Setting a descriptor row up goes through the named-custom-provider
