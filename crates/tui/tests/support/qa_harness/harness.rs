@@ -608,9 +608,20 @@ fn consume_cursor_position_queries(tail: &mut Vec<u8>, bytes: &[u8]) -> usize {
 /// Construct a sealed-`HOME` workspace under a `tempfile::TempDir` so the
 /// scenario can never read or mutate the developer's real config / skills.
 pub fn make_sealed_workspace() -> Result<SealedWorkspace> {
+    sealed_workspace_at(|tmp, _home| tmp.join("workspace"))
+}
+
+/// Like [`make_sealed_workspace`], but the workspace is `HOME/<project>`, so
+/// the TUI displays it as `~/<project>` the way a real user's checkout reads
+/// instead of an absolute tempdir path. Used for published website captures.
+pub fn make_sealed_workspace_in_home(project: &str) -> Result<SealedWorkspace> {
+    sealed_workspace_at(|_tmp, home| home.join(project))
+}
+
+fn sealed_workspace_at(workspace: impl FnOnce(&Path, &Path) -> PathBuf) -> Result<SealedWorkspace> {
     let tmp = tempfile::TempDir::new().context("tempdir")?;
-    let workspace = tmp.path().join("workspace");
     let home = tmp.path().join("home");
+    let workspace = workspace(tmp.path(), &home);
     std::fs::create_dir_all(&workspace).context("mkdir workspace")?;
     std::fs::create_dir_all(home.join(".codewhale")).context("mkdir home/.codewhale")?;
     std::fs::create_dir_all(home.join(".deepseek")).context("mkdir home/.deepseek")?;

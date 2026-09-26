@@ -116,8 +116,11 @@ export default async function RuntimePage({ params }: { params: Promise<{ locale
   return (
     <>
       <PageHeader
+        seal="接"
         kicker={isZh ? "Runtime & 集成" : "Runtime & Integrations"}
         title={isZh ? "运行时与集成" : "Runtime and integrations"}
+        titleAside={isZh ? "Runtime & Integrations" : "运行时与集成"}
+        titleAsideLang={isZh ? "en" : "zh"}
         lede={
           isZh
             ? "Codewhale 不仅是一个终端 Agent——它还是一个可通过多种协议和集成方式嵌入到你现有工作流中的本地控制平面。"
@@ -127,7 +130,7 @@ export default async function RuntimePage({ params }: { params: Promise<{ locale
       />
 
       <div className="page-body">
-        <Section id="runtime-integrations" title={isZh ? "集成方式" : "Integration surfaces"}>
+        <Section id="runtime-integrations" seal="集" title={isZh ? "集成方式" : "Integration surfaces"}>
           <ul className="dir-list dir-list-card" role="list">
             {INTEGRATIONS.map((item) => (
               <li key={item.name}>
@@ -145,28 +148,28 @@ export default async function RuntimePage({ params }: { params: Promise<{ locale
           </ul>
         </Section>
 
-        <Section id="runtime-trust" title={isZh ? "信任边界" : "Trust boundary"}>
-          <div className="grid-2">
+        <Section id="runtime-trust" layout="split" seal="信" title={isZh ? "信任边界" : "Trust boundary"}>
+          <dl className="ruled-list ruled-list-stacked">
             {trust.map((item) => (
-              <div key={item.title} className="tile">
-                <h3>{item.title}</h3>
-                <p>{item.body}</p>
+              <div key={item.title}>
+                <dt>{item.title}</dt>
+                <dd>{item.body}</dd>
               </div>
             ))}
-          </div>
+          </dl>
         </Section>
 
-        <Section id="runtime-facts" title={isZh ? "运行时事实" : "Runtime facts"}>
-          <dl className="def-rows">
-            <div className="def-row">
+        <Section id="runtime-facts" layout="split" seal="数" title={isZh ? "运行时事实" : "Runtime facts"}>
+          <dl className="ruled-list">
+            <div>
               <dt>{isZh ? "版本" : "Version"}</dt>
               <dd className="tabular">{facts.version ?? "—"}</dd>
             </div>
-            <div className="def-row">
+            <div>
               <dt>{isZh ? "工具数量" : "Tool count"}</dt>
               <dd className="tabular">{facts.toolCount ?? "—"}</dd>
             </div>
-            <div className="def-row">
+            <div>
               <dt>{isZh ? "沙箱后端" : "Sandbox backends"}</dt>
               <dd>{facts.sandboxBackends.length ? facts.sandboxBackends.join(" · ") : "—"}</dd>
             </div>

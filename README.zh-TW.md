@@ -3,7 +3,7 @@
 
 Codewhale 是一款開源代理，可使用你選擇的託管模型或本機模型讀取專案、編輯檔案、執行指令，並檢查自己的工作。從終端機中的一項任務開始。對於較大的工作，可以將部分任務交給使用不同模型、擔任不同角色的代理。
 
-![Codewhale 在終端機中執行](web/public/codewhale-tui-d7a9a1c.png)
+![Codewhale 在終端機中執行](web/public/codewhale-tui-5765d80.png)
 
 *終端機預覽截圖來自 v0.10.0 的開發建置版本。*
 

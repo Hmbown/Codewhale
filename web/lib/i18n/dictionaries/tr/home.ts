@@ -28,6 +28,8 @@ export const home: HomeDict = {
   sourceCandidate: "Yayımlanmadı",
   publishedRelease: "yayımlandı",
   figcaptionSourceCandidate: "yayımlanmadı",
+  chapterTerminal: "Senin terminalin",
+  chapterTerminalTitle: "Yapmak istediğin bir şeyle başla",
   gainHeading:
     "Codewhale ile neler yapabilirsin",
   gainLede:
@@ -46,6 +48,7 @@ export const home: HomeDict = {
       "Ajanların için barındırılan veya yerel modeller kullan; farklı modeller ve roller, işin kendilerine uygun kısımlarını üstlensin."
     ]
   ],
+  chapterModels: "Senin modellerin",
   modelsHeading: "Her görev için model seçenekleri",
   modelsBody:
     "Doğrudan model barındıran bir sağlayıcıya bağlan, birden fazla sağlayıcıya erişmek için bir ağ geçidi kullan veya bir modeli yerel olarak çalıştır; ardından çalışırken her oturumun hangi modeli kullanacağını seç.",
@@ -60,6 +63,7 @@ export const home: HomeDict = {
     "Codewhale'i kurup bir model bağladıktan sonra ilk görevini terminalde anlatabilir, birkaç ajanın işi paylaşmasını istediğinde bir Fleet ekleyebilirsin.",
   startGuideLink: "Başlangıç kılavuzunu oku",
   startVocabularyLink: "Ürün sözlüğünü gör",
+  chapterAvailability: "Nerede çalışır",
   availabilityHeading: "Codewhale'i nerelerde kullanabilirsin",
   availabilityLede:
     "Biz web uygulamasını, masaüstü uygulamasını ve bulut bilgisayarlarını geliştirirken sen Codewhale'i bugün terminalinde kullanabilirsin.",

@@ -17,6 +17,50 @@
   padding-block: var(--space-6) var(--space-8);
 }
 
+/* ---------- not found: the Codwhale poster ---------- */
+.not-found {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: clamp(2rem, 6vw, 5.5rem);
+  max-width: 70rem;
+  margin-inline: auto;
+  padding-block: clamp(1rem, 4vw, 3rem);
+}
+.not-found-copy { display: grid; gap: var(--space-5); min-width: 0; }
+.not-found-title {
+  max-width: 11ch;
+  font-size: var(--text-display-lg);
+  font-weight: 600;
+  line-height: 1.04;
+  letter-spacing: -0.03em;
+  text-wrap: balance;
+}
+.not-found-code { display: block; margin-bottom: 0.2em; color: var(--accent); }
+.not-found-body {
+  color: var(--muted);
+  font-size: clamp(1.0625rem, 1rem + 0.3vw, 1.25rem);
+  line-height: 1.6;
+  white-space: pre-line;
+}
+/* The poster sits in the deep water: a navy plate with a hairline edge. */
+.not-found-frame {
+  justify-self: end;
+  width: 100%;
+  max-width: 30rem;
+  padding: clamp(0.75rem, 2vw, 1.25rem);
+  background: var(--ocean-floor);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sheet);
+  box-shadow: 0 30px 70px -30px rgb(3 10 28 / 0.7);
+}
+.not-found-poster { display: block; width: 100%; height: auto; border-radius: var(--radius-surface); }
+@media (max-width: 760px) {
+  .not-found { grid-template-columns: minmax(0, 1fr); }
+  .not-found-title { max-width: 15ch; }
+  .not-found-frame { justify-self: center; }
+}
+
 /* ------------------------------------------------------------------ */
 /*  Connection banner — offline / reconnecting / degraded / restored    */
 /* ------------------------------------------------------------------ */

@@ -2,18 +2,30 @@
 /*  Home — the whale on the horizon                                     */
 /* ------------------------------------------------------------------ */
 /*
- * The sky holds the promise, the actions and the install plate. The whale
- * rests on one straight horizon. Everything below is the sea (`.stage`), in
- * both appearances, and it continues into the footer with no second edge.
+ * The sky holds the promise, the actions and the install plate, over water
+ * rising from the bottom right (the hero strata). The whale rests on one
+ * straight horizon. Below it are the shallows (the terminal, what you can
+ * do, the models, the start), then one waterline band into deep water
+ * (`.stage`, in both appearances) that runs on into the footer.
  */
 
 .home-hero { position: relative; }
 
 .home-sky {
   position: relative;
+  isolation: isolate;
   padding-block: clamp(2.5rem, 7vw, 5.5rem) 0;
   /* The sky rises into the logo's blue at the horizon, not away from it. */
   background: linear-gradient(180deg, transparent 0, transparent 30%, var(--sky-rise) 100%);
+}
+
+/* The hero water: static, decorative, anchored to the horizon. */
+.home-strata {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
 }
 
 .home-hero-inner {
@@ -117,7 +129,7 @@
 /* The real terminal, floating just under the surface. */
 .home-shot {
   display: grid;
-  gap: var(--space-3);
+  gap: var(--space-5);
   width: min(100%, 60rem);
   margin-inline: auto;
 }
@@ -131,6 +143,11 @@
   justify-content: space-between;
   gap: var(--space-2) var(--space-4);
 }
+
+/* The deep water after the waterline, in both appearances; the footer's
+   band rises out of it. */
+.home-deep { background: var(--ocean-floor); }
+.home-deep .home-sea-body { padding-top: var(--space-6); }
 
 .home-modes { font-family: var(--font-body); }
 
@@ -159,4 +176,6 @@
   .home-reflection .whale-pose { --pose-size: clamp(8rem, 36vw, 12rem); }
   .home-reflection .whale-pose { grid-column: 1; justify-self: end; }
   .home-hero-copy { padding-bottom: 0; }
+  /* On a narrow sky the water keeps to the lower half, under the whale. */
+  .home-strata { top: 40%; }
 }

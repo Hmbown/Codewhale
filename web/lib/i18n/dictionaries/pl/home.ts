@@ -28,6 +28,8 @@ export const home: HomeDict = {
   sourceCandidate: "Niewydane",
   publishedRelease: "wydane",
   figcaptionSourceCandidate: "niewydane",
+  chapterTerminal: "Twój terminal",
+  chapterTerminalTitle: "Zacznij od tego, co chcesz stworzyć",
   gainHeading:
     "Co możesz zrobić z Codewhale",
   gainLede:
@@ -46,6 +48,7 @@ export const home: HomeDict = {
       "Korzystaj z hostowanych lub lokalnych modeli dla swoich agentów i dobieraj różne modele oraz role do odpowiednich części zadania."
     ]
   ],
+  chapterModels: "Twoje modele",
   modelsHeading: "Wybór modeli do każdego zadania",
   modelsBody:
     "Połącz się bezpośrednio z dostawcą modeli hostowanych, użyj bramki, by korzystać z kilku dostawców, lub uruchom model lokalnie, a następnie wybieraj w trakcie pracy model dla każdej sesji.",
@@ -60,6 +63,7 @@ export const home: HomeDict = {
     "Po zainstalowaniu Codewhale i podłączeniu modelu możesz opisać pierwsze zadanie w terminalu, a gdy zechcesz rozdzielić pracę między kilku agentów, dodać Fleet.",
   startGuideLink: "Przeczytaj przewodnik na start",
   startVocabularyLink: "Zobacz słownik produktu",
+  chapterAvailability: "Gdzie działa",
   availabilityHeading: "Gdzie możesz korzystać z Codewhale",
   availabilityLede:
     "Możesz już dziś korzystać z Codewhale w terminalu, a my pracujemy nad aplikacją webową, aplikacją desktopową i komputerami w chmurze.",

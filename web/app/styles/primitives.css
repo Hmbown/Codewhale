@@ -174,9 +174,45 @@
   gap: var(--space-2) var(--space-5);
   margin-bottom: var(--space-5);
 }
-.section-head-text { display: grid; gap: var(--space-2); min-width: 0; max-width: 46rem; }
-.section-title { font-size: var(--text-title); line-height: 1.25; letter-spacing: -0.015em; }
-.section-scope { color: var(--muted); font-size: var(--text-body); line-height: 1.6; }
+.section-head-text { display: grid; gap: var(--space-3); min-width: 0; max-width: 46rem; }
+/* The editorial scale: a section title reads as a heading from across the
+   room (28-40px), not as a label. */
+.section-title {
+  max-width: 22ch;
+  font-size: var(--text-section);
+  font-weight: 600;
+  line-height: 1.12;
+  letter-spacing: -0.025em;
+  text-wrap: balance;
+}
+.section-scope { max-width: 40rem; color: var(--muted); font-size: var(--text-body); line-height: 1.6; }
+
+/* A running head above a section title: "01 / Your terminal", or a seal and
+   the subject. */
+.section-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  color: var(--accent);
+  font-size: var(--text-ui);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The two-column section form: the title, scope and link on the left; the
+   content (usually a ruled list) on the right. */
+.section-split {
+  display: grid;
+  gap: var(--space-5) clamp(2rem, 6vw, 5rem);
+  grid-template-columns: minmax(0, 1fr);
+}
+.section-split-head { min-width: 0; }
+.section-split-body { min-width: 0; }
+@media (min-width: 900px) {
+  .section-split { grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr); align-items: start; }
+  .section-split-head { position: sticky; top: calc(var(--nav-height, 4rem) + var(--space-5)); }
+}
+.section-split .section-link { justify-self: start; margin-top: var(--space-2); }
 
 .section-link {
   display: inline-flex;
@@ -251,6 +287,158 @@
 .tile .section-link { margin-top: var(--space-2); }
 a.tile { transition: background-color var(--dur-state) var(--ease-out), border-color var(--dur-state) var(--ease-out); }
 a.tile:hover { background: var(--hover); border-color: var(--line-strong); }
+
+/* ---------- ruled lists ---------- */
+/* The editorial list: a hairline between rows, a mono key on the left and
+   the explanation beside it. No box; the rules carry the structure. Used
+   wherever a list does not need icons. */
+.ruled-list { border-top: 1px solid var(--line-strong); }
+.ruled-list > div {
+  display: grid;
+  gap: var(--space-1) var(--space-5);
+  padding-block: var(--space-4);
+  border-bottom: 1px solid var(--line);
+}
+.ruled-list dt {
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-mono);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.ruled-list dd { min-width: 0; color: var(--muted); font-size: var(--text-ui); line-height: 1.6; }
+.ruled-list dd strong { color: var(--text); font-weight: 500; }
+.ruled-list dd > .status:first-child { display: flex; width: max-content; margin-bottom: var(--space-1); }
+.ruled-list dd code { color: var(--text); font-family: var(--font-mono); font-size: var(--text-mono); overflow-wrap: anywhere; }
+@media (min-width: 640px) {
+  .ruled-list > div { grid-template-columns: minmax(8rem, 13rem) minmax(0, 1fr); }
+}
+
+/* Stacked: a heading-like key above its explanation, for statements rather
+   than facts. */
+.ruled-list.ruled-list-stacked > div { grid-template-columns: minmax(0, 1fr); }
+.ruled-list-stacked dt { font-family: var(--font-body); font-size: var(--text-body); font-weight: 600; }
+
+/* Ruled columns: three short statements divided by hairlines. */
+.ruled-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  border-top: 1px solid var(--line-strong);
+}
+.ruled-cols > * {
+  display: grid;
+  align-content: start;
+  gap: var(--space-2);
+  padding: var(--space-5) 0;
+  border-bottom: 1px solid var(--line);
+}
+.ruled-cols h3 { font-size: var(--text-heading); }
+.ruled-cols p { color: var(--muted); font-size: var(--text-ui); line-height: 1.6; }
+.ruled-cols .ruled-icon { color: var(--accent); }
+.ruled-cols .ruled-icon svg { width: 1.25rem; height: 1.25rem; }
+@media (min-width: 900px) {
+  .ruled-cols { grid-template-columns: repeat(3, minmax(0, 1fr)); border-bottom: 1px solid var(--line); }
+  .ruled-cols > * { padding: var(--space-5) var(--space-5) var(--space-6); border-bottom: 0; }
+  .ruled-cols > :first-child { padding-inline-start: 0; }
+  .ruled-cols > * + * { border-inline-start: 1px solid var(--line); }
+}
+
+/* ---------- seals ---------- */
+/* One Han glyph stamped in the logo's ombre (components/seal.tsx). */
+.seal {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 2.5rem;
+  height: 2.5rem;
+  color: var(--on-brand);
+  background: var(--brand-fill);
+  border-radius: var(--radius-control);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.18);
+  font-family: var(--font-cjk);
+  font-size: 1.25rem;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0;
+}
+.seal-sm { width: 2rem; height: 2rem; font-size: 1rem; }
+.seal-lg { width: 3rem; height: 3rem; font-size: 1.5rem; }
+@media (forced-colors: active) {
+  .seal { border: 1px solid CanvasText; }
+}
+
+/* The bilingual Han title: the page's name in the other script, set beside
+   it in the ombre ink. */
+.page-title-aside {
+  font-family: var(--font-cjk);
+  font-size: 0.72em;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--accent);
+  white-space: nowrap;
+}
+@supports ((-webkit-background-clip: text) or (background-clip: text)) {
+  .page-title-aside {
+    background: var(--ombre-ink);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+}
+@media (forced-colors: active) {
+  .page-title-aside { background: none; -webkit-text-fill-color: currentColor; }
+}
+
+/* ---------- strata: the water, drawn ---------- */
+/* components/strata.tsx reads its inks from here, so it re-inks with the
+   appearance. Static and decorative; hidden under forced colours. */
+.strata { display: block; width: 100%; height: 100%; pointer-events: none; }
+.home-strata {
+  --strata-haze: rgb(30 143 216 / 0.08);
+  --strata-1: rgb(30 143 216 / 0.12);
+  --strata-2: rgb(30 143 216 / 0.16);
+  --strata-3: rgb(11 72 187 / 0.14);
+  --strata-4: #cfe2f6;
+  --strata-line: #1e8fd8;
+  --strata-thread: #0b48bb;
+}
+/* A waterline band always descends into deep water, in both appearances:
+   its floor is the colour the sea below starts with. */
+.waterline {
+  --strata-1: rgb(30 143 216 / 0.26);
+  --strata-2: rgb(24 119 201 / 0.5);
+  --strata-3: rgb(11 72 187 / 0.8);
+  --strata-4: var(--brand-deep);
+  --strata-line: #90b9ff;
+  --strata-thread: #1e8fd8;
+  position: relative;
+  height: clamp(4.5rem, 9vw, 8rem);
+  pointer-events: none;
+}
+.waterline-deep { --strata-4: var(--ocean-floor); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .home-strata {
+    --strata-haze: rgb(30 143 216 / 0.16);
+    --strata-1: rgb(30 143 216 / 0.16);
+    --strata-2: rgb(11 72 187 / 0.34);
+    --strata-3: rgb(11 72 187 / 0.55);
+    --strata-4: #0b48bb;
+    --strata-line: #90b9ff;
+    --strata-thread: #1e8fd8;
+  }
+}
+:root[data-theme="dark"] .home-strata {
+  --strata-haze: rgb(30 143 216 / 0.16);
+  --strata-1: rgb(30 143 216 / 0.16);
+  --strata-2: rgb(11 72 187 / 0.34);
+  --strata-3: rgb(11 72 187 / 0.55);
+  --strata-4: #0b48bb;
+  --strata-line: #90b9ff;
+  --strata-thread: #1e8fd8;
+}
+@media (forced-colors: active) {
+  .strata { display: none; }
+}
 
 /* ---------- definition rows ---------- */
 .def-rows {
@@ -434,7 +622,7 @@ a.dir-row:hover .dir-action { color: var(--text); }
 
 /* ---------- code with copy ---------- */
 .code { position: relative; min-width: 0; }
-.code pre.code-block { padding-right: 3rem; }
+.code pre.code-block { padding-right: 6.5rem; }
 /* A long command scrolls under the button, so the button sits flush with the
    block's edge and a short fade on its leading side hides the text beneath
    it instead of letting a sliver show on either side. Commands are always
@@ -442,12 +630,14 @@ a.dir-row:hover .dir-action { color: var(--text); }
 .code .code-copy {
   position: absolute;
   background: var(--surface);
-  top: 0.25rem;
-  right: 1px;
+  top: 50%;
+  right: 0.25rem;
+  transform: translateY(-50%);
+  color: var(--muted);
   box-shadow: -0.75rem 0 0.5rem -0.25rem var(--surface);
 }
 .code .code-copy:focus-visible { box-shadow: var(--glow-focus); }
-.code .code-copy:hover { background: var(--hover); }
+.code .code-copy:hover { background: var(--hover); color: var(--text); }
 .code-copy[data-copied="true"] { color: var(--live); }
 
 /* ---------- plate ---------- */
@@ -464,6 +654,35 @@ a.dir-row:hover .dir-action { color: var(--text); }
 }
 .plate:focus-within { border-color: var(--line-strong); }
 .plate pre.code-block { background: var(--surface); }
+
+/* ---------- a live terminal capture ---------- */
+/* components/terminal-capture.tsx: real PTY cells as text. 100 columns stay
+   100 columns; a narrow screen scrolls the frame, never shrinks it past
+   legibility. */
+.term-capture-scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  background: #0a1e33;
+}
+.term-capture {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  margin: 0;
+  padding: 1rem 1.125rem;
+  color: #f6f2e8;
+  font-family: var(--font-mono);
+  font-size: clamp(0.75rem, 0.3rem + 0.95vw, 0.9375rem);
+  line-height: 1.25;
+  white-space: pre;
+  font-variant-ligatures: none;
+  tab-size: 8;
+}
+/* A row is one terminal line; each run fills the whole line box, so row
+   backgrounds meet without seams. */
+.term-capture-row { display: block; height: 1.25em; }
+.term-capture-row > span { display: inline-block; height: 100%; vertical-align: top; }
+.term-capture-cell { display: inline-block; width: 1ch; overflow: hidden; vertical-align: top; }
 
 /* ---------- figure ---------- */
 .figure { display: grid; gap: var(--space-3); min-width: 0; }

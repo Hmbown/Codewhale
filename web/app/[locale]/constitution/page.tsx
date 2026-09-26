@@ -54,8 +54,11 @@ export default async function ConstitutionPage({ params }: { params: Promise<{ l
   return (
     <>
       <PageHeader
+        seal="法"
         kicker={isZh ? "立论" : "The thesis"}
         title={isZh ? "三层法" : "Three layers of law"}
+        titleAside={isZh ? "Three layers of law" : "三层法"}
+        titleAsideLang={isZh ? "en" : "zh"}
         lede={
           isZh
             ? "项目一变老，指令就开始堆积、彼此冲突：最初的规格、后来推翻它的重构、陈旧的记忆、上一个智能体的交接、你此刻的要求、刚跑出的与交接说法不符的测试结果。扁平的系统提示词让模型靠猜来化解；Codewhale 用一部嵌套的宪章给出明确的位阶。顺序由执行框架强制生效——有测试断言它不会漂移——换掉模型，结构依然完好。"
@@ -78,6 +81,7 @@ export default async function ConstitutionPage({ params }: { params: Promise<{ l
       <div className="page-body">
         <Section
           id="constitution-rank"
+          seal="序"
           title={isZh ? "位阶，从最稳到最活" : "The rank, most-static first"}
           scope={
             isZh
@@ -110,11 +114,12 @@ export default async function ConstitutionPage({ params }: { params: Promise<{ l
 
         <Section
           id="constitution-trace"
+          seal="证"
           title={isZh ? "在推理里可以被看到" : "Observable in the reasoning"}
           scope={
             isZh
-              ? "位阶不是落地页上的一句宣称。下面是真实会话的忠实片段——模型在裁决时直接援引条款。"
-              : "The rank is not a claim on a landing page. These are faithful excerpts from a real session — the model cites the articles as it decides."
+              ? "位阶会体现在模型的推理里：它在裁决时直接援引条款。下面是示意，概括了这类推理的样子，并非某一次会话的逐字记录。"
+              : "The rank shows up in the model's reasoning: it cites the articles as it decides. These panes are illustrations of that kind of reasoning, paraphrased for this page, not a transcript of one session."
           }
         >
           <ThinkingTrace locale={locale} />

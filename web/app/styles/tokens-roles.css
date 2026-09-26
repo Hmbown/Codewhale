@@ -71,7 +71,8 @@
   --text-prose: 1.0625rem;   /* 17 reading: docs, legal, answers */
   --leading-prose: 1.6;
   --text-heading: 1.0625rem; /* 17 600 group heading */
-  --text-title: 1.375rem;    /* 22 600 section title */
+  --text-title: 1.375rem;    /* 22 600 group and prose title */
+  --text-section: clamp(1.75rem, 1.2rem + 1.7vw, 2.5rem); /* 28-40 editorial section title */
   --text-display: clamp(2rem, 1.3rem + 2.6vw, 3rem);         /* inner-page title */
   --text-display-lg: clamp(2.5rem, 1.4rem + 4.4vw, 4.5rem);  /* the home hero */
   --text-xs: var(--text-caption);
@@ -147,6 +148,7 @@
   --attention: var(--gpui-light-attention);
   --danger: var(--gpui-light-danger);
   --mark-ink: var(--gpui-light-text);
+  --ombre-ink: linear-gradient(135deg, var(--brand-light), var(--brand-deep));
   --diff-add: rgb(104 152 119 / 0.14);
   --diff-del: rgb(189 119 116 / 0.11);
   /* The sky: paper that brightens toward blue at the top of the page. */
@@ -184,6 +186,7 @@
     --attention: var(--gpui-dark-attention);
     --danger: var(--gpui-dark-danger);
     --mark-ink: var(--gpui-dark-text);
+    --ombre-ink: linear-gradient(135deg, #7cc2f2, var(--brand-light));
     --diff-add: rgb(80 170 140 / 0.16);
     --diff-del: rgb(227 154 144 / 0.12);
     --ground: radial-gradient(90rem 38rem at 50% -14rem, rgb(30 143 216 / 0.3), transparent 70%), linear-gradient(180deg, var(--ocean-sky) 0, var(--ocean-floor) 34rem);
@@ -216,6 +219,7 @@
   --attention: var(--gpui-dark-attention);
   --danger: var(--gpui-dark-danger);
   --mark-ink: var(--gpui-dark-text);
+  --ombre-ink: linear-gradient(135deg, #7cc2f2, var(--brand-light));
   --diff-add: rgb(80 170 140 / 0.16);
   --diff-del: rgb(227 154 144 / 0.12);
   --ground: radial-gradient(90rem 38rem at 50% -14rem, rgb(30 143 216 / 0.3), transparent 70%), linear-gradient(180deg, var(--ocean-sky) 0, var(--ocean-floor) 34rem);
@@ -253,6 +257,7 @@
   --attention: var(--gpui-dark-attention);
   --danger: var(--gpui-dark-danger);
   --mark-ink: var(--gpui-dark-text);
+  --ombre-ink: linear-gradient(135deg, #7cc2f2, var(--brand-light));
   --diff-add: rgb(80 170 140 / 0.16);
   --diff-del: rgb(227 154 144 / 0.12);
   --glow: 0 0 0 3px color-mix(in srgb, currentColor 20%, transparent), 0 0 12px 1px color-mix(in srgb, currentColor 45%, transparent);
@@ -278,6 +283,10 @@
   color-scheme: dark;
   color: var(--text);
 }
+
+/* The page's own ground, resolved here on :root so it survives into regions
+   (the footer, the stage) that re-declare --bg. */
+:root { --page-ground: var(--bg); }
 
 /* ---------- legacy names ---------- */
 /* Pages and partials that have not moved to the roles (the docs) read these.

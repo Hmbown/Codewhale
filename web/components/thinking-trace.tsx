@@ -1,15 +1,14 @@
 import { Icon } from "./icon";
 /**
- * "See how it decides" — a terminal-styled pane that surfaces REAL reasoning
- * traces from a Codewhale session, paired with the decision each produced.
+ * "See how it decides" — a terminal-styled pane that illustrates how the
+ * constitution's rank shows up in a model's reasoning, paired with the
+ * decision each line of reasoning led to.
  *
- * The point is "show, don't tell": every agent claims to be aligned/trustworthy;
- * Codewhale can prove it, because the Constitution is observable in the model's
- * reasoning (it cites "Article II", "Article V", etc. as it decides). No other
- * agent can show this because none have a hierarchy the model reasons against.
- *
- * The traces below are faithful excerpts from an actual session — not invented
- * marketing copy. Keep them honest if you edit them (see AGENTS.md Article II).
+ * These are ILLUSTRATIONS, labelled as such on the page: short paraphrases
+ * of the kind of reasoning the rank produces, not a transcript of one cited
+ * session. If a real, linkable session transcript is ever published, cite it
+ * here and change the label; until then, never present these as captured
+ * output (see AGENTS.md Article II).
  */
 
 export type Scene = {
@@ -75,7 +74,7 @@ export function ThinkingTrace({ locale = "en" }: { locale?: string }) {
           <figcaption className="trace-head">
             <span className="status status-accent">
               <span className="status-dot" aria-hidden="true" />
-              {isZh ? "推理痕迹" : "Reasoning trace"}
+              {isZh ? "示意" : "Illustration"}
             </span>
             <span className="trace-context">{isZh ? s.context.zh : s.context.en}</span>
           </figcaption>

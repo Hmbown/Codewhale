@@ -4,7 +4,9 @@
 use std::time::Duration;
 
 use super::qa_harness;
-use qa_harness::harness::{Harness, SealedWorkspace, make_sealed_workspace};
+use qa_harness::harness::{
+    Harness, SealedWorkspace, make_sealed_workspace, make_sealed_workspace_in_home,
+};
 use qa_harness::keys;
 
 const WAIT: Duration = Duration::from_secs(15);
@@ -12,17 +14,63 @@ const SIZES: [(u16, u16); 5] = [(12, 40), (16, 60), (24, 80), (32, 100), (40, 14
 const TITLE: &str = "Recent proof";
 const SAVED_TEXT: &str = "Restored conversation proof";
 
+/// Published codewhale.net terminal media. Default Underwater theme, no
+/// motion, a home-relative workspace, and only states a fresh install really
+/// reaches: the first-run provider picker, home, a typed draft, and /help.
 #[test]
 #[ignore = "opt-in website media; empty isolated session, no provider calls"]
 fn website_current_terminal_capture() {
     assert!(std::env::var_os("QA_LAUNCH_CAPTURE_DIR").is_some());
-    let (_workspace, mut tui) =
-        start_with_options(24, 100, false, &[], Some("shoreline"), true, false);
+    let workspace = make_sealed_workspace_in_home("my-project").unwrap();
+    let (_workspace, mut tui) = start_in(
+        workspace,
+        Launch {
+            rows: 24,
+            cols: 100,
+            // The fixture Ctrl+U leaves a "Ctrl+Z restores" receipt that
+            // never expires on an idle, motionless screen.
+            keep_composer: true,
+            ..Launch::default()
+        },
+        |tui| capture(tui, "website-provider-picker"),
+    );
     // Capture only actual application output: no fabricated history, usage,
     // connected tools, model response or completed work.
-    tui.wait_for_idle(Duration::from_secs(4), WAIT).unwrap();
+    tui.wait_for_idle(Duration::from_secs(1), WAIT).unwrap();
+    assert_website_frame(&mut tui);
     capture(&mut tui, "website-home");
+
+    // Backspace, not Ctrl+U: clearing by Ctrl+U raises a receipt that would
+    // be published with the frame.
+    let prompt = "Add a --json flag to the export command";
+    tui.send(keys::key::backspaces(80)).unwrap();
+    wait(&mut tui, "Type a message");
+    tui.send(prompt).unwrap();
+    wait(&mut tui, prompt);
+    wait(&mut tui, "[↵]");
+    assert_website_frame(&mut tui);
+    capture(&mut tui, "website-composer");
+    tui.send(keys::key::backspaces(prompt.len())).unwrap();
+    wait(&mut tui, "Type a message");
+
+    tui.paste("/help").unwrap();
+    tui.wait_for_idle(Duration::from_millis(300), WAIT).unwrap();
+    tui.send(keys::key::enter()).unwrap();
+    wait(&mut tui, "/model");
+    capture(&mut tui, "website-help");
     tui.shutdown();
+}
+
+/// The published frame names the project the way a user's shell would and
+/// never leaks the sealed tempdir.
+fn assert_website_frame(tui: &mut Harness) {
+    tui.pump();
+    let text = tui.frame().text();
+    assert!(
+        text.contains("~/my-project") && !text.contains(".tmp"),
+        "website frame must show ~/my-project and no tempdir: {}",
+        tui.diagnostics()
+    );
 }
 
 fn start(rows: u16, cols: u16, with_mcp: bool) -> (SealedWorkspace, Harness) {
@@ -61,7 +109,52 @@ fn start_with_options(
     animated: bool,
     no_color: bool,
 ) -> (SealedWorkspace, Harness) {
-    let workspace = make_sealed_workspace().unwrap();
+    start_in(
+        make_sealed_workspace().unwrap(),
+        Launch {
+            rows,
+            cols,
+            with_mcp,
+            titles,
+            theme,
+            animated,
+            no_color,
+            keep_composer: false,
+        },
+        |_| {},
+    )
+}
+
+#[derive(Default)]
+struct Launch<'a> {
+    rows: u16,
+    cols: u16,
+    with_mcp: bool,
+    titles: &'a [&'a str],
+    theme: Option<&'a str>,
+    animated: bool,
+    no_color: bool,
+    /// Skip the post-launch Ctrl+U that empties the composer.
+    keep_composer: bool,
+}
+
+/// Launch into `workspace` and walk first-run onboarding to home.
+/// `on_provider_picker` sees the real first-run provider picker.
+fn start_in(
+    workspace: SealedWorkspace,
+    launch: Launch<'_>,
+    on_provider_picker: impl FnOnce(&mut Harness),
+) -> (SealedWorkspace, Harness) {
+    let Launch {
+        rows,
+        cols,
+        with_mcp,
+        titles,
+        theme,
+        animated,
+        no_color,
+        keep_composer,
+    } = launch;
     let trust = workspace.workspace().join(".deepseek");
     let sessions = workspace.home().join(".codewhale/sessions");
     for directory in [&trust, &sessions] {
@@ -123,6 +216,7 @@ fn start_with_options(
         .seal_home(workspace.home())
         .env("CODEWHALE_DISABLE_MODELS_DEV_FETCH", "1")
         .env("CODEWHALE_NO_UPDATE_CHECK", "1")
+        .env("CODEWHALE_DISABLE_LOCAL_OLLAMA_PROBE", "1")
         .env("NO_ANIMATIONS", if animated { "0" } else { "1" })
         .env("COLORTERM", "truecolor")
         .env("NO_COLOR", if no_color { "1" } else { "" })
@@ -137,11 +231,12 @@ fn start_with_options(
         .spawn()
         .unwrap();
     wait(&mut tui, "Choose your model provider");
+    on_provider_picker(&mut tui);
     tui.send(keys::key::ctrl('o')).unwrap();
     wait(&mut tui, "You're ready.");
     tui.send(keys::key::enter()).unwrap();
     wait(&mut tui, "New session");
-    if animated {
+    if animated || keep_composer {
         return (workspace, tui);
     }
     tui.wait_for_idle(Duration::from_millis(300), WAIT).unwrap();

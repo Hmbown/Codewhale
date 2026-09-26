@@ -1,12 +1,13 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { defaultLocale } from "@/lib/i18n/config";
 import { getStates } from "@/lib/i18n/dictionaries";
 import { pathLocale } from "@/lib/i18n/path";
 import { RetryAction } from "./retry-action";
-import { EmptyState, ErrorState, LoadingState } from "./surface-state";
+import { ErrorState, LoadingState } from "./surface-state";
 
 /**
  * Route boundaries — `loading.tsx`, `error.tsx`, `not-found.tsx` — receive
@@ -46,24 +47,35 @@ export function ErrorRoute({ reset, digest }: { reset: () => void; digest?: stri
 export function NotFoundRoute() {
   const locale = useRouteLocale();
   const t = getStates(locale);
-  // The whale is searching: the page is missing, not broken.
+  // The founder's own joke: the Codwhale game poster, kept whole at every
+  // width, in a navy frame beside the way back.
   return (
-    <EmptyState
-      locale={locale}
-      pose="search"
-      titleAs="h1"
-      title={t.notFoundTitle}
-      body={t.notFoundBody}
-      action={
-        <>
-          <Link href={`/${locale}`} className="btn btn-primary">
+    <section className="not-found" aria-labelledby="not-found-title">
+      <div className="not-found-copy">
+        <h1 id="not-found-title" className="not-found-title">
+          <span className="not-found-code">404.</span> {t.notFoundTitle}
+        </h1>
+        <p className="not-found-body">{t.notFoundBody}</p>
+        <div className="actions">
+          <Link href={`/${locale}`} className="btn btn-primary btn-lg">
             {t.notFoundHomeLink}
           </Link>
-          <Link href={`/${locale}/docs`} className="btn btn-secondary">
+          <Link href={`/${locale}/docs`} className="btn btn-secondary btn-lg">
             {t.docsIndexLink}
           </Link>
-        </>
-      }
-    />
+        </div>
+      </div>
+      <div className="not-found-frame stage">
+        <Image
+          className="not-found-poster"
+          src="/codwhale-404.webp"
+          alt={t.notFoundPosterAlt}
+          width={1122}
+          height={1402}
+          priority
+          unoptimized
+        />
+      </div>
+    </section>
   );
 }

@@ -68,6 +68,7 @@ export default async function FeedPage({ params }: { params: Promise<{ locale: s
   const copy = isZh
     ? {
         title: "动态",
+        titleAside: "Activity",
         lede: (
           <>
             来自{" "}
@@ -82,6 +83,7 @@ export default async function FeedPage({ params }: { params: Promise<{ locale: s
       }
     : {
         title: "Activity",
+        titleAside: "动态",
         lede: (
           <>
             Follow issues and pull requests from{" "}
@@ -106,7 +108,14 @@ export default async function FeedPage({ params }: { params: Promise<{ locale: s
 
   return (
     <>
-      <PageHeader title={copy.title} lede={copy.lede} pose="browse" />
+      <PageHeader
+        seal="动"
+        title={copy.title}
+        titleAside={copy.titleAside}
+        titleAsideLang={isZh ? "en" : "zh"}
+        lede={copy.lede}
+        pose="browse"
+      />
       <div className="page-body">
         <div className="grid-2 feed-columns">
           {columns.map((column) => (

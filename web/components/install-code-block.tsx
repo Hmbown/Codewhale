@@ -12,8 +12,9 @@ interface Props {
 }
 
 /**
- * A command in a code block with one icon button that copies it. The check
- * mark and the "Copied" announcement appear only after the clipboard write
+ * A command in a code block with one button that copies it: the copy icon
+ * and the word, so the action reads without guessing at the glyph. The check
+ * mark, "Copied" and its announcement appear only after the clipboard write
  * succeeds; a failed write never shows a false confirmation.
  */
 export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copied", copyLocale }: Props) {
@@ -32,6 +33,8 @@ export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copie
     }
   };
 
+  const copiedWord = copiedLabel.replace(/\s*✓\s*$/u, "");
+
   return (
     <div className="code">
       <pre tabIndex={0} className="code-block">{cmd}</pre>
@@ -39,16 +42,15 @@ export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copie
         type="button"
         lang={copyLocale}
         onClick={copy}
-        aria-label={copyLabel}
-        title={copyLabel}
         data-copied={copied}
-        className="nav-icon-button nav-icon-button-sm code-copy"
+        className="btn btn-sm code-copy"
       >
-        <Icon name={copied ? "check" : "copy"} className="nav-icon" />
+        <Icon name={copied ? "check" : "copy"} className="icon" />
+        <span className="code-copy-label">{copied ? copiedWord : copyLabel}</span>
       </button>
       <span className="sr-only" aria-live="polite" lang={copyLocale}>
         {/* The check mark is drawn by the icon; announce only the word. */}
-        {copied ? copiedLabel.replace(/\s*✓\s*$/u, "") : ""}
+        {copied ? copiedWord : ""}
       </span>
     </div>
   );

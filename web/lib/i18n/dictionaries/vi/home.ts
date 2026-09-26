@@ -28,6 +28,8 @@ export const home: HomeDict = {
   sourceCandidate: "Chưa phát hành",
   publishedRelease: "đã phát hành",
   figcaptionSourceCandidate: "chưa phát hành",
+  chapterTerminal: "Terminal của bạn",
+  chapterTerminalTitle: "Bắt đầu với điều bạn muốn tạo ra",
   gainHeading:
     "Những việc bạn có thể làm với Codewhale",
   gainLede:
@@ -46,6 +48,7 @@ export const home: HomeDict = {
       "Sử dụng mô hình chạy trên máy chủ hoặc cục bộ cho các tác tử, với những mô hình và vai trò khác nhau đảm nhận các phần công việc phù hợp."
     ]
   ],
+  chapterModels: "Mô hình của bạn",
   modelsHeading: "Lựa chọn mô hình cho từng tác vụ",
   modelsBody:
     "Bạn có thể kết nối trực tiếp với một nhà cung cấp mô hình, dùng cổng kết nối để truy cập nhiều nhà cung cấp hoặc chạy mô hình cục bộ, rồi chọn mô hình cho từng phiên khi làm việc.",
@@ -60,6 +63,7 @@ export const home: HomeDict = {
     "Sau khi cài đặt Codewhale và kết nối một mô hình, bạn có thể mô tả tác vụ đầu tiên trong terminal và thêm Fleet khi muốn nhiều tác tử cùng chia sẻ công việc.",
   startGuideLink: "Đọc hướng dẫn bắt đầu",
   startVocabularyLink: "Xem thuật ngữ sản phẩm",
+  chapterAvailability: "Chạy ở đâu",
   availabilityHeading: "Nơi bạn có thể sử dụng Codewhale",
   availabilityLede:
     "Bạn có thể sử dụng Codewhale trong terminal ngay hôm nay, trong khi chúng tôi đang phát triển ứng dụng web, ứng dụng máy tính và máy tính đám mây.",

@@ -566,7 +566,9 @@ done
   });
 
   it("keeps supplied terminal screenshots and website dimensions truthful", () => {
-    // Website and README share the same exact-build terminal-cell capture.
+    // Website and README share the same exact-build terminal-cell capture:
+    // the site renders its cells as live text, the README shows the same
+    // frame rasterized from them.
     const readmeImage = bytes(matrix.screenshot.readme);
     const websiteImage = bytes(matrix.screenshot.website);
 
@@ -584,10 +586,12 @@ done
     expect(readme).toContain(matrix.screenshot.readme);
     expect(`web/public${TERMINAL_SCREENSHOT.src}`).toBe(matrix.screenshot.website);
     expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
-    expect(homepage).toContain("src={TERMINAL_SCREENSHOT.src}");
+    expect(homepage).toContain('<TerminalCapture\n                    frame="home"');
+    expect(TERMINAL_SCREENSHOT.capture).toBe("web/lib/terminal-captures/website-home-100x24.json");
+    expect(matrix.screenshot.sources).toContain(TERMINAL_SCREENSHOT.capture);
     // Every locale describes the actual capture; build identity comes from
     // the media manifest instead of a stale version embedded in translations.
-    expect(homepage).toContain("alt={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}");
+    expect(homepage).toContain("label={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}");
     expect(homepage).toContain("fill(d.shotBuild, { version: TERMINAL_SCREENSHOT.version })");
     expect(getHome("en").shotBuild).toBe("v{version} pre-release build");
     for (const locale of ["en", "zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"]) {

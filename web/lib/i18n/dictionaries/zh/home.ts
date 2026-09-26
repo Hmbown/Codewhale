@@ -28,6 +28,8 @@ export const home: HomeDict = {
   sourceCandidate: "未发布",
   publishedRelease: "已发布",
   figcaptionSourceCandidate: "未发布",
+  chapterTerminal: "你的终端",
+  chapterTerminalTitle: "从你想做的项目开始",
   gainHeading: "你可以用 Codewhale 做什么",
   gainLede: "从具体目标开始：修复错误、理解项目，或把重复任务变成工作流程。先用一个智能体，需要时再拆分大型任务。",
   gain: [
@@ -44,6 +46,7 @@ export const home: HomeDict = {
       "开始前设定权限，处理审批请求，随时中断正在运行的任务。查看对话与工具结果，再决定如何继续。"
     ]
   ],
+  chapterModels: "你的模型",
   modelsHeading: "为每项任务选择合适的模型",
   modelsBody:
     "为每个会话选择提供商和模型：使用 API 密钥、受支持的提供商登录方式，或本地模型。Codewhale 账户与模型连接各有用途。",
@@ -57,6 +60,7 @@ export const home: HomeDict = {
   startLede: "安装已发布版本，连接模型，然后在项目文件夹中尝试一项任务。智能体团队是可选的；先用一个智能体，等任务适合拆分时再增加。",
   startGuideLink: "阅读新手指引",
   startVocabularyLink: "查名词",
+  chapterAvailability: "在哪里运行",
   availabilityHeading: "你可以在哪里使用 Codewhale",
   availabilityLede: "终端与本地浏览器客户端现已可用。桌面和托管网页应用正基于同一会话模型开发；各端的开放状态分别列在下方。",
   availability: [
