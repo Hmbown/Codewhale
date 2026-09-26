@@ -1103,7 +1103,7 @@ async fn run_image_search(
         .map_err(|e| ToolError::execution_failed(format!("Failed to build HTTP client: {e}")))?;
 
     // Step 1: fetch the HTML page to obtain the `vqd` token used by the images API.
-    let encoded = url_encode(query);
+    let encoded = crate::utils::url_encode(query);
     let seed_url = format!("https://duckduckgo.com/?q={encoded}&iax=images&ia=images");
     let seed_resp = client
         .get(&seed_url)
@@ -1755,12 +1755,6 @@ fn decode_html_entities(text: &str) -> String {
         .replace("&gt;", ">")
         .replace("&nbsp;", " ")
 }
-
-fn url_encode(input: &str) -> String {
-    crate::utils::url_encode(input)
-}
-
-// === Tests ===
 
 #[cfg(test)]
 mod tests {
