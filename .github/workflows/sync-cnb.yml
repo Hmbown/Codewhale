@@ -35,11 +35,16 @@ on:
     tags: ['v*']
   workflow_dispatch: {}
 
-# Serialize runs so the back-to-back main-push + tag-push from auto-tag.yml
-# don't race each other rebasing onto CNB. cancel-in-progress: false so
-# every commit actually arrives — we'd rather queue than drop.
+# Serialize runs per ref. One global group was wrong: with
+# cancel-in-progress: false GitHub still keeps only ONE pending run per group
+# and cancels it when a newer one queues, so a release tag sync waiting behind
+# a main push was dropped by the next branch push. Keyed by ref, each tag gets
+# its own group (never superseded), and a pending branch sync is only ever
+# replaced by a newer push of the same branch, whose force-push supersedes it.
+# The main and tag pushes from auto-tag.yml write different CNB refs, so
+# running them concurrently cannot conflict.
 concurrency:
-  group: cnb-sync
+  group: cnb-sync-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -48,8 +53,9 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
 

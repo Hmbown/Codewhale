@@ -883,6 +883,36 @@ fn saved_history_boundary(
     None
 }
 
+/// The number of leading messages whose recovery projection is exactly
+/// `target`, or `None` when no prefix matches.
+///
+/// `session_recovery_projection` is a per-message concatenation, so the first
+/// exact prefix match is found in one walk: append each message's entries in
+/// order, and the moment one is longer than `target` or differs from `target`'s
+/// entry at that position, no longer prefix can match either.
+///
+/// Rebuilding the projection of every prefix instead — what the alignment used
+/// to do — is quadratic in the transcript: measured at ~9 s on a 5 MB session,
+/// before a fork could do anything else.
+fn exact_prefix_boundary(messages: &[Message], target: &[Value]) -> Option<usize> {
+    if target.is_empty() {
+        return Some(0);
+    }
+    let mut produced = 0usize;
+    for (index, message) in messages.iter().enumerate() {
+        for entry in session_recovery_projection(std::slice::from_ref(message)) {
+            if produced >= target.len() || target[produced] != entry {
+                return None;
+            }
+            produced += 1;
+        }
+        if produced == target.len() {
+            return Some(index + 1);
+        }
+    }
+    None
+}
+
 /// The conversation identity two histories are compared by: user prompts (their
 /// `<turn_meta>` envelope removed), assistant text, thinking and tool calls,
 /// and tool results.
@@ -933,6 +963,42 @@ fn session_recovery_projection(messages: &[Message]) -> Vec<Value> {
         }
     }
     projection
+}
+
+/// Whether a source's saved transcript has stopped being a transcript of its
+/// turns.
+///
+/// A context compaction rewrites the model-visible history in place: what
+/// stays verbatim is the user prompts inside a token budget, and everything a
+/// prompt stood for — the answers, the tool calls, their results — is
+/// summarized away. The saved messages are therefore an *abbreviation* of the
+/// turns, and every boundary in them still names a turn while carrying only
+/// its prompt.
+///
+/// That matters to a fork, which is a slice of that history. Copying the
+/// abbreviation into a document that claims, through its checkpoint, to cover
+/// the kept turns hands every reader of that document — the session view,
+/// `restore_thread_messages` — a run of prompts with the agent's
+/// output missing, because nothing is left for it to rebuild the turns from.
+/// The turn store is not rewritten by compaction, so the records can: they are
+/// what the fork rebuilds the kept exchanges from
+/// (`reconstruct_messages_from_turns_with`).
+///
+/// The compaction names the turn it ran for, so the records answer the
+/// question directly. Any compaction in the thread is enough: the turns before
+/// it are the ones whose transcript was replaced, and a cut after them would
+/// still slice an abbreviation.
+fn saved_transcript_is_compacted(
+    turns: &[TurnRecord],
+    items_by_turn: &HashMap<String, Vec<TurnItemRecord>>,
+) -> bool {
+    turns.iter().any(|turn| {
+        items_by_turn.get(&turn.id).is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.kind == TurnItemKind::ContextCompaction)
+        })
+    })
 }
 
 fn thread_execution_state_matches(left: &ThreadRecord, right: &ThreadRecord) -> bool {
@@ -2354,6 +2420,29 @@ impl RuntimeThreadStore {
                 &path,
             )
         })
+    }
+
+    /// Publish many items at once, paying the items directory's costs once.
+    ///
+    /// Each `save_item` sweeps the whole items directory for stale temp files
+    /// and fsyncs it — right for one record, ruinous for the hundreds a fork
+    /// clones (measured: 22 ms of directory scan per item, 34 s for one fork's
+    /// 771). The per-record checks and the atomic replace are unchanged; see
+    /// [`crate::utils::write_atomic_batch`].
+    ///
+    /// Ordering stays the caller's: items, then their turns, then the thread
+    /// record that makes them reachable.
+    pub fn save_items_batch(&self, items: &[&TurnItemRecord]) -> Result<()> {
+        let mut files = Vec::with_capacity(items.len());
+        for item in items {
+            validated_record_id(&item.turn_id, "turn id")?;
+            let path = self.item_path(&item.id)?;
+            reject_symlinked_store_file(&path)?;
+            let payload = serde_json::to_string_pretty(item)?;
+            files.push((path, payload.into_bytes()));
+        }
+        crate::utils::write_atomic_batch(&files)
+            .with_context(|| format!("Failed to write {} store items", files.len()))
     }
 
     fn remove_turn(&self, turn_id: &str) -> Result<()> {
@@ -4739,7 +4828,10 @@ struct ActiveThreads {
 
 pub(crate) struct PreparedThreadFork {
     source_id: String,
-    target_turn_id: String,
+    /// The first turn the fork *drops*, when it drops any: the turn whose
+    /// prompt the receipt hands back. `None` for a fork that keeps the whole
+    /// conversation (a branch point at the last turn).
+    dropped_turn_id: Option<String>,
     depth_from_tail: usize,
     thread: ThreadRecord,
     records: Vec<(TurnRecord, Vec<TurnItemRecord>)>,
@@ -9006,8 +9098,20 @@ impl RuntimeThreadManager {
         session.metadata.copy_cost_from(&source.metadata);
 
         let session_id = session.metadata.id.clone();
-        let messages_sha256 = session_messages_sha256(prefix)?;
         manager.save_session(&session)?;
+
+        // Fingerprint the document the way every reader sees it. A saved
+        // session is repaired on the way out — `resume_session` re-pairs the
+        // tool calls with their results and writes the repair back — so a
+        // prefix rebuilt from turn records can be stored in one shape and read
+        // in another: a tool call whose result never arrived arrives here as
+        // the repair's notice message. Fingerprinting the written shape names
+        // bytes no reader sees, and every reader then rejects the fork — its
+        // own hydration refuses the document, and resuming the session does
+        // not recognise the thread that holds it, so it opens a second one and
+        // the first is left stale.
+        let stored = manager.resume_session(&session_id)?.session.messages;
+        let messages_sha256 = session_messages_sha256(&stored)?;
 
         forked.session_id = Some(session_id);
         forked.saved_session_checkpoint = Some(SavedSessionCheckpoint {
@@ -9029,20 +9133,36 @@ impl RuntimeThreadManager {
         forked.archived = false;
 
         let source_turns = self.store.list_turns_for_thread(&source.id)?;
+        // One read for every turn's items — see `prepared_items_for_turns`: a
+        // whole-thread fork visits every turn, and the per-turn scan made that
+        // quadratic over a store that only grows.
+        let mut items_by_turn = self.prepared_items_for_turns(&source_turns)?;
         // The fork's own document holds exactly the prefix its source
         // checkpoint already covers — see `bind_fork_to_own_session`. A source
         // whose checkpoint no longer matches its file has no prefix to copy;
         // the fork then keeps the binding it inherited, which is what it did
         // before this existed, rather than failing the fork outright.
-        let fork_prefix = match self.saved_session_prefix(&source, &source_turns) {
-            Ok(Some(prefix)) => Some(prefix),
-            Ok(None) => None,
-            Err(error) => {
-                tracing::warn!(
-                    thread_id = %source.id,
-                    "fork source has no usable saved-session prefix: {error:#}"
-                );
-                None
+        //
+        // A compacted source has no transcript to copy at all: its saved
+        // messages are the summary plus the prompts that stayed verbatim, so
+        // the whole conversation is rebuilt from its records instead — see
+        // `saved_transcript_is_compacted`.
+        let fork_prefix = if saved_transcript_is_compacted(&source_turns, &items_by_turn) {
+            Some((
+                self.reconstruct_messages_from_turns_with(&source_turns, &items_by_turn)?,
+                source_turns.len(),
+            ))
+        } else {
+            match self.saved_session_prefix(&source, &source_turns) {
+                Ok(Some(prefix)) => Some(prefix),
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::warn!(
+                        thread_id = %source.id,
+                        "fork source has no usable saved-session prefix: {error:#}"
+                    );
+                    None
+                }
             }
         };
         let mut cloned_records = Vec::with_capacity(source_turns.len());
@@ -9057,7 +9177,7 @@ impl RuntimeThreadManager {
             }
             cloned_turn.item_ids.clear();
 
-            let items = self.store.list_items_for_turn(&source_turn.id)?;
+            let items = items_by_turn.remove(&source_turn.id).unwrap_or_default();
             let mut cloned_items = Vec::with_capacity(items.len());
             for item in items {
                 let mut cloned_item = item.clone();
@@ -9128,12 +9248,14 @@ impl RuntimeThreadManager {
     /// `None` when no detail was recorded (defensive — every persisted
     /// `UserMessage` since v0.6 carries a detail string).
     ///
-    /// Counts user turns by iterating `list_turns_for_thread` (sorted
-    /// oldest → newest) backwards. A turn is counted as a "user turn"
+    /// Counts user turns over `list_turns_for_thread` (sorted
+    /// oldest → newest). A turn is counted as a "user turn"
     /// when at least one of its items has `kind ==
     /// TurnItemKind::UserMessage`. Steered turns (which append additional
     /// `UserMessage` items) still count as one turn — backtrack rewinds
-    /// at the turn boundary, not at the steer boundary.
+    /// at the turn boundary, not at the steer boundary. That predicate lives
+    /// in `user_turn_indices`, which the named anchor is resolved through
+    /// (`fork_cut_for_user_turn`) as well.
     ///
     /// Errors:
     /// - `depth_from_tail` exceeds the number of user turns
@@ -9155,6 +9277,114 @@ impl RuntimeThreadManager {
         self.publish_prepared_fork(prepared).await
     }
 
+    /// Fork a thread at a named user turn — the branch point a transcript's
+    /// "continue from here" row names.
+    ///
+    /// The fork *keeps* that turn and every turn before it, and drops the
+    /// turns after it; the first dropped turn's prompt comes back so a client
+    /// can put it in the composer as the thing that was asked next, to edit or
+    /// replace. Naming the last turn keeps every turn — a fork of the whole
+    /// conversation — which is the same rule read at the end of the thread.
+    ///
+    /// `turn_id` is a turn id as `GET /v1/threads/{id}` reports it and must
+    /// name a user turn (the same predicate [`Self::fork_at_user_message`]
+    /// counts). This exists because a client cannot count those turns for
+    /// itself: the transcript it renders and the turn store this cuts are not
+    /// the same list — steers, image-only prompts and injected handoffs each
+    /// sit on one side only — so a depth the client computed is an off-by-one
+    /// waiting to fork the wrong prefix and report success. Naming the turn
+    /// moves that decision to the side that owns the list.
+    ///
+    /// Like every other fork, this touches neither the source thread nor the
+    /// workspace: it is a sibling conversation, never an undo. Rollback of
+    /// the dropped turns' file changes is `/patch-undo` territory and is
+    /// deliberately absent here — a fork that rewound the workspace would
+    /// rewind it for the branch that was left behind too.
+    pub async fn fork_at_user_turn(
+        &self,
+        id: &str,
+        turn_id: &str,
+    ) -> Result<(
+        ThreadRecord,
+        Option<String>,
+        Vec<codewhale_protocol::runtime::RuntimeImageInput>,
+        Option<std::num::NonZeroU32>,
+    )> {
+        let prepared = self.prepare_fork_at_user_turn(id, turn_id).await?;
+        self.publish_prepared_fork(prepared).await
+    }
+
+    /// How many turns a named anchor keeps, the first user turn it drops, and
+    /// its distance from the tail.
+    ///
+    /// The fork keeps the anchor turn, so the cut is one past it: the branch
+    /// point is the answer a person is looking at, not the question above it.
+    /// The turn right after the anchor need not be a user turn — a manual
+    /// `/compact` is a turn of its own with no prompt — so the receipt names
+    /// the next *user* turn, which is what was asked next, while the cut still
+    /// drops everything after the anchor.
+    fn fork_cut_for_user_turn(
+        &self,
+        turns: &[TurnRecord],
+        items_by_turn: &HashMap<String, Vec<TurnItemRecord>>,
+        turn_id: &str,
+    ) -> Result<(usize, Option<usize>, usize)> {
+        // Oldest → newest, so the named turn's position is a direct index.
+        let user_turn_indices = Self::user_turn_indices(turns, items_by_turn);
+        let position = user_turn_indices
+            .iter()
+            .position(|index| turns[*index].id == turn_id)
+            .with_context(|| {
+                format!("fork_at_user_turn: turn {turn_id} is not a user turn of this thread")
+            })?;
+        Ok((
+            user_turn_indices[position] + 1,
+            user_turn_indices.get(position + 1).copied(),
+            user_turn_indices.len() - 1 - position,
+        ))
+    }
+
+    /// The indices into `turns` that count as user turns, oldest → newest.
+    ///
+    /// A turn is a user turn when at least one of its items has `kind ==
+    /// TurnItemKind::UserMessage`; a steered turn counts once, at its turn
+    /// boundary, not once per steer. One home for that rule, so a
+    /// tail-relative depth and a named-turn anchor can never disagree about
+    /// which turn they mean. Free-standing because it reads nothing but the
+    /// turns and the items already loaded for them.
+    fn user_turn_indices(
+        turns: &[TurnRecord],
+        items_by_turn: &HashMap<String, Vec<TurnItemRecord>>,
+    ) -> Vec<usize> {
+        let mut indices = Vec::new();
+        for (idx, turn) in turns.iter().enumerate() {
+            let is_user_turn = items_by_turn.get(&turn.id).is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.kind == TurnItemKind::UserMessage)
+            });
+            if is_user_turn {
+                indices.push(idx);
+            }
+        }
+        indices
+    }
+
+    /// Every item of every turn in `turns`, keyed by turn id.
+    ///
+    /// `list_items_for_turn` scans the store's whole items directory to find
+    /// one turn's items, and a fork visits every turn: on a store holding tens
+    /// of thousands of items that is seconds per turn, which is how a branch
+    /// came to take minutes. One scan answers all of them — the same call the
+    /// thread projection already reads a transcript with.
+    fn prepared_items_for_turns(
+        &self,
+        turns: &[TurnRecord],
+    ) -> Result<HashMap<String, Vec<TurnItemRecord>>> {
+        let turn_ids: Vec<String> = turns.iter().map(|turn| turn.id.clone()).collect();
+        self.store.list_items_for_turns_map(&turn_ids)
+    }
+
     pub(crate) async fn prepare_fork_at_user_message(
         &self,
         id: &str,
@@ -9162,19 +9392,12 @@ impl RuntimeThreadManager {
     ) -> Result<PreparedThreadFork> {
         let source = self.get_thread(id).await?;
         let source_turns = self.store.list_turns_for_thread(&source.id)?;
+        // Every item of every turn in one read: see `prepared_items_for_turns`.
+        let items_by_turn = self.prepared_items_for_turns(&source_turns)?;
 
-        // Walk turns from newest to oldest. For each turn, ask: does it
-        // contain a UserMessage item? If yes, it counts toward the depth.
-        let mut user_turn_indices: Vec<usize> = Vec::new();
-        for (idx, turn) in source_turns.iter().enumerate().rev() {
-            let items = self.store.list_items_for_turn(&turn.id)?;
-            if items
-                .iter()
-                .any(|item| item.kind == TurnItemKind::UserMessage)
-            {
-                user_turn_indices.push(idx);
-            }
-        }
+        // Which turns count as user turns, oldest first; the depth names one
+        // of them counting back from the end.
+        let user_turn_indices = Self::user_turn_indices(&source_turns, &items_by_turn);
         if depth_from_tail >= user_turn_indices.len() {
             bail!(
                 "fork_at_user_message: depth {} exceeds {} user turn(s)",
@@ -9182,33 +9405,94 @@ impl RuntimeThreadManager {
                 user_turn_indices.len()
             );
         }
-        // `user_turn_indices` is newest-first because we iterated in
-        // reverse, so the Nth element is exactly the Nth-from-tail user
-        // turn in the original chronological list.
-        let target_turn_idx = user_turn_indices[depth_from_tail];
-        let target_turn_id = source_turns[target_turn_idx].id.clone();
+        let target_turn_idx = user_turn_indices[user_turn_indices.len() - 1 - depth_from_tail];
+        // A depth-relative cut *drops* the turn it names — `/undo` removes the
+        // exchange a person pointed at — where a named-turn cut keeps it. That
+        // one turn is the whole difference between "undo this" and "branch
+        // after this", and it lives here rather than in either caller.
+        self.prepare_fork_from_cutoff(
+            source,
+            source_turns,
+            items_by_turn,
+            target_turn_idx,
+            Some(target_turn_idx),
+            depth_from_tail,
+        )
+    }
 
-        // Pull the original user-message text out of the dropped turn so
-        // the caller can drop it back into the composer.
-        let target_items = self.store.list_items_for_turn(&target_turn_id)?;
-        let original_user_text = target_items
-            .iter()
-            .find(|item| item.kind == TurnItemKind::UserMessage)
+    pub(crate) async fn prepare_fork_at_user_turn(
+        &self,
+        id: &str,
+        turn_id: &str,
+    ) -> Result<PreparedThreadFork> {
+        let source = self.get_thread(id).await?;
+        let source_turns = self.store.list_turns_for_thread(&source.id)?;
+        let items_by_turn = self.prepared_items_for_turns(&source_turns)?;
+        let (cutoff_turn_idx, receipt_turn_idx, depth_from_tail) =
+            self.fork_cut_for_user_turn(&source_turns, &items_by_turn, turn_id)?;
+        self.prepare_fork_from_cutoff(
+            source,
+            source_turns,
+            items_by_turn,
+            cutoff_turn_idx,
+            receipt_turn_idx,
+            depth_from_tail,
+        )
+    }
+
+    /// Clone the turns before `cutoff_turn_idx` into a sibling thread, and name
+    /// the first *user* turn left behind (`receipt_turn_idx`, at or after the
+    /// cutoff) in the receipt.
+    ///
+    /// One body for every fork that cuts a suffix: the depth-relative path
+    /// (`/undo`, retry, backtrack) passes the anchor turn's own index and drops
+    /// it, the named-anchor path passes one past its anchor and keeps it, so
+    /// the cloning, the saved-session prefix and the receipt cannot drift apart
+    /// between them.
+    fn prepare_fork_from_cutoff(
+        &self,
+        source: ThreadRecord,
+        source_turns: Vec<TurnRecord>,
+        mut items_by_turn: HashMap<String, Vec<TurnItemRecord>>,
+        cutoff_turn_idx: usize,
+        receipt_turn_idx: Option<usize>,
+        depth_from_tail: usize,
+    ) -> Result<PreparedThreadFork> {
+        // The first user turn the fork drops, when it drops any. Its prompt is
+        // what the caller puts back in the composer: for a depth-relative cut
+        // that is the turn being undone, and for an anchored cut it is the
+        // question that followed the branch point — not a prompt-less turn
+        // (a manual compaction, a routing settlement) that happens to sit
+        // between them.
+        debug_assert!(receipt_turn_idx.is_none_or(|idx| idx >= cutoff_turn_idx));
+        let dropped_turn = receipt_turn_idx.and_then(|idx| source_turns.get(idx));
+        let dropped_turn_id = dropped_turn.map(|turn| turn.id.clone());
+        let dropped_user_item = dropped_turn
+            .and_then(|turn| items_by_turn.get(&turn.id))
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.kind == TurnItemKind::UserMessage)
+            });
+        let original_user_text = dropped_user_item
+            .as_ref()
             .and_then(|item| item.detail.clone());
-        let original_images = target_items
-            .iter()
-            .find(|item| item.kind == TurnItemKind::UserMessage)
+        let original_images = dropped_user_item
+            .as_ref()
             .map(|item| {
                 item.user_content()
                     .and_then(|content| crate::image_attach::runtime_images_from_blocks(&content))
             })
             .transpose()?
             .unwrap_or_default();
+        // The next turn's allowance travels with the prompt it belongs to;
+        // with nothing dropped there is no next turn to inherit from.
+        let max_output_tokens = dropped_turn.and_then(|turn| turn.max_output_tokens);
 
-        // Copy turns strictly before `target_turn_idx` into a new thread.
-        // Mirrors `fork_thread` but stops at the cutoff instead of copying
-        // every turn. Kept structurally close so future parity reviews
-        // can spot drift between the two paths.
+        // Copy the turns before the cutoff into a new thread. Mirrors
+        // `fork_thread` but stops at the cutoff instead of copying every turn.
+        // Kept structurally close so future parity reviews can spot drift
+        // between the two paths.
         let mut forked = source.clone();
         let now = Utc::now();
         forked.id = format!("thr_{}", &Uuid::new_v4().to_string()[..8]);
@@ -9221,63 +9505,109 @@ impl RuntimeThreadManager {
         // own — see `bind_fork_to_own_session`.
         let mut fork_prefix: Option<(Vec<Message>, usize)> = None;
         if let Some((messages, covered)) = self.saved_session_prefix(&source, &source_turns)? {
-            let kept_turns = covered.min(target_turn_idx);
-            let retained_messages = if covered <= target_turn_idx {
-                messages.len()
+            let kept_turns = covered.min(cutoff_turn_idx);
+            // A compacted source has no transcript to cut — see
+            // `saved_transcript_is_compacted`. Every boundary in its saved
+            // messages names a turn while carrying only that turn's prompt, so
+            // a slice of them would claim coverage of exchanges the fork's own
+            // document does not hold. There is nothing for the boundary search
+            // to find either, so it is skipped rather than risk a refusal for a
+            // trim the fork is not going to take.
+            let compacted = saved_transcript_is_compacted(&source_turns, &items_by_turn);
+            let retained_messages = if compacted {
+                None
+            } else if covered <= cutoff_turn_idx {
+                Some(messages.len())
             } else {
-                let kept_messages =
-                    self.reconstruct_messages_from_turns(&source_turns[..target_turn_idx])?;
+                let kept_messages = self.reconstruct_messages_from_turns_with(
+                    &source_turns[..cutoff_turn_idx],
+                    &items_by_turn,
+                )?;
                 let kept_projection = session_recovery_projection(&kept_messages);
                 // An exact projection match is the strongest proof: message for
                 // message, this prefix *is* the kept history. It holds for a
                 // transcript the records reproduce, and is tried first so those
                 // shapes keep their exact boundary.
-                if let Some(count) = (0..=messages.len()).find(|count| {
-                    session_recovery_projection(&messages[..*count]) == kept_projection
-                }) {
-                    count
-                } else {
-                    // It cannot hold for a real conversation: the model-visible
-                    // transcript carries the per-turn `<turn_meta>` preamble and
-                    // tool results as the route's compaction left them, neither
-                    // of which the records keep. The prompt is recorded
-                    // verbatim, so it still names the message the undone turn
-                    // begins at — see `saved_history_boundary`.
-                    let target_prompt = projected_user_texts(
-                        &self.reconstruct_messages_from_turns(
-                            &source_turns[target_turn_idx..=target_turn_idx],
+                // One walk, not one rebuild per prefix — see
+                // `exact_prefix_boundary`.
+                Some(
+                    if let Some(count) = exact_prefix_boundary(&messages, &kept_projection) {
+                        count
+                    } else {
+                        // It cannot hold for a real conversation: the model-visible
+                        // transcript carries the per-turn `<turn_meta>` preamble and
+                        // tool results as the route's compaction left them, neither
+                        // of which the records keep. The prompt is recorded
+                        // verbatim, so it still names the message the first dropped
+                        // turn begins at — see `saved_history_boundary`.
+                        //
+                        // That turn is the one the kept history stops *before*: the
+                        // anchor itself for a depth-relative cut, and the next user
+                        // turn after the anchor for a fork at a named turn, which
+                        // keeps it. When no user turn is dropped at all, every
+                        // saved prompt belongs to a kept turn, and so does the
+                        // whole saved transcript.
+                        match dropped_turn {
+                            None => messages.len(),
+                            Some(dropped_turn) => {
+                                let dropped_prompt = projected_user_texts(
+                        &self.reconstruct_messages_from_turns_with(
+                            std::slice::from_ref(dropped_turn),
+                            &items_by_turn,
                         )?,
                     )
                     .into_iter()
                     .next()
                     .with_context(|| {
                         format!(
-                            "Turn {target_turn_id} records no user prompt to align the saved history with; the source thread was preserved"
+                            "Turn {} records no user prompt to align the saved history with; the source thread was preserved",
+                            dropped_turn.id
                         )
                     })?;
-                    saved_history_boundary(
+                                saved_history_boundary(
                         &messages,
                         &projected_user_texts(&kept_messages),
-                        &target_prompt,
+                        &dropped_prompt,
                     )
                     .context("Cannot identify an exact saved-history boundary for this backtrack; the source thread was preserved")?
-                }
+                            }
+                        }
+                    },
+                )
+            };
+            let (prefix, covered_turns) = match retained_messages {
+                Some(retained) => (messages[..retained].to_vec(), kept_turns),
+                None => (
+                    self.reconstruct_messages_from_turns_with(
+                        &source_turns[..cutoff_turn_idx],
+                        &items_by_turn,
+                    )?,
+                    cutoff_turn_idx,
+                ),
             };
             forked.saved_session_checkpoint = Some(SavedSessionCheckpoint {
-                covered_turn_id: kept_turns
+                covered_turn_id: covered_turns
                     .checked_sub(1)
                     .map(|index| source_turns[index].id.clone()),
-                messages_sha256: match &source.saved_session_checkpoint {
-                    Some(checkpoint) => checkpoint.messages_sha256.clone(),
-                    None => session_messages_sha256(&messages)?,
+                // A copy of the source's own slice keeps the source's
+                // fingerprint, which is what an inherited binding (the fork
+                // could not be given a document) is verified against. A
+                // rebuilt prefix describes itself and hashes itself.
+                messages_sha256: if compacted {
+                    session_messages_sha256(&prefix)?
+                } else {
+                    match &source.saved_session_checkpoint {
+                        Some(checkpoint) => checkpoint.messages_sha256.clone(),
+                        None => session_messages_sha256(&messages)?,
+                    }
                 },
-                retained_messages: Some(retained_messages),
+                retained_messages: Some(prefix.len()),
             });
-            fork_prefix = Some((messages[..retained_messages].to_vec(), kept_turns));
+            fork_prefix = Some((prefix, covered_turns));
         }
 
-        let mut cloned_records = Vec::with_capacity(target_turn_idx);
-        for source_turn in source_turns.iter().take(target_turn_idx) {
+        let mut cloned_records = Vec::with_capacity(cutoff_turn_idx);
+        for source_turn in source_turns.iter().take(cutoff_turn_idx) {
             let mut cloned_turn = source_turn.clone();
             cloned_turn.id = format!("turn_{}", &Uuid::new_v4().to_string()[..8]);
             cloned_turn.thread_id = forked.id.clone();
@@ -9288,7 +9618,7 @@ impl RuntimeThreadManager {
             }
             cloned_turn.item_ids.clear();
 
-            let items = self.store.list_items_for_turn(&source_turn.id)?;
+            let items = items_by_turn.remove(&source_turn.id).unwrap_or_default();
             let mut cloned_items = Vec::with_capacity(items.len());
             for item in items {
                 let mut cloned_item = item.clone();
@@ -9314,13 +9644,13 @@ impl RuntimeThreadManager {
         );
         Ok(PreparedThreadFork {
             source_id: source.id,
-            target_turn_id,
+            dropped_turn_id,
             depth_from_tail,
             thread: forked,
             records: cloned_records,
             original_user_text,
             original_images,
-            max_output_tokens: source_turns[target_turn_idx].max_output_tokens,
+            max_output_tokens,
             own_session,
         })
     }
@@ -9362,7 +9692,7 @@ impl RuntimeThreadManager {
                     "thread": prepared.thread,
                     "source_thread_id": prepared.source_id,
                     "backtrack_depth_from_tail": prepared.depth_from_tail,
-                    "dropped_turn_id": prepared.target_turn_id,
+                    "dropped_turn_id": prepared.dropped_turn_id,
                 }),
             )
             .await
@@ -9392,11 +9722,18 @@ impl RuntimeThreadManager {
         let mut saved_turn_ids = Vec::new();
         let mut saved_item_ids = Vec::new();
         let persistence = (|| -> Result<()> {
-            for (turn, items) in records {
-                for item in items {
-                    self.store.save_item(item)?;
-                    saved_item_ids.push(item.id.clone());
-                }
+            // Every cloned item in one batch. Each `save_item` sweeps the
+            // whole items directory and fsyncs it, which is right for a single
+            // record and ruinous for the hundreds a fork clones — the sweep
+            // gives the same answer every time. Items first, turns next, the
+            // thread record that makes them reachable last: the commit point is
+            // unchanged, and the ids are recorded before the batch so a partial
+            // write is still cleaned up.
+            let batch: Vec<&TurnItemRecord> =
+                records.iter().flat_map(|(_, items)| items.iter()).collect();
+            saved_item_ids.extend(batch.iter().map(|item| item.id.clone()));
+            self.store.save_items_batch(&batch)?;
+            for (turn, _) in records {
                 self.store.save_turn(turn)?;
                 saved_turn_ids.push(turn.id.clone());
             }
@@ -12158,6 +12495,11 @@ impl RuntimeThreadManager {
             // match to the existing seeder's projection; never use mtime or
             // silently let a saved file replace a newer Runtime transcript.
             let expected = session_recovery_projection(&session.messages);
+            // One read for every turn, not one per turn: the walk below
+            // rebuilds each turn's messages as it compares prefixes, and
+            // `list_items_for_turn` scans the store's whole items directory
+            // per call.
+            let items_by_turn = self.prepared_items_for_turns(turns)?;
             let mut prefix = Vec::new();
             let mut covered = (expected.is_empty()).then_some(0);
             for (index, turn) in turns.iter().enumerate() {
@@ -12165,7 +12507,10 @@ impl RuntimeThreadManager {
                     break;
                 }
                 prefix.extend(session_recovery_projection(
-                    &self.reconstruct_messages_from_turns(std::slice::from_ref(turn))?,
+                    &self.reconstruct_messages_from_turns_with(
+                        std::slice::from_ref(turn),
+                        &items_by_turn,
+                    )?,
                 ));
                 if prefix == expected {
                     covered = Some(index + 1);
@@ -12192,9 +12537,22 @@ impl RuntimeThreadManager {
     }
 
     fn reconstruct_messages_from_turns(&self, turns: &[TurnRecord]) -> Result<Vec<Message>> {
+        // One batch read for the whole set. `list_items_for_turn` scans the
+        // store's entire items directory to answer for a single turn, so a
+        // caller with several turns — the fork alignment below, a legacy
+        // saved-session link — paid one scan per turn.
+        let items_by_turn = self.prepared_items_for_turns(turns)?;
+        self.reconstruct_messages_from_turns_with(turns, &items_by_turn)
+    }
+
+    fn reconstruct_messages_from_turns_with(
+        &self,
+        turns: &[TurnRecord],
+        items_by_turn: &HashMap<String, Vec<TurnItemRecord>>,
+    ) -> Result<Vec<Message>> {
         let mut messages = Vec::new();
         for turn in turns {
-            let stored_items = self.store.list_items_for_turn(&turn.id)?;
+            let stored_items = items_by_turn.get(&turn.id).cloned().unwrap_or_default();
             let items = if turn.item_ids.is_empty() {
                 stored_items
             } else {

@@ -30,7 +30,7 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Contributors",
         "items": [
-          "@gaord — let undo roll back files for the turn it is undoing (#6483), stopped resume and fork from duplicating threads and sessions (#6406), and exposed user-defined provider routes to native clients (#6404).",
+          "@gaord — let a client fork a thread at a named turn (#6580), let undo roll back files for the turn it is undoing (#6483), stopped resume and fork from duplicating threads and sessions (#6406), and exposed user-defined provider routes to native clients (#6404).",
           "@Lstarsky0 — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine (#6405, #6417, #6499, #6574), tightened the Chinese-branching ceiling to 18 (#6403), and made Fleet publish without a two-link window (#6431).",
           "@aboimpinto — restored a green Linux full-workspace test gate without loosening any test (#6581).",
           "@dajiaohuang — codewhale config set checks a known setting's value against its schema type before saving it (#6568).",
@@ -41,10 +41,11 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Added",
         "items": [
+          "Runtime API: POST /v1/threads/{id}/fork-at-turn forks a thread at a named user turn, keeping that turn and every turn before it. The receipt matches /undo and returns the first dropped prompt so a client can put it back in the composer. Naming the turn replaces a client-computed depth, which could fork the wrong prefix. The fork leaves the workspace and any running turn untouched (#6580, thanks @gaord).",
           "Official model routing: /router (also /model router) sets up the Auto router with presets: Jev (TypeSafe's decision model, via OpenRouter or a TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes one test call before it saves, /status shows the router's choice, cost and latency, and a failing router is shown as failing (#6525).",
           "Code mode composes MCP and plugin tools and is on by default: execute_tools programs can call MCP tools, and each nested call passes the same approval gate as a direct call, pausing the program for approval when needed. Every nested call keeps its receipt, including calls that finish before a deadline, and code_mode = false turns it off. codewhale mcp list and codewhale doctor warn when a user MCP server duplicates the built-in Computer Use bundle (#6562, #6509)."
         ],
-        "itemCount": 2
+        "itemCount": 3
       },
       {
         "heading": "Fixed",
