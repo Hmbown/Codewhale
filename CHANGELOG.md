@@ -43,6 +43,12 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Fixed
 
+- Tool output is no longer cut off where you can't get it back. Search
+  answers, test runs, git, verifier and web results reach the model whole up
+  to one budget sized to the model's context window, and anything beyond it
+  can be read back with `retrieve_tool_result`. Native search answers are no
+  longer capped at 2,048–4,096 tokens, and an answer the provider cuts short
+  is marked as cut ([#6508](https://github.com/Hmbown/Codewhale/issues/6508)).
 - The installation page is generated from `docs/INSTALL.md`, so the website
   and the guide can no longer disagree; broken anchors and unsafe links fail
   the build ([#6450](https://github.com/Hmbown/Codewhale/pull/6450)).

@@ -48,6 +48,7 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Fixed",
         "items": [
+          "Tool output is no longer cut off where you can't get it back. Search answers, test runs, git, verifier and web results reach the model whole up to one budget sized to the model's context window, and anything beyond it can be read back with retrieve_tool_result. Native search answers are no longer capped at 2,048–4,096 tokens, and an answer the provider cuts short is marked as cut (#6508).",
           "The installation page is generated from docs/INSTALL.md, so the website and the guide can no longer disagree; broken anchors and unsafe links fail the build (#6450).",
           "codewhale config set refuses a value of the wrong type for a known setting (a word for an on/off switch, text for a number, a choice outside the list) instead of saving it (#6568, thanks @dajiaohuang).",
           "A turn that stops producing output now reports itself: the turn loop records its phase and last progress, and an overdue phase surfaces instead of hanging silently until the stream idle timeout. A delegated agent's final result is never dropped when the host is busy, so a finished child no longer leaves a ghost Running row behind (#6184).",
@@ -58,10 +59,9 @@ export const CHANGELOG: ChangelogRelease[] = [
           "Upgrading Codewhale no longer turns off the built-in Computer Use. Each build writes the built-in bundle to its own directory, so an upgrade used to present it as never reviewed and disabled. Now the review and enablement carry to the new build when its capabilities are unchanged. Changed capabilities show capabilities-changed and wait for review, and a revoked trust never carries (#6303).",
           "\"Allow for this conversation\" records a grant for that tool and argument class instead of switching the whole thread to Full Access, so the call you just approved is no longer failed by a Permissions change. An approval also survives a Permissions change that only widens what is allowed, grants end when a thread is archived or deleted, and web.run open grants are scoped by host. Full Access covers MCP tools that declare themselves destructive in every host, including…",
           "web.run retries a refused page once with a browser user agent, and one site's failure no longer fails the whole call or drops its search results.",
-          "Hooks treat bash, Bash and exec_shell as one tool in tool_name conditions, so the documented example fires.",
-          "macOS no longer reports Codewhale's ordinary heap as GPU (IOAccelerator) memory."
+          "Hooks treat bash, Bash and exec_shell as one tool in tool_name conditions, so the documented example fires."
         ],
-        "itemCount": 19
+        "itemCount": 20
       },
       {
         "heading": "Removed",
