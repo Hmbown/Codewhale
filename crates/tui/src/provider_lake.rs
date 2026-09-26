@@ -294,6 +294,7 @@ pub fn set_live_snapshot(snapshot: CatalogSnapshot, source: LiveSource) {
 /// scoped persistent caches need that distinction: switching Baseten to a new
 /// base URL with no matching cache must remove the old URL's Baseten rows
 /// immediately instead of presenting them as if they belonged to the new host.
+#[cfg(test)]
 pub fn replace_provider_live_snapshot(provider: &str, snapshot: CatalogSnapshot) {
     let provider = provider.trim();
     if provider.is_empty() {
