@@ -130,6 +130,29 @@ mod tests {
         );
     }
 
+    /// #6616: AICraft carries the console, docs and guidance its neighbours
+    /// do, and every link a descriptor publishes is HTTPS.
+    #[test]
+    fn aicraft_carries_console_docs_and_guidance() {
+        let aicraft = provider_descriptor("ai-craft").expect("aicraft");
+        assert_eq!(aicraft.id, "aicraft");
+        assert_eq!(
+            aicraft.docs_url.as_deref(),
+            Some("https://aicraftapi.com/docs.html#codewhale")
+        );
+        assert_eq!(
+            aicraft.credential_url.as_deref(),
+            Some("https://aicraftapi.com/dashboard.html")
+        );
+        let guidance = aicraft.guidance.as_deref().expect("aicraft guidance");
+        assert!(guidance.contains("Store AICRAFT_API_KEY"), "{guidance}");
+        for row in bundled_provider_descriptors() {
+            for url in [&row.docs_url, &row.credential_url].into_iter().flatten() {
+                assert!(url.starts_with("https://"), "{}: {url}", row.id);
+            }
+        }
+    }
+
     #[test]
     fn descriptors_do_not_embed_model_rosters() {
         let raw = DESCRIPTORS_JSON;

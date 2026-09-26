@@ -10,6 +10,9 @@
       "api_key_env": "AICRAFT_API_KEY",
       "default_model": "claude-4.6-sonnet",
       "discovery": "models_endpoint",
+      "docs_url": "https://aicraftapi.com/docs.html#codewhale",
+      "credential_url": "https://aicraftapi.com/dashboard.html",
+      "guidance": "OpenAI-compatible host (Chat Completions + GET /v1/models). Live /v1/models is the model authority: the roster spans DeepSeek, Claude, Gemini, Qwen, GLM, MiniMax and Doubao ids. Store AICRAFT_API_KEY, not a raw key.",
       "aliases": [
         "ai-craft",
         "ai_craft"
