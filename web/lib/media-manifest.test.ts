@@ -30,6 +30,7 @@ import {
   type MediaAsset,
 } from "./media-manifest";
 import { ALL_LOCALES } from "./i18n/config";
+import { getDocsShell } from "./i18n/dictionaries";
 
 // Captions are required for locales that ship a complete pack, not for every
 // routed locale: `locales` also includes `partial` locales, which route with an
@@ -162,8 +163,9 @@ describe("session media component contract", () => {
     expect(component).toContain("session-media-pending");
     expect(component).toContain("asset.pendingLabel");
     // Pending copy states plainly that nothing is recorded yet, both locales.
-    expect(component).toContain("There is no recording yet");
-    expect(component).toContain("还没有录像");
+    expect(component).toContain("t.mediaPendingNote");
+    expect(getDocsShell("en").mediaPendingNote).toContain("There is no recording yet");
+    expect(getDocsShell("zh").mediaPendingNote).toContain("还没有录像");
   });
 
   it("carries the structural reduced-motion contract: no autoplay, ever", () => {

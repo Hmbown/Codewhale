@@ -3,8 +3,8 @@ import type { DocsShellDict } from "../types";
 /**
  * Simplified-Chinese dictionary for the docs shell: portal hero, hub
  * metadata, task/topic search, sidebar and breadcrumb chrome, the
- * release-truth band, the contextual help band on every docs page, and the
- * shared page-body chrome.
+ * release-truth band, the contextual help band on every docs page, the
+ * shared page-body chrome, and the session recording panel.
  */
 export const docsShell: DocsShellDict = {
   metaTitle: "文档 · Codewhale",
@@ -53,4 +53,9 @@ export const docsShell: DocsShellDict = {
   nextHeading: "下一步",
   noteLabel: "注意：",
   onThisPage: "本页内容",
+
+  mediaPendingNote: "还没有录像。录好之后会放在这里，附字幕、文字稿和可选的 GIF 下载。",
+  mediaPlanLink: "录制计划与验收清单 ↗",
+  mediaGifFallback: "GIF 下载回退（无视频环境）",
+  mediaTranscript: "文字稿 ↗",
 };

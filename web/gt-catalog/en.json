@@ -211,7 +211,11 @@
     "helpIssue": "Report a docs problem ↗",
     "nextHeading": "Next",
     "noteLabel": "Note:",
-    "onThisPage": "On this page"
+    "onThisPage": "On this page",
+    "mediaPendingNote": "There is no recording yet. When there is, it goes here with captions, a transcript, and an optional GIF download.",
+    "mediaPlanLink": "Recording plan and acceptance checklist ↗",
+    "mediaGifFallback": "GIF fallback download (no-video environments)",
+    "mediaTranscript": "Transcript ↗"
   },
   "docs-hooks": {
     "metaTitle": "Run commands on events · Codewhale Docs",
