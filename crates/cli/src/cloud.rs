@@ -1179,11 +1179,7 @@ fn resolve_local_key(
     kind: ProviderKind,
 ) -> Result<Option<String>> {
     let provider_config = config.config.providers.for_provider(kind);
-    let from_config = provider_config.api_key.clone().or_else(|| {
-        (kind == ProviderKind::Deepseek)
-            .then(|| config.config.api_key.clone())
-            .flatten()
-    });
+    let from_config = provider_config.api_key.clone();
     if let Some(value) = from_config
         .and_then(resolve_config_key_reference)
         .filter(|value| !value.trim().is_empty())

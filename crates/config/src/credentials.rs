@@ -42,9 +42,6 @@ pub fn provider_slot(provider: ProviderKind) -> &'static str {
 /// Remove any plaintext `api_key` left in the config for `provider`.
 pub fn clear_provider_api_key_from_config(store: &mut ConfigStore, provider: ProviderKind) {
     store.config.providers.for_provider_mut(provider).api_key = None;
-    if provider == ProviderKind::Deepseek {
-        store.config.api_key = None;
-    }
 }
 
 /// Plaintext-free metadata that accompanies a saved key.

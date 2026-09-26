@@ -1684,9 +1684,7 @@ impl Engine {
             .map(|identity| (identity.key, identity.exact_id))
             .unwrap_or_else(|_| {
                 let key = api_config.provider_identity_for(api_provider);
-                let exact_id = (!(api_provider == ApiProvider::Custom
-                    && api_config.uses_legacy_literal_custom_route()))
-                .then(|| key.clone());
+                let exact_id = Some(key.clone());
                 (key, exact_id)
             });
         let api_key_env_only_recovery = Self::env_only_api_key_recovery_hint(api_config);

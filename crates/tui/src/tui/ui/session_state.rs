@@ -1107,13 +1107,10 @@ pub(crate) fn mirror_saved_api_key_in_config(
     provider: ApiProvider,
     api_key: String,
 ) {
+    // DeepSeek's key is saved to `[providers.deepseek]`, which DeepSeek-CN
+    // also reads (#6394).
     if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
-        config.api_key = Some(api_key);
-        config.auth_mode = Some("api_key".to_string());
-        return;
-    }
-    if provider == ApiProvider::Custom && config.uses_legacy_literal_custom_route() {
-        config.api_key = Some(api_key);
+        config.set_provider_api_key_override(ApiProvider::Deepseek, Some(api_key));
         config.auth_mode = Some("api_key".to_string());
         return;
     }

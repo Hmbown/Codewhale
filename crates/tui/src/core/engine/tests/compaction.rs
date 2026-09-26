@@ -6,10 +6,10 @@ async fn rejected_manual_compaction_route_closes_typed_lifecycle() {
     let _api_key = EnvVarGuard::remove("DEEPSEEK_API_KEY");
     let route_config = Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some(String::new()),
         default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some(String::new()), None);
     let route = resolve_runtime_route(
         &route_config,
         ApiProvider::Deepseek,
@@ -61,10 +61,10 @@ async fn queued_manual_compaction_cancellation_is_idempotent_and_skips_route_act
     let _api_key = EnvVarGuard::remove("DEEPSEEK_API_KEY");
     let route_config = Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some(String::new()),
         default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some(String::new()), None);
     let route = resolve_runtime_route(
         &route_config,
         ApiProvider::Deepseek,
@@ -210,10 +210,12 @@ async fn manual_compaction_accounts_accepted_and_rejected_responses_once() {
             .await;
         let route_config = Config {
             provider: Some("deepseek".to_string()),
-            api_key: Some("fixture-key".to_string()),
-            base_url: Some(format!("{}/v1", server.uri())),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(
+            Some("fixture-key".to_string()),
+            Some(format!("{}/v1", server.uri())),
+        );
         let (mut engine, handle) = Engine::new(
             EngineConfig {
                 workspace: workspace.path().to_path_buf(),

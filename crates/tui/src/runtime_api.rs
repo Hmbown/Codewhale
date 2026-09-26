@@ -8589,8 +8589,9 @@ struct SwitchProviderRequest {
     /// addresses them everywhere else: the generic kind in the id (`custom`)
     /// plus this additive exact id, exactly as `ProviderEntry`
     /// `model_provider_id` and `POST /v1/threads` already carry it. Omitted
-    /// keeps the pre-existing meaning — the built-in id, or the active
-    /// legacy root-level custom route.
+    /// keeps the pre-existing meaning — the built-in id, or the literal
+    /// `[providers.custom]` route (where the older top-level custom route
+    /// lives since #6394).
     #[serde(default)]
     model_provider_id: Option<String>,
 }

@@ -81,11 +81,13 @@ fn web_launcher_failure_is_a_recoverable_manual_bootstrap_warning() {
 fn provider_default_model_cases() -> Vec<(&'static str, Config, &'static str)> {
     let deepseek = Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some("deepseek-test-key".to_string()),
-        base_url: Some("http://127.0.0.1:1/v1".to_string()),
         default_text_model: Some("deepseek-v4-flash".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("deepseek-test-key".to_string()),
+        Some("http://127.0.0.1:1/v1".to_string()),
+    );
 
     let mut zai_providers = crate::config::ProvidersConfig::default();
     zai_providers.zai.api_key = Some("zai-test-key".to_string());
@@ -1160,10 +1162,12 @@ async fn build_test_server(
         Config::load(Some(path), None)?
     } else {
         Config {
-            api_key: Some("runtime-api-test-key".to_string()),
-            base_url: Some("http://127.0.0.1:1/v1".to_string()),
             ..Config::default()
         }
+        .with_legacy_root(
+            Some("runtime-api-test-key".to_string()),
+            Some("http://127.0.0.1:1/v1".to_string()),
+        )
     };
     config.mcp_config_path = Some(root.join("mcp.json").to_string_lossy().to_string());
     let manager = TaskManager::start_with_executor(
@@ -2403,10 +2407,10 @@ fn test_fleet_route_config() -> crate::config::Config {
     providers.zai.api_key = Some("test-key".to_string());
     crate::config::Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some("test-key".to_string()),
         providers: Some(providers),
         ..crate::config::Config::default()
     }
+    .with_legacy_root(Some("test-key".to_string()), None)
 }
 
 #[tokio::test]
@@ -16599,9 +16603,9 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
     let mut config = Config {
         provider: Some("deepseek".into()),
         default_text_model: Some("deepseek-v4-flash-vision-exp".into()),
-        api_key: Some("synthetic-image-key".into()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("synthetic-image-key".into()), None);
     config.set_provider_model_override(
         ApiProvider::Deepseek,
         Some("deepseek-v4-flash-vision-exp".into()),
@@ -16720,9 +16724,9 @@ async fn runtime_image_stream_rejection_does_not_leave_empty_threads() -> Result
     let mut config = Config {
         provider: Some("deepseek".into()),
         default_text_model: Some("deepseek-v4-flash-vision-exp".into()),
-        api_key: Some("synthetic-image-key".into()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("synthetic-image-key".into()), None);
     config.set_provider_model_override(
         ApiProvider::Deepseek,
         Some("deepseek-v4-flash-vision-exp".into()),
@@ -18196,15 +18200,26 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
     let workspace = tmp.path().join("workspace");
     fs::create_dir_all(&workspace)?;
 
-    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
-        tmp.path().join("runtime"),
-        tmp.path().join("sessions"),
-        Some("keys-token".to_string()),
-        false,
-        workspace.clone(),
-    )
-    .await?
-    .context("secrets test requires a loopback listener")?;
+    // No literal DeepSeek key in the live config: the older harness kept one
+    // at the top level, where it silently outranked the store. Since #6394
+    // that key is a `[providers.deepseek]` literal and the write refuses.
+    let (addr, _runtime_threads, handle) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            tmp.path().join("runtime"),
+            tmp.path().join("sessions"),
+            Some("keys-token".to_string()),
+            false,
+            workspace.clone(),
+            TestServerOverrides {
+                config: Some(
+                    Config::default()
+                        .with_legacy_root(None, Some("http://127.0.0.1:1/v1".to_string())),
+                ),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+        .context("secrets test requires a loopback listener")?;
     let client = crate::tls::reqwest_client();
     let base = format!("http://{addr}");
 

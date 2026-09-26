@@ -2673,10 +2673,10 @@ mod tests {
         providers.zai.api_key = Some("test-key".to_string());
         Config {
             provider: Some("deepseek".to_string()),
-            api_key: Some("test-key".to_string()),
             providers: Some(providers),
             ..Config::default()
         }
+        .with_legacy_root(Some("test-key".to_string()), None)
     }
 
     fn select_test_fleet(workspace: &Path, members: &[(&str, &str)]) {

@@ -106,8 +106,6 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
         axum::serve(listener, app).await.unwrap();
     });
     let config = crate::config::Config {
-        api_key: Some("fixture-key".to_string()),
-        base_url: Some(format!("http://{address}/v1")),
         retry: Some(crate::config::RetryConfig {
             enabled: Some(false),
             max_retries: Some(0),
@@ -116,7 +114,11 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
             exponential_base: Some(1.0),
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(
+        Some("fixture-key".to_string()),
+        Some(format!("http://{address}/v1")),
+    );
     let manager = Arc::new(RwLock::new(
         SubAgentManager::new(workspace.path().to_path_buf(), 4)
             .with_state_path(workspace.path().join(".codewhale/subagents/state.json")),

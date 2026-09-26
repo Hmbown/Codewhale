@@ -24,7 +24,7 @@ fn provider_model_id(key: &str) -> Option<&str> {
 }
 
 fn parse_config(body: &str) -> Result<Config> {
-    toml::from_str(body)
+    crate::config::parse_config_base(body)
         .map_err(|_| anyhow::anyhow!("Could not parse route configuration; contents omitted"))
 }
 

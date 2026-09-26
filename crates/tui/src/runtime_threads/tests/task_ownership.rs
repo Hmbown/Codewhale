@@ -3,10 +3,12 @@ use crate::task_manager::{TaskManager, TaskManagerConfig};
 
 fn fixture_config() -> Config {
     let mut config = Config {
-        api_key: Some("local-fixture-key".into()),
-        base_url: Some("http://127.0.0.1:1/v1".into()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("local-fixture-key".into()),
+        Some("http://127.0.0.1:1/v1".into()),
+    );
     config.set_feature("mcp", false).unwrap();
     config.set_feature("subagents", false).unwrap();
     config

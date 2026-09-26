@@ -230,11 +230,15 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let client = crate::client::CodewhaleClient::new(&crate::config::Config {
-            api_key: Some("test-guardian-cache-key".to_string()),
-            base_url: Some(server.uri()),
-            ..Default::default()
-        })
+        let client = crate::client::CodewhaleClient::new(
+            &crate::config::Config {
+                ..Default::default()
+            }
+            .with_legacy_root(
+                Some("test-guardian-cache-key".to_string()),
+                Some(server.uri()),
+            ),
+        )
         .unwrap();
         for (decision, risk) in [("allow", "low"), ("deny", "high")] {
             server.reset().await;

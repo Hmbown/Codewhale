@@ -1678,6 +1678,37 @@ enum ConfigCommand {
     Import(config_bundles::ImportArgs),
     /// Export a portable, secret-free config bundle.
     Export(config_bundles::ExportArgs),
+    /// Move legacy top-level `base_url` / `api_key` into their
+    /// `[providers.<name>]` tables, keeping comments. Writes a one-time,
+    /// credential-free backup first. Codewhale already reads the old shape;
+    /// this only tidies the file.
+    Migrate {
+        /// Print what would move without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Resolve a top-level value that disagrees with its provider table
+        /// by keeping one of them. Without it, a conflicting pair is left
+        /// exactly as it is.
+        #[arg(long, value_enum)]
+        prefer: Option<LegacyRootPreferArg>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum LegacyRootPreferArg {
+    /// Keep the top-level value (the key Codewhale sends today).
+    TopLevel,
+    /// Keep the `[providers.<name>]` value.
+    Table,
+}
+
+impl From<LegacyRootPreferArg> for codewhale_config::legacy_root::LegacyRootPrefer {
+    fn from(value: LegacyRootPreferArg) -> Self {
+        match value {
+            LegacyRootPreferArg::TopLevel => Self::TopLevel,
+            LegacyRootPreferArg::Table => Self::Table,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -1835,7 +1866,13 @@ fn install_rustls_crypto_provider() {
 pub fn run_cli() -> std::process::ExitCode {
     install_rustls_crypto_provider();
 
-    match run() {
+    let outcome = run();
+    // A config write may have moved legacy top-level `base_url` / `api_key`
+    // into their provider tables (#6394); say so once, off stdout.
+    for notice in codewhale_config::legacy_root::take_notices() {
+        eprintln!("note: {notice}");
+    }
+    match outcome {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             // Use the full anyhow chain so callers see the underlying
@@ -2599,7 +2636,6 @@ fn run_logout_command_with_secrets_unlocked(
     profile: Option<&str>,
 ) -> Result<()> {
     let original_config = store.config.clone();
-    store.config.api_key = None;
     for provider in ProviderKind::ALL {
         clear_provider_api_key_from_config(store, provider);
         store
@@ -2879,11 +2915,7 @@ fn provider_config_api_key(store: &ConfigStore, provider: ProviderKind) -> Optio
         .for_provider(provider)
         .api_key
         .as_deref();
-    let root = (provider == ProviderKind::Deepseek)
-        .then_some(store.config.api_key.as_deref())
-        .flatten();
-    slot.or(root)
-        .filter(|value| classify_config_api_key_value(value) == ConfigApiKeyValueKind::Literal)
+    slot.filter(|value| classify_config_api_key_value(value) == ConfigApiKeyValueKind::Literal)
 }
 
 fn provider_config_set(store: &ConfigStore, provider: ProviderKind) -> bool {
@@ -4444,12 +4476,9 @@ fn run_auth_migrate(store: &mut ConfigStore, secrets: &Secrets, dry_run: bool) -
             .api_key
             .clone()
             .filter(literal);
-        let from_root = (provider == ProviderKind::Deepseek)
-            .then(|| store.config.api_key.clone())
-            .flatten()
-            .filter(literal);
-        let value = from_provider_block.or(from_root);
-        let Some(value) = value else { continue };
+        let Some(value) = from_provider_block else {
+            continue;
+        };
 
         if let Ok(Some(existing)) = secrets.get(slot)
             && existing == value
@@ -4466,9 +4495,6 @@ fn run_auth_migrate(store: &mut ConfigStore, secrets: &Secrets, dry_run: bool) -
         }
         if !dry_run {
             store.config.providers.for_provider_mut(provider).api_key = None;
-            if provider == ProviderKind::Deepseek {
-                store.config.api_key = None;
-            }
         }
         migrated.push((provider, slot));
     }
@@ -4528,6 +4554,7 @@ fn run_config_command(
             ConfigCommand::Set { .. }
                 | ConfigCommand::Unset { .. }
                 | ConfigCommand::Import(_)
+                | ConfigCommand::Migrate { dry_run: false, .. }
                 | ConfigCommand::Telemetry {
                     accept_notice: Some(_)
                 }
@@ -4648,7 +4675,7 @@ fn run_config_command(
                 }
             } else {
                 store.save()?;
-                println!("set {key}");
+                println!("set {}", config_key_label(store, &key));
             }
             Ok(())
         }
@@ -4684,9 +4711,10 @@ fn run_config_command(
                 println!("unset notifications.{}", setting.key());
                 return Ok(());
             }
+            let label = config_key_label(store, &key);
             store.config.unset_value(&key)?;
             store.save()?;
-            println!("unset {key}");
+            println!("unset {label}");
             Ok(())
         }
         ConfigCommand::List => {
@@ -4742,7 +4770,65 @@ fn run_config_command(
             config_bundles::run_import(&args, store, &workspace)
         }
         ConfigCommand::Export(args) => config_bundles::run_export(&args, store),
+        ConfigCommand::Migrate { dry_run, prefer } => {
+            run_config_migrate(store, dry_run, prefer.map(Into::into))
+        }
     }
+}
+
+/// `key`, or `key (providers.<name>.<field>)` when `key` is a legacy
+/// top-level spelling that addresses the active provider's table (#6394).
+fn config_key_label(store: &ConfigStore, key: &str) -> String {
+    match store.config.root_alias_key(key) {
+        Some(real) => format!("{real} (`{key}` now names the active provider's table)"),
+        None => key.to_string(),
+    }
+}
+
+fn run_config_migrate(
+    store: &mut ConfigStore,
+    dry_run: bool,
+    prefer: Option<codewhale_config::legacy_root::LegacyRootPrefer>,
+) -> Result<()> {
+    let path = store.path().to_path_buf();
+    let receipt = if dry_run {
+        codewhale_config::preview_legacy_root_config(&path, prefer)?
+    } else {
+        let (receipt, backup) = codewhale_config::migrate_legacy_root_config(&path, prefer)?;
+        if let Some(backup) = backup {
+            println!("backup: {}", backup.display());
+        }
+        store.reload()?;
+        receipt
+    };
+    if receipt.is_empty() {
+        println!("nothing to migrate in {}", path.display());
+        return Ok(());
+    }
+    for line in receipt.lines() {
+        println!("{line}");
+    }
+    if dry_run {
+        println!("dry run: {} was not changed", path.display());
+    }
+    Ok(())
+}
+
+/// Doctor lines for legacy top-level keys: sources only, never values.
+fn legacy_root_doctor_lines(
+    receipt: &codewhale_config::legacy_root::LegacyRootMigration,
+) -> Vec<String> {
+    use codewhale_config::legacy_root::LegacyRootNote;
+    let mut lines = Vec::new();
+    for note in &receipt.notes {
+        match note {
+            LegacyRootNote::Conflict { .. } => lines.push(format!("warning: {note}")),
+            _ => lines.push(format!(
+                "note: {note} (in memory; the next save or `codewhale config migrate` updates the file)"
+            )),
+        }
+    }
+    lines
 }
 
 /// settings.toml is user-global. A `config` command aimed at a workspace
@@ -4808,10 +4894,15 @@ fn run_config_doctor(store: &ConfigStore) -> Result<()> {
         println!("warning: {finding}");
     }
 
-    let mut secrets: Vec<(String, Option<String>)> =
-        vec![("api_key".to_string(), store.config.api_key.clone())];
-    let mut endpoints: Vec<(String, Option<String>)> =
-        vec![("base_url".to_string(), store.config.base_url.clone())];
+    // Legacy top-level `base_url` / `api_key` (#6394): what loading moved in
+    // memory, which pair still disagrees, and which value is in use. Sources
+    // only, never values.
+    for line in legacy_root_doctor_lines(store.legacy_root_migration()) {
+        println!("{line}");
+    }
+
+    let mut secrets: Vec<(String, Option<String>)> = Vec::new();
+    let mut endpoints: Vec<(String, Option<String>)> = Vec::new();
     for provider in ProviderKind::ALL {
         let table = store.config.providers.for_provider(provider);
         secrets.push((format!("{provider:?}.api_key"), table.api_key.clone()));
@@ -6236,7 +6327,13 @@ mod tests {
     fn config_doctor_fails_on_empty_secret_and_bad_url() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("config.toml");
-        write_config_fixture(&path, "api_key = \"\"\nbase_url = \"gopher://x\"\n");
+        // The top-level endpoint is checked where it now lives (#6394); an
+        // empty top-level key would simply be dropped, so the empty key is a
+        // table value here.
+        write_config_fixture(
+            &path,
+            "base_url = \"gopher://x\"\n\n[providers.deepseek]\napi_key = \"\"\n",
+        );
         let store = ConfigStore::load(Some(path)).expect("load fixture");
         let error = run_config_doctor(&store).expect_err("doctor must fail");
         let message = format!("{error:#}");
@@ -7975,8 +8072,6 @@ verbosity = "project-imported"
             &secrets,
         )
         .expect("auth set should persist credential");
-
-        assert!(store.config.api_key.is_none());
         assert!(store.config.providers.deepseek.api_key.is_none());
         // Intentional change: auth set used to pin `deepseek-v4-pro` here,
         // silently moving a fresh install off the cheaper `deepseek-flash`
@@ -8480,8 +8575,6 @@ verbosity = "project-imported"
             &secrets,
         )
         .expect("set should succeed");
-
-        assert!(store.config.api_key.is_none());
         assert!(store.config.providers.deepseek.api_key.is_none());
         let saved = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(!saved.contains("sk-keyring"), "{saved}");
@@ -8633,7 +8726,6 @@ verbosity = "project-imported"
             std::process::id()
         ));
         let mut store = ConfigStore::load(Some(path.clone())).expect("store should load");
-        store.config.api_key = Some("sk-stale".to_string());
         store.config.providers.deepseek.api_key = Some("sk-stale".to_string());
         store.save().unwrap();
 
@@ -8649,8 +8741,6 @@ verbosity = "project-imported"
             &secrets,
         )
         .expect("clear should succeed");
-
-        assert!(store.config.api_key.is_none());
         assert!(store.config.providers.deepseek.api_key.is_none());
         assert_eq!(inner.get("deepseek").unwrap(), None);
 
@@ -9028,7 +9118,6 @@ verbosity = "project-imported"
         ));
         let mut store = ConfigStore::load(Some(path.clone())).expect("store should load");
         store.config.provider = ProviderKind::Deepseek;
-        store.config.api_key = Some("sk-config-3333".to_string());
         store.config.providers.deepseek.api_key = Some("sk-config-3333".to_string());
 
         let inner = Arc::new(InMemoryKeyringStore::new());
@@ -10087,7 +10176,6 @@ verbosity = "project-imported"
 
         assert_eq!(resolved.api_key.as_deref(), Some("ring-key"));
         assert_eq!(resolved.api_key_source, Some(RuntimeApiKeySource::Keyring));
-        assert!(store.config.api_key.is_none());
         assert!(store.config.providers.deepseek.api_key.is_none());
         assert!(
             !path.exists(),
@@ -10124,7 +10212,6 @@ verbosity = "project-imported"
         let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.to_string_lossy());
         let path = home.join("config.toml");
         let mut store = ConfigStore::load(Some(path.clone())).expect("store should load");
-        store.config.api_key = Some("sk-stale".to_string());
         store.config.providers.deepseek.api_key = Some("sk-stale".to_string());
         store.config.providers.fireworks.api_key = Some("fw-stale".to_string());
         store.config.providers.xai.auth_mode = Some("oauth".to_string());
@@ -10147,8 +10234,6 @@ verbosity = "project-imported"
         let secrets = no_keyring_secrets();
 
         run_logout_command_with_secrets(&mut store, &secrets, None).expect("logout should succeed");
-
-        assert!(store.config.api_key.is_none());
         assert!(store.config.providers.deepseek.api_key.is_none());
         assert!(store.config.providers.fireworks.api_key.is_none());
         assert!(store.config.providers.xai.auth_mode.is_none());
@@ -10311,7 +10396,6 @@ verbosity = "project-imported"
             std::process::id()
         ));
         let mut store = ConfigStore::load(Some(path.clone())).expect("store should load");
-        store.config.api_key = Some("sk-deep".to_string());
         store.config.providers.deepseek.api_key = Some("sk-deep".to_string());
         store.config.providers.openrouter.api_key = Some("or-key".to_string());
         store.config.providers.novita.api_key = Some("nv-key".to_string());
@@ -10332,7 +10416,6 @@ verbosity = "project-imported"
         assert_eq!(inner.get("novita").unwrap(), Some("nv-key".to_string()));
 
         // Config file must no longer contain the api keys.
-        assert!(store.config.api_key.is_none());
         assert!(store.config.providers.deepseek.api_key.is_none());
         assert!(store.config.providers.openrouter.api_key.is_none());
         assert!(store.config.providers.novita.api_key.is_none());

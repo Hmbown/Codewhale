@@ -188,21 +188,6 @@ pub(crate) fn credential_state_for_provider(
         return CredentialState::Legacy;
     }
     if provider == ApiProvider::Custom {
-        if config.uses_legacy_literal_custom_route() {
-            if config
-                .base_url
-                .as_deref()
-                .is_some_and(crate::config::base_url_uses_local_host)
-                && !api_key_required
-            {
-                return CredentialState::Local;
-            }
-            return if crate::config::has_api_key_for(config, provider) {
-                CredentialState::Saved
-            } else {
-                CredentialState::MissingKey
-            };
-        }
         let Some(configured) = config.provider_config_for(provider) else {
             return CredentialState::MissingKey;
         };
@@ -214,8 +199,12 @@ pub(crate) fn credential_state_for_provider(
         if auth_optional {
             return CredentialState::Local;
         }
+        // The literal `custom` route (older top-level shape, now
+        // `[providers.custom]`) also owns the generic `custom` secret slot.
         let has_auth = (provider == config.api_provider()
             && crate::config::explicit_cli_api_key_override().is_some())
+            || (config.selects_literal_custom_provider()
+                && crate::config::has_api_key_for(config, provider))
             || configured.api_key.as_deref().is_some_and(|value| {
                 crate::config::classify_config_api_key_value(value)
                     == crate::config::ConfigApiKeyValueKind::Literal
@@ -382,13 +371,6 @@ pub(crate) fn route_is_valid_for_model(
         saved_provider_model: None,
         base_url_override: if provider == config.api_provider() {
             Some(config.active_route_base_url())
-        } else if provider == ApiProvider::Custom && config.uses_legacy_literal_custom_route() {
-            config
-                .base_url
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
         } else {
             configured
                 .and_then(|entry| entry.base_url.as_deref())
@@ -1089,9 +1071,9 @@ mod tests {
     #[test]
     fn observed_success_is_scoped_to_exact_model_endpoint_and_custom_provider() {
         let deepseek = crate::config::Config {
-            api_key: Some("deepseek-test-key".to_string()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(Some("deepseek-test-key".to_string()), None);
         let mut checks = ProviderReadinessSnapshot::default();
         checks.record_success(&deepseek, ApiProvider::Deepseek, "deepseek-v4-pro");
         assert_eq!(
@@ -1143,9 +1125,9 @@ mod tests {
     #[test]
     fn auto_model_readiness_follows_the_route_not_the_literal_identity() {
         let config = crate::config::Config {
-            api_key: Some("test-key".to_string()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(Some("test-key".to_string()), None);
         let mut checks = ProviderReadinessSnapshot::default();
 
         // Before any observed turn, auto honestly reports unchecked.
@@ -1303,9 +1285,9 @@ mod tests {
         );
         let stale_root_config = crate::config::Config {
             provider: Some("xai".to_string()),
-            api_key: Some("legacy-deepseek-root-key".to_string()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(Some("legacy-deepseek-root-key".to_string()), None);
         assert_eq!(
             credential_state_for_provider(&stale_root_config, ApiProvider::Xai),
             CredentialState::MissingKey,
@@ -1724,10 +1706,13 @@ mod tests {
         for provider_name in ["deepseek", "deepseek-cn"] {
             let config = crate::config::Config {
                 provider: Some(provider_name.to_string()),
-                base_url: Some("https://tenant-gateway.example.test/v1".to_string()),
                 default_text_model: Some("anthropic/private-model".to_string()),
                 ..Default::default()
-            };
+            }
+            .with_legacy_root(
+                None,
+                Some("https://tenant-gateway.example.test/v1".to_string()),
+            );
             let provider = config.api_provider();
             assert!(matches!(
                 provider,
@@ -1834,10 +1819,10 @@ default_text_model = "deepseek-chat"
 
         let deepseek_cn_local = crate::config::Config {
             provider: Some("deepseek-cn".to_string()),
-            base_url: Some("http://127.0.0.1:9090/v1".to_string()),
             default_text_model: Some("local-cn-model".to_string()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(None, Some("http://127.0.0.1:9090/v1".to_string()));
         assert_eq!(
             credential_state_for_provider(&deepseek_cn_local, ApiProvider::DeepseekCN),
             CredentialState::Local

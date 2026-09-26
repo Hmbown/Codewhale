@@ -3378,7 +3378,7 @@ mod tests {
         let state = build_state(Some(config_path), None).expect("state");
         {
             let mut cfg = state.config.write().await;
-            cfg.api_key = Some("sk-deepseek-secret".to_string());
+            cfg.providers.deepseek.api_key = Some("sk-deepseek-secret".to_string());
         }
 
         let response = process_app_request(

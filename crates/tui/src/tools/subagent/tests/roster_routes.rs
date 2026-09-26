@@ -7,14 +7,13 @@ async fn roster_matches_actual_start_receipts_and_refreshes_live_role_defaults()
     let root = tempdir().unwrap();
     let (client, calls, _) = delayed_chat_client(Duration::ZERO, "done").await;
     let config = crate::config::Config {
-        api_key: Some("test-key".into()),
-        base_url: Some(client.base_url().into()),
         subagents: Some(crate::config::SubagentsConfig {
             worker_model: Some("deepseek-v4-flash".into()),
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".into()), Some(client.base_url().into()));
     let manager = new_shared_subagent_manager(root.path().to_path_buf(), 8);
     let context = ToolContext::new(root.path()).with_state_namespace("roster-route-consumer");
     let mut runtime = SubAgentRuntime::new(
@@ -149,10 +148,9 @@ async fn advertised_task_route_overrides_reach_start_and_foreign_models_fail_bef
     let root = tempdir().unwrap();
     let (client, _, _) = delayed_chat_client(Duration::ZERO, "done").await;
     let config = crate::config::Config {
-        api_key: Some("test-key".into()),
-        base_url: Some(client.base_url().into()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".into()), Some(client.base_url().into()));
     let manager = new_shared_subagent_manager(root.path().to_path_buf(), 2);
     let context = ToolContext::new(root.path()).with_state_namespace("explicit-task-route");
     let runtime = SubAgentRuntime::new(
@@ -209,14 +207,13 @@ async fn saved_profile_discovery_and_actual_start_share_current_instructions_rou
     let profile = profile_dir.join("bug-hunter.toml");
     let (client, calls, bodies) = delayed_chat_client(Duration::ZERO, "done").await;
     let config = crate::config::Config {
-        api_key: Some("test-key".into()),
-        base_url: Some(client.base_url().into()),
         subagents: Some(crate::config::SubagentsConfig {
             explorer_model: Some("invalid\nrole-default".into()),
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".into()), Some(client.base_url().into()));
     let manager = new_shared_subagent_manager(root.path().to_path_buf(), 2);
     let context = ToolContext::new(root.path()).with_state_namespace("saved-profile-consumer");
     let runtime = SubAgentRuntime::new(
@@ -324,10 +321,9 @@ async fn saved_provider_pin_reaches_actual_request_and_conflicts_fail_before_adm
     std::fs::write(profile_dir.join("router-review.toml"), "id = \"router-review\"\nbase_role = \"reviewer\"\nprovider = \"openrouter\"\nmodel = \"qwen/qwen3.7-plus\"\nreasoning_effort = \"low\"\n").unwrap();
     let (client, calls, bodies) = delayed_chat_client(Duration::ZERO, "done").await;
     let mut config = crate::config::Config {
-        api_key: Some("test-key".into()),
-        base_url: Some(client.base_url().into()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".into()), Some(client.base_url().into()));
     let router = config.provider_config_for_mut(ApiProvider::Openrouter);
     router.api_key = Some("test-router-key".into());
     router.base_url = Some(client.base_url().into());
@@ -418,10 +414,9 @@ async fn saved_profile_cannot_widen_parent_posture_or_depth_and_missing_provider
     profile.permissions.allow_shell = true;
     profile.permissions.trust = true;
     let mut config = crate::config::Config {
-        api_key: Some("test-key".into()),
-        base_url: Some(client.base_url().into()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".into()), Some(client.base_url().into()));
     let mut fleet = codewhale_config::FleetConfigToml::default();
     fleet
         .profiles
@@ -481,10 +476,9 @@ async fn selected_fleet_capability_and_broken_selection_refuse_actual_start() {
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path().join("state"));
     let (client, calls, _) = delayed_chat_client(Duration::ZERO, "done").await;
     let config = crate::config::Config {
-        api_key: Some("test-key".into()),
-        base_url: Some(client.base_url().into()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".into()), Some(client.base_url().into()));
     let mut fleet = FleetFile::new("Capability fixture".into(), None).unwrap();
     fleet.members.push(serde_json::from_value(json!({
         "id":"visual-review", "role":"reviewer", "provider":"deepseek", "model":"deepseek-v4-flash", "requires":["vision"]
@@ -532,10 +526,9 @@ async fn selected_models_reach_exact_provider_and_off_list_refuses_before_admiss
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path().join("state"));
     let (client, calls, bodies) = delayed_chat_client(Duration::ZERO, "done").await;
     let mut config = crate::config::Config {
-        api_key: Some("test-key".into()),
-        base_url: Some(client.base_url().into()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".into()), Some(client.base_url().into()));
     let router = config.provider_config_for_mut(ApiProvider::Openrouter);
     router.api_key = Some("test-router-key".into());
     router.base_url = Some(client.base_url().into());
@@ -1255,10 +1248,9 @@ async fn issue_6117_invalid_personal_profile_is_visible_and_never_admitted_as_bu
     std::fs::write(&profile, "provider = \"openrouter\"\nmodel = \"qwen/qwen3.7-plus\"\nallow_shell = false\ntrust = false\n").unwrap();
     let (client, calls, _) = delayed_chat_client(Duration::ZERO, "done").await;
     let config = crate::config::Config {
-        api_key: Some("test-key".into()),
-        base_url: Some(client.base_url().into()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".into()), Some(client.base_url().into()));
     let manager = new_shared_subagent_manager(root.path().to_path_buf(), 2);
     let context = ToolContext::new(root.path()).with_state_namespace("issue-6117");
     let runtime = SubAgentRuntime::new(

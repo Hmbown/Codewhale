@@ -4619,11 +4619,13 @@ approval_required = true
     fn fleet_routes_keep_legacy_literal_custom_without_named_tables() {
         let config = Config {
             provider: Some("custom".to_string()),
-            base_url: Some("http://127.0.0.1:18080/v1".to_string()),
-            api_key: Some("local-test-key".to_string()),
             default_text_model: Some("legacy-custom-model".to_string()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(
+            Some("local-test-key".to_string()),
+            Some("http://127.0.0.1:18080/v1".to_string()),
+        );
 
         let routes = cross_provider_model_routes(
             &config,

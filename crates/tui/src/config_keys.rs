@@ -22,10 +22,16 @@ use crate::settings::Settings;
 /// the dispatcher's [`ConfigToml`] typed fields. Each has a named reader:
 /// profile overlays (`ConfigFile::profiles`), per-project trust
 /// (`config::project_trust_*`), the route-preference migration
-/// (`config_persistence`), the MCP stdio dispatcher's literal JSON key, and
-/// the stream-timeout fallbacks in `ConfigToml::stream_chunk_timeout_secs`.
+/// (`config_persistence`), the MCP stdio dispatcher's literal JSON key, the
+/// stream-timeout fallbacks in `ConfigToml::stream_chunk_timeout_secs`, and
+/// the legacy top-level `base_url` / `api_key`, which
+/// `codewhale_config::legacy_root` moves into `[providers.<name>]` (#6394).
 const OTHER_READER_ROOT_KEYS: &[&str] = &[
     "profiles",
+    "base_url",
+    "baseUrl",
+    "api_key",
+    "apiKey",
     "projects",
     "route_preferences_version",
     "route_preferences_migration",

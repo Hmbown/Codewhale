@@ -3,7 +3,7 @@
   "totals": {
     "prod": 75,
     "test": 89,
-    "late": 2,
+    "late": 1,
     "uilib": 1,
     "doc": 1
   },
@@ -33,7 +33,6 @@
       "tools|tui": 14
     },
     "late": {
-      "config_persistence|route_preferences": 1,
       "core|exec_agent": 1
     },
     "uilib": {

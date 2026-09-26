@@ -20113,7 +20113,6 @@ fn configured_model_subagent_keeps_exact_id_and_negative_capability() {
     let mut runtime = tests::stub_runtime();
     let mut config = crate::config::Config {
         provider: Some("deepseek".into()),
-        api_key: Some("configured-model-local-fixture".into()),
         custom_models: Some(vec![
             toml::from_str(
                 r#"
@@ -20128,7 +20127,8 @@ fn configured_model_subagent_keeps_exact_id_and_negative_capability() {
             .unwrap(),
         ]),
         ..crate::config::Config::default()
-    };
+    }
+    .with_legacy_root(Some("configured-model-local-fixture".into()), None);
     config.set_provider_base_url_override(
         crate::config::ApiProvider::Deepseek,
         Some("https://api.deepseek.com".into()),
@@ -20188,7 +20188,6 @@ async fn configured_model_subagent_full_bind_preserves_task_profile_and_role_ids
     ] {
         let mut config = crate::config::Config {
             provider: Some("deepseek".into()),
-            api_key: Some("configured-model-local-fixture".into()),
             custom_models: Some(vec![
                 toml::from_str(
                     r#"
@@ -20203,7 +20202,8 @@ async fn configured_model_subagent_full_bind_preserves_task_profile_and_role_ids
                 .unwrap(),
             ]),
             ..crate::config::Config::default()
-        };
+        }
+        .with_legacy_root(Some("configured-model-local-fixture".into()), None);
         config.set_provider_base_url_override(
             crate::config::ApiProvider::Deepseek,
             Some(base.into()),

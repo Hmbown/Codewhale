@@ -153,7 +153,7 @@ wiremock = "0.6"
 tiny_http = "0.12"
 pretty_assertions = "1.4"
 rio-vt = "0.5.1"
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

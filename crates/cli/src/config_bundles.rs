@@ -1292,7 +1292,7 @@ fn collect_model_edits(
 }
 
 fn config_from_document(body: &str) -> Result<ConfigToml> {
-    let mut config: ConfigToml = toml::from_str(body).map_err(|_| {
+    let mut config = codewhale_config::parse_config_toml(body).map_err(|_| {
         anyhow!("imported configuration has an invalid TOML type; contents omitted")
     })?;
     let document: toml::Value = toml::from_str(body)?;
@@ -2274,13 +2274,13 @@ verbosity = "verbose"
             BundleMetadata::default(),
         )
         .unwrap();
-        assert_eq!(
-            literal_export
-                .global
-                .entries
-                .get("default_text_model")
-                .and_then(toml::Value::as_str),
-            Some("LiteralRootModel")
+        // The literal route's top-level fields became `[providers.custom]`
+        // when parsed (#6394); its model survives the export.
+        assert!(
+            serialize_bundle(&literal_export)
+                .unwrap()
+                .contains("LiteralRootModel"),
+            "{literal_export:#?}"
         );
     }
 
