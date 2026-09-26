@@ -130,7 +130,9 @@ quieter, and Fleet runs can be checked before they spend anything.
   time of day), Grok and MiniMax M3 (rates rise on long prompts), Xiaomi MiMo
   (pay-as-you-go and Token Plan keys look the same), Alibaba Model Studio plans
   (quota, not per-token) and StepFun. DeepSeek's output limit stays at its
-  published 384K instead of the refreshed 393,216
+  published 384K instead of the refreshed 393,216, and the reasoning controls
+  Codewhale records for Grok, MiniMax, Qwen 3.8 Max, Muse Spark and Step 3.5
+  (defaults, always-on thinking, extra effort tiers) survive the refresh
   ([#6396](https://github.com/Hmbown/Codewhale/issues/6396)).
 
 ### Removed

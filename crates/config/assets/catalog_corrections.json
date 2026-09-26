@@ -69,6 +69,268 @@
       "provider": "minimax-anthropic",
       "id": "MiniMax-M3",
       "pricing_withheld": "MiniMax doubles M3 rates once a prompt passes 512K tokens. A flat catalog rate would understate long sessions."
+    },
+    {
+      "provider": "minimax",
+      "id": "MiniMax-M3",
+      "reasoning_options": [
+        {
+          "type": "thinking",
+          "values": [
+            "adaptive",
+            "disabled"
+          ],
+          "default": "adaptive"
+        }
+      ],
+      "reason": "MiniMax M3 thinking is adaptive or disabled, with a different default per dialect (47163da80, MiniMax Messages provider); Models.dev lists a plain toggle."
+    },
+    {
+      "provider": "minimax",
+      "id": "MiniMax-M2.7",
+      "reasoning_options": [
+        {
+          "type": "thinking",
+          "values": [
+            "always_on"
+          ],
+          "default": "always_on"
+        }
+      ],
+      "reason": "MiniMax M2.7 always thinks (47163da80, MiniMax Messages provider); Models.dev lists no reasoning control."
+    },
+    {
+      "provider": "minimax",
+      "id": "MiniMax-M2.7-highspeed",
+      "reasoning_options": [
+        {
+          "type": "thinking",
+          "values": [
+            "always_on"
+          ],
+          "default": "always_on"
+        }
+      ],
+      "reason": "MiniMax M2.7 always thinks (47163da80, MiniMax Messages provider); Models.dev lists no reasoning control."
+    },
+    {
+      "provider": "minimax-anthropic",
+      "id": "MiniMax-M3",
+      "reasoning_options": [
+        {
+          "type": "thinking",
+          "values": [
+            "adaptive",
+            "disabled"
+          ],
+          "default": "disabled"
+        }
+      ],
+      "reason": "MiniMax M3 thinking is adaptive or disabled, with a different default per dialect (47163da80, MiniMax Messages provider); Models.dev lists a plain toggle."
+    },
+    {
+      "provider": "minimax-anthropic",
+      "id": "MiniMax-M2.7",
+      "reasoning_options": [
+        {
+          "type": "thinking",
+          "values": [
+            "always_on"
+          ],
+          "default": "always_on"
+        }
+      ],
+      "reason": "MiniMax M2.7 always thinks (47163da80, MiniMax Messages provider); Models.dev lists no reasoning control."
+    },
+    {
+      "provider": "minimax-anthropic",
+      "id": "MiniMax-M2.7-highspeed",
+      "reasoning_options": [
+        {
+          "type": "thinking",
+          "values": [
+            "always_on"
+          ],
+          "default": "always_on"
+        }
+      ],
+      "reason": "MiniMax M2.7 always thinks (47163da80, MiniMax Messages provider); Models.dev lists no reasoning control."
+    },
+    {
+      "provider": "modelstudio-token-plan",
+      "id": "qwen3.8-max",
+      "reasoning_options": [
+        {
+          "type": "thinking",
+          "values": [
+            "always_on"
+          ],
+          "default": "always_on"
+        }
+      ],
+      "reason": "qwen3.8-max is thinking-only (owner's Token Plan console, ec4a5aeb2; Codewhale never sends it a thinking switch, see modelstudio_model_is_thinking_only in crates/tui/src/client/chat.rs); Models.dev lists a toggle."
+    },
+    {
+      "provider": "modelstudio-token-plan-anthropic",
+      "id": "qwen3.8-max",
+      "reasoning_options": [
+        {
+          "type": "thinking",
+          "values": [
+            "always_on"
+          ],
+          "default": "always_on"
+        }
+      ],
+      "reason": "qwen3.8-max is thinking-only (owner's Token Plan console, ec4a5aeb2; Codewhale never sends it a thinking switch, see modelstudio_model_is_thinking_only in crates/tui/src/client/chat.rs); Models.dev lists a toggle."
+    },
+    {
+      "provider": "modelstudio-coding-plan",
+      "id": "qwen3.8-max",
+      "reasoning_options": [
+        {
+          "type": "thinking",
+          "values": [
+            "always_on"
+          ],
+          "default": "always_on"
+        }
+      ],
+      "reason": "qwen3.8-max is thinking-only (owner's Token Plan console, ec4a5aeb2; Codewhale never sends it a thinking switch, see modelstudio_model_is_thinking_only in crates/tui/src/client/chat.rs); Models.dev lists a toggle."
+    },
+    {
+      "provider": "modelstudio-coding-plan-anthropic",
+      "id": "qwen3.8-max",
+      "reasoning_options": [
+        {
+          "type": "thinking",
+          "values": [
+            "always_on"
+          ],
+          "default": "always_on"
+        }
+      ],
+      "reason": "qwen3.8-max is thinking-only (owner's Token Plan console, ec4a5aeb2; Codewhale never sends it a thinking switch, see modelstudio_model_is_thinking_only in crates/tui/src/client/chat.rs); Models.dev lists a toggle."
+    },
+    {
+      "provider": "meta",
+      "id": "muse-spark-1.1",
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ]
+        }
+      ],
+      "reason": "Meta Muse Spark also takes the none and ultra efforts (a50b6532b); Models.dev lists minimal to xhigh."
+    },
+    {
+      "provider": "meta",
+      "id": "muse-spark-1.2",
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ]
+        }
+      ],
+      "reason": "Meta Muse Spark also takes the none and ultra efforts (a50b6532b); Models.dev lists minimal to xhigh."
+    },
+    {
+      "provider": "meta",
+      "id": "muse-spark-1.2-contributor",
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "ultra"
+          ]
+        }
+      ],
+      "reason": "Meta Muse Spark also takes the none and ultra efforts (a50b6532b); Models.dev lists minimal to xhigh."
+    },
+    {
+      "provider": "xai",
+      "id": "grok-4.7",
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "default": "high"
+        }
+      ],
+      "reason": "xAI documents high as the default effort and reasoning cannot be turned off (https://docs.x.ai/docs/guides/reasoning, 6be755f31 / #6501); Models.dev lists the ladder without a default."
+    },
+    {
+      "provider": "xai",
+      "id": "grok-4.6",
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "default": "high"
+        }
+      ],
+      "reason": "xAI documents high as the default effort and reasoning cannot be turned off (https://docs.x.ai/docs/guides/reasoning, 6be755f31 / #6501); Models.dev lists the ladder without a default."
+    },
+    {
+      "provider": "xai",
+      "id": "grok-4.5",
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "high"
+        }
+      ],
+      "reason": "xAI documents high as the default effort and reasoning cannot be turned off (https://docs.x.ai/docs/guides/reasoning, 6be755f31 / #6501); Models.dev lists the ladder without a default."
+    },
+    {
+      "provider": "stepfun",
+      "id": "step-3.5-flash",
+      "reasoning_options": [
+        {
+          "type": "thinking",
+          "values": [
+            "adaptive"
+          ]
+        }
+      ],
+      "reason": "StepFun's model guide (platform.stepfun.ai/docs/en/guides/models, recorded in the seed on 2026-09-19) gives base Step 3.5 the provider's adaptive reasoning; only step-3.5-flash-2603 takes low/high effort. Models.dev gives both low/high."
     }
   ]
 }
