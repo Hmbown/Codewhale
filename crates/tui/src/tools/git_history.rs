@@ -10,6 +10,7 @@ use std::process::Output;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use super::shell_output::truncate_head_tail_chars;
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_bool, optional_str, optional_u64, required_str,
@@ -131,7 +132,8 @@ impl ToolSpec for GitLogTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let (content, truncated, omitted_chars) =
+            truncate_head_tail_chars(&stdout, MAX_OUTPUT_CHARS);
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": git_ctx.working_dir,
@@ -253,7 +255,8 @@ impl ToolSpec for GitShowTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let (content, truncated, omitted_chars) =
+            truncate_head_tail_chars(&stdout, MAX_OUTPUT_CHARS);
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": git_ctx.working_dir,
@@ -387,7 +390,8 @@ impl ToolSpec for GitBlameTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let (content, truncated, omitted_chars) =
+            truncate_head_tail_chars(&stdout, MAX_OUTPUT_CHARS);
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": working_dir,
@@ -520,7 +524,8 @@ impl ToolSpec for GitFetchTool {
         } else {
             format!("{stdout}\n{stderr}")
         };
-        let (content, truncated, omitted_chars) = truncate_with_note(&combined, MAX_OUTPUT_CHARS);
+        let (content, truncated, omitted_chars) =
+            truncate_head_tail_chars(&combined, MAX_OUTPUT_CHARS);
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": git_ctx.working_dir,
@@ -635,7 +640,8 @@ impl ToolSpec for GitMergeTreeTool {
         }
 
         let conflicts = !output.status.success();
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let (content, truncated, omitted_chars) =
+            truncate_head_tail_chars(&stdout, MAX_OUTPUT_CHARS);
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
             "working_dir": git_ctx.working_dir,
@@ -956,34 +962,6 @@ fn format_command(working_dir: &Path, args: &[String]) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     )
-}
-
-fn truncate_with_note(text: &str, max_chars: usize) -> (String, bool, usize) {
-    if text.chars().count() <= max_chars {
-        return (text.to_string(), false, 0);
-    }
-    let end = char_boundary_index(text, max_chars);
-    let truncated = &text[..end];
-    let omitted_chars = text
-        .chars()
-        .count()
-        .saturating_sub(truncated.chars().count());
-    let note = format!(
-        "\n\n[output truncated to {max_chars} characters; {omitted_chars} characters omitted]"
-    );
-    (format!("{truncated}{note}"), true, omitted_chars)
-}
-
-fn char_boundary_index(text: &str, max_chars: usize) -> usize {
-    if max_chars == 0 {
-        return 0;
-    }
-    for (count, (idx, _)) in text.char_indices().enumerate() {
-        if count == max_chars {
-            return idx;
-        }
-    }
-    text.len()
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::cargo_failure_summary::summarize_cargo_failure;
+use super::shell_output::truncate_head_tail_chars;
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_bool, optional_str,
@@ -107,8 +108,8 @@ impl ToolSpec for RunTestsTool {
         let exit_code = output.status.code().unwrap_or(-1);
         let stdout_raw = String::from_utf8_lossy(&output.stdout);
         let stderr_raw = String::from_utf8_lossy(&output.stderr);
-        let stdout = truncate_with_note(&stdout_raw, MAX_OUTPUT_CHARS);
-        let stderr = truncate_with_note(&stderr_raw, MAX_OUTPUT_CHARS);
+        let stdout = truncate_head_tail_chars(&stdout_raw, MAX_OUTPUT_CHARS).0;
+        let stderr = truncate_head_tail_chars(&stderr_raw, MAX_OUTPUT_CHARS).0;
 
         let result = RunTestsOutput {
             success: output.status.success(),
@@ -162,34 +163,6 @@ fn format_command(workspace: &Path, args: &[String]) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     )
-}
-
-fn truncate_with_note(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let end = char_boundary_index(text, max_chars);
-    let truncated = &text[..end];
-    let omitted_chars = text
-        .chars()
-        .count()
-        .saturating_sub(truncated.chars().count());
-    let note = format!(
-        "\n\n[output truncated to {max_chars} characters; {omitted_chars} characters omitted]"
-    );
-    format!("{truncated}{note}")
-}
-
-fn char_boundary_index(text: &str, max_chars: usize) -> usize {
-    if max_chars == 0 {
-        return 0;
-    }
-    for (count, (idx, _)) in text.char_indices().enumerate() {
-        if count == max_chars {
-            return idx;
-        }
-    }
-    text.len()
 }
 
 #[cfg(test)]
@@ -319,9 +292,10 @@ mod tests {
 
     #[test]
     fn truncation_adds_note() {
-        let long = "x".repeat(MAX_OUTPUT_CHARS + 128);
-        let truncated = truncate_with_note(&long, MAX_OUTPUT_CHARS);
+        let long = "x".repeat(MAX_OUTPUT_CHARS + 128) + "test result: FAILED";
+        let (truncated, _, _) = truncate_head_tail_chars(&long, MAX_OUTPUT_CHARS);
         assert!(truncated.contains("output truncated"));
+        assert!(truncated.ends_with("test result: FAILED"));
     }
 
     /// A child parked at a workspace root that is not the project root (the

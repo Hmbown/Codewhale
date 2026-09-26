@@ -17,6 +17,7 @@ use shlex::try_join;
 
 use crate::dependencies::ExternalTool;
 
+use super::shell_output::truncate_head_tail_chars;
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
 };
@@ -1334,9 +1335,8 @@ async fn run_gate(gate: VerifierGate) -> GateResult {
         }
         stderr_text.push_str(&note);
     }
-    let (stdout, stdout_truncated) =
-        truncate_with_note(&String::from_utf8_lossy(&stdout), MAX_GATE_OUTPUT_CHARS);
-    let (stderr, stderr_truncated) = truncate_with_note(&stderr_text, MAX_GATE_OUTPUT_CHARS);
+    let (stdout, stdout_truncated) = truncate_gate_output(&String::from_utf8_lossy(&stdout));
+    let (stderr, stderr_truncated) = truncate_gate_output(&stderr_text);
     let passed = !timed_out && exit_status.is_some_and(|status| status.success());
     GateResult {
         name: gate.name,
@@ -1427,34 +1427,10 @@ fn render_command(program: Option<&str>, args: &[String]) -> String {
     parts.join(" ")
 }
 
-fn truncate_with_note(text: &str, max_chars: usize) -> (String, bool) {
-    if text.chars().count() <= max_chars {
-        return (text.to_string(), false);
-    }
-    let end = char_boundary_index(text, max_chars);
-    let truncated = &text[..end];
-    let omitted_chars = text
-        .chars()
-        .count()
-        .saturating_sub(truncated.chars().count());
-    (
-        format!(
-            "{truncated}\n\n[output truncated to {max_chars} characters; {omitted_chars} characters omitted]"
-        ),
-        true,
-    )
-}
-
-fn char_boundary_index(text: &str, max_chars: usize) -> usize {
-    if max_chars == 0 {
-        return 0;
-    }
-    for (count, (idx, _)) in text.char_indices().enumerate() {
-        if count == max_chars {
-            return idx;
-        }
-    }
-    text.len()
+/// Gate output keeps its tail: failures and the summary line print last.
+fn truncate_gate_output(text: &str) -> (String, bool) {
+    let (content, truncated, _) = truncate_head_tail_chars(text, MAX_GATE_OUTPUT_CHARS);
+    (content, truncated)
 }
 
 #[cfg(test)]

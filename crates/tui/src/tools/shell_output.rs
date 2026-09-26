@@ -168,6 +168,37 @@ fn is_summary_line(line: &str) -> bool {
     false
 }
 
+/// Bound `text` to `max_chars` characters by keeping a short head and a long
+/// tail, eliding the middle behind an explicit marker (#6508).
+///
+/// Test runners and compilers print failures and the summary line last, and a
+/// large diff's final files are as important as its first, so a head-only cut
+/// drops exactly the part the caller needs. The head keeps a fifth of the
+/// budget (the command banner, the first files); the tail keeps the rest.
+///
+/// Returns `(content, truncated, omitted_chars)`.
+pub(crate) fn truncate_head_tail_chars(text: &str, max_chars: usize) -> (String, bool, usize) {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return (text.to_string(), false, 0);
+    }
+    let head_chars = max_chars / 5;
+    let tail_chars = max_chars - head_chars;
+    let omitted = total - head_chars - tail_chars;
+    let byte_at = |chars: usize| {
+        text.char_indices()
+            .nth(chars)
+            .map_or(text.len(), |(idx, _)| idx)
+    };
+    let head = &text[..byte_at(head_chars)];
+    let tail = &text[byte_at(total - tail_chars)..];
+    let content = format!(
+        "{head}\n\n[... output truncated: {omitted} characters omitted from the middle; \
+         showing the first {head_chars} and last {tail_chars} of {total} characters ...]\n\n{tail}"
+    );
+    (content, true, omitted)
+}
+
 fn char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
     if max_bytes >= text.len() {
         return text.len();
@@ -239,6 +270,54 @@ pub(crate) fn summarize_output(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn head_tail_chars_passes_short_text_through() {
+        let (out, truncated, omitted) = truncate_head_tail_chars("short", 100);
+        assert_eq!(out, "short");
+        assert!(!truncated);
+        assert_eq!(omitted, 0);
+    }
+
+    /// #6508: a failing cargo run prints its failures and summary last; the
+    /// old head-only cut dropped them.
+    #[test]
+    fn head_tail_chars_keeps_cargo_failure_tail() {
+        let mut text = String::from("running 5000 tests\n");
+        for i in 0..5_000 {
+            text.push_str(&format!("test case_{i} ... ok\n"));
+        }
+        text.push_str("failures:\n    tests::the_one_that_broke\n");
+        text.push_str("test result: FAILED. 4999 passed; 1 failed\n");
+        let max = 2_000;
+        let (out, truncated, omitted) = truncate_head_tail_chars(&text, max);
+        assert!(truncated);
+        assert!(out.starts_with("running 5000 tests"));
+        assert!(out.contains("tests::the_one_that_broke"));
+        assert!(out.ends_with("test result: FAILED. 4999 passed; 1 failed\n"));
+        assert!(out.contains(&format!("{omitted} characters omitted from the middle")));
+        assert_eq!(omitted, text.chars().count() - max);
+        let marker_len = out.chars().count() - max;
+        assert!(marker_len < 200, "marker should be short: {marker_len}");
+    }
+
+    #[test]
+    fn head_tail_chars_splits_on_char_boundaries() {
+        let text = "é".repeat(50) + &"🐳".repeat(50);
+        let (out, truncated, omitted) = truncate_head_tail_chars(&text, 10);
+        assert!(truncated);
+        assert_eq!(omitted, 90);
+        assert!(out.starts_with("éé\n\n[..."));
+        assert!(out.ends_with(&"🐳".repeat(8)));
+    }
+
+    #[test]
+    fn head_tail_chars_zero_budget_keeps_only_marker() {
+        let (out, truncated, omitted) = truncate_head_tail_chars("abc", 0);
+        assert!(truncated);
+        assert_eq!(omitted, 3);
+        assert!(out.contains("3 characters omitted"));
+    }
 
     #[test]
     fn truncation_preserves_cargo_test_summary_lines_from_tail() {

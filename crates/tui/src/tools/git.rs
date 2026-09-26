@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use crate::dependencies::ExternalTool;
 
+use super::shell_output::truncate_head_tail_chars;
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_bool, optional_str, optional_u64,
@@ -132,7 +133,8 @@ impl ToolSpec for GitStatusTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let (content, truncated, omitted_chars) =
+            truncate_head_tail_chars(&stdout, MAX_OUTPUT_CHARS);
 
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
@@ -234,7 +236,8 @@ impl ToolSpec for GitDiffTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (content, truncated, omitted_chars) = truncate_with_note(&stdout, MAX_OUTPUT_CHARS);
+        let (content, truncated, omitted_chars) =
+            truncate_head_tail_chars(&stdout, MAX_OUTPUT_CHARS);
 
         Ok(ToolResult::success(content).with_metadata(json!({
             "command": command_str,
@@ -406,7 +409,8 @@ impl ToolSpec for GitCommitPlanTool {
         };
 
         let content = render_commit_plan(&repo_root, index_has_staged_changes, &commits);
-        let (content, truncated, omitted_chars) = truncate_with_note(&content, MAX_OUTPUT_CHARS);
+        let (content, truncated, omitted_chars) =
+            truncate_head_tail_chars(&content, MAX_OUTPUT_CHARS);
         let metadata_commits: Vec<Value> = commits
             .iter()
             .enumerate()
@@ -516,34 +520,6 @@ fn format_command(working_dir: &Path, args: &[String]) -> String {
     // `[String]::join` produces the same string as collecting `&str` first, so
     // join the slice directly and skip the intermediate `Vec<&str>` allocation.
     format!("git -C {} {}", working_dir.display(), args.join(" "))
-}
-
-fn truncate_with_note(text: &str, max_chars: usize) -> (String, bool, usize) {
-    if text.chars().count() <= max_chars {
-        return (text.to_string(), false, 0);
-    }
-    let end = char_boundary_index(text, max_chars);
-    let truncated = &text[..end];
-    let omitted_chars = text
-        .chars()
-        .count()
-        .saturating_sub(truncated.chars().count());
-    let note = format!(
-        "\n\n[output truncated to {max_chars} characters; {omitted_chars} characters omitted]"
-    );
-    (format!("{truncated}{note}"), true, omitted_chars)
-}
-
-fn char_boundary_index(text: &str, max_chars: usize) -> usize {
-    if max_chars == 0 {
-        return 0;
-    }
-    for (count, (idx, _)) in text.char_indices().enumerate() {
-        if count == max_chars {
-            return idx;
-        }
-    }
-    text.len()
 }
 
 // === Commit Split Specific Types & Helpers ===
@@ -1378,11 +1354,12 @@ mod tests {
 
     #[test]
     fn truncation_adds_note() {
-        let long = "a".repeat(MAX_OUTPUT_CHARS + 100);
-        let (truncated, did_truncate, omitted) = truncate_with_note(&long, MAX_OUTPUT_CHARS);
+        let long = "a".repeat(MAX_OUTPUT_CHARS + 100) + "diff --git a/last.rs b/last.rs";
+        let (truncated, did_truncate, omitted) = truncate_head_tail_chars(&long, MAX_OUTPUT_CHARS);
         assert!(did_truncate);
         assert!(omitted > 0);
         assert!(truncated.contains("output truncated"));
+        assert!(truncated.ends_with("diff --git a/last.rs b/last.rs"));
     }
 
     // === Commit plan (#3999) ===
