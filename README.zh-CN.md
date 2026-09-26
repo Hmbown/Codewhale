@@ -3,7 +3,7 @@
 
 Codewhale 是一款开源智能体，可使用你选择的托管模型或本地模型读取项目、编辑文件、运行命令并检查自己的工作。从终端中的一项任务开始。对于较大的工作，可以将其中的部分任务交给使用不同模型、承担不同角色的智能体。
 
-![Codewhale 在终端中运行](web/public/codewhale-tui-d7a9a1c.png)
+![Codewhale 在终端中运行](web/public/codewhale-tui-5765d80.png)
 
 *终端预览截图来自 v0.10.0 的开发构建。*
 

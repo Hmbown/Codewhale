@@ -3,7 +3,7 @@
 
 Codewhale là tác nhân mã nguồn mở có thể đọc dự án, chỉnh sửa tệp, chạy lệnh và kiểm tra công việc của mình bằng mô hình do nhà cung cấp lưu trữ hoặc mô hình cục bộ mà bạn chọn. Hãy bắt đầu với một tác vụ trong terminal. Với công việc lớn hơn, bạn có thể giao từng phần cho các tác nhân dùng mô hình và đảm nhiệm vai trò khác nhau.
 
-![Codewhale đang chạy trong terminal](web/public/codewhale-tui-d7a9a1c.png)
+![Codewhale đang chạy trong terminal](web/public/codewhale-tui-5765d80.png)
 
 *Hình xem trước terminal từ bản dựng phát triển v0.10.0.*
 

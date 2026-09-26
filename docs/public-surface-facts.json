@@ -248,17 +248,19 @@
     ]
   },
   "screenshot": {
-    "readme": "web/public/codewhale-tui-d7a9a1c.png",
-    "website": "web/public/codewhale-tui-d7a9a1c.png",
+    "readme": "web/public/codewhale-tui-5765d80.png",
+    "website": "web/public/codewhale-tui-5765d80.png",
     "sourceVersion": "0.10.0",
-    "sourceCommit": "d7a9a1c8c15635a84099d5fc2ee965146cf197c7",
-    "sourceSha256": "73e56158d6ec6c04933ce787c23c07322ce4d509b54050b54b12d181b09314b8",
-    "terminal": "real PTY cell capture rendered with Menlo and Apple Symbols",
-    "theme": "Shoreline dark",
-    "capture": "Captured on 2026-09-20 from the exact d7a9a1c8c156 development build in an isolated empty workspace: canonical whale mark, new session, composer, Ask permissions, Work mode and model status. Rendered directly from terminal cells without changing the content. No fixture conversations or provider requests. This documents appearance, not a published release or completed task. Ask/Work is the captured posture, not a default claim.",
+    "sourceCommit": "5765d80278f7184d187fa6682ba96b403a006523",
+    "sourceSha256": "359359275fefed015ba0e3772fee9e09d64048813d311c31d6ee2a83b1ee85b5",
+    "terminal": "real PTY cell capture; the website renders the cells as live HTML text, and the README image is the same frame rasterized with Menlo by web/scripts/render-terminal-capture.mjs",
+    "theme": "Underwater (default)",
+    "capture": "Captured on 2026-09-25 from a development build of source 5765d80278f7 (0.10.0 dev) by crates/tui/tests/cucumber/launch_card_pty.rs::website_current_terminal_capture: a sealed HOME with the workspace at ~/my-project, no provider connected (explored offline), no network probes, no animations. Shows the whale mark, the first-run starter prompt in the composer, Ask permissions, Work mode and the model status. Rendered directly from terminal cells without changing the content. No fixture conversations or provider requests. This documents appearance, not a published release or completed task. Ask/Work is the captured posture, not a default claim.",
     "sources": [
       "crates/tui/tests/cucumber/launch_card_pty.rs",
-      "web/public/codewhale-tui-d7a9a1c.png"
+      "web/lib/terminal-captures/website-home-100x24.json",
+      "web/scripts/render-terminal-capture.mjs",
+      "web/public/codewhale-tui-5765d80.png"
     ]
   }
 }
