@@ -123,6 +123,7 @@ mod shell_dispatcher;
 mod skills;
 mod snapshot;
 mod startup_trace;
+mod superfast;
 mod task_manager;
 mod telemetry_notice;
 #[cfg(test)]
