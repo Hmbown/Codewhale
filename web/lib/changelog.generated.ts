@@ -61,7 +61,7 @@ export const CHANGELOG: ChangelogRelease[] = [
           "Hooks treat bash, Bash and exec_shell as one tool in tool_name conditions, so the documented example fires.",
           "macOS no longer reports Codewhale's ordinary heap as GPU (IOAccelerator) memory."
         ],
-        "itemCount": 19
+        "itemCount": 21
       },
       {
         "heading": "Removed",

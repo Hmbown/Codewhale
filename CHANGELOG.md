@@ -119,6 +119,19 @@ quieter, and Fleet runs can be checked before they spend anything.
   marked `[rlm_query incomplete: …]` instead of an empty string, its model
   calls appear in the parent turn's record, and its history is no longer
   trimmed ([#6511](https://github.com/Hmbown/Codewhale/issues/6511)).
+- Starting without a network connection no longer drops images you attach to a
+  model that accepts them. The offline model list lagged behind providers and
+  listed Claude and others as text-only; it can now only say a model takes
+  images, never that it refuses them, and a provider that does refuse gets one
+  resend without the image and a message saying so
+  ([#6396](https://github.com/Hmbown/Codewhale/issues/6396)).
+- Model prices that a flat rate would get wrong now show as unknown after the
+  model list refreshes online, as they already did offline: DeepSeek (priced by
+  time of day), Grok and MiniMax M3 (rates rise on long prompts), Xiaomi MiMo
+  (pay-as-you-go and Token Plan keys look the same), Alibaba Model Studio plans
+  (quota, not per-token) and StepFun. DeepSeek's output limit stays at its
+  published 384K instead of the refreshed 393,216
+  ([#6396](https://github.com/Hmbown/Codewhale/issues/6396)).
 
 ### Removed
 

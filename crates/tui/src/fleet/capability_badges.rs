@@ -161,8 +161,9 @@ mod tests {
         assert!(badges.badges.contains(&"384K out".to_string()));
         assert!(badges.badges.contains(&"tools".to_string()));
         assert!(badges.badges.contains(&"reasoning".to_string()));
-        // Text-only modalities are an explicit sourced fact, not an unknown.
-        assert!(badges.badges.contains(&"no vision".to_string()));
+        // The offline seed's text-only row is not a refusal (#6396): the seed
+        // lags providers, so it may say "vision" but never "no vision".
+        assert!(!badges.badges.contains(&"no vision".to_string()));
         assert!(
             badges.provenance.contains("catalog"),
             "catalog facts must carry catalog provenance, got {}",

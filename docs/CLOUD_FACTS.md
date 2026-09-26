@@ -80,12 +80,15 @@ catalog authority.
 The existing compiler inserts cloud facts at layer 15:
 
 ```
-0 bundled Models.dev < 5 bundled Codewhale < 10 live Models.dev
+0 bundled Models.dev < 10 live Models.dev < 12 Codewhale corrections
 < 15 verified cloud facts < 20 provider-owned live < 25 Codewhale account
 < 30 config < 40 user overrides < policy DENY
 ```
 
-An upsert patches specified metadata fields. Creating a row requires either its
+An upsert patches specified metadata fields. `pricing_withheld` (a reason)
+clears a row's price so it reads as unknown rather than as a misleading flat
+rate; the bundled corrections in `crates/config/assets/catalog_corrections.json`
+use the same field and patch code. Creating a row requires either its
 context window or an `allow_unlisted` assertion (below); an attested ID-only row
 is created with every limit, price and capability **unknown** rather than
 inferred from a sibling model or a lower stale layer. Deprecation annotates;
@@ -93,8 +96,8 @@ hide only removes lower bundled/Models.dev rows. Cloud data cannot delete
 provider-live, account, config or user rows.
 
 **Which rows a patch reaches.** An upsert replaces fields on a row held at
-layer 0, 5 or 10 — the bundled Models.dev seed, the bundled Codewhale snapshot,
-and a live Models.dev refresh — and is skipped with a receipt on anything at
+layer 0 or 10 — the bundled Models.dev seed or a live Models.dev refresh,
+including rows a bundled Codewhale correction patched — and is skipped with a receipt on anything at
 layer 20 and above. That reach is the point of the layer split: most models a
 user sees are described by Models.dev rather than by the provider, so a stale
 context window or a changed rate on such a model is exactly what a signed

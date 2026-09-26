@@ -3185,6 +3185,7 @@ impl CodewhaleClient {
                 .into_iter()
                 .map(|model| CatalogOffering {
                     cost_source: None,
+                    modalities_source: None,
                     provider: provider.clone(),
                     endpoint_key: if self.api_provider == ApiProvider::OpencodeGo {
                         codewhale_config::opencode_go_endpoint_key(&model.id)
@@ -4243,6 +4244,7 @@ fn codewhale_catalog_offerings_from_body(
         };
         offerings.push(CatalogOffering {
             cost_source: None,
+            modalities_source: None,
             provider: provider.to_string(),
             wire_model_id: id,
             canonical_model: None,
@@ -4294,6 +4296,7 @@ fn named_gateway_catalog_offerings_from_body(
             if let Some(matched) = same_provider_match {
                 CatalogOffering {
                     cost_source: Some(matched.pricing_source().clone()),
+                    modalities_source: Some(matched.modalities_source().clone()),
                     provider: provider.to_string(),
                     wire_model_id: model.id,
                     canonical_model: matched.canonical_model.clone(),
@@ -4316,6 +4319,7 @@ fn named_gateway_catalog_offerings_from_body(
             } else {
                 CatalogOffering {
                     cost_source: None,
+                    modalities_source: None,
                     provider: provider.to_string(),
                     wire_model_id: model.id,
                     canonical_model: None,
@@ -4568,6 +4572,7 @@ fn baseten_to_catalog_offering(
 
     Ok(CatalogOffering {
         cost_source: None,
+        modalities_source: None,
         provider: provider.to_string(),
         wire_model_id: item.id.clone(),
         canonical_model: None,
@@ -4705,6 +4710,7 @@ fn openrouter_to_catalog_offering(
 
     Ok(CatalogOffering {
         cost_source: None,
+        modalities_source: None,
         provider: provider.to_string(),
         wire_model_id: item.id.clone(),
         canonical_model: None,
