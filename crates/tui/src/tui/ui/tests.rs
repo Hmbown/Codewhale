@@ -28410,6 +28410,87 @@ fn background_notice_waits_for_finite_work_and_a_busy_parent() {
 }
 
 #[test]
+fn a_shell_finished_during_a_completed_turn_is_left_to_the_turn_notice() {
+    use crate::tui::background_finished::{FinishedOutcome, FinishedWork};
+    // #6565 review: a shell the model waited on mid-turn must not produce a
+    // "Shell finished" notice next to the turn's own "Turn complete".
+    let mut app = create_test_app();
+    let config = Config::default();
+    // A running agent holds the batch, so what survives the turn's end is
+    // visible here instead of being flushed.
+    let mut running = make_subagent(
+        "agent_busy",
+        crate::tools::subagent::SubAgentStatus::Running,
+    );
+    running.started_at = Some(Instant::now());
+    app.subagent_cache.push(running);
+    let shell = |command: &str| {
+        FinishedWork::shell(
+            command,
+            FinishedOutcome::Done,
+            "exit 0 · 45s".to_string(),
+            Duration::from_secs(45),
+        )
+    };
+    app.background_finished
+        .push(shell("cargo test").in_turn(true));
+    app.background_finished
+        .push(shell("npm run build").in_turn(false));
+
+    // A failed turn sends no turn notice, so nothing is dropped.
+    settle_background_finished_at_turn_end(&mut app, &config, false);
+    assert_eq!(app.background_finished.len(), 2);
+
+    settle_background_finished_at_turn_end(&mut app, &config, true);
+    let names: Vec<&str> = app
+        .background_finished
+        .iter()
+        .map(|item| item.name.as_str())
+        .collect();
+    assert_eq!(names, ["npm run build"], "only the pre-turn shell is left");
+}
+
+#[test]
+fn a_stale_durable_task_does_not_hold_the_background_notice() {
+    use crate::tui::background_finished::FinishedWork;
+    // #6565 review: a recovered Running task with unverified ownership stays
+    // Running indefinitely; it must not hold `final-only` forever.
+    let mut app = create_test_app();
+    let config = Config::default();
+    let task = |stale: bool| TaskPanelEntry {
+        exit_code: None,
+        id: "task_orphan".to_string(),
+        status: "running".to_string(),
+        prompt_summary: "rebuild the index".to_string(),
+        duration_ms: None,
+        kind: TaskPanelEntryKind::Background,
+        stale,
+        elapsed_since_output_ms: None,
+        owner_agent_id: None,
+        owner_agent_name: None,
+        current_tool: None,
+        role: None,
+        files_touched: 0,
+    };
+    let finished = || {
+        FinishedWork::agent(
+            "explore",
+            &crate::tools::subagent::SubAgentStatus::Completed,
+            "Found it.",
+            Duration::from_secs(3),
+        )
+    };
+    app.task_panel.push(task(false));
+    app.background_finished.push(finished());
+    flush_background_finished(&mut app, &config, false);
+    assert_eq!(app.background_finished.len(), 1, "a live task holds it");
+
+    app.task_panel[0] = task(true);
+    flush_background_finished(&mut app, &config, false);
+    assert!(app.background_finished.is_empty(), "a stale task does not");
+}
+
+#[test]
 fn workflow_tool_is_running_detects_running_workflow_cell() {
     let mut app = create_test_app();
     assert!(!workflow_tool_is_running(&app));

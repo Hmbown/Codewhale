@@ -71,12 +71,15 @@ pub(super) async fn refresh_active_task_panel(
                 }
                 _ => summary,
             };
-            Some(FinishedWork::task(
-                &task.prompt_summary,
-                outcome,
-                summary,
-                std::time::Duration::from_millis(task.duration_ms.unwrap_or_default()),
-            ))
+            Some(
+                FinishedWork::task(
+                    &task.prompt_summary,
+                    outcome,
+                    summary,
+                    std::time::Duration::from_millis(task.duration_ms.unwrap_or_default()),
+                )
+                .in_turn(app.is_loading),
+            )
         })
         .collect::<Vec<_>>();
     let durable_background_completed = newly_finished_tasks
@@ -178,12 +181,16 @@ pub(super) async fn refresh_active_task_panel(
             crate::tui::app::StatusToastLevel::Warning
         };
         app.push_status_toast(bound_agent_activity_text(&toast), level, Some(6_000));
-        app.background_finished.push(FinishedWork::shell(
-            &job.command,
-            outcome,
-            summary,
-            std::time::Duration::from_millis(job.elapsed_ms),
-        ));
+        let parent_busy = app.is_loading;
+        app.background_finished.push(
+            FinishedWork::shell(
+                &job.command,
+                outcome,
+                summary,
+                std::time::Duration::from_millis(job.elapsed_ms),
+            )
+            .in_turn(parent_busy),
+        );
     }
     while app.finished_shell_ids.len() > MAX_FINISHED_SHELLS {
         app.finished_shell_ids.pop_front();

@@ -2845,9 +2845,12 @@ pub(crate) async fn run_event_loop(
                                 .insert("routed_usage_receipt_missing".to_string());
                         }
 
-                        // The parent turn is idle now: background work held
-                        // for it is announced (#6565).
-                        flush_background_finished(app, config, true);
+                        // The parent turn is idle now (#6565).
+                        settle_background_finished_at_turn_end(
+                            app,
+                            config,
+                            status == crate::core::events::TurnOutcomeStatus::Completed,
+                        );
 
                         // Emit OSC 9 / BEL desktop notification for long turns, and
                         // always stop the title animation that began on TurnStarted.

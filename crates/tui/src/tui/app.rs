@@ -553,6 +553,11 @@ pub struct AgentProgressMeta {
     /// The engine's name for this agent from its spawn or completion event
     /// (`subagent_display_name`), used until a manager snapshot arrives.
     pub display_name: Option<String>,
+    /// When the TUI last received any mailbox envelope from this child. The
+    /// manager's `idle_ms` is only as fresh as the last `AgentList` snapshot,
+    /// and ordinary progress does not refresh that snapshot, so the quiet
+    /// readout caps the engine's clock with this one.
+    pub last_progress_at: Option<Instant>,
 }
 
 /// Per-turn LSP repair-loop summary for the Turn Inspector (#4107).

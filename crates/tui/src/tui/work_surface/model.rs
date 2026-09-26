@@ -1977,8 +1977,9 @@ const QUIET_AFTER_MS: u64 = 60_000;
 /// no progress for a minute and has no tool in flight (#6565).
 ///
 /// This reads the engine's own clock (`idle_ms`, the one its heartbeat reads)
-/// and the bound that heartbeat enforces; the TUI keeps no stall clock of its
-/// own. A tool in flight is never quiet: a long tool is expected, and the
+/// and the bound that heartbeat enforces, capped by the last envelope the TUI
+/// saw from the child, because `AgentList` snapshots are not refreshed by
+/// ordinary progress. A tool in flight is never quiet: a long tool is expected, and the
 /// heartbeat bound sits above the tool timeout. When the engine does stop the
 /// agent, the row's result says so ("Auto-cancelled after 300s without
 /// sub-agent progress"), and Stop on the row ends it sooner.
@@ -1993,7 +1994,13 @@ fn quiet_fact(
     let since_snapshot = app.subagent_cache_received_at.map_or(0, |at| {
         u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)
     });
-    let idle = agent.idle_ms?.saturating_add(since_snapshot);
+    let mut idle = agent.idle_ms?.saturating_add(since_snapshot);
+    // The snapshot is not refreshed by ordinary progress, so an agent that
+    // kept working after it would otherwise read as quiet. Any envelope the
+    // TUI saw from the child since then caps the estimate.
+    if let Some(at) = meta.and_then(|meta| meta.last_progress_at) {
+        idle = idle.min(u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
+    }
     if idle < QUIET_AFTER_MS {
         return None;
     }
@@ -4369,5 +4376,41 @@ mod tests {
         app.agent_progress_meta.clear();
         app.subagent_cache[0].idle_ms = Some(20_000);
         assert!(!detail(&app).contains("quiet"), "{}", detail(&app));
+    }
+
+    #[test]
+    fn progress_after_an_old_snapshot_keeps_a_working_agent_from_reading_quiet() {
+        let mut app = test_app();
+        let mut agent = running_agent("agent_busy");
+        // The snapshot is ten minutes old; its idle clock would read quiet.
+        agent.idle_ms = Some(0);
+        agent.heartbeat_timeout_ms = Some(300_000);
+        app.subagent_cache.push(agent);
+        app.subagent_cache_received_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(600));
+        let detail = |app: &App| {
+            agent_rows(app)
+                .into_iter()
+                .find(|ranked| ranked.row.id.0 == "worker:agent_busy")
+                .expect("row")
+                .row
+                .detail
+        };
+        assert!(detail(&app).contains("quiet 5m"), "{}", detail(&app));
+        // A progress envelope since then, with no tool in flight between
+        // read-only tools, means the agent is working.
+        app.agent_progress_meta
+            .entry("agent_busy".to_string())
+            .or_default()
+            .last_progress_at = Some(std::time::Instant::now());
+        assert!(!detail(&app).contains("quiet"), "{}", detail(&app));
+        // The TUI's clock only caps the engine's, never extends it: a child
+        // quiet since its last envelope two minutes ago reads 2m.
+        app.agent_progress_meta
+            .get_mut("agent_busy")
+            .expect("meta")
+            .last_progress_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(125));
+        assert!(detail(&app).contains("quiet 2m"), "{}", detail(&app));
     }
 }

@@ -693,6 +693,7 @@ fn bounded_mailbox_message(message: &MailboxMessage) -> MailboxMessage {
 fn record_agent_current_activity(app: &mut App, message: &MailboxMessage) {
     let agent_id = message.agent_id().to_string();
     let meta = app.agent_progress_meta.entry(agent_id).or_default();
+    meta.last_progress_at = Some(Instant::now());
     if let MailboxMessage::TokenUsage { route, usage, .. } = message {
         // The child's own used-token tally (input + output), matching the
         // worker budget's `usage_total_tokens`. Counting only completions made

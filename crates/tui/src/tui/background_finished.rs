@@ -67,6 +67,11 @@ pub struct FinishedWork {
     /// One line of facts for a shell or task ("exit 0 · 12s", "killed").
     pub summary: Option<String>,
     pub elapsed: Duration,
+    /// Whether the parent turn was running when this finished. A shell or
+    /// task that finished while the model was working is reported by that
+    /// turn's own notice, so [`drop_reported_by_turn`] removes it when the
+    /// turn completes instead of sending a second notice.
+    pub during_turn: bool,
 }
 
 impl FinishedWork {
@@ -80,6 +85,7 @@ impl FinishedWork {
             result: Some(result.to_string()),
             summary: None,
             elapsed,
+            during_turn: false,
         }
     }
 
@@ -105,6 +111,7 @@ impl FinishedWork {
             result: None,
             summary: Some(summary),
             elapsed,
+            during_turn: false,
         }
     }
 
@@ -118,7 +125,15 @@ impl FinishedWork {
             result: None,
             summary: Some(summary),
             elapsed,
+            during_turn: false,
         }
+    }
+
+    /// Marks this item as finished while the parent turn was running.
+    #[must_use]
+    pub fn in_turn(mut self, parent_busy: bool) -> Self {
+        self.during_turn = parent_busy;
+        self
     }
 
     /// The preview line for this item: an agent's result headline (with `…`
@@ -164,6 +179,14 @@ impl FinishedWork {
     }
 }
 
+/// Drop the shells and tasks that finished while the parent turn was running.
+///
+/// Called when that turn completes: its own notice covers them, so they must
+/// not go out as a second notice. Agents keep their own notice.
+pub fn drop_reported_by_turn(batch: &mut Vec<FinishedWork>) {
+    batch.retain(|item| item.kind == FinishedKind::Agent || !item.during_turn);
+}
+
 /// Whether the pending batch should be announced now.
 ///
 /// - `off` drains the batch without a notice.
@@ -171,8 +194,9 @@ impl FinishedWork {
 /// - `final-only` waits while finite work is still live (running agents, a
 ///   running workflow, queued or running durable tasks). Running shells are
 ///   open-ended and never count. A batch with no agent in it also waits for
-///   the parent turn to go idle, so a shell the model is handling mid-turn is
-///   reported by the turn, not by a second notice.
+///   the parent turn to go idle; when that turn completes,
+///   [`drop_reported_by_turn`] removes the shells and tasks that finished
+///   during it, so they are reported by the turn, not by a second notice.
 #[must_use]
 pub fn ready_to_flush(
     mode: SubagentCompletionNotification,

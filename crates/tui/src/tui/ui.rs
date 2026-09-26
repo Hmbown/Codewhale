@@ -1302,7 +1302,8 @@ pub(crate) fn clamp_event_poll_timeout(timeout: Duration) -> Duration {
 /// the `[notifications].subagent_completion` mode says it is time (#6565).
 ///
 /// Finite work still live (running agents that are not suspect ghosts, a
-/// running workflow, queued or running durable tasks) holds a `final-only`
+/// running workflow, queued or running durable tasks that are not stale)
+/// holds a `final-only`
 /// batch; a running background shell never does. `parent_idle` forces the
 /// parent-turn half of the rule open, for the moment a turn completes.
 /// `settings()` still has the final say (method=off / condition=never).
@@ -1315,7 +1316,11 @@ pub(crate) fn flush_background_finished(app: &mut App, config: &Config, parent_i
     let finite_work_live = session_state::live_running_agent_count(app, Instant::now()) > 0
         || frame::workflow_tool_is_running(app)
         || app.task_panel.iter().any(|entry| {
-            !entry.prompt_summary.starts_with("shell: ")
+            // A stale entry (a recovered task whose ownership is unverified)
+            // is not known to be running and could hold the batch forever,
+            // the same reason suspect ghost agents are left out.
+            !entry.stale
+                && !entry.prompt_summary.starts_with("shell: ")
                 && !entry.id.starts_with("shell_")
                 && matches!(entry.status.as_str(), "queued" | "running")
         });
@@ -1352,6 +1357,22 @@ pub(crate) fn flush_background_finished(app: &mut App, config: &Config, parent_i
             notifications::notify_done(method, in_tmux, &payload, threshold, elapsed);
         }
     }
+}
+
+/// Settle the background-finished batch when the parent turn ends (#6565).
+///
+/// A completed turn sends its own notice, which covers the shells and tasks
+/// that finished while it ran, so those are dropped rather than announced a
+/// second time. Whatever else was held for the turn is then flushed.
+pub(crate) fn settle_background_finished_at_turn_end(
+    app: &mut App,
+    config: &Config,
+    turn_completed: bool,
+) {
+    if turn_completed {
+        crate::tui::background_finished::drop_reported_by_turn(&mut app.background_finished);
+    }
+    flush_background_finished(app, config, true);
 }
 
 // Keyboard-shortcut predicates moved to `tui/key_shortcuts.rs`.
