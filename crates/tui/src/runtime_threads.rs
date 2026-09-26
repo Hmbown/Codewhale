@@ -13238,18 +13238,30 @@ impl RuntimeThreadManager {
                                         "response_redacted": true,
                                     }));
                                 } else {
+                                    // Durable receipt: credentials a tool
+                                    // printed are masked before they reach
+                                    // the item store or the event log (B1).
+                                    let content =
+                                        codewhale_config::persistence::redact_model_bound_secrets(
+                                            &output.content,
+                                        );
                                     item.summary = summarize_text(
-                                        &format!("{name}: {}", output.content),
+                                        &format!("{name}: {content}"),
                                         SUMMARY_LIMIT,
                                     );
-                                    item.detail = Some(output.content.clone());
+                                    item.detail = Some(content);
                                     // `detail` is now the tool output, so the
                                     // call identity persisted at start must be
                                     // carried through metadata. Mark the
                                     // terminal result too so restart history
                                     // rebuild can re-emit the paired
                                     // tool_call/tool_result (#5823).
-                                    let mut meta = match output.metadata {
+                                    // Tool metadata carries output too
+                                    // (`exec_shell` keeps stdout/stderr
+                                    // summaries), so it is masked the same way.
+                                    let mut meta = match output.metadata.as_ref().map(
+                                        codewhale_config::persistence::redact_json_model_bound_secrets,
+                                    ) {
                                         Some(Value::Object(map)) => Value::Object(map),
                                         _ => json!({}),
                                     };
@@ -13287,9 +13299,12 @@ impl RuntimeThreadManager {
                             }
                             Err(err) => {
                                 item.status = TurnItemLifecycleStatus::Failed;
+                                let err = codewhale_config::persistence::redact_model_bound_secrets(
+                                    &err.to_string(),
+                                );
                                 item.summary =
                                     summarize_text(&format!("{name} failed: {err}"), SUMMARY_LIMIT);
-                                item.detail = Some(err.to_string());
+                                item.detail = Some(err);
                             }
                         }
                         self.store.save_item(&item)?;
@@ -14030,7 +14045,8 @@ impl RuntimeThreadManager {
                             .await
                             .ok();
                             // Recorded and reported as a timeout, not the
-                            // operator's denial.
+                            // operator's denial; the engine refunds the call's
+                            // tool-call budget slot.
                             let _ = engine.deny_tool_call_timed_out(id).await;
                         }
                     }

@@ -1,5 +1,6 @@
 //! Embedded, loopback-only browser client for the Runtime API.
 
+use codewhale_core::secret_eq::constant_time_eq;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -184,18 +185,6 @@ fn valid_bootstrap_nonce(value: &str) -> bool {
     value.strip_prefix(BOOTSTRAP_PREFIX).is_some_and(|random| {
         random.len() == 32 && random.bytes().all(|byte| byte.is_ascii_hexdigit())
     })
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
 }
 
 fn secured_asset(content_type: &'static str, body: &'static str) -> Response {

@@ -1324,6 +1324,7 @@ mod tests {
     fn command_palette_skills_use_workspace_and_configured_directories() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let workspace_skill_dir = workspace
             .join(".agents")
             .join("skills")
@@ -1497,6 +1498,7 @@ mod tests {
         let workspace = tmp.path().join("workspace");
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
+        crate::config::save_workspace_trust(&workspace).expect("trust workspace");
         std::fs::write(
             commands_dir.join("review.md"),
             "---\ndescription: Review with context\nargument-hint: <path>\n---\nReview $ARGUMENTS",
@@ -1528,6 +1530,7 @@ mod tests {
     fn command_palette_uses_frontmatter_name_usage_and_arguments() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1591,6 +1594,7 @@ mod tests {
     fn hidden_frontmatter_name_override_suppresses_shadowed_builtin() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1618,6 +1622,7 @@ mod tests {
     fn command_palette_filters_shadowed_builtin_aliases_from_description() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1662,6 +1667,7 @@ mod tests {
         // command (its metadata and action), never the built-in row.
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1707,6 +1713,7 @@ mod tests {
         // matching the shared alias-aware contract.
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1745,6 +1752,7 @@ mod tests {
         // still owning the token (AT-008 boundary in the palette).
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(
@@ -1777,6 +1785,7 @@ mod tests {
         // from its description.
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let commands_dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&commands_dir).expect("create commands dir");
         std::fs::write(

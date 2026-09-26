@@ -1799,6 +1799,18 @@ impl CodewhaleClient {
         redact_model_bound_text(text, &self.model_bound_secret_values)
     }
 
+    /// Redact tool output as it enters the transcript. Same masking as the
+    /// request boundary, including the confirmed `[redaction] model_bound`
+    /// opt-out: a user who chose to let the model see file bytes verbatim
+    /// keeps that, and everyone else never stores a live credential.
+    pub(crate) fn redact_tool_output_for_transcript(&self, text: &str) -> String {
+        if self.model_bound_masking {
+            redact_model_bound_text(text, &self.model_bound_secret_values)
+        } else {
+            text.to_string()
+        }
+    }
+
     /// Alternate models share this client's frozen endpoint and declarations.
     /// Resolution still owns protocol admission, including closed rosters.
     pub(crate) fn resolve_model_route(&self, model: &str) -> Result<ReadyRouteCandidate> {

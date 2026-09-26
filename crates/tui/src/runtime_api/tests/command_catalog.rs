@@ -83,6 +83,13 @@ async fn get_v1_commands_serves_the_catalog_over_http() -> Result<()> {
     let commands_dir = workspace.join(".codewhale").join("commands");
     fs::create_dir_all(&commands_dir)?;
     fs::write(commands_dir.join("model.md"), "Pick the fast route.\n")?;
+    // Workspace commands load only in a trusted workspace. A sealed config
+    // path lets the server's threads read the same trust record.
+    let _config = crate::test_support::EnvVarGuard::set(
+        "CODEWHALE_CONFIG_PATH",
+        temp.path().join("config.toml"),
+    );
+    crate::test_support::trust_workspace(&workspace);
 
     let Some((addr, _runtime_threads, handle)) =
         spawn_test_server_with_root_token_mobile_workspace(

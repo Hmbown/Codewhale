@@ -13,7 +13,12 @@
 //!
 //! ## Precedence
 //!
-//! Workspace-local directories shadow user-global by name:
+//! Workspace-local directories load only in a trusted workspace (`/trust`),
+//! and a workspace command never replaces a protected built-in such as
+//! `/trust` or `/undo` (the definition is skipped with a load error; see
+//! `PROTECTED_BUILTINS` in `user_registry.rs`). Other built-ins stay
+//! shadowable. Workspace-local directories
+//! shadow user-global by name:
 //!
 //! 1. `<workspace>/.codewhale/commands/` (project-local, highest)
 //! 2. `<workspace>/.deepseek/commands/`  (legacy project-local)
@@ -50,18 +55,46 @@ fn legacy_global_commands_dir() -> PathBuf {
     home.join(".deepseek").join("commands")
 }
 
-/// Return all candidate commands directories in precedence order.
+/// The workspace whose repository-supplied commands and workflows may load:
+/// only a trusted one. A cloned repository's `.claude/commands/*.md` is text
+/// the user never reviewed, sent to the model as the user's own message.
+fn trusted_workspace(workspace: Option<&Path>) -> Option<&Path> {
+    workspace.filter(|ws| crate::config::is_workspace_trusted(ws))
+}
+
+/// Workspace-local command directories, trusted or not, in precedence order.
+pub(crate) fn workspace_commands_dirs(workspace: &Path) -> [PathBuf; 4] {
+    [
+        workspace.join(".codewhale").join("commands"),
+        workspace.join(".deepseek").join("commands"),
+        workspace.join(".claude").join("commands"),
+        workspace.join(".cursor").join("commands"),
+    ]
+}
+
+/// Return all candidate commands directories in precedence order. Workspace
+/// directories are included only when the workspace is trusted.
 pub(crate) fn commands_dirs(workspace: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(ws) = workspace {
-        dirs.push(ws.join(".codewhale").join("commands"));
-        dirs.push(ws.join(".deepseek").join("commands"));
-        dirs.push(ws.join(".claude").join("commands"));
-        dirs.push(ws.join(".cursor").join("commands"));
+    if let Some(ws) = trusted_workspace(workspace) {
+        dirs.extend(workspace_commands_dirs(ws));
     }
     dirs.push(global_commands_dir());
     dirs.push(legacy_global_commands_dir());
     dirs
+}
+
+/// Whether `path` came from the user's own global command or workflow store,
+/// as opposed to a workspace (repository) directory.
+pub(crate) fn is_user_global_command_source(path: &Path) -> bool {
+    let home = crate::config::effective_home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    [
+        global_commands_dir(),
+        legacy_global_commands_dir(),
+        home.join(".codewhale").join("workflows"),
+    ]
+    .iter()
+    .any(|dir| path.starts_with(dir))
 }
 
 /// Saved-workflow slash commands (#4121 packaging): `*.workflow.js` files
@@ -70,7 +103,7 @@ pub(crate) fn commands_dirs(workspace: Option<&Path>) -> Vec<PathBuf> {
 /// run's `args`. Workspace definitions shadow the user-global store.
 pub(crate) fn workflow_dirs(workspace: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(ws) = workspace {
+    if let Some(ws) = trusted_workspace(workspace) {
         dirs.push(ws.join(".codewhale").join("workflows"));
     }
     let home = crate::config::effective_home_dir().unwrap_or_else(|| PathBuf::from("~"));
@@ -363,6 +396,13 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Workspace commands load only in a trusted workspace.
+    fn trusted_workspace() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        crate::config::save_workspace_trust(tmp.path()).expect("trust test workspace");
+        tmp
+    }
+
     #[test]
     fn test_global_commands_dir_contains_codewhale_commands() {
         let dir = global_commands_dir();
@@ -414,7 +454,7 @@ mod tests {
 
     #[test]
     fn load_user_commands_scans_workspace_local_dir() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = trusted_workspace();
         let ws = tmp.path();
         let cmds_dir = ws.join(".codewhale").join("commands");
         write_command(&cmds_dir, "hello", "echo hi");
@@ -429,7 +469,7 @@ mod tests {
 
     #[test]
     fn load_user_commands_scans_claude_and_cursor_dirs() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = trusted_workspace();
         let ws = tmp.path();
         write_command(
             &ws.join(".claude").join("commands"),
@@ -456,7 +496,7 @@ mod tests {
 
     #[test]
     fn workspace_local_shadows_global_by_name() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = trusted_workspace();
         let ws = tmp.path();
 
         // Workspace-local version
@@ -501,7 +541,7 @@ mod tests {
         use crate::config::Config;
         use crate::tui::app::TuiOptions;
 
-        let tmp = TempDir::new().unwrap();
+        let tmp = trusted_workspace();
         let ws = tmp.path().to_path_buf();
         write_command(
             &ws.join(".deepseek").join("commands"),
@@ -528,7 +568,7 @@ mod tests {
     fn frontmatter_is_stripped_before_dispatch() {
         use crate::config::Config;
 
-        let tmp = TempDir::new().unwrap();
+        let tmp = trusted_workspace();
         let ws = tmp.path().to_path_buf();
         write_command(
             &ws.join(".deepseek").join("commands"),
@@ -584,7 +624,7 @@ mod tests {
     fn allowed_tools_frontmatter_sets_app_state() {
         use crate::config::Config;
 
-        let tmp = TempDir::new().unwrap();
+        let tmp = trusted_workspace();
         let ws = tmp.path().to_path_buf();
         write_command(
             &ws.join(".deepseek").join("commands"),
@@ -612,7 +652,7 @@ mod tests {
             return;
         }
 
-        let tmp = TempDir::new().unwrap();
+        let tmp = trusted_workspace();
         let ws = tmp.path().to_path_buf();
         let init = std::process::Command::new("git")
             .args(["-C", ws.to_str().unwrap(), "init"])
@@ -656,7 +696,7 @@ mod tests {
     fn new_user_command_clears_stale_paused_state() {
         use crate::config::Config;
 
-        let tmp = TempDir::new().unwrap();
+        let tmp = trusted_workspace();
         let ws = tmp.path().to_path_buf();
         let commands_dir = ws.join(".codewhale").join("commands");
         write_command(
@@ -684,7 +724,7 @@ mod tests {
         use crate::tools::plan::UpdatePlanArgs;
         use crate::tools::todo::TodoStatus;
 
-        let tmp = TempDir::new().unwrap();
+        let tmp = trusted_workspace();
         let ws = tmp.path().to_path_buf();
         let commands_dir = ws.join(".codewhale").join("commands");
         write_command(&commands_dir, "first", "first command body");
@@ -738,7 +778,7 @@ mod tests {
     fn review_regression_empty_allowed_tools_blocks_all_tools() {
         use crate::config::Config;
 
-        let tmp = TempDir::new().unwrap();
+        let tmp = trusted_workspace();
         let ws = tmp.path().to_path_buf();
         write_command(
             &ws.join(".deepseek").join("commands"),
@@ -755,7 +795,7 @@ mod tests {
     fn review_regression_allowed_tools_accepts_per_item_quotes() {
         use crate::config::Config;
 
-        let tmp = TempDir::new().unwrap();
+        let tmp = trusted_workspace();
         let ws = tmp.path().to_path_buf();
         write_command(
             &ws.join(".deepseek").join("commands"),
@@ -775,7 +815,7 @@ mod tests {
     fn review_regression_dispatch_without_frontmatter_resets_previous_command_state() {
         use crate::config::Config;
 
-        let tmp = TempDir::new().unwrap();
+        let tmp = trusted_workspace();
         let ws = tmp.path().to_path_buf();
         let commands_dir = ws.join(".deepseek").join("commands");
         write_command(
@@ -813,7 +853,7 @@ mod tests {
     fn description_frontmatter_sets_work_objective_and_autocomplete_description() {
         use crate::config::Config;
 
-        let tmp = TempDir::new().unwrap();
+        let tmp = trusted_workspace();
         let ws = tmp.path().to_path_buf();
         write_command(
             &ws.join(".deepseek").join("commands"),

@@ -330,9 +330,20 @@ impl SkillRootCatalog {
     ) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
+        // Repository-supplied skills are instructions the user never
+        // reviewed; they load only once the workspace is trusted. Resolved
+        // lazily so a workspace without project skill dirs never reads config.
+        let mut workspace_trusted = None;
 
         for root in &self.roots {
             if !root.active_for_runtime {
+                continue;
+            }
+            if root.scope == SkillScope::Project
+                && path_is_existing_dir(&root.path)
+                && !*workspace_trusted
+                    .get_or_insert_with(|| crate::config::is_workspace_trusted(workspace))
+            {
                 continue;
             }
             match mode {
@@ -406,6 +417,28 @@ impl SkillRootCatalog {
             })
             .collect()
     }
+}
+
+/// Project skill directories that exist but were not loaded because the
+/// workspace is not trusted, so discovery can say so instead of dropping them
+/// silently.
+#[must_use]
+pub fn untrusted_project_skill_dirs(workspace: &Path, home_dir: Option<&Path>) -> Vec<PathBuf> {
+    let catalog = SkillRootCatalog::build(workspace, home_dir, None);
+    let present: Vec<PathBuf> = catalog
+        .roots
+        .iter()
+        .filter(|root| {
+            root.scope == SkillScope::Project
+                && root.active_for_runtime
+                && path_is_existing_dir(&root.path)
+        })
+        .map(|root| root.path.clone())
+        .collect();
+    if present.is_empty() || crate::config::is_workspace_trusted(workspace) {
+        return Vec::new();
+    }
+    present
 }
 
 /// Resolve candidate skill directories for runtime discovery (existing paths
@@ -739,6 +772,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("ws");
         let home = tmp.path().join("home");
+        crate::test_support::trust_workspace(&workspace);
         write_dir(&workspace.join(".agents").join("skills"));
         write_dir(&workspace.join("skills"));
         write_dir(&workspace.join(".claude").join("skills"));
@@ -798,6 +832,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("ws");
         let home = tmp.path().join("home");
+        crate::test_support::trust_workspace(&workspace);
         write_dir(&workspace.join(".agents").join("skills"));
         write_dir(&workspace.join(".codewhale").join("skills"));
         write_dir(&home.join(".codewhale").join("skills"));

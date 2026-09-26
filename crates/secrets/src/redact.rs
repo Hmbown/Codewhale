@@ -245,6 +245,10 @@ fn redact_line(line: &str, policy: RedactionPolicy) -> String {
             changed = true;
             masked.push(word.replace(trimmed, REDACTED));
             spaced = SpacedAssignment::None;
+        } else if let Some(redacted) = redact_structured_word(trimmed, policy) {
+            changed = true;
+            masked.push(word.replace(trimmed, &redacted));
+            spaced = SpacedAssignment::None;
         } else {
             masked.push(word.to_string());
             spaced = spaced.advance(trimmed);
@@ -301,6 +305,52 @@ impl SpacedAssignment {
         }
         Self::None
     }
+}
+
+/// Compact JSON and query strings (`{"tokens":{"access_token":"eyJ…"}}`,
+/// `curl`, `jq -c`, `?access_token=…&x=1`) carry no spaces, so the word pass
+/// sees the whole document as one word whose first separator belongs to a
+/// harmless key. Split such a word on its structure and offer every member to
+/// the same keyed and bare-token checks; the delimiters are kept byte-exact.
+fn redact_structured_word(word: &str, policy: RedactionPolicy) -> Option<String> {
+    const DELIMITERS: [char; 7] = ['{', '}', '[', ']', ',', '&', '?'];
+    if !word.contains(DELIMITERS) {
+        return None;
+    }
+    let mut out = String::with_capacity(word.len());
+    let mut changed = false;
+    let mut start = 0;
+    for (idx, ch) in word.match_indices(DELIMITERS) {
+        changed |= push_structured_segment(&mut out, &word[start..idx], policy);
+        out.push_str(ch);
+        start = idx + ch.len();
+    }
+    changed |= push_structured_segment(&mut out, &word[start..], policy);
+    changed.then_some(out)
+}
+
+fn push_structured_segment(out: &mut String, segment: &str, policy: RedactionPolicy) -> bool {
+    // A value an earlier pass already masked (`?token=***`) stays as it is.
+    let already_masked = segment.split_once(['=', ':']).is_some_and(|(_, value)| {
+        let (core, _) = strip_value_quotes(value);
+        !core.is_empty() && core.chars().all(|c| c == '*')
+    });
+    if segment.is_empty() || already_masked {
+        out.push_str(segment);
+        return false;
+    }
+    if let Some(redacted) = redact_inline_keyed_assignment(segment, policy) {
+        out.push_str(&redacted);
+        return true;
+    }
+    let (core, _) = strip_value_quotes(segment);
+    let core = core.trim_end_matches(['"', '\'']);
+    if !core.is_empty() && (looks_like_secret_token(core) || is_jwt_shaped(core)) {
+        out.push_str(&segment.replacen(core, REDACTED, 1));
+        return true;
+    }
+    out.push_str(segment);
+    false
 }
 
 fn trim_word_punctuation(word: &str) -> &str {

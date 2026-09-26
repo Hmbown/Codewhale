@@ -1998,6 +1998,7 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let _home = ScopedHome::set(tmp.path().join("home"));
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let configured_dir = tmp.path().join("configured-skills");
         write_test_skill(
             &workspace.join(".claude").join("skills"),

@@ -3,6 +3,7 @@ use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use codewhale_core::secret_eq::constant_time_eq;
 use serde_json::json;
 
 use super::{RuntimeApiState, mobile};
@@ -120,17 +121,17 @@ pub(super) fn request_has_header_runtime_token(req: &Request, expected: &str) ->
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|raw| raw.strip_prefix("Bearer "))
-        .is_some_and(|token| token == expected)
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
         || req
             .headers()
             .get("x-codewhale-runtime-token")
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|token| token == expected)
+            .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
         || req
             .headers()
             .get("x-deepseek-runtime-token")
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|token| token == expected)
+            .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
 }
 
 /// The web bootstrap adds cookie authentication to the existing bearer/header

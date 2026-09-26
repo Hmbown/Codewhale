@@ -14593,9 +14593,14 @@ fn create_managed_skill(root_dir: &std::path::Path, name: &str) -> Result<(PathB
 
 #[tokio::test]
 async fn skill_lifecycle_uninstall_removes_installed_skill() -> Result<()> {
+    let _env = lock_test_env();
     let tmp = tempfile::tempdir()?;
     let root = tmp.path().join("runtime");
     let workspace = tmp.path().to_path_buf();
+    // Project skills load only in a trusted workspace; a sealed config path
+    // lets the server's threads read the same trust record.
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", tmp.path().join("config.toml"));
+    crate::test_support::trust_workspace(&workspace);
     let sessions_dir = root.join("sessions");
     fs::create_dir_all(&root)?;
 

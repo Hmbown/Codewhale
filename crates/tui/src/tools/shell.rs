@@ -6628,6 +6628,11 @@ impl ToolSpec for NoteTool {
         file.write_all(format!("\n---\n{note_content}\n").as_bytes())
             .await
             .map_err(|e| ToolError::execution_failed(format!("Failed to write note: {e}")))?;
+        // tokio's File finishes a write on a background thread; report
+        // success only once the bytes reached the file.
+        file.flush()
+            .await
+            .map_err(|e| ToolError::execution_failed(format!("Failed to write note: {e}")))?;
 
         Ok(ToolResult::success(format!(
             "Note appended to {}",

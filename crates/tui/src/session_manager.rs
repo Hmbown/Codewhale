@@ -1546,6 +1546,19 @@ impl SessionManager {
         write().map(Some)
     }
 
+    /// Run an out-of-band rewrite of a session's files (`scrub-secrets`)
+    /// under the same per-session lock every save takes, so it cannot
+    /// interleave with a live session's save. `None` when the session was
+    /// deleted; an invalid id is an `InvalidInput` error.
+    pub(crate) fn with_session_file_lock<T>(
+        &self,
+        session_id: &str,
+        rewrite: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<Option<T>> {
+        let session_id = self.validated_session_id(session_id)?;
+        self.with_session_write_admission(session_id, rewrite)
+    }
+
     /// Serialize active accounting admission with deletion of its origin.
     /// A retired origin is handled without running the callback. Callers must
     /// release this boundary before attempting a late-usage append, which

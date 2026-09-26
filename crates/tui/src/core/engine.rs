@@ -3784,9 +3784,43 @@ impl Engine {
         Some(format!("Active goal token budget: {token_budget}"))
     }
 
-    async fn add_session_message(&mut self, message: Message) {
+    async fn add_session_message(&mut self, mut message: Message) {
+        self.redact_tool_results_for_transcript(&mut message);
         self.session.add_message(message);
         self.emit_session_updated().await;
+    }
+
+    /// Scrub credentials from tool output once, as it enters the transcript
+    /// (B1). The transcript is what session JSON, the journal and every
+    /// later request are built from, so a token a tool printed is never
+    /// written to disk live. Honors the confirmed `[redaction] model_bound`
+    /// opt-out the same way the request boundary does.
+    fn redact_tool_results_for_transcript(&self, message: &mut Message) {
+        for block in &mut message.content {
+            let ContentBlock::ToolResult {
+                content,
+                content_blocks,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            *content = self.redact_tool_output_for_transcript(content);
+            for value in content_blocks.iter_mut().flatten() {
+                if value.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    && let Some(serde_json::Value::String(text)) = value.get_mut("text")
+                {
+                    *text = self.redact_tool_output_for_transcript(text);
+                }
+            }
+        }
+    }
+
+    fn redact_tool_output_for_transcript(&self, text: &str) -> String {
+        match self.codewhale_client.as_ref() {
+            Some(client) => client.redact_tool_output_for_transcript(text),
+            None => codewhale_config::persistence::redact_model_bound_secrets(text),
+        }
     }
 
     async fn add_interrupted_assistant_text(&mut self, text: &str) {

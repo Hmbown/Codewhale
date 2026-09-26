@@ -4390,6 +4390,10 @@ impl Engine {
                                 }
                             }
                             Ok(ApprovalResult::Denied) => {
+                                // A refused call never executes: hand its
+                                // admission slot back (#5170 covers gates
+                                // at planning time; approval is the last).
+                                nested_gate_env.tool_call_budget.refund();
                                 emit_tool_audit(json!({
                                     "event": "tool.approval_decision",
                                     "tool_id": tool_id.clone(),
@@ -4414,6 +4418,17 @@ impl Engine {
                                     None,
                                 )
                             }
+                            Ok(ApprovalResult::TimedOut) => {
+                                nested_gate_env.tool_call_budget.refund();
+                                emit_tool_audit(json!({
+                                    "event": "tool.approval_decision",
+                                    "tool_id": tool_id.clone(),
+                                    "tool_name": tool_name.clone(),
+                                    "decision": "timeout",
+                                    "caller": caller_type_for_tool_use(tool_caller.as_ref()),
+                                }));
+                                (Some(Err(approval_timed_out_error(&tool_name))), None, None)
+                            }
                             Ok(ApprovalResult::RetryWithPolicy(policy)) => {
                                 emit_tool_audit(json!({
                                     "event": "tool.approval_decision",
@@ -4432,7 +4447,11 @@ impl Engine {
                                     Some(ToolApprovalStamp::ApprovedWithPolicy),
                                 )
                             }
-                            Err(err) => (Some(Err(err)), None, None),
+                            Err(err) => {
+                                // Cancelled or unavailable: the call never ran.
+                                nested_gate_env.tool_call_budget.refund();
+                                (Some(Err(err)), None, None)
+                            }
                         }
                     } else {
                         (None, None, None)
@@ -4874,6 +4893,12 @@ impl Engine {
                         plan.name
                     ))),
                 ),
+                // An expired approval card is not a denial: the user never
+                // answered, and the model is told so.
+                Ok(ApprovalResult::TimedOut) => (
+                    NestedDecision::TimedOut,
+                    Some(approval_timed_out_error(&plan.name)),
+                ),
                 Err(error) => (NestedDecision::Refused, Some(error)),
             };
             emit_tool_audit(json!({
@@ -4885,6 +4910,9 @@ impl Engine {
                 "parent_tool_id": parent_id,
             }));
             if let Some(error) = refusal {
+                // Admitted by planning but never executed: hand the slot
+                // back, as a direct call's refused approval does.
+                nested_gate_env.tool_call_budget.refund();
                 return NestedCallVerdict::Refused { error, decision };
             }
             decision
@@ -7048,6 +7076,17 @@ pub(super) fn resolve_auto_effort(
         Some(other) => Some(other.to_string()),
         None => None,
     }
+}
+
+/// The error a call gets when its approval card expired unanswered. It must
+/// not read as a refusal: the user never saw or never answered the card, so
+/// the model is told to ask again rather than to treat the idea as rejected.
+fn approval_timed_out_error(tool_name: &str) -> ToolError {
+    ToolError::execution_failed(format!(
+        "Tool '{tool_name}' did not run: its approval request timed out with no answer. \
+         The user did not deny it. Do not retry it blindly; say what you intended and \
+         wait for the user to approve or give new instructions."
+    ))
 }
 
 #[cfg(test)]

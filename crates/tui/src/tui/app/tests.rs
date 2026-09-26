@@ -2823,6 +2823,7 @@ fn new_caches_workspace_skills_for_slash_menu() {
 fn cached_skills_merges_across_candidate_directories() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
 
     // Higher-precedence directory contains a stale empty dir for `foo`
     // (no SKILL.md). This used to shadow the real definition further
@@ -2973,6 +2974,7 @@ fn cached_skills_include_configured_directory() {
 fn cached_skills_preserve_configured_directory_in_codewhale_only_scan() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
 
     let codewhale_skill_dir = workspace
         .join(".codewhale")

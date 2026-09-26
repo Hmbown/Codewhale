@@ -79,6 +79,9 @@ pub(super) enum ApprovalResult {
     Approved,
     /// User denied the tool execution.
     Denied,
+    /// The approval card expired unanswered. Nobody refused the call, so it
+    /// is reported as a timeout — never as "denied by user".
+    TimedOut,
     /// User requested retry with an elevated sandbox policy.
     RetryWithPolicy(crate::sandbox::SandboxPolicy),
 }
@@ -239,7 +242,7 @@ impl Engine {
                         }
                         ApprovalDecision::TimedOut { id } if id == tool_id => {
                             self.commit_approval_outcome(tool_id, ApprovalOutcome::Timeout).await?;
-                            return Ok(ApprovalResult::Denied);
+                            return Ok(ApprovalResult::TimedOut);
                         }
                         ApprovalDecision::Unavailable { id } if id == tool_id => {
                             self.commit_approval_outcome(tool_id, ApprovalOutcome::Unavailable).await?;
@@ -1565,7 +1568,7 @@ mod tests {
                     assert!(matches!(result, Ok(ApprovalResult::Denied)));
                 }
                 ApprovalOutcome::Timeout => {
-                    assert!(matches!(result, Ok(ApprovalResult::Denied)));
+                    assert!(matches!(result, Ok(ApprovalResult::TimedOut)));
                 }
                 ApprovalOutcome::Cancelled => assert!(result.is_err()),
                 ApprovalOutcome::RetryWithPolicy { .. } => {

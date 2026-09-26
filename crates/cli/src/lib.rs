@@ -338,8 +338,9 @@ New integrations should prefer `codewhale app-server`.")]
     Web(WebArgs),
     /// Sign in to your Codewhale account (browser device flow).
     Login(LoginArgs),
-    /// Remove saved authentication state.
-    Logout,
+    /// Remove saved authentication state (every provider key, OAuth login,
+    /// the account session and the Daytona token). Asks before deleting.
+    Logout(LogoutArgs),
     /// Manage authentication credentials and provider mode.
     Auth(AuthArgs),
     /// Sign in to your Codewhale account and manage account-scoped provider keys.
@@ -1520,6 +1521,13 @@ fn remote_setup_tui_args(args: RemoteSetupArgs) -> Vec<String> {
 }
 
 #[derive(Debug, Args)]
+struct LogoutArgs {
+    /// Delete without the confirmation prompt (required when stdin is not a terminal).
+    #[arg(long, short = 'y', default_value_t = false)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
 struct LoginArgs {
     /// Print the verification URL without trying to open a browser.
     #[arg(long, default_value_t = false)]
@@ -2210,7 +2218,10 @@ fn run() -> Result<()> {
                 &store,
             )
         }
-        Some(Commands::Logout) => run_logout_command(&mut store, cli.profile.as_deref()),
+        Some(Commands::Logout(args)) => {
+            confirm_logout(args.yes)?;
+            run_logout_command(&mut store, cli.profile.as_deref())
+        }
         Some(Commands::Auth(args)) => match args.command {
             AuthCommand::XaiDevice => {
                 let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
@@ -2577,6 +2588,37 @@ fn reject_legacy_login_provider_args(args: &LoginArgs) -> Result<()> {
          To configure a provider key, run `codewhale auth set --provider <provider>` (hidden prompt) \
          or `codewhale auth set --provider <provider> --api-key-stdin`."
     )
+}
+
+const LOGOUT_CONFIRM_PROMPT: &str = "This deletes every saved provider API key and OAuth login, \
+the Codewhale account session and the Daytona token. Type 'yes' to log out: ";
+
+/// `codewhale logout` wipes every provider credential at once, so it must not
+/// run on a stray keystroke. Non-interactive callers opt in with `--yes`.
+fn confirm_logout(yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        bail!(
+            "logout would delete every saved provider key; nothing was deleted. \
+             Re-run with --yes to confirm non-interactively."
+        );
+    }
+    confirm_logout_answer(&mut io::stdin().lock(), &mut io::stderr().lock())
+}
+
+fn confirm_logout_answer(reader: &mut impl io::BufRead, writer: &mut impl io::Write) -> Result<()> {
+    write!(writer, "{LOGOUT_CONFIRM_PROMPT}")?;
+    writer.flush()?;
+    let mut answer = String::new();
+    reader
+        .read_line(&mut answer)
+        .context("reading logout confirmation")?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "yes" | "y") {
+        bail!("logout cancelled; no credentials were deleted");
+    }
+    Ok(())
 }
 
 fn run_logout_command(store: &mut ConfigStore, profile: Option<&str>) -> Result<()> {
@@ -10110,6 +10152,38 @@ verbosity = "project-imported"
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn logout_confirmation_accepts_only_an_explicit_yes() {
+        let mut out = Vec::new();
+        confirm_logout_answer(&mut std::io::Cursor::new("yes\n"), &mut out).expect("yes confirms");
+        assert!(String::from_utf8_lossy(&out).contains("Type 'yes' to log out"));
+        confirm_logout_answer(&mut std::io::Cursor::new("Y\n"), &mut Vec::new())
+            .expect("y confirms");
+        for answer in ["\n", "no\n", "", "yess\n"] {
+            let err = confirm_logout_answer(&mut std::io::Cursor::new(answer), &mut Vec::new())
+                .expect_err("anything else cancels");
+            assert!(
+                err.to_string().contains("no credentials were deleted"),
+                "{err}"
+            );
+        }
+        assert!(confirm_logout(true).is_ok(), "--yes skips the prompt");
+    }
+
+    #[test]
+    fn logout_parses_yes_flag() {
+        let cli = parse_ok(&["codewhale", "logout", "--yes"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Logout(LogoutArgs { yes: true }))
+        ));
+        let cli = parse_ok(&["codewhale", "logout"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Logout(LogoutArgs { yes: false }))
+        ));
     }
 
     #[test]

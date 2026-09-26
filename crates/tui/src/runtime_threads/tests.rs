@@ -19254,6 +19254,102 @@ async fn canonical_sessions_root_is_resolved_off_the_ui_runtime_and_cached() -> 
     Ok(())
 }
 
+/// B1: a credential a tool printed is masked in the durable tool item (and
+/// the event log built from it) on Runtime API threads, as it is in the
+/// engine transcript.
+#[tokio::test]
+async fn runtime_tool_items_store_tool_output_with_credentials_masked() -> Result<()> {
+    const TOKEN: &str = "sk-ant-oat01-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefghij";
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            trust_mode: Some(true),
+            auto_approve: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "print the auth file".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
+    harness
+        .tx_event
+        .send(EngineEvent::TurnStarted {
+            turn_id: turn.id.clone(),
+            created_at: Utc::now(),
+            route: None,
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallStarted {
+            id: "tool-cat-auth".to_string(),
+            name: "exec_command".to_string(),
+            input: json!({"cmd": "cat auth.json"}),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallComplete {
+            id: "tool-cat-auth".to_string(),
+            name: "exec_command".to_string(),
+            // Real `exec_shell` metadata shape: the summaries carry the
+            // first stdout line, here compact JSON as `jq -c` prints it.
+            result: Ok(crate::tools::spec::ToolResult::success(format!(
+                "{{\n  \"access_token\": \"{TOKEN}\",\n  \"note\": \"keep me\"\n}}\n"
+            ))
+            .with_metadata(json!({
+                "exit_code": 0,
+                "summary": format!("{{\"tokens\":{{\"access_token\":\"{TOKEN}\"}}}}"),
+                "stdout_summary": format!("{{\"tokens\":{{\"access_token\":\"{TOKEN}\"}}}}"),
+                "stderr_summary": format!("export OPENAI_API_KEY={TOKEN}"),
+                "stdout_len": 120,
+            }))),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    wait_for_terminal_turn(&manager, &turn.id).await?;
+
+    let items = manager.store.list_items_for_turn(&turn.id)?;
+    let tool_item = items
+        .iter()
+        .find(|item| {
+            item.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("keep me"))
+        })
+        .context("the tool item keeps its ordinary output")?;
+    let stored = serde_json::to_string(tool_item)?;
+    assert!(!stored.contains(TOKEN), "{stored}");
+    let metadata = tool_item.metadata.as_ref().context("tool metadata kept")?;
+    assert_eq!(metadata["stdout_len"], 120, "ordinary metadata survives");
+    assert_eq!(metadata["exit_code"], 0);
+    let events = serde_json::to_string(&manager.events_since(&thread.id, None)?)?;
+    assert!(!events.contains(TOKEN), "the event log holds no live token");
+    Ok(())
+}
+
 /// B3: Runtime API approvals (GPUI, web) follow the one approval clock,
 /// `[approval] timeout_seconds`. Unset, nothing denies on the user's behalf;
 /// `[tools] user_input_timeout_seconds` no longer bounds approvals.

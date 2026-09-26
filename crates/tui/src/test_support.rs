@@ -398,6 +398,14 @@ pub(crate) fn assert_byte_identical(label: &str, a: &str, b: &str) {
 // than hidden inside another near-identical literal.
 
 /// Default `TuiOptions` for tests, pinned to the deepseek-v4-pro fixture route.
+/// Mark `workspace` trusted in the test's config, creating it first so the
+/// trust key is the canonical path. Repository-supplied commands and skills
+/// load only in a trusted workspace.
+pub(crate) fn trust_workspace(workspace: &Path) {
+    std::fs::create_dir_all(workspace).expect("create test workspace");
+    crate::config::save_workspace_trust(workspace).expect("trust test workspace");
+}
+
 pub(crate) fn test_tui_options(workspace: impl AsRef<Path>) -> crate::tui::app::TuiOptions {
     let workspace = workspace.as_ref().to_path_buf();
     crate::tui::app::TuiOptions {

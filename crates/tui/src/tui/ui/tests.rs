@@ -18007,6 +18007,8 @@ fn apply_slash_menu_selection_honors_user_argument_metadata_and_builtin_override
         "---\narguments: <path>\n---\ninspect",
     )
     .expect("write argument command");
+    // Workspace commands load only in a trusted workspace.
+    crate::config::save_workspace_trust(tmp.path()).expect("trust test workspace");
     let mut app = create_test_app();
     app.workspace = tmp.path().to_path_buf();
     let entries = vec![

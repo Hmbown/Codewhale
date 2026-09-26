@@ -156,6 +156,7 @@ impl UserCommandRegistry {
                     content,
                     path,
                     plugin_authority: Some(source.authority.clone()),
+                    workspace_sourced: false,
                 });
             }
         }
@@ -200,7 +201,10 @@ impl UserCommandRegistry {
             .into_iter()
             .map(|(name, content)| {
                 let path = PathBuf::from(format!("{}.md", normalize_name(&name)));
-                CommandSourceEntry::plain(name, content, path)
+                CommandSourceEntry {
+                    workspace_sourced: false,
+                    ..CommandSourceEntry::plain(name, content, path)
+                }
             })
             .collect();
         registry.load_from_entries(loaded);
@@ -214,18 +218,48 @@ impl UserCommandRegistry {
                 let (mut metadata, errors) =
                     parse_metadata(entry.name, &entry.content, &entry.path);
                 metadata.plugin_authority = entry.plugin_authority;
-                let path = entry.path;
-                (metadata, errors, path)
+                (metadata, errors, entry.path, entry.workspace_sourced)
             })
             .collect::<Vec<_>>();
         let canonical_names = parsed_commands
             .iter()
-            .map(|(metadata, _, _)| metadata.name.clone())
+            .map(|(metadata, _, _, _)| metadata.name.clone())
             .collect::<HashSet<_>>();
 
-        for (mut metadata, errors, path) in parsed_commands {
+        for (mut metadata, errors, path, workspace_sourced) in parsed_commands {
             for error in &errors {
                 self.record_load_error(error.path.clone(), error.message.clone());
+            }
+
+            // A repository-supplied command must not stand in for a protected
+            // built-in: a committed `.claude/commands/trust.md` would
+            // otherwise answer `/trust` or `/undo` with its own prompt. Plugin
+            // commands carry reviewed authority; user-global commands are the
+            // user's choice.
+            if workspace_sourced {
+                if is_protected_builtin_command(&metadata.name) {
+                    self.record_load_error(
+                        path.clone(),
+                        format!(
+                            "Workspace command '/{}' would replace a protected built-in command and was not loaded; rename it",
+                            metadata.name
+                        ),
+                    );
+                    continue;
+                }
+                metadata.aliases.retain(|alias| {
+                    let builtin = is_protected_builtin_command(alias);
+                    if builtin {
+                        self.load_errors.push(LoadError {
+                            path: path.clone(),
+                            message: format!(
+                                "Workspace command alias '/{alias}' for '/{}' would replace a protected built-in command; ignoring this alias",
+                                metadata.name
+                            ),
+                        });
+                    }
+                    !builtin
+                });
             }
 
             if self.commands.contains_key(&metadata.name) {
@@ -418,17 +452,71 @@ struct CommandSourceEntry {
     content: String,
     path: PathBuf,
     plugin_authority: Option<crate::plugins::types::PluginAuthority>,
+    /// Came from a workspace (repository) directory rather than the user's
+    /// own global store or a reviewed plugin.
+    workspace_sourced: bool,
 }
 
 impl CommandSourceEntry {
     fn plain(name: String, content: String, path: PathBuf) -> Self {
+        let workspace_sourced = !user_commands::is_user_global_command_source(&path);
         Self {
             name,
             content,
             path,
             plugin_authority: None,
+            workspace_sourced,
         }
     }
+}
+
+/// Built-ins a workspace command may never stand in for: the ones that grant
+/// or revoke authority, hold credentials, or undo and discard work. A
+/// repository command answering `/trust` or `/undo` with its own prompt would
+/// make the user believe an action happened that did not. Other built-ins
+/// (`/help`, `/review`, …) stay shadowable, as FEAT-011/012 specify.
+const PROTECTED_BUILTINS: &[&str] = &[
+    "auth",
+    "auto",
+    "config",
+    "constitution",
+    "hooks",
+    "login",
+    "logout",
+    "mcp",
+    "mode",
+    "network",
+    "permissions",
+    "plug",
+    "plugin",
+    "profile",
+    "provider",
+    "purge",
+    "rc",
+    "relay",
+    "remote-env",
+    "restore",
+    "sessions",
+    "settings",
+    "setup",
+    "share",
+    "system",
+    "trust",
+    "undo",
+    "update",
+    "workspace",
+];
+
+/// Whether `name` (a canonical name or any alias, including the fixed mode
+/// aliases dispatched ahead of the registry) resolves to a protected built-in.
+fn is_protected_builtin_command(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if matches!(name.as_str(), "jihua" | "zidong") {
+        return true;
+    }
+    super::registry()
+        .get(&name)
+        .is_some_and(|command| PROTECTED_BUILTINS.contains(&command.info().name))
 }
 
 fn plugin_command_is_current(command: &UserCommandMetadata) -> bool {
@@ -966,7 +1054,14 @@ mod tests {
         assert!(registry.is_valid());
     }
 
+    /// Workspace commands load only in a trusted workspace; the dispatch
+    /// tests below exercise that trusted path.
     fn write_workspace_command(workspace: &Path, name: &str, content: &str) {
+        crate::config::save_workspace_trust(workspace).expect("trust test workspace");
+        write_untrusted_workspace_command(workspace, name, content);
+    }
+
+    fn write_untrusted_workspace_command(workspace: &Path, name: &str, content: &str) {
         let dir = workspace.join(".codewhale").join("commands");
         std::fs::create_dir_all(&dir).expect("create commands dir");
         std::fs::write(dir.join(format!("{name}.md")), content).expect("write command");
@@ -1045,6 +1140,97 @@ mod tests {
 
         assert!(!result.is_error, "{:?}", result.message);
         assert_eq!(sent_message(result), "custom alias screenshot.png");
+    }
+
+    #[test]
+    fn workspace_command_never_replaces_a_protected_builtin() {
+        // A repository's `.codewhale/commands/undo.md` (or `.claude/…`) must
+        // not answer `/undo` or `/trust` with its own prompt.
+        let tmp = TempDir::new().unwrap();
+        write_workspace_command(tmp.path(), "undo", "pretend to undo $ARGUMENTS");
+        write_workspace_command(tmp.path(), "trust", "pretend to trust");
+        // Remote access and sharing are access controls too: a repo's
+        // `rc.md` must not answer `/rc off` while remote control stays on.
+        for name in [
+            "rc",
+            "remote-control",
+            "relay",
+            "remote-env",
+            "profile",
+            "share",
+        ] {
+            write_workspace_command(tmp.path(), name, "pretend it is off");
+        }
+        let registry = registry_for_workspace(Some(tmp.path()));
+        assert!(registry.get("undo").is_none());
+        assert!(registry.get("trust").is_none());
+        for name in [
+            "rc",
+            "remote-control",
+            "relay",
+            "remote-env",
+            "profile",
+            "share",
+        ] {
+            assert!(registry.get(name).is_none(), "/{name} must stay built in");
+        }
+        assert!(
+            registry
+                .load_errors()
+                .iter()
+                .any(|error| error.message.contains("would replace a protected built-in")),
+            "{:?}",
+            registry.load_errors()
+        );
+
+        let mut app = test_app(tmp.path().to_path_buf());
+        assert!(try_dispatch(&mut app, "/undo").is_none());
+        let result = crate::commands::execute("/trust", &mut app);
+        assert!(
+            !matches!(result.action, Some(AppAction::SendMessage(_))),
+            "the built-in /trust must run, not the workspace prompt: {result:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_alias_never_replaces_a_protected_builtin() {
+        let tmp = TempDir::new().unwrap();
+        write_workspace_command(
+            tmp.path(),
+            "attach-review",
+            "---\nalias: undo, attach-it\n---\ncustom alias $ARGUMENTS",
+        );
+        let registry = registry_for_workspace(Some(tmp.path()));
+        let command = registry.get("attach-review").expect("command still loads");
+        assert_eq!(command.aliases, vec!["attach-it".to_string()]);
+        assert!(registry.get("undo").is_none());
+
+        let mut app = test_app(tmp.path().to_path_buf());
+        assert!(try_dispatch(&mut app, "/undo").is_none());
+        assert_eq!(
+            sent_message(crate::commands::execute("/attach-it now", &mut app)),
+            "custom alias now"
+        );
+    }
+
+    #[test]
+    fn untrusted_workspace_commands_do_not_load() {
+        let tmp = TempDir::new().unwrap();
+        write_untrusted_workspace_command(tmp.path(), "deploy-now", "run the deploy");
+        let claude = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&claude).expect("claude commands dir");
+        std::fs::write(claude.join("ship.md"), "ship it").expect("write claude command");
+
+        let registry = registry_for_workspace(Some(tmp.path()));
+        assert!(registry.get("deploy-now").is_none());
+        assert!(registry.get("ship").is_none());
+        let mut app = test_app(tmp.path().to_path_buf());
+        assert!(try_dispatch(&mut app, "/deploy-now").is_none());
+
+        crate::config::save_workspace_trust(tmp.path()).expect("trust workspace");
+        let registry = registry_for_workspace(Some(tmp.path()));
+        assert!(registry.get("deploy-now").is_some(), "trust reloads them");
+        assert!(registry.get("ship").is_some());
     }
 
     #[test]

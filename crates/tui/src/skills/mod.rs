@@ -1071,7 +1071,34 @@ pub fn discover_in_workspace_with_mode_and_plugins(
     mode: SkillDiscoveryMode,
     plugins: Option<&crate::plugins::PluginRegistry>,
 ) -> SkillRegistry {
-    discover_from_directories_with_plugins(skills_directories_for_mode(workspace, mode), plugins)
+    let registry = discover_from_directories_with_plugins(
+        skills_directories_for_mode(workspace, mode),
+        plugins,
+    );
+    with_untrusted_project_skills_warning(registry, workspace)
+}
+
+/// Name the project skill directories an untrusted workspace kept out, so
+/// `/skills` and the model see why a repository's skills are missing.
+fn with_untrusted_project_skills_warning(
+    mut registry: SkillRegistry,
+    workspace: &Path,
+) -> SkillRegistry {
+    let home = crate::config::effective_home_dir();
+    let skipped = roots::untrusted_project_skill_dirs(workspace, home.as_deref());
+    if !skipped.is_empty() {
+        let dirs = skipped
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Not `push_warning`: discovery runs per turn, and this state is
+        // expected until the user trusts the workspace, so it is not logged.
+        registry.warnings.push(format!(
+            "Project skills in {dirs} were not loaded: this workspace is not trusted. Run /trust to load them."
+        ));
+    }
+    registry
 }
 
 /// Discover skills from the workspace search set plus the configured install
@@ -1087,7 +1114,8 @@ pub fn discover_for_workspace_and_dir_with_mode_and_plugins(
     plugins: Option<&crate::plugins::PluginRegistry>,
 ) -> SkillRegistry {
     let dirs = skill_directories_for_workspace_and_dir(workspace, skills_dir, mode);
-    discover_from_directories_with_plugins(dirs, plugins)
+    let registry = discover_from_directories_with_plugins(dirs, plugins);
+    with_untrusted_project_skills_warning(registry, workspace)
 }
 
 #[must_use]

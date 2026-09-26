@@ -28,6 +28,7 @@
 //! Human keystrokes are never logged or put in events: events carry time
 //! spans and counts only. Frames are never events.
 
+use codewhale_core::secret_eq::constant_time_eq;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1087,7 +1088,7 @@ fn principal_from_headers(state: &RouteState, headers: &HeaderMap) -> Option<Pri
         return Some(Principal::Owner);
     };
     let presented = bearer(headers)?;
-    if presented == expected {
+    if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
         return Some(Principal::Owner);
     }
     state.computer.client_principal(presented)
@@ -1334,7 +1335,7 @@ fn require_owner(state: &RouteState, headers: &HeaderMap) -> Result<(), ApiErr> 
         ));
     };
     match bearer(headers) {
-        Some(presented) if presented == expected => Ok(()),
+        Some(presented) if constant_time_eq(presented.as_bytes(), expected.as_bytes()) => Ok(()),
         Some(presented) if state.computer.client_principal(presented).is_some() => {
             Err(ApiErr::new(
                 StatusCode::FORBIDDEN,
