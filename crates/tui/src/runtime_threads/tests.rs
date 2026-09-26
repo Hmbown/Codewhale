@@ -19334,6 +19334,114 @@ mod adoption_refusal {
         assert!(!binding.is_adoptable_empty_store()?);
         Ok(())
     }
+
+    fn set_aside_destination(fixture: &Fixture, name: &str) -> std::path::PathBuf {
+        fixture
+            .root
+            .path()
+            .join("sessions")
+            .join(".set-aside")
+            .join("run")
+            .join(name)
+    }
+
+    /// #6144: a set-aside holds the store's lock for the whole move and
+    /// never unlinks the lock file. An opener that takes the store's lock in
+    /// the gap after the held lock file has been moved out gets a fresh lock
+    /// on a fresh store at the old path, and it is that store's only owner:
+    /// a second opener is refused, and the moved store's lock is not held.
+    #[test]
+    fn opener_in_the_set_aside_gap_is_the_only_owner() -> Result<()> {
+        let fixture = fixture()?;
+        let binding = opened_binding(&fixture, "gap", &"0".repeat(64))?;
+        let source = binding.data_dir.clone();
+        let destination = set_aside_destination(&fixture, "gap");
+        let held = binding.try_hold()?.expect("unheld store");
+
+        let gap_owner = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = gap_owner.clone();
+        let gap_source = source.clone();
+        set_owner_lock_test_hook(OwnerLockTestPoint::LockFileMoved, move || {
+            *slot.borrow_mut() = Some(RuntimeProcessOwnerLock::acquire(&gap_source));
+        });
+        held.move_to(&destination)?;
+        let gap_owner = gap_owner
+            .borrow_mut()
+            .take()
+            .expect("the gap hook ran")
+            .expect("the gap opener takes the lock at the old path");
+
+        assert!(destination.join("state.json").is_file(), "store data moved");
+        assert!(
+            destination.join(RUNTIME_PROCESS_OWNER_LOCK_FILE).is_file(),
+            "the held lock file moved with the store instead of being unlinked"
+        );
+        assert!(
+            source.join(RUNTIME_PROCESS_OWNER_LOCK_FILE).is_file(),
+            "the gap opener's store is left in place"
+        );
+
+        let second = RuntimeProcessOwnerLock::acquire(&source);
+        assert!(
+            second.is_err(),
+            "a second opener must not also own the store"
+        );
+        assert!(binding.try_hold()?.is_none());
+        assert!(binding.has_live_holder()?);
+        assert!(
+            RuntimeProcessOwnerLock::try_acquire_file(
+                &destination.join(RUNTIME_PROCESS_OWNER_LOCK_FILE),
+                false,
+            )?
+            .is_some(),
+            "the moved store's lock is released, not held by the gap opener"
+        );
+
+        drop(gap_owner);
+        assert!(RuntimeProcessOwnerLock::acquire(&source).is_ok());
+        Ok(())
+    }
+
+    /// #6144: an opener that opened the lock file before a set-aside moved
+    /// it, and locked it after, holds the moved file. It must notice and
+    /// lock the store at its own path instead, or a later opener would
+    /// create a fresh lock file there and both would own that store.
+    #[test]
+    fn opener_that_locks_a_moved_lock_file_reopens_its_path() -> Result<()> {
+        let fixture = fixture()?;
+        let binding = opened_binding(&fixture, "raced", &"0".repeat(64))?;
+        let source = binding.data_dir.clone();
+        let destination = set_aside_destination(&fixture, "raced");
+
+        let mover_binding = binding.clone();
+        let mover_destination = destination.clone();
+        set_owner_lock_test_hook(OwnerLockTestPoint::LockFileOpened, move || {
+            mover_binding
+                .try_hold()
+                .expect("hold")
+                .expect("the opener has not locked yet")
+                .move_to(&mover_destination)
+                .expect("set aside while the opener sits between open and lock");
+        });
+        let owner = RuntimeProcessOwnerLock::acquire(&source)?;
+        assert!(destination.join("state.json").is_file(), "the move ran");
+
+        assert!(
+            RuntimeProcessOwnerLock::acquire(&source).is_err(),
+            "the opener owns the store at its path, so a second opener is refused"
+        );
+        assert!(binding.has_live_holder()?);
+        assert!(
+            RuntimeProcessOwnerLock::try_acquire_file(
+                &destination.join(RUNTIME_PROCESS_OWNER_LOCK_FILE),
+                false,
+            )?
+            .is_some(),
+            "the opener let go of the moved store's lock"
+        );
+        drop(owner);
+        Ok(())
+    }
 }
 
 /// The exact-prefix search a fork's alignment runs, in one pass.

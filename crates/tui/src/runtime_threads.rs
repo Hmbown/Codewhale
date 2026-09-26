@@ -5151,16 +5151,25 @@ impl HeldRuntimeStore {
         Ok(None)
     }
 
-    /// Move the store to `destination`, still holding its lock, so no opener
-    /// can race the move. Store data is never unlinked; only the lock file,
-    /// a lease with no content, is removed once the move is done.
+    /// Move the store to `destination`, holding its lock for the whole move,
+    /// so no opener can race it. Nothing is unlinked.
     ///
     /// The store directory itself is not renamed: it contains the open lock
     /// file, and Windows refuses to rename a directory while a handle inside
-    /// it is open. Each other entry is renamed into `destination` instead,
-    /// which every platform allows while a sibling is open. After the lock
-    /// drops, the lease file and the emptied directory are removed; an
-    /// opener that races in then only finds (or recreates) an empty store.
+    /// it is open. Each entry is renamed into `destination` instead, the lock
+    /// file last. Renaming the open, locked lock file is allowed on every
+    /// platform: unix renames the inode the lock is on, and on Windows std
+    /// opens files with `FILE_SHARE_DELETE`, which permits a rename while the
+    /// handle is open (a `LockFile` byte-range lock does not block it). The
+    /// lock is dropped only after the emptied source directory is removed.
+    ///
+    /// Unlinking the lock file after dropping it is what this must never do
+    /// (#6144): on unix `remove_file` succeeds while another process holds a
+    /// lock on the file, so an opener that locked in that gap would hold a
+    /// lock on an unlinked inode, and the next opener would create and lock a
+    /// fresh file: two owners of one store. An opener that opened the old
+    /// path before the move and locks after it sees its file is no longer at
+    /// the path and reopens (see [`RuntimeProcessOwnerLock`]).
     pub(crate) fn move_to(self, destination: &Path) -> Result<()> {
         anyhow::ensure!(
             !destination.exists(),
@@ -5170,50 +5179,47 @@ impl HeldRuntimeStore {
         let source = self.binding.data_dir.clone();
         fs::create_dir_all(destination)
             .with_context(|| format!("Failed to create {}", destination.display()))?;
-        let entries = fs::read_dir(&source)
-            .with_context(|| format!("Failed to read Runtime store {}", source.display()))?;
-        let mut moved: Vec<std::ffi::OsString> = Vec::new();
-        let mut result = Ok(());
-        for entry in entries {
-            let name = match entry {
-                Ok(entry) => entry.file_name(),
-                Err(error) => {
-                    result = Err(anyhow::Error::from(error)
-                        .context(format!("Failed to read Runtime store {}", source.display())));
-                    break;
+        let mut names: Vec<std::ffi::OsString> = Vec::new();
+        let listed = fs::read_dir(&source)
+            .and_then(|entries| {
+                for entry in entries {
+                    let name = entry?.file_name();
+                    if name != RUNTIME_PROCESS_OWNER_LOCK_FILE {
+                        names.push(name);
+                    }
                 }
-            };
-            if name == RUNTIME_PROCESS_OWNER_LOCK_FILE {
-                continue;
-            }
-            if let Err(error) = fs::rename(source.join(&name), destination.join(&name)) {
-                result = Err(anyhow::Error::from(error).context(format!(
+                Ok(())
+            })
+            .with_context(|| format!("Failed to read Runtime store {}", source.display()));
+        if let Err(error) = listed {
+            let _ = fs::remove_dir(destination);
+            return Err(error);
+        }
+        names.push(RUNTIME_PROCESS_OWNER_LOCK_FILE.into());
+        let mut moved: Vec<&std::ffi::OsString> = Vec::new();
+        for name in &names {
+            if let Err(error) = fs::rename(source.join(name), destination.join(name)) {
+                // Put back what already moved so the store is never left
+                // split across two directories; the lock is still held.
+                for name in moved.into_iter().rev() {
+                    let _ = fs::rename(destination.join(name), source.join(name));
+                }
+                let _ = fs::remove_dir(destination);
+                return Err(anyhow::Error::from(error).context(format!(
                     "Failed to move Runtime store {} to {}",
                     source.display(),
                     destination.display()
                 )));
-                break;
             }
             moved.push(name);
         }
-        if let Err(error) = result {
-            // Put back what already moved so the store is never left split
-            // across two directories; the lock is still held.
-            for name in moved {
-                let _ = fs::rename(destination.join(&name), source.join(&name));
-            }
-            let _ = fs::remove_dir(destination);
-            return Err(error);
-        }
-        drop(self);
-        match fs::remove_file(source.join(RUNTIME_PROCESS_OWNER_LOCK_FILE)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            // An opener raced in and holds the lease: the store it opened is
-            // empty and stays where it is.
-            Err(_) => return Ok(()),
-        }
+        #[cfg(test)]
+        run_owner_lock_test_hook(OwnerLockTestPoint::LockFileMoved);
+        // Still holding the lock. A directory that is no longer empty means
+        // an opener created a fresh lock file in it after the move; that
+        // store is its own, so it stays.
         let _ = fs::remove_dir(&source);
+        drop(self);
         Ok(())
     }
 
@@ -5336,6 +5342,75 @@ pub(crate) fn try_lock_file_exclusive(file: &File) -> std::io::Result<bool> {
     }
 }
 
+/// How many times an owner-lock acquire reopens the path after finding the
+/// file it locked was moved out of the store. Each retry needs another
+/// maintenance move to land in the same window, so a few is plenty.
+const OWNER_LOCK_MOVED_RETRIES: usize = 4;
+
+/// True when `file` is still the file at `path`. [`HeldRuntimeStore::move_to`]
+/// renames a held lock file out of its store, so a process that opened the
+/// path before that move and locked after it holds a lock on the moved store,
+/// not on the one at `path` (#6144). A held file that is no longer one
+/// regular file (unlinked, or linked twice) is not at the path either.
+fn owner_lock_is_at_path(file: &File, path: &Path) -> Result<bool> {
+    let Ok(held) = runtime_store_file_identity(file) else {
+        return Ok(false);
+    };
+    let current = match open_runtime_store_file(path, "Runtime process owner lock", |options| {
+        options.read(true);
+    }) {
+        Ok(current) => current,
+        Err(error)
+            if error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(runtime_store_file_identity(&current)? == held)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum OwnerLockTestPoint {
+    /// In `RuntimeProcessOwnerLock::acquire`, after the lock file is opened
+    /// and before it is locked.
+    LockFileOpened,
+    /// In `HeldRuntimeStore::move_to`, after the held lock file is renamed
+    /// into the destination and before the lock is dropped.
+    LockFileMoved,
+}
+
+#[cfg(test)]
+type OwnerLockTestHooks = Vec<(OwnerLockTestPoint, Box<dyn FnOnce()>)>;
+
+#[cfg(test)]
+thread_local! {
+    static OWNER_LOCK_TEST_HOOKS: std::cell::RefCell<OwnerLockTestHooks> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `hook` once, on this thread, the next time `point` is reached.
+#[cfg(test)]
+pub(crate) fn set_owner_lock_test_hook(point: OwnerLockTestPoint, hook: impl FnOnce() + 'static) {
+    OWNER_LOCK_TEST_HOOKS.with(|hooks| hooks.borrow_mut().push((point, Box::new(hook))));
+}
+
+#[cfg(test)]
+fn run_owner_lock_test_hook(point: OwnerLockTestPoint) {
+    let hook = OWNER_LOCK_TEST_HOOKS.with(|hooks| {
+        let mut hooks = hooks.borrow_mut();
+        let index = hooks.iter().position(|(at, _)| *at == point)?;
+        Some(hooks.remove(index).1)
+    });
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct RuntimeProcessOwnerLock {
     _file: File,
@@ -5350,55 +5425,73 @@ impl RuntimeProcessOwnerLock {
                 .context("Owner lease has no parent")?
                 .to_path_buf(),
         )?;
-        ensure_runtime_store_dir(&root)?;
-        let file = open_runtime_store_file(path, "Execution owner lease", |options| {
-            options
-                .create(create)
-                .truncate(false)
-                .read(true)
-                .write(true);
-        })?;
-        match Self::try_lock_exclusive(&file) {
-            Ok(()) => Ok(Some(Self { _file: file })),
-            Err(error) if Self::is_contention(&error) => Ok(None),
-            Err(error) => Err(error).context("Failed to acquire execution owner lease"),
+        for _ in 0..OWNER_LOCK_MOVED_RETRIES {
+            ensure_runtime_store_dir(&root)?;
+            let file = open_runtime_store_file(path, "Execution owner lease", |options| {
+                options
+                    .create(create)
+                    .truncate(false)
+                    .read(true)
+                    .write(true);
+            })?;
+            match Self::try_lock_exclusive(&file) {
+                Ok(()) => {}
+                Err(error) if Self::is_contention(&error) => return Ok(None),
+                Err(error) => {
+                    return Err(error).context("Failed to acquire execution owner lease");
+                }
+            }
+            if owner_lock_is_at_path(&file, path)? {
+                return Ok(Some(Self { _file: file }));
+            }
+            // Moved out of this store between open and lock: reopen.
         }
+        Ok(None)
     }
 
     pub(crate) fn acquire(root: &Path) -> Result<Self> {
         let root = checked_runtime_store_root(root.to_path_buf())?;
-        ensure_runtime_store_dir(&root)?;
         let path = root.join(RUNTIME_PROCESS_OWNER_LOCK_FILE);
-        let file = open_runtime_store_file(&path, "Runtime process owner lock", |options| {
-            options.create(true).truncate(false).read(true).write(true);
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .context("Failed to protect Runtime process owner lock")?;
-        }
         // Same-process drop-then-reopen can observe WouldBlock for a brief
         // window while the previous fd is still closing — the same close-
         // release race #5735 hit on the Runtime Chat scope lock. Retry only
         // that contention; a lock that stays held still belongs to its owner.
         let deadline = Instant::now() + Duration::from_millis(25);
-        loop {
-            match Self::try_lock_exclusive(&file) {
-                Ok(()) => break,
-                Err(error) if Self::is_contention(&error) => {
-                    if Instant::now() >= deadline {
-                        bail!("{RUNTIME_PROCESS_OWNER_LOCK_HELD}");
+        for _ in 0..OWNER_LOCK_MOVED_RETRIES {
+            ensure_runtime_store_dir(&root)?;
+            let file = open_runtime_store_file(&path, "Runtime process owner lock", |options| {
+                options.create(true).truncate(false).read(true).write(true);
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .context("Failed to protect Runtime process owner lock")?;
+            }
+            #[cfg(test)]
+            run_owner_lock_test_hook(OwnerLockTestPoint::LockFileOpened);
+            loop {
+                match Self::try_lock_exclusive(&file) {
+                    Ok(()) => break,
+                    Err(error) if Self::is_contention(&error) => {
+                        if Instant::now() >= deadline {
+                            bail!("{RUNTIME_PROCESS_OWNER_LOCK_HELD}");
+                        }
+                        std::thread::yield_now();
+                        std::thread::sleep(Duration::from_millis(1));
                     }
-                    std::thread::yield_now();
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(error) => {
-                    return Err(error).context("Failed to acquire Runtime process owner lock");
+                    Err(error) => {
+                        return Err(error).context("Failed to acquire Runtime process owner lock");
+                    }
                 }
             }
+            if owner_lock_is_at_path(&file, &path)? {
+                return Ok(Self { _file: file });
+            }
+            // A maintenance move renamed the file out of this store between
+            // our open and our lock; the lock we hold is on the moved store.
         }
-        Ok(Self { _file: file })
+        bail!("{RUNTIME_PROCESS_OWNER_LOCK_HELD}")
     }
 
     fn is_contention(error: &std::io::Error) -> bool {
