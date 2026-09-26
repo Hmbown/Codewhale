@@ -693,9 +693,10 @@ impl CompletionSound {
 pub enum SubagentCompletionNotification {
     /// Notify on every subagent completion.
     Always,
-    /// Notify only when the last subagent in a batch finishes — no other
-    /// subagents running and no workflow run in progress. Default: stays quiet
-    /// mid-run and fires once when the fleet drains.
+    /// One notice for a batch of finished background work (sub-agents,
+    /// background shells, durable tasks), sent once no agent, workflow run or
+    /// durable task is still running. A running shell never holds it back.
+    /// Default: stays quiet mid-run and fires once when the batch drains.
     #[default]
     FinalOnly,
     /// Never fire a subagent-completion notification.

@@ -7497,6 +7497,7 @@ mod tests {
     fn durable_tasks_suppress_the_launch_tableau() {
         let mut app = create_test_app();
         app.task_panel.push(TaskPanelEntry {
+            exit_code: None,
             id: "shell_1".to_string(),
             status: "running".to_string(),
             prompt_summary: "cargo test".to_string(),

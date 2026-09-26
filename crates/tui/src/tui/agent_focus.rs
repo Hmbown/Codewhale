@@ -941,6 +941,8 @@ mod tests {
                 duration_ms: 0,
                 started_at: None,
                 from_prior_session: false,
+                idle_ms: None,
+                heartbeat_timeout_ms: None,
             });
         focus_agent(&mut app, "agent_scout");
         let posture = focused_posture(&app).expect("posture line from the snapshot");
@@ -1005,6 +1007,8 @@ mod tests {
             duration_ms: 1_000,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         }
     }
 

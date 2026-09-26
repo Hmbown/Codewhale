@@ -100,9 +100,10 @@ export const CHANGELOG: ChangelogRelease[] = [
           "Stopping an agent that writes files keeps and names the work it had changed, as a budget stop already did (#5529).",
           "workflow(fleet:) runs Fleets saved from the Fleet UI, and finds workspace Fleets under .codewhale/fleets.",
           "The runtime API can stop a delegated agent run from the desktop.",
-          "A finished agent's answer is no longer cut off. Its row and its completion notification show the first sentence of its result instead of a ## Summary heading or its last tool, and opening the agent shows the whole result, or the full reason it stopped, even when no transcript was captured. Each agent also has one name: a workflow task's label or its dispatch name appears on the rows, the notification and the runtime API alike, never its internal id (#6565)."
+          "A finished agent's answer is no longer cut off. Its row and its completion notification show the first sentence of its result instead of a ## Summary heading or its last tool, and opening the agent shows the whole result, or the full reason it stopped, even when no transcript was captured. Each agent also has one name: a workflow task's label or its dispatch name appears on the rows, the notification and the runtime API alike, never its internal id (#6565).",
+          "Background work tells you when it ends. One notice names every agent, shell and task that finished, and says \"2 done · 1 failed\" when something did not succeed. A running dev server no longer holds that notice back. A failed, killed or timed-out background shell is reported like a completed one, with its exit code. Finished shells stay listed under \"Finished\", muted and led by their command, and finished tasks no longer look live or reopen the dock. An agent that has shown…"
         ],
-        "itemCount": 6
+        "itemCount": 7
       },
       {
         "heading": "Plugins",

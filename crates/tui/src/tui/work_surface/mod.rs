@@ -1027,6 +1027,8 @@ mod tests {
             duration_ms: 50,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         });
         app.agent_progress_meta.insert(
             "agent_worker".to_string(),
@@ -1112,6 +1114,8 @@ mod tests {
             duration_ms: 50,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         }
     }
 
@@ -2023,6 +2027,8 @@ mod tests {
                 duration_ms: 100,
                 started_at: None,
                 from_prior_session: false,
+                idle_ms: None,
+                heartbeat_timeout_ms: None,
             });
         }
 

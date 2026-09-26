@@ -335,6 +335,7 @@ mod tests {
         let options = crate::test_support::test_tui_options(std::path::PathBuf::from("."));
         let mut app = crate::test_support::test_app_with_options(options);
         app.task_panel.push(TaskPanelEntry {
+            exit_code: None,
             id: "shell_a1b2c3d4".to_string(),
             status: "running".to_string(),
             prompt_summary: "shell: cargo test -p codewhale-tui".to_string(),
@@ -349,6 +350,7 @@ mod tests {
             files_touched: 0,
         });
         app.task_panel.push(TaskPanelEntry {
+            exit_code: None,
             id: "run".to_string(),
             status: "running".to_string(),
             prompt_summary: "background confirmation test".to_string(),
@@ -408,6 +410,7 @@ mod tests {
         let mut app = crate::test_support::test_app_with_options(options);
         app.task_panel.extend([
             TaskPanelEntry {
+                exit_code: None,
                 id: "durable-running".to_string(),
                 status: "running".to_string(),
                 prompt_summary: "durable work".to_string(),
@@ -422,6 +425,7 @@ mod tests {
                 files_touched: 0,
             },
             TaskPanelEntry {
+                exit_code: None,
                 id: "durable-queued".to_string(),
                 status: "queued".to_string(),
                 prompt_summary: "durable work".to_string(),
@@ -493,6 +497,8 @@ mod tests {
             duration_ms: 100,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         };
         app.subagent_cache
             .push(running("agent_named_lane", "triage"));

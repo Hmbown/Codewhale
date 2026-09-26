@@ -1373,10 +1373,13 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 #                 off:  disable banners; an explicit completion sound is independent
 # threshold_secs = 30      # only notify when the turn took >= this many seconds
 # include_summary = false  # include elapsed time + cost in the notification body
-# subagent_completion = "final-only" # always | final-only | off — per-subagent
-#                          notifications during fleet/workflow runs. final-only
-#                          (default) stays quiet mid-run and fires once when the
-#                          batch drains; off silences them entirely.
+# subagent_completion = "final-only" # always | final-only | off — notices when
+#                          background work finishes: sub-agents, background
+#                          shells and durable tasks. final-only (default) sends
+#                          one notice naming everything that finished once no
+#                          agent, workflow or durable task is still running (a
+#                          running shell such as a dev server never holds it
+#                          back); off silences them entirely.
 # completion_sound = "off" # off | beep | bell | file — opt-in turn-completion sound
 # sound_file = "E:\\google\\downloads\\notify.wav" # WAV used when completion_sound = "file" (Windows)
 [notifications]
