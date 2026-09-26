@@ -192,10 +192,6 @@ pub enum ToolVisibility {
     Deferred,
     /// In this step's request, with no transport flag to say which.
     InRequest,
-    /// Registered and model-visible, but not carried by this step's request.
-    RegistryOnly,
-    /// Registered but not model-visible (hidden compatibility alias).
-    Hidden,
 }
 
 impl ToolVisibility {
@@ -205,8 +201,6 @@ impl ToolVisibility {
             Self::Active => "active",
             Self::Deferred => "deferred",
             Self::InRequest => "in-request",
-            Self::RegistryOnly => "registry-only",
-            Self::Hidden => "hidden",
         }
     }
 
@@ -240,6 +234,7 @@ impl ProviderAvailability {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
@@ -364,6 +359,7 @@ impl ToolInspectionSnapshot {
     /// Wire facts only. Provenance, attribution, capabilities, approval, and
     /// provider identity stay explicitly unknown.
     #[must_use]
+    #[cfg(test)]
     pub fn from_prepared_request(turn_id: &str, step: u32, tools: Option<&[Tool]>) -> Self {
         Self::from_prepared_request_with_surface(turn_id, step, tools, None)
     }

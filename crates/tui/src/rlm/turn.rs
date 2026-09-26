@@ -32,7 +32,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::client::CodewhaleClient;
 use crate::core::events::Event;
 use crate::repl::PythonRuntime;
 use codewhale_models::{
@@ -116,60 +115,10 @@ pub struct RlmTurnResult {
     pub total_rpcs: u32,
 }
 
-/// Run a full RLM turn. `prompt` is loaded into the REPL as `context`; it
-/// never enters the root LLM's window.
-///
-/// No in-tree caller today (#6511): the live entry is the recursive sub-RLM
-/// in `bridge.rs::dispatch_rlm`. Deleting this public pair is blocked on a
-/// separate cleanup — it is what keeps `CodewhaleClient` in the crate's public
-/// API, and removing it unmasks test-only dead code across `client`,
-/// `llm_client`, `provider_lake` and `tool_inspection`.
-pub async fn run_rlm_turn(
-    client: &CodewhaleClient,
-    model: String,
-    prompt: String,
-    child_model: String,
-    tx_event: mpsc::Sender<Event>,
-    max_depth: u32,
-) -> RlmTurnResult {
-    run_rlm_turn_with_root(
-        client,
-        model,
-        prompt,
-        None,
-        child_model,
-        tx_event,
-        max_depth,
-    )
-    .await
-}
-
-/// Variant that also passes a small `root_prompt` (the user-facing task)
-/// shown to the root LLM each iteration so it remembers its objective.
-pub async fn run_rlm_turn_with_root(
-    client: &CodewhaleClient,
-    model: String,
-    prompt: String,
-    root_prompt: Option<String>,
-    child_model: String,
-    tx_event: mpsc::Sender<Event>,
-    max_depth: u32,
-) -> RlmTurnResult {
-    run_rlm_turn_inner(
-        Arc::new(client.clone()),
-        model,
-        prompt,
-        root_prompt,
-        child_model,
-        tx_event,
-        max_depth,
-    )
-    .await
-}
-
 /// Inner entry point — also used by the bridge when it recurses. Returns
 /// a boxed future to break the recursive opaque-future-type cycle:
 /// `run_rlm_turn_inner` → `RlmBridge::dispatch` → `run_rlm_turn_inner`.
+#[cfg(test)]
 pub(crate) fn run_rlm_turn_inner(
     client: Arc<dyn RlmLlmClient>,
     model: String,

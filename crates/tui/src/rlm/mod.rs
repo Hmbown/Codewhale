@@ -32,7 +32,7 @@ pub mod turn;
 pub(crate) use bridge::ModelClientRlmAdapter;
 pub use bridge::RlmBridge;
 pub use prompt::rlm_system_prompt;
-pub use turn::{RlmTermination, RlmTurnResult, run_rlm_turn, run_rlm_turn_with_root};
+pub use turn::{RlmTermination, RlmTurnResult};
 
 fn add_usage_with_prompt_cache(total: &mut Usage, delta: &Usage) {
     total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);

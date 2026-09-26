@@ -121,6 +121,7 @@ impl ErrorEnvelope {
     /// Non-recoverable internal error — missing client, spawn failure, etc.
     /// Flips the session into offline mode.
     #[must_use]
+    #[cfg(test)]
     pub fn fatal(message: impl Into<String>) -> Self {
         Self::new(
             ErrorCategory::Internal,
@@ -157,24 +158,13 @@ impl ErrorEnvelope {
 
     /// Recoverable network / transport hiccup.
     #[must_use]
+    #[cfg(test)]
     pub fn network(message: impl Into<String>) -> Self {
         Self::new(
             ErrorCategory::Network,
             ErrorSeverity::Warning,
             true,
             "network_transient",
-            message,
-        )
-    }
-
-    /// Tool execution failure.
-    #[must_use]
-    pub fn tool(message: impl Into<String>) -> Self {
-        Self::new(
-            ErrorCategory::Tool,
-            ErrorSeverity::Error,
-            true,
-            "tool_failed",
             message,
         )
     }

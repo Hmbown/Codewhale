@@ -150,23 +150,6 @@ pub struct AuthenticationErrorContext {
 
 impl AuthenticationErrorContext {
     #[must_use]
-    pub fn new(
-        provider: &str,
-        base_url: &str,
-        model: &str,
-        key_source: &str,
-        api_key: &str,
-    ) -> Self {
-        Self::from_parts(
-            Some(provider),
-            Some(base_url),
-            Some(model),
-            Some(key_source),
-            Some(api_key),
-        )
-    }
-
-    #[must_use]
     pub fn from_parts(
         provider: Option<&str>,
         base_url: Option<&str>,
@@ -257,11 +240,6 @@ impl AuthenticationErrorDetail {
     }
 
     #[must_use]
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    #[must_use]
     pub fn to_user_message(&self) -> String {
         let Some(context) = self.context.as_ref() else {
             return self.message.clone();
@@ -328,6 +306,7 @@ fn public_key_prefix(api_key: &str) -> Option<&str> {
         .find(|prefix| api_key.starts_with(prefix))
 }
 
+#[cfg(test)]
 fn redact_api_key_from_message(message: &str, api_key: Option<&str>) -> String {
     let Some(api_key) = api_key.and_then(non_empty_trimmed) else {
         return message.to_string();
@@ -578,6 +557,7 @@ impl LlmError {
     /// Constructs an `LlmError` from HTTP response data plus request context
     /// that is safe to display when authentication fails.
     #[must_use]
+    #[cfg(test)]
     pub fn from_http_response_with_request_context(
         status: u16,
         body: &str,

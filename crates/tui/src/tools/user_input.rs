@@ -116,6 +116,7 @@ pub struct UserInputRequest {
 impl UserInputRequest {
     /// Parse and validate against the built-in default limits. Call sites that
     /// hold a session's resolved config use [`Self::from_value_with_limits`].
+    #[cfg(test)]
     pub fn from_value(value: &Value) -> Result<Self, ToolError> {
         Self::from_value_with_limits(value, UserInputLimits::default())
     }
@@ -131,6 +132,7 @@ impl UserInputRequest {
         Ok(request)
     }
 
+    #[cfg(test)]
     pub fn validate(&self) -> Result<(), ToolError> {
         self.validate_with_limits(UserInputLimits::default())
     }

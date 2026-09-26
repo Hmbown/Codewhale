@@ -614,6 +614,15 @@ pub enum Event {
     },
 
     /// Request user decision after sandbox denial
+    // Consumers (TUI, runtime threads, exec agent, protocol parity) handle
+    // this, but the engine never emits it. It stayed "live" only because the
+    // deleted public `rlm::run_rlm_turn` put `Event` in the crate's public
+    // API (#6511). Whether to wire the emitter or drop the elevation flow is
+    // a separate product decision.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no engine emitter yet; tests construct it")
+    )]
     ElevationRequired {
         tool_id: String,
         tool_name: String,

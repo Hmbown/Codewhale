@@ -20,9 +20,11 @@ use tokio::sync::{
 };
 
 use codewhale_config::catalog::{
-    CatalogOffering, CatalogRefreshError, CatalogSnapshot, CatalogSource, CatalogStatus,
-    ProviderCatalogCache, ProviderCatalogDelta, base_url_fingerprint, now_unix,
+    CatalogOffering, CatalogRefreshError, CatalogSource, ProviderCatalogDelta,
+    base_url_fingerprint, now_unix,
 };
+#[cfg(test)]
+use codewhale_config::catalog::{CatalogSnapshot, CatalogStatus, ProviderCatalogCache};
 use codewhale_config::provider::WireFormat;
 use codewhale_config::route::{
     LogicalModelRef, ReadyRouteCandidate, RouteLimits, RouteRequest, RouteResolver,
@@ -3241,6 +3243,7 @@ impl CodewhaleClient {
     /// success or a typed failure (#3385). Returns the resulting status so the UI
     /// can surface a visible "fresh / failed(reason)" chip without inspecting the
     /// cache internals. A failed refresh preserves any previously cached rows.
+    #[cfg(test)]
     pub async fn refresh_catalog_cache(
         &self,
         cache: &mut ProviderCatalogCache,
@@ -4591,6 +4594,7 @@ fn baseten_to_catalog_offering(
     })
 }
 
+#[cfg(test)]
 fn publish_provider_lake_scope(cache: &ProviderCatalogCache, provider: &str, fingerprint: &str) {
     // Publish fresh *and* stale/prior rows so pickers keep live catalog coverage
     // after TTL expiry or a failed refresh (#4139). Exact replacement is
