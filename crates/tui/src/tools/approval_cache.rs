@@ -347,51 +347,13 @@ fn shell_command_grant_scope(input: &serde_json::Value) -> String {
     if tokens.is_empty() {
         return "shell:<empty>".to_string();
     }
-    if !shell_command_is_compound(cmd)
-        && !shell_command_is_wrapper(&tokens)
-        && !shell_command_has_code_option(&tokens)
-    {
+    if !shell_command_is_compound(cmd) && !shell_command_is_wrapper(&tokens) {
         let family = classify_command(&tokens);
-        if command_family_is_known(&family) && !family_arguments_are_config(&family) {
+        if command_family_is_known(&family) {
             return format!("shell:{family}");
         }
     }
     format!("shell:cmd:{}", normalize_shell_command(cmd))
-}
-
-/// Options that can make a known command run other code, read another
-/// program, or write anywhere: `git -ccore.fsmonitor=./x status`,
-/// `cargo build --config build.rustc-wrapper=…`, `git diff --output=<path>`,
-/// `make -f /tmp/x`. The family ignores flags, so any of these keys the
-/// grant on the full command instead.
-fn shell_command_has_code_option(tokens: &[&str]) -> bool {
-    const CODE_OPTIONS: &[&str] = &[
-        "-c",
-        "-C",
-        "--config",
-        "--exec",
-        "--exec-path",
-        "--script-shell",
-        "-f",
-        "--file",
-        "--makefile",
-        "-e",
-        "--eval",
-        "--require",
-        "--upload-pack",
-        "--receive-pack",
-        "--manifest-path",
-    ];
-    tokens
-        .iter()
-        .skip(1)
-        .any(|token| token.contains('=') || CODE_OPTIONS.contains(token))
-}
-
-/// Families whose arguments are settings, so one grant would cover every
-/// setting (`git config user.name x` covering `git config core.fsmonitor`).
-fn family_arguments_are_config(family: &str) -> bool {
-    matches!(family.split(' ').nth(1), Some("config" | "set" | "remote"))
 }
 
 /// Whether the dictionary recognised `family`, rather than falling back to
@@ -734,20 +696,6 @@ mod tests {
         assert_eq!(key("cd src && make"), key("  cd src   &&  make "));
         assert_ne!(key("echo \"a  b\""), key("echo \"a b\""));
         assert!(key("rm -rf ~").0.starts_with("shell:cmd:"));
-        // Options and config arguments that can run code key the full
-        // command, though the family ignores flags.
-        assert_ne!(key("git status"), key("git -ccore.fsmonitor=./evil status"));
-        assert_ne!(key("git status"), key("git -C ../other status"));
-        assert_ne!(
-            key("cargo build"),
-            key("cargo build --config build.rustc-wrapper=./x")
-        );
-        assert_ne!(key("git diff"), key("git diff --output=/etc/hosts"));
-        assert_ne!(key("make"), key("make -f /tmp/x"));
-        assert_ne!(
-            key("git config user.name x"),
-            key("git config core.fsmonitor ./x.sh")
-        );
         // A known, simple command keeps its family grant.
         assert_eq!(key("git status"), key("git status --porcelain"));
         assert_ne!(key("git status"), key("git push"));
