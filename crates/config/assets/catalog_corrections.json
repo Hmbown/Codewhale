@@ -61,6 +61,11 @@
       "reason": "DeepSeek publishes a 384K output limit; Models.dev lists 393216 (384 x 1024). Which one the API accepts is unverified, and the lower bound is accepted either way."
     },
     {
+      "provider": "zai",
+      "id": "GLM-5.3",
+      "pricing_withheld": "Codewhale's default Z.ai route is the GLM Coding Plan (DEFAULT_ZAI_BASE_URL, api.z.ai/api/coding/paas/v4), which bills credit multipliers, not USD per token; see the seed's pending_release_metadata."
+    },
+    {
       "provider": "openrouter",
       "id": "deepseek/deepseek-v4-pro",
       "pricing_withheld": "Codewhale prices hosted DeepSeek from the reviewed provider-docs table in crates/tui/src/pricing.rs; a catalog rate would outrank it (for Fireworks V4 Pro the table has 1.74 and Models.dev 1.20 per 1M input)."

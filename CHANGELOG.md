@@ -128,8 +128,8 @@ quieter, and Fleet runs can be checked before they spend anything.
 - Model prices that a flat rate would get wrong now show as unknown after the
   model list refreshes online, as they already did offline: DeepSeek (priced by
   time of day, or from Codewhale's reviewed table on hosted providers), Grok and MiniMax M3 (rates rise on long prompts), Xiaomi MiMo
-  (pay-as-you-go and Token Plan keys look the same), Alibaba Model Studio plans
-  (quota, not per-token) and StepFun. DeepSeek's output limit stays at its
+  (pay-as-you-go and Token Plan keys look the same), GLM-5.3 and the Alibaba
+  Model Studio plans (quota or credits, not per-token) and StepFun. DeepSeek's output limit stays at its
   published 384K instead of the refreshed 393,216, and the reasoning controls
   Codewhale records for Grok, MiniMax, Qwen 3.8 Max, Muse Spark and Step 3.5
   (defaults, always-on thinking, extra effort tiers) survive the refresh
