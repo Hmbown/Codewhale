@@ -482,6 +482,27 @@ export interface FaqDict {
   noResultsBody: string;
 }
 
+/** `app/[locale]/roadmap/page.tsx`. */
+export interface RoadmapDict {
+  metaTitle: string;
+  metaDescription: string;
+  eyebrow: string;
+  /** Page H1. */
+  title: string;
+  introduction: string;
+  sectionTitle: string;
+  browseIssues: string;
+  /** Track size; `{count}` is filled at render time. */
+  trackCount: string;
+  /** Track size when it is exactly one. */
+  trackCountOne: string;
+  contributeTitle: string;
+  contributeBody: string;
+  issuesDetail: string;
+  discussionsDetail: string;
+  pullsDetail: string;
+}
+
 export type DocsHooksDict = DocsPageDict;
 
 export type DocsTroubleshootingDict = DocsPageDict;

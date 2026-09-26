@@ -47,6 +47,7 @@ mod doctor_fix;
 mod dsh_credentials;
 mod error_taxonomy;
 mod eval;
+mod extension_host;
 mod external_credentials;
 mod features;
 mod fleet;
@@ -73,6 +74,7 @@ mod oauth;
 mod operate;
 mod plugins;
 mod pricing;
+mod process_tree;
 mod project_context;
 mod project_context_cache;
 mod prompts;
@@ -6619,6 +6621,7 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
     let mut config_members = 0usize;
     let mut personal_members = 0usize;
     let mut workspace_members = 0usize;
+    let mut claude_members = 0usize;
     for member in roster.members() {
         match member.origin {
             crate::fleet::roster::ProfileOrigin::BuiltIn => built_in_members += 1,
@@ -6626,10 +6629,12 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
             crate::fleet::roster::ProfileOrigin::Config => config_members += 1,
             crate::fleet::roster::ProfileOrigin::Personal => personal_members += 1,
             crate::fleet::roster::ProfileOrigin::Workspace => workspace_members += 1,
+            crate::fleet::roster::ProfileOrigin::ClaudeCode => claude_members += 1,
         }
     }
     let roster_members = roster.members().len();
-    let custom_members = plugin_members + config_members + personal_members + workspace_members;
+    let custom_members =
+        plugin_members + config_members + personal_members + workspace_members + claude_members;
     let roster_ready = roster.load_error().is_none() && roster_members > 0;
     let runtime_ready =
         subagents_enabled && max_subagents > 0 && launch_concurrency > 0 && max_spawn_depth > 0;
@@ -6687,6 +6692,7 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
             "config": config_members,
             "personal": personal_members,
             "workspace": workspace_members,
+            "claude": claude_members,
             "custom": custom_members,
             "starter_roster_available": built_in_members > 0,
             "readiness_rule": "built-in starter roster or custom roster",
@@ -8427,7 +8433,28 @@ fn load_structural_config_from_cli(cli: &Cli) -> Result<Config> {
         apply_saved_reasoning_preference(&mut config, &settings);
     }
     cli.feature_toggles.apply(&mut config)?;
+    install_extension_host_boot_config(&config);
     Ok(config)
+}
+
+/// Select the plugin activation policy (v3, or v4 with the experimental
+/// extension host) and the host's Node override, once per process, before
+/// any plugin discovery. Later config reloads never flip either.
+fn install_extension_host_boot_config(config: &Config) {
+    let enabled = config
+        .features()
+        .enabled(crate::features::Feature::ExtensionHost);
+    crate::plugins::activation::install_extension_host_policy(enabled);
+    if enabled {
+        crate::extension_host::configure(crate::extension_host::ExtensionHostOptions {
+            node_override: config
+                .extension_host
+                .as_ref()
+                .and_then(|table| table.node.as_deref())
+                .map(|node| PathBuf::from(shellexpand::tilde(node).as_ref())),
+            root: None,
+        });
+    }
 }
 
 fn effective_config_profile(cli: &Cli) -> Option<String> {
@@ -8447,6 +8474,7 @@ fn load_config_from_cli_with_effective_profile(cli: &Cli) -> Result<(Config, Opt
         apply_saved_reasoning_preference(&mut config, &settings);
     }
     cli.feature_toggles.apply(&mut config)?;
+    install_extension_host_boot_config(&config);
     // Install the foreign-instruction opt-in before anything can load project
     // context. This is the single funnel every runtime goes through — TUI,
     // exec, ACP, and the app-server passthrough all resolve config here — so
@@ -12151,8 +12179,49 @@ fn exec_sandbox_elevation_authorized(
 }
 
 fn emit_exec_stream_event(event: &ExecStreamEvent) -> Result<()> {
-    println!("{}", serde_json::to_string(&exec_stream_value(event)?)?);
-    Ok(())
+    let mut line = serde_json::to_string(&exec_stream_value(event)?)?;
+    line.push('\n');
+    write_exec_stdout(&line)
+}
+
+/// Headless `exec` ignores SIGPIPE while it runs, because it writes to pipes
+/// it does not own: a stdio MCP server, LSP, hook or shell child that exits
+/// early must fail that one write with `EPIPE`, not kill the run with no
+/// output. Under the default disposition, an MCP server whose interpreter
+/// could not start (a broken `node` on PATH for the built-in Computer Use
+/// plugin) made `exec --auto` exit 141 before printing anything.
+fn ignore_sigpipe_for_headless_exec() {
+    // SAFETY: a plain disposition change with no handler. Children still start
+    // with SIGPIPE at SIG_DFL: the standard library resets it before exec.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+}
+
+/// Write exec output to stdout. SIGPIPE is ignored during exec (see
+/// [`ignore_sigpipe_for_headless_exec`]), so a reader that closed stdout
+/// (`codewhale exec ... | head -1`) surfaces here as `BrokenPipe`. End the
+/// process the way the default disposition would have (#4030) instead of
+/// panicking inside `print!`.
+fn write_exec_stdout(text: &str) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+            // SAFETY: restores the default disposition and re-raises the
+            // signal the write would have delivered without SIG_IGN.
+            #[cfg(unix)]
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                libc::raise(libc::SIGPIPE);
+            }
+            std::process::exit(141);
+        }
+        result => result.map_err(Into::into),
+    }
 }
 
 /// Process exit code `codewhale exec` uses when a turn ends on a retryable

@@ -908,6 +908,9 @@ impl App {
             self.apply_clipboard_content(content);
             return true;
         }
+        // The read cannot tell an empty clipboard from an unreadable one;
+        // either way the user asked to paste and nothing happened.
+        self.status_message = Some(self.tr(MessageId::ClipboardNothingToPaste).into_owned());
         false
     }
 

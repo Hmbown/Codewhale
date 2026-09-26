@@ -774,11 +774,10 @@ pub enum AppAction {
     /// action; handled in the UI event loop where the live `Config` supplies
     /// provider credentials.
     VoiceCapture,
-    /// Export and share the current session as a web URL.
+    /// Upload an already-rendered, redacted session page as a secret gist.
+    /// Emitted only by `/share confirm`.
     ShareSession {
-        history_len: usize,
-        model: String,
-        mode: String,
+        html: String,
     },
 }
 

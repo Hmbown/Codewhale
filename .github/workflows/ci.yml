@@ -139,8 +139,23 @@ jobs:
             # `heavy` (check-versions.sh / check-ohos-deps.sh via Version
             # drift, dev-cache/dev-test
             # self-checks via Version drift), so no coverage is lost.
+            #
+            # Rust reads non-.rs files too, so "docs-only" is decided by what
+            # the binary and its tests consume, not by file extension. Every
+            # path under crates/ is heavy (about 70 include_str! calls embed
+            # crate markdown: skill bodies, crates/tui/CHANGELOG.md,
+            # SURVIVAL_CONTRACT.md, export fixtures). The docs/ files below
+            # are embedded with include_str!/include_bytes! or read by Rust
+            # tests, so they must match before the docs/*|*.md light arm.
+            # Everything else Rust reads (config.example.toml, workflows/,
+            # fleets/, scripts/*.json, .codewhale/, .env.example) is already
+            # heavy by default. .github/scripts/release-workflows.test.js
+            # fails if an include_str!/include_bytes! target classifies light.
             case "${path}" in
               scripts/release/npm-wrapper-smoke.js|scripts/mobile-smoke.sh|scripts/check-provider-registry.py)
+                heavy=true
+                ;;
+              crates/*|docs/HOOKS.md|docs/KEYBINDINGS.md|docs/TELEMETRY.md|docs/FLEET_WORKFLOW_TUTORIAL.md|docs/2512.24601v2.pdf|docs/cloud-facts/*|docs/examples/*)
                 heavy=true
                 ;;
               docs/*|*.md|packaging/aur/*|.github/PULL_REQUEST_TEMPLATE.md|.github/ISSUE_TEMPLATE/*|.github/scripts/agent-task-metadata.test.sh|.github/workflows/agent-task-labels.yml|.github/workflows/auto-tag.yml|.github/workflows/stale.yml|.github/workflows/triage.yml|scripts/release/check-versions.sh|scripts/release/check-ohos-deps.sh|scripts/release/install-dogfood.sh|scripts/release/install-dogfood.test.sh|scripts/release/prepare-release.sh|scripts/release/prepare-release.test.sh|scripts/dev-cache.sh|scripts/dev-cache.test.sh|scripts/dev-cargo.sh|scripts/dev-test.sh)
@@ -194,7 +209,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
       - name: Check version drift
         # Checks 7 and 12 audit the previous-tag..HEAD commit range, not this
         # tree, so a receipt another merge forgot reddens every open PR. They
@@ -258,12 +273,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
       - name: Install data parser
         run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
       - name: Check offline plugin conversion
@@ -305,6 +320,20 @@ jobs:
         # manifest contract, the registry, the exec/ssh transport, the four
         # platform backends, and the MCP stdio protocol. No GUI input runs.
         run: (cd crates/tui/plugins/computer-use && npm test)
+
+      - name: Run extension host suites and check the committed bundle
+        # The TypeScript extension host (experimental, [features]
+        # extension_host). Its tests import the committed dist/ only, so
+        # `npm test` needs no install; the rebuild then fails if dist/ drifted
+        # from src/ or the lockfile. Node 22 matches the host's engines floor.
+        run: |
+          set -euo pipefail
+          cd crates/tui/extension-host
+          npm test
+          npm ci --ignore-scripts
+          npm run typecheck
+          npm run build
+          git diff --exit-code -- dist
 
   vscode-extension:
     name: VS Code extension
@@ -608,9 +637,6 @@ jobs:
       - name: Skip Rust lint for light change
         if: needs.changes.outputs.heavy != 'true'
         run: echo "No executable Rust changes detected; preserving required Lint context."
-      - name: Linux clippy location
-        if: needs.changes.outputs.heavy == 'true'
-        run: echo "Linux clippy/test gates run on CNB for mirrored fix/*, rebrand/*, work/v*, and main branches."
 
   msrv:
     # The workspace must build on its minimum supported toolchain. A lint
@@ -778,6 +804,13 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+      - uses: actions/setup-node@v7
+        # The extension-host integration tests spawn the real bundle under
+        # Node >= 22.19; CODEWHALE_EXT_HOST_TESTS below makes a missing Node a
+        # failure instead of a silent skip.
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        with:
+          node-version: 22
       - name: Hold this machine's build lock (self-hosted)
         # The self-hosted Mac is also a developer machine: local agents build
         # through scripts/dev-cargo.sh, which holds this lock, and two Cargo
@@ -823,6 +856,7 @@ jobs:
         shell: bash
         run: sh scripts/with-hermetic-test-home.sh cargo nextest run --workspace --all-features --locked --profile ci
         env:
+          CODEWHALE_EXT_HOST_TESTS: '1'
           # sccache 0.17 panics resolving its config directory under the
           # isolated Windows home before Cargo can compile or run any test.
           # Bypass only that optional cache; keep the full suite and isolation.
@@ -895,9 +929,13 @@ jobs:
     # macOS leg runs on the self-hosted Mac (trusted event and
     # CW_SELF_HOSTED_MAC == 'true'), it runs these two steps on the warm
     # build instead. The name keeps "(fork PR)" so check contexts stay stable.
+    # Hosted macOS allows only five concurrent jobs per account, and this job
+    # doubled every pull request's claim on them, queueing the required Test
+    # (macos-latest) leg for hours. So pull requests skip it and every push to
+    # main still runs it; a regression shows up on the merge that caused it.
     name: macOS budget and eval (fork PR)
     needs: changes
-    if: needs.changes.outputs.heavy == 'true' && !(needs.changes.outputs.trusted == 'true' && vars.CW_SELF_HOSTED_MAC == 'true')
+    if: needs.changes.outputs.heavy == 'true' && github.event_name != 'pull_request' && !(needs.changes.outputs.trusted == 'true' && vars.CW_SELF_HOSTED_MAC == 'true')
     timeout-minutes: 75
     runs-on: macos-latest
     steps:
@@ -923,13 +961,17 @@ jobs:
     # ubuntu-only, so the required "npm wrapper smoke (ubuntu-latest)"
     # context is unaffected. Heavy pull requests execute the Ubuntu smoke
     # here; their branches may not be mirrored to CNB.
+    # Pushes to main run Ubuntu (a CNB pointer) and Windows only. The macOS
+    # leg was a ~28-minute hosted-Mac build on every main push while hosted
+    # macOS is capped at 5 concurrent jobs; it stays in the manual
+    # workflow_dispatch (full CI) matrix and in the release pipeline.
     # A cold Windows build can take 29 minutes before the smoke even starts.
     # Leave room for installation; bound the smoke itself independently below.
     timeout-minutes: 45
     runs-on: ${{ needs.changes.outputs.heavy == 'true' && matrix.os || 'ubuntu-latest' }}
     strategy:
       matrix:
-        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || github.event_name == 'workflow_dispatch' && '["ubuntu-latest","macos-latest","windows-latest"]' || '["ubuntu-latest","windows-latest"]') }}
     steps:
       - name: Skip npm wrapper smoke for light change
         if: needs.changes.outputs.heavy != 'true'
@@ -953,7 +995,7 @@ jobs:
       - uses: actions/setup-node@v7
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         with:
-          node-version: 20
+          node-version: 22
       - name: Install Linux system dependencies
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         run: |

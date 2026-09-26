@@ -62,13 +62,14 @@ All drafts follow these rules:
 
 ## Maintainer review surface
 
-Access at `/admin?token=<MAINTAINER_TOKEN>`.
+Open `/en/admin` (or `/zh/admin`) and enter `MAINTAINER_TOKEN` in the login
+form. The form posts to `/api/admin/login`; the token never goes in the URL.
 
 - Lists all pending drafts with source link, draft body, and three actions:
   - **Post as comment** — calls GitHub REST API using `MAINTAINER_GITHUB_PAT`
   - **Edit & post** — opens a textarea for editing before posting
   - **Discard** — removes the draft from KV
-- The auth token is set via `MAINTAINER_TOKEN` env var. Access sets an `mt` cookie for the session.
+- The auth token is set via `MAINTAINER_TOKEN` env var. A successful login sets an httpOnly `mt_sid` session cookie that lasts 24 hours.
 - **Nothing posts to GitHub without an explicit maintainer click.**
 
 ## Environment variables

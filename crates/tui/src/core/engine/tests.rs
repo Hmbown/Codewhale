@@ -20905,6 +20905,22 @@ fn filter_tool_scenario() {
             assert!(visible.contains("after"), "{visible:?}");
         }
     }
+    // DeepSeek's doubled-delimiter DSML form, emitted when the request offers
+    // no tools: one-shot `codewhale exec` printed it verbatim as the answer.
+    {
+        let text = "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"read_file\">\n<｜｜DSML｜｜ parameter name=\"path\" string=\"true\">note.txt</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>\n";
+        assert!(contains_fake_tool_wrapper(text));
+        for cut in 1..text.len() {
+            if !text.is_char_boundary(cut) {
+                continue;
+            }
+            let mut state = ToolCallDeltaFilterState::default();
+            let mut visible = filter_tool_call_delta_with_state(&text[..cut], &mut state);
+            visible.push_str(&filter_tool_call_delta_with_state(&text[cut..], &mut state));
+            visible.push_str(&flush_tool_call_delta_state(&mut state));
+            assert_eq!(visible.trim(), "", "cut {cut} leaked DSML: {visible:?}");
+        }
+    }
     // from filter_tool_call_delta_strips_deepseek_native_token_split_across_chunks
     {
         // The streaming filter carries a partial marker across chunk boundaries.
@@ -25945,6 +25961,181 @@ fn compaction_envelope_carries_the_turn_reasoning_tier() {
             .as_deref(),
         Some("high")
     );
+}
+
+/// Extension host phase 1, acceptance 2: a real DSH plugin's tool on the
+/// model path is deferred (reached through `tool_search`), raises an approval
+/// the core composes and attributes to `extension:<plugin>`, and after
+/// approval returns the fixture payload from the real host process.
+#[tokio::test]
+async fn extension_tool_is_deferred_gated_and_attributed_on_the_model_path() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+
+    let Some(node) = crate::extension_host::tests::node_for_tests(
+        "extension_tool_is_deferred_gated_and_attributed_on_the_model_path",
+    ) else {
+        return;
+    };
+    let _policy = crate::plugins::activation::TestPolicyGuard::extension_host(true);
+    let fixture = crate::extension_host::tests::FixturePlugins::new(&["dsh-workspace-deps"]).await;
+    let manager = fixture.manager(node);
+    manager
+        .sync(fixture.registry())
+        .await
+        .expect("host activation");
+    let _manager = crate::extension_host::TestManagerGuard::install(Arc::clone(&manager));
+
+    let mock = std::sync::Arc::new(MockLlmClient::new(vec![
+        canned::tool_call_turn(
+            "call-search",
+            "tool_search",
+            r#"{"query":"load_workspace_dependencies bundled python"}"#,
+        ),
+        canned::tool_call_turn("call-ext", "load_workspace_dependencies", "{}"),
+        canned::simple_text_turn("Found the bundled Python."),
+    ]));
+    let client: crate::core::model_client::SharedModelClient = mock.clone();
+    let config = Config::default();
+    let mut engine_config = deterministic_engine_config(fixture.workspace());
+    engine_config.features.enable(Feature::ExtensionHost);
+    engine_config.plugin_registry = Some(fixture.registry());
+    let (engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
+    let task = tokio::spawn(engine.run());
+    handle
+        .send(external_user_message_op(
+            "Where is the bundled Python?",
+            AppMode::Agent,
+            &config,
+        ))
+        .await
+        .expect("send turn");
+
+    let (mut search, mut approval, mut result) = (None, None, None);
+    let mut rx = handle.rx_event.write().await;
+    loop {
+        let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+            .await
+            .expect("timed out waiting for the extension tool turn")
+            .expect("engine event stream closed");
+        match event {
+            Event::ToolCallComplete { id, result: r, .. } if id == "call-search" => {
+                search = Some(r.expect("tool_search result"));
+            }
+            Event::ApprovalRequired {
+                id, description, ..
+            } if id == "call-ext" => {
+                assert!(result.is_none(), "approval must precede execution");
+                approval = Some(description);
+                handle.approve_tool_call(&id).await.expect("approve");
+            }
+            Event::ToolCallComplete { id, result: r, .. } if id == "call-ext" => {
+                result = Some(r.expect("extension tool result"));
+            }
+            Event::TurnComplete { status, error, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(rx);
+
+    let first_request = mock
+        .captured_requests()
+        .into_iter()
+        .next()
+        .expect("request");
+    let advertised = first_request.tools.as_ref().and_then(|tools| {
+        tools
+            .iter()
+            .find(|tool| tool.name == "load_workspace_dependencies")
+            .cloned()
+    });
+    assert!(
+        advertised
+            .as_ref()
+            .is_none_or(|tool| tool.defer_loading == Some(true)),
+        "extension tools are deferred, never eager: {advertised:?}"
+    );
+    let search = search.expect("tool_search ran");
+    assert!(
+        search.content.contains("load_workspace_dependencies"),
+        "{}",
+        search.content
+    );
+    let approval = approval.expect("the extension tool raised an approval");
+    assert!(
+        approval.contains("extension:dsh-workspace-deps"),
+        "{approval}"
+    );
+    let result = result.expect("the approved call completed");
+    assert!(result.success, "{result:?}");
+    // The payload rendered by the DSH plugin's own `output.render`.
+    assert!(
+        result.content.contains("\"numpy\": \"2.1.0\"") && result.content.contains("dependencies"),
+        "{}",
+        result.content
+    );
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    task.await.expect("engine task");
+    assert_eq!(manager.spawn_attempts(), 1, "one host for the process");
+    manager.shutdown().await;
+}
+
+/// Extension host phase 1, acceptance 7: with the flag off the engine never
+/// touches the extension host, even when a native plugin is installed.
+#[tokio::test]
+async fn extension_host_flag_off_never_spawns_the_host() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+
+    let fixture = {
+        let _policy = crate::plugins::activation::TestPolicyGuard::extension_host(true);
+        crate::extension_host::tests::FixturePlugins::new(&["dsh-workspace-deps"]).await
+    };
+    let _policy = crate::plugins::activation::TestPolicyGuard::extension_host(false);
+    let manager = Arc::new(crate::extension_host::ExtensionHostManager::new(
+        crate::extension_host::ExtensionHostOptions::default(),
+    ));
+    let _manager = crate::extension_host::TestManagerGuard::install(Arc::clone(&manager));
+    let mock = std::sync::Arc::new(MockLlmClient::new(vec![canned::simple_text_turn("hi")]));
+    let client: crate::core::model_client::SharedModelClient = mock.clone();
+    let config = Config::default();
+    let mut engine_config = deterministic_engine_config(fixture.workspace());
+    assert!(!engine_config.features.enabled(Feature::ExtensionHost));
+    engine_config.plugin_registry = Some(fixture.registry());
+    let (engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
+    let task = tokio::spawn(engine.run());
+    handle
+        .send(external_user_message_op("hello", AppMode::Agent, &config))
+        .await
+        .expect("send turn");
+    let mut rx = handle.rx_event.write().await;
+    loop {
+        let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+            .await
+            .expect("timed out")
+            .expect("engine event stream closed");
+        if let Event::TurnComplete { .. } = event {
+            break;
+        }
+    }
+    drop(rx);
+    let request = mock
+        .captured_requests()
+        .into_iter()
+        .next()
+        .expect("request");
+    assert!(
+        request.tools.as_ref().is_none_or(|tools| tools
+            .iter()
+            .all(|tool| tool.name != "load_workspace_dependencies")),
+        "no extension tool with the flag off"
+    );
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    task.await.expect("engine task");
+    assert_eq!(manager.spawn_attempts(), 0);
+    assert_eq!(manager.status(), crate::extension_host::HostStatus::Idle);
 }
 
 fn user_text(text: &str) -> Message {

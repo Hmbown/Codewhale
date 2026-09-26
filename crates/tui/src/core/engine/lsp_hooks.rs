@@ -25,11 +25,14 @@ pub(super) fn edited_paths_for_tool(tool_name: &str, input: &serde_json::Value) 
                 Vec::new()
             }
         }
+        // A section that deletes its file (`+++ /dev/null`) leaves nothing
+        // to diagnose, so only files that still exist afterwards are listed.
         "apply_patch" => preflight_apply_patch(input)
             .map(|preflight| {
                 preflight
                     .touched_files
                     .into_iter()
+                    .filter(|path| !preflight.deletes.contains(path))
                     .map(PathBuf::from)
                     .collect()
             })

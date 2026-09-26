@@ -2235,7 +2235,7 @@ mod tests {
         for (name, expected) in [
             ("init", CommandCapabilities::WORKSPACE),
             ("lsp", CommandCapabilities::PROJECT),
-            ("share", CommandCapabilities::PROJECT),
+            ("share", CommandCapabilities::SESSION_EXPORT),
             (
                 "goal",
                 CommandCapabilities::PROJECT.union(CommandCapabilities::PRESENTATION),
@@ -3033,10 +3033,14 @@ mod tests {
             })
             .map(|command| command.info().name)
             .collect();
+        // `/share` publishes the same redacted projection `/export` renders,
+        // so it holds the same authority and nothing more.
+        let mut export_declarers = export_declarers;
+        export_declarers.sort_unstable();
         assert_eq!(
             export_declarers,
-            vec!["export"],
-            "exactly one registration may declare SESSION_EXPORT"
+            vec!["export", "share"],
+            "only /export and /share may declare SESSION_EXPORT"
         );
 
         // The legacy function registration was removed for export only: the

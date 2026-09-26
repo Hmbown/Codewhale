@@ -1735,6 +1735,141 @@ fn restore_contract_line_endings(text: &str, ending: &str) -> String {
     }
 }
 
+/// First code point of the placeholder range that carries one non-UTF-8 byte
+/// through a text edit (Supplementary Private Use Area-A, U+F0000..=U+F00FF).
+const RAW_BYTE_PLACEHOLDER_BASE: u32 = 0xF_0000;
+
+fn is_raw_byte_placeholder(ch: char) -> bool {
+    (RAW_BYTE_PLACEHOLDER_BASE..=RAW_BYTE_PLACEHOLDER_BASE + 0xFF).contains(&u32::from(ch))
+}
+
+/// Decode `bytes` for a text edit without losing any of them: valid UTF-8 is
+/// kept as text and each invalid byte becomes a placeholder code point that
+/// [`encode_lossless_text`] turns back into the same byte. A file that is not
+/// UTF-8 and already uses the placeholder range (or edits that do) cannot be
+/// round-tripped, so the edit is refused rather than risk a silent rewrite.
+///
+/// The flag is `true` only when placeholders were introduced. A valid UTF-8
+/// file keeps its characters as they are, including any in the placeholder
+/// range (Nerd Font icons live there), and is written back as plain UTF-8.
+fn decode_bytes_losslessly(
+    bytes: &[u8],
+    edits: &[ContractEdit],
+    path: &str,
+) -> Result<(String, bool), ToolError> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok((text.to_string(), false));
+    }
+    let refuse = || {
+        ToolError::execution_failed(format!(
+            "Could not edit file {path}: it is not valid UTF-8 and uses characters Codewhale needs to keep its raw bytes intact. The file was not changed; use File `patch` or a shell tool for this file."
+        ))
+    };
+    if edits.iter().any(|edit| {
+        edit.old_text.chars().any(is_raw_byte_placeholder)
+            || edit.new_text.chars().any(is_raw_byte_placeholder)
+    }) {
+        return Err(refuse());
+    }
+    let mut out = String::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        if chunk.valid().chars().any(is_raw_byte_placeholder) {
+            return Err(refuse());
+        }
+        out.push_str(chunk.valid());
+        for &byte in chunk.invalid() {
+            out.push(
+                char::from_u32(RAW_BYTE_PLACEHOLDER_BASE + u32::from(byte))
+                    .expect("placeholder range holds valid code points"),
+            );
+        }
+    }
+    Ok((out, true))
+}
+
+/// Inverse of [`decode_bytes_losslessly`] for a file it decoded with
+/// placeholders. Never call it on text from a valid UTF-8 file.
+fn encode_lossless_text(text: &str) -> Vec<u8> {
+    if !text.chars().any(is_raw_byte_placeholder) {
+        return text.as_bytes().to_vec();
+    }
+    let mut out = Vec::with_capacity(text.len());
+    let mut buf = [0_u8; 4];
+    for ch in text.chars() {
+        if is_raw_byte_placeholder(ch) {
+            out.push((u32::from(ch) - RAW_BYTE_PLACEHOLDER_BASE) as u8);
+        } else {
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out
+}
+
+/// The line terminator of each line in `text`, in order (`\r\n`, `\n` or a
+/// lone `\r`). The k-th entry ends the k-th line of the LF-normalized text.
+fn line_terminators(text: &str) -> Vec<&'static str> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
+                out.push("\r\n");
+                index += 2;
+            }
+            b'\r' => {
+                out.push("\r");
+                index += 1;
+            }
+            b'\n' => {
+                out.push("\n");
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    out
+}
+
+/// Give every line an edit left alone its original terminator back, and the
+/// file's dominant `fallback` terminator to lines the edit wrote (B6). The
+/// edit ran on LF-normalized text; restoring one style for the whole file
+/// rewrote mixed-ending files on lines nobody touched.
+fn restore_line_endings_per_line(
+    original: &str,
+    normalized_original: &str,
+    updated: &str,
+    fallback: &str,
+) -> String {
+    let terminators = line_terminators(original);
+    if terminators.iter().all(|ending| *ending == fallback) {
+        return restore_contract_line_endings(updated, fallback);
+    }
+    let diff = similar::TextDiff::configure()
+        .timeout(std::time::Duration::from_secs(1))
+        .diff_lines(normalized_original, updated);
+    let mut out = String::with_capacity(updated.len() + terminators.len());
+    for change in diff.iter_all_changes() {
+        let ending = match change.tag() {
+            similar::ChangeTag::Delete => continue,
+            similar::ChangeTag::Equal => change
+                .old_index()
+                .and_then(|index| terminators.get(index).copied())
+                .unwrap_or(fallback),
+            similar::ChangeTag::Insert => fallback,
+        };
+        let line = change.value();
+        match line.strip_suffix('\n') {
+            Some(body) => {
+                out.push_str(body);
+                out.push_str(ending);
+            }
+            None => out.push_str(line),
+        }
+    }
+    out
+}
+
 /// Rewrite `content` to match the line-ending style of an existing file's
 /// `prior` content, so a full-file overwrite (`write_file` / contract `write`)
 /// does not silently flip a CRLF (Windows) file to LF — the same policy
@@ -2088,7 +2223,9 @@ impl EditFileTool {
             ToolError::execution_failed(format!("Could not edit file {path_str}: {error}"))
         })?;
         check_file_operation_cancelled(context)?;
-        let raw = String::from_utf8_lossy(&raw_bytes).into_owned();
+        // Bytes that are not UTF-8 ride through the edit as placeholders and
+        // are written back unchanged (B6), instead of becoming U+FFFD.
+        let (raw, has_raw_bytes) = decode_bytes_losslessly(&raw_bytes, &edits, path_str)?;
         let (bom, without_bom) = raw
             .strip_prefix('\u{FEFF}')
             .map_or(("", raw.as_str()), |text| ("\u{FEFF}", text));
@@ -2096,13 +2233,21 @@ impl EditFileTool {
         let normalized = normalize_contract_line_endings(without_bom);
         let updated = apply_contract_edits(&normalized, &edits, path_str)?;
         check_file_operation_cancelled(context)?;
-        let mut final_content = format!("{bom}{}", restore_contract_line_endings(&updated, ending));
+        let mut final_content = format!(
+            "{bom}{}",
+            restore_line_endings_per_line(without_bom, &normalized, &updated, ending)
+        );
         guard_edit(&file_path, path_str, Some(&raw), &final_content)?;
         if let Some(normalized) = normalize_edit(&file_path, &raw, &final_content).await {
             final_content = normalized;
         }
 
-        run_blocking_write_atomic(&file_path, final_content.clone().into_bytes()).await?;
+        let bytes = if has_raw_bytes {
+            encode_lossless_text(&final_content)
+        } else {
+            final_content.clone().into_bytes()
+        };
+        run_blocking_write_atomic(&file_path, bytes).await?;
         check_file_operation_cancelled(context)?;
         context.note_file_read(&file_path);
         drop(mutation_guard);

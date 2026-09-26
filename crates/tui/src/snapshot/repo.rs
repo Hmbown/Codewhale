@@ -501,10 +501,13 @@ impl SnapshotRepo {
         }
         let tree = String::from_utf8_lossy(&tree.stdout).trim().to_string();
 
+        // A HEAD that names a missing commit would make every `commit-tree
+        // -p` below fail ("is not a valid object"), silently ending undo.
+        self.repair_broken_head()?;
         let parent = run_git(
             &self.git_dir,
             &self.work_tree,
-            &["rev-parse", "--verify", "HEAD"],
+            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
         )?;
         let parent = parent
             .status
@@ -549,6 +552,127 @@ impl SnapshotRepo {
                 "git commit-tree returned a malformed commit id: {sha:?}"
             ))
         })
+    }
+
+    /// Repair a side repo whose HEAD names a commit that no longer exists
+    /// (an interrupted gc or prune, a copied or partially deleted
+    /// `~/.codewhale/snapshots` directory). Left alone, every later snapshot
+    /// fails on `commit-tree -p <missing>` and /undo is dead without a word.
+    ///
+    /// The broken ref is deleted so the next snapshot starts a fresh history.
+    /// Restore points before the break cannot be recovered; the caller tells
+    /// the user. Returns `true` when a repair happened.
+    pub fn repair_broken_head(&self) -> io::Result<bool> {
+        let commit = run_git(
+            &self.git_dir,
+            &self.work_tree,
+            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+        )?;
+        if commit.status.success() {
+            return Ok(false);
+        }
+        // An unborn branch (fresh repo) names nothing: nothing to repair.
+        let named = run_git(
+            &self.git_dir,
+            &self.work_tree,
+            &["rev-parse", "--verify", "--quiet", "HEAD"],
+        )?;
+        if !named.status.success() {
+            return Ok(false);
+        }
+        let missing = String::from_utf8_lossy(&named.stdout).trim().to_string();
+        // A lookup can fail for a moment while another session sharing this
+        // repo runs gc or repack. Only a commit that is really absent
+        // justifies touching HEAD: deleting it discards every restore point.
+        if self.is_commit(&missing)? {
+            return Ok(false);
+        }
+        // The newest reflog entry that still names a commit keeps the
+        // restore points before the break.
+        if let Some(recovered) = self.newest_reflog_commit(&missing)? {
+            let reset = run_git(
+                &self.git_dir,
+                &self.work_tree,
+                &["update-ref", "HEAD", &recovered],
+            )?;
+            if reset.status.success() {
+                tracing::warn!(
+                    target: "snapshot",
+                    "snapshot history HEAD pointed at missing commit {missing}; reset to {recovered} from the reflog"
+                );
+                return Ok(false);
+            }
+        }
+        let delete = run_git(
+            &self.git_dir,
+            &self.work_tree,
+            &["update-ref", "-d", "HEAD"],
+        )?;
+        if !delete.status.success() {
+            return Err(io_other(format!(
+                "snapshot history HEAD points at missing commit {missing} and could not be reset: {}",
+                String::from_utf8_lossy(&delete.stderr).trim()
+            )));
+        }
+        tracing::warn!(
+            target: "snapshot",
+            "snapshot history HEAD pointed at missing commit {missing}; started a fresh history"
+        );
+        Ok(true)
+    }
+
+    fn is_commit(&self, oid: &str) -> io::Result<bool> {
+        let object = format!("{oid}^{{commit}}");
+        Ok(
+            run_git(&self.git_dir, &self.work_tree, &["cat-file", "-e", &object])?
+                .status
+                .success(),
+        )
+    }
+
+    /// The newest commit recorded in HEAD's reflogs (its branch's, then
+    /// HEAD's own) that still exists, skipping `missing`.
+    fn newest_reflog_commit(&self, missing: &str) -> io::Result<Option<String>> {
+        let branch = run_git(&self.git_dir, &self.work_tree, &["symbolic-ref", "HEAD"])?;
+        let mut logs = Vec::new();
+        if branch.status.success() {
+            let name = String::from_utf8_lossy(&branch.stdout).trim().to_string();
+            logs.push(self.git_dir.join("logs").join(name));
+        }
+        logs.push(self.git_dir.join("logs").join("HEAD"));
+        for log in logs {
+            let Ok(text) = std::fs::read_to_string(&log) else {
+                continue;
+            };
+            // Each line is `<old> <new> <who> <when>\t<message>`.
+            for line in text.lines().rev() {
+                let mut fields = line.split(' ');
+                let (Some(old), Some(new)) = (fields.next(), fields.next()) else {
+                    continue;
+                };
+                for oid in [new, old] {
+                    if oid.len() >= 40
+                        && oid != missing
+                        && oid.bytes().any(|b| b != b'0')
+                        && self.is_commit(oid)?
+                    {
+                        return Ok(Some(oid.to_string()));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Point the side repo's HEAD branch at a commit id that does not exist.
+    #[cfg(test)]
+    pub(crate) fn point_head_at_missing_commit_for_test(&self) {
+        let branch = run_git(&self.git_dir, &self.work_tree, &["symbolic-ref", "HEAD"])
+            .expect("symbolic-ref");
+        let branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
+        let path = self.git_dir.join(&branch);
+        std::fs::create_dir_all(path.parent().expect("ref parent")).expect("ref dir");
+        std::fs::write(path, "1111111111111111111111111111111111111111\n").expect("write ref");
     }
 
     /// Prefix a snapshot label with its owning session id, if any.
@@ -1752,6 +1876,51 @@ mod tests {
         // The user's workspace must NOT have a real `.git` because we
         // never created one in their workspace — only in the side dir.
         assert!(!repo.work_tree().join(".git").exists());
+    }
+
+    /// B2: a side repo whose HEAD names a missing commit made every snapshot
+    /// fail on `commit-tree -p` ("is not a valid object"), so /undo died
+    /// silently. The broken ref is reset and snapshots resume.
+    #[test]
+    fn broken_head_is_repaired_and_snapshots_resume() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        std::fs::write(repo.work_tree().join("a.txt"), b"alpha").unwrap();
+        repo.snapshot("pre-turn:1").expect("first snapshot");
+        assert!(!repo.repair_broken_head().expect("healthy head"));
+
+        repo.point_head_at_missing_commit_for_test();
+        assert!(
+            repo.list(10).is_err() || repo.list(10).unwrap().is_empty(),
+            "a broken head cannot list its history"
+        );
+
+        // With a reflog, the last commit that still exists is restored and
+        // the restore points before the break survive.
+        assert!(
+            !repo.repair_broken_head().expect("recover"),
+            "recovered from the reflog, not restarted"
+        );
+        let list = repo.list(10).expect("list after recovery");
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].label, "pre-turn:1");
+
+        // Without one, the broken ref is deleted and history restarts.
+        repo.point_head_at_missing_commit_for_test();
+        std::fs::remove_dir_all(repo.git_dir.join("logs")).expect("drop reflogs");
+        assert!(repo.repair_broken_head().expect("repair"), "repaired once");
+        assert!(!repo.repair_broken_head().expect("idempotent"));
+        std::fs::write(repo.work_tree().join("a.txt"), b"beta").unwrap();
+        repo.snapshot("pre-turn:2").expect("snapshots resume");
+        let list = repo.list(10).expect("list after repair");
+        assert_eq!(list.len(), 1, "history restarts at the repair: {list:?}");
+        assert_eq!(list[0].label, "pre-turn:2");
+
+        // The snapshot path repairs on its own too, for callers that never
+        // asked.
+        repo.point_head_at_missing_commit_for_test();
+        repo.snapshot("pre-turn:3")
+            .expect("snapshot repairs on its own");
     }
 
     #[test]

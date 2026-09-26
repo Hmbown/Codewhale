@@ -455,30 +455,9 @@ fn truncate(text: &str, max: usize) -> String {
     out
 }
 
-/// Context-menu labels for git actions on a path.
-#[must_use]
-pub fn context_menu_git_actions(path: &str, branch: Option<&str>) -> Vec<(String, String)> {
-    let mut actions = vec![
-        ("Open path".into(), format!("open:{path}")),
-        ("Diff file".into(), format!("diff:{path}")),
-    ];
-    if let Some(branch) = branch {
-        actions.push(("Branch here".into(), format!("branch:{branch}")));
-    }
-    actions.push(("Worktrees…".into(), "worktrees".into()));
-    actions
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn context_menu_includes_worktrees() {
-        let actions = context_menu_git_actions("src/main.rs", Some("main"));
-        assert!(actions.iter().any(|(_, id)| id == "worktrees"));
-        assert!(actions.iter().any(|(label, _)| label.contains("Diff")));
-    }
 
     #[test]
     fn manager_constructs_from_workspace() {

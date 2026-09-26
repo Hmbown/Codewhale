@@ -1010,7 +1010,10 @@ mod tests {
                 role: Some("general".to_string()),
             },
             model: "test-model".to_string(),
-            nickname: Some("Blue Whale".to_string()),
+            nickname: Some(crate::tools::subagent::whale_name_for_id_in_locale(
+                "agent_worker",
+                "en",
+            )),
             status: SubAgentStatus::Running,
             worker_status: Some(AgentWorkerStatus::RunningTool),
             runtime_permissions: None,
@@ -1048,7 +1051,10 @@ mod tests {
         // The identity column leads with the agent's nickname and keeps the
         // fleet role as the fallback spelling. It is never the raw agent id
         // (#36), and carries no `(+N)` while the agent is childless.
-        assert_eq!(row.label, "Blue Whale");
+        assert_eq!(
+            row.label,
+            crate::tools::subagent::whale_name_for_id_in_locale("agent_worker", "en")
+        );
         let facts = row.agent.as_ref().expect("agent row facts");
         assert_eq!(facts.role_label, "general");
         assert_eq!(facts.objective, "Wire settled file activity");
@@ -1198,9 +1204,10 @@ mod tests {
 
     #[test]
     fn agent_rows_completed_agents_render_quietly_without_spawn_metadata() {
-        // #36: quiet completion — a finished agent keeps status + objective;
-        // in-flight metadata (tool, step counters, file tallies) must not
-        // linger as a receipt dump.
+        // #36: quiet completion — a finished agent keeps status + what it
+        // did; in-flight metadata (tool, step counters) must not linger as a
+        // receipt dump. #6565: what it changed is the receipt, and once its
+        // result is known the row says what it produced.
         let mut app = app();
         app.current_session_id = Some(SESSION.to_string());
         app.subagent_cache.push(cached_worker(
@@ -1238,7 +1245,23 @@ mod tests {
         );
         assert!(!row.detail.contains("using "), "{}", row.detail);
         assert!(!row.detail.contains("step 7"), "{}", row.detail);
-        assert!(!row.detail.contains("files changed"), "{}", row.detail);
+        assert!(row.detail.contains("4 files changed"), "{}", row.detail);
+
+        app.subagent_cache[0].result =
+            Some("## Summary\n\nPatched the parser. Tests pass.".to_string());
+        let rows = super::model::project(&mut app);
+        let row = rows
+            .iter()
+            .find(|row| row.id.0 == "worker:agent_done")
+            .expect("completed agent row");
+        assert_eq!(
+            row.detail, "completed · Patched the parser. · 4 files changed",
+            "the headline replaces the assignment"
+        );
+        assert_eq!(
+            row.agent.as_ref().map(|facts| facts.objective.as_str()),
+            Some("Patched the parser.")
+        );
     }
 
     // ---- Fleet row layout -------------------------------------------------
@@ -1983,7 +2006,10 @@ mod tests {
                     role: Some("worker".to_string()),
                 },
                 model: "test-model".to_string(),
-                nickname: Some("Blue Whale".to_string()),
+                nickname: Some(crate::tools::subagent::whale_name_for_id_in_locale(
+                    "agent_converge",
+                    "en",
+                )),
                 status: SubAgentStatus::Running,
                 worker_status: Some(AgentWorkerStatus::Running),
                 runtime_permissions: None,
@@ -3901,6 +3927,76 @@ mod tests {
         assert!(
             matches!(handled, Some(Some(SidebarRowAction::InspectWork { .. }))),
             "⌥V opens the selected row's own details: {handled:?}"
+        );
+    }
+
+    /// T1: a real right-click over an agent row opens that row's menu. The
+    /// work surface's catch-all arm marked every event consumed, so
+    /// `handle_mouse_event` returned before its right-click branch and no
+    /// menu ever opened over the dock.
+    #[test]
+    fn right_click_on_an_agent_row_opens_its_menu() {
+        use crate::tui::views::{ContextMenuAction, ModalKind, ViewEvent};
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let mut app = app();
+        app.work_surface.panel = super::RailPanel::Agents;
+        app.current_session_id = Some(SESSION.to_string());
+        app.subagent_cache.push(cached_worker(
+            "agent-live",
+            "builder",
+            None,
+            None,
+            SubAgentStatus::Running,
+        ));
+        let _ = render_text(&mut app, 100, 6);
+        let row_y = app
+            .work_surface
+            .hitboxes
+            .iter()
+            .find(|hit| hit.id.0 == "worker:agent-live")
+            .expect("the live agent row is painted")
+            .row_y;
+
+        let events = crate::tui::mouse_ui::handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: 2,
+                row: row_y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(events.is_empty());
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::ContextMenu));
+
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        app.view_stack.render(area, &mut buf);
+        let text: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert_eq!(text.matches("Focus agent").count(), 1, "{text}");
+        assert!(
+            text.contains("Stop agent…"),
+            "a running agent can be stopped"
+        );
+        assert!(!text.contains("Message agent") && !text.contains("Open transcript"));
+        assert!(
+            !text.contains("Command palette"),
+            "app chrome stays off a row's menu"
+        );
+
+        // Enter runs the primary entry: the same focus a left click runs.
+        let events = app
+            .view_stack
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(
+                events.as_slice(),
+                [ViewEvent::ContextMenuSelected {
+                    action: ContextMenuAction::Row(SidebarRowAction::OpenAgentTranscript { agent_id }),
+                }] if agent_id == "agent-live"
+            ),
+            "{events:?}"
         );
     }
 }

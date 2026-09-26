@@ -53,7 +53,8 @@ impl CommandCapabilities {
     pub const SESSION_CONTROL: Self = Self(1 << 14);
     /// Session-export host data (FEAT-025 D1), the next non-conflicting bit
     /// after `SESSION_CONTROL`. Required only by the host-dependent `/export`
-    /// command and its `/daochu` alias; every concrete App, snapshot, clipboard,
+    /// command (and its `/daochu` alias) and by `/share`, which publishes the
+    /// same redacted projection; every concrete App, snapshot, clipboard,
     /// filesystem, history, and turn-handoff access stays behind the TUI export
     /// adapter.
     ///

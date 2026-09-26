@@ -140,3 +140,93 @@ async fn get_v1_commands_serves_the_catalog_over_http() -> Result<()> {
     handle.abort();
     Ok(())
 }
+
+/// B4: `GET /v1/hooks` serves the hook set Runtime threads run, from the
+/// engine's own loader, with credential-shaped values masked.
+#[tokio::test]
+async fn get_v1_hooks_serves_the_runtime_hook_set() -> Result<()> {
+    let _env = lock_test_env();
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("hooks-route");
+    let sessions_dir = root.join("sessions");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let config = Config {
+        hooks: Some(crate::hooks::HooksConfig {
+        hooks: vec![
+            crate::hooks::Hook::new(
+                crate::hooks::HookEvent::ToolCallAfter,
+                "curl -H 'Authorization: Bearer sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789' https://example.invalid",
+            )
+            .with_name("notify"),
+        ],
+        enabled: true,
+        ..crate::hooks::HooksConfig::default()
+    }),
+        ..Config::default()
+    };
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            root,
+            sessions_dir,
+            None,
+            false,
+            workspace,
+            TestServerOverrides {
+                config: Some(config),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let body: serde_json::Value = client
+        .get(format!("http://{addr}/v1/hooks"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(body["enabled"], true);
+    let hooks = body["hooks"].as_array().expect("hooks array");
+    assert_eq!(hooks.len(), 1, "{body}");
+    assert_eq!(hooks[0]["name"], "notify");
+    assert_eq!(hooks[0]["event"], "tool_call_after");
+    assert_eq!(hooks[0]["source"], "global");
+    let command = hooks[0]["command"].as_str().expect("command");
+    assert!(command.starts_with("curl"), "{command}");
+    assert!(!command.contains("sk-ant-api03-AbCd"), "{command}");
+
+    let missing = client
+        .get(format!("http://{addr}/v1/hooks?thread_id=thr_missing"))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    handle.abort();
+    Ok(())
+}
+
+#[test]
+fn hook_listing_masks_url_paths_and_userinfo() {
+    assert_eq!(
+        redact_hook_command_for_listing(
+            "curl -X POST https://hooks.slack.com/services/T000/B000/XXXXsecret -d @-"
+        ),
+        "curl -X POST https://hooks.slack.com/[redacted] -d @-"
+    );
+    assert_eq!(
+        redact_hook_command_for_listing("notify 'https://user:pw@example.test/hook?k=v'"),
+        "notify 'https://example.test/[redacted]'"
+    );
+    assert_eq!(
+        redact_hook_command_for_listing("ping https://example.test"),
+        "ping https://example.test"
+    );
+    assert_eq!(
+        redact_hook_command_for_listing("./scripts/lint.sh --fix"),
+        "./scripts/lint.sh --fix"
+    );
+}

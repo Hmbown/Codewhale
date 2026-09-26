@@ -283,6 +283,10 @@ pub(crate) fn exec_automation_services(
     Ok(Some(std::sync::Arc::new(tokio::sync::Mutex::new(service))))
 }
 
+/// Printed to stderr when a tool-less one-shot `exec` answer contained
+/// tool-call markup that the engine stripped from the visible output.
+pub(crate) const ONE_SHOT_TOOL_CALL_NOTICE: &str = "codewhale exec: the model tried to call a tool, but this run offers none, so the tool call was removed from the answer. Re-run with --auto (or --allowed-tools) to let it use tools.";
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_exec_agent(
     config: &Config,
@@ -319,6 +323,8 @@ pub(crate) async fn run_exec_agent(
     use crate::tools::todo::new_shared_todo_list;
     use codewhale_config::AppMode;
     use codewhale_execpolicy::ApprovalMode;
+
+    ignore_sigpipe_for_headless_exec();
 
     // Withhold `request_user_input`; a headless run has no responder.
     let disallowed_tools = exec_disallowed_tools(disallowed_tools);
@@ -801,7 +807,6 @@ pub(crate) async fn run_exec_agent(
     let mut turn_usage_seq: u32 = 0;
     let mut settled_usage: Option<codewhale_models::Usage> = None;
 
-    let mut stdout = io::stdout();
     let mut ends_with_newline = false;
     // One absolute host deadline includes every autonomous child fan-in turn;
     // child-specific shorter deadlines remain enforced by their runtime.
@@ -820,8 +825,7 @@ pub(crate) async fn run_exec_agent(
                 if output_format == ExecOutputFormat::StreamJson {
                     emit_exec_stream_event(&ExecStreamEvent::Content { content })?;
                 } else if !json_output {
-                    print!("{content}");
-                    stdout.flush()?;
+                    write_exec_stdout(&content)?;
                 }
                 ends_with_newline = summary.output.ends_with('\n');
             }
@@ -830,7 +834,7 @@ pub(crate) async fn run_exec_agent(
                     && !json_output
                     && !ends_with_newline =>
             {
-                println!();
+                write_exec_stdout("\n")?;
             }
             Event::ThinkingDelta { .. } => {
                 // Exec stream-json intentionally omits reasoning deltas; the
@@ -1390,6 +1394,15 @@ pub(crate) async fn run_exec_agent(
                 latest_model = model;
                 latest_workspace = workspace;
             }
+            // A tool-less one-shot run has no tool channel, so a model that
+            // still tries to call a tool writes the call as text. The engine
+            // strips that markup from the answer; say why the answer is short
+            // and how to give the model tools, instead of exiting on nothing.
+            Event::Status { message }
+                if one_shot && message == crate::core::engine::FAKE_WRAPPER_NOTICE =>
+            {
+                eprintln!("{ONE_SHOT_TOOL_CALL_NOTICE}");
+            }
             // #3027: surface the engine's max-steps notice in text mode so a
             // --max-turns run that stops early says why instead of going quiet.
             Event::Status { message }
@@ -1458,7 +1471,7 @@ pub(crate) async fn run_exec_agent(
         summary.record_one_shot_outcome(settled_usage);
     }
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&summary)?);
+        write_exec_stdout(&format!("{}\n", serde_json::to_string_pretty(&summary)?))?;
     }
 
     if let Some(error) = summary.error.as_ref()

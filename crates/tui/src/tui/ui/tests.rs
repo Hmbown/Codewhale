@@ -27592,6 +27592,23 @@ fn subagent_completion_notification_can_include_elapsed_summary() {
 }
 
 #[test]
+fn subagent_notification_names_the_agent_and_previews_its_answer() {
+    // #6565: the notice used the raw id as detail and the report's first
+    // line (often `## Summary`) as preview.
+    let payload = crate::tui::notifications::subagent_terminal_payload(
+        codewhale_localization::Locale::En,
+        "audit docs",
+        "## Summary\n\nThree links are stale. Two are in README.md.\n<codewhale:subagent.done>{}</codewhale:subagent.done>",
+        &crate::tools::subagent::SubAgentStatus::Completed,
+        false,
+        Duration::from_secs(5),
+    );
+    assert_eq!(payload.headline(), "Agent complete");
+    assert_eq!(payload.detail(), Some("audit docs"));
+    assert_eq!(payload.preview(), Some("Three links are stale."));
+}
+
+#[test]
 fn subagent_cancelled_notification_never_claims_completion() {
     let payload = crate::tui::notifications::subagent_terminal_payload(
         codewhale_localization::Locale::En,
@@ -30947,32 +30964,21 @@ fn pending_child_approval_drives_the_phase_to_waiting_on_you() {
     assert_eq!(phase.label(app.ui_locale), "needs you");
 }
 
-/// #6565: the label a workflow gives a child is its one name. It replaces the
-/// counter placeholder the child got before the workflow event arrived, and
-/// the status line, card owner and roster all read it.
+/// #6565: the label a workflow gives a child is its one name. The engine
+/// makes it the child's explicit nickname, so the spawn event and every
+/// snapshot carry it; it replaces the counter placeholder a progress-first
+/// child got, and the status line, card owner and roster all read it.
 #[test]
 fn workflow_task_label_is_the_one_name_for_that_agent() {
-    use crate::tui::widgets::workflow_panel::WorkflowPanelEvent;
+    use crate::tools::subagent::SubAgentStatus;
 
     let mut app = create_test_app();
     // Progress arrived first and assigned the placeholder.
     assert_eq!(app.ensure_agent_label("agent_wf1"), "Agent 1");
 
-    app.apply_workflow_panel_event(
-        "run-1",
-        WorkflowPanelEvent::TaskStarted {
-            task_id: "agent_wf1".to_string(),
-            label: Some("audit docs".to_string()),
-            profile: Some("explore".to_string()),
-            model: None,
-            strength: None,
-            resolved_model: None,
-            worktree: false,
-            workspace: None,
-            route: Box::default(),
-            at_ms: 1_000,
-        },
-    );
+    let mut first = make_subagent("agent_wf1", SubAgentStatus::Running);
+    first.nickname = Some("audit docs".to_string());
+    app.subagent_cache.push(first);
 
     assert_eq!(app.ensure_agent_label("agent_wf1"), "audit docs");
     assert_eq!(app.agent_display_label("agent_wf1"), "audit docs");
@@ -30985,20 +30991,27 @@ fn workflow_task_label_is_the_one_name_for_that_agent() {
         "audit docs"
     );
 
-    // A parallel task with the same label gets a name the person can tell
-    // apart on the approval card; hearing about either task again keeps it.
-    app.note_workflow_agent_label("agent_wf2", "audit docs");
+    // A parallel task with the same label, known so far only from its spawn
+    // event, gets a name the person can tell apart on the approval card;
+    // hearing about either task again keeps it.
+    app.agent_progress_meta
+        .entry("agent_wf2".to_string())
+        .or_default()
+        .display_name = Some("audit docs".to_string());
     assert_eq!(app.ensure_agent_label("agent_wf2"), "audit docs · 2");
     assert_eq!(
         crate::tui::pending_requests::owner_for(&mut app, "agent_wf2").label,
         "audit docs · 2"
     );
-    app.note_workflow_agent_label("agent_wf2", "audit docs");
-    app.note_workflow_agent_label("agent_wf1", "audit docs");
+    let mut second = make_subagent("agent_wf2", SubAgentStatus::Running);
+    second.nickname = Some("audit docs".to_string());
+    app.subagent_cache.push(second);
+    assert_eq!(app.ensure_agent_label("agent_wf2"), "audit docs · 2");
+    assert_eq!(app.ensure_agent_label("agent_wf1"), "audit docs");
     assert_eq!(app.agent_display_label("agent_wf1"), "audit docs");
     assert_eq!(app.agent_display_label("agent_wf2"), "audit docs · 2");
     assert_eq!(
         app.agent_given_name("agent_wf2").as_deref(),
-        Some("audit docs · 2")
+        Some("audit docs")
     );
 }

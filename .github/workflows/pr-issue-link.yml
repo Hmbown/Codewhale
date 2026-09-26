@@ -21,6 +21,7 @@ permissions:
 jobs:
   link:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       # Automated dependency bumps (dependabot and any other GitHub-verified
       # bot account) are machine-generated and can never carry a closing

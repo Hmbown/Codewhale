@@ -881,13 +881,21 @@ must continue to redact or reject them independently of fleet selection.
 
 ## Child grants: 0.10.1 scope and the 0.11 rework (#6298)
 
-Today a child's authority is assembled from several layers: role postures, a
-permission ceiling, the shell policy, inherited tool scope, deny-list unions,
-sentinels, and a single-command read-only grammar. That grammar is both too
-narrow and not a real boundary. A verifier cannot run the builds and fetches
-it is handed, and the grammar is a classifier, not a sandbox.
+A child's authority is one grant object, `ChildGrant`
+(`crates/tui/src/worker_profile.rs`). It shipped in v0.10.0 (966ef974e1,
+#5633). It has `files` (none / read / write), `shell` (none / inspect /
+verify / full), `network`, `desktop`, a tool `surface`, the caller's explicit
+`scope`, and `spawn`. Roles are presets over it (`ChildGrant::for_role`), and
+`ChildGrant::resolve` intersects the preset with the parent-derived profile
+and the caller's scope. The child's tool catalog, its dispatch refusals, and
+its capability envelope all read the same grant, so a tool the child can see
+is a tool it can call. `desktop` is in no preset.
 
-**Shipped before 0.10.1** (narrow fixes on the current model):
+`ShellGrant::Verify` also shipped in v0.10.0: the Verifier preset gets the
+bounded built-in verification surface (default workspace checks, pure test
+selection, bounded Git fetch and merge-tree) instead of a shell grammar.
+
+**Other fixes shipped by v0.10.0** (on top of the grant):
 
 - Children never inherit desktop or computer-control tools (b5e48cd31, #6296).
 - A bounded verify surface for Git: `fetch` against a configured remote name
@@ -897,23 +905,18 @@ it is handed, and the grammar is a classifier, not a sandbox.
 - One reasoning vocabulary (c2bc1244d). Token budgets are tracked but never
   enforced (a7a8bdb33).
 
-**0.10.1 re-scope.** This release adds no grant-model code. #6298 is re-scoped
-to the design below, and the rework lands in 0.11 as its own slices.
+**0.10.1 scope.** This release adds no new grant-model code. #6298 is
+re-scoped to the remainder below, which lands in 0.11 as its own slices.
 
-**0.11 rework** (size L, one slice at a time):
+**0.11 remainder** (one slice at a time):
 
-1. **One grant object per child.** It has `files` (none / read / write),
-   `shell` (none / inspect / verify / full), `network`, `desktop` (off unless
-   granted), and a preset tool allowlist. Roles become presets over it. Catalog
-   visibility and execution denial come from the same grant, which retires the
-   ceiling, sentinel, and posture re-mapping layers.
-2. **A `verify` shell mode that works.** `cargo test`/`check` and Git fetch run
-   under an explicit, bounded write scope (`target/`, refs), replacing the
-   command allowlist that pretends to be read-only.
-3. **Classified tool families that fail closed.** MCP and desktop tools form a
+1. **A `verify` shell mode for builds.** `cargo test`/`check` run under an
+   explicit, bounded write scope (`target/`, refs), so a verifier can run the
+   builds it is handed without a full shell.
+2. **Classified tool families that fail closed.** MCP and desktop tools form a
    labeled family. A child gets that family only when the spawn grants it with
    a reason, and an unclassified tool is not granted.
-4. **Legible grants.** The role picker, roster, and receipts show the effective
+3. **Legible grants.** The role picker, roster, and receipts show the effective
    grant, model, and thinking tier in plain words.
 
 Related work is tracked in #6015, #5633, #6194, and #6232.

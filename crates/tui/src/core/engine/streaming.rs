@@ -261,7 +261,9 @@ pub(super) fn stream_read_error_user_message(message: &str, any_content_received
 ///
 /// 1. Generic/Anthropic-style (`[TOOL_CALL]`, `<invoke …>`, `<function_calls>`).
 /// 2. DSML wrappers, in fullwidth `｜` (U+FF5C) and ASCII `|` delimiters, upper
-///    and lower case.
+///    and lower case. DeepSeek also emits a doubled-delimiter form
+///    (`<｜｜DSML｜｜ calls>`) when a request offers no tools; one-shot
+///    `codewhale exec` printed it verbatim as the answer.
 /// 3. **DeepSeek's native tool-call tokens** (#3880). DeepSeek's chat template
 ///    separates words with `▁` (U+2581 LOWER ONE EIGHTH BLOCK), not a space or
 ///    underscore, so `<｜tool▁calls▁begin｜>` does not match any DSML entry and
@@ -271,7 +273,7 @@ pub(super) fn stream_read_error_user_message(message: &str, any_content_received
 ///
 /// When adding a shape, add it here and to the two marker tables below.
 /// `marker_tables_are_consistent` enforces that they agree.
-pub(crate) const TOOL_CALL_MARKER_PAIRS: [(&str, &str); 28] = [
+pub(crate) const TOOL_CALL_MARKER_PAIRS: [(&str, &str); 30] = [
     ("[TOOL_CALL]", "[/TOOL_CALL]"),
     ("<codewhale:tool_call", "</codewhale:tool_call>"),
     ("<tool_call", "</tool_call>"),
@@ -283,6 +285,8 @@ pub(crate) const TOOL_CALL_MARKER_PAIRS: [(&str, &str); 28] = [
     ("<|DSML|invoke ", "</|DSML|invoke>"),
     ("<|dsml|tool_calls>", "</|dsml|tool_calls>"),
     ("<|dsml|invoke ", "</|dsml|invoke>"),
+    ("<｜｜DSML｜｜ calls>", "</｜｜DSML｜｜ calls>"),
+    ("<｜｜DSML｜｜ invoke ", "</｜｜DSML｜｜ invoke>"),
     ("<|tool_calls>", "</|tool_calls>"),
     // DeepSeek native, fullwidth delimiters, U+2581 separator.
     ("<｜tool▁calls▁begin｜>", "<｜tool▁calls▁end｜>"),
@@ -305,7 +309,7 @@ pub(crate) const TOOL_CALL_MARKER_PAIRS: [(&str, &str); 28] = [
     ("<|tool_output_begin|>", "<|tool_output_end|>"),
 ];
 
-pub(crate) const TOOL_CALL_START_MARKERS: [&str; 28] = [
+pub(crate) const TOOL_CALL_START_MARKERS: [&str; 30] = [
     "[TOOL_CALL]",
     "<codewhale:tool_call",
     "<tool_call",
@@ -317,6 +321,8 @@ pub(crate) const TOOL_CALL_START_MARKERS: [&str; 28] = [
     "<|DSML|invoke ",
     "<|dsml|tool_calls>",
     "<|dsml|invoke ",
+    "<｜｜DSML｜｜ calls>",
+    "<｜｜DSML｜｜ invoke ",
     "<|tool_calls>",
     "<｜tool▁calls▁begin｜>",
     "<｜tool▁call▁begin｜>",
@@ -336,7 +342,7 @@ pub(crate) const TOOL_CALL_START_MARKERS: [&str; 28] = [
     "<|tool_output_begin|>",
 ];
 
-pub(crate) const TOOL_CALL_END_MARKERS: [&str; 28] = [
+pub(crate) const TOOL_CALL_END_MARKERS: [&str; 30] = [
     "[/TOOL_CALL]",
     "</codewhale:tool_call>",
     "</tool_call>",
@@ -348,6 +354,8 @@ pub(crate) const TOOL_CALL_END_MARKERS: [&str; 28] = [
     "</|DSML|invoke>",
     "</|dsml|tool_calls>",
     "</|dsml|invoke>",
+    "</｜｜DSML｜｜ calls>",
+    "</｜｜DSML｜｜ invoke>",
     "</|tool_calls>",
     "<｜tool▁calls▁end｜>",
     "<｜tool▁call▁end｜>",
@@ -485,10 +493,15 @@ pub(crate) fn filter_tool_call_delta_with_state(
 
     loop {
         if state.in_tool_call {
+            // Close only on the opener's own end marker when it is known.
+            // Falling back to any end marker let a nested closer inside a
+            // DSML block (`</｜DSML｜invoke>`) end the block whenever a delta
+            // lacked the outer closer, leaking `</｜DSML｜tool_calls>`.
             let active_end_marker = state.active_end_marker;
-            let found = active_end_marker
-                .and_then(|marker| rest.find(marker).map(|idx| (idx, marker.len())))
-                .or_else(|| find_first_marker(rest, &TOOL_CALL_END_MARKERS));
+            let found = match active_end_marker {
+                Some(marker) => rest.find(marker).map(|idx| (idx, marker.len())),
+                None => find_first_marker(rest, &TOOL_CALL_END_MARKERS),
+            };
             let Some((idx, len)) = found else {
                 let keep = active_end_marker.map_or_else(
                     || trailing_marker_prefix_len(rest, &TOOL_CALL_END_MARKERS),
