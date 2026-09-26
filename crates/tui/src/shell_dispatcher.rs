@@ -390,24 +390,8 @@ impl ShellDispatcher {
             }
         }
 
-        // Disable raw mode; guard restores it only if it was already enabled.
-        let raw_mode_was_enabled = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
-        if raw_mode_was_enabled {
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
-        struct FgRawModeGuard {
-            restore: bool,
-        }
-        impl Drop for FgRawModeGuard {
-            fn drop(&mut self) {
-                if self.restore {
-                    let _ = crossterm::terminal::enable_raw_mode();
-                }
-            }
-        }
-        let _guard = FgRawModeGuard {
-            restore: raw_mode_was_enabled,
-        };
+        // Leave raw mode; the guard restores it only if it was already enabled.
+        let _raw_mode = crate::host_terminal::suspend_raw_mode();
 
         let mut cmd = self.build_command(shell_command);
         cmd.current_dir(cwd);

@@ -1383,6 +1383,41 @@ impl Engine {
         ))
     }
 
+    /// Where the user message just added sits in the session, for
+    /// [`Self::retract_unanswered_user_message`].
+    pub(super) fn mark_unanswered_user_message(&self) -> crate::core::turn::UnansweredUserMessage {
+        crate::core::turn::UnansweredUserMessage {
+            len: self.session.messages.len(),
+            revision: self.session.messages_revision,
+        }
+    }
+
+    /// Remove this turn's user message when nothing followed it — the request
+    /// was refused before any model output (#6566). The mark is the session
+    /// length and messages revision right after the message was added: an
+    /// append since (an answer, a tool call, a runtime note) changes the
+    /// length, and a rewrite (compaction, context recovery) changes the
+    /// revision even when the length happens to match, so either leaves the
+    /// session as it is rather than delete some other message.
+    pub(super) fn retract_unanswered_user_message(
+        &mut self,
+        mark: crate::core::turn::UnansweredUserMessage,
+    ) -> bool {
+        let messages = &self.session.messages;
+        if mark.len == 0
+            || messages.len() != mark.len
+            || self.session.messages_revision != mark.revision
+            || messages
+                .last()
+                .is_none_or(|message| message.role != Role::User)
+        {
+            return false;
+        }
+        self.session.messages.truncate_to(mark.len - 1);
+        self.session.bump_messages_revision();
+        true
+    }
+
     pub(super) fn decorate_auth_error_message(&self, message: String) -> String {
         let Some(hint) = self.api_key_env_only_recovery.as_ref() else {
             return message;
@@ -5556,6 +5591,7 @@ impl Engine {
         };
         user_msg.content.splice(image_index..image_index, images);
         self.session.add_message(user_msg);
+        turn.unanswered_user_message = Some(self.mark_unanswered_user_message());
 
         self.emit_session_updated().await;
 
@@ -8344,7 +8380,7 @@ pub(crate) mod turn_heartbeat;
 pub(crate) mod turn_loop;
 pub(crate) use dispatch::{
     FLEET_FINAL_REPORT_NOTICE, FLEET_NO_PROGRESS_STOP, FLEET_STRATEGY_SWITCH_NOTICE,
-    FleetDenialAction, FleetDenialBatch, FleetDenialGuard,
+    FleetDenialAction, FleetDenialBatch, FleetDenialGuard, content_without_approval_note,
 };
 pub(crate) use token_estimate_cache::TokenEstimateCache;
 

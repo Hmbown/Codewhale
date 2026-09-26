@@ -10,9 +10,17 @@ description = "Colour tokens, themes, and contrast math for Codewhale's terminal
 [lints]
 workspace = true
 
+# `ratatui` (default) enables the `Color` roles, themes, adaptation, contrast
+# math and terminal detection. Without it the crate is the renderer-free
+# core (RGB tuples, ThemeId, theme and hex normalizers) that the headless
+# runtime links: `codewhale-palette = { default-features = false }`.
+[features]
+default = ["ratatui"]
+ratatui = ["dep:ratatui"]
+
 [dependencies]
 codewhale-config = { path = "../config", version = "0.10.0" }
-ratatui = { version = "=0.30.2", features = ["unstable-rendered-line-info"] }
+ratatui = { version = "=0.30.2", features = ["unstable-rendered-line-info"], optional = true }
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
 

@@ -6,6 +6,11 @@ Current boundary note (read the workspace version from `Cargo.toml`; this
 boundary has held since v0.9.1):
 - `crates/tui` is still the live end-user runtime for the TUI, runtime API, task manager, and tool execution loop.
 - Other workspace crates are being split out incrementally, but they are not yet the sole runtime source of truth.
+- The runtime is moving into `crates/runtime` (`codewhale-runtime`) in the
+  order `docs/design/TUI_DECONSTRUCTION.md` records: engine, tools, config,
+  client and stores move there together, never into `crates/core`, and the
+  TUI stays the only crate that writes to the terminal. Until a module has
+  moved, its path under `crates/tui/src` is still where it lives.
 - The LSP subsystem (`crates/tui/src/lsp/`) is fully wired into the engine's
   post-tool-execution path (`core/engine/lsp_hooks.rs`), providing inline
   diagnostics after `File` write, edit, and patch actions.
@@ -128,11 +133,22 @@ boundary has held since v0.9.1):
 - **`crates/models`** - Provider request/response models and the offline model
   metadata catalog.
 - **`crates/palette`** - Colour tokens, themes, and contrast math for the
-  terminal UI.
+  terminal UI. Its `ratatui` feature (on by default) gates everything that
+  renders; theme ids, setting normalizers and hex parsing compile without it,
+  which is how the runtime links it.
 - **`crates/paths`** - User-scoped runtime path authority (`CODEWHALE_HOME`
   and platform home resolution).
 - **`crates/protocol`** - Request/response framing and protocol types.
-- **`crates/secrets`** - OS keyring integration for API key storage.
+- **`crates/runtime`** - `codewhale-runtime`, the headless runtime being
+  split out of `crates/tui` (`docs/design/TUI_DECONSTRUCTION.md`). Today it
+  holds the leaf modules that moved first (retry status, safe labels, sleep
+  guard, session tree, ...) and `host_terminal`, the one port through which
+  runtime code asks the terminal UI for a terminal effect. It never depends on
+  the TUI, `ratatui` or `crossterm`; `scripts/check-command-crate-boundaries.py`
+  enforces that and ratchets the runtime -> UI references still in `crates/tui`.
+- **`crates/secrets`** - OS keyring integration for API key storage, plus the
+  shared output sanitizer (`sanitize`) and redaction (`redact`) that UI and
+  runtime code both call.
 - **`crates/state`** - SQLite thread/session persistence layer.
 - **`crates/telemetry`** - Anonymous, user-disableable aggregate usage
   counting; the only crate allowed to build or send a telemetry payload

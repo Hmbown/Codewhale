@@ -12,11 +12,11 @@ const DEFAULT_CAPACITY: usize = 256;
 
 static RESPONSE_CACHE: OnceLock<ResponseCache> = OnceLock::new();
 
-pub(crate) fn response_cache() -> &'static ResponseCache {
+pub fn response_cache() -> &'static ResponseCache {
     RESPONSE_CACHE.get_or_init(ResponseCache::new)
 }
 
-pub(crate) fn request_is_cacheable(request: &MessageRequest) -> bool {
+pub fn request_is_cacheable(request: &MessageRequest) -> bool {
     request.stream != Some(true)
         && request.tools.as_ref().is_none_or(Vec::is_empty)
         && request.tool_choice.is_none()
@@ -24,7 +24,7 @@ pub(crate) fn request_is_cacheable(request: &MessageRequest) -> bool {
         && request.top_p.is_none_or(|top_p| top_p == 1.0)
 }
 
-pub(crate) struct ResponseCache {
+pub struct ResponseCache {
     inner: Mutex<LruCache<[u8; 32], MessageResponse>>,
 }
 
@@ -39,7 +39,7 @@ impl ResponseCache {
         }
     }
 
-    pub(crate) fn make_key(
+    pub fn make_key(
         provider: &str,
         base_url: &str,
         path_suffix: Option<&str>,
@@ -55,7 +55,7 @@ impl ResponseCache {
         hasher.finalize().into()
     }
 
-    pub(crate) fn get(&self, key: &[u8; 32]) -> Option<MessageResponse> {
+    pub fn get(&self, key: &[u8; 32]) -> Option<MessageResponse> {
         let mut cache = self.inner.lock().ok()?;
         cache.get(key).cloned().map(|mut response| {
             response.usage = Usage::default();
@@ -63,7 +63,7 @@ impl ResponseCache {
         })
     }
 
-    pub(crate) fn put(&self, key: [u8; 32], value: MessageResponse) {
+    pub fn put(&self, key: [u8; 32], value: MessageResponse) {
         if let Ok(mut cache) = self.inner.lock() {
             cache.put(key, value);
         }

@@ -5565,6 +5565,72 @@ pub fn resolve_server_scope(global_path: &Path, workspace: &Path, name: &str) ->
     McpServerScope::Plugin
 }
 
+/// Plugin name of the built-in Computer Use bundle.
+const COMPUTER_USE_PLUGIN_NAME: &str = "computer-use";
+
+/// User-configured servers that launch the same Computer Use plugin as the
+/// enabled built-in `computer-use` bundle, with the argument that gave each
+/// one away. Two copies advertise every Computer Use schema twice (about
+/// 2.5k tokens on every request) and keep two consent ledgers. Diagnostic
+/// only: callers warn and never remove the user's entry.
+pub(crate) fn duplicate_computer_use_servers(config: &McpConfig) -> Vec<(String, String)> {
+    let builtin_enabled = config.servers.values().any(|server| {
+        server.is_enabled()
+            && server
+                .reviewed_plugin
+                .as_ref()
+                .is_some_and(|source| source.plugin_name() == COMPUTER_USE_PLUGIN_NAME)
+    });
+    if !builtin_enabled {
+        return Vec::new();
+    }
+    let mut duplicates = config
+        .servers
+        .iter()
+        .filter(|(_, server)| server.reviewed_plugin.is_none() && server.is_enabled())
+        .filter_map(|(name, server)| {
+            launches_computer_use_plugin(server).map(|arg| (name.clone(), arg))
+        })
+        .collect::<Vec<_>>();
+    duplicates.sort();
+    duplicates
+}
+
+/// The argument naming a Computer Use `mcp/server.mjs`, when this server
+/// runs one: the `plugin.json` next to its `mcp/` directory says
+/// `"name": "computer-use"`, or — when no manifest is readable — the path
+/// has the bundle's shape (`.../computer-use/.../mcp/server.mjs`, any case
+/// or separator).
+fn launches_computer_use_plugin(server: &McpServerConfig) -> Option<String> {
+    server.command.as_ref()?;
+    server.args.iter().find_map(|arg| {
+        let normalized = arg.replace('\\', "/");
+        if !normalized.ends_with("mcp/server.mjs") {
+            return None;
+        }
+        let script = Path::new(arg);
+        let script = if script.is_relative() {
+            server
+                .cwd
+                .as_ref()
+                .map_or_else(|| script.to_path_buf(), |cwd| cwd.join(script))
+        } else {
+            script.to_path_buf()
+        };
+        let root = script.parent().and_then(Path::parent);
+        if let Some(root) = root
+            && let Ok(text) = std::fs::read_to_string(root.join("plugin.json"))
+        {
+            let name = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|manifest| manifest.get("name")?.as_str().map(str::to_string));
+            return (name.as_deref() == Some(COMPUTER_USE_PLUGIN_NAME)).then(|| arg.clone());
+        }
+        let squashed = normalized.to_ascii_lowercase().replace([' ', '-', '_'], "");
+        squashed.contains("computeruse").then(|| arg.clone())
+    })
+}
+
 pub fn load_config_with_workspace(global_path: &Path, workspace: &Path) -> Result<McpConfig> {
     let plugins = crate::plugins::PluginRegistry::empty(workspace);
     load_config_with_workspace_and_plugins(global_path, workspace, &plugins)

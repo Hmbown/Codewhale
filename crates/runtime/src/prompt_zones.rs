@@ -315,7 +315,6 @@ pub struct TurnScratch {
     pub user_message: Option<Message>,
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 impl TurnScratch {
     pub fn new() -> Self {
         Self::default()
@@ -338,7 +337,6 @@ impl TurnScratch {
 ///
 /// **Phase 1 scaffolding** — not yet wired into the engine request path.
 /// Currently the engine continues to use `MessageRequest` directly.
-#[expect(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ThreeZoneRequest<'a> {
     pub prefix: &'a FrozenPrefix,
@@ -357,7 +355,6 @@ pub struct ThreeZoneRequest<'a> {
     pub metadata: Option<serde_json::Value>,
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 impl<'a> ThreeZoneRequest<'a> {
     /// Build the full message list from system prompt, append-log messages,
     /// and scratch user message. The returned vector is serialized as the

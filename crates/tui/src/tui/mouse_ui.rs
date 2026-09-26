@@ -268,60 +268,16 @@ fn move_composer_cursor_by_wrapped_rows(app: &mut App, text_area: Rect, rows: is
     true
 }
 
-/// The WorkflowPanel's clickable affordance: its header row only (#6503).
-/// Hover registration (`frame.rs`) uses the same rect, so every row that
-/// glows acts and phase/child rows are never invisible click targets.
-pub(crate) fn workflow_panel_header_area(app: &App) -> Option<Rect> {
-    app.viewport.last_workflow_panel_area.map(|area| Rect {
-        height: area.height.min(1),
-        ..area
-    })
-}
-
-/// Click the WorkflowPanel header to toggle expand/collapse, or the trailing
-/// cancel affordance while a run is active (#4121).
-fn handle_workflow_panel_mouse(app: &mut App, mouse: MouseEvent) -> bool {
-    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+/// A click on the workbar opens `/workflows`, the view that lists every run
+/// with its agents and cancels one.
+fn handle_workbar_mouse(app: &mut App, mouse: MouseEvent) -> bool {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        || !mouse_hits_rect(mouse, app.viewport.last_workbar_area)
+        || app.workflow_runs.is_empty()
+    {
         return false;
     }
-    let Some(header) = workflow_panel_header_area(app) else {
-        return false;
-    };
-    if !mouse_hits_rect(mouse, Some(header)) {
-        return false;
-    }
-    if app.workflow_panel.is_none() {
-        return false;
-    }
-
-    if let Some(panel) = app.workflow_panel.as_mut() {
-        panel.keyboard_focus = true;
-    }
-
-    let in_cancel_zone = mouse_hits_rect(mouse, app.viewport.last_workflow_cancel_area);
-    let running = app
-        .workflow_panel
-        .as_ref()
-        .is_some_and(|panel| panel.lifecycle.is_running());
-
-    if in_cancel_zone && running {
-        let run_id = app
-            .workflow_panel
-            .as_ref()
-            .map(|panel| panel.run_id.clone())
-            .expect("running panel has an id");
-        app.input = format!("/workflow cancel {run_id}");
-        app.cursor_position = app.input.chars().count();
-        app.status_message = Some(app.tr(MessageId::SidebarDestructiveArmed).into_owned());
-        if let Some(panel) = app.workflow_panel.as_mut() {
-            panel.keyboard_focus = false;
-        }
-        app.needs_redraw = true;
-        return true;
-    }
-
-    // Any other click on the header toggles expand/collapse.
-    app.toggle_workflow_panel();
+    crate::tui::views::workflows_manager::open(app);
     true
 }
 
@@ -722,9 +678,7 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
         return Vec::new();
     }
 
-    // WorkflowPanel toggle / cancel (#4121) before composer so the strip
-    // above the input remains clickable.
-    if handle_workflow_panel_mouse(app, mouse) {
+    if handle_workbar_mouse(app, mouse) {
         return Vec::new();
     }
 
@@ -2153,38 +2107,22 @@ mod tests {
         app
     }
 
-    /// #6520 review: only the header row — the row that shows the hover
-    /// glow — toggles the workflow card; phase and child rows are not
-    /// invisible click targets.
     #[test]
-    fn workflow_card_click_target_is_the_header_row_only() {
+    fn workbar_click_opens_the_workflows_view() {
         let mut app = create_test_app();
-        app.workflow_panel = Some(crate::tui::widgets::workflow_panel::WorkflowPanel::new(
-            "workflow_1",
-            "audit",
-            1,
-        ));
-        app.viewport.last_workflow_panel_area = Some(Rect::new(0, 5, 80, 6));
-        let expanded = |app: &App| app.workflow_panel.as_ref().is_some_and(|p| p.expanded);
-        assert!(expanded(&app));
-
-        assert!(!super::handle_workflow_panel_mouse(
-            &mut app,
-            left_click(10, 7)
-        ));
-        assert!(
-            expanded(&app),
-            "a body-row click must not collapse the card"
-        );
-
-        assert!(super::handle_workflow_panel_mouse(
-            &mut app,
-            left_click(10, 5)
-        ));
-        assert!(!expanded(&app), "the header click toggles");
+        app.workflow_runs
+            .push(crate::tui::widgets::workflow_panel::WorkflowPanel::new(
+                "workflow_1",
+                "audit",
+                1,
+            ));
+        app.viewport.last_workbar_area = Some(Rect::new(0, 20, 80, 1));
+        assert!(!super::handle_workbar_mouse(&mut app, left_click(10, 5)));
+        assert!(app.view_stack.is_empty());
+        assert!(super::handle_workbar_mouse(&mut app, left_click(10, 20)));
         assert_eq!(
-            super::workflow_panel_header_area(&app),
-            Some(Rect::new(0, 5, 80, 1))
+            app.view_stack.top_kind(),
+            Some(crate::tui::views::ModalKind::WorkflowsManager)
         );
     }
 

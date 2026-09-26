@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use ratatui::style::Color;
 use serde::Deserialize;
 
+use super::ids::{USER_THEME_PREFIX, normalize_theme_setting, normalize_user_theme_selector};
 use super::{ThemeId, UiTheme, parse_hex_rgb_color};
 
-pub const USER_THEME_PREFIX: &str = "custom:";
 pub const USER_THEME_SCHEMA: &str = include_str!("../assets/user-theme.schema.json");
 const MAX_USER_THEME_BYTES: u64 = 64 * 1024;
 
@@ -78,34 +78,6 @@ struct UserThemeColors {
 #[must_use]
 pub fn user_theme_schema_json() -> &'static str {
     USER_THEME_SCHEMA
-}
-
-pub fn normalize_user_theme_selector(value: &str) -> Result<Option<String>, String> {
-    let trimmed = value.trim();
-    let Some(slug) = trimmed.strip_prefix(USER_THEME_PREFIX) else {
-        return Ok(None);
-    };
-    let slug = slug.trim().to_ascii_lowercase();
-    if slug.is_empty()
-        || slug.len() > 64
-        || !slug
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-    {
-        return Err(
-            "custom theme names must be 1-64 ASCII letters, digits, '-' or '_'".to_string(),
-        );
-    }
-    Ok(Some(format!("{USER_THEME_PREFIX}{slug}")))
-}
-
-pub fn normalize_theme_setting(value: &str) -> Result<String, String> {
-    if let Some(id) = ThemeId::from_name(value) {
-        return Ok(id.name().to_string());
-    }
-    normalize_user_theme_selector(value)?.ok_or_else(|| {
-        format!("invalid theme '{value}'; use a compiled theme name or custom:<name>")
-    })
 }
 
 pub fn resolve_theme_setting(

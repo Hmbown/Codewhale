@@ -124,7 +124,6 @@ impl PressureLevel {
     /// Unused by the engine today; kept as the pressure-level counterpart of
     /// `ContextBudget::should_compact` so both live next to their thresholds.
     #[must_use]
-    #[cfg_attr(not(test), expect(dead_code))]
     pub const fn suggests_compaction(self) -> bool {
         matches!(self, PressureLevel::High | PressureLevel::Critical)
     }
@@ -247,7 +246,6 @@ impl ContextBudget {
     /// Whether current input has reached the compaction trigger and compaction
     /// should be suggested.
     #[must_use]
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn should_compact(&self) -> bool {
         self.window_tokens > 0 && self.input_tokens >= self.compaction_trigger_tokens
     }
@@ -255,7 +253,6 @@ impl ContextBudget {
     /// Whether another `additional_input_tokens` of input would fit within the
     /// available budget (i.e. not exceed the reserved boundary).
     #[must_use]
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn fits_additional(&self, additional_input_tokens: u64) -> bool {
         additional_input_tokens <= self.available_input_tokens
     }

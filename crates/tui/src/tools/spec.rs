@@ -713,6 +713,13 @@ pub struct ToolExecutionState {
     pub(crate) provider_native_search: Option<crate::client::ProviderNativeSearchClient>,
     /// Exact active route capability facts. Unknown stays fail-closed.
     pub(crate) route_capabilities: codewhale_config::route::RouteCapabilities,
+    /// Engine-served gate for calls nested inside an `execute_tools` program.
+    /// Set only on the context of one `execute_tools` call by the turn loop;
+    /// every nested call is planned and approved through the same gate a
+    /// direct call gets. `None` everywhere else (sub-agents, tests, exec
+    /// hosts without an engine turn), where code mode keeps its read-only,
+    /// auto-approved profile.
+    pub(crate) nested_call_gate: Option<crate::tools::codemode::NestedCallGate>,
 }
 
 impl std::ops::Deref for ToolContext {
@@ -812,6 +819,7 @@ impl ToolContext {
                 search_base_url: None,
                 provider_native_search: None,
                 route_capabilities: codewhale_config::route::RouteCapabilities::default(),
+                nested_call_gate: None,
             }),
         }
     }

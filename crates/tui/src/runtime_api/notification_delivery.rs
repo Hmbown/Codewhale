@@ -2,9 +2,11 @@
 //! policy owners. This endpoint prepares an attempt; it never submits a banner.
 
 use super::*;
+use crate::notify::payload::NotificationPayload;
+use crate::notify::{
+    DeliveryOutcome, Method, NotificationGate, audio as notification_audio, sound_policy,
+};
 use crate::runtime_threads::{RuntimeEventRecord, RuntimeTurnStatus};
-use crate::tui::notification_payload::NotificationPayload;
-use crate::tui::{notification_audio, notifications, sound_policy};
 use codewhale_localization::{Locale, MessageId, tr};
 
 #[derive(Deserialize)]
@@ -174,33 +176,33 @@ fn prepare_payload(
     unfocused_for: Duration,
 ) -> PreparedNotification {
     let notification_config = config.notifications_config();
-    let Some((method, threshold, _)) = notifications::settings_projection(config) else {
+    let Some((method, threshold, _)) = crate::notify::settings_projection(&notification_config)
+    else {
         return PreparedNotification::suppressed("suppressed");
     };
     let method = match method {
-        notifications::Method::Auto => notifications::Method::MacOS,
-        notifications::Method::Off => notifications::Method::Off,
+        Method::Auto => Method::MacOS,
+        Method::Off => Method::Off,
         _ => return PreparedNotification::suppressed("unsupported_method"),
     };
     let attention =
-        notifications::native_attention_allowed(&notification_config, focused, unfocused_for);
-    let threshold =
-        if payload.kind() == crate::tui::notification_payload::NotificationKind::TurnComplete {
-            threshold
-        } else {
-            Duration::ZERO
-        };
+        crate::notify::native_attention_allowed(&notification_config, focused, unfocused_for);
+    let threshold = if payload.kind() == crate::notify::payload::NotificationKind::TurnComplete {
+        threshold
+    } else {
+        Duration::ZERO
+    };
     let mut sound = "off";
     // Capture the shared policy's intended sinks. Neither closure performs IO;
     // the response says prepared, never dispatched/delivered. The native host
     // owns the subsequent permission check and submission receipt.
-    let outcome = notifications::notify_with_sinks(
+    let outcome = crate::tui::notifications::notify_with_sinks(
         method,
         false,
         payload,
         threshold,
         elapsed,
-        notifications::NotificationGate::from_config(&notification_config),
+        NotificationGate::from_config(&notification_config),
         attention,
         &mut std::io::sink(),
         &mut |kind, bell| {
@@ -221,9 +223,9 @@ fn prepare_payload(
             };
             notification_audio::AudioOutcome::Dispatched
         },
-        &mut |_| notifications::DeliveryOutcome::Dispatched(notifications::Method::MacOS),
+        &mut |_| DeliveryOutcome::Dispatched(Method::MacOS),
     );
-    if !matches!(outcome, notifications::DeliveryOutcome::Dispatched(_)) {
+    if !matches!(outcome, DeliveryOutcome::Dispatched(_)) {
         return PreparedNotification::suppressed("suppressed");
     }
     PreparedNotification {

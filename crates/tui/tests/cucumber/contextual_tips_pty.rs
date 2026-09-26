@@ -28,7 +28,7 @@ fn launch(workspace: &SealedWorkspace) -> Harness {
         .size(32, 100)
         .spawn()
         .unwrap();
-    tui.wait_for_text("Type a message", TIMEOUT).unwrap();
+    tui.wait_for_composer(TIMEOUT).unwrap();
     tui
 }
 

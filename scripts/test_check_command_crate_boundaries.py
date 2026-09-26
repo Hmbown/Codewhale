@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -108,6 +109,143 @@ class SourceTests(unittest.TestCase):
             "pub struct CommandContexts<'a> { marker: &'a str }\n"
         )
         self.assertEqual(mod.check_contract_source_text(source, "safe.rs"), [])
+
+
+class TreeModeTests(unittest.TestCase):
+    RULE = mod.BoundaryRule(
+        "codewhale-runtime",
+        "tree",
+        ("codewhale-tui", "ratatui", "crossterm"),
+        "the runtime must stay UI-free",
+    )
+
+    def test_parse_cargo_tree_keeps_names(self) -> None:
+        text = "codewhale-runtime v0.10.0 (/x)\nanyhow v1.0.100\nratatui v0.30.2 (*)\n"
+        self.assertEqual(mod.parse_cargo_tree(text), {"codewhale-runtime", "anyhow", "ratatui"})
+
+    def test_clean_tree_passes(self) -> None:
+        self.assertEqual(mod.check_tree_packages(self.RULE, {"anyhow", "serde"}), [])
+
+    def test_runtime_rule_is_tree_mode(self) -> None:
+        rule = next(r for r in mod.BOUNDARY_RULES if r.package == "codewhale-runtime")
+        self.assertEqual(rule.mode, "tree")
+        self.assertIn("ratatui", rule.forbidden_packages)
+        self.assertIn("crossterm", rule.forbidden_packages)
+
+    def test_runtime_source_scan(self) -> None:
+        self.assertEqual(
+            mod.check_runtime_source_text("// ratatui::Frame is not used here\nfn f() {}\n", "a.rs"),
+            [],
+        )
+        for source in (
+            "use crossterm::terminal;",
+            "let _ = ratatui::style::Color::Reset;",
+            'const X: &str = include_str!("../../tui/assets/x.json");',
+        ):
+            with self.subTest(source=source):
+                self.assertTrue(mod.check_runtime_source_text(source, "a.rs"))
+
+    def test_ui_library_in_tree_fails(self) -> None:
+        violations = mod.check_tree_packages(self.RULE, {"anyhow", "ratatui", "crossterm"})
+        self.assertEqual(len(violations), 2)
+        self.assertIn("ratatui", str(violations[1]) + str(violations[0]))
+
+
+def write_tree(root: Path, files: dict[str, str]) -> None:
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+
+class RatchetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.graph = mod.load_runtime_ratchet()
+
+    def report(self, tui: dict[str, str], runtime: dict[str, str] | None = None):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_tree(Path(tmp, "tui"), tui)
+            write_tree(Path(tmp, "runtime"), runtime or {})
+            return self.graph.build_report(Path(tmp, "tui"), Path(tmp, "runtime"))
+
+    def test_counts_grouped_imports_and_masks_comments_and_strings(self) -> None:
+        report = self.report({
+            "lib.rs": "mod core; mod tui;\n",
+            "core.rs": (
+                "use crate::{tui::App, tui::views::{A, B}};\n"
+                "// crate::tui::ignored\n"
+                "const S: &str = \"crate::tui::ignored\";\n"
+                "fn f() { crate::tui::draw(); }\n"
+                "#[cfg(test)]\nmod tests { fn t() { crate::tui::fixture(); } }\n"
+            ),
+            "tui.rs": "",
+        })
+        self.assertEqual(report.counts["prod"], {"core|tui": 4})
+        self.assertEqual(report.counts["test"], {"core|tui": 1})
+
+    def test_ui_library_and_late_edges_are_counted(self) -> None:
+        report = self.report({
+            "lib.rs": "mod core; mod exec_agent;\n",
+            "core.rs": "fn f() { crossterm::terminal::enable_raw_mode(); }\n"
+            "#[cfg(test)]\nmod tests { fn t() { crate::exec_agent::run(); } }\n",
+            "exec_agent.rs": "",
+        })
+        self.assertEqual(report.counts["uilib"], {"core|crossterm": 1})
+        self.assertEqual(report.counts["late"], {"core|exec_agent": 1})
+
+    def test_runtime_crate_modules_join_the_closure(self) -> None:
+        report = self.report(
+            {"lib.rs": "mod core;\nuse codewhale_runtime::{elapsed};\n", "core.rs": ""},
+            {"lib.rs": "pub mod elapsed;\n", "elapsed.rs": "fn f() { ratatui::x(); }\n"},
+        )
+        self.assertIn("elapsed", report.closure)
+        self.assertEqual(report.counts["uilib"], {"elapsed|ratatui": 1})
+
+    def test_rise_and_unrecorded_drop_both_fail(self) -> None:
+        report = self.report({
+            "lib.rs": "mod core; mod tui;\n",
+            "core.rs": "fn f() { crate::tui::a(); crate::tui::b(); }\n",
+            "tui.rs": "",
+        })
+        rises, drops = self.graph.compare({"counts": {"prod": {"core|tui": 1}}}, report)
+        self.assertTrue(rises and rises[0].startswith("prod core|tui: 1 -> 2"))
+        self.assertEqual(drops, [])
+        rises, drops = self.graph.compare({"counts": {"prod": {"core|tui": 3}}}, report)
+        self.assertEqual((rises, drops), ([], ["prod core|tui: 3 -> 2"]))
+
+    def test_super_chains_that_reach_the_root_count(self) -> None:
+        report = self.report({
+            "lib.rs": "mod core; mod tui;\n",
+            "core/mod.rs": (
+                "mod inner;\n"
+                "fn f() { super::tui::a(); }\n"
+                "pub(in super::super) fn g() {}\n"
+                "#[cfg(test)]\nmod tests { use super::super::{tui::B, x}; use super::*; }\n"
+            ),
+            # Depth 2: two `super`s reach the root, one stays inside `core`.
+            "core/inner.rs": "use super::super::tui as ui;\nfn f() { super::tui::local(); }\n",
+            "tui.rs": "",
+        })
+        self.assertEqual(report.counts["prod"], {"core|tui": 2})
+        self.assertEqual(report.counts["test"], {"core|tui": 1})
+
+    def test_hand_raised_baseline_fails_against_the_base(self) -> None:
+        previous = {"counts": {"prod": {"tools|tui": 8}}}
+        self.assertEqual(self.graph.baseline_raises(previous, previous), [])
+        self.assertEqual(
+            self.graph.baseline_raises(previous, {"counts": {"prod": {"tools|tui": 7}}}), []
+        )
+        self.assertEqual(
+            self.graph.baseline_raises(previous, {"counts": {"prod": {"tools|tui": 9}}}),
+            ["prod tools|tui: 8 -> 9"],
+        )
+        self.assertEqual(
+            self.graph.baseline_raises(previous, {"counts": {"test": {"core|tui": 1}}}),
+            ["test core|tui: 0 -> 1 (new pair)"],
+        )
+
+    def test_checked_in_baseline_holds(self) -> None:
+        self.assertEqual(self.graph.check(), [])
 
 
 if __name__ == "__main__":

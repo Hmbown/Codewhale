@@ -1,5 +1,29 @@
 //! RLM turn loop — paper Algorithm 1 driven over a long-lived Python
 //! subprocess + stdin/stdout RPC bridge (no HTTP sidecar).
+//!
+//! # What this loop is, and is not (#6511)
+//!
+//! This is the recursive sub-RLM behind `rlm_query` from the Python REPL
+//! (`bridge.rs::dispatch_rlm`). It is a second model/code-round loop beside
+//! `Engine::run_turn`, listed as a named interim exception in
+//! `crates/core/tests/single_turn_loop.rs` until it converges.
+//!
+//! - **Logged.** Every status line and code round is sent on `tx_event`; the
+//!   bridge forwards a nested loop's events to its parent's stream (and to
+//!   `tracing` when the parent has no event stream) instead of draining them.
+//!   A terminal `RLM finished: …` line records how the loop ended.
+//! - **History is kept whole.** The root model sees every prior round. The
+//!   history is bounded by [`MAX_RLM_ITERATIONS`] (two small metadata messages
+//!   per round), not by silently dropping the middle.
+//! - **Never an empty answer without a reason.** On exhaustion the last root
+//!   response is returned with the error, and the REPL's `rlm_query` hands
+//!   that text to the caller marked `[rlm_query incomplete: …]`. Any other
+//!   empty answer, except a deliberate `FINAL("")`, carries an error naming
+//!   the termination.
+//! - Not bounded by wall clock: per-request cancellation comes from the
+//!   parent turn; the iteration cap is the cost bound. `turn_timeout()` was
+//!   deliberately made `None` (no fixed 180s cap on long RLM work), so the
+//!   #6511 ask to bound by wall clock instead of a count is still open.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,14 +54,10 @@ const MAX_RLM_ITERATIONS: u32 = 25;
 /// hard-fail. The paper requires `code → REPL → Final`; anything else is
 /// not the RLM contract.
 const MAX_CONSECUTIVE_NO_CODE: u32 = 3;
-/// Max output tokens for the root LLM — it just needs to generate code.
 /// Max chars of stdout shown as metadata to the root LLM in next iteration.
 const STDOUT_METADATA_PREVIEW_LEN: usize = 800;
 /// Max chars of `context` shown as a preview in the metadata.
 const PROMPT_PREVIEW_LEN: usize = 500;
-/// Temperature for root LLM calls.
-/// Bound on conversation history we keep across iterations.
-const MAX_HISTORY_MESSAGES: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -53,7 +73,8 @@ pub enum RlmTermination {
     /// row. The accumulated last response text is surfaced as the answer
     /// rather than being thrown away.
     NoCode,
-    /// Iteration cap reached without `FINAL`.
+    /// Iteration cap reached without `FINAL`. The last root response is
+    /// surfaced as the answer alongside the error.
     Exhausted,
     /// Hard error — LLM call failed, REPL crashed, timeout.
     Error,
@@ -97,6 +118,12 @@ pub struct RlmTurnResult {
 
 /// Run a full RLM turn. `prompt` is loaded into the REPL as `context`; it
 /// never enters the root LLM's window.
+///
+/// No in-tree caller today (#6511): the live entry is the recursive sub-RLM
+/// in `bridge.rs::dispatch_rlm`. Deleting this public pair is blocked on a
+/// separate cleanup — it is what keeps `CodewhaleClient` in the crate's public
+/// API, and removing it unmasks test-only dead code across `client`,
+/// `llm_client`, `provider_lake` and `tool_inspection`.
 pub async fn run_rlm_turn(
     client: &CodewhaleClient,
     model: String,
@@ -105,8 +132,8 @@ pub async fn run_rlm_turn(
     tx_event: mpsc::Sender<Event>,
     max_depth: u32,
 ) -> RlmTurnResult {
-    run_rlm_turn_inner(
-        Arc::new(client.clone()),
+    run_rlm_turn_with_root(
+        client,
         model,
         prompt,
         None,
@@ -272,7 +299,8 @@ async fn run_rlm_turn_impl(
         child_model.clone(),
         max_depth,
         routed_usage.clone(),
-    );
+    )
+    .with_events(tx_event.clone());
 
     let _ = tx_event
         .send(Event::status(format!(
@@ -642,12 +670,6 @@ async fn run_rlm_turn_impl(
                         total_rpcs,
                     };
                 }
-                if messages.len() > MAX_HISTORY_MESSAGES {
-                    let drop_from = messages.len() - MAX_HISTORY_MESSAGES + 1;
-                    let mut kept = vec![messages[0].clone()];
-                    kept.extend(messages.drain(drop_from..));
-                    messages = kept;
-                }
                 continue;
             } else {
                 consecutive_empty_rounds = 0;
@@ -693,18 +715,12 @@ async fn run_rlm_turn_impl(
                 Some(&code_to_run),
                 Some(&stdout_preview_for_next),
             ));
-
-            if messages.len() > MAX_HISTORY_MESSAGES {
-                let drop_from = messages.len() - MAX_HISTORY_MESSAGES + 1;
-                let mut kept = vec![messages[0].clone()];
-                kept.extend(messages.drain(drop_from..));
-                messages = kept;
-            }
         }
 
-        let _ = last_response_text;
+        // Exhausted: surface the last root response rather than discarding
+        // it; the error below says the loop never reached FINAL.
         RlmTurnResult {
-            answer: String::new(),
+            answer: last_response_text,
             iterations: MAX_RLM_ITERATIONS,
             duration: start.elapsed(),
             error: Some(format!(
@@ -721,7 +737,43 @@ async fn run_rlm_turn_impl(
     };
 
     repl.shutdown().await;
+    let result = require_answer_or_error(result);
+    let _ = tx_event
+        .send(Event::status(termination_status(&result)))
+        .await;
     result
+}
+
+/// An empty answer is never returned silently: without an error of its own,
+/// it gets one naming how the loop ended. A deliberate `FINAL("")` is the
+/// model's answer, not a failure, and stays an empty answer with no error.
+fn require_answer_or_error(mut result: RlmTurnResult) -> RlmTurnResult {
+    if result.termination != RlmTermination::Final
+        && result.answer.trim().is_empty()
+        && result.error.is_none()
+    {
+        result.error = Some(format!(
+            "RLM ended ({:?}) after {} iteration(s) with an empty answer",
+            result.termination, result.iterations
+        ));
+    }
+    result
+}
+
+/// The terminal log line for one RLM loop.
+fn termination_status(result: &RlmTurnResult) -> String {
+    let mut line = format!(
+        "RLM finished: {:?} after {} iteration(s), {} sub-LLM call(s), answer {} chars",
+        result.termination,
+        result.iterations,
+        result.total_rpcs,
+        result.answer.chars().count()
+    );
+    if let Some(error) = result.error.as_deref() {
+        line.push_str(" — ");
+        line.push_str(error);
+    }
+    line
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,6 +1154,118 @@ mod tests {
             result.routed_usage_drop_records[0].route.model,
             "root-model"
         );
+    }
+
+    fn text_response(text: &str) -> MessageResponse {
+        MessageResponse {
+            id: "mock_rlm_round".to_string(),
+            r#type: "message".to_string(),
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+            model: "mock-model".to_string(),
+            stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
+            container: None,
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 5,
+                ..Usage::default()
+            },
+        }
+    }
+
+    /// #6511: an exhausted loop used to return `answer: String::new()` and
+    /// drop the middle of its history after 20 messages.
+    #[tokio::test]
+    async fn exhausted_loop_returns_last_response_and_keeps_whole_history() {
+        let mock = Arc::new(MockLlmClient::new(Vec::new()));
+        for round in 0..MAX_RLM_ITERATIONS {
+            mock.push_message_response(text_response(&format!(
+                "```repl\nprint('round {round}')\n```"
+            )));
+        }
+        let client: Arc<dyn RlmLlmClient> = mock.clone();
+        let (tx, mut rx) = mpsc::channel(1024);
+
+        let result = run_rlm_turn_inner(
+            client,
+            "root-model".to_string(),
+            "long context".to_string(),
+            None,
+            "child-model".to_string(),
+            tx,
+            0,
+        )
+        .await;
+
+        assert_eq!(result.termination, RlmTermination::Exhausted);
+        assert_eq!(result.iterations, MAX_RLM_ITERATIONS);
+        let last_round = MAX_RLM_ITERATIONS - 1;
+        assert!(
+            result.answer.contains(&format!("round {last_round}")),
+            "exhaustion must surface the last root response, got {:?}",
+            result.answer
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("exhausted")),
+            "{:?}",
+            result.error
+        );
+
+        let requests = mock.captured_requests();
+        assert_eq!(requests.len(), MAX_RLM_ITERATIONS as usize);
+        // Initial metadata plus (code, result) per completed round: nothing
+        // from the middle is dropped.
+        let last = requests.last().expect("last root request");
+        assert_eq!(
+            last.messages.len(),
+            1 + 2 * (MAX_RLM_ITERATIONS as usize - 1)
+        );
+
+        let mut statuses = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Status { message } = event {
+                statuses.push(message);
+            }
+        }
+        assert!(
+            statuses
+                .iter()
+                .any(|line| line.starts_with("RLM finished: Exhausted")),
+            "the loop must log how it ended: {statuses:#?}"
+        );
+    }
+
+    #[test]
+    fn empty_answer_is_never_returned_without_an_error() {
+        let empty = |termination| RlmTurnResult {
+            answer: "  ".to_string(),
+            iterations: 2,
+            duration: Duration::ZERO,
+            error: None,
+            usage: Usage::default(),
+            routed_usage: Vec::new(),
+            routed_usage_drop_records: Vec::new(),
+            routed_usage_dropped_records: 0,
+            termination,
+            trace: Vec::new(),
+            total_rpcs: 0,
+        };
+        let error = require_answer_or_error(empty(RlmTermination::NoCode))
+            .error
+            .expect("empty answer needs a reason");
+        assert!(error.contains("empty answer"), "{error}");
+        assert!(error.contains("NoCode"), "{error}");
+
+        // `FINAL("")` is an answer the model chose; callers keep getting "".
+        let deliberate = require_answer_or_error(empty(RlmTermination::Final));
+        assert!(deliberate.error.is_none(), "{:?}", deliberate.error);
     }
 
     #[test]

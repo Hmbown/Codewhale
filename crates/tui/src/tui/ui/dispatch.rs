@@ -979,6 +979,10 @@ pub(crate) fn build_dispatch_success_closure(
             // last_send_at was already anchored in the sync prepare phase so
             // the tail-flash starts together with the visible user cell.
             app.last_submitted_prompt = Some(prepare.message.display.clone());
+            app.unanswered_submission = Some(crate::tui::app::UnansweredSubmission {
+                message: prepare.message.clone(),
+                history_cell: prepare.history_cell,
+            });
             app.clear_receipt();
             app.tool_evidence.clear();
 
@@ -1061,9 +1065,10 @@ pub(crate) fn build_dispatch_success_closure(
     )
 }
 
-/// Missing-credential / auth preflight failures must keep the transcript echo.
-/// The user already submitted; rolling the HistoryCell::User back and restoring
-/// the composer hides the turn and makes first-run feel broken.
+/// Missing-credential / auth preflight failures. The message never reached a
+/// model, so it returns to the composer with a transcript line saying why
+/// (`keep_unsent_message_for_connect`) rather than as an echo that has to be
+/// typed again — which lost the text and then showed it twice (#6566).
 pub(crate) fn is_missing_credential_dispatch_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("api key not found")
@@ -1102,27 +1107,23 @@ pub(crate) fn build_dispatch_error_closure(
             app.receipt_text = prepare.snapshot.receipt_text.clone();
             app.receipt_started_at = prepare.snapshot.receipt_started_at;
             app.tool_evidence = prepare.snapshot.tool_evidence.clone();
-            let keep_user_echo = is_missing_credential_dispatch_error(&error);
-            if keep_user_echo {
-                // Echo first: keep HistoryCell::User painted in prepare. Drop only
-                // the unsent api_messages append and loading chrome.
-                app.truncate_api_messages(prepare.snapshot.api_messages_len);
-                app.last_send_at = prepare.snapshot.last_send_at;
-            } else {
-                app.history.truncate(prepare.snapshot.history_len);
-                app.prune_transcript_index_state(prepare.snapshot.history_len);
-                app.history_revisions
-                    .truncate(prepare.snapshot.history_revisions_len);
-                app.history_version = prepare.snapshot.history_version;
-                app.truncate_api_messages(prepare.snapshot.api_messages_len);
-                app.last_send_at = prepare.snapshot.last_send_at;
-            }
+            let missing_credential = is_missing_credential_dispatch_error(&error);
+            // Nothing was sent, so the optimistic echo goes too. A message
+            // that is not in the transcript can be sent again without
+            // appearing twice (#6566).
+            app.history.truncate(prepare.snapshot.history_len);
+            app.prune_transcript_index_state(prepare.snapshot.history_len);
+            app.history_revisions
+                .truncate(prepare.snapshot.history_revisions_len);
+            app.history_version = prepare.snapshot.history_version;
+            app.truncate_api_messages(prepare.snapshot.api_messages_len);
+            app.last_send_at = prepare.snapshot.last_send_at;
             app.needs_redraw = true;
 
             match recovery {
                 DispatchRecovery::Immediate => {
-                    if keep_user_echo {
-                        keep_failed_immediate_submit_echo(app, prepare.message, &error);
+                    if missing_credential {
+                        keep_unsent_message_for_connect(app, prepare.message, &error);
                     } else {
                         restore_failed_immediate_submit(
                             app,
@@ -1146,8 +1147,8 @@ pub(crate) fn build_dispatch_error_closure(
                     ));
                 }
                 DispatchRecovery::Initial => {
-                    if keep_user_echo {
-                        keep_failed_immediate_submit_echo(app, prepare.message, &error);
+                    if missing_credential {
+                        keep_unsent_message_for_connect(app, prepare.message, &error);
                     } else {
                         let initial_error = app
                             .tr(MessageId::DispatchFailedInitial)

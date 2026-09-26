@@ -303,6 +303,9 @@ pub struct RlmBridge {
     /// zero, those requests fall back to plain `Llm` completions.
     depth_remaining: u32,
     usage: RlmUsageAccumulator,
+    /// Where a nested sub-RLM's events go (#6511). `None` logs them through
+    /// `tracing` instead; they are never silently drained.
+    events: Option<tokio::sync::mpsc::Sender<crate::core::events::Event>>,
 }
 
 impl RlmBridge {
@@ -330,7 +333,19 @@ impl RlmBridge {
             child_model,
             depth_remaining,
             usage,
+            events: None,
         }
+    }
+
+    /// Forward nested sub-RLM events to `events` (the parent turn's stream),
+    /// so recursive model calls reach the session record.
+    #[must_use]
+    pub(crate) fn with_events(
+        mut self,
+        events: tokio::sync::mpsc::Sender<crate::core::events::Event>,
+    ) -> Self {
+        self.events = Some(events);
+        self
     }
 
     pub(crate) async fn usage_snapshot(&self) -> RlmUsageSnapshot {
@@ -470,14 +485,29 @@ impl RlmBridge {
             return self.dispatch_llm(prompt, None, None, None).await;
         }
 
-        // Build a drain channel to absorb status events from the nested
-        // turn (we don't surface them; this dispatch is invisible to the
-        // outer agent stream).
+        // Forward the nested turn's events to the parent stream as status
+        // lines (#6511). A nested code round must not stream into the parent's
+        // assistant message, so every event is flattened to a labelled
+        // status; with no parent stream the lines go to `tracing`.
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let drain = spawn_supervised(
-            "rlm-bridge-drain",
+        let parent = self.events.clone();
+        let depth = self.depth_remaining;
+        let forwarder = spawn_supervised(
+            "rlm-bridge-forward",
             std::panic::Location::caller(),
-            async move { while rx.recv().await.is_some() {} },
+            async move {
+                while let Some(event) = rx.recv().await {
+                    let Some(line) = nested_rlm_status_line(event, depth) else {
+                        continue;
+                    };
+                    match parent.as_ref() {
+                        Some(parent) => {
+                            let _ = parent.send(crate::core::events::Event::status(line)).await;
+                        }
+                        None => tracing::info!(target: "rlm", "{line}"),
+                    }
+                }
+            },
         );
 
         let child_model = self.child_model.clone();
@@ -496,7 +526,9 @@ impl RlmBridge {
         )
         .await;
 
-        drain.abort();
+        // The nested turn has returned and dropped its senders; let the
+        // forwarder flush the tail instead of aborting it mid-record.
+        let _ = tokio::time::timeout(Duration::from_secs(5), forwarder).await;
 
         SingleResp {
             text: result.answer,
@@ -522,6 +554,22 @@ impl RlmBridge {
         }
     }
 }
+
+/// One nested sub-RLM event as a parent-stream status line, or `None` for an
+/// event kind the nested loop does not produce.
+fn nested_rlm_status_line(event: crate::core::events::Event, depth: u32) -> Option<String> {
+    use crate::core::events::Event;
+    let body = match event {
+        Event::Status { message } => message,
+        Event::MessageDelta { content, .. } => content.trim().to_string(),
+        _ => return None,
+    };
+    Some(format!("{NESTED_RLM_STATUS_PREFIX}{depth}): {body}"))
+}
+
+/// Status-line prefix for forwarded nested sub-RLM events;
+/// `core::events::status_visibility` classifies these as internal receipts.
+pub(crate) const NESTED_RLM_STATUS_PREFIX: &str = "sub-RLM (depth ";
 
 fn batch_guard(prompt_count: usize, dependency_mode: Option<&str>) -> Option<BatchResp> {
     if prompt_count == 0 {
@@ -996,6 +1044,52 @@ mod tests {
         );
         assert_eq!(snapshot.dropped_records, 0);
         assert!(snapshot.drop_records.is_empty());
+    }
+
+    /// #6511: a nested sub-RLM's events used to go to a drain task, so its
+    /// model calls never reached the parent's record.
+    #[tokio::test]
+    async fn nested_rlm_events_reach_the_parent_stream() {
+        let mock = Arc::new(MockLlmClient::new(Vec::new()));
+        mock.push_message_response(mock_response("```repl\nFINAL('nested answer')\n```", 3, 4));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let bridge = bridge_for(Arc::clone(&mock), 1).with_events(tx);
+
+        let response = bridge
+            .dispatch_rlm("nested context".to_string(), None)
+            .await;
+        assert_eq!(response.text, "nested answer");
+        assert!(response.error.is_none(), "{:?}", response.error);
+
+        let mut lines = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                crate::core::events::Event::Status { message } => lines.push(message),
+                other => panic!("nested events must arrive as status lines, got {other:?}"),
+            }
+        }
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.starts_with(NESTED_RLM_STATUS_PREFIX)),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("FINAL('nested answer')")),
+            "the nested code round is part of the record: {lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("RLM finished: Final")),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            crate::core::events::status_visibility(&lines[0]),
+            crate::core::events::StatusVisibility::Internal
+        );
     }
 
     #[tokio::test]

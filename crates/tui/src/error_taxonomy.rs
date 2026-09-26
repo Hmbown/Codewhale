@@ -31,6 +31,12 @@ pub enum ErrorSeverity {
     Critical,
 }
 
+/// Error code for a provider credential rejection (401-class) that arrived
+/// before any model output, after the engine took the turn's question back
+/// out of the session (#6566). Hosts that see it return the text to the
+/// person to send again; nothing else about the authentication error changes.
+pub const CREDENTIAL_REJECTED_UNSENT_CODE: &str = "llm_auth_rejected_unsent";
+
 /// Unified envelope used when crossing subsystem boundaries.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ErrorEnvelope {

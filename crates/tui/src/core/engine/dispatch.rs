@@ -317,6 +317,8 @@ pub(super) enum ToolApprovalStamp {
 }
 
 impl ToolApprovalStamp {
+    const ALL: [Self; 2] = [Self::ApprovedByUser, Self::ApprovedWithPolicy];
+
     fn decision(self) -> &'static str {
         match self {
             Self::ApprovedByUser => "approved_by_user",
@@ -361,6 +363,43 @@ pub(super) fn stamp_tool_result_approval(result: &mut ToolResult, approval: Tool
         result.content = note.to_string();
     } else {
         result.content = format!("{note}\n\n{}", result.content);
+    }
+}
+
+/// The tool output a person reads: the result without the note
+/// [`stamp_tool_result_approval`] put in front of it for the model (#6566).
+///
+/// Only a result the engine stamped (`metadata.approval.model_visible`) loses
+/// a note, and only that decision's exact note text followed by a blank line
+/// (or nothing). Output that merely begins with "[approval] " — from a
+/// command, a file, or anything else a tool read — is shown whole, so
+/// injected text cannot hide tool output from the person.
+pub(crate) fn content_without_approval_note(result: &ToolResult) -> &str {
+    let content = result.content.as_str();
+    let approval = result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("approval"));
+    let stamped = approval
+        .and_then(|approval| approval.get("model_visible"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let Some(stamp) = approval
+        .and_then(|approval| approval.get("decision"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|decision| {
+            ToolApprovalStamp::ALL
+                .into_iter()
+                .find(|stamp| stamp.decision() == decision)
+        })
+        .filter(|_| stamped)
+    else {
+        return content;
+    };
+    match content.strip_prefix(stamp.model_visible_note()) {
+        Some("") => "",
+        Some(rest) => rest.strip_prefix("\n\n").unwrap_or(content),
+        None => content,
     }
 }
 

@@ -1793,7 +1793,7 @@ impl GenericToolCell {
 
         // #4038 / #4122: purpose-built workflow run card (compact in live,
         // expanded in transcript) shared with the WorkflowPanel state machine.
-        if let Some(lines) = self.try_render_as_workflow(width, low_motion, mode) {
+        if let Some(lines) = self.try_render_as_workflow(width, low_motion, mode, locale) {
             return lines;
         }
 
@@ -2018,16 +2018,19 @@ impl GenericToolCell {
         ))
     }
 
-    /// Render the `workflow` tool via the shared WorkflowPanel history-card
-    /// renderer (#4122). Live mode stays compact (lifecycle, children, phases,
-    /// failures, elapsed); transcript mode expands phase/child summaries,
-    /// artifact/transcript links, final result, and failure details.
-    /// Status-list payloads keep a multi-run summary card.
+    /// Render the `workflow` tool as the transcript's two lines per run
+    /// (#4122): the call that launched it is one `started` line naming the
+    /// run, and the card `App::announce_settled_workflows` writes when the run
+    /// settles is one finish line — state, agents, elapsed, tokens — with the
+    /// result or reason under it. Live progress is the workbar's, not the
+    /// transcript's. Transcript mode expands the finish card's phase/child
+    /// detail. Status-list payloads keep a multi-run summary card.
     fn try_render_as_workflow(
         &self,
         width: u16,
         low_motion: bool,
         mode: RenderMode,
+        locale: Locale,
     ) -> Option<Vec<Line<'static>>> {
         if self.name != "workflow" {
             return None;
@@ -2088,41 +2091,68 @@ impl GenericToolCell {
         }
 
         use crate::tui::widgets::workflow_panel::{WorkflowHistoryExtras, WorkflowPanel};
-        let panel = WorkflowPanel::from_run_json(&value)?;
-        // Prefer the panel's lifecycle-aware status label when the tool cell
-        // is still marked running but the snapshot already terminal (or vice
-        // versa during live streaming).
-        let header_status = match panel.lifecycle {
-            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Failed
-            | crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Cancelled => {
-                ToolStatus::Failed
-            }
+        let mut panel = WorkflowPanel::from_run_json(&value)?;
+        panel.locale = locale;
+        let finish_card = value
+            .get("transcript_line")
+            .and_then(serde_json::Value::as_str)
+            == Some("finished");
+        // A foreground `run` card returns the settled record itself, so it
+        // carries its own finish; a detached start is finished by the card
+        // `App::announce_settled_workflows` writes later.
+        let owns_finish =
+            finish_card || (self.status != ToolStatus::Running && panel.lifecycle.is_terminal());
+        if !finish_card {
+            // The start line: the run's name. Its progress lives in the
+            // workbar, never here.
+            let name = panel.label.split_whitespace().collect::<Vec<_>>().join(" ");
+            lines.push(render_tool_header_with_family_and_summary(
+                family,
+                Some(name.as_str()),
+                codewhale_localization::tr(
+                    locale,
+                    codewhale_localization::MessageId::WorkflowLineStarted,
+                )
+                .as_ref(),
+                if owns_finish {
+                    ToolStatus::Success
+                } else {
+                    self.status
+                },
+                None,
+                low_motion,
+            ));
+        }
+        let finish = owns_finish.then(|| panel.finish_line()).flatten();
+        let Some((state, facts, detail)) = finish else {
+            return Some(wrap_card_rail(lines, self.status));
+        };
+        let finish_status = match panel.lifecycle {
             crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Succeeded => {
                 ToolStatus::Success
             }
             crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Degraded => {
                 ToolStatus::Warning
             }
-            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Pending
-            | crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Running => {
-                if self.status == ToolStatus::Failed {
-                    ToolStatus::Failed
-                } else if self.status == ToolStatus::Success {
-                    ToolStatus::Success
-                } else {
-                    ToolStatus::Running
-                }
-            }
+            _ => ToolStatus::Failed,
         };
-        let summary = panel.history_header_summary(usize::from(width).saturating_sub(18));
         lines.push(render_tool_header_with_family_and_summary(
             family,
-            Some(summary.as_str()),
-            tool_status_label(header_status),
-            header_status,
+            Some(facts.as_str()),
+            &state,
+            finish_status,
             None,
             low_motion,
         ));
+        if let Some(detail) = detail {
+            let room = usize::from(width).saturating_sub(4).max(8);
+            lines.extend(render_card_detail_line(
+                None,
+                &crate::tui::ui_text::truncate_line_to_width(&detail, room),
+                tool_value_style(),
+                width,
+            ));
+        }
         let expanded = matches!(mode, RenderMode::Transcript);
         if expanded {
             let extras = WorkflowHistoryExtras {
@@ -2152,7 +2182,7 @@ impl GenericToolCell {
                 ));
             }
         }
-        Some(wrap_card_rail(lines, self.status))
+        Some(wrap_card_rail(lines, finish_status))
     }
 }
 

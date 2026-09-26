@@ -140,10 +140,11 @@ Rules for \"suggestions\":\n\
 - Anchor a suggestion only to lines that appear in the diff you were given, and never to a deleted line. If you are not sure of the exact line numbers, omit \"replacement\".\n\
 - A wrong replacement is worse than no replacement: it is one click from being merged. When in doubt, omit it.";
 
-/// The system prompt shared by every structured review path (`review`
-/// tool and `codewhale review --pr`). Callers parse the reply with
-/// [`ReviewOutput::from_str`], which falls back to freeform text when a
-/// model ignores the JSON contract.
+/// The one review system prompt (#6510), shared by every review path: the
+/// `review` tool, `codewhale review --pr`, and `codewhale review` of a plain
+/// diff. Callers parse the reply with [`ReviewOutput::from_str`] or
+/// [`ReviewOutput::from_structured_str`], which fall back to freeform text
+/// when a model ignores the JSON contract.
 #[must_use]
 pub fn review_system_prompt() -> &'static str {
     REVIEW_SYSTEM_PROMPT
@@ -219,7 +220,10 @@ impl ReviewOutput {
         ReviewOutput::fallback(raw)
     }
 
-    fn from_structured_str(raw: &str) -> Option<Self> {
+    /// Parse `raw` only when it is the structured review contract (all four
+    /// top-level fields present), unlike [`Self::from_str`], which falls
+    /// back to wrapping prose.
+    pub(crate) fn from_structured_str(raw: &str) -> Option<Self> {
         let candidate = serde_json::from_str::<Value>(raw)
             .ok()
             .or_else(|| extract_json_block(raw).and_then(|json| serde_json::from_str(json).ok()))?;

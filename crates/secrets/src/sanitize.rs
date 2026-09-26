@@ -23,6 +23,18 @@ pub fn strip_ansi_into(s: &str, out: &mut String) {
     strip_ansi_impl(s, out, false);
 }
 
+/// Drop control bytes from a streaming text chunk, keeping printable
+/// characters, `\n` and `\t`. The terminal UI applies it to every streamed
+/// chunk before rendering; notification payloads apply it after stripping
+/// whole escape sequences.
+#[must_use]
+pub fn sanitize_stream_chunk(chunk: &str) -> String {
+    chunk
+        .chars()
+        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+        .collect()
+}
+
 /// Like [`strip_ansi_into`], but SGR sequences (`ESC [ … m`: colour, bold,
 /// underline, reset) pass through untouched so a renderer that understands
 /// them can paint the output as the tool emitted it. Everything else — OSC

@@ -295,13 +295,8 @@ pub(crate) async fn open_provider_picker(
     engine_handle: &EngineHandle,
 ) {
     if app.onboarding == OnboardingState::Provider {
-        open_onboarding_provider_picker(
-            app,
-            config,
-            engine_handle,
-            app.onboarding_missing_key_recovery,
-        )
-        .await;
+        let recover_configured_route = app.onboarding_recovers_configured_route();
+        open_onboarding_provider_picker(app, config, engine_handle, recover_configured_route).await;
     } else {
         open_launch_provider_picker(app, config, engine_handle).await;
     }

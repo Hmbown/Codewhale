@@ -74,7 +74,6 @@ pub enum GoalRunStatus {
     /// verifier confirmed — see `GoalGate`).
     Completed,
     /// The model reported it is blocked and needs the user.
-    #[cfg_attr(not(test), expect(dead_code))]
     Blocked,
 }
 
@@ -134,7 +133,6 @@ impl GoalBudget {
     }
 
     /// A token budget for telemetry/UI. It never pauses an unbounded goal.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub const fn with_token_budget(token_budget: u64) -> Self {
         Self {
             token_budget: Some(token_budget),
@@ -304,7 +302,6 @@ pub const fn token_budget_exhausted(_progress: GoalProgress, _budget: GoalBudget
 /// Whether a stop reason represents success (Completed) vs. an early/forced exit.
 /// Useful for the UI/status projection (#2666 token/time visibility).
 #[must_use]
-#[cfg_attr(not(test), expect(dead_code))]
 pub fn is_success(reason: StopReason) -> bool {
     matches!(reason, StopReason::Completed)
 }

@@ -33,7 +33,7 @@ jobs:
         with:
           node-version: 20
           package-manager-cache: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable 2026-07-18
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable 2026-07-18
         with:
           toolchain: stable
       - name: Match dispatch to the requested commit

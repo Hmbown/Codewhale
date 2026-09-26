@@ -300,7 +300,7 @@ fn emit_tool_audit_to_path(path: &Path, event: serde_json::Value) {
 }
 
 impl Engine {
-    pub(super) async fn execute_mcp_tool_with_pool(
+    pub(crate) async fn execute_mcp_tool_with_pool(
         pool: Arc<AsyncMutex<McpPool>>,
         tx_event: &mpsc::Sender<Event>,
         name: &str,

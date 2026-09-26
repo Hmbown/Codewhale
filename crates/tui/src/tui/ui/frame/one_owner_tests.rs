@@ -149,7 +149,7 @@ fn count_rows_containing(rows: &[String], needle: &str) -> usize {
 /// exposes the width band the one-owner fixture's notice collapses.
 #[test]
 fn composed_frame_paints_each_fact_in_exactly_one_row() {
-    for (width, height) in [(80u16, 24u16), (120, 32), (160, 40)] {
+    for (width, height) in [(80u16, 24u16), (120, 32), (160, 40), (200, 40)] {
         let mut app = working_app();
         let rows = draw(&mut app, width, height);
         let pct = super::info_context_percent(&app);
@@ -220,8 +220,9 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         // turn has been doing what it is doing, and how long the session has
         // worked. Both halves shed before the hint and the counts, so a
         // narrow row keeps the affordances and drops the stopwatch. When
-        // both would paint, the session half needs ~120 columns here and
-        // the turn half ~160; each paints in exactly one row wherever it
+        // both would paint, the session half needs ~125 columns here (the
+        // running hint also names the agent arrows, `← for agents · ↓ to
+        // manage`) and the turn half ~200; each paints in exactly one row wherever it
         // paints. The metrics line carries no repository, branch or provider.
         // First turn: the turn half names the phase and stays; the session
         // reading is the identical duration, so it is suppressed rather than
@@ -251,7 +252,7 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         let mut worked = working_app();
         worked.cumulative_turn_duration = Duration::from_secs(60);
         let rows = draw(&mut worked, width, height);
-        if width >= 120 {
+        if width >= 160 {
             let worked_needle = "worked 2m 15s";
             assert!(rows[posture].contains(worked_needle), "{}", rows[posture]);
             assert_eq!(
@@ -261,7 +262,9 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
                 rows.join("\n")
             );
         }
-        if width >= 160 {
+        // With both clock halves and the running arrow hints, the turn half
+        // needs more than 160 columns.
+        if width >= 200 {
             assert!(rows[posture].contains(turn_needle), "{}", rows[posture]);
         }
         assert!(!rows[metrics].contains('⑂'), "{}", rows[metrics]);

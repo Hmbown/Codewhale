@@ -2283,25 +2283,9 @@ impl ShellManager {
         child_env::apply_to_command(&mut cmd, child_env::string_map_env(&exec_env.env));
         remove_readonly_redirect_env(&mut cmd, &exec_env.env);
 
-        // Disable raw mode before spawn; restore only if raw mode was active
-        // on entry (issue #1690).
-        let raw_mode_was_enabled = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
-        if raw_mode_was_enabled {
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
-        struct SyncRawModeGuard {
-            restore: bool,
-        }
-        impl Drop for SyncRawModeGuard {
-            fn drop(&mut self) {
-                if self.restore {
-                    let _ = crossterm::terminal::enable_raw_mode();
-                }
-            }
-        }
-        let _guard = SyncRawModeGuard {
-            restore: raw_mode_was_enabled,
-        };
+        // Leave raw mode before spawn; the guard restores it only if raw mode
+        // was active on entry (issue #1690).
+        let _raw_mode = crate::host_terminal::suspend_raw_mode();
 
         let mut child = cmd
             .spawn()
@@ -2443,25 +2427,9 @@ impl ShellManager {
         }
         install_parent_death_signal(&mut cmd);
 
-        // Disable raw mode before spawn; restore only if raw mode was active
-        // on entry (issue #1690).
-        let raw_mode_was_enabled = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
-        if raw_mode_was_enabled {
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
-        struct InteractiveRawModeGuard {
-            restore: bool,
-        }
-        impl Drop for InteractiveRawModeGuard {
-            fn drop(&mut self) {
-                if self.restore {
-                    let _ = crossterm::terminal::enable_raw_mode();
-                }
-            }
-        }
-        let _guard = InteractiveRawModeGuard {
-            restore: raw_mode_was_enabled,
-        };
+        // Leave raw mode before spawn; the guard restores it only if raw mode
+        // was active on entry (issue #1690).
+        let _raw_mode = crate::host_terminal::suspend_raw_mode();
 
         child_env::apply_to_command(&mut cmd, child_env::string_map_env(&exec_env.env));
 

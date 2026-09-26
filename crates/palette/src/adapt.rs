@@ -3,9 +3,8 @@
 use ratatui::style::Color;
 
 use super::detect::PaletteMode;
-use super::themes::{
-    GRAYSCALE_UI_THEME, LIGHT_UI_THEME, SOLARIZED_LIGHT_UI_THEME, ThemeId, UiTheme,
-};
+use super::ids::ThemeId;
+use super::themes::{GRAYSCALE_UI_THEME, LIGHT_UI_THEME, SOLARIZED_LIGHT_UI_THEME, UiTheme};
 use super::tokens::*;
 
 #[must_use]

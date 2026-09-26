@@ -3,10 +3,11 @@
 //! Read-side caveat (0.9.4): the renderer this module was written for was
 //! the legacy footer's retry banner, which went with `FooterWidget`. The
 //! *producer* — `client::send_with_retry` — is still live and still records
-//! every retry, and `client`'s own tests read it back through [`snapshot`].
+//! every retry, and `client`'s own tests read it back through `snapshot`.
 //! The read surface (`snapshot`, the countdown, the banner fields) is
-//! therefore test-gated (`#[cfg(test)]` where possible,
-//! `cfg_attr(not(test))` allows where prod constructs); a renderer
+//! therefore test-gated (`cfg(any(test, feature = "test-support"))` where
+//! possible, so the TUI's tests reach it through the `test-support`
+//! feature; `cfg_attr(not(test))` allows where prod constructs); a renderer
 //! restores it by dropping the gates. Give the banner a renderer, or
 //! delete the producer too — but not half of it.
 //!
@@ -52,19 +53,14 @@ pub enum RetryState {
     /// starts. `since` records when the row was set so a future polish
     /// pass can age it out automatically; today the engine clears it on
     /// `TurnStarted`.
-    Failed {
-        #[cfg_attr(not(test), expect(dead_code))]
-        reason: String,
-        #[expect(dead_code)]
-        since: Instant,
-    },
+    Failed { reason: String, since: Instant },
 }
 
 impl RetryState {
     /// Wall-clock seconds remaining on the active banner, or `None` if
     /// not active. Saturates at zero — the renderer should treat any
     /// negative remaining as "firing now".
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn seconds_remaining(&self) -> Option<u64> {
         match self {
@@ -81,7 +77,7 @@ impl RetryState {
     /// Whether the failure row should still be shown. Mirrors the
     /// "until next turn" rule in the issue spec; the engine clears it
     /// explicitly via [`clear`] on `TurnStarted`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn is_failed(&self) -> bool {
         matches!(self, Self::Failed { .. })
@@ -90,7 +86,7 @@ impl RetryState {
 
 /// Lazy-init the cell on first read so callers don't have to initialize
 /// process-wide state at boot.
-#[cfg(not(test))]
+#[cfg(not(any(test, all(feature = "test-thread-scoped-state", debug_assertions))))]
 fn with_state<R>(f: impl FnOnce(&mut RetryState) -> R) -> R {
     static STATE: OnceLock<Mutex<RetryState>> = OnceLock::new();
     let mut state = STATE
@@ -100,7 +96,7 @@ fn with_state<R>(f: impl FnOnce(&mut RetryState) -> R) -> R {
     f(&mut state)
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, all(feature = "test-thread-scoped-state", debug_assertions))))]
 fn with_rate_limit<R>(f: impl FnOnce(&mut Option<Instant>) -> R) -> R {
     static STATE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
     let mut state = STATE
@@ -119,7 +115,17 @@ fn with_rate_limit<R>(f: impl FnOnce(&mut Option<Instant>) -> R) -> R {
 /// provider pause into another test's assertions. Scoping by thread removes the
 /// race at its source rather than asking every future test that happens to
 /// perform HTTP to remember a lock.
-#[cfg(test)]
+///
+/// This changes behavior (a `Retry-After` pause no longer holds across tokio
+/// worker threads), so it is *not* part of `test-support`, which only adds
+/// helpers. The TUI's tests opt in with `test-thread-scoped-state`, and even
+/// then only a build with debug assertions gets it: an optimized build, e.g.
+/// `cargo build --release --workspace --all-features`, keeps the process-wide
+/// pause. Cargo unifies features across one build, so under
+/// `cargo test --workspace` (or a debug `--all-features` build) the debug
+/// `codewhale` binary that integration tests spawn gets the per-thread pause
+/// too; release and optimized binaries never do.
+#[cfg(any(test, all(feature = "test-thread-scoped-state", debug_assertions)))]
 fn with_state<R>(f: impl FnOnce(&mut RetryState) -> R) -> R {
     #[allow(clippy::type_complexity)]
     static STATE: OnceLock<Mutex<std::collections::HashMap<std::thread::ThreadId, RetryState>>> =
@@ -133,7 +139,7 @@ fn with_state<R>(f: impl FnOnce(&mut RetryState) -> R) -> R {
         .or_insert(RetryState::Idle))
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(feature = "test-thread-scoped-state", debug_assertions)))]
 fn with_rate_limit<R>(f: impl FnOnce(&mut Option<Instant>) -> R) -> R {
     #[allow(clippy::type_complexity)]
     static STATE: OnceLock<
@@ -148,7 +154,7 @@ fn with_rate_limit<R>(f: impl FnOnce(&mut Option<Instant>) -> R) -> R {
 
 /// Read snapshot for renderers. No production renderer exists since the
 /// legacy footer went away; `client` retry tests are the only readers.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub fn snapshot() -> RetryState {
     with_state(|state| state.clone())
@@ -214,7 +220,7 @@ pub fn clear() {
     with_state(|state| *state = RetryState::Idle);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn clear_rate_limit() {
     with_rate_limit(|current| *current = None);
 }
@@ -223,7 +229,7 @@ pub fn clear_rate_limit() {
 /// parallel runner can't observe a torn read. The guard is exported so
 /// tests in *other* modules (e.g. footer rendering tests) can hold the
 /// same lock as the ones in `retry_status::tests`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn test_guard() -> std::sync::MutexGuard<'static, ()> {
     static GUARD: Mutex<()> = Mutex::new(());
     GUARD.lock().unwrap_or_else(|e| e.into_inner())

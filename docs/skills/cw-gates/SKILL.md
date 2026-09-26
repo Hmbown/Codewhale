@@ -45,7 +45,7 @@ invocation, and applies the isolated build-dir topology
 
 ```bash
 scripts/dev-test.sh --list
-scripts/dev-test.sh crates/tui/src/elapsed.rs      # path → area + filter
+scripts/dev-test.sh crates/runtime/src/elapsed.rs      # path → area + filter
 scripts/dev-test.sh tui tools::                    # area + filter
 scripts/dev-test.sh config
 ```

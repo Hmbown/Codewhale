@@ -637,7 +637,11 @@ impl ShellPhase {
         {
             return Self::Failed;
         }
+        // A child agent's unanswered approval or question is the person's
+        // move, even while other agents keep working: the footer says
+        // "waiting on you", not "agents underway" (#6565).
         if app.pending_user_input_prompt.is_some()
+            || !app.pending_child_requests.is_empty()
             || app
                 .task_panel
                 .iter()

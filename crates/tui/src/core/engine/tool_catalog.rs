@@ -23,7 +23,7 @@ use crate::dependencies::ExternalTool;
 use crate::features::{Feature, Features};
 use crate::regex_cache::compile_user_regex;
 
-pub(super) const MULTI_TOOL_PARALLEL_NAME: &str = "multi_tool_use.parallel";
+pub(crate) const MULTI_TOOL_PARALLEL_NAME: &str = "multi_tool_use.parallel";
 pub(crate) const REQUEST_USER_INPUT_NAME: &str = "request_user_input";
 pub(super) const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
 const CODE_EXECUTION_TOOL_TYPE: &str = "code_execution_20250825";
@@ -1556,6 +1556,47 @@ fn execute_tool_search_inner(
             "unavailable_tool_references": unavailable_references,
         })),
     })
+}
+
+/// Describe-only `tool_search` for `execute_tools` programs: the same
+/// ranking as a direct search, answered with each match's name, description
+/// and input schema — and no activation, so the request's tool array and
+/// the session-pinned prefix stay exactly as they were.
+pub(super) fn describe_tools_for_program(
+    input: &serde_json::Value,
+    catalog: &[Tool],
+) -> Result<ToolResult, ToolError> {
+    let query = required_str(input, "query")?;
+    let match_kind = optional_str(input, "match")?.unwrap_or("bm25");
+    let max_results = usize::try_from(optional_u64(
+        input,
+        "max_results",
+        TOOL_SEARCH_DEFAULT_MAX_RESULTS as u64,
+    )?)
+    .unwrap_or(TOOL_SEARCH_DEFAULT_MAX_RESULTS)
+    .clamp(1, TOOL_SEARCH_MAX_RESULTS_LIMIT);
+    let names = match match_kind {
+        "regex" => discover_tools_with_regex(catalog, query, max_results)?,
+        "bm25" => discover_tools_with_bm25_like(catalog, query, max_results),
+        other => {
+            return Err(ToolError::invalid_input(format!(
+                "Unsupported match algorithm '{other}'. Expected one of: bm25, regex"
+            )));
+        }
+    };
+    let tools = names
+        .iter()
+        .filter_map(|name| catalog.iter().find(|tool| &tool.name == name))
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+    ToolResult::json(&json!({ "tools": tools }))
+        .map_err(|error| ToolError::execution_failed(error.to_string()))
 }
 
 pub(super) async fn execute_code_execution_tool(

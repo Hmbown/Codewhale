@@ -26,19 +26,17 @@ pub struct PermissionRuleSavePreview {
 }
 
 impl PermissionRuleSavePreview {
+    /// What saving these rules does, in the words the person reads on the
+    /// card. The entries below it name each command or file, and `omitted`
+    /// counts the rest, so the summary does not repeat a rule count (#6566).
     #[must_use]
     pub fn summary(&self) -> String {
-        let action = match self.action {
-            PermissionAction::Allow => "allow",
-            PermissionAction::Ask => "ask",
-            PermissionAction::Deny => "deny",
-        };
-        let noun = if self.rule_count == 1 {
-            "rule"
-        } else {
-            "rules"
-        };
-        format!("{} {action} {noun}", self.rule_count)
+        match self.action {
+            PermissionAction::Allow => "always allow",
+            PermissionAction::Ask => "always ask first",
+            PermissionAction::Deny => "never allow",
+        }
+        .to_string()
     }
 }
 
@@ -66,22 +64,36 @@ pub(super) fn build_save_preview(
     })
 }
 
+/// One saved rule as a plain phrase: what it covers ("run cargo test",
+/// "edit src/lib.rs") and where. The card used to print the rule's config
+/// syntax (`tool=exec_shell command=… command_exact=true`), which is the
+/// storage format, not something a person decides on (#6566).
 #[must_use]
 fn format_save_entry(rule: &ToolAskRule) -> String {
-    let mut parts = vec![format!("tool={}", sanitize_preview_value(&rule.tool))];
-    if let Some(command) = &rule.command {
-        parts.push(format!("command={}", sanitize_preview_value(command)));
-    }
-    if let Some(path) = &rule.path {
-        parts.push(format!("path={}", sanitize_preview_value(path)));
-    }
-    if rule.command_exact {
-        parts.push("command_exact=true".to_string());
-    }
+    let verb = match rule.tool.as_str() {
+        "exec_shell" if rule.command_exact => Some("run exactly"),
+        "exec_shell" => Some("run"),
+        "write_file" => Some("write"),
+        "edit_file" => Some("edit"),
+        "apply_patch" => Some("change"),
+        _ => None,
+    };
+    let target = rule
+        .command
+        .as_deref()
+        .or(rule.path.as_deref())
+        .map(sanitize_preview_value);
+    let mut entry = match (verb, target) {
+        (Some(verb), Some(target)) => format!("{verb} {target}"),
+        (Some(verb), None) => format!("{verb} ({})", sanitize_preview_value(&rule.tool)),
+        (None, Some(target)) => format!("{} {target}", sanitize_preview_value(&rule.tool)),
+        (None, None) => sanitize_preview_value(&rule.tool),
+    };
     if let Some(workspace) = &rule.workspace {
-        parts.push(format!("workspace={}", sanitize_preview_value(workspace)));
+        entry.push_str(" in ");
+        entry.push_str(&sanitize_preview_value(workspace));
     }
-    parts.join(" ")
+    entry
 }
 
 #[must_use]

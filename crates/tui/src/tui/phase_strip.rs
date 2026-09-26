@@ -1376,6 +1376,24 @@ pub(crate) fn tideline_footer_from_app(app: &mut App, width: u16) -> TidelineFoo
     let hint = hint
         .filter(|(_, _, key)| !crate::tui::footer_hints::retired(&app.footer_hint_uses, key))
         .map(|(text, ink, _)| (text, ink));
+    // While a turn runs, the arrow keys stay live beside Esc, so the row reads
+    // `Esc to interrupt · ← for agents · ↓ to manage` — the running agents and
+    // workflows are what a user wants to reach mid-turn.
+    let hint = if matches!(phase, ShellPhase::Working | ShellPhase::Verifying)
+        && !app.double_tap_window_open()
+        && crate::tui::agent_focus::shell_shortcuts_available(app, false)
+        && !crate::tui::footer_hints::retired(
+            &app.footer_hint_uses,
+            crate::tui::footer_hints::AGENT_ARROWS,
+        ) {
+        let arrows = crate::tui::agent_focus::footer_agent_hints(app);
+        Some(match hint {
+            Some((text, ink)) => (format!("{text} · {arrows}"), ink),
+            None => (arrows, ChromeInk::MetadataHint),
+        })
+    } else {
+        hint
+    };
 
     // The right slot: the live status toast if one is owed, else the compact
     // MCP or plugin boot chip, else the remote-control state when it is on.

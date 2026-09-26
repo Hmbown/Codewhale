@@ -44,7 +44,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 Use both or the workspace gate only when the risk genuinely spans both.
 `scripts/dev-test.sh <area|path> [filter]` prints and runs the fastest
 targeted invocation for a source path (for example
-`scripts/dev-test.sh crates/tui/src/elapsed.rs`). It uses `cargo nextest
+`scripts/dev-test.sh crates/runtime/src/elapsed.rs`). It uses `cargo nextest
 run` when nextest is installed (`CODEWHALE_DEV_NEXTEST=0` forces libtest)
 and applies `scripts/dev-cache.sh` so a new worktree gets an isolated
 Cargo build-dir. For PTY

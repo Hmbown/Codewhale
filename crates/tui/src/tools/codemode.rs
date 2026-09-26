@@ -1,5 +1,5 @@
-//! `execute_tools` — Code Mode Phase 1: run a model-provided JavaScript program
-//! that composes read-only tool calls through `tools.call(name, args)`.
+//! `execute_tools` — code mode: run a model-provided JavaScript program that
+//! composes tool calls through `tools.call(name, args)`.
 //!
 //! The program handles loops, branching, filtering, and data movement;
 //! intermediate results stay in the VM and only the bounded return value plus
@@ -8,38 +8,49 @@
 //! tool is engine-injected, never registered, and dispatched in
 //! `core::engine::tool_execution`.
 //!
-//! Authority stays entirely in Rust. Every nested call traverses the same
-//! gates a direct call would — registry resolution, the parent turn's
-//! deny-lists and authority envelope — plus the Phase-1 profile gates
-//! (read-only, auto-approved). Approving the program never approves anything
-//! the program might do: a nested call that needs approval aborts the program
-//! with a receipt naming it. Nested calls do not take per-tool locks (the
-//! program runs under its own exclusive lock instead); see the limitations.
+//! Authority stays entirely in Rust, and there is one gate. In a main-session
+//! turn the engine hands the program a [`NestedCallGate`]; every nested call —
+//! native, plugin, or MCP — is sent back to the turn loop and planned by the
+//! same `plan_tool_calls` a direct call goes through (deny/allow lists,
+//! preparation, hooks, ask-rules, Auto-Review, repo law, the worker authority
+//! envelope, the K1 Computer Use refusal), with the source tagged as code mode
+//! so a nested call never activates a deferred schema. A nested call that
+//! needs approval suspends the program: the engine raises the normal
+//! approval request (`request_tool_approval`, same receipt log, same card) and
+//! the program resumes on allow; on deny only that nested call fails, as an
+//! exception the program can catch. Approving the program itself therefore
+//! grants nothing, and `execute_tools` is prepared as auto-approved.
 //!
-//! KV-cache effect: under the default Direct tool mode this tool is deferred,
-//! not eager, so the session-pinned prefix is unchanged until the model
-//! activates it via `tool_search` — activation is a declared
-//! `change:tool_surface` transition, same as any other deferred tool. Under
-//! CodeMode (`[features] code_mode`) it is eager instead; the flag is session
-//! config, so the prefix stays stable within a session either way. Program
-//! text and nested results live in append-only turn history, never in the
-//! prefix.
+//! Without a gate (sub-agents, direct unit calls) the program keeps the
+//! Phase-1 profile: read-only, auto-approved native calls only, no MCP.
 //!
-//! Known limitations (Phase 1):
-//! - Read-only composition. Nested calls must satisfy `is_read_only_for` and
-//!   resolve `ApprovalRequirement::Auto` (posture-independent: Auto tools run
-//!   under every posture, including Never). Anything else aborts the program.
-//! - No nested `agent`, `workflow`, `tool_search`, interpreter, or MCP calls,
-//!   and no recursive `execute_tools`. Fan-out stays with `workflow`/`task()`.
-//! - No approval suspension: a gated call aborts with a receipt instead of
-//!   prompting. Per-call approval previews are Phase 2.
-//! - Nested reads do not serialize against concurrent sibling top-level
-//!   writes. Prefer running `execute_tools` alone in its block when a
-//!   consistent snapshot matters.
+//! Receipts (#6509): the host records every nested call when it starts, so a
+//! program that hits its deadline still reports what finished, what was
+//! refused, and what was in flight. Oversized nested results keep the
+//! `{content, metadata, truncated}` keys, and the cut is never silent:
+//! `truncated` names the original size and the spillover file holding the
+//! full output, and `content` becomes the leading text of the raw output
+//! (a JSON result cannot stay parsed once cut), so a script checks
+//! `truncated` before reading fields. A failed call's text is bounded and
+//! spilled the same way.
+//!
+//! KV-cache effect: `[features] code_mode` (on by default) makes
+//! `execute_tools` eager from the first request of a session; with the flag
+//! off it is deferred like the interpreter tools. The flag is session config,
+//! so the prefix is stable within a session either way. The definition text
+//! is static. Program text, nested results, and the describe-only nested
+//! `tool_search` (which returns schemas without activating them) live in
+//! append-only turn history, never in the prefix.
+//!
+//! Known limitations:
+//! - Nested calls do not take per-tool locks against sibling top-level calls;
+//!   the program runs under its own exclusive lock instead. Inside the
+//!   program, calls the gate marks non-parallel run one at a time.
+//! - No nested `agent`, `workflow`, `request_user_input`, interpreter,
+//!   interactive shell, sandbox escalation, Computer Use consent/script, MCP
+//!   sign-in, or recursive `execute_tools`. Those stay direct calls.
 //! - Rich content blocks (images) from nested results are dropped; text and
-//!   JSON payloads pass through bounded. Each nested payload is a
-//!   `{content, metadata}` envelope: content parsed as JSON when possible,
-//!   metadata verbatim (continuation notices included) or null.
+//!   JSON payloads pass through bounded.
 //! - Hidden from Plan mode and refused under a worker authority envelope,
 //!   like the other execution surfaces.
 
@@ -48,8 +59,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
-use tokio::time::timeout;
+use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore, mpsc, oneshot};
 
 use codewhale_models::Tool;
 use codewhale_workflow_js::{
@@ -57,9 +67,11 @@ use codewhale_workflow_js::{
     ToolCallResponse, ToolInvoker, WorkflowDriver, WorkflowRunCancel, WorkflowVm,
 };
 
+use crate::core::events::Event;
+use crate::mcp::McpPool;
 use crate::tools::registry::{ToolRegistry, enforce_tool_authority};
 use crate::tools::spec::{
-    ApprovalRequirement, ToolContext, ToolError, ToolResult, ToolSpec, required_str,
+    ApprovalRequirement, RichToolResult, ToolContext, ToolError, ToolResult, ToolSpec, required_str,
 };
 
 /// Tool name surfaced to the model. Dispatched alongside the synthetic
@@ -70,44 +82,61 @@ const EXECUTE_TOOLS_TOOL_TYPE: &str = "execute_tools_20260918";
 
 /// Maximum program source accepted, in bytes.
 const MAX_CODE_BYTES: usize = 64 * 1024;
-/// Whole-run wall deadline. The watchdog drops the run future; the VM
-/// thread then unwinds through the standard cancel cascade.
-const RUN_DEADLINE_SECS: u64 = 30;
+/// Run deadline when no engine turn serves the program (sub-agents, direct
+/// unit calls). Those callers bound the whole call themselves (the sub-agent
+/// tool timeout), so this is the turn-sized backstop rather than an invented
+/// short cap. A gated run takes the remaining turn wall clock instead.
+const FALLBACK_RUN_DEADLINE: Duration =
+    Duration::from_secs(crate::core::engine::turn_budget::DEFAULT_TURN_WALL_CLOCK_SECS);
+/// How often the run watchdog re-checks while the program is paused on the
+/// gate (approval card, hook, review). Bounds the overrun after a pause.
+const PAUSED_WATCHDOG_POLL: Duration = Duration::from_millis(200);
 /// Maximum nested tool calls in flight at once, enforced host-side.
 const MAX_CONCURRENT_CALLS: usize = 4;
-/// Per nested-call result cap, in serialized bytes.
-const PER_CALL_RESULT_CAP_BYTES: usize = 32 * 1024;
+/// Per nested-call result cap, in serialized bytes. The same threshold the
+/// engine spills a direct tool result at, so a nested result is never cut
+/// sooner than the same call made directly.
+const PER_CALL_RESULT_CAP_BYTES: usize = crate::tools::truncate::SPILLOVER_THRESHOLD_BYTES;
 /// Model-visible return cap, in serialized bytes.
 const RETURN_CAP_BYTES: usize = 16 * 1024;
 
-/// Names refused before any other check, with a message that names the
-/// supported alternative. Checked against the requested name; the read-only
-/// and auto-approve gates below would refuse most of these anyway, but the
-/// explicit list keeps the receipt diagnostic instead of puzzling.
+/// Names refused before the gate, with a message that names the supported
+/// alternative. These either need the turn loop itself (a prompt, a
+/// sub-agent, a schema activation) or would nest an execution surface.
 const PROHIBITED_NESTED: &[&str] = &[
     EXECUTE_TOOLS_TOOL_NAME,
     "code_execution",
     "js_execution",
     "agent",
     "workflow",
-    "tool_search",
+    crate::core::engine::tool_catalog::REQUEST_USER_INPUT_NAME,
+    crate::core::engine::tool_catalog::MULTI_TOOL_PARALLEL_NAME,
 ];
 
-/// Model-facing definition. `defer_loading` is decided by the catalog (this
-/// name is not in the eager set, so it stays deferred); `allowed_callers`
-/// mirrors the interpreter tools.
+/// Model-facing definition. `defer_loading` is decided by the catalog
+/// (eager under code mode, deferred otherwise); `allowed_callers` mirrors
+/// the interpreter tools. The text is static so it never moves the prefix.
 pub fn execute_tools_tool_definition() -> Tool {
     Tool {
         tool_type: Some(EXECUTE_TOOLS_TOOL_TYPE.to_string()),
         name: EXECUTE_TOOLS_TOOL_NAME.to_string(),
-        description: "Execute a JavaScript program that composes read-only tool calls via \
-             tools.call(name, args) and returns a bounded JSON result. Discover tool \
-             names and schemas with tool_search BEFORE writing the program. Phase-1 \
-             limits: nested calls must be read-only and auto-approved; writes, \
-             shell, subagents, workflows, MCP tools, and nested execute_tools abort \
-             the program with a receipt. At most 50 nested calls, 4 concurrent, \
-             30s per run, 16 KiB returned. Intermediate results stay in the \
-             program; return only what the next decision needs."
+        description: "Run a JavaScript program that composes tool calls with \
+             `await tools.call(name, args)` and returns a bounded JSON result. Prefer it \
+             whenever you would make several dependent or repetitive calls, MCP and plugin \
+             tools included: intermediate results stay in the program and only what you \
+             return reaches the conversation. Every nested call passes the same permission \
+             checks as a direct call; a call that needs approval pauses the program until \
+             the user decides, and a denied or refused call throws inside the program (catch \
+             it to continue). Inside a program, tools.call('tool_search', {query}) returns \
+             matching tool names with their input schemas without loading them into the \
+             conversation. Each result is {content, metadata, truncated}. When a result is \
+             cut, truncated names its full size and saved copy and content is the leading \
+             text of the raw output instead of parsed JSON, so check truncated before \
+             reading fields. Not \
+             available inside programs: agent, workflow, request_user_input, nested \
+             execute_tools, interactive shells, sandbox escalation, Computer Use consent or \
+             scripts, and MCP sign-in. At most 50 nested calls, 4 concurrent; the return \
+             value is capped at 16 KiB."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -127,44 +156,353 @@ pub fn execute_tools_tool_definition() -> Tool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The engine-served gate
+// ---------------------------------------------------------------------------
+
+/// How the gate decided one nested call. Named in the receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NestedDecision {
+    /// Admitted without a prompt: an auto-approved tier, a remembered grant,
+    /// or a posture that already covers it.
+    Auto,
+    /// A person approved this exact nested call.
+    Approved,
+    /// A person denied it.
+    Denied,
+    /// The approval card expired with no answer. The call did not run, and
+    /// the user did not deny it.
+    TimedOut,
+    /// A gate refused it before any prompt (policy, hook, authority, or a
+    /// name that stays a direct call).
+    Refused,
+}
+
+/// The gate's answer for one nested call.
+pub(crate) enum NestedCallVerdict {
+    /// Run the call with the final (possibly hook-rewritten) name and input.
+    Run {
+        name: String,
+        input: Value,
+        supports_parallel: bool,
+        decision: NestedDecision,
+        /// `additionalContext` from tool_call_before hooks (#3026), recorded
+        /// on the call's receipt so it reaches the model.
+        hook_context: Option<String>,
+    },
+    /// The engine answered in place (describe-only `tool_search`, a guard).
+    Answered {
+        result: ToolResult,
+        hook_context: Option<String>,
+    },
+    /// Do not run it; the error is what the program sees.
+    Refused {
+        error: ToolError,
+        decision: NestedDecision,
+    },
+}
+
+/// One nested call waiting on the turn loop's gate.
+pub(crate) struct NestedCallRequest {
+    pub(crate) name: String,
+    pub(crate) input: Value,
+    pub(crate) reply: oneshot::Sender<NestedCallVerdict>,
+}
+
+/// Handle a running program uses to reach the engine turn that launched it.
+/// Built per `execute_tools` call by the turn loop and carried on that call's
+/// [`ToolContext`]; dropped with the call.
+#[derive(Clone)]
+pub(crate) struct NestedCallGate {
+    requests: mpsc::Sender<NestedCallRequest>,
+    mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
+    tx_event: mpsc::Sender<Event>,
+    deadline: Duration,
+}
+
+impl NestedCallGate {
+    /// A gate plus the receiver the turn loop serves. `deadline` bounds the
+    /// program's own run time; time spent waiting on the gate (approval
+    /// cards, hooks, reviews) does not count against it.
+    pub(crate) fn new(
+        mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
+        tx_event: mpsc::Sender<Event>,
+        deadline: Duration,
+    ) -> (Self, mpsc::Receiver<NestedCallRequest>) {
+        let (requests, receiver) = mpsc::channel(MAX_CONCURRENT_CALLS);
+        (
+            Self {
+                requests,
+                mcp_pool,
+                tx_event,
+                deadline,
+            },
+            receiver,
+        )
+    }
+
+    async fn ask(&self, name: String, input: Value) -> NestedCallVerdict {
+        let unavailable = || NestedCallVerdict::Refused {
+            error: ToolError::not_available(
+                "the turn that launched this program is no longer serving its permission gate",
+            ),
+            decision: NestedDecision::Refused,
+        };
+        let (reply, answer) = oneshot::channel();
+        if self
+            .requests
+            .send(NestedCallRequest { name, input, reply })
+            .await
+            .is_err()
+        {
+            return unavailable();
+        }
+        answer.await.unwrap_or_else(|_| unavailable())
+    }
+}
+
+/// Refusals decided from the request alone: calls that need the turn loop
+/// itself or their own approval card stay direct. Checked on the name the
+/// program sent, and again by the turn loop on the name planning resolved it
+/// to (`Agent` resolves to `agent`) and the final, hook-rewritten input.
+///
+/// Names compare ASCII case-insensitively: dispatch resolves `Agent` to
+/// `agent`, so a case-sensitive list would be a bypass, not a policy.
+pub(crate) fn refusal_before_gate(name: &str, input: &Value, gated: bool) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    if PROHIBITED_NESTED.contains(&lower.as_str())
+        || (!gated && crate::core::engine::tool_catalog::is_tool_search_tool(&lower))
+    {
+        return Some(format!(
+            "`{name}` is not available inside execute_tools programs; call it directly (use workflow/task() for fan-out)"
+        ));
+    }
+    if matches!(lower.as_str(), "bash" | "exec_shell")
+        && input.get("interactive").and_then(Value::as_bool) == Some(true)
+    {
+        return Some(format!(
+            "`{name}` with interactive:true needs the terminal; call it directly"
+        ));
+    }
+    if input.get("sandbox_permissions").is_some() {
+        return Some(format!(
+            "`{name}` requests a sandbox escalation, which needs its own exact-call approval; call it directly"
+        ));
+    }
+    if crate::tools::approval_cache::computer_use_user_gate(name, input).is_some()
+        || crate::tools::approval_cache::computer_use_batch_hidden_gate(name, input).is_some()
+    {
+        return Some(format!(
+            "Computer Use call `{name}` grants consent or runs a script; it needs its own approval card, so call it directly and let the user decide"
+        ));
+    }
+    if McpPool::is_mcp_tool(name)
+        && name.ends_with(&format!("_{}", crate::mcp::AUTHENTICATE_TOOL_NAME))
+    {
+        return Some(format!("`{name}` starts an MCP sign-in; call it directly"));
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Receipts
+// ---------------------------------------------------------------------------
+
+/// What was cut from an oversized value, and where the whole value went.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct Truncation {
+    original_bytes: usize,
+    kept_bytes: usize,
+    spill_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CallStatus {
+    /// Started and not yet finished. Left in place when the run ends early,
+    /// so the receipt says the call may have partially run.
+    InFlight,
+    Ok,
+    Failed,
+    Refused,
+}
+
 /// One nested call, as recorded by the host — not the script. The receipt is
 /// what makes "no failures found" distinguishable from "nothing ran".
 #[derive(Debug, Clone, serde::Serialize)]
 struct CallReceipt {
+    seq: usize,
     tool: String,
+    decision: Option<NestedDecision>,
+    status: CallStatus,
     ok: bool,
     elapsed_ms: u64,
     bytes: usize,
-    truncated: bool,
+    truncated: Option<Truncation>,
     note: Option<String>,
+    /// `additionalContext` a tool_call_before hook attached to this call,
+    /// the same text a direct call appends to its result (#3026).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hook_context: Option<String>,
 }
+
+/// Run clock that stops while the program waits on the gate, so a person
+/// taking a minute on an approval card does not spend the program's budget.
+struct PauseClock {
+    started: Instant,
+    paused: Duration,
+    depth: usize,
+    since: Option<Instant>,
+}
+
+impl PauseClock {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            paused: Duration::ZERO,
+            depth: 0,
+            since: None,
+        }
+    }
+
+    fn pause(&mut self) {
+        if self.depth == 0 {
+            self.since = Some(Instant::now());
+        }
+        self.depth += 1;
+    }
+
+    fn resume(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+        if self.depth == 0
+            && let Some(since) = self.since.take()
+        {
+            self.paused += since.elapsed();
+        }
+    }
+
+    fn active(&self) -> Duration {
+        let paused = self.paused + self.since.map_or(Duration::ZERO, |since| since.elapsed());
+        self.started.elapsed().saturating_sub(paused)
+    }
+}
+
+struct PauseGuard<'a>(&'a Mutex<PauseClock>);
+
+impl Drop for PauseGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut clock) = self.0.lock() {
+            clock.resume();
+        }
+    }
+}
+
+/// Abort a spawned nested call when the program stops waiting for it.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Invoker
+// ---------------------------------------------------------------------------
 
 /// [`ToolInvoker`] over a snapshot of the parent turn's registry.
 ///
 /// The snapshot (spec Arcs plus a cloned [`ToolContext`]) is taken at
-/// dispatch so the invoker is `'static` for the VM thread. Deny-lists and
-/// the authority envelope are re-enforced per call from the cloned context,
-/// so a program never outranks the turn that launched it.
+/// dispatch so the invoker is `'static` for the VM thread. Nested calls run
+/// on the engine's runtime (captured at dispatch), not the VM thread's.
 pub(crate) struct CodemodeInvoker {
     specs: Vec<Arc<dyn ToolSpec>>,
     context: ToolContext,
+    gate: Option<NestedCallGate>,
+    runtime: Option<tokio::runtime::Handle>,
     semaphore: Arc<Semaphore>,
+    /// Non-parallel nested calls take this exclusively; parallel-safe ones
+    /// share it, mirroring how the engine schedules direct calls.
+    order: RwLock<()>,
     receipts: Mutex<Vec<CallReceipt>>,
+    clock: Mutex<PauseClock>,
+    spill_prefix: String,
 }
 
 impl CodemodeInvoker {
     fn new(specs: Vec<Arc<dyn ToolSpec>>, context: ToolContext) -> Self {
+        let mut context = context;
+        let gate = context.execution.nested_call_gate.take();
+        let spill_prefix = context
+            .origin_tool_call_id
+            .clone()
+            .unwrap_or_else(|| EXECUTE_TOOLS_TOOL_NAME.to_string());
         Self {
             specs,
             context,
+            gate,
+            runtime: tokio::runtime::Handle::try_current().ok(),
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CALLS)),
+            order: RwLock::new(()),
             receipts: Mutex::new(Vec::new()),
+            clock: Mutex::new(PauseClock::new()),
+            spill_prefix,
         }
     }
 
-    fn record(&self, receipt: CallReceipt) {
-        if let Ok(mut receipts) = self.receipts.lock() {
-            receipts.push(receipt);
+    fn deadline(&self) -> Duration {
+        self.gate
+            .as_ref()
+            .map_or(FALLBACK_RUN_DEADLINE, |gate| gate.deadline)
+    }
+
+    fn pause(&self) -> PauseGuard<'_> {
+        if let Ok(mut clock) = self.clock.lock() {
+            clock.pause();
+        }
+        PauseGuard(&self.clock)
+    }
+
+    /// Time left before the deadline, or `None` once it has passed. While
+    /// the program is paused on the gate its budget is frozen, so the
+    /// watchdog looks again shortly: sleeping out the whole deadline here
+    /// would let the program overrun by that much once the gate answers.
+    fn remaining(&self, deadline: Duration) -> Option<Duration> {
+        let clock = self.clock.lock().ok()?;
+        if clock.depth > 0 {
+            return Some(PAUSED_WATCHDOG_POLL.min(deadline));
+        }
+        deadline
+            .checked_sub(clock.active())
+            .filter(|left| !left.is_zero())
+    }
+
+    fn begin(&self, tool: &str) -> usize {
+        let Ok(mut receipts) = self.receipts.lock() else {
+            return 0;
+        };
+        let seq = receipts.len() + 1;
+        receipts.push(CallReceipt {
+            seq,
+            tool: tool.to_string(),
+            decision: None,
+            status: CallStatus::InFlight,
+            ok: false,
+            elapsed_ms: 0,
+            bytes: 0,
+            truncated: None,
+            note: None,
+            hook_context: None,
+        });
+        seq
+    }
+
+    fn finish(&self, seq: usize, update: impl FnOnce(&mut CallReceipt)) {
+        if let Ok(mut receipts) = self.receipts.lock()
+            && let Some(receipt) = receipts.iter_mut().find(|receipt| receipt.seq == seq)
+        {
+            update(receipt);
         }
     }
 
@@ -175,16 +513,237 @@ impl CodemodeInvoker {
             .unwrap_or_default()
     }
 
-    fn refused(&self, tool: &str, started: Instant, note: String) -> DriverError {
-        self.record(CallReceipt {
-            tool: tool.to_string(),
-            ok: false,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            bytes: 0,
-            truncated: false,
-            note: Some(note.clone()),
+    fn refused(
+        &self,
+        seq: usize,
+        started: Instant,
+        decision: NestedDecision,
+        note: String,
+    ) -> DriverError {
+        self.finish(seq, |receipt| {
+            receipt.decision = Some(decision);
+            receipt.status = CallStatus::Refused;
+            receipt.elapsed_ms = started.elapsed().as_millis() as u64;
+            receipt.note = Some(note.clone());
         });
         DriverError::Rejected(note)
+    }
+
+    /// Phase-1 admission when no engine gate serves the program.
+    fn ungated_admission(&self, name: &str, input: &Value) -> Result<(), String> {
+        if McpPool::is_mcp_tool(name) {
+            return Err(format!(
+                "`{name}` is an MCP tool; this program has no session permission gate (sub-agent or host without a turn), so call it directly"
+            ));
+        }
+        let Some(spec) = self.specs.iter().find(|spec| spec.name() == name) else {
+            return Err(format!(
+                "unknown tool `{name}`; discover names with tool_search before writing the program"
+            ));
+        };
+        if !spec.is_read_only_for(input) {
+            return Err(format!(
+                "`{name}` can mutate; without a session permission gate code mode executes read-only calls only"
+            ));
+        }
+        if spec.approval_requirement_for(input) != ApprovalRequirement::Auto {
+            return Err(format!(
+                "`{name}` needs approval; without a session permission gate code mode executes only auto-approved calls"
+            ));
+        }
+        enforce_tool_authority(name, input, spec.as_ref(), &self.context)
+            .map_err(|err| err.to_string())
+    }
+
+    /// Execute an admitted call on the engine runtime: MCP through the
+    /// session pool (same dispatcher as a direct call), everything else
+    /// through its registry spec under the turn's authority envelope.
+    async fn execute(&self, name: &str, input: Value) -> Result<RichToolResult, ToolError> {
+        let future: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<RichToolResult, ToolError>> + Send>,
+        > = if McpPool::is_mcp_tool(name) {
+            let Some(gate) = self.gate.as_ref() else {
+                return Err(ToolError::not_available(format!(
+                    "MCP tool `{name}` needs the session MCP pool"
+                )));
+            };
+            let Some(pool) = gate.mcp_pool.clone() else {
+                return Err(ToolError::not_available(format!(
+                    "MCP is not connected for this turn, so `{name}` cannot run"
+                )));
+            };
+            let tx_event = gate.tx_event.clone();
+            let disallowed = self.context.disallowed_tools.clone();
+            let name = name.to_string();
+            Box::pin(async move {
+                crate::core::engine::Engine::execute_mcp_tool_with_pool(
+                    pool,
+                    &tx_event,
+                    &name,
+                    input,
+                    &disallowed,
+                )
+                .await
+            })
+        } else {
+            let Some(spec) = self.specs.iter().find(|spec| spec.name() == name).cloned() else {
+                return Err(ToolError::not_available(format!(
+                    "tool `{name}` is not registered"
+                )));
+            };
+            enforce_tool_authority(name, &input, spec.as_ref(), &self.context)?;
+            let context = self.context.clone();
+            Box::pin(async move { spec.execute_rich(input, &context).await })
+        };
+        match self.runtime.as_ref() {
+            Some(runtime) => {
+                let mut task = AbortOnDrop(runtime.spawn(future));
+                match (&mut task.0).await {
+                    Ok(result) => result,
+                    Err(err) => Err(ToolError::execution_failed(format!(
+                        "nested call did not complete: {err}"
+                    ))),
+                }
+            }
+            None => future.await,
+        }
+    }
+
+    /// Shape one finished call for the program and complete its receipt.
+    fn deliver(
+        &self,
+        seq: usize,
+        started: Instant,
+        name: &str,
+        decision: NestedDecision,
+        outcome: Result<RichToolResult, ToolError>,
+    ) -> Result<ToolCallResponse, DriverError> {
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match outcome {
+            Ok(rich) => {
+                let result = rich.into_result();
+                let success = result.success;
+                let (payload, raw_len, truncated) = if success {
+                    self.bounded_envelope(seq, name, &result)
+                } else {
+                    let raw_len = result.content.len();
+                    let (text, truncated) = bound_text(
+                        result.content,
+                        PER_CALL_RESULT_CAP_BYTES,
+                        &self.spill_id(seq, name),
+                    );
+                    (text, raw_len, truncated)
+                };
+                self.finish(seq, |receipt| {
+                    receipt.decision = Some(decision);
+                    receipt.status = if success {
+                        CallStatus::Ok
+                    } else {
+                        CallStatus::Failed
+                    };
+                    receipt.ok = success;
+                    receipt.elapsed_ms = elapsed_ms;
+                    receipt.bytes = raw_len;
+                    receipt.truncated = truncated;
+                });
+                Ok(ToolCallResponse {
+                    ok: success,
+                    result: payload,
+                })
+            }
+            Err(err) => {
+                let message = err.to_string();
+                // Validation-shaped failures mean nothing ran (admission);
+                // execution failures ran and failed (agent kind via ok:false);
+                // seam breaks are unavailable.
+                match err {
+                    ToolError::InvalidInput { .. }
+                    | ToolError::MissingField { .. }
+                    | ToolError::PathEscape { .. }
+                    | ToolError::PermissionDenied { .. } => {
+                        Err(self.refused(seq, started, decision, message))
+                    }
+                    ToolError::Timeout { .. }
+                    | ToolError::Cancelled { .. }
+                    | ToolError::NotAvailable { .. } => {
+                        self.finish(seq, |receipt| {
+                            receipt.decision = Some(decision);
+                            receipt.status = CallStatus::Failed;
+                            receipt.elapsed_ms = elapsed_ms;
+                            receipt.note = Some(message.clone());
+                        });
+                        Err(DriverError::Unavailable(message))
+                    }
+                    ToolError::ExecutionFailed { .. } => {
+                        let bytes = message.len();
+                        let (text, truncated) = bound_text(
+                            message,
+                            PER_CALL_RESULT_CAP_BYTES,
+                            &self.spill_id(seq, name),
+                        );
+                        self.finish(seq, |receipt| {
+                            receipt.decision = Some(decision);
+                            receipt.status = CallStatus::Failed;
+                            receipt.elapsed_ms = elapsed_ms;
+                            receipt.bytes = bytes;
+                            receipt.truncated = truncated;
+                        });
+                        Ok(ToolCallResponse {
+                            ok: false,
+                            result: text,
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spillover id for one nested call's full output.
+    fn spill_id(&self, seq: usize, name: &str) -> String {
+        format!("{}-nested-{seq}-{name}", self.spill_prefix)
+    }
+
+    /// Stable envelope: the tool's text content (parsed as JSON when it is
+    /// JSON), its structured metadata, and `truncated` (null unless cut).
+    /// An oversized result keeps the same keys: `content` becomes the head
+    /// of the raw text (no longer parsed JSON) and `truncated` says how much
+    /// there was and where the whole output was saved.
+    fn bounded_envelope(
+        &self,
+        seq: usize,
+        name: &str,
+        result: &ToolResult,
+    ) -> (Value, usize, Option<Truncation>) {
+        let metadata = result.metadata.clone().unwrap_or(Value::Null);
+        let content = serde_json::from_str(&result.content)
+            .unwrap_or_else(|_| Value::String(result.content.clone()));
+        let payload = json!({ "content": content, "metadata": metadata, "truncated": Value::Null });
+        let raw = payload.to_string();
+        if raw.len() <= PER_CALL_RESULT_CAP_BYTES {
+            return (payload, raw.len(), None);
+        }
+        let spill_path = spill(&self.spill_id(seq, name), &raw);
+        let metadata_len = metadata.to_string().len();
+        let metadata = if metadata_len <= PER_CALL_RESULT_CAP_BYTES / 4 {
+            metadata
+        } else {
+            Value::Null
+        };
+        let head = char_prefix(&result.content, PER_CALL_RESULT_CAP_BYTES / 2);
+        let truncation = Truncation {
+            original_bytes: raw.len(),
+            kept_bytes: head.len(),
+            spill_path,
+        };
+        (
+            json!({
+                "content": head,
+                "metadata": metadata,
+                "truncated": truncation,
+            }),
+            raw.len(),
+            Some(truncation),
+        )
     }
 }
 
@@ -198,118 +757,67 @@ impl ToolInvoker for CodemodeInvoker {
             .await
             .map_err(|_| DriverError::Unavailable("code-mode run shut down".to_string()))?;
         let started = Instant::now();
-        let name = request.tool.as_str();
+        let ToolCallRequest { tool, input } = request;
+        let seq = self.begin(&tool);
 
-        if PROHIBITED_NESTED.contains(&name) {
-            return Err(self.refused(
-                name,
-                started,
-                format!(
-                    "`{name}` is not available inside execute_tools programs; use workflow/task() for fan-out and tool_search before writing the program"
-                ),
-            ));
-        }
-        if crate::mcp::McpPool::is_mcp_tool(name) {
-            return Err(self.refused(
-                name,
-                started,
-                "MCP tools are excluded from Phase-1 code mode".to_string(),
-            ));
-        }
-        let Some(spec) = self.specs.iter().find(|spec| spec.name() == name) else {
-            return Err(self.refused(
-                name,
-                started,
-                format!("unknown tool `{name}`; discover names with tool_search before writing the program"),
-            ));
-        };
-        if !spec.is_read_only_for(&request.input) {
-            return Err(self.refused(
-                name,
-                started,
-                format!("`{name}` can mutate; Phase-1 code mode executes read-only calls only"),
-            ));
-        }
-        if spec.approval_requirement_for(&request.input) != ApprovalRequirement::Auto {
-            return Err(self.refused(
-                name,
-                started,
-                format!(
-                    "`{name}` needs approval; Phase-1 code mode executes only auto-approved calls"
-                ),
-            ));
-        }
-        if let Err(err) = enforce_tool_authority(name, &request.input, spec.as_ref(), &self.context)
-        {
-            return Err(self.refused(name, started, err.to_string()));
+        if let Some(note) = refusal_before_gate(&tool, &input, self.gate.is_some()) {
+            return Err(self.refused(seq, started, NestedDecision::Refused, note));
         }
 
-        match spec
-            .execute_rich(request.input.clone(), &self.context)
-            .await
-        {
-            Ok(rich) => {
-                let result = rich.into_result();
-                // Stable envelope: the tool's text content (parsed as JSON
-                // when it is JSON) plus its structured metadata, so
-                // continuation and truncation notices survive the bridge.
-                let content = serde_json::from_str(&result.content)
-                    .unwrap_or_else(|_| Value::String(result.content.clone()));
-                let payload = json!({
-                    "content": content,
-                    "metadata": result.metadata.clone().unwrap_or(Value::Null),
-                });
-                let raw_len = payload.to_string().len();
-                let (bounded, truncated) = bound_json(payload, PER_CALL_RESULT_CAP_BYTES);
-                self.record(CallReceipt {
-                    tool: name.to_string(),
-                    ok: result.success,
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                    bytes: raw_len,
-                    truncated,
-                    note: None,
-                });
-                Ok(ToolCallResponse {
-                    ok: result.success,
-                    result: if result.success {
-                        bounded
-                    } else {
-                        Value::String(result.content)
-                    },
-                })
-            }
-            Err(err) => {
-                let message = err.to_string();
-                // Validation-shaped failures mean nothing ran (admission);
-                // execution failures ran and failed (agent kind via ok:false);
-                // seam breaks are unavailable.
-                match err {
-                    ToolError::InvalidInput { .. }
-                    | ToolError::MissingField { .. }
-                    | ToolError::PathEscape { .. }
-                    | ToolError::PermissionDenied { .. } => {
-                        Err(self.refused(name, started, message))
+        let (name, input, supports_parallel, decision, hook_context) = match self.gate.as_ref() {
+            Some(gate) => {
+                let verdict = {
+                    let _paused = self.pause();
+                    gate.ask(tool.clone(), input).await
+                };
+                match verdict {
+                    NestedCallVerdict::Run {
+                        name,
+                        input,
+                        supports_parallel,
+                        decision,
+                        hook_context,
+                    } => (name, input, supports_parallel, decision, hook_context),
+                    NestedCallVerdict::Answered {
+                        result,
+                        hook_context,
+                    } => {
+                        self.finish(seq, |receipt| receipt.hook_context = hook_context);
+                        return self.deliver(
+                            seq,
+                            started,
+                            &tool,
+                            NestedDecision::Auto,
+                            Ok(RichToolResult::plain(result)),
+                        );
                     }
-                    ToolError::Timeout { .. }
-                    | ToolError::Cancelled { .. }
-                    | ToolError::NotAvailable { .. } => Err(DriverError::Unavailable(message)),
-                    ToolError::ExecutionFailed { .. } => {
-                        self.record(CallReceipt {
-                            tool: name.to_string(),
-                            ok: false,
-                            elapsed_ms: started.elapsed().as_millis() as u64,
-                            bytes: message.len(),
-                            truncated: false,
-                            note: None,
-                        });
-                        Ok(ToolCallResponse {
-                            ok: false,
-                            result: Value::String(message),
-                        })
+                    NestedCallVerdict::Refused { error, decision } => {
+                        return Err(self.refused(seq, started, decision, error.to_string()));
                     }
                 }
             }
-        }
+            None => {
+                if let Err(note) = self.ungated_admission(&tool, &input) {
+                    return Err(self.refused(seq, started, NestedDecision::Refused, note));
+                }
+                (tool.clone(), input, true, NestedDecision::Auto, None)
+            }
+        };
+        self.finish(seq, |receipt| {
+            if name != tool {
+                receipt.tool = name.clone();
+            }
+            receipt.hook_context = hook_context;
+        });
+
+        let outcome = if supports_parallel {
+            let _shared = self.order.read().await;
+            self.execute(&name, input).await
+        } else {
+            let _exclusive = self.order.write().await;
+            self.execute(&name, input).await
+        };
+        self.deliver(seq, started, &name, decision, outcome)
     }
 }
 
@@ -370,22 +878,50 @@ impl WorkflowDriver for CodemodeDriver {
     fn cancel_all(&self) {}
 }
 
-/// Bound a JSON value to `cap` serialized bytes, replacing oversize payloads
-/// with a preview that stays valid JSON.
-fn bound_json(value: Value, cap: usize) -> (Value, bool) {
+/// Longest prefix of `text` within `max_bytes` that ends on a char boundary.
+fn char_prefix(text: &str, max_bytes: usize) -> String {
+    let cut = max_bytes.min(text.len());
+    let cut = (0..=cut)
+        .rev()
+        .find(|&index| text.is_char_boundary(index))
+        .unwrap_or(0);
+    text[..cut].to_string()
+}
+
+/// Save a full value through the session spillover store; `None` when the
+/// store is unavailable (the truncation is still reported).
+fn spill(id: &str, content: &str) -> Option<String> {
+    crate::tools::truncate::write_spillover(id, content)
+        .map(|path| path.display().to_string())
+        .map_err(|error| {
+            tracing::warn!(target: "codemode", %error, "nested result spillover failed");
+        })
+        .ok()
+}
+
+/// Bound the program's return value to `cap` serialized bytes. An oversized
+/// value becomes the head of its JSON text, and the truncation record says so.
+fn bound_json(value: Value, cap: usize, spill_id: &str) -> (Value, Option<Truncation>) {
     let raw = value.to_string();
     if raw.len() <= cap {
-        return (value, false);
+        return (value, None);
     }
-    let preview: String = raw.chars().take(cap / 2).collect();
-    (
-        json!({
-            "_truncated": true,
-            "bytes": raw.len(),
-            "preview": preview,
-        }),
-        true,
-    )
+    bound_text(raw, cap, spill_id)
+}
+
+/// Bound `text` to `cap` bytes: an oversized text becomes its head, the
+/// whole text is saved, and the truncation record says so.
+fn bound_text(text: String, cap: usize, spill_id: &str) -> (Value, Option<Truncation>) {
+    if text.len() <= cap {
+        return (Value::String(text), None);
+    }
+    let head = char_prefix(&text, cap / 2);
+    let truncation = Truncation {
+        original_bytes: text.len(),
+        kept_bytes: head.len(),
+        spill_path: spill(spill_id, &text),
+    };
+    (Value::String(head), Some(truncation))
 }
 
 fn receipt_payload(
@@ -410,10 +946,10 @@ fn receipt_payload(
     }
 }
 
-/// Execute one `execute_tools` call: validate, run the program under the run
+/// Execute one `execute_tools` call: validate, run the program under its
 /// deadline, and return the bounded program value plus the host-owned
-/// receipt. A script failure is a `success: false` payload, not a host
-/// error — only VM and deadline failures are `Err`.
+/// receipt. A script failure or a deadline is a `success: false` payload
+/// that still lists every nested call — only VM setup failures are `Err`.
 pub async fn execute_tools_tool(
     input: &Value,
     registry: &ToolRegistry,
@@ -430,24 +966,45 @@ pub async fn execute_tools_tool(
     }
     let invoker = Arc::new(CodemodeInvoker::new(registry.all(), context.clone()));
     let driver = Arc::new(CodemodeDriver::default());
-    let outcome = timeout(
-        Duration::from_secs(RUN_DEADLINE_SECS),
-        WorkflowVm::new().run_tools_script(
-            code,
-            Value::Null,
-            driver.clone(),
-            invoker.clone(),
-            WorkflowRunCancel::new(),
-        ),
-    )
-    .await;
-    let program_result = match outcome {
-        Err(_) => {
-            return Err(ToolError::Timeout {
-                seconds: RUN_DEADLINE_SECS,
-            });
+    let deadline = invoker.deadline();
+    let cancel = WorkflowRunCancel::new();
+    let vm = WorkflowVm::new();
+    let mut run = Box::pin(vm.run_tools_script(
+        code,
+        Value::Null,
+        driver.clone(),
+        invoker.clone(),
+        cancel.clone(),
+    ));
+    let outcome = loop {
+        let Some(remaining) = invoker.remaining(deadline) else {
+            break None;
+        };
+        tokio::select! {
+            result = &mut run => break Some(result),
+            () = tokio::time::sleep(remaining) => {}
         }
-        Ok(Err(err)) => {
+    };
+    let program_result = match outcome {
+        None => {
+            // Stop the VM (and with it every in-flight nested call) before
+            // reading the receipt, so the listed state is final.
+            cancel.cancel();
+            drop(run);
+            return Ok(receipt_payload(
+                false,
+                json!({
+                    "error": format!(
+                        "execute_tools stopped at its {}s run deadline (time waiting on approvals is not counted). Calls with status ok/failed/refused finished; calls still in_flight were cancelled and may have partially run.",
+                        deadline.as_secs()
+                    ),
+                    "timed_out": true,
+                }),
+                &invoker,
+                &driver,
+            ));
+        }
+        Some(Err(err)) => {
             return Ok(receipt_payload(
                 false,
                 json!({ "error": err.to_string() }),
@@ -455,9 +1012,10 @@ pub async fn execute_tools_tool(
                 &driver,
             ));
         }
-        Ok(Ok(value)) => value,
+        Some(Ok(value)) => value,
     };
-    let (bounded, truncated) = bound_json(program_result, RETURN_CAP_BYTES);
+    let spill_id = format!("{}-return", invoker.spill_prefix);
+    let (bounded, truncated) = bound_json(program_result, RETURN_CAP_BYTES, &spill_id);
     Ok(receipt_payload(
         true,
         json!({ "return": bounded, "return_truncated": truncated }),
@@ -520,18 +1078,32 @@ mod tests {
 
     #[test]
     fn bound_json_keeps_small_values_verbatim() {
-        let (value, truncated) = bound_json(json!({"a": 1}), 1024);
-        assert!(!truncated);
+        let (value, truncated) = bound_json(json!({"a": 1}), 1024, "bound-small");
+        assert!(truncated.is_none());
         assert_eq!(value, json!({"a": 1}));
     }
 
     #[test]
-    fn bound_json_truncates_to_valid_json_with_preview() {
+    fn bound_json_names_what_it_cut() {
+        let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let spill_root = tempfile::tempdir().unwrap();
+        let previous =
+            crate::tools::truncate::set_test_spillover_root(Some(spill_root.path().to_path_buf()));
         let big = "x".repeat(100);
-        let (value, truncated) = bound_json(json!({ "blob": big }), 64);
-        assert!(truncated);
-        assert_eq!(value["bytes"], json!(111));
-        assert!(value["preview"].as_str().is_some());
+        let (value, truncated) = bound_json(json!({ "blob": big }), 64, "bound-big");
+        crate::tools::truncate::set_test_spillover_root(previous);
+        let truncated = truncated.expect("oversized value is reported");
+        assert_eq!(truncated.original_bytes, 111);
+        assert_eq!(truncated.kept_bytes, 32);
+        assert!(
+            value
+                .as_str()
+                .is_some_and(|head| head.starts_with("{\"blob\""))
+        );
+        let saved = truncated.spill_path.expect("full value saved");
+        assert_eq!(std::fs::read_to_string(saved).unwrap().len(), 111);
     }
 
     use crate::core::engine::tool_catalog::ToolMode;
@@ -657,5 +1229,385 @@ mod tests {
         assert_eq!(body["nested_calls"], 2);
         assert_eq!(body["body"]["return"]["listed"], true);
         assert_eq!(body["body"]["return"]["loaded"], true);
+    }
+
+    // --- Gated (engine-served) programs -----------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A stand-in for the turn loop's gate: answers every nested call with
+    /// `answer` after `delay`, counting how often it was asked.
+    fn gated_context(
+        workspace: &std::path::Path,
+        deadline: Duration,
+        delay: Duration,
+        mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
+        answer: impl Fn(&str, &Value) -> NestedCallVerdict + Send + Sync + 'static,
+    ) -> (ToolContext, Arc<AtomicUsize>) {
+        let (tx_event, mut rx_event) = mpsc::channel(64);
+        tokio::spawn(async move { while rx_event.recv().await.is_some() {} });
+        let (gate, mut requests) = NestedCallGate::new(mcp_pool, tx_event, deadline);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                let verdict = answer(&request.name, &request.input);
+                let _ = request.reply.send(verdict);
+            }
+        });
+        let mut context = ToolContext::new(workspace);
+        context.execution.nested_call_gate = Some(gate);
+        (context, asked)
+    }
+
+    fn run_as_asked(name: &str, input: &Value) -> NestedCallVerdict {
+        NestedCallVerdict::Run {
+            name: name.to_string(),
+            input: input.clone(),
+            supports_parallel: true,
+            decision: NestedDecision::Auto,
+            hook_context: None,
+        }
+    }
+
+    fn body(result: &ToolResult) -> Value {
+        serde_json::from_str(&result.content).expect("receipt is JSON")
+    }
+
+    /// A tool that takes longer than any test deadline.
+    struct SlowTool;
+
+    #[async_trait]
+    impl ToolSpec for SlowTool {
+        fn name(&self) -> &str {
+            "slow"
+        }
+        fn description(&self) -> &str {
+            "sleeps"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn capabilities(&self) -> Vec<crate::tools::spec::ToolCapability> {
+            vec![crate::tools::spec::ToolCapability::ReadOnly]
+        }
+        async fn execute(
+            &self,
+            _input: Value,
+            _context: &ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(ToolResult::success("late"))
+        }
+    }
+
+    /// A tool whose output is larger than the nested result cap.
+    struct HugeTool;
+
+    #[async_trait]
+    impl ToolSpec for HugeTool {
+        fn name(&self) -> &str {
+            "huge"
+        }
+        fn description(&self) -> &str {
+            "big output"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn capabilities(&self) -> Vec<crate::tools::spec::ToolCapability> {
+            vec![crate::tools::spec::ToolCapability::ReadOnly]
+        }
+        async fn execute(
+            &self,
+            input: Value,
+            _context: &ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            let text = "y".repeat(PER_CALL_RESULT_CAP_BYTES * 2);
+            if input.get("fail").and_then(Value::as_bool) == Some(true) {
+                return Ok(ToolResult::error(text));
+            }
+            Ok(ToolResult::success(text))
+        }
+    }
+
+    #[tokio::test]
+    async fn gated_nested_mcp_call_runs_through_the_session_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(AsyncMutex::new(McpPool::new(
+            crate::mcp::McpConfig::default(),
+        )));
+        let (context, asked) = gated_context(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::ZERO,
+            Some(pool),
+            run_as_asked,
+        );
+        let registry = ToolRegistryBuilder::new().build(context.clone());
+        let code = "const r = await tools.call('list_mcp_resources', {}); \
+                    return { hasContent: r.content !== undefined, truncated: r.truncated };";
+        let result = execute_tools_tool(&json!({ "code": code }), &registry, &context)
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.content);
+        let body = body(&result);
+        assert_eq!(body["body"]["return"]["hasContent"], true);
+        assert_eq!(body["body"]["return"]["truncated"], Value::Null);
+        assert_eq!(body["calls"][0]["tool"], "list_mcp_resources");
+        assert_eq!(body["calls"][0]["decision"], "auto");
+        assert_eq!(body["calls"][0]["status"], "ok");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "the MCP call went through the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_denial_fails_only_that_nested_call() {
+        let (_dir, note) = workspace_with_note();
+        let workspace = note.parent().unwrap().to_path_buf();
+        let target = workspace.join("denied.txt");
+        let (context, _asked) = gated_context(
+            &workspace,
+            Duration::from_secs(30),
+            Duration::ZERO,
+            None,
+            |name, input| {
+                if name == "write" {
+                    NestedCallVerdict::Refused {
+                        error: ToolError::permission_denied("Tool 'write' denied by user"),
+                        decision: NestedDecision::Denied,
+                    }
+                } else {
+                    run_as_asked(name, input)
+                }
+            },
+        );
+        let registry = ToolRegistryBuilder::new()
+            .with_tool(Arc::new(ReadTool))
+            .with_tool(Arc::new(WriteTool))
+            .build(context.clone());
+        let note_path = note.to_string_lossy().replace('\\', "\\\\");
+        let target_path = target.to_string_lossy().replace('\\', "\\\\");
+        let code = format!(
+            "let denied = null; \
+             try {{ await tools.call('write', {{ path: '{target_path}', content: 'x' }}); }} \
+             catch (e) {{ denied = String(e.message || e); }} \
+             const r = await tools.call('read', {{ path: '{note_path}' }}); \
+             return {{ denied, read: JSON.stringify(r).includes('alpha') }};"
+        );
+        let result = execute_tools_tool(&json!({ "code": code }), &registry, &context)
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.content);
+        let body = body(&result);
+        assert!(
+            body["body"]["return"]["denied"]
+                .as_str()
+                .is_some_and(|message| message.contains("denied by user")),
+            "{body}"
+        );
+        assert_eq!(body["body"]["return"]["read"], true);
+        assert_eq!(body["calls"][0]["decision"], "denied");
+        assert_eq!(body["calls"][0]["status"], "refused");
+        assert_eq!(body["calls"][1]["status"], "ok");
+        assert!(!target.exists(), "a denied write never runs");
+    }
+
+    #[tokio::test]
+    async fn computer_use_consent_is_refused_inside_a_program_before_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (context, asked) = gated_context(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::ZERO,
+            None,
+            run_as_asked,
+        );
+        let invoker = CodemodeInvoker::new(Vec::new(), context);
+        for (name, input) in [
+            (
+                "mcp_plugin-12-computer-use-computer_consent",
+                json!({"action": "allow", "app": "Safari", "bundle_id": "com.apple.Safari"}),
+            ),
+            (
+                "mcp_plugin-12-computer-use-computer_app_script",
+                json!({"script": "do shell script \"id\""}),
+            ),
+            ("mcp_github_authenticate", json!({})),
+            ("exec_shell", json!({"command": "ls", "interactive": true})),
+            ("request_user_input", json!({})),
+            // Dispatch resolves names case-insensitively, so the refusals do.
+            ("Agent", json!({})),
+            ("WORKFLOW", json!({})),
+            ("Execute_Tools", json!({"code": "return 1;"})),
+            ("BASH", json!({"command": "ls", "interactive": true})),
+            ("Exec_Shell", json!({"command": "ls", "interactive": true})),
+        ] {
+            let err = invoker
+                .invoke(ToolCallRequest {
+                    tool: name.to_string(),
+                    input,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(err, DriverError::Rejected(_)), "{name}: {err:?}");
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "nothing reached the gate");
+        assert!(
+            invoker
+                .drain()
+                .iter()
+                .all(|receipt| receipt.status == CallStatus::Refused)
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_keeps_finished_receipts_and_names_in_flight_calls() {
+        let (_dir, note) = workspace_with_note();
+        let workspace = note.parent().unwrap().to_path_buf();
+        let (context, _asked) = gated_context(
+            &workspace,
+            Duration::from_millis(400),
+            Duration::ZERO,
+            None,
+            run_as_asked,
+        );
+        let registry = ToolRegistryBuilder::new()
+            .with_tool(Arc::new(ReadTool))
+            .with_tool(Arc::new(SlowTool))
+            .build(context.clone());
+        let note_path = note.to_string_lossy().replace('\\', "\\\\");
+        let code = format!(
+            "await tools.call('read', {{ path: '{note_path}' }}); \
+             await tools.call('slow', {{}}); return 'unreachable';"
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_tools_tool(&json!({ "code": code }), &registry, &context),
+        )
+        .await
+        .expect("the run deadline ends the program")
+        .expect("a deadline is a receipt, not a host error");
+        assert!(!result.success);
+        let body = body(&result);
+        assert_eq!(body["body"]["timed_out"], true, "{body}");
+        assert_eq!(body["nested_calls"], 2);
+        assert_eq!(body["calls"][0]["tool"], "read");
+        assert_eq!(body["calls"][0]["status"], "ok");
+        assert_eq!(body["calls"][1]["tool"], "slow");
+        assert_eq!(body["calls"][1]["status"], "in_flight");
+    }
+
+    #[tokio::test]
+    async fn time_waiting_on_the_gate_does_not_spend_the_deadline() {
+        let (_dir, note) = workspace_with_note();
+        let workspace = note.parent().unwrap().to_path_buf();
+        // Each gate answer takes longer than the whole run deadline, as a
+        // person deciding an approval would.
+        let (context, _asked) = gated_context(
+            &workspace,
+            Duration::from_millis(300),
+            Duration::from_millis(500),
+            None,
+            run_as_asked,
+        );
+        let registry = ToolRegistryBuilder::new()
+            .with_tool(Arc::new(ReadTool))
+            .build(context.clone());
+        let note_path = note.to_string_lossy().replace('\\', "\\\\");
+        let code = format!(
+            "const a = await tools.call('read', {{ path: '{note_path}' }}); \
+             const b = await tools.call('read', {{ path: '{note_path}' }}); \
+             return JSON.stringify([a, b]).includes('alpha');"
+        );
+        let result = execute_tools_tool(&json!({ "code": code }), &registry, &context)
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.content);
+        assert_eq!(body(&result)["body"]["return"], true);
+    }
+
+    #[test]
+    fn watchdog_rechecks_promptly_while_paused_on_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let invoker = CodemodeInvoker::new(Vec::new(), ToolContext::new(dir.path()));
+        let deadline = Duration::from_secs(600);
+        let paused = invoker.pause();
+        // A paused program never times out, but the watchdog must not sleep
+        // out the whole deadline or the run would overrun by that much once
+        // the gate answers.
+        assert_eq!(invoker.remaining(deadline), Some(PAUSED_WATCHDOG_POLL));
+        drop(paused);
+        assert!(
+            invoker
+                .remaining(deadline)
+                .is_some_and(|left| left > PAUSED_WATCHDOG_POLL)
+        );
+    }
+
+    // This test deliberately serializes access to process-global spillover
+    // state while awaiting the program.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn oversized_nested_result_keeps_its_envelope_and_says_what_was_cut() {
+        let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let spill_root = tempfile::tempdir().unwrap();
+        let previous =
+            crate::tools::truncate::set_test_spillover_root(Some(spill_root.path().to_path_buf()));
+        let dir = tempfile::tempdir().unwrap();
+        let (context, _asked) = gated_context(
+            dir.path(),
+            Duration::from_secs(30),
+            Duration::ZERO,
+            None,
+            run_as_asked,
+        );
+        let registry = ToolRegistryBuilder::new()
+            .with_tool(Arc::new(HugeTool))
+            .build(context.clone());
+        let code = "const r = await tools.call('huge', {}); \
+                    let failed = null; \
+                    try { await tools.call('huge', { fail: true }); } \
+                    catch (e) { failed = String(e.message || e).length; } \
+                    return { keys: Object.keys(r).sort(), cut: r.truncated, \
+                             head: r.content.length, kind: typeof r.content, failed };";
+        let result = execute_tools_tool(&json!({ "code": code }), &registry, &context)
+            .await
+            .unwrap();
+        crate::tools::truncate::set_test_spillover_root(previous);
+        assert!(result.success, "{}", result.content);
+        let body = body(&result);
+        let returned = &body["body"]["return"];
+        assert_eq!(
+            returned["keys"],
+            json!(["content", "metadata", "truncated"])
+        );
+        assert!(
+            returned["cut"]["original_bytes"].as_u64().unwrap() > PER_CALL_RESULT_CAP_BYTES as u64
+        );
+        assert_eq!(returned["head"], json!(PER_CALL_RESULT_CAP_BYTES / 2));
+        assert_eq!(returned["kind"], "string", "a cut result is its raw head");
+        assert!(returned["cut"]["spill_path"].as_str().is_some(), "{body}");
+        assert!(body["calls"][0]["truncated"]["original_bytes"].is_u64());
+        // A failed call's text is bounded and spilled the same way.
+        assert_eq!(returned["failed"], json!(PER_CALL_RESULT_CAP_BYTES / 2));
+        assert_eq!(body["calls"][1]["status"], "failed");
+        assert_eq!(
+            body["calls"][1]["truncated"]["original_bytes"],
+            json!(PER_CALL_RESULT_CAP_BYTES * 2)
+        );
+        assert!(
+            body["calls"][1]["truncated"]["spill_path"]
+                .as_str()
+                .is_some(),
+            "{body}"
+        );
     }
 }

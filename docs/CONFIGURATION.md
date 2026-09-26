@@ -2978,7 +2978,13 @@ web_search = true # enables deferred Web; the flag name is retained for config c
 apply_patch = true
 mcp = true
 exec_policy = true
+code_mode = true # execute_tools composes MCP/plugin/native calls; false defers it behind tool_search
 ```
+
+`code_mode` is on by default: `execute_tools` is advertised from the first
+request and nested calls go through the same permission gate as direct calls
+(see [Tool surface](TOOL_SURFACE.md#code-mode-execute_tools)). Set
+`code_mode = false` to defer it behind `tool_search` again.
 
 You can also override features for a single run:
 

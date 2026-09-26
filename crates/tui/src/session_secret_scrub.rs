@@ -26,9 +26,9 @@ pub(crate) struct ScrubReport {
     /// Session and checkpoint files examined.
     pub files_scanned: usize,
     /// Files holding at least one unredacted credential in tool output.
-    pub files_with_secrets: Vec<PathBuf>,
+    pub flagged_files: Vec<PathBuf>,
     /// Tool-result text fields that contained a credential.
-    pub tool_results_with_secrets: usize,
+    pub flagged_tool_results: usize,
     /// Files the scan could not read or parse, left untouched.
     pub unreadable: Vec<PathBuf>,
 }
@@ -95,8 +95,8 @@ pub(crate) fn scrub_files(
             FileScan::Unreadable => report.unreadable.push(path.clone()),
             FileScan::Clean => {}
             FileScan::Dirty(redacted) => {
-                report.tool_results_with_secrets += redacted;
-                report.files_with_secrets.push(path.clone());
+                report.flagged_tool_results += redacted;
+                report.flagged_files.push(path.clone());
             }
         }
     }
@@ -214,8 +214,8 @@ mod tests {
 
         let report = scrub_files(&files, None).expect("scan");
         assert_eq!(report.files_scanned, 4);
-        assert_eq!(report.files_with_secrets.len(), 2, "{report:?}");
-        assert_eq!(report.tool_results_with_secrets, 6);
+        assert_eq!(report.flagged_files.len(), 2, "{report:?}");
+        assert_eq!(report.flagged_tool_results, 6);
         assert_eq!(report.unreadable, vec![dir.path().join("broken.json")]);
         assert!(
             std::fs::read_to_string(&dirty).unwrap().contains(TOKEN),
@@ -225,7 +225,7 @@ mod tests {
         let manager =
             crate::session_manager::SessionManager::new(dir.path().to_path_buf()).expect("manager");
         let applied = scrub_files(&files, Some(&manager)).expect("scrub");
-        assert_eq!(applied.files_with_secrets.len(), 2);
+        assert_eq!(applied.flagged_files.len(), 2);
         assert_eq!(applied.unreadable, vec![dir.path().join("broken.json")]);
         for path in [&dirty, &checkpoint] {
             let text = std::fs::read_to_string(path).unwrap();
@@ -235,9 +235,7 @@ mod tests {
             assert_eq!(value["messages"][0]["content"][0]["text"], "show auth");
         }
         assert_eq!(
-            scrub_files(&files, None)
-                .expect("rescan")
-                .files_with_secrets,
+            scrub_files(&files, None).expect("rescan").flagged_files,
             Vec::<PathBuf>::new(),
             "a scrubbed store scans clean"
         );

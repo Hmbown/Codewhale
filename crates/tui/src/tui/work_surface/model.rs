@@ -1644,8 +1644,8 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
             // names the agents dispatched without one. Never the bare agent
             // id (#36) — absent rather than fabricated, so the identity
             // column falls back to the role.
-            let name = crate::tui::sidebar::dispatched_agent_name(agent)
-                .map(str::to_string)
+            let name = app
+                .agent_given_name(&agent.agent_id)
                 .or_else(|| resolved_profile.map(str::to_string))
                 .or_else(|| {
                     agent
@@ -1662,25 +1662,7 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
             // counters, file tallies) is working state, not a receipt, and
             // must not linger as a spawn-metadata dump after the run ends.
             if !terminal {
-                if let Some(detail) =
-                    current_activity.and_then(|activity| activity.detail.as_deref())
-                {
-                    facts.push(detail.to_string());
-                }
-                if let Some(tool) =
-                    current_activity.and_then(|activity| activity.current_tool.as_deref())
-                {
-                    facts.push(format!("using {tool}"));
-                }
-                if let Some(step) = current_activity.and_then(|activity| activity.step) {
-                    facts.push(format!("step {step}"));
-                }
-                if let Some(files) = meta
-                    .map(|meta| meta.files_touched)
-                    .filter(|count| *count > 0)
-                {
-                    facts.push(format!("{files} files changed"));
-                }
+                facts.extend(live_activity_facts(app, &agent.agent_id));
             }
             AgentRowSeed {
                 agent_id: agent.agent_id.clone(),
@@ -1747,25 +1729,7 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
                     .is_some_and(|a| matches!(a.status, AgentCurrentActivityStatus::Failed));
                 let name = app.agent_label_map.get(id).cloned();
                 let mut facts = vec![status.to_string()];
-                if let Some(detail) =
-                    current_activity.and_then(|activity| activity.detail.as_deref())
-                {
-                    facts.push(detail.to_string());
-                }
-                if let Some(tool) =
-                    current_activity.and_then(|activity| activity.current_tool.as_deref())
-                {
-                    facts.push(format!("using {tool}"));
-                }
-                if let Some(step) = current_activity.and_then(|activity| activity.step) {
-                    facts.push(format!("step {step}"));
-                }
-                if let Some(files) = meta
-                    .map(|meta| meta.files_touched)
-                    .filter(|count| *count > 0)
-                {
-                    facts.push(format!("{files} files changed"));
-                }
+                facts.extend(live_activity_facts(app, id));
                 AgentRowSeed {
                     agent_id: id.clone(),
                     parent_run_id: meta.and_then(|meta| meta.parent_run_id.clone()),
@@ -1823,6 +1787,51 @@ fn summarize_assignment(value: &str) -> String {
     } else {
         summary
     }
+}
+
+/// A running agent's live facts for its dock row, each said once (#6565).
+/// The activity detail usually already names the step and the tool ("step 6:
+/// finished tool 'read_file'"); repeating them as `using read_file · step 6`
+/// made every row say the same thing twice.
+fn live_activity_facts(app: &App, agent_id: &str) -> Vec<String> {
+    let meta = app.agent_progress_meta.get(agent_id);
+    let activity = meta.and_then(|meta| meta.current_activity.as_ref());
+    let detail = activity.and_then(|activity| activity.detail.as_deref());
+    let mut facts = Vec::new();
+    if let Some(detail) = detail {
+        facts.push(detail.to_string());
+    }
+    let said = |fact: &str| detail.is_some_and(|detail| names_whole(detail, fact));
+    if let Some(tool) = activity.and_then(|activity| activity.current_tool.as_deref())
+        && !said(tool)
+    {
+        facts.push(format!("using {tool}"));
+    }
+    if let Some(step) = activity.and_then(|activity| activity.step) {
+        let step = format!("step {step}");
+        if !said(&step) {
+            facts.push(step);
+        }
+    }
+    if let Some(files) = meta
+        .map(|meta| meta.files_touched)
+        .filter(|count| *count > 0)
+    {
+        facts.push(format!("{files} files changed"));
+    }
+    facts
+}
+
+/// Whether `text` names `fact` as a whole token: "step 1" is not said by
+/// "step 10", nor a tool `read` by "read_file".
+fn names_whole(text: &str, fact: &str) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    !fact.is_empty()
+        && text.match_indices(fact).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + fact.len()..].chars().next();
+            !before.is_some_and(is_word) && !after.is_some_and(is_word)
+        })
 }
 
 /// Has this agent stopped working? Typed live activity wins over the worker
@@ -2896,6 +2905,21 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::tools::spec::ToolResult;
+
+    /// #6565: a fact is dropped from a dock row only when the detail names
+    /// that exact fact, never a longer one that contains it.
+    #[test]
+    fn a_fact_is_said_only_by_its_whole_name() {
+        assert!(names_whole("step 6: finished tool 'read_file'", "step 6"));
+        assert!(names_whole(
+            "step 6: finished tool 'read_file'",
+            "read_file"
+        ));
+        assert!(!names_whole("step 10: finished tool 'read_file'", "step 1"));
+        assert!(!names_whole("finished tool 'read_file'", "read"));
+        assert!(names_whole("read then step 1", "step 1"));
+        assert!(!names_whole("anything", ""));
+    }
     use crate::tui::app::TuiOptions;
     use crate::tui::tool_routing::{handle_tool_call_complete, handle_tool_call_started};
     use crate::work_graph::{CompatTodoBinding, OperationBinding, WorkNodeId};

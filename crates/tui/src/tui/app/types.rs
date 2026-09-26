@@ -284,6 +284,16 @@ pub struct QueuedMessage {
     pub history_echoed: bool,
 }
 
+/// The message the current turn was dispatched with, and the transcript cell
+/// that shows it. When the engine reports the turn was never sent (a key
+/// rejected before any model output), this is what goes back in the composer,
+/// skill included, and the bubble that comes out of the transcript (#6566).
+#[derive(Debug, Clone)]
+pub struct UnansweredSubmission {
+    pub message: QueuedMessage,
+    pub history_cell: usize,
+}
+
 /// A steer handed to the engine that the engine has not yet recorded.
 ///
 /// Live-only, and deliberately not in `api_messages`: `EngineHandle::steer`

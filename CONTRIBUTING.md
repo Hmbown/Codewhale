@@ -97,7 +97,7 @@ scripts/dev-cargo.sh check -p codewhale-tui
 
 # 2. Run only the tests near your change (one crate, one filter).
 scripts/dev-test.sh tui fleet_setup
-# or: scripts/dev-test.sh crates/tui/src/elapsed.rs
+# or: scripts/dev-test.sh crates/runtime/src/elapsed.rs
 
 # 3. Run a whole crate's unit suite. scripts/dev-test.sh uses nextest when
 #    it is installed (one process per test, all cores busy, slow tests

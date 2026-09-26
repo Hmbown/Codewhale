@@ -40,9 +40,10 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Added",
         "items": [
-          "Official model routing: /router (also /model router) sets up the Auto router with presets: Jev (TypeSafe's decision model, via OpenRouter or a TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes one test call before it saves, /status shows the router's choice, cost and latency, and a failing router is shown as failing (#6525)."
+          "Official model routing: /router (also /model router) sets up the Auto router with presets: Jev (TypeSafe's decision model, via OpenRouter or a TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes one test call before it saves, /status shows the router's choice, cost and latency, and a failing router is shown as failing (#6525).",
+          "Code mode composes MCP and plugin tools and is on by default: execute_tools programs can call MCP tools, and each nested call passes the same approval gate as a direct call, pausing the program for approval when needed. Every nested call keeps its receipt, including calls that finish before a deadline, and code_mode = false turns it off. codewhale mcp list and codewhale doctor warn when a user MCP server duplicates the built-in Computer Use bundle (#6562, #6509)."
         ],
-        "itemCount": 1
+        "itemCount": 2
       },
       {
         "heading": "Fixed",
@@ -60,7 +61,7 @@ export const CHANGELOG: ChangelogRelease[] = [
           "Hooks treat bash, Bash and exec_shell as one tool in tool_name conditions, so the documented example fires.",
           "macOS no longer reports Codewhale's ordinary heap as GPU (IOAccelerator) memory."
         ],
-        "itemCount": 16
+        "itemCount": 19
       },
       {
         "heading": "Removed",

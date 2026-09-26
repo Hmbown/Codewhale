@@ -35,7 +35,7 @@ Underwater's continuous water column is authored by `OceanRamp::for_theme` in
 `crates/tui/src/tui/ocean.rs`: dark navy at the top, deeper near the composer.
 Its existing motion policy preserves reduced/still modes and semantic surfaces.
 
-For the charcoal alternative, the source of truth is `crates/palette/src/tokens.rs` and the
+For the charcoal alternative, the source of truth is `crates/palette/src/rgb.rs` and the
 `SHORELINE_UI_THEME` / `SHORELINE_LIGHT_UI_THEME` mappings in
 `crates/palette/src/themes.rs`. The dark palette is unchanged by the
 Workbench index pass:

@@ -150,12 +150,18 @@ pub(super) fn prepare_tool_call(
             .and_then(Value::as_str)
             .and_then(|code| code.lines().map(str::trim).find(|line| !line.is_empty()))
             .unwrap_or("execute_tools program");
-        return Ok(conservative_execution_policy(
+        let mut policy = conservative_execution_policy(
             name,
             input.clone(),
             &format!("execute_tools: {first_line}"),
             session_auto_approve,
-        ));
+        );
+        // #6562: every nested call is planned and approved through the same
+        // gate as a direct call (or, without an engine gate, limited to
+        // read-only auto-approved calls), so approving the program itself
+        // would grant nothing. It stays exclusive and non-read-only.
+        policy.call.approval = ApprovalRequirement::Auto;
+        return Ok(policy);
     }
 
     if name == JS_EXECUTION_TOOL_NAME {

@@ -392,6 +392,9 @@ fn named_provider_and_model_reach_an_actual_exec_request_with_a_profile() {
         "--set",
         "sandbox_mode=read-only",
         "exec",
+        // Plain exec is a zero-tool one-shot (#6510); `--auto` opens the tool
+        // surface so the read-only `--set` is proven to filter it.
+        "--auto",
         "--max-turns",
         "1",
         "--output-format",

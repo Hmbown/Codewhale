@@ -1463,6 +1463,16 @@ impl ViewStack {
             .is_some_and(|view| view.kind() == ModalKind::Extensions)
     }
 
+    /// Whether a provider picker anywhere in the stack has been used — a key
+    /// pressed or a click landed in it.
+    pub fn provider_picker_interacted(&mut self) -> bool {
+        self.views.iter_mut().any(|view| {
+            view.as_any_mut()
+                .downcast_mut::<crate::tui::provider_picker::ProviderPickerView>()
+                .is_some_and(|picker| picker.interacted())
+        })
+    }
+
     /// Hand a freshly-built read model to the open Extensions panel, when it
     /// is on top. A pager or another modal stacked above it means the user is
     /// looking at something else — the rebuild is skipped and the next poll
@@ -5736,8 +5746,15 @@ pub(crate) fn subagent_view_agents(
     for agent in &mut agents[..manager_agent_count] {
         // The row headline reads `nickname`, so the dispatch name lands there
         // when the agent has one; the generated whale names the rest (#5287).
-        let display_name = crate::tui::sidebar::dispatched_agent_name(agent)
-            .map(str::to_string)
+        // The view is handed manager rows that may not be in
+        // `subagent_cache` yet, so the row's own dispatch name backs up the
+        // app-wide lookup.
+        let own_name = agent.name.trim();
+        let display_name = app
+            .agent_given_name(&agent.agent_id)
+            .or_else(|| {
+                (!own_name.is_empty() && own_name != agent.agent_id).then(|| own_name.to_string())
+            })
             .or_else(|| display_names.remove(&agent.agent_id));
         agent.nickname = display_name;
     }

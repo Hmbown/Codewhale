@@ -39,6 +39,15 @@ impl StepBudgetSource {
     }
 }
 
+/// Where a turn's user message sat in the session right after it was added:
+/// the session length and messages revision then. Together they identify
+/// that message; a later append or rewrite changes one of them (#6566).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnansweredUserMessage {
+    pub len: usize,
+    pub revision: u64,
+}
+
 /// Context for a single turn (user message + AI response).
 #[derive(Debug)]
 pub struct TurnContext {
@@ -63,6 +72,12 @@ pub struct TurnContext {
     /// granted (#5994). Set by the turn loop; the cross-turn goal fence reads
     /// it so an exhausted goal pauses instead of re-arming.
     pub budget_exhausted_final_report: bool,
+    /// This turn's user message while no model request has been accepted
+    /// yet. A credential rejection while it is still the last message takes
+    /// it back out of the session, so a retry after fixing the key is not a
+    /// duplicate (#6566). Cleared once a request is accepted: from then on a
+    /// model has seen the message.
+    pub unanswered_user_message: Option<UnansweredUserMessage>,
 
     pub(crate) stop_diagnostics: crate::tool_inspection::TurnStopDiagnostics,
     pub(crate) last_request_snapshot: Option<crate::tool_inspection::ToolInspectionSnapshot>,
@@ -124,6 +139,7 @@ impl TurnContext {
             max_steps,
             budget_source,
             budget_exhausted_final_report: false,
+            unanswered_user_message: None,
             stop_diagnostics: crate::tool_inspection::TurnStopDiagnostics {
                 effective_max_steps: (max_steps != u32::MAX).then_some(max_steps),
                 step_budget_source: budget_source.key_label(),

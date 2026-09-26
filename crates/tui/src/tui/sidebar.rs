@@ -26,19 +26,6 @@ pub struct SidebarAgentRow {
     pub children_settled: Option<(usize, usize)>,
 }
 
-/// The name a sub-agent was dispatched under, when it has one (#5287).
-///
-/// `SubAgentResult::name` carries the session name, which the manager seeds
-/// with the agent id and only replaces when the dispatch supplied a name. An
-/// id is a lookup handle, never the identity an operator dispatched by, so it
-/// is reported as absent here and the caller falls back to its own chain.
-pub(crate) fn dispatched_agent_name(
-    agent: &crate::tools::subagent::SubAgentResult,
-) -> Option<&str> {
-    let name = agent.name.trim();
-    (!name.is_empty() && name != agent.agent_id).then_some(name)
-}
-
 pub(crate) fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
     let cached_ids: std::collections::HashSet<&str> = app
         .subagent_cache
@@ -62,8 +49,8 @@ pub(crate) fn sidebar_agent_rows(app: &App) -> Vec<SidebarAgentRow> {
             // The dispatch name leads (#5287). Generated whales name the
             // agents that have none, locale-derived from the neutral agent
             // id; never replay a persisted label from another language.
-            let display_name = dispatched_agent_name(agent)
-                .map(str::to_string)
+            let display_name = app
+                .agent_given_name(&agent.agent_id)
                 .or_else(|| {
                     agent
                         .child_route
