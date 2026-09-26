@@ -135,11 +135,15 @@ web/
 │   ├── deepseek.ts             v4-flash chat client + curate() prompt
 │   ├── facts.ts                getFacts(): KV value, else build-time FACTS
 │   ├── facts.generated.ts      GENERATED — do not edit by hand
+│   ├── changelog.generated.ts  GENERATED at build/test time, untracked
+│   ├── install-guide.generated.ts GENERATED at build/test time, untracked
 │   ├── facts-drift.ts          runtime re-derivation for the drift cron
 │   ├── community-agent.ts      triage / pr-review / digest cron tasks
 │   └── kv.ts                   Cloudflare KV access via OpenNext bindings
 ├── scripts/
 │   ├── derive-facts.mjs        prebuild: repo sources → lib/facts.generated.ts
+│   ├── derive-changelog.mjs    prebuild + vitest setup: CHANGELOG.md → lib/changelog.generated.ts
+│   ├── derive-install.mjs      prebuild + vitest setup: docs/INSTALL.md → lib/install-guide.generated.ts
 │   ├── compare-deployed-facts.mjs credential-free exact-SHA receipt check
 │   └── check-kv-id.mjs         predeploy guard for KV namespace ids
 ├── wrangler.jsonc              CF Worker config + cron + KV binding
