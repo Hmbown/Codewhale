@@ -34,9 +34,10 @@ export const CHANGELOG: ChangelogRelease[] = [
           "@Lstarsky0 — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine (#6405, #6417, #6499, #6574), tightened the Chinese-branching ceiling to 18 (#6403), and made Fleet publish without a two-link window (#6431).",
           "@aboimpinto — restored a green Linux full-workspace test gate without loosening any test (#6581).",
           "@dajiaohuang — codewhale config set checks a known setting's value against its schema type before saving it (#6568).",
-          "@Water-Run — ingested namespaced model-only catalog entries so models present only in the canonical models map reach the offering list (#6400), and retired the blanket dead-code allowance with its unused feature stages, tightening the budget to match (#6402)."
+          "@Water-Run — ingested namespaced model-only catalog entries so models present only in the canonical models map reach the offering list (#6400), and retired the blanket dead-code allowance with its unused feature stages, tightening the budget to match (#6402).",
+          "@SparkofSpike — let making room survive a provider request-body limit (HTTP 413) by shrinking, then replacing, inline images for that one summary pass (#6642)."
         ],
-        "itemCount": 5
+        "itemCount": 6
       },
       {
         "heading": "Added",
@@ -50,7 +51,7 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Fixed",
         "items": [
-          "Making room now recovers from a provider request-body limit (HTTP 413) instead of failing the pass. A summary request that is refused for size re-encodes the conversation's inline images smaller and retries, says so in the status line while it does, and — if the request is still refused — replaces the images with text notes for that one summary pass. Session history keeps the real images either way.",
+          "Making room now recovers from a provider request-body limit (HTTP 413) instead of failing the pass. A summary request that is refused for size re-encodes the conversation's inline images smaller and retries, says so in the status line while it does, and — if the request is still refused — replaces the images with text notes for that one summary pass. Session history keeps the real images either way (#6642, thanks @SparkofSpike).",
           "codewhale exec --auto no longer exits 141 with no output when a child it writes to, such as a stdio MCP server, closes its pipe early. Headless exec now ignores SIGPIPE while it runs, as the interactive TUI already did, and exec ... | head still ends quietly. One-shot codewhale exec no longer prints DeepSeek's raw <｜｜DSML｜｜ calls> tool-call markup as its answer: the markup is removed, and an answer that was only a tool call fails at once with the reason and a pointer to…",
           "The installation page is generated from docs/INSTALL.md, so the website and the guide can no longer disagree; broken anchors and unsafe links fail the build (#6450).",
           "codewhale config set refuses a value of the wrong type for a known setting (a word for an on/off switch, text for a number, a choice outside the list) instead of saving it (#6568, thanks @dajiaohuang).",
@@ -63,7 +64,7 @@ export const CHANGELOG: ChangelogRelease[] = [
           "\"Allow for this conversation\" records a grant for that tool and argument class instead of switching the whole thread to Full Access, so the call you just approved is no longer failed by a Permissions change. An approval also survives a Permissions change that only widens what is allowed, grants end when a thread is archived or deleted, and web.run open grants are scoped by host. Full Access covers MCP tools that declare themselves destructive in every host, including…",
           "web.run retries a refused page once with a browser user agent, and one site's failure no longer fails the whole call or drops its search results."
         ],
-        "itemCount": 21
+        "itemCount": 22
       },
       {
         "heading": "Removed",

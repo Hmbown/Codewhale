@@ -23,6 +23,7 @@ quieter, and Fleet runs can be checked before they spend anything.
 - **[@aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test ([#6581](https://github.com/Hmbown/Codewhale/pull/6581)).
 - **[@dajiaohuang](https://github.com/dajiaohuang)** — `codewhale config set` checks a known setting's value against its schema type before saving it ([#6568](https://github.com/Hmbown/Codewhale/pull/6568)).
 - **[@Water-Run](https://github.com/Water-Run)** — ingested namespaced model-only catalog entries so models present only in the canonical `models` map reach the offering list ([#6400](https://github.com/Hmbown/Codewhale/pull/6400)), and retired the blanket dead-code allowance with its unused feature stages, tightening the budget to match ([#6402](https://github.com/Hmbown/Codewhale/pull/6402)).
+- **[@SparkofSpike](https://github.com/SparkofSpike)** — let making room survive a provider request-body limit (HTTP 413) by shrinking, then replacing, inline images for that one summary pass ([#6642](https://github.com/Hmbown/Codewhale/pull/6642)).
 
 ### Added
 
@@ -56,7 +57,8 @@ quieter, and Fleet runs can be checked before they spend anything.
   re-encodes the conversation's inline images smaller and retries, says so in
   the status line while it does, and — if the request is still refused —
   replaces the images with text notes for that one summary pass. Session
-  history keeps the real images either way.
+  history keeps the real images either way
+  ([#6642](https://github.com/Hmbown/Codewhale/pull/6642), thanks @SparkofSpike).
 - `codewhale exec --auto` no longer exits 141 with no output when a child
   it writes to, such as a stdio MCP server, closes its pipe early. Headless
   exec now ignores SIGPIPE while it runs, as the interactive TUI already did,

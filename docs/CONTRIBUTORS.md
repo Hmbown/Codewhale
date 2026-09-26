@@ -37,6 +37,7 @@ notes, and relevant issue/PR comments.
 - **[aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test ([#6581](https://github.com/Hmbown/Codewhale/pull/6581)).
 - **[dajiaohuang](https://github.com/dajiaohuang)** — validated `config set` values against the settings schema ([#6568](https://github.com/Hmbown/Codewhale/pull/6568)).
 - **[Water-Run](https://github.com/Water-Run)** — ingested namespaced model-only catalog entries so models present only in the canonical `models` map reach the offering list ([#6400](https://github.com/Hmbown/Codewhale/pull/6400)), and retired the blanket dead-code allowance and its unused feature stages, tightening the budget to match ([#6402](https://github.com/Hmbown/Codewhale/pull/6402)).
+- **[Sh1Zuku / SparkofSpike](https://github.com/SparkofSpike)** — let making room survive a provider request-body limit (HTTP 413) by shrinking, then replacing, inline images for that one summary pass ([#6642](https://github.com/Hmbown/Codewhale/pull/6642)).
 
 </details>
 
