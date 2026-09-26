@@ -2012,6 +2012,8 @@
   "AgentFocusPlaceholder": "傳訊給 {agent} · Esc 返回主對話",
   "AgentFocusNoTranscript": "{agent} 尚無對話紀錄。工作者開始交流後會顯示於此。",
   "AgentFocusOmitted": "記憶體中的對話紀錄省略了較早的 {count} 則訊息。",
+  "AgentFocusResult": "結果",
+  "AgentFocusStopReason": "停止原因",
   "AgentFocusFollowUpDelivered": "已為 {agent} 排入佇列：它會在下一輪讀取此訊息。",
   "AgentFocusFollowUpQueued": "已為 {agent} 排入佇列",
   "AgentFocusFollowUpContinued": "{agent} 已完成；已在新分支（{target}）上繼續。此檢視現在跟隨該分支。",

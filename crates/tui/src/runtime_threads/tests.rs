@@ -9183,6 +9183,7 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
             for owner in [thread_id.clone(), foreign_id] {
                 let _ = tx_event
                     .send(EngineEvent::AgentSpawned {
+                        display_name: None,
                         owner_session_id: owner.clone(),
                         id: "worker_spawn".into(),
                         prompt: "private prompt".into(),
@@ -9221,6 +9222,8 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
                 ] {
                     let _ = tx_event
                         .send(EngineEvent::AgentComplete {
+                            // #6565: hosts name the agent the way the TUI does.
+                            display_name: (id == "worker_completed").then(|| "audit docs".into()),
                             owner_session_id: owner.clone(),
                             id: id.into(),
                             result: "Completed successfully".into(),
@@ -9297,6 +9300,26 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
             .unwrap()
             .contains("outcome unconfirmed")
     );
+    assert_eq!(workers[2].payload["agent_name"], "audit docs");
+    assert!(
+        workers[2].payload["item"]["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("Sub-agent audit docs completed")
+    );
+    let notices = manager.list_notices(&thread.id);
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice.detail == "audit docs finished"),
+        "{notices:?}"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice.detail == "worker_failed failed"),
+        "{notices:?}"
+    );
     assert!(
         manager
             .events_since(&foreign.id, None)?
@@ -9334,6 +9357,7 @@ async fn preturn_control_status_does_not_make_empty_turn_succeed() -> Result<()>
         if matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             let _ = tx_event
                 .send(EngineEvent::AgentComplete {
+                    display_name: None,
                     owner_session_id: thread_id,
                     id: "stale_agent".to_string(),
                     result: "stale completion".to_string(),
@@ -18299,6 +18323,7 @@ async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result
     harness
         .tx_event
         .send(EngineEvent::AgentComplete {
+            display_name: None,
             owner_session_id: thread.id.clone(),
             id: "agent_done".to_string(),
             result: "did the thing".to_string(),

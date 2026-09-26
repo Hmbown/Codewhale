@@ -13460,10 +13460,13 @@ impl RuntimeThreadManager {
                     worker_status,
                     parent_run_id,
                     spawn_depth,
+                    display_name,
                     ..
                 } if owner_session_id == thread_id => {
+                    // Hosts name the agent the way the TUI does (#6565).
+                    let name = display_name.as_deref().unwrap_or(&id);
                     let message = format!(
-                        "Sub-agent {id} spawned: {}",
+                        "Sub-agent {name} spawned: {}",
                         summarize_text(&prompt, SUMMARY_LIMIT)
                     );
                     let item = TurnItemRecord {
@@ -13486,7 +13489,7 @@ impl RuntimeThreadManager {
                         Some(&turn_id),
                         Some(&item.id),
                         "agent.spawned",
-                        json!({ "item": item, "agent_id": id,
+                        json!({ "item": item, "agent_id": id, "agent_name": display_name,
                             "worker_status": worker_status, "parent_run_id": parent_run_id,
                             "spawn_depth": spawn_depth }),
                     )
@@ -13536,12 +13539,14 @@ impl RuntimeThreadManager {
                     spawn_depth,
                     continuable,
                     usage,
+                    display_name,
                 } if owner_session_id == thread_id => {
                     let worker_status = outcome
                         .as_ref()
                         .map(crate::tools::subagent::subagent_status_name);
+                    let name = display_name.as_deref().unwrap_or(&id);
                     let message = format!(
-                        "Sub-agent {id} {}: {}",
+                        "Sub-agent {name} {}: {}",
                         worker_status.unwrap_or("settled (outcome unconfirmed)"),
                         summarize_text(&result, SUMMARY_LIMIT)
                     );
@@ -13565,7 +13570,7 @@ impl RuntimeThreadManager {
                         Some(&turn_id),
                         Some(&item.id),
                         "agent.completed",
-                        json!({ "item": item, "agent_id": id,
+                        json!({ "item": item, "agent_id": id, "agent_name": display_name,
                             "worker_status": worker_status, "parent_run_id": parent_run_id,
                             "spawn_depth": spawn_depth, "continuable": continuable,
                             "usage": usage }),
@@ -13578,9 +13583,18 @@ impl RuntimeThreadManager {
                         &turn_id,
                         &id,
                         format!(
-                            "sub-agent {} {}",
-                            id,
-                            worker_status.unwrap_or("settled (outcome unconfirmed)")
+                            "{name} {}",
+                            match outcome.as_ref() {
+                                Some(SubAgentStatus::Completed) => "finished",
+                                Some(
+                                    SubAgentStatus::Failed(_) | SubAgentStatus::BudgetExhausted,
+                                ) => "failed",
+                                Some(
+                                    SubAgentStatus::Cancelled | SubAgentStatus::Interrupted(_),
+                                ) => "stopped",
+                                Some(SubAgentStatus::Running) | None =>
+                                    "settled (outcome unconfirmed)",
+                            }
                         ),
                     );
                 }

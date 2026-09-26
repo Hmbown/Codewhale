@@ -3439,6 +3439,7 @@ pub(crate) async fn run_event_loop(
                         spawn_depth,
                         model,
                         route_source: _,
+                        display_name,
                     } if event_owner_is_active(
                         app.current_session_id.as_deref(),
                         &owner_session_id,
@@ -3450,6 +3451,9 @@ pub(crate) async fn run_event_loop(
                         let meta = app.agent_progress_meta.entry(id.clone()).or_default();
                         meta.parent_run_id = parent_run_id;
                         meta.spawn_depth = spawn_depth;
+                        // The engine's name for the child, before any snapshot
+                        // arrives, so the first label is already the right one.
+                        meta.display_name = display_name;
                         meta.current_activity = worker_status.map(|status| {
                             AgentCurrentActivity::bounded(
                                 status.into(),
@@ -3552,12 +3556,19 @@ pub(crate) async fn run_event_loop(
                         id,
                         result,
                         outcome,
+                        display_name,
                         ..
                     } if event_owner_is_active(
                         app.current_session_id.as_deref(),
                         &owner_session_id,
                     ) =>
                     {
+                        if display_name.is_some() {
+                            app.agent_progress_meta
+                                .entry(id.clone())
+                                .or_default()
+                                .display_name = display_name;
+                        }
                         let subagent_elapsed = app
                             .agent_activity_started_at
                             .or(app.turn_started_at)
@@ -3606,9 +3617,10 @@ pub(crate) async fn run_event_loop(
                                 notifications::settings(config)
                         {
                             let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
+                            let label = app.ensure_agent_label(&id);
                             let payload = notifications::subagent_terminal_payload(
                                 app.ui_locale,
-                                &id,
+                                &label,
                                 &result,
                                 terminal_status,
                                 include_summary,

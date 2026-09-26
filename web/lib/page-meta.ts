@@ -71,12 +71,12 @@ const OG_LOCALE: Record<string, string> = {
  * ```ts
  * export async function generateMetadata({ params }) {
  *   const { locale } = await params;
- *   const isZh = locale === "zh";
+ *   const t = getFaq(locale);
  *   return buildPageMetadata({
- *     path: "/install",
+ *     path: "/faq",
  *     locale,
- *     title: isZh ? "安装 · Codewhale" : "Install · Codewhale",
- *     description: isZh ? "…" : "…",
+ *     title: t.metaTitle,
+ *     description: t.metaDescription,
  *   });
  * }
  * ```

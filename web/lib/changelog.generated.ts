@@ -99,9 +99,10 @@ export const CHANGELOG: ChangelogRelease[] = [
           "A queued agent says why it is waiting, for example when launches are throttled after provider rate limits, and when its time budget ends (#6277).",
           "Stopping an agent that writes files keeps and names the work it had changed, as a budget stop already did (#5529).",
           "workflow(fleet:) runs Fleets saved from the Fleet UI, and finds workspace Fleets under .codewhale/fleets.",
-          "The runtime API can stop a delegated agent run from the desktop."
+          "The runtime API can stop a delegated agent run from the desktop.",
+          "A finished agent's answer is no longer cut off. Its row and its completion notification show the first sentence of its result instead of a ## Summary heading or its last tool, and opening the agent shows the whole result, or the full reason it stopped, even when no transcript was captured. Each agent also has one name: a workflow task's label or its dispatch name appears on the rows, the notification and the runtime API alike, never its internal id (#6565)."
         ],
-        "itemCount": 5
+        "itemCount": 6
       },
       {
         "heading": "Plugins",

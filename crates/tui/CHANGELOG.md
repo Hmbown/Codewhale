@@ -141,6 +141,12 @@ quieter, and Fleet runs can be checked before they spend anything.
   marked `[rlm_query incomplete: …]` instead of an empty string, its model
   calls appear in the parent turn's record, and its history is no longer
   trimmed ([#6511](https://github.com/Hmbown/Codewhale/issues/6511)).
+- Starting without a network connection no longer drops images you attach to a
+  model that accepts them. The offline model list lagged behind providers and
+  listed Claude and others as text-only; it can now only say a model takes
+  images, never that it refuses them, and a provider that does refuse gets one
+  resend without the image and a message saying so
+  ([#6396](https://github.com/Hmbown/Codewhale/issues/6396)).
 
 ### Removed
 
@@ -206,6 +212,13 @@ quieter, and Fleet runs can be checked before they spend anything.
 - `workflow(fleet:)` runs Fleets saved from the Fleet UI, and finds
   workspace Fleets under `.codewhale/fleets`.
 - The runtime API can stop a delegated agent run from the desktop.
+- A finished agent's answer is no longer cut off. Its row and its completion
+  notification show the first sentence of its result instead of a
+  `## Summary` heading or its last tool, and opening the agent shows the whole
+  result, or the full reason it stopped, even when no transcript was captured.
+  Each agent also has one name: a workflow task's label or its dispatch name
+  appears on the rows, the notification and the runtime API alike, never its
+  internal id ([#6565](https://github.com/Hmbown/Codewhale/issues/6565)).
 
 ### Plugins
 

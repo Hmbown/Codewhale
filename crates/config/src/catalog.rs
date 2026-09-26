@@ -136,6 +136,11 @@ pub struct CatalogOffering {
     /// Price authority stays separate when a layer changes only capabilities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_source: Option<CatalogSource>,
+    /// Who stated [`Self::modalities`], when a higher layer re-sourced the row
+    /// without restating them (a signed patch, a correction, or a provider
+    /// roster enriched from the seed). `None` means [`Self::source`] did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modalities_source: Option<CatalogSource>,
     /// Input/output modalities for this offering, when known. Carried as the
     /// raw Models.dev shape so a factual `text` vs `multimodal` label can be
     /// derived without guessing; `None` means the layer did not state it (an
@@ -167,6 +172,12 @@ impl CatalogOffering {
     #[must_use]
     pub fn pricing_source(&self) -> &CatalogSource {
         self.cost_source.as_ref().unwrap_or(&self.source)
+    }
+
+    /// The layer that stated this row's modalities.
+    #[must_use]
+    pub fn modalities_source(&self) -> &CatalogSource {
+        self.modalities_source.as_ref().unwrap_or(&self.source)
     }
 
     /// The provider id as a route newtype.
@@ -204,7 +215,15 @@ impl CatalogOffering {
                 .unwrap_or_default(),
             capabilities: crate::route::RouteCapabilities {
                 attachments: crate::route::CapabilityState::from_optional_bool(self.attachment),
-                image_input: crate::models_dev::image_input_support(self.modalities.as_ref()),
+                // The offline seed is stale by nature, so it may say an image
+                // is accepted but never that it is refused: a wrong refusal
+                // strips the user's images before sending, while a wrong
+                // `Unknown` costs one rejected request that the turn loop
+                // recovers from and reports (#6396).
+                image_input: crate::models_dev::image_input_support_for(
+                    self.modalities.as_ref(),
+                    matches!(self.modalities_source(), CatalogSource::Bundled),
+                ),
                 reasoning: crate::route::CapabilityState::from_optional_bool(self.reasoning),
                 native_tool_calls: crate::route::CapabilityState::from_optional_bool(
                     self.tool_call,
@@ -375,6 +394,7 @@ fn offerings_from_models_dev(
                 reasoning_options: model.reasoning_options.clone(),
                 source: source.clone(),
                 cost_source: None,
+                modalities_source: None,
             });
         }
     }
