@@ -95,12 +95,13 @@ export const CHANGELOG: ChangelogRelease[] = [
         "heading": "Fleet and agents",
         "items": [
           "codewhale fleet run <spec> --check runs every validation a real run would and stops there: nothing is created, launched or spent.",
-          "A queued agent says why it is waiting, for example when launches are throttled after provider rate limits, and when its time budget ends (#6277).",
+          "A queued agent says why it is waiting, for example when launches are throttled after provider rate limits, and when it stops waiting (#6277).",
+          "Read-only agents can run chained inspection commands (a leading cd, &&, ;, echo separators, 2>/dev/null), and a refused command now names the rule it broke and what to do instead. Durable Fleet workers accept the same read-only commands as in-session agents. An agent's time budget starts when it launches, and a queued agent that never gets a slot says it never started (#6015).",
           "Stopping an agent that writes files keeps and names the work it had changed, as a budget stop already did (#5529).",
           "workflow(fleet:) runs Fleets saved from the Fleet UI, and finds workspace Fleets under .codewhale/fleets.",
           "The runtime API can stop a delegated agent run from the desktop."
         ],
-        "itemCount": 5
+        "itemCount": 6
       },
       {
         "heading": "Plugins",

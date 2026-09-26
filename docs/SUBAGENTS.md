@@ -272,6 +272,38 @@ change inside a worker's broad scope is not enough to attribute that write to
 the worker. `path:LINE` and `path:LINE-LINE` evidence citations, including
 sentence punctuation and Markdown links, never count as edit claims.
 
+### Read-only shell commands
+
+Scout, reviewer and planner agents, agents narrowed with
+`write_authority: "read_only"`, and durable Fleet workers with a read-only
+shell grant all judge `bash` calls by the same read-only grammar:
+
+- inspection programs: `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `which`,
+  `stat`, `file`, `du`, `df`, `grep`, `rg`, `fd`, `find` without `-exec` or
+  `-delete`, and `sed -n <range>p`;
+- `git status`, `log`, `diff`, `show`, `ls-files`, `blame` and `grep`,
+  optionally after `-C <dir>` or `--no-pager`;
+- the text filters `sort`, `uniq`, `cut`, `tr` and `comm`, and literal
+  `echo`/`printf`;
+- with a network grant, `gh` issue/pr/release/repo/run/workflow view or list
+  reads and `npm view`.
+
+Admitted commands can be joined with `|`, `&&`, `||` and `;`, for example
+`git diff HEAD && echo '=== FILES ===' && ls -la`. A leading `cd <dir> &&`
+sets the working directory, and that directory must be inside the workspace.
+The only redirects are `2>/dev/null`, `>/dev/null` and `2>&1`. Quoted text is
+data, so `rg 'a && b' src` is one search. Other redirects, `$` or backtick
+expansion, subshells, backgrounding, inline environment assignments, and any
+other program (such as `python`, `awk`, `jq` or `cargo`) are refused. Options
+and path operands are still checked, and each `gh` or `npm` read needs the
+network grant even inside a pipeline.
+
+A refused command comes back to the agent as an error result that names the
+rule, for example
+`[shell.readonly.command] program: `touch` is not a read-only inspection command`,
+followed by what the agent can do instead. The agent keeps working, and
+repeated refusals without progress end it as failed rather than completed.
+
 ### Reading beside a writer
 
 Read-only tools and classifier-approved shell reads can run while a peer owns
