@@ -26,6 +26,136 @@ fn sniffs_every_accepted_format_from_magic_bytes() {
     );
 }
 
+/// Noise defeats compression, so the shrink ladder has to re-encode for real.
+fn noise_payload(width: u32, height: u32) -> Vec<u8> {
+    use image::ImageEncoder as _;
+    let mut pixels = image::RgbImage::new(width, height);
+    for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+        *pixel = image::Rgb([
+            (x.wrapping_mul(31) ^ y.wrapping_mul(17)) as u8,
+            (x.wrapping_mul(7) ^ y.wrapping_mul(29)) as u8,
+            (x.wrapping_add(y).wrapping_mul(13)) as u8,
+        ]);
+    }
+    let mut bytes = Vec::new();
+    image::codecs::png::PngEncoder::new_with_quality(
+        &mut bytes,
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::NoFilter,
+    )
+    .write_image(
+        pixels.as_raw(),
+        width,
+        height,
+        image::ExtendedColorType::Rgb8,
+    )
+    .expect("encode fixture png");
+    bytes
+}
+
+fn image_blocks_fixture() -> Vec<codewhale_models::Message> {
+    let payload = STANDARD.encode(noise_payload(320, 320));
+    vec![
+        codewhale_models::Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "look at this".to_string(),
+                    cache_control: None,
+                },
+                ContentBlock::ImageUrl {
+                    image_url: ImageUrlContent {
+                        url: format!("data:image/png;base64,{payload}"),
+                    },
+                },
+            ],
+        },
+        codewhale_models::Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "Read image file [image/png]".to_string(),
+                is_error: None,
+                content_blocks: Some(vec![serde_json::json!({
+                    "type": "image",
+                    "mime_type": "image/png",
+                    "data": payload,
+                })]),
+            }],
+        },
+    ]
+}
+
+#[test]
+fn compaction_shrink_rewrites_both_image_carriers_under_budget() {
+    let budget = 64 * 1024;
+    let mut messages = image_blocks_fixture();
+    let outcome = shrink_images_for_request_with_budget(&mut messages, budget);
+    assert_eq!(outcome.images, 2, "both carriers are rewritten");
+    assert!(outcome.bytes_after < outcome.bytes_before);
+
+    let ContentBlock::ImageUrl { image_url } = &messages[0].content[1] else {
+        panic!("image block survives the shrink");
+    };
+    let (mime, payload) = parse_data_url(&image_url.url).expect("data url");
+    assert!(matches!(mime, "image/png" | "image/jpeg"), "{mime}");
+    let bytes = STANDARD.decode(payload).expect("base64");
+    assert!(bytes.len() <= budget, "{} <= {budget}", bytes.len());
+    assert_eq!(sniff_media_type(&bytes), Some(mime));
+
+    let ContentBlock::ToolResult { content_blocks, .. } = &messages[1].content[0] else {
+        panic!("tool result survives the shrink");
+    };
+    let block = &content_blocks.as_ref().expect("blocks")[0];
+    assert_eq!(block["type"], "image");
+    let nested = STANDARD
+        .decode(block["data"].as_str().expect("data"))
+        .expect("nested base64");
+    assert!(nested.len() <= budget);
+    assert_eq!(
+        sniff_media_type(&nested),
+        block["mime_type"].as_str(),
+        "the mime must match the rewritten bytes"
+    );
+}
+
+#[test]
+fn compaction_shrink_leaves_an_under_budget_history_untouched() {
+    let mut messages = image_blocks_fixture();
+    let before = messages.clone();
+    let outcome = shrink_images_for_request_with_budget(&mut messages, 32 * 1024 * 1024);
+    assert_eq!(outcome, ShrunkInlineImages::default());
+    assert_eq!(messages, before, "a fitting request is never rewritten");
+}
+
+#[test]
+fn compaction_placeholder_keeps_the_image_visible_as_text() {
+    let mut messages = image_blocks_fixture();
+    let replaced = replace_images_with_placeholders(
+        &mut messages,
+        "the summary request exceeded the provider's request-body limit (HTTP 413)",
+    );
+    assert_eq!(replaced, 2);
+
+    let ContentBlock::Text { text, .. } = &messages[0].content[1] else {
+        panic!("image_url becomes a note");
+    };
+    assert!(text.contains("omitted from this summary pass"), "{text}");
+    assert!(text.contains("do not describe"), "{text}");
+
+    let ContentBlock::ToolResult {
+        content,
+        content_blocks,
+        ..
+    } = &messages[1].content[0]
+    else {
+        panic!("tool result survives");
+    };
+    assert!(content_blocks.is_none(), "no base64 may remain");
+    assert!(content.contains("1 image(s)"), "{content}");
+    assert!(content.contains("Read image file [image/png]"), "{content}");
+}
+
 #[test]
 fn sniffing_ignores_the_extension_and_believes_the_bytes() {
     // A JPEG named .png must be declared image/jpeg, or the provider

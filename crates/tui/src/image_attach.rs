@@ -46,7 +46,10 @@ use anyhow::{Result, bail};
 use codewhale_protocol::runtime::{
     MAX_RUNTIME_IMAGE_BYTES, MAX_RUNTIME_IMAGE_TOTAL_BYTES, MAX_RUNTIME_IMAGES, RuntimeImageInput,
 };
-use image::{DynamicImage, ImageReader, Limits};
+use image::codecs::jpeg::JpegEncoder;
+use image::codecs::png::{CompressionType, FilterType as PngFilter, PngEncoder};
+use image::imageops::FilterType;
+use image::{DynamicImage, ExtendedColorType, GenericImageView, ImageEncoder, ImageReader, Limits};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -260,7 +263,7 @@ impl std::fmt::Display for ImageAttachError {
 
 impl std::error::Error for ImageAttachError {}
 
-fn human_bytes(bytes: usize) -> String {
+pub(crate) fn human_bytes(bytes: usize) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     } else if bytes >= 1024 {
@@ -766,6 +769,334 @@ pub fn strip_images_when_unsupported(
         }
     }
     stripped
+}
+
+/// Total inline-image byte budget for one compaction retry that follows a
+/// provider body-size rejection.
+///
+/// An HTTP 413 boundary caps the request *body*, and the token-side context
+/// budget that governs compaction cannot see it: an image that costs a flat
+/// token estimate can still spend megabytes of base64. Nothing consults this
+/// budget on the happy path — it exists only to recover a summary call that
+/// has already been refused, where the cheapest useful move is to re-encode
+/// the inline images under a cap at or below the smallest provider body limits
+/// seen in practice and retry.
+pub(crate) const COMPACTION_IMAGE_TOTAL_BUDGET_BYTES: usize = 2 * 1024 * 1024;
+
+/// Smallest per-image share of that budget, so an image-heavy session still
+/// re-encodes each image instead of dividing the budget down to nothing.
+const COMPACTION_IMAGE_MIN_BUDGET_BYTES: usize = 96 * 1024;
+
+/// Longest edge a re-encoded inline image keeps, in pixels.
+const COMPACTION_IMAGE_MAX_EDGE: u32 = 1024;
+
+/// Longest edge the shrink ladder descends to before giving up on an image.
+const COMPACTION_IMAGE_MIN_EDGE: u32 = 128;
+
+/// JPEG quality for re-encoded images that carry no meaningful alpha.
+const COMPACTION_IMAGE_JPEG_QUALITY: u8 = 80;
+
+/// What one inline-image shrink pass changed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShrunkInlineImages {
+    /// Images that were re-encoded smaller.
+    pub images: usize,
+    /// Decoded bytes of those images before the pass.
+    pub bytes_before: usize,
+    /// Decoded bytes of those images after the pass.
+    pub bytes_after: usize,
+}
+
+/// Re-encode every inline image in `messages` under a total byte budget.
+///
+/// Covers both carriers an outbound request can hold: an `image_url` block,
+/// and the stored tool-result shape (`{"type":"image","mime_type","data"}`)
+/// that the wire projection reads back out via
+/// [`provider_tool_result_image_refs`].
+///
+/// `images == 0` means nothing was rewritten — there were no inline images,
+/// or each was already under its share of the budget — so a caller that is
+/// still looking at a body-size rejection must climb to the next rung rather
+/// than resend the same bytes.
+pub(crate) fn shrink_images_for_request(
+    messages: &mut [codewhale_models::Message],
+) -> ShrunkInlineImages {
+    shrink_images_for_request_with_budget(messages, COMPACTION_IMAGE_TOTAL_BUDGET_BYTES)
+}
+
+/// Budget-parameterized core of [`shrink_images_for_request`], kept separate
+/// so tests can drive it with small budgets and small images.
+pub(crate) fn shrink_images_for_request_with_budget(
+    messages: &mut [codewhale_models::Message],
+    budget: usize,
+) -> ShrunkInlineImages {
+    let sizes = inline_image_sizes(messages);
+    let total: usize = sizes.iter().sum();
+    if sizes.is_empty() || total <= budget {
+        return ShrunkInlineImages::default();
+    }
+    let per_image = (budget / sizes.len()).max(COMPACTION_IMAGE_MIN_BUDGET_BYTES);
+    let mut outcome = ShrunkInlineImages::default();
+    for message in messages.iter_mut() {
+        for block in &mut message.content {
+            match block {
+                ContentBlock::ImageUrl { image_url } => {
+                    if let Some((url, shrunk)) = shrink_data_url(&image_url.url, per_image) {
+                        image_url.url = url;
+                        outcome.images += 1;
+                        outcome.bytes_before += shrunk.before;
+                        outcome.bytes_after += shrunk.after;
+                    }
+                }
+                ContentBlock::ToolResult { content_blocks, .. } => {
+                    let Some(blocks) = content_blocks.as_mut() else {
+                        continue;
+                    };
+                    for value in blocks.iter_mut() {
+                        if let Some(shrunk) = shrink_stored_tool_image(value, per_image) {
+                            outcome.images += 1;
+                            outcome.bytes_before += shrunk.before;
+                            outcome.bytes_after += shrunk.after;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    outcome
+}
+
+/// Replace every inline image with a text note that keeps the image's
+/// existence visible without its bytes.
+///
+/// This is the last rung of the request-size ladder. A summary pass that still
+/// exceeds the provider's body cap after re-encoding has nothing left to give
+/// but the pixels; the note keeps the fact that a tool or the user supplied an
+/// image — and how large it was — so the handoff can still say so instead of
+/// silently dropping the detail. Session history keeps the real image; this
+/// only rewrites the outbound copy.
+///
+/// Returns the number of images replaced.
+pub(crate) fn replace_images_with_placeholders(
+    messages: &mut [codewhale_models::Message],
+    reason: &str,
+) -> usize {
+    let mut replaced = 0;
+    for message in messages.iter_mut() {
+        for block in &mut message.content {
+            match block {
+                ContentBlock::ImageUrl { image_url } => {
+                    let bytes = parse_data_url(&image_url.url)
+                        .map(|(_, payload)| decoded_len_estimate(payload));
+                    *block = ContentBlock::Text {
+                        text: image_placeholder_note(1, bytes, reason),
+                        cache_control: None,
+                    };
+                    replaced += 1;
+                }
+                ContentBlock::ToolResult {
+                    content,
+                    content_blocks,
+                    ..
+                } => {
+                    let Some(blocks) = content_blocks.as_ref() else {
+                        continue;
+                    };
+                    let mut count = 0usize;
+                    let mut bytes = 0usize;
+                    for value in blocks {
+                        if let Some((_, payload)) = stored_tool_image_payload(value) {
+                            count += 1;
+                            bytes += decoded_len_estimate(payload);
+                        }
+                    }
+                    if count == 0 {
+                        continue;
+                    }
+                    // Same shape as `strip_images_when_unsupported`: the
+                    // wire projection reads tool images back out of
+                    // `content_blocks` and would count a text block placed
+                    // there as an omitted image.
+                    *content_blocks = None;
+                    *content = format!(
+                        "{content}\n{}",
+                        image_placeholder_note(count, Some(bytes), reason)
+                    );
+                    replaced += count;
+                }
+                _ => {}
+            }
+        }
+    }
+    replaced
+}
+
+/// The in-band note that replaces an inline image byte payload for one
+/// summary pass. It tells the summarizer what was there and what to do
+/// about it (refer to it as an image; never invent its contents), rather than
+/// leaving a silent gap.
+fn image_placeholder_note(count: usize, bytes: Option<usize>, reason: &str) -> String {
+    let size = bytes.map_or(String::new(), |bytes| format!(" (~{})", human_bytes(bytes)));
+    format!(
+        "[{count} image(s){size} omitted from this summary pass: {reason}. \
+         The image(s) remain in the session. Refer to them only as images the \
+         conversation included; do not describe or guess what they showed.]"
+    )
+}
+
+/// Base64 length to decoded length: four characters carry three bytes.
+fn decoded_len_estimate(payload: &str) -> usize {
+    payload.len() / 4 * 3
+}
+
+/// Decoded-size estimates for every inline image, in request order.
+fn inline_image_sizes(messages: &[codewhale_models::Message]) -> Vec<usize> {
+    let mut sizes = Vec::new();
+    for message in messages {
+        for block in &message.content {
+            match block {
+                ContentBlock::ImageUrl { image_url } => {
+                    if let Some((_, payload)) = parse_data_url(&image_url.url) {
+                        sizes.push(decoded_len_estimate(payload));
+                    }
+                }
+                ContentBlock::ToolResult { content_blocks, .. } => {
+                    if let Some(blocks) = content_blocks.as_ref() {
+                        for value in blocks {
+                            if let Some((_, payload)) = stored_tool_image_payload(value) {
+                                sizes.push(decoded_len_estimate(payload));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    sizes
+}
+
+/// The `(mime_type, data)` pair of a stored tool-result image block, if the
+/// block is one.
+fn stored_tool_image_payload(value: &serde_json::Value) -> Option<(&str, &str)> {
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("image") {
+        return None;
+    }
+    let mime_type = value.get("mime_type").and_then(serde_json::Value::as_str)?;
+    let data = value.get("data").and_then(serde_json::Value::as_str)?;
+    Some((mime_type, data))
+}
+
+/// One rewritten image, in decoded bytes.
+#[derive(Debug, Clone, Copy)]
+struct ShrunkPayload {
+    before: usize,
+    after: usize,
+}
+
+/// Re-encode a `data:` URL image under `budget`, returning the replacement
+/// URL plus the byte delta.
+fn shrink_data_url(url: &str, budget: usize) -> Option<(String, ShrunkPayload)> {
+    let (_, payload) = parse_data_url(url)?;
+    let (mime, data, shrunk) = shrink_base64_image(payload, budget)?;
+    Some((format!("data:{mime};base64,{data}"), shrunk))
+}
+
+/// Re-encode one stored tool-result image block in place.
+fn shrink_stored_tool_image(value: &mut serde_json::Value, budget: usize) -> Option<ShrunkPayload> {
+    let (_, payload) = stored_tool_image_payload(value)?;
+    let (mime, data, shrunk) = shrink_base64_image(payload, budget)?;
+    let object = value.as_object_mut()?;
+    object.insert("mime_type".to_string(), serde_json::Value::String(mime));
+    object.insert("data".to_string(), serde_json::Value::String(data));
+    Some(shrunk)
+}
+
+/// Re-encode one base64 inline image to fit `budget` decoded bytes.
+///
+/// `None` means the image already fits, cannot be decoded, or the re-encode
+/// came back no smaller — so a caller's "did anything change" tally stays
+/// honest about what a retry would actually send.
+fn shrink_base64_image(data: &str, budget: usize) -> Option<(String, String, ShrunkPayload)> {
+    let bytes = STANDARD.decode(data).ok()?;
+    if bytes.len() <= budget {
+        return None;
+    }
+    let (decoded, _, _) = decode_and_guard_image(&bytes).ok()?;
+    let (mime, encoded) = reencode_within_budget(decoded, budget)?;
+    if encoded.len() >= bytes.len() {
+        return None;
+    }
+    Some((
+        mime.to_string(),
+        STANDARD.encode(&encoded),
+        ShrunkPayload {
+            before: bytes.len(),
+            after: encoded.len(),
+        },
+    ))
+}
+
+/// Encode `image` down a short ladder until it fits `budget`.
+///
+/// Rung order: longest edge capped at [`COMPACTION_IMAGE_MAX_EDGE`], then
+/// halved until [`COMPACTION_IMAGE_MIN_EDGE`]. Alpha-bearing images stay PNG
+/// (JPEG would flatten transparency); everything else becomes JPEG, which is
+/// what actually makes screenshots and artwork small. The smallest rung wins
+/// even when nothing fits `budget`, because a smaller-than-before payload is
+/// still progress for the retry.
+fn reencode_within_budget(image: DynamicImage, budget: usize) -> Option<(&'static str, Vec<u8>)> {
+    let mut current = image;
+    let (mut width, mut height) = current.dimensions();
+    if width.max(height) > COMPACTION_IMAGE_MAX_EDGE {
+        let scale = f64::from(COMPACTION_IMAGE_MAX_EDGE) / f64::from(width.max(height));
+        let scaled_width = ((f64::from(width) * scale).round() as u32).max(1);
+        let scaled_height = ((f64::from(height) * scale).round() as u32).max(1);
+        current = current.resize(scaled_width, scaled_height, FilterType::Lanczos3);
+        (width, height) = current.dimensions();
+    }
+    let mut smallest: Option<(&'static str, Vec<u8>)> = None;
+    loop {
+        if let Some(candidate) = encode_inline_image(&current)
+            && smallest
+                .as_ref()
+                .is_none_or(|(_, best)| candidate.1.len() < best.len())
+        {
+            smallest = Some(candidate);
+        }
+        if smallest
+            .as_ref()
+            .is_some_and(|(_, bytes)| bytes.len() <= budget)
+        {
+            break;
+        }
+        if width.max(height) <= COMPACTION_IMAGE_MIN_EDGE {
+            break;
+        }
+        (width, height) = ((width / 2).max(1), (height / 2).max(1));
+        current = current.resize(width, height, FilterType::Lanczos3);
+    }
+    smallest
+}
+
+/// One encoder pass: PNG when alpha matters, JPEG otherwise.
+fn encode_inline_image(image: &DynamicImage) -> Option<(&'static str, Vec<u8>)> {
+    let (width, height) = image.dimensions();
+    let mut bytes = Vec::new();
+    if image.color().has_alpha() {
+        let rgba = image.to_rgba8();
+        PngEncoder::new_with_quality(&mut bytes, CompressionType::Best, PngFilter::Adaptive)
+            .write_image(rgba.as_raw(), width, height, ExtendedColorType::Rgba8)
+            .ok()?;
+        Some(("image/png", bytes))
+    } else {
+        let rgb = image.to_rgb8();
+        JpegEncoder::new_with_quality(&mut bytes, COMPACTION_IMAGE_JPEG_QUALITY)
+            .write_image(rgb.as_raw(), width, height, ExtendedColorType::Rgb8)
+            .ok()?;
+        Some(("image/jpeg", bytes))
+    }
 }
 
 /// Render dropped-attachment notices as a block the model will read.

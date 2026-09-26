@@ -3,6 +3,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::DEFAULT_TEXT_MODEL;
@@ -65,9 +66,20 @@ pub struct CompactionConfig {
     pub retained_user_message_tokens: usize,
 }
 
+/// Host callback for user-visible progress during a compaction pass.
+///
+/// Compaction runs inside the engine's provider boundary, where the engine
+/// owns the only channel that reaches the person. Injecting a sink lets a
+/// downgrade (re-encoding images after an HTTP 413, say) say what it is doing
+/// while it is doing it, instead of surfacing only when the pass ends.
+pub trait CompactionNoticeSink: Send + Sync + std::fmt::Debug {
+    /// Deliver one already-rendered, user-visible sentence.
+    fn notice(&self, message: String);
+}
+
 /// Host-prepared configuration carried from compaction eligibility through
 /// the replacement-history commit.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub struct PreparedCompactionEnvelope {
     pub config: CompactionConfig,
     /// Durable handoff owner; set by the engine, never added to the stable prefix.
@@ -80,6 +92,33 @@ pub struct PreparedCompactionEnvelope {
     /// request that omits it shares no cacheable prefix with the turn it
     /// summarizes and re-bills the whole history uncached.
     pub reasoning_effort: Option<String>,
+    /// User-visible progress sink supplied by the host that owns the run
+    /// (the interactive engine, typically). `None` keeps every notice in the
+    /// log only — the pass itself never depends on it.
+    pub notice_sink: Option<Arc<dyn CompactionNoticeSink>>,
+}
+
+impl std::fmt::Debug for PreparedCompactionEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedCompactionEnvelope")
+            .field("config", &self.config)
+            .field("session_id", &self.session_id)
+            .field("tools", &self.tools)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("notice_sink", &self.notice_sink.as_ref().map(|_| "<sink>"))
+            .finish()
+    }
+}
+
+impl PartialEq for PreparedCompactionEnvelope {
+    /// The notice sink is host plumbing, not envelope content: two passes over
+    /// the same config are equal whether or not their host delivers notices.
+    fn eq(&self, other: &Self) -> bool {
+        self.config == other.config
+            && self.session_id == other.session_id
+            && self.tools == other.tools
+            && self.reasoning_effort == other.reasoning_effort
+    }
 }
 
 impl PreparedCompactionEnvelope {
@@ -90,6 +129,7 @@ impl PreparedCompactionEnvelope {
             session_id: None,
             tools: None,
             reasoning_effort: None,
+            notice_sink: None,
         }
     }
 }
@@ -1228,6 +1268,7 @@ pub async fn compact_messages_safe(
             system_prompt,
             prepared.tools.as_deref(),
             prepared.reasoning_effort.as_deref(),
+            prepared.notice_sink.as_deref(),
             &mut quality_retries,
             invocation_usage,
         )
@@ -1391,6 +1432,7 @@ async fn compact_messages(
         None,
         None,
         None,
+        None,
         &mut quality_retries,
         &mut invocation_usage,
     )
@@ -1405,6 +1447,7 @@ async fn compact_messages_with_metadata(
     system_prompt: Option<&SystemPrompt>,
     tools: Option<&[Tool]>,
     reasoning_effort: Option<&str>,
+    notice_sink: Option<&dyn CompactionNoticeSink>,
     quality_retries: &mut u32,
     invocation_usage: &mut Usage,
 ) -> Result<(Vec<Message>, Option<SystemPrompt>, CompactionCoverage)> {
@@ -1419,6 +1462,7 @@ async fn compact_messages_with_metadata(
         system_prompt,
         tools,
         reasoning_effort,
+        notice_sink,
         quality_retries,
         invocation_usage,
     )
@@ -1629,6 +1673,7 @@ async fn create_summary(
     system_prompt: Option<&SystemPrompt>,
     tools: Option<&[Tool]>,
     reasoning_effort: Option<&str>,
+    notice_sink: Option<&dyn CompactionNoticeSink>,
     quality_retries: &mut u32,
     invocation_usage: &mut Usage,
 ) -> Result<String> {
@@ -1658,6 +1703,12 @@ async fn create_summary(
     });
 
     let mut quality_retry_used = false;
+    // Request-size ladder: an HTTP 413 caps the request *body*, which the
+    // token-side budget cannot predict (a flat per-image token estimate can
+    // hide megabytes of base64). A refused summary call gets two byte-side
+    // downgrades before it fails — re-encode the inline images smaller, then
+    // replace them with text notes — each followed by exactly one retry.
+    let mut size_ladder = RequestSizeLadder::Start;
     loop {
         // Codex compaction is a normal model generation over the existing
         // cached prefix. Do the same here: the resolved route decides how
@@ -1678,7 +1729,14 @@ async fn create_summary(
         let cost_scope = crate::cost_status::scope_token();
         let response = match client.create_message(request).await {
             Ok(response) => response,
-            Err(err) if is_context_window_error(&err) && request_messages.len() > 2 => {
+            // A byte-side size rejection can also read like a length problem
+            // (gateway HTML pages carry their own wording); the size ladder
+            // owns it, not the drop-oldest ladder.
+            Err(err)
+                if !is_request_too_large_error(&err)
+                    && is_context_window_error(&err)
+                    && request_messages.len() > 2 =>
+            {
                 logging::warn(format!(
                     "Compaction summary input over the context window ({err}); \
                      dropping the oldest history item and retrying"
@@ -1686,6 +1744,50 @@ async fn create_summary(
                 drop_oldest_history_messages(&mut request_messages);
                 continue;
             }
+            Err(err) if is_request_too_large_error(&err) => match size_ladder {
+                RequestSizeLadder::Start => {
+                    let shrunk =
+                        crate::image_attach::shrink_images_for_request(&mut request_messages);
+                    if shrunk.images == 0 {
+                        return Err(err.context(
+                            "The summary request exceeded the provider's request-body limit and the history carries no inline images to re-encode",
+                        ));
+                    }
+                    size_ladder = RequestSizeLadder::ImagesShrunk;
+                    let message = format!(
+                        "Making room exceeded the provider's request-body limit (HTTP 413); re-encoded {} inline image(s) smaller ({} to {}) and is retrying the summary.",
+                        shrunk.images,
+                        crate::image_attach::human_bytes(shrunk.bytes_before),
+                        crate::image_attach::human_bytes(shrunk.bytes_after),
+                    );
+                    logging::warn(&message);
+                    deliver_compaction_notice(notice_sink, message);
+                    continue;
+                }
+                RequestSizeLadder::ImagesShrunk => {
+                    let replaced = crate::image_attach::replace_images_with_placeholders(
+                        &mut request_messages,
+                        "the summary request exceeded the provider's request-body limit (HTTP 413)",
+                    );
+                    if replaced == 0 {
+                        return Err(err.context(
+                            "The summary request still exceeded the provider's request-body limit and no inline images were left to replace",
+                        ));
+                    }
+                    size_ladder = RequestSizeLadder::ImagesReplaced;
+                    let message = format!(
+                        "Making room still exceeded the provider's request-body limit; replaced {replaced} inline image(s) with text notes for this summary pass and is retrying.",
+                    );
+                    logging::warn(&message);
+                    deliver_compaction_notice(notice_sink, message);
+                    continue;
+                }
+                RequestSizeLadder::ImagesReplaced => {
+                    return Err(err.context(
+                        "The summary request exceeded the provider's request-body limit even after re-encoding and then replacing every inline image",
+                    ));
+                }
+            },
             Err(err) => return Err(err),
         };
 
@@ -1768,6 +1870,47 @@ no replacement checkpoint was committed",
         }
 
         return Ok(summary);
+    }
+}
+
+/// How far the request-size ladder for one summary call has descended.
+///
+/// The ladder exists because HTTP 413 rejects the request *body* by bytes,
+/// which the token-side context budget that governs compaction cannot see.
+/// Each rung is one retry: re-encode the inline images under a byte budget,
+/// then replace them with text notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestSizeLadder {
+    /// No size downgrade applied yet.
+    Start,
+    /// Inline images were re-encoded smaller.
+    ImagesShrunk,
+    /// Inline images were replaced with text notes.
+    ImagesReplaced,
+}
+
+/// Whether the provider refused the request body for size (HTTP 413 and its
+/// common wordings). A smaller payload can succeed where this one did not,
+/// which is exactly what the request-size ladder trades on.
+///
+/// Walks the whole error chain: the rejection may be stated by a fronting
+/// gateway (an HTML page from openresty reading "413 Request Entity Too
+/// Large") and then wrapped again by the client's own error text, so the
+/// top-level message alone is not reliable.
+fn is_request_too_large_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        let lower = cause.to_string().to_lowercase();
+        lower.contains("http 413")
+            || lower.contains("payload too large")
+            || lower.contains("request entity too large")
+            || lower.contains("length limit exceeded")
+    })
+}
+
+/// Forward one user-visible progress sentence, when the host supplied a sink.
+fn deliver_compaction_notice(sink: Option<&dyn CompactionNoticeSink>, message: String) {
+    if let Some(sink) = sink {
+        sink.notice(message);
     }
 }
 
@@ -2149,6 +2292,304 @@ mod tests {
     const FIXED_SUMMARY: &str = "1. Primary request and intent — migrate the session store. \
         2. Key technical concepts — sqlite. 7. Pending tasks — finish the fixed clock. \
         8. Current work — rerunning the session tests.";
+
+    /// A real PNG whose bytes are worth shrinking. Noise defeats compression,
+    /// which is the point: the shrink ladder must actually re-encode.
+    fn noisy_png_bytes(width: u32, height: u32) -> Vec<u8> {
+        use image::ImageEncoder as _;
+        let mut pixels = image::RgbImage::new(width, height);
+        for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                (x.wrapping_mul(31) ^ y.wrapping_mul(17)) as u8,
+                (x.wrapping_mul(7) ^ y.wrapping_mul(29)) as u8,
+                (x.wrapping_add(y).wrapping_mul(13)) as u8,
+            ]);
+        }
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new_with_quality(
+            &mut bytes,
+            image::codecs::png::CompressionType::Fast,
+            image::codecs::png::FilterType::NoFilter,
+        )
+        .write_image(
+            pixels.as_raw(),
+            width,
+            height,
+            image::ExtendedColorType::Rgb8,
+        )
+        .expect("encode fixture png");
+        bytes
+    }
+
+    fn png_data_url(width: u32, height: u32) -> String {
+        use base64::Engine as _;
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(noisy_png_bytes(width, height))
+        )
+    }
+
+    fn user_image_message(data_url: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "look at this screenshot".to_string(),
+                    cache_control: None,
+                },
+                ContentBlock::ImageUrl {
+                    image_url: ImageUrlContent {
+                        url: data_url.to_string(),
+                    },
+                },
+            ],
+        }
+    }
+
+    /// Total inline-image URL bytes a request carries, the byte side an HTTP
+    /// 413 boundary actually measures.
+    fn inline_image_bytes(request: &MessageRequest) -> usize {
+        request
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .map(|block| match block {
+                ContentBlock::ImageUrl { image_url } => image_url.url.len(),
+                ContentBlock::ToolResult { content_blocks, .. } => {
+                    content_blocks.as_ref().map_or(0, |blocks| {
+                        blocks.iter().fold(0, |sum, block| {
+                            let nested = block
+                                .get("data")
+                                .and_then(serde_json::Value::as_str)
+                                .map_or(0, str::len);
+                            sum + nested
+                        })
+                    })
+                }
+                _ => 0,
+            })
+            .sum()
+    }
+
+    fn summary_content() -> Vec<ContentBlock> {
+        vec![ContentBlock::Text {
+            text: "1. Primary request: keep working on the session store. \
+                   7. Pending: rerun the tests."
+                .to_string(),
+            cache_control: None,
+        }]
+    }
+
+    fn request_body_413() -> anyhow::Error {
+        anyhow::anyhow!(
+            "LLM error: HTTP 413: Failed to buffer the request body: length limit exceeded"
+        )
+    }
+
+    /// The same boundary stated by a fronting gateway (openresty) instead of
+    /// the API's own body reader. Reported on 2026-09-26; the ladder must
+    /// treat it as the same byte-side rejection.
+    fn request_body_413_html_gateway() -> anyhow::Error {
+        anyhow::anyhow!(
+            "LLM error: HTTP 413: DeepSeek API returned an HTML error page (HTTP 413): \
+             413 Request Entity Too Large 413 Request Entity Too Large openresty"
+        )
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingNoticeSink {
+        messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingNoticeSink {
+        fn messages(&self) -> Vec<String> {
+            self.messages.lock().expect("notice sink").clone()
+        }
+    }
+
+    impl CompactionNoticeSink for RecordingNoticeSink {
+        fn notice(&self, message: String) {
+            self.messages.lock().expect("notice sink").push(message);
+        }
+    }
+
+    /// A 900x900 noise PNG exceeds the 2 MiB inline-image budget, so the
+    /// ladder must actually rewrite it.
+    fn body_413_retry_envelope(
+        sink: std::sync::Arc<RecordingNoticeSink>,
+    ) -> PreparedCompactionEnvelope {
+        let mut envelope = prepared(&CompactionConfig {
+            enabled: false,
+            ..CompactionConfig::default()
+        });
+        envelope.notice_sink = Some(sink);
+        envelope
+    }
+
+    #[tokio::test]
+    async fn request_body_413_reencodes_images_smaller_and_retries() {
+        let _environment = crate::test_support::lock_test_env();
+        let messages = vec![
+            msg("user", "context before the screenshots"),
+            user_image_message(&png_data_url(900, 900)),
+        ];
+        let client = ScriptedSummaryClient::with_outcomes(vec![
+            Err(request_body_413()),
+            Ok(summary_content()),
+        ]);
+        let sink = std::sync::Arc::new(RecordingNoticeSink::default());
+        let envelope = body_413_retry_envelope(sink.clone());
+        let mut usage = Usage::default();
+
+        let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
+        assert!(
+            result.is_ok(),
+            "the retry after shrinking must succeed: {result:?}"
+        );
+
+        let requests = client.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 2, "one rejection, one retry");
+        let first = inline_image_bytes(&requests[0]);
+        let second = inline_image_bytes(&requests[1]);
+        assert!(first > 0, "the fixture must carry the image");
+        assert!(
+            second > 0 && second < first,
+            "the retry must carry smaller image bytes ({second} < {first})"
+        );
+        let notices = sink.messages();
+        assert_eq!(notices.len(), 1, "one notice per downgrade: {notices:?}");
+        assert!(
+            notices[0].contains("re-encoded") && notices[0].contains("413"),
+            "the notice must name the downgrade: {notices:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_body_413_after_shrinking_replaces_images_with_notes() {
+        let _environment = crate::test_support::lock_test_env();
+        let messages = vec![
+            msg("user", "context before the screenshots"),
+            user_image_message(&png_data_url(900, 900)),
+        ];
+        let client = ScriptedSummaryClient::with_outcomes(vec![
+            Err(request_body_413()),
+            Err(request_body_413()),
+            Ok(summary_content()),
+        ]);
+        let sink = std::sync::Arc::new(RecordingNoticeSink::default());
+        let envelope = body_413_retry_envelope(sink.clone());
+        let mut usage = Usage::default();
+
+        let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
+        assert!(
+            result.is_ok(),
+            "the retry after replacing images must succeed: {result:?}"
+        );
+
+        let requests = client.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 3, "reject, shrink retry, replace retry");
+        let first = inline_image_bytes(&requests[0]);
+        let second = inline_image_bytes(&requests[1]);
+        let third = inline_image_bytes(&requests[2]);
+        assert!(second > 0 && second < first);
+        assert_eq!(third, 0, "the last rung carries no image bytes");
+        let note_present = requests[2].messages.iter().any(|message| {
+            message.content.iter().any(|block| match block {
+                ContentBlock::Text { text, .. } => text.contains("omitted from this summary pass"),
+                _ => false,
+            })
+        });
+        assert!(note_present, "the summarizer is told what was there");
+        let notices = sink.messages();
+        assert_eq!(notices.len(), 2, "one notice per rung: {notices:?}");
+        assert!(notices[1].contains("replaced"), "{notices:?}");
+    }
+
+    #[tokio::test]
+    async fn request_body_413_from_a_gateway_html_page_enters_the_same_ladder() {
+        let _environment = crate::test_support::lock_test_env();
+        let messages = vec![
+            msg("user", "context before the screenshots"),
+            user_image_message(&png_data_url(900, 900)),
+        ];
+        let client = ScriptedSummaryClient::with_outcomes(vec![
+            Err(request_body_413_html_gateway()),
+            Ok(summary_content()),
+        ]);
+        let sink = std::sync::Arc::new(RecordingNoticeSink::default());
+        let envelope = body_413_retry_envelope(sink.clone());
+        let mut usage = Usage::default();
+
+        let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
+        assert!(
+            result.is_ok(),
+            "the gateway-page rejection must enter the ladder: {result:?}"
+        );
+        let requests = client.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 2, "one rejection, one retry");
+        assert!(
+            inline_image_bytes(&requests[1]) < inline_image_bytes(&requests[0]),
+            "the retry must carry smaller image bytes"
+        );
+        let notices = sink.messages();
+        assert_eq!(
+            notices.len(),
+            1,
+            "the user hears about the downgrade: {notices:?}"
+        );
+        assert!(notices[0].contains("413"), "{notices:?}");
+    }
+
+    #[tokio::test]
+    async fn request_body_413_without_inline_images_fails_with_context() {
+        let _environment = crate::test_support::lock_test_env();
+        let messages = vec![msg("user", "no images anywhere in this history")];
+        let client = ScriptedSummaryClient::with_outcomes(vec![Err(request_body_413())]);
+        let sink = std::sync::Arc::new(RecordingNoticeSink::default());
+        let envelope = body_413_retry_envelope(sink.clone());
+        let mut usage = Usage::default();
+
+        let error = compact_messages_safe(&client, &messages, None, &envelope, &mut usage)
+            .await
+            .expect_err("nothing left to shrink, the pass must fail");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("request-body limit"),
+            "the failure must name the boundary: {text}"
+        );
+        let requests = client.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 1, "no pointless identical retry");
+        assert!(sink.messages().is_empty(), "nothing was downgraded");
+    }
+
+    #[tokio::test]
+    async fn request_body_413_after_replacements_fails_with_the_full_ladder() {
+        let _environment = crate::test_support::lock_test_env();
+        let messages = vec![
+            msg("user", "context before the screenshots"),
+            user_image_message(&png_data_url(900, 900)),
+        ];
+        let client = ScriptedSummaryClient::with_outcomes(vec![
+            Err(request_body_413()),
+            Err(request_body_413()),
+            Err(request_body_413()),
+        ]);
+        let sink = std::sync::Arc::new(RecordingNoticeSink::default());
+        let envelope = body_413_retry_envelope(sink.clone());
+        let mut usage = Usage::default();
+
+        let error = compact_messages_safe(&client, &messages, None, &envelope, &mut usage)
+            .await
+            .expect_err("every rung refused, the pass must fail");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("even after re-encoding and then replacing"),
+            "the failure must report the full ladder: {text}"
+        );
+        let requests = client.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 3, "two retries, then stop");
+        assert_eq!(sink.messages().len(), 2, "both rungs announced");
+    }
 
     struct ScriptedSummaryClient {
         responses: std::sync::Mutex<std::collections::VecDeque<anyhow::Result<Vec<ContentBlock>>>>,
