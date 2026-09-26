@@ -747,7 +747,11 @@ outside the current VS Code folder.
 
 Thread forks are sibling runtime threads, not an in-place tree projection.
 `thread.forked` events include `source_thread_id`; internal backtrack-aware
-forks may also include `backtrack_depth_from_tail` and `dropped_turn_id`.
+forks may also include `backtrack_depth_from_tail` and `dropped_turn_id`, and
+a fork anchored to a named turn (`/fork-at-turn`) reports them with the depth
+resolved from that turn, and names the first user turn it dropped (not the
+anchor, which a named-turn fork keeps, and not a prompt-less turn such as a
+manual compaction that sits between them).
 Thread list and summary responses remain flat in v0.8.40, so clients that need
 a graph should reconstruct it from events instead of assuming list order is a
 complete tree.
@@ -808,6 +812,7 @@ route.
 - `POST /v1/threads/{id}/turns/{turn_id}/interrupt`
 - `POST /v1/threads/{id}/compact` (manual compaction)
 - `POST /v1/threads/{id}/undo` - fork the thread with the last N turns removed (`{"depth": N}`, default 0 = last turn only); returns the forked thread plus `original_user_text` so a GUI can pre-populate the input box
+- `POST /v1/threads/{id}/fork-at-turn` - fork at one named user turn (`{"turn_id": "turn_…"}`, as `GET /v1/threads/{id}` reports it). The fork *keeps* that turn and every turn before it, and drops the turns after it; naming the last turn therefore keeps the whole conversation. The receipt is `/undo`'s (`thread`, `original_user_text`, `original_user_images`), carrying the *first dropped* user turn's prompt — what was asked next, even when a prompt-less turn such as a manual `/compact` sits between — so a client can put it back in the composer for editing. The source thread, its session document and the workspace are untouched, and there is no file rollback: a fork is a sibling conversation, and rewinding the workspace would rewind the branch left behind with it. Clients should name the turn instead of computing a `depth` — the transcript they render and the turn list this cuts are not the same list (steers, image-only prompts and injected handoffs each sit on one side only), and a client-side count that is off by one forks the wrong prefix while answering `201`. `400` when the turn is not a user turn of that thread.
 - `POST /v1/threads/{id}/patch-undo` - snapshot-based whole-workspace rollback followed by the same fork (`{"depth": N}`); returns `patch_result` (`files_restored`, `summary`, `snapshot_label`) alongside the forked thread. See [Workspace restore endpoints](#workspace-restore-endpoints) for the trust, admission and abort rules.
 - `POST /v1/threads/{id}/file-revert` - restore exactly one file from one named snapshot (`{"path", "snapshot_id", "expected_hash"}`); never forks the conversation. See [Workspace restore endpoints](#workspace-restore-endpoints).
 - `POST /v1/threads/{id}/retry` - fork with the last N turns removed and immediately start a new turn (`{"depth": N, "prompt": "..."}`; `prompt` overrides the original user text, which is re-used when omitted)

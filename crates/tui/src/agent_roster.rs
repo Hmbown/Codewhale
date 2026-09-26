@@ -113,9 +113,14 @@ pub struct AgentRosterRow {
     pub model: String,
     pub state: RosterState,
     pub status: AgentWorkerStatus,
-    /// The agent's current step or last tool, in one line. `None` when the
-    /// worker has not reported an event yet.
+    /// The agent's outcome, current step or last tool, in one line. `None`
+    /// when the worker has not reported an event yet.
     pub activity: Option<String>,
+    /// What a settled worker produced, in full (its result, or its error). The
+    /// row shows a one-line headline; the focused view shows this, so the
+    /// answer is never only available cut off (#6565). `None` while live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
     /// Wall time: elapsed for a live agent, final duration for a finished one.
     pub millis: Option<u64>,
     pub input_tokens: Option<u64>,
@@ -186,6 +191,7 @@ pub fn row_from_record(record: &AgentWorkerRecord, now_ms: u64) -> AgentRosterRo
         state,
         status: record.status,
         activity: activity_line(record),
+        outcome: settled_outcome(record).map(str::to_string),
         millis: wall_millis(record, now_ms),
         input_tokens: record.usage.input_tokens,
         output_tokens: record.usage.output_tokens,
@@ -214,13 +220,18 @@ pub fn display_name(record: &AgentWorkerRecord) -> String {
         .unwrap_or_else(|| record.spec.agent_type.as_str().to_string())
 }
 
-/// The agent's current step or last tool, in one line.
+/// The agent's outcome, current step or last tool, in one line.
 ///
-/// Preference order is most-specific-first: the newest event naming a tool, then
-/// the newest event carrying a message, then the worker's latest message. A
-/// finished worker shows what it finished doing, not a stale "running" line.
+/// A settled worker leads with what it produced (#6565): a finished one shows
+/// the headline of its result, and a failed or cancelled one its error, not
+/// the last tool it happened to call. A live worker's preference order is
+/// most-specific-first: the newest event naming a tool, then the newest event
+/// carrying a message, then the worker's latest message.
 #[must_use]
 pub fn activity_line(record: &AgentWorkerRecord) -> Option<String> {
+    if let Some(headline) = settled_outcome(record).and_then(result_headline) {
+        return Some(one_line(&headline));
+    }
     let from_events = record.events.iter().rev().find_map(|event| {
         event
             .tool_name
@@ -235,6 +246,76 @@ pub fn activity_line(record: &AgentWorkerRecord) -> Option<String> {
         .or_else(|| record.latest_message.clone())
         .or_else(|| record.result_summary.clone())
         .map(|line| one_line(&line))
+}
+
+/// What a settled worker produced, in full: its result when it finished, its
+/// error (else its partial result) when it failed or was stopped. `None` while
+/// it is live or parked.
+#[must_use]
+pub fn settled_outcome(record: &AgentWorkerRecord) -> Option<&str> {
+    let outcome = match RosterState::from_record(record) {
+        RosterState::Done => record.result_summary.as_deref(),
+        RosterState::Failed | RosterState::Cancelled => {
+            record.error.as_deref().or(record.result_summary.as_deref())
+        }
+        RosterState::Running | RosterState::Waiting | RosterState::Parked => None,
+    };
+    outcome.filter(|text| !text.trim().is_empty())
+}
+
+/// The line of an agent's result that says what it found (#6565).
+///
+/// A report usually opens with scaffolding: a `## Summary` heading, a rule, a
+/// code fence, or the machine-readable completion envelope. Showing its first
+/// line showed the scaffolding and hid the answer. This skips blank lines, the
+/// `<codewhale:…>` envelope, headings, rule-only lines and fence markers, and
+/// returns the first sentence of the first line of prose. A result that is
+/// only headings still yields its first heading, without the `#` marks.
+/// `None` when nothing is left.
+///
+/// The headline is not bounded here; a one-row surface bounds it with
+/// [`one_line`], which marks the cut with `…`. The full result stays one Enter
+/// away in the agent's focused view.
+#[must_use]
+pub fn result_headline(text: &str) -> Option<String> {
+    let is_rule = |line: &str| {
+        line.chars().filter(|c| !c.is_whitespace()).count() >= 3
+            && line
+                .chars()
+                .all(|c| matches!(c, '-' | '*' | '_' | '=') || c.is_whitespace())
+    };
+    let is_fence = |line: &str| line.starts_with("```") || line.starts_with("~~~");
+    let candidates = || {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("<codewhale:"))
+            .filter(|line| !is_rule(line) && !is_fence(line))
+    };
+    let line = match candidates().find(|line| !line.starts_with('#')) {
+        Some(line) => line,
+        None => candidates().next()?.trim_start_matches('#').trim(),
+    };
+    let sentence = first_sentence(line).trim();
+    (!sentence.is_empty()).then(|| sentence.to_string())
+}
+
+/// Up to and including the first sentence terminator followed by a space, so
+/// `v0.10.1` or `foo.rs` inside a line does not end the sentence. CJK full
+/// stops end it wherever they fall.
+fn first_sentence(line: &str) -> &str {
+    let mut chars = line.char_indices().peekable();
+    while let Some((index, c)) = chars.next() {
+        let end = index + c.len_utf8();
+        if matches!(c, '。' | '！' | '？') {
+            return &line[..end];
+        }
+        if matches!(c, '.' | '!' | '?')
+            && chars.peek().is_some_and(|(_, next)| next.is_whitespace())
+        {
+            return &line[..end];
+        }
+    }
+    line
 }
 
 /// Collapse to a single line and bound it. Rail rows are one row.

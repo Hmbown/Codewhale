@@ -2012,6 +2012,8 @@
   "AgentFocusPlaceholder": "Nachricht an {agent} · Esc zurück zur Hauptunterhaltung",
   "AgentFocusNoTranscript": "Für {agent} liegt noch kein Transkript vor. Nachrichten erscheinen hier, sobald der Worker sie austauscht.",
   "AgentFocusOmitted": "Frühere Nachrichten ({count}) fehlen im Transkript im Arbeitsspeicher.",
+  "AgentFocusResult": "Ergebnis",
+  "AgentFocusStopReason": "Warum es angehalten hat",
   "AgentFocusFollowUpDelivered": "Für {agent} eingereiht: er liest die Nachricht in seiner nächsten Runde.",
   "AgentFocusFollowUpQueued": "Für {agent} eingereiht",
   "AgentFocusFollowUpContinued": "{agent} war bereits fertig; auf einem neuen Fork ({target}) fortgesetzt. Diese Ansicht folgt jetzt dem Fork.",

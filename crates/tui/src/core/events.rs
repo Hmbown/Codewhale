@@ -443,6 +443,10 @@ pub enum Event {
         /// `run.model`, …). `None` for spawn paths that bypass route
         /// resolution (checkpoint resume, engine-internal spawns).
         route_source: Option<String>,
+        /// The name this agent goes by on every surface: its workflow task
+        /// label, dispatch name, or role, resolved once by the engine
+        /// (`subagent_display_name`). Never the raw id.
+        display_name: Option<String>,
     },
 
     /// Sub-agent progress update
@@ -468,6 +472,8 @@ pub enum Event {
         /// Provider-reported child usage from the durable ledger (#6315).
         /// None means the worker has no usage receipt, never zero tokens.
         usage: Option<crate::tools::subagent::AgentRunUsage>,
+        /// Same resolved name as `AgentSpawned::display_name`.
+        display_name: Option<String>,
     },
 
     /// Receipt for an operator follow-up sent to a child (`Op::FollowUpSubAgent`).

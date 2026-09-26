@@ -7,7 +7,7 @@ const MIGRATION_HOME = join("lib", "i18n");
 // One-way ceiling (#5519): the isZh migration converges or holds, never
 // regresses. To lower the number: migrate branches into lib/i18n, then set
 // CEILING to the new count reported by this test.
-const CEILING = 11;
+const CEILING = 9;
 
 function walk(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {

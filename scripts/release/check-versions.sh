@@ -145,10 +145,11 @@ if ! ./scripts/sync-changelog.sh --check >/dev/null 2>&1; then
   fail=1
 fi
 
-# 6) Current candidate/release-note shape. Normal branch and release-candidate
-# CI must accept an honest source candidate. Tag creation and public release
-# workflows pass --require-dated-release so publication cannot proceed until
-# the same entry has a real release date and tag-based compare link.
+# 6) Current candidate/release-note shape. Normal branch CI must accept an
+# honest source candidate. The release candidate, tag creation and public
+# release workflows pass --require-dated-release so publication cannot proceed
+# until the same entry has a real release date and tag-based compare link (an
+# RC receipt only counts for the exact tag SHA, so it must see the dated entry).
 current_section="$(
   awk -v version="${workspace_version}" '
     index($0, "## [" version "] - ") == 1 { in_section = 1; print; next }

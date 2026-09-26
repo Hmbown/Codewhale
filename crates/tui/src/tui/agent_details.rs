@@ -578,7 +578,9 @@ mod tests {
                 role: Some("worker".to_string()),
             },
             model: "deepseek-v4-pro".to_string(),
-            nickname: Some("Blue Whale".to_string()),
+            nickname: Some(crate::tools::subagent::whale_name_for_id_in_locale(
+                agent_id, "en",
+            )),
             status,
             worker_status: None,
             runtime_permissions: None,
