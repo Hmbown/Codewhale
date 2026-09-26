@@ -1380,6 +1380,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             get(turn_artifacts::list_turn_artifacts),
         )
         .route(
+            "/v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}",
+            get(turn_artifacts::read_turn_artifact),
+        )
+        .route(
             "/v1/threads/{id}/turns/{turn_id}/interrupt",
             post(interrupt_thread_turn),
         )
@@ -10200,6 +10204,13 @@ impl ApiError {
     fn payload_too_large(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.into(),
+        }
+    }
+
+    fn gone(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::GONE,
             message: message.into(),
         }
     }

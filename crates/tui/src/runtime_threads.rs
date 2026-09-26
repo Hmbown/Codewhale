@@ -8464,7 +8464,7 @@ impl RuntimeThreadManager {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<Option<TurnArtifactsView>> {
-        self.get_thread(thread_id).await?;
+        let thread = self.get_thread(thread_id).await?;
         if validated_record_id(turn_id, "turn id").is_err() {
             return Ok(None);
         }
@@ -8479,17 +8479,19 @@ impl RuntimeThreadManager {
             if turn.thread_id != thread_id {
                 return Ok(None);
             }
+            let item_artifacts = manager.item_artifact_refs(&turn);
             let artifacts = if turn.workspace.is_some() {
                 turn.artifacts
             } else {
-                let items = manager.item_artifact_refs(&turn);
-                turn_artifacts::merge_turn_artifacts(&items, None).artifacts
+                turn_artifacts::merge_turn_artifacts(&item_artifacts, None).artifacts
             };
             Ok(Some(TurnArtifactsView {
                 thread_id,
                 turn_id,
                 workspace: turn.workspace,
                 artifacts,
+                item_artifacts,
+                thread_workspace: thread.workspace,
             }))
         })
         .await
@@ -15869,6 +15871,14 @@ pub struct TurnArtifactsView {
     /// `null` while the turn is still running.
     pub workspace: Option<TurnWorkspaceArtifacts>,
     pub artifacts: Vec<TurnArtifactRef>,
+    /// Every item-level ref, including intermediate revisions of a file the
+    /// turn wrote more than once. The read route resolves `?revision=`
+    /// against these.
+    #[serde(skip)]
+    pub item_artifacts: Vec<TurnArtifactRef>,
+    /// The thread workspace every file ref is relative to.
+    #[serde(skip)]
+    pub thread_workspace: PathBuf,
 }
 
 /// The snapshot pair an engine reported for one turn.
@@ -15920,7 +15930,7 @@ fn workspace_delta(
 
 mod turn_artifacts;
 pub use turn_artifacts::{
-    TurnArtifactKind, TurnArtifactRef, TurnWorkspaceArtifacts, TurnWorkspaceReason,
+    FileChangeKind, TurnArtifactKind, TurnArtifactRef, TurnWorkspaceArtifacts, TurnWorkspaceReason,
     TurnWorkspaceState,
 };
 

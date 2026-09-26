@@ -1258,114 +1258,16 @@ fn read_session_artifact_window(
     offset: usize,
     limit: usize,
 ) -> Result<SessionArtifactReadResponse, ApiError> {
-    if !crate::artifacts::is_valid_session_id(id) {
-        return Err(ApiError::bad_request("invalid session id"));
-    }
-    let manager = SessionManager::new(sessions_dir.to_path_buf())
-        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
-    let record = match manager.load_session_snapshot(id) {
-        Ok(session) if session.metadata.id == id => session
-            .artifacts
-            .into_iter()
-            .find(|record| record.id == artifact_id),
-        Ok(_) => return Err(ApiError::forbidden("artifact session owner does not match")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(map_session_err(id, error, "read")),
-    };
-    // The reserved image namespace always requires its immutable manifest,
-    // even if a later SavedSession index also mentions that handle.
-    let image_handle = artifact_id.strip_prefix("art_image_").is_some_and(|hash| {
-        hash.len() == 64
-            && hash
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    });
-    let record = record.filter(|_| !image_handle);
-    let (summary, evidence) = if let Some(record) = record {
-        if record.storage_path.is_absolute()
-            || !crate::fleet::files::path_is_confined(&record.storage_path)
-            || (!record.session_id.is_empty() && record.session_id != id)
-        {
-            return Err(ApiError::forbidden(
-                "artifact record is not confined to its session",
-            ));
-        }
-        let mut summary = artifact_summary(&record);
-        summary.session_id = id.to_owned();
-        (summary, None)
-    } else {
-        // Fresh Engine sessions can publish immutable observations before a
-        // SavedSession JSON exists. Only the exact owned image manifest grants
-        // access; arbitrary relative paths and other evidence are not a fallback.
-        if !image_handle {
-            return Err(ApiError::not_found("artifact not found"));
-        }
-        let relative = PathBuf::from(id)
-            .join(crate::tools::large_output_router::evidence_metadata_relative_path(artifact_id));
-        let file = super::workspace::open_confined_file(sessions_dir, &relative, false)?;
-        let evidence = crate::tools::large_output_router::read_evidence_metadata_file(&file)
-            .map_err(|error| super::workspace::map_fs_error(error, "evidence metadata"))?;
-        let expected_path = PathBuf::from(crate::artifacts::ARTIFACTS_DIR_NAME)
-            .join(format!("{artifact_id}.image"));
-        if evidence.origin_session != id
-            || evidence.handle != artifact_id
-            || evidence.storage_path != expected_path
-            || evidence.generation != 1
-            || evidence.encoding != "binary"
-            || evidence.call_id.is_empty()
-        {
-            return Err(ApiError::forbidden(
-                "image evidence owner or path does not match",
-            ));
-        }
-        if evidence.redacted
-            || crate::tools::large_output_router::evidence_is_expired(
-                &evidence,
-                crate::tools::large_output_router::unix_millis_now(),
-            )
-        {
-            return Err(ApiError::forbidden("image evidence is no longer available"));
-        }
-        if evidence.size_bytes > crate::image_attach::MAX_IMAGE_BYTES as u64
-            || !matches!(
-                evidence.content_type.as_str(),
-                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-            )
-        {
-            return Err(ApiError::bad_request("invalid image evidence"));
-        }
-        let created_at = i64::try_from(evidence.created_at_unix_ms)
-            .ok()
-            .and_then(chrono::DateTime::from_timestamp_millis)
-            .ok_or_else(|| ApiError::bad_request("invalid evidence timestamp"))?;
-        let summary = SessionArtifactSummary {
-            id: artifact_id.to_owned(),
-            session_id: id.to_owned(),
-            content_type: Some(evidence.content_type.clone()),
-            kind: crate::artifacts::ArtifactKind::ToolOutput,
-            tool_call_id: evidence.call_id.clone(),
-            tool_name: evidence.tool_name.clone(),
-            created_at,
-            byte_size: evidence.size_bytes,
-            preview: String::new(),
-            path: crate::artifacts::format_artifact_relative_path(&evidence.storage_path),
-        };
-        (summary, Some(evidence))
-    };
-    let relative = PathBuf::from(id).join(&summary.path);
-    let file = super::workspace::open_confined_file(sessions_dir, &relative, false)?;
-    let read = super::workspace::read_confined_bytes(&file)?;
-    if let Some(evidence) = evidence
-        && (read.size != evidence.size_bytes
-            || read.revision != evidence.digest
-            || crate::image_attach::sniff_media_type(&read.bytes)
-                != Some(evidence.content_type.as_str())
-            || crate::image_attach::decode_and_guard_image(&read.bytes).is_err())
-    {
-        return Err(ApiError::bad_request(
-            "image evidence integrity check failed",
-        ));
-    }
+    let resolved = resolve_session_artifact(
+        sessions_dir,
+        id,
+        artifact_id,
+        ArtifactAuthority::SavedSession,
+    )?;
+    let summary = resolved
+        .summary
+        .ok_or_else(|| ApiError::internal("saved-session artifact has no summary"))?;
+    let read = resolved.read;
     let (window, truncated) = super::workspace::read_window(&read.bytes, offset, limit);
     let (encoding, content) = super::workspace::encode_window(window);
     Ok(SessionArtifactReadResponse {
@@ -1378,6 +1280,209 @@ fn read_session_artifact_window(
         encoding,
         content,
     })
+}
+
+/// Who vouches that `artifact_id` belongs to session `id`.
+pub(super) enum ArtifactAuthority<'a> {
+    /// The SavedSession JSON's `artifacts` index.
+    SavedSession,
+    /// A runtime turn's recorded reference. Runtime engines of unbound
+    /// threads have no SavedSession index, so the turn record is the
+    /// ownership proof: the bytes must sit at `path` and, when `revision` is
+    /// known, hash to it.
+    TurnRef {
+        path: &'a str,
+        revision: Option<&'a str>,
+    },
+}
+
+/// One session artifact's bytes, read through the confined opener.
+pub(super) struct ResolvedSessionArtifact {
+    /// The index or manifest record; `None` for a turn-ref read of a
+    /// non-image artifact, whose caller already holds the reference.
+    pub(super) summary: Option<SessionArtifactSummary>,
+    pub(super) read: super::workspace::ConfinedFileBytes,
+}
+
+/// The one resolver behind both session-artifact reads: the session route
+/// (SavedSession authority) and the turn route (turn-ref authority). Both
+/// get the same session-id validation, confinement, image-manifest checks
+/// and integrity checks.
+pub(super) fn resolve_session_artifact(
+    sessions_dir: &std::path::Path,
+    id: &str,
+    artifact_id: &str,
+    authority: ArtifactAuthority<'_>,
+) -> Result<ResolvedSessionArtifact, ApiError> {
+    if !crate::artifacts::is_valid_session_id(id) {
+        return Err(ApiError::bad_request("invalid session id"));
+    }
+    // The reserved image namespace always requires its immutable manifest,
+    // even if a later SavedSession index also mentions that handle.
+    let image_handle = artifact_id.strip_prefix("art_image_").is_some_and(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    });
+    let (summary, relative_path, evidence) = if image_handle {
+        let (summary, evidence) = image_evidence_summary(sessions_dir, id, artifact_id)?;
+        let path = summary.path.clone();
+        (Some(summary), path, Some(evidence))
+    } else {
+        match &authority {
+            ArtifactAuthority::SavedSession => {
+                let summary = saved_session_summary(sessions_dir, id, artifact_id)?;
+                let path = summary.path.clone();
+                (Some(summary), path, None)
+            }
+            ArtifactAuthority::TurnRef { path, .. } => {
+                let relative = PathBuf::from(path);
+                if relative.is_absolute() || !crate::fleet::files::path_is_confined(&relative) {
+                    return Err(ApiError::forbidden(
+                        "artifact reference is not confined to its session",
+                    ));
+                }
+                (None, (*path).to_string(), None)
+            }
+        }
+    };
+    let relative = PathBuf::from(id).join(&relative_path);
+    let opened = super::workspace::open_confined_file(sessions_dir, &relative, false)
+        .and_then(|file| super::workspace::read_confined_bytes(&file));
+    let read = match (opened, &authority) {
+        (Ok(read), _) => read,
+        // A turn recorded these bytes; their absence means the session
+        // directory was pruned since.
+        (Err(error), ArtifactAuthority::TurnRef { .. })
+            if error.status == StatusCode::NOT_FOUND =>
+        {
+            return Err(ApiError::gone(
+                "this artifact's bytes are no longer stored (its session was pruned)",
+            ));
+        }
+        (Err(error), _) => return Err(error),
+    };
+    if let Some(evidence) = evidence
+        && (read.size != evidence.size_bytes
+            || read.revision != evidence.digest
+            || crate::image_attach::sniff_media_type(&read.bytes)
+                != Some(evidence.content_type.as_str())
+            || crate::image_attach::decode_and_guard_image(&read.bytes).is_err())
+    {
+        return Err(ApiError::bad_request(
+            "image evidence integrity check failed",
+        ));
+    }
+    if let ArtifactAuthority::TurnRef {
+        revision: Some(expected),
+        ..
+    } = authority
+        && read.revision != expected
+    {
+        return Err(ApiError::conflict(format!(
+            "artifact bytes changed since the turn recorded them; current revision is {}",
+            read.revision
+        )));
+    }
+    Ok(ResolvedSessionArtifact { summary, read })
+}
+
+fn saved_session_summary(
+    sessions_dir: &std::path::Path,
+    id: &str,
+    artifact_id: &str,
+) -> Result<SessionArtifactSummary, ApiError> {
+    let manager = SessionManager::new(sessions_dir.to_path_buf())
+        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+    let record = match manager.load_session_snapshot(id) {
+        Ok(session) if session.metadata.id == id => session
+            .artifacts
+            .into_iter()
+            .find(|record| record.id == artifact_id),
+        Ok(_) => return Err(ApiError::forbidden("artifact session owner does not match")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(map_session_err(id, error, "read")),
+    };
+    let record = record.ok_or_else(|| ApiError::not_found("artifact not found"))?;
+    if record.storage_path.is_absolute()
+        || !crate::fleet::files::path_is_confined(&record.storage_path)
+        || (!record.session_id.is_empty() && record.session_id != id)
+    {
+        return Err(ApiError::forbidden(
+            "artifact record is not confined to its session",
+        ));
+    }
+    let mut summary = artifact_summary(&record);
+    summary.session_id = id.to_owned();
+    Ok(summary)
+}
+
+/// Fresh Engine sessions can publish immutable observations before a
+/// SavedSession JSON exists. Only the exact owned image manifest grants
+/// access; arbitrary relative paths and other evidence are not a fallback.
+fn image_evidence_summary(
+    sessions_dir: &std::path::Path,
+    id: &str,
+    artifact_id: &str,
+) -> Result<
+    (
+        SessionArtifactSummary,
+        crate::tools::large_output_router::EvidenceArtifact,
+    ),
+    ApiError,
+> {
+    let relative = PathBuf::from(id)
+        .join(crate::tools::large_output_router::evidence_metadata_relative_path(artifact_id));
+    let file = super::workspace::open_confined_file(sessions_dir, &relative, false)?;
+    let evidence = crate::tools::large_output_router::read_evidence_metadata_file(&file)
+        .map_err(|error| super::workspace::map_fs_error(error, "evidence metadata"))?;
+    let expected_path =
+        PathBuf::from(crate::artifacts::ARTIFACTS_DIR_NAME).join(format!("{artifact_id}.image"));
+    if evidence.origin_session != id
+        || evidence.handle != artifact_id
+        || evidence.storage_path != expected_path
+        || evidence.generation != 1
+        || evidence.encoding != "binary"
+        || evidence.call_id.is_empty()
+    {
+        return Err(ApiError::forbidden(
+            "image evidence owner or path does not match",
+        ));
+    }
+    if evidence.redacted
+        || crate::tools::large_output_router::evidence_is_expired(
+            &evidence,
+            crate::tools::large_output_router::unix_millis_now(),
+        )
+    {
+        return Err(ApiError::forbidden("image evidence is no longer available"));
+    }
+    if evidence.size_bytes > crate::image_attach::MAX_IMAGE_BYTES as u64
+        || !matches!(
+            evidence.content_type.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        )
+    {
+        return Err(ApiError::bad_request("invalid image evidence"));
+    }
+    let created_at = i64::try_from(evidence.created_at_unix_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .ok_or_else(|| ApiError::bad_request("invalid evidence timestamp"))?;
+    let summary = SessionArtifactSummary {
+        id: artifact_id.to_owned(),
+        session_id: id.to_owned(),
+        content_type: Some(evidence.content_type.clone()),
+        kind: crate::artifacts::ArtifactKind::ToolOutput,
+        tool_call_id: evidence.call_id.clone(),
+        tool_name: evidence.tool_name.clone(),
+        created_at,
+        byte_size: evidence.size_bytes,
+        preview: String::new(),
+        path: crate::artifacts::format_artifact_relative_path(&evidence.storage_path),
+    };
+    Ok((summary, evidence))
 }
 
 #[cfg(test)]

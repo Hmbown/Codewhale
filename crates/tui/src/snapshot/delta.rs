@@ -292,6 +292,61 @@ impl SnapshotRepo {
         Ok(facts)
     }
 
+    /// The bytes of regular file `rel` in snapshot `id`, or `None` when the
+    /// snapshot does not hold a regular file there. A blob larger than
+    /// `max_bytes` is refused with `FileTooLarge` before it is read.
+    pub fn read_blob(
+        &self,
+        id: &SnapshotId,
+        rel: &str,
+        max_bytes: u64,
+    ) -> io::Result<Option<Vec<u8>>> {
+        if safe_display(rel.as_bytes()).as_deref() != Some(rel) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot path must be a plain workspace-relative path",
+            ));
+        }
+        let entry = git_output(
+            self,
+            &[
+                "--literal-pathspecs",
+                "ls-tree",
+                "-z",
+                "--long",
+                "--end-of-options",
+                id.as_str(),
+                "--",
+                rel,
+            ],
+        )?;
+        // `<mode> blob <oid> <size>\t<path>\0`
+        let Some(line) = entry.split(|byte| *byte == 0).find(|line| !line.is_empty()) else {
+            return Ok(None);
+        };
+        let header = std::str::from_utf8(line)
+            .ok()
+            .and_then(|line| line.split('\t').next())
+            .unwrap_or_default();
+        let fields: Vec<&str> = header.split_whitespace().collect();
+        let [mode, "blob", oid, size] = fields.as_slice() else {
+            return Ok(None);
+        };
+        if !matches!(*mode, "100644" | "100755") {
+            return Ok(None);
+        }
+        let size: u64 = size
+            .parse()
+            .map_err(|_| io::Error::other("ls-tree returned an invalid size"))?;
+        if size > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "snapshot blob exceeds the read limit",
+            ));
+        }
+        git_output(self, &["cat-file", "blob", oid]).map(Some)
+    }
+
     /// Which of `paths` snapshot `id` contains. A path absent from both
     /// snapshots of a pair is one the snapshots cannot see (excluded or
     /// ignored), which is different from one that did not change.
@@ -450,6 +505,44 @@ mod tests {
             .find(|e| e.path == "small.txt")
             .unwrap();
         assert_eq!(small.sha256, sha(b"small\n"));
+    }
+
+    #[test]
+    fn read_blob_returns_exact_snapshot_bytes_and_refuses_unsafe_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let (repo, _home) = repo(root.path());
+        let work = repo.work_tree().to_path_buf();
+        fs::create_dir(work.join("dir")).unwrap();
+        fs::write(work.join("dir/a.txt"), b"exact \x00 bytes").unwrap();
+        let id = repo.snapshot("post-turn:1").unwrap();
+        fs::write(work.join("dir/a.txt"), b"changed later").unwrap();
+        assert_eq!(
+            repo.read_blob(&id, "dir/a.txt", 1024).unwrap().as_deref(),
+            Some(&b"exact \x00 bytes"[..])
+        );
+        assert_eq!(repo.read_blob(&id, "dir/missing.txt", 1024).unwrap(), None);
+        assert_eq!(
+            repo.read_blob(&id, "dir", 1024).unwrap(),
+            None,
+            "a tree is not a file"
+        );
+        assert_eq!(
+            repo.read_blob(&id, "dir/a.txt", 3).unwrap_err().kind(),
+            io::ErrorKind::FileTooLarge
+        );
+        for unsafe_path in [
+            "../escape",
+            "/etc/passwd",
+            "dir/../dir/a.txt",
+            ".git/config",
+            "",
+        ] {
+            assert_eq!(
+                repo.read_blob(&id, unsafe_path, 1024).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "{unsafe_path:?}"
+            );
+        }
     }
 
     #[test]
