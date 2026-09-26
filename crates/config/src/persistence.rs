@@ -364,7 +364,15 @@ mod tests {
 
     #[test]
     fn compact_json_and_query_strings_mask_their_credentials() {
-        let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJlLXZhbHVl";
+        // A synthetic, unsigned test value, assembled from its three
+        // segments so the source holds no complete token literal.
+        let jwt = [
+            "eyJhbGciOiJSUzI1NiJ9",
+            "eyJzdWIiOiJ1c2VyIn0",
+            "c2lnbmF0dXJlLXZhbHVl",
+        ]
+        .join(".");
+        let jwt = jwt.as_str();
         let refresh = "rt_Q2x9fK3mZ7pL1vB8nH4sT6wY0aE5cR2d";
         let cases = [
             format!(

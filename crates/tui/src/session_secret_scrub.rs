@@ -71,15 +71,18 @@ pub(crate) fn scrub_files(
     let mut report = ScrubReport::default();
     for path in files {
         report.files_scanned += 1;
-        let scan = match apply {
-            None => scrub_file(path, false)?,
-            Some(manager) => {
+        // The scan is read-only; its counts are what the report prints.
+        let scan = scrub_file(path, false)?;
+        let scan = match (apply, scan) {
+            (Some(manager), FileScan::Dirty(redacted)) => {
                 // `<id>.json` and `checkpoints/<id>.json` share the id's lock.
+                // The rewrite re-reads the file under that lock, so it masks
+                // whatever the file holds at that moment.
                 let session_id = path.file_stem().and_then(|stem| stem.to_str());
-                match session_id
-                    .map(|id| manager.with_session_file_lock(id, || scrub_file(path, true)))
-                {
-                    Some(Ok(Some(scan))) => scan,
+                match session_id.map(|id| {
+                    manager.with_session_file_lock(id, || scrub_file(path, true).map(|_| ()))
+                }) {
+                    Some(Ok(Some(()))) => FileScan::Dirty(redacted),
                     // A deleted session is not resurrected by a rewrite.
                     Some(Ok(None)) => FileScan::Clean,
                     // No lockable session id: leave the file untouched.
@@ -90,6 +93,7 @@ pub(crate) fn scrub_files(
                     Some(Err(error)) => return Err(error),
                 }
             }
+            (_, scan) => scan,
         };
         match scan {
             FileScan::Unreadable => report.unreadable.push(path.clone()),

@@ -11977,6 +11977,9 @@ fn measure_representative_runtime_context()
     // Keep the model-visible shell fact stable across developer and CI hosts
     // while exercising the exact-path contract used at runtime.
     let _shell = EnvVarGuard::set("SHELL", "/bin/bash");
+    // The fixture measures a trusted repository: project skills load only in
+    // a trusted workspace, and the skill stage exists to measure one.
+    crate::test_support::trust_workspace(&workspace);
 
     let mut stages = vec![representative_stage(
         "base",
