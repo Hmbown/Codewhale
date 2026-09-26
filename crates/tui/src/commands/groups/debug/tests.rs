@@ -2170,3 +2170,106 @@ fn test_undo_reports_that_files_were_not_reverted_when_the_repo_is_unavailable()
         "the reason must travel with the fallback: {message}"
     );
 }
+
+#[test]
+fn receipts_command_is_registered_and_reads_the_transcript() {
+    assert_eq!(
+        crate::commands::get_command_info("receipts").map(|info| info.name),
+        Some("receipts")
+    );
+    assert_eq!(
+        crate::commands::get_command_info("receipt").map(|info| info.name),
+        Some("receipts")
+    );
+    let mut app = create_test_app();
+    app.current_session_id = None;
+    let empty = crate::commands::execute("/receipts", &mut app);
+    assert!(!empty.is_error, "{:?}", empty.message);
+    assert!(
+        empty
+            .message
+            .as_deref()
+            .is_some_and(|text| text.contains("No actions recorded.")),
+        "{:?}",
+        empty.message
+    );
+
+    app.api_messages_mut().push(Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "run the tests".to_string(),
+            cache_control: None,
+        }],
+    });
+    app.api_messages_mut().push(Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: "call-1".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "cargo test"}),
+            caller: None,
+            thought_signature: None,
+        }],
+    });
+    app.api_messages_mut().push(Message {
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "call-1".to_string(),
+            content: "ok".to_string(),
+            is_error: None,
+            content_blocks: None,
+        }],
+    });
+    let listed = crate::commands::execute("/receipts", &mut app);
+    let text = listed.message.expect("receipt text");
+    assert!(text.contains("Ran 1 command"), "{text}");
+    assert!(text.contains("1. ran `cargo test`"), "{text}");
+
+    // `$`, `*`, and `_` in a command must reach the note cell as JSON, not
+    // as math or emphasis.
+    let shell = r#"echo "$HOME" && echo $PATH *_x_*"#;
+    app.api_messages_mut().push(Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: "call-2".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": shell }),
+            caller: None,
+            thought_signature: None,
+        }],
+    });
+    app.api_messages_mut().push(Message {
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "call-2".to_string(),
+            content: "ok".to_string(),
+            is_error: None,
+            content_blocks: None,
+        }],
+    });
+    let json = crate::commands::execute("/receipts json", &mut app);
+    let fenced = json.message.expect("json");
+    let body = fenced
+        .strip_prefix("```json\n")
+        .and_then(|rest| rest.strip_suffix("\n```"))
+        .expect("the JSON is fenced");
+    let value: serde_json::Value = serde_json::from_str(body).expect("valid json");
+    assert_eq!(value["totals"]["commands"], 2);
+    let rendered: String = HistoryCell::System { content: fenced }
+        .lines(400)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains(r#""command": "echo \"$HOME\" && echo $PATH *_x_*""#),
+        "{rendered}"
+    );
+    let bad = crate::commands::execute("/receipts nope", &mut app);
+    assert!(bad.is_error);
+}

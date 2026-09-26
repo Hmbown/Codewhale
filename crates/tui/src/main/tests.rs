@@ -961,3 +961,29 @@ fn test_bare_stdio_command_is_structurally_valid_without_resolution() {
         other => panic!("Expected structural Ok, got {other:?}"),
     }
 }
+
+#[test]
+fn receipts_cli_parses_id_last_turn_and_format() {
+    let cli = Cli::try_parse_from(["codewhale", "receipts", "--last", "--format", "json"])
+        .expect("parse --last");
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Receipts {
+            last: true,
+            id: None,
+            format: receipts::ReceiptFormat::Json,
+            ..
+        })
+    ));
+    let cli = Cli::try_parse_from(["codewhale", "receipt", "thr_1", "--turn", "turn_2"])
+        .expect("parse alias");
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Receipts { ref id, ref turn, format: receipts::ReceiptFormat::Md, .. })
+            if id.as_deref() == Some("thr_1") && turn.as_deref() == Some("turn_2")
+    ));
+    assert!(
+        Cli::try_parse_from(["codewhale", "receipts", "abc", "--last"]).is_err(),
+        "an id and --last conflict"
+    );
+}

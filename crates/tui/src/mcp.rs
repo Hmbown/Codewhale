@@ -1244,6 +1244,19 @@ pub enum McpToolApprovalHint {
 static MCP_TOOL_APPROVAL_HINTS: std::sync::LazyLock<RwLock<HashMap<String, McpToolApprovalHint>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// The connected-app server named by an `mcp_<server>_<tool>` tool name.
+/// Presentation only: server names may themselves hold `_`, so this is never
+/// a policy input.
+#[must_use]
+pub fn connected_app_server(tool_name: &str) -> Option<&str> {
+    let rest = tool_name.strip_prefix("mcp_")?;
+    match rest.split_once('_') {
+        Some((server, _)) if !server.is_empty() => Some(server),
+        _ if !rest.is_empty() => Some(rest),
+        _ => None,
+    }
+}
+
 /// The approval hint recorded for a model-visible MCP tool name, if any.
 #[must_use]
 pub fn mcp_tool_approval_hint(model_tool_name: &str) -> Option<McpToolApprovalHint> {

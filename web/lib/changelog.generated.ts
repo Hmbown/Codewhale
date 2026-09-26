@@ -43,13 +43,17 @@ export const CHANGELOG: ChangelogRelease[] = [
         "items": [
           "Runtime API: POST /v1/threads/{id}/fork-at-turn forks a thread at a named user turn, keeping that turn and every turn before it. The receipt matches /undo and returns the first dropped prompt so a client can put it back in the composer. Naming the turn replaces a client-computed depth, which could fork the wrong prefix. The fork leaves the workspace and any running turn untouched (#6580, thanks @gaord).",
           "Official model routing: /router (also /model router) sets up the Auto router with presets: Jev (TypeSafe's decision model, via OpenRouter or a TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes one test call before it saves, /status shows the router's choice, cost and latency, and a failing router is shown as failing (#6525).",
+          "Receipts: /receipts, codewhale receipts [ID|--last] [--format md|json], and GET /v1/threads/{id}/receipt (plus a per-turn form) list what a session did, one line per action: files changed with line counts, commands with exit codes, web and MCP calls, agents, approvals and who gave them, and failures. They also count what ran without asking and name the posture each turn ran under, read from the turn's own record. A call Codewhale blocked before it started (Auto-Review or…",
           "Code mode composes MCP and plugin tools and is on by default: execute_tools programs can call MCP tools, and each nested call passes the same approval gate as a direct call, pausing the program for approval when needed. Every nested call keeps its receipt, including calls that finish before a deadline, and code_mode = false turns it off. codewhale mcp list and codewhale doctor warn when a user MCP server duplicates the built-in Computer Use bundle (#6562, #6509)."
         ],
-        "itemCount": 3
+        "itemCount": 4
       },
       {
         "heading": "Fixed",
         "items": [
+          "Approvals now record who decided: you, a session rule, or the posture. An automatic approval used to be saved exactly like one you gave, and an app approval that expired was saved as your denial. GET /v1/approvals now returns decided_by.",
+          "Network audit lines now go to the same audit.log as every other audit event ($CODEWHALE_HOME included), and test runs no longer append to your real one.",
+          "Auto-Review verdicts now reach audit.log, as /permissions said they did. They were written only when CODEWHALE_TOOL_AUDIT_LOG was set.",
           "codewhale exec --auto no longer exits 141 with no output when a child it writes to, such as a stdio MCP server, closes its pipe early. Headless exec now ignores SIGPIPE while it runs, as the interactive TUI already did, and exec ... | head still ends quietly. One-shot codewhale exec no longer prints DeepSeek's raw <｜｜DSML｜｜ calls> tool-call markup as its answer: the markup is removed, and an answer that was only a tool call fails at once with the reason and a pointer to…",
           "The installation page is generated from docs/INSTALL.md, so the website and the guide can no longer disagree; broken anchors and unsafe links fail the build (#6450).",
           "codewhale config set refuses a value of the wrong type for a known setting (a word for an on/off switch, text for a number, a choice outside the list) instead of saving it (#6568, thanks @dajiaohuang).",
@@ -58,12 +62,9 @@ export const CHANGELOG: ChangelogRelease[] = [
           "A provider response that ends cleanly with no text and no tool call is retried before the turn fails, and the failure names how many retries ran (#6310).",
           "The context meter, the point where Codewhale makes room, preflight, /context and turn receipts show one pressure number instead of disagreeing (#6407).",
           "Continuing a conversation that is already open no longer adds a second thread, and a fork keeps its own session file, so autosave on one side no longer leaves the other unloadable (#6406, thanks @gaord).",
-          "Upgrading Codewhale no longer turns off the built-in Computer Use. Each build writes the built-in bundle to its own directory, so an upgrade used to present it as never reviewed and disabled. Now the review and enablement carry to the new build when its capabilities are unchanged. Changed capabilities show capabilities-changed and wait for review, and a revoked trust never carries (#6303).",
-          "\"Allow for this conversation\" records a grant for that tool and argument class instead of switching the whole thread to Full Access, so the call you just approved is no longer failed by a Permissions change. An approval also survives a Permissions change that only widens what is allowed, grants end when a thread is archived or deleted, and web.run open grants are scoped by host. Full Access covers MCP tools that declare themselves destructive in every host, including…",
-          "web.run retries a refused page once with a browser user agent, and one site's failure no longer fails the whole call or drops its search results.",
-          "Hooks treat bash, Bash and exec_shell as one tool in tool_name conditions, so the documented example fires."
+          "Upgrading Codewhale no longer turns off the built-in Computer Use. Each build writes the built-in bundle to its own directory, so an upgrade used to present it as never reviewed and disabled. Now the review and enablement carry to the new build when its capabilities are unchanged. Changed capabilities show capabilities-changed and wait for review, and a revoked trust never carries (#6303)."
         ],
-        "itemCount": 20
+        "itemCount": 24
       },
       {
         "heading": "Removed",

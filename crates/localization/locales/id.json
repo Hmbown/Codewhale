@@ -413,6 +413,7 @@
   "CmdConstitutionDescription": "Kelola hukum konstitusi tetap dan pratinjaunya",
   "CmdContextDescription": "Buka inspektor konteks atau laporan source-map",
   "CmdCostDescription": "Tampilkan rincian biaya sesi",
+  "CmdReceiptsDescription": "Tampilkan apa yang dilakukan sesi ini: berkas, perintah, persetujuan",
   "CmdDiffDescription": "Tampilkan perubahan file sejak awal sesi",
   "CmdEditDescription": "Revisi dan kirim ulang pesan terakhir",
   "CmdExitDescription": "Keluar dari aplikasi",

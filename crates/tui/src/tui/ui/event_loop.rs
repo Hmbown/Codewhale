@@ -3855,7 +3855,13 @@ pub(crate) async fn run_event_loop(
                             });
                             // Auto-elevate to full access (no sandbox)
                             let policy = crate::sandbox::SandboxPolicy::DangerFullAccess;
-                            let _ = engine_handle.retry_tool_with_policy(tool_id, policy).await;
+                            let _ = engine_handle
+                                .retry_tool_with_policy_by(
+                                    tool_id,
+                                    policy,
+                                    crate::approval_log::ApprovalDecider::Posture,
+                                )
+                                .await;
                         } else {
                             log_sensitive_event(
                                 "tool.sandbox.prompt_elevation",
@@ -3987,12 +3993,27 @@ pub(crate) async fn run_event_loop(
                         risk,
                         reason,
                     } => {
-                        // A permission decision nobody was prompted for. The
-                        // audit log already has the full record; the
+                        // A permission decision nobody was prompted for. It
+                        // goes to `audit.log` (what `/permissions` promises;
+                        // until 0.10.1 only `CODEWHALE_TOOL_AUDIT_LOG` got
+                        // it), written off the event loop (#6149). The
                         // transcript gets a one-line receipt so the person
                         // can see who decided and why, without a modal. It is
                         // held until the tool card completes so it lands
                         // under that card rather than inside a running run.
+                        let mut audit = crate::tui::gate_receipts::tool_gate_audit_record(
+                            agent_id.as_deref(),
+                            &tool_id,
+                            &tool_name,
+                            gate,
+                            decision,
+                            risk.as_deref(),
+                            &reason,
+                        );
+                        audit["session_id"] = serde_json::json!(app.current_session_id);
+                        tokio::task::spawn_blocking(move || {
+                            log_sensitive_event("tool.gate.decision", audit);
+                        });
                         let receipt = crate::tui::gate_receipts::tool_gate_receipt(
                             app.ui_locale,
                             &tool_name,
@@ -7554,7 +7575,9 @@ pub(super) async fn handle_approval_required_event(
                     "mode": app.mode.label(),
                 }),
             );
-            let _ = engine_handle.deny_tool_call(id.clone()).await;
+            let _ = engine_handle
+                .deny_tool_call_by(id.clone(), crate::approval_log::ApprovalDecider::Posture)
+                .await;
             let notice = app
                 .tr(MessageId::ApprovalFullAccessPolicyBlocked)
                 .replace("{tool}", &tool_name);
@@ -7570,7 +7593,8 @@ pub(super) async fn handle_approval_required_event(
                     "mode": app.mode.label(),
                 }),
             );
-            let _ = engine_handle.approve_tool_call(id.clone()).await;
+            let by = auto_approval_decider(app, approval_force_prompt);
+            let _ = engine_handle.approve_tool_call_by(id.clone(), by).await;
         }
         ApprovalRequestDisposition::AutoDenyAutoReview => {
             log_sensitive_event(
@@ -7581,7 +7605,9 @@ pub(super) async fn handle_approval_required_event(
                     "mode": app.mode.label(),
                 }),
             );
-            let _ = engine_handle.deny_tool_call(id.clone()).await;
+            let _ = engine_handle
+                .deny_tool_call_by(id.clone(), crate::approval_log::ApprovalDecider::Posture)
+                .await;
             let held =
                 crate::tui::gate_receipts::auto_review_held_receipt(app.ui_locale, &tool_name);
             app.add_message(HistoryCell::System {
@@ -7601,7 +7627,9 @@ pub(super) async fn handle_approval_required_event(
                     "mode": app.mode.label(),
                 }),
             );
-            let _ = engine_handle.deny_tool_call(id.clone()).await;
+            let _ = engine_handle
+                .deny_tool_call_by(id.clone(), crate::approval_log::ApprovalDecider::Posture)
+                .await;
             app.push_status_toast_record(
                 StatusToast::new(
                     app.tr(MessageId::ApprovalNeverPostureBlocked)

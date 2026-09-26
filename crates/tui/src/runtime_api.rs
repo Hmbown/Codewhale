@@ -1384,6 +1384,11 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         )
         .route("/v1/threads/{id}/compact", post(compact_thread))
         .route("/v1/threads/{id}/usage", get(get_thread_usage))
+        .route("/v1/threads/{id}/receipt", get(get_thread_receipt))
+        .route(
+            "/v1/threads/{id}/turns/{turn_id}/receipt",
+            get(get_turn_receipt),
+        )
         .route("/v1/threads/{id}/events", get(stream_thread_events))
         .route("/v1/agent-mail", post(send_agent_mail))
         .route("/v1/threads/{id}/agent-mail", get(list_agent_mail))
@@ -4169,6 +4174,10 @@ struct ApprovalHistoryRow {
     approval_id: String,
     tool_name: String,
     outcome: String,
+    /// Who resolved it: `user`, `session_rule`, `posture`, or `host`.
+    /// Absent while pending and on records written before deciders were kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decided_by: Option<crate::approval_log::ApprovalDecider>,
     asked_at: chrono::DateTime<Utc>,
     decided_at: Option<chrono::DateTime<Utc>>,
 }
@@ -4198,6 +4207,7 @@ fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<Ap
                 approval_id: completed.ask.approval_id().to_string(),
                 tool_name: completed.ask.tool_name().unwrap_or("unknown").to_string(),
                 outcome: approval_outcome_label(&completed.outcome).to_string(),
+                decided_by: completed.decided_by,
                 asked_at,
                 decided_at: Some(completed.decided_at),
             }
@@ -4206,6 +4216,7 @@ fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<Ap
             approval_id: ask.approval_id().to_string(),
             tool_name: ask.tool_name().unwrap_or("unknown").to_string(),
             outcome: "pending".to_string(),
+            decided_by: None,
             asked_at: ask.created_at(),
             decided_at: None,
         }))
@@ -5566,6 +5577,44 @@ async fn get_thread_usage(
         thread_id: id,
         totals,
     }))
+}
+
+/// `GET /v1/threads/{id}/receipt` — what the thread did, built by the one
+/// receipt builder from the thread snapshot and its `approval.*` events
+/// (`docs/RECEIPTS.md`). Read-only.
+async fn get_thread_receipt(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::receipts::Receipt>, ApiError> {
+    thread_receipt(&state, &id, None).await.map(Json)
+}
+
+/// `GET /v1/threads/{id}/turns/{turn_id}/receipt` — the same receipt scoped
+/// to one turn.
+async fn get_turn_receipt(
+    State(state): State<RuntimeApiState>,
+    Path((id, turn_id)): Path<(String, String)>,
+) -> Result<Json<crate::receipts::Receipt>, ApiError> {
+    thread_receipt(&state, &id, Some(&turn_id)).await.map(Json)
+}
+
+async fn thread_receipt(
+    state: &RuntimeApiState,
+    id: &str,
+    turn: Option<&str>,
+) -> Result<crate::receipts::Receipt, ApiError> {
+    let detail = state
+        .runtime_threads
+        .get_thread_detail(id)
+        .await
+        .map_err(map_thread_err)?;
+    let events = state
+        .runtime_threads
+        .events_since_async(id, None)
+        .await
+        .map_err(map_thread_err)?;
+    crate::receipts::thread_receipt(&detail.thread, &detail.turns, &detail.items, &events, turn)
+        .map_err(|error| ApiError::not_found(error.to_string()))
 }
 
 async fn update_thread(

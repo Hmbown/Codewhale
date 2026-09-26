@@ -1997,6 +1997,39 @@ impl RuntimeThreadStore {
         Ok(store)
     }
 
+    /// Open an existing store only to read it: no directories, owner file,
+    /// torn-tail repair, or recovery. `None` when `root` holds no store.
+    /// Offline readers (`codewhale receipts`) use this so reading a thread
+    /// never mutates a store a live `codewhale serve` may own. Event reads
+    /// still take the shared event lock, so they see only committed records.
+    pub(crate) fn open_read_only(root: PathBuf) -> Result<Option<Self>> {
+        let root = checked_runtime_store_root(root)?;
+        let threads_dir = root.join("threads");
+        if !threads_dir.is_dir() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            threads_dir,
+            turns_dir: root.join("turns"),
+            items_dir: root.join("items"),
+            events_dir: root.join("events"),
+            goals_dir: root.join("goals"),
+            mail_dir: root.join("agent-mail"),
+            turn_operations_dir: root.join("turn-operations"),
+            owner_id: String::new(),
+            state_path: root.join("state.json"),
+            event_lock_path: root.join(EVENT_TRANSACTION_LOCK_FILE),
+            thread_mutation: Arc::new(parking_lot::Mutex::new(())),
+            turn_mutation: Arc::new(parking_lot::ReentrantMutex::new(())),
+            goal_mutation: Arc::new(parking_lot::Mutex::new(())),
+            mail_mutation: Arc::new(parking_lot::Mutex::new(())),
+            #[cfg(test)]
+            turn_dir_files_read: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            item_dir_files_read: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }))
+    }
+
     fn open_event_lock(&self) -> Result<File> {
         let file =
             open_runtime_store_file(&self.event_lock_path, "Runtime event lock", |options| {
@@ -13657,7 +13690,9 @@ impl RuntimeThreadManager {
                         .active_turn_authority(&thread_id, &turn_id, &engine)
                         .await
                     else {
-                        let _ = engine.deny_tool_call(&id).await;
+                        let _ = engine
+                            .deny_tool_call_by(&id, crate::approval_log::ApprovalDecider::Host)
+                            .await;
                         continue;
                     };
                     let auto_approve = authority.auto_approve;
@@ -13739,9 +13774,19 @@ impl RuntimeThreadManager {
                         .await
                         .ok();
                         if approved {
-                            let _ = engine.approve_tool_call(id).await;
+                            let _ = engine
+                                .approve_tool_call_by(
+                                    id,
+                                    crate::approval_log::ApprovalDecider::Posture,
+                                )
+                                .await;
                         } else {
-                            let _ = engine.deny_tool_call(id).await;
+                            let _ = engine
+                                .deny_tool_call_by(
+                                    id,
+                                    crate::approval_log::ApprovalDecider::Posture,
+                                )
+                                .await;
                         }
                         continue;
                     }
@@ -13768,7 +13813,9 @@ impl RuntimeThreadManager {
                         )
                         .await
                         .ok();
-                        let _ = engine.deny_tool_call(id).await;
+                        let _ = engine
+                            .deny_tool_call_by(id, crate::approval_log::ApprovalDecider::Posture)
+                            .await;
                         continue;
                     }
 
@@ -13812,7 +13859,12 @@ impl RuntimeThreadManager {
                         )
                         .await
                         .ok();
-                        let _ = engine.approve_tool_call(id).await;
+                        let _ = engine
+                            .approve_tool_call_by(
+                                id,
+                                crate::approval_log::ApprovalDecider::SessionRule,
+                            )
+                            .await;
                         continue;
                     }
 
@@ -13835,7 +13887,9 @@ impl RuntimeThreadManager {
                     };
                     let Some((approval_id, rx)) = registration else {
                         drop(projection);
-                        let _ = engine.deny_tool_call(&id).await;
+                        let _ = engine
+                            .deny_tool_call_by(&id, crate::approval_log::ApprovalDecider::Host)
+                            .await;
                         continue;
                     };
                     if let Err(err) = self
@@ -13858,7 +13912,9 @@ impl RuntimeThreadManager {
                     {
                         self.cancel_pending_approval(&approval_id);
                         drop(projection);
-                        let _ = engine.deny_tool_call(&id).await;
+                        let _ = engine
+                            .deny_tool_call_by(&id, crate::approval_log::ApprovalDecider::Host)
+                            .await;
                         return Err(err);
                     }
                     drop(projection);
@@ -13938,7 +13994,9 @@ impl RuntimeThreadManager {
                         )
                         .await
                         .ok();
-                        let _ = engine.deny_tool_call(id).await;
+                        let _ = engine
+                            .deny_tool_call_by(id, crate::approval_log::ApprovalDecider::Host)
+                            .await;
                         continue;
                     }
                     match decision {
@@ -14074,15 +14132,21 @@ impl RuntimeThreadManager {
                     match Self::approval_decision(auto_approve, trust_mode, true) {
                         RuntimeApprovalDecision::RetryWithFullAccess => {
                             let _ = engine
-                                .retry_tool_with_policy(
+                                .retry_tool_with_policy_by(
                                     tool_id,
                                     crate::sandbox::SandboxPolicy::DangerFullAccess,
+                                    crate::approval_log::ApprovalDecider::Posture,
                                 )
                                 .await;
                         }
                         RuntimeApprovalDecision::ApproveTool
                         | RuntimeApprovalDecision::DenyTool => {
-                            let _ = engine.deny_tool_call(tool_id).await;
+                            let _ = engine
+                                .deny_tool_call_by(
+                                    tool_id,
+                                    crate::approval_log::ApprovalDecider::Posture,
+                                )
+                                .await;
                         }
                     }
                 }

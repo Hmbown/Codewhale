@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use crate::approval_log::{ApprovalOutcome, ApprovalReceipt};
+use crate::approval_log::{ApprovalDecider, ApprovalOutcome, ApprovalReceipt};
 use crate::core::events::Event;
 use crate::tools::spec::ToolError;
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
@@ -39,9 +39,11 @@ use super::Engine;
 pub(super) enum ApprovalDecision {
     Approved {
         id: String,
+        by: ApprovalDecider,
     },
     Denied {
         id: String,
+        by: ApprovalDecider,
     },
     /// The interactive card expired unanswered (#6101): the configured
     /// bound denied the call, not the operator.
@@ -58,6 +60,7 @@ pub(super) enum ApprovalDecision {
     RetryWithPolicy {
         id: String,
         policy: crate::sandbox::SandboxPolicy,
+        by: ApprovalDecider,
     },
 }
 
@@ -134,12 +137,16 @@ impl Engine {
         })
     }
 
+    /// Record the decision half. `decided_by` is `None` only for a timeout,
+    /// whose outcome already names what ended the wait; a yes or a no always
+    /// says who answered.
     async fn commit_approval_outcome(
         &self,
         tool_id: &str,
         outcome: ApprovalOutcome,
+        decided_by: Option<ApprovalDecider>,
     ) -> Result<(), ToolError> {
-        self.commit_approval_receipt(ApprovalReceipt::decided(tool_id, outcome))
+        self.commit_approval_receipt(ApprovalReceipt::decided_with(tool_id, outcome, decided_by))
             .await
     }
 
@@ -152,8 +159,12 @@ impl Engine {
         self.commit_approval_receipt(ApprovalReceipt::asked(tool_id, tool_name))
             .await?;
         if self.tx_event.send(event).await.is_err() {
-            self.commit_approval_outcome(tool_id, ApprovalOutcome::Unavailable)
-                .await?;
+            self.commit_approval_outcome(
+                tool_id,
+                ApprovalOutcome::Unavailable,
+                Some(ApprovalDecider::Host),
+            )
+            .await?;
             return Err(ToolError::execution_failed(
                 "Approval request could not reach its decision host; tool execution was blocked."
                     .to_string(),
@@ -213,14 +224,14 @@ impl Engine {
                 }
                 _ = self.cancel_token.cancelled() => {
                     let suffix = self.cancel_reason_suffix();
-                    self.commit_approval_outcome(tool_id, ApprovalOutcome::Cancelled).await?;
+                    self.commit_approval_outcome(tool_id, ApprovalOutcome::Cancelled, Some(ApprovalDecider::Host)).await?;
                     return Err(ToolError::cancelled(
                         format!("Request cancelled while awaiting approval{suffix}"),
                     ));
                 }
                 decision = self.rx_approval.recv() => {
                     let Some(decision) = decision else {
-                        self.commit_approval_outcome(tool_id, ApprovalOutcome::Unavailable).await?;
+                        self.commit_approval_outcome(tool_id, ApprovalOutcome::Unavailable, Some(ApprovalDecider::Host)).await?;
                         return Err(ToolError::execution_failed(
                             "Approval channel closed — engine is shutting down. \
                              The approval modal can no longer reach the engine; \
@@ -229,20 +240,20 @@ impl Engine {
                         ));
                     };
                     match decision {
-                        ApprovalDecision::Approved { id } if id == tool_id => {
-                            self.commit_approval_outcome(tool_id, ApprovalOutcome::ApprovedOnce).await?;
+                        ApprovalDecision::Approved { id, by } if id == tool_id => {
+                            self.commit_approval_outcome(tool_id, ApprovalOutcome::ApprovedOnce, Some(by)).await?;
                             return Ok(ApprovalResult::Approved);
                         }
-                        ApprovalDecision::Denied { id } if id == tool_id => {
-                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Denied).await?;
+                        ApprovalDecision::Denied { id, by } if id == tool_id => {
+                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Denied, Some(by)).await?;
                             return Ok(ApprovalResult::Denied);
                         }
                         ApprovalDecision::TimedOut { id } if id == tool_id => {
-                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Timeout).await?;
+                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Timeout, None).await?;
                             return Ok(ApprovalResult::Denied);
                         }
                         ApprovalDecision::Unavailable { id } if id == tool_id => {
-                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Unavailable).await?;
+                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Unavailable, Some(ApprovalDecider::Host)).await?;
                             return Err(ToolError::execution_failed(
                                 "The approval request for this call was no longer current \
                                  (its turn had ended), so it was not shown to the user and \
@@ -250,10 +261,11 @@ impl Engine {
                                     .to_string(),
                             ));
                         }
-                        ApprovalDecision::RetryWithPolicy { id, policy } if id == tool_id => {
+                        ApprovalDecision::RetryWithPolicy { id, policy, by } if id == tool_id => {
                             self.commit_approval_outcome(
                                 tool_id,
                                 ApprovalOutcome::RetryWithPolicy { policy: policy.clone() },
+                                Some(by),
                             ).await?;
                             return Ok(ApprovalResult::RetryWithPolicy(policy));
                         }
@@ -1497,29 +1509,66 @@ mod tests {
         }
     }
 
+    /// Every closed outcome is persisted with the decider the handle was given,
+    /// so a receipt's "approved by you" is a person and nothing else.
     #[tokio::test]
     async fn keyless_engine_persists_every_closed_approval_outcome() {
         enum Decision {
             Approve,
+            ApproveBy(ApprovalDecider),
             Deny,
+            DenyBy(ApprovalDecider),
             Timeout,
             Cancel,
             Retry,
         }
         let cases = [
-            (Decision::Approve, ApprovalOutcome::ApprovedOnce),
-            (Decision::Deny, ApprovalOutcome::Denied),
-            (Decision::Timeout, ApprovalOutcome::Timeout),
-            (Decision::Cancel, ApprovalOutcome::Cancelled),
+            (
+                Decision::Approve,
+                ApprovalOutcome::ApprovedOnce,
+                Some(ApprovalDecider::User),
+            ),
+            (
+                Decision::ApproveBy(ApprovalDecider::Posture),
+                ApprovalOutcome::ApprovedOnce,
+                Some(ApprovalDecider::Posture),
+            ),
+            (
+                Decision::ApproveBy(ApprovalDecider::SessionRule),
+                ApprovalOutcome::ApprovedOnce,
+                Some(ApprovalDecider::SessionRule),
+            ),
+            (
+                Decision::Deny,
+                ApprovalOutcome::Denied,
+                Some(ApprovalDecider::User),
+            ),
+            (
+                Decision::DenyBy(ApprovalDecider::Posture),
+                ApprovalOutcome::Denied,
+                Some(ApprovalDecider::Posture),
+            ),
+            (
+                Decision::DenyBy(ApprovalDecider::Host),
+                ApprovalOutcome::Denied,
+                Some(ApprovalDecider::Host),
+            ),
+            (Decision::Timeout, ApprovalOutcome::Timeout, None),
+            (
+                Decision::Cancel,
+                ApprovalOutcome::Cancelled,
+                Some(ApprovalDecider::Host),
+            ),
             (
                 Decision::Retry,
                 ApprovalOutcome::RetryWithPolicy {
                     policy: SandboxPolicy::DangerFullAccess,
                 },
+                Some(ApprovalDecider::User),
             ),
         ];
 
-        for (index, (decision, expected)) in cases.into_iter().enumerate() {
+        for (index, (decision, expected, expected_by)) in cases.into_iter().enumerate() {
             let tmp = tempfile::tempdir().expect("tempdir");
             let (mut engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
             let store = crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions"));
@@ -1544,7 +1593,15 @@ mod tests {
             assert!(matches!(emitted, Event::ApprovalRequired { .. }));
             match decision {
                 Decision::Approve => handle.approve_tool_call(&tool_id).await.expect("approve"),
+                Decision::ApproveBy(by) => handle
+                    .approve_tool_call_by(&tool_id, by)
+                    .await
+                    .expect("approve by"),
                 Decision::Deny => handle.deny_tool_call(&tool_id).await.expect("deny"),
+                Decision::DenyBy(by) => handle
+                    .deny_tool_call_by(&tool_id, by)
+                    .await
+                    .expect("deny by"),
                 Decision::Timeout => handle
                     .deny_tool_call_timed_out(&tool_id)
                     .await
@@ -1576,6 +1633,7 @@ mod tests {
             let replay = store.replay(&session_id).expect("replay approvals");
             assert_eq!(replay.completed.len(), 1);
             assert_eq!(replay.completed[0].outcome, expected);
+            assert_eq!(replay.completed[0].decided_by, expected_by, "case {index}");
             assert!(replay.unmatched_asks.is_empty());
         }
     }
@@ -1611,6 +1669,7 @@ mod tests {
         let replay = store.replay(&session_id).expect("replay approvals");
         assert_eq!(replay.completed.len(), 1);
         assert_eq!(replay.completed[0].outcome, ApprovalOutcome::Unavailable);
+        assert_eq!(replay.completed[0].decided_by, Some(ApprovalDecider::Host));
     }
 
     #[tokio::test]

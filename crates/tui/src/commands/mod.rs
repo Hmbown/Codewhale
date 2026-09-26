@@ -1044,9 +1044,9 @@ mod tests {
                 has_debug = true;
                 assert_eq!(
                     commands.len(),
-                    13,
+                    14,
                     "debug group (group-local metadata exception) expected \
-                     exactly 13 commands, got {}",
+                     exactly 14 commands, got {}",
                     commands.len()
                 );
             }

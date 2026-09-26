@@ -22,6 +22,7 @@ use super::{
     CancelReason, EngineHandle, LiveRuntimeAuthority, Op, RuntimePermissionAuthority,
     UserInputResponse,
 };
+use crate::approval_log::ApprovalDecider;
 
 #[derive(Clone)]
 pub(super) struct TurnControl {
@@ -486,18 +487,37 @@ impl EngineHandle {
         }
     }
 
-    /// Approve a pending tool call
+    /// Approve a pending tool call because a person said yes.
     pub async fn approve_tool_call(&self, id: impl Into<String>) -> Result<()> {
+        self.approve_tool_call_by(id, ApprovalDecider::User).await
+    }
+
+    /// Approve a pending tool call, recording who answered: a person, a
+    /// session rule, or the active posture. The approval receipt keeps it.
+    pub async fn approve_tool_call_by(
+        &self,
+        id: impl Into<String>,
+        by: ApprovalDecider,
+    ) -> Result<()> {
         self.tx_approval
-            .send(ApprovalDecision::Approved { id: id.into() })
+            .send(ApprovalDecision::Approved { id: id.into(), by })
             .await?;
         Ok(())
     }
 
-    /// Deny a pending tool call
+    /// Deny a pending tool call because a person said no.
     pub async fn deny_tool_call(&self, id: impl Into<String>) -> Result<()> {
+        self.deny_tool_call_by(id, ApprovalDecider::User).await
+    }
+
+    /// Deny a pending tool call, recording who answered.
+    pub async fn deny_tool_call_by(
+        &self,
+        id: impl Into<String>,
+        by: ApprovalDecider,
+    ) -> Result<()> {
         self.tx_approval
-            .send(ApprovalDecision::Denied { id: id.into() })
+            .send(ApprovalDecision::Denied { id: id.into(), by })
             .await?;
         Ok(())
     }
@@ -523,16 +543,28 @@ impl EngineHandle {
         Ok(())
     }
 
-    /// Retry a tool call with an elevated sandbox policy.
+    /// Retry a tool call with an elevated sandbox policy a person chose.
     pub async fn retry_tool_with_policy(
         &self,
         id: impl Into<String>,
         policy: crate::sandbox::SandboxPolicy,
     ) -> Result<()> {
+        self.retry_tool_with_policy_by(id, policy, ApprovalDecider::User)
+            .await
+    }
+
+    /// Retry a tool call with an elevated sandbox policy, recording who chose it.
+    pub async fn retry_tool_with_policy_by(
+        &self,
+        id: impl Into<String>,
+        policy: crate::sandbox::SandboxPolicy,
+        by: ApprovalDecider,
+    ) -> Result<()> {
         self.tx_approval
             .send(ApprovalDecision::RetryWithPolicy {
                 id: id.into(),
                 policy,
+                by,
             })
             .await?;
         Ok(())

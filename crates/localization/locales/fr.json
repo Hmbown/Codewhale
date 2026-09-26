@@ -413,6 +413,7 @@
   "CmdConstitutionDescription": "Gérer la constitution permanente et ses aperçus",
   "CmdContextDescription": "Ouvrir l'inspecteur de contexte ou le rapport source-map",
   "CmdCostDescription": "Afficher le détail des coûts de la session",
+  "CmdReceiptsDescription": "Afficher ce que cette session a fait : fichiers, commandes, approbations",
   "CmdDiffDescription": "Afficher les modifications de fichiers depuis le début de la session",
   "CmdEditDescription": "Réviser et renvoyer le dernier message",
   "CmdExitDescription": "Quitter l'application",

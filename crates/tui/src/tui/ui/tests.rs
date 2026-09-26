@@ -25642,6 +25642,81 @@ async fn drain_approval_event(
     .await;
 }
 
+/// The answer carries who gave it: the posture for a call it allows or
+/// refuses on its own, the session rule for one a remembered grant or denial
+/// answers. A receipt's "by you" depends on this.
+#[tokio::test]
+async fn auto_answered_approvals_name_their_decider() {
+    use crate::approval_log::ApprovalDecider;
+    use crate::core::engine::MockApprovalEvent;
+    const GROUP: &str = "shell:exec_shell:cargo test";
+    let parent = |id: &str| EngineEvent::ApprovalRequired {
+        id: id.to_string(),
+        tool_name: "exec_shell".to_string(),
+        description: "run the tests".to_string(),
+        input: serde_json::json!({"command": "cargo test"}),
+        approval_key: format!("key-{id}"),
+        approval_grouping_key: GROUP.to_string(),
+        intent_summary: None,
+        approval_force_prompt: false,
+    };
+    let approved = |id: &str| MockApprovalEvent::Approved { id: id.to_string() };
+    let denied = |id: &str| MockApprovalEvent::Denied { id: id.to_string() };
+    let cases = [
+        (
+            ApprovalMode::Bypass,
+            "full",
+            approved("full"),
+            ApprovalDecider::Posture,
+        ),
+        (
+            ApprovalMode::Suggest,
+            "grant",
+            approved("grant"),
+            ApprovalDecider::SessionRule,
+        ),
+        (
+            ApprovalMode::Suggest,
+            "denial",
+            denied("denial"),
+            ApprovalDecider::SessionRule,
+        ),
+        (
+            ApprovalMode::Never,
+            "never",
+            denied("never"),
+            ApprovalDecider::Posture,
+        ),
+        (
+            ApprovalMode::Auto,
+            "review",
+            denied("review"),
+            ApprovalDecider::Posture,
+        ),
+    ];
+    for (mode, id, expected, by) in cases {
+        let mut app = ask_posture_app();
+        app.approval_mode = mode;
+        app.is_loading = true;
+        match id {
+            "grant" => {
+                app.approval_session_approved.insert(GROUP.to_string());
+            }
+            "denial" => {
+                app.approval_session_denied.insert(format!("key-{id}"));
+            }
+            _ => {}
+        }
+        let mut mock = mock_engine_handle();
+        drain_approval_event(&mut app, &mock.handle, parent(id)).await;
+        assert_eq!(
+            mock.recv_approval_decision().await,
+            Some((expected, Some(by))),
+            "{mode:?} {id}"
+        );
+    }
+}
+
 fn ask_posture_app() -> App {
     let mut app = create_test_app();
     app.mode = AppMode::Agent;

@@ -416,6 +416,7 @@
   "CmdConstitutionDescription": "Administrar la constitución permanente y vistas previas",
   "CmdContextDescription": "Abrir el inspector compacto de contexto de la sesión",
   "CmdCostDescription": "Mostrar el desglose de costo de la sesión",
+  "CmdReceiptsDescription": "Mostrar lo que hizo esta sesión: archivos, comandos, aprobaciones",
   "CmdDiffDescription": "Mostrar cambios en archivos desde el inicio de la sesión",
   "CmdEditDescription": "Revisar y reenviar el último mensaje",
   "CmdExitDescription": "Salir de la aplicación",

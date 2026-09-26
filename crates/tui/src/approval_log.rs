@@ -26,6 +26,25 @@ pub(crate) enum ApprovalOutcome {
     },
 }
 
+/// Who resolved an approval request. Recorded on the decision half so a
+/// receipt says "approved by you" only when a person answered. Records
+/// written before this field existed carry no decider; readers report it as
+/// not recorded rather than guessing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ApprovalDecider {
+    /// A person answered the prompt: the terminal card, the app, the web
+    /// mirror, or a Runtime API client acting for them.
+    User,
+    /// A remembered "allow/deny for this session" rule answered it.
+    SessionRule,
+    /// The active mode or permission posture answered it without a prompt.
+    Posture,
+    /// The host resolved it without a person: the turn had ended, was
+    /// cancelled, or the decision channel closed.
+    Host,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub(crate) enum ApprovalReceipt {
@@ -40,6 +59,8 @@ pub(crate) enum ApprovalReceipt {
         tool_call_id: String,
         outcome: ApprovalOutcome,
         created_at: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decided_by: Option<ApprovalDecider>,
     },
 }
 
@@ -54,13 +75,23 @@ impl ApprovalReceipt {
         }
     }
 
+    /// A decision whose decider this call site does not know.
     pub(crate) fn decided(tool_call_id: impl Into<String>, outcome: ApprovalOutcome) -> Self {
+        Self::decided_with(tool_call_id, outcome, None)
+    }
+
+    pub(crate) fn decided_with(
+        tool_call_id: impl Into<String>,
+        outcome: ApprovalOutcome,
+        decided_by: Option<ApprovalDecider>,
+    ) -> Self {
         let tool_call_id = tool_call_id.into();
         Self::Decided {
             approval_id: tool_call_id.clone(),
             tool_call_id,
             outcome,
             created_at: Utc::now(),
+            decided_by,
         }
     }
 
@@ -96,6 +127,7 @@ pub(crate) struct CompletedApproval {
     pub(crate) ask: ApprovalReceipt,
     pub(crate) outcome: ApprovalOutcome,
     pub(crate) decided_at: DateTime<Utc>,
+    pub(crate) decided_by: Option<ApprovalDecider>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -142,7 +174,7 @@ impl ApprovalReplay {
                     tool_call_id,
                     outcome,
                     created_at,
-                    ..
+                    decided_by,
                 } => {
                     if approval_id != tool_call_id {
                         return Err(format!(
@@ -159,6 +191,7 @@ impl ApprovalReplay {
                         ask,
                         outcome: outcome.clone(),
                         decided_at: *created_at,
+                        decided_by: *decided_by,
                     });
                 }
             }

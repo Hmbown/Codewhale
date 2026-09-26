@@ -416,6 +416,7 @@
   "CmdConstitutionDescription": "管理长期宪章与预览",
   "CmdContextDescription": "打开压缩会话上下文检查器或源映射报告",
   "CmdCostDescription": "显示本次会话的费用明细",
+  "CmdReceiptsDescription": "显示本次会话做了什么：文件、命令、审批",
   "CmdDiffDescription": "显示会话开始以来的文件变更",
   "CmdEditDescription": "修改并重新提交最后一条消息",
   "CmdExitDescription": "退出应用",

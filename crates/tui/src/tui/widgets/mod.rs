@@ -2872,7 +2872,7 @@ fn category_label_for(request: &ApprovalRequest, locale: Locale) -> (Cow<'static
     // "Connected app (github)": name the server the tool comes from.
     let label = match (
         category,
-        crate::tui::approval::connected_app_server(&request.tool_name),
+        crate::mcp::connected_app_server(&request.tool_name),
     ) {
         (ToolCategory::McpRead | ToolCategory::McpAction, Some(server)) => {
             Cow::Owned(format!("{label} ({server})"))

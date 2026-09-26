@@ -135,6 +135,10 @@ fn agent_list_event(manager: &SubAgentManager, active_session_id: &str) -> Event
     }
 }
 
+/// The `<turn_meta>` line naming the permission posture a turn ran under
+/// (`permission_chip_label`). Receipts read it back from saved transcripts,
+/// so the writer and the reader share this prefix.
+pub(crate) const PERMISSION_POSTURE_LINE: &str = "Current permission posture: ";
 const MCP_REGISTRY_FIRST_INSTRUCTION_SOURCE: &str = "runtime:mcp-registry-first";
 const MCP_REGISTRY_FIRST_INSTRUCTION: &str = "## MCP Registry\n\nThe Registry installs and connects a local MCP server when this session lacks a capability. It is a fallback for a capability you do not have, not a step before ordinary work.\n\nPrefer what is already available, in order: tools already in this catalog, the project's own scripts, tests, and dev tooling, and platform capabilities. Creating a file, reading a fixture, running a repo command, and checking your own output are ordinary work — do them directly.\n\nReach for the Registry once you have identified a specific capability that no available tool covers and that you would otherwise install or reimplement, such as a document or media converter, access to an external database or service, or a protocol client. Then call `registry_sync` with a `query` naming that capability; it scores the local Registry snapshot host-side and returns at most eight matches, so the full index never enters the conversation. When a returned server plausibly covers that capability, call `start_registry_mcp_server` with its exact name rather than installing or running its package command through the shell. If nothing matches, refine the query once, then continue with local tools.\n\nBoth Registry tools are deferred: load one with `tool_search` before its first call, and use the returned schema. If a call instead reports that it only loaded the schema, retry once with that schema. Do not go searching for them for work you can already do.";
 /// The one system prompt for an isolated Runtime Chat session. The engine owns
@@ -2659,10 +2663,10 @@ impl Engine {
     ) -> bool {
         use crate::tools::subagent::{ChildApprovalOutcome, SubAgentManager};
         let (id, outcome) = match &decision {
-            super::engine::approval::ApprovalDecision::Approved { id } => {
+            super::engine::approval::ApprovalDecision::Approved { id, .. } => {
                 (id.clone(), ChildApprovalOutcome::Approved)
             }
-            super::engine::approval::ApprovalDecision::Denied { id } => {
+            super::engine::approval::ApprovalDecision::Denied { id, .. } => {
                 (id.clone(), ChildApprovalOutcome::Denied)
             }
             // A child has no timeout outcome of its own (#6101); an expired
@@ -3904,7 +3908,7 @@ impl Engine {
             // `render_environment_block` for the prefix-cache rationale).
             format!("Current workspace: {}", self.config.workspace.display()),
             format!(
-                "Current permission posture: {}",
+                "{PERMISSION_POSTURE_LINE}{}",
                 approval_mode.permission_chip_label()
             ),
             format!(
@@ -7869,15 +7873,26 @@ pub(crate) enum MockApprovalEvent {
 #[cfg(test)]
 impl MockEngineHandle {
     pub(crate) async fn recv_approval_event(&mut self) -> Option<MockApprovalEvent> {
-        match self.rx_approval.recv().await? {
-            ApprovalDecision::Approved { id } => Some(MockApprovalEvent::Approved { id }),
-            ApprovalDecision::Denied { id } => Some(MockApprovalEvent::Denied { id }),
-            ApprovalDecision::TimedOut { id } => Some(MockApprovalEvent::TimedOut { id }),
-            ApprovalDecision::Unavailable { id } => Some(MockApprovalEvent::Unavailable { id }),
-            ApprovalDecision::RetryWithPolicy { id, policy } => {
-                Some(MockApprovalEvent::RetryWithPolicy { id, policy })
+        self.recv_approval_decision().await.map(|(event, _)| event)
+    }
+
+    /// The next decision and who the host said made it (`None` for a
+    /// timeout or an unavailable request, which name their own cause).
+    pub(crate) async fn recv_approval_decision(
+        &mut self,
+    ) -> Option<(
+        MockApprovalEvent,
+        Option<crate::approval_log::ApprovalDecider>,
+    )> {
+        Some(match self.rx_approval.recv().await? {
+            ApprovalDecision::Approved { id, by } => (MockApprovalEvent::Approved { id }, Some(by)),
+            ApprovalDecision::Denied { id, by } => (MockApprovalEvent::Denied { id }, Some(by)),
+            ApprovalDecision::TimedOut { id } => (MockApprovalEvent::TimedOut { id }, None),
+            ApprovalDecision::Unavailable { id } => (MockApprovalEvent::Unavailable { id }, None),
+            ApprovalDecision::RetryWithPolicy { id, policy, by } => {
+                (MockApprovalEvent::RetryWithPolicy { id, policy }, Some(by))
             }
-        }
+        })
     }
 
     pub(crate) async fn recv_user_input_submission(

@@ -359,7 +359,7 @@ this; the table maps each integration need to where a local client reads it.
 | Event stream | `GET /v1/threads/{id}/events` (replay + live SSE) | available |
 | Turn status / terminal classification | `TurnRecord.status` + error summary | available |
 | Token usage | `TurnRecord.usage`; aggregate via `GET /v1/usage` | available |
-| Single-read run receipt (route + usage + cost) | `GET /v1/threads/{id}/turns/{turn_id}/receipt` | proposed ([RECEIPTS.md](RECEIPTS.md)) |
+| Action receipt (files, commands, web/MCP calls, agents, approvals and who decided, failures) | `GET /v1/threads/{id}/receipt`, `GET /v1/threads/{id}/turns/{turn_id}/receipt` | available ([RECEIPTS.md](RECEIPTS.md)) |
 
 For one-shot/headless automation, prefer `codewhale exec` with explicit
 `--provider <id> --model <id>` so a failure identifies the exact provider/model
@@ -691,6 +691,10 @@ and live state comes only from a resumed thread's SSE stream.
 - `PATCH /v1/threads/{id}` (see body shape below)
 - `POST /v1/threads/{id}/resume`
 - `POST /v1/threads/{id}/fork`
+- `GET /v1/threads/{id}/receipt` — what the thread did, one entry per action
+  (read-only; shape in [RECEIPTS.md](RECEIPTS.md))
+- `GET /v1/threads/{id}/turns/{turn_id}/receipt` — the same, for one turn;
+  `404` for an unknown thread or a turn that is not this thread's
 
 `POST /v1/threads` accepts optional execution defaults in addition to the
 provider, model, workspace, and permission fields:
