@@ -1012,14 +1012,48 @@ shutdown may close the model receiver after acceptance. Once the Runtime has
 accepted the result, that call is terminal and a duplicate result returns 404.
 
 **Events** (SSE replay + live stream)
-- `GET /v1/threads/{id}/events?since_seq=<u64>`
+- `GET /v1/threads/{id}/events?since_seq=<u64>&replay_limit=<n>&progress=true`
+
+Cursors:
+
+- `since_seq` is the per-thread cursor: events with `seq > since_seq` are sent.
+  Omitted (and no `Last-Event-ID`), the stream starts from the beginning of the
+  thread's history.
+- Every journal frame carries `id: <seq>`, so a browser `EventSource` can
+  resume through the `Last-Event-ID` header it sends on reconnect. An explicit
+  `since_seq` wins over the header, so a deliberate replay from `0` is never
+  overridden by a stale id. A header value that is not a decimal integer is
+  ignored.
+- `replay_limit` (at most 4096) returns only the newest tail of the requested
+  history; `previous_seq` on the first returned event advances past exactly the
+  omitted history.
 
 Durable history parsing runs off the async server workers and reaches SSE in
 bounded batches of at most 256 events through a backpressured channel. Broadcast
 delivery is only a wake-up optimization: a lagged receiver opens the same
-bounded durable replay from its last accepted cursor. Optional `replay_limit`
-returns the newest requested tail and may not exceed 4096; `previous_seq` on
-the first returned event advances past exactly the omitted history.
+bounded durable replay from its last accepted cursor.
+
+`progress=true` adds `stream.progress` transport frames
+(`{schema_version, event, kind, thread_id, seq, state}`, `state` is
+`replaying` or `live`) at the current cursor and advertises them with
+`x-codewhale-event-progress: 1`. The stream reports `live` only after durable
+history and the already-queued live tail are both drained; broadcast-lag
+recovery returns it to `replaying`. Progress frames never carry a new sequence
+number.
+
+Failures before the stream opens are ordinary HTTP errors with the JSON error
+body, never SSE:
+
+| Status | When |
+| --- | --- |
+| `401` / `403` | Missing or wrong Runtime credential |
+| `404` | Unknown thread |
+| `400` | `replay_limit` above 4096 |
+| `500` | The durable history could not be opened (including a replay worker crash before the first cursor) |
+
+Once the response is `200`, every end the server chooses is a final
+`stream.end` frame; see [Ending and resuming a thread
+stream](#ending-and-resuming-a-thread-stream).
 
 **Snapshots** (side-git restore point listing + restore)
 - `GET /v1/snapshots?limit=20`
@@ -1837,6 +1871,66 @@ Compatibility notes:
 - `timestamp` remains the canonical event time for schema version 1. `created_at`
   is an equivalent alias for clients that use `created_at` naming elsewhere; do
   not require both fields to be present.
+
+### Ending and resuming a thread stream
+
+Whenever the server ends a `/v1/threads/{id}/events` stream that already
+returned `200`, the last frame is `stream.end`, sent exactly once and always
+(it does not need `progress=true`):
+
+```
+event: stream.end
+data: {"schema_version":1,"event":"stream.end","kind":"stream.end","thread_id":"thr_1234abcd","reason":"replay_failed","last_seq":42,"retryable":true}
+```
+
+- It is a transport frame, not a journal event: it has **no `seq`** and **no
+  SSE `id:`**. Clients that acknowledge on `seq` skip it, and a browser's
+  `Last-Event-ID` stays on the last real event.
+- `last_seq` is the stream's cursor when it ended: the last journal `seq`
+  delivered on this connection, or the effective start cursor if none was
+  (after a `replay_limit` tail, that is already past the omitted history). It
+  is exactly the `since_seq` that resumes with no loss and no repeats.
+- `retryable` says whether resuming from `last_seq` can succeed. Key the client
+  on it, not on the reason list. Treat an unknown `reason` by its `retryable`.
+- There is no free-text message. The underlying error is in the Runtime log,
+  and it can contain store paths.
+
+| `reason` | Meaning | `retryable` |
+| --- | --- | --- |
+| `replay_failed` | The durable history read that feeds the opening replay failed, including a replay worker crash after the first cursor | `true` |
+| `catch_up_failed` | After broadcast lag, the durable re-read from the stream's cursor could not be opened or failed | `true` |
+| `runtime_shutdown` | The Runtime API server is stopping (SIGINT, SIGTERM, or SIGHUP; Ctrl+C or Ctrl+Break on Windows). Open streams get this frame within a bounded drain window before the process exits | `true` |
+
+Every `200` response carries `x-codewhale-stream-end: 1`. With that header, an
+EOF **without** `stream.end` means the connection or the Runtime process died
+without the server choosing to end the stream: a network or proxy drop, a
+crash, or a kill that allows no drain (for example `SIGKILL`). A Runtime that
+predates this frame sends no header; there EOF stays ambiguous, so treat it as
+connection loss.
+
+Client resume rule:
+
+1. Keep `cursor` = the `seq` of the last journal frame you accepted. Ignore
+   frames with `seq <= cursor`. If a frame's `previous_seq` is not your
+   `cursor`, you missed events: reload the thread snapshot rather than trust
+   local state.
+2. On `stream.end` with `retryable: true`, reconnect with
+   `since_seq = last_seq` after a bounded backoff, and tell the user what the
+   Runtime said (for example, "Runtime is shutting down — reconnecting").
+   With `retryable: false`, stop, show the reason, and fall back to the
+   snapshot.
+3. On EOF or a transport error without `stream.end`, reconnect with
+   `since_seq = cursor` after a bounded backoff and show a connection problem,
+   not a Runtime error.
+4. A `401`/`403` or `404` before the stream opens is terminal (a credential or
+   thread problem). Retry `5xx` with backoff.
+5. Never reconnect from `0` to "start over": replay is idempotent only by
+   cursor.
+
+Fleet streams (`/v1/fleet/runs/{run_id}/events`) keep their own end frames,
+`fleet.stream.error {retryable}` and `fleet.replay.cursor_unavailable`. They
+differ from `stream.end`: they carry no cursor, because a Fleet client resumes
+from the opaque `cursor` of the last Fleet event it accepted.
 
 ### Steer delivery
 

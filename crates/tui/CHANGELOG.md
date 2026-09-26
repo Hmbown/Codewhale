@@ -51,6 +51,12 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Fixed
 
+- Runtime API: the thread event stream now ends with a typed `stream.end`
+  frame (reason and resume cursor) whenever the server closes it, including
+  on shutdown, so clients can tell a Runtime error from a dropped connection
+  and resume from the right event. A replay worker crash no longer ends
+  history early and skips events without a detectable gap, and the mobile
+  page resumes from its last event instead of replaying from zero.
 - `codewhale exec --auto` no longer exits 141 with no output when a child
   it writes to, such as a stdio MCP server, closes its pipe early. Headless
   exec now ignores SIGPIPE while it runs, as the interactive TUI already did,

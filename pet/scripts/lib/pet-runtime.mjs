@@ -2,6 +2,13 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { privacyEvent, redact } from '../../dist/core/ingest.js';
 import { CodewhaleRuntimeTrace, isCodewhaleRuntimeRecord, observeRuntimeRequests } from '../../dist/core/codewhale.js';
 
+/** What each Runtime `stream.end` reason means, for the recorder's report. */
+const STREAM_END_REASONS = Object.freeze({
+  replay_failed: 'Runtime could not read the thread history',
+  catch_up_failed: 'Runtime fell behind and could not catch up',
+  runtime_shutdown: 'Runtime is shutting down',
+});
+
 /** A read-only transport for the existing Runtime journal. All event meaning
  * remains in Whalesong's importer and canonical pet bucketer. No raw journal,
  * prompt, tool argument or bearer token is written into the pet recording. */
@@ -54,6 +61,18 @@ export async function followRuntime({ baseUrl, threadId, token, report = () => {
               throw new Error('Invalid Runtime replay progress.');
             connected = record.state === 'live';
             continue;
+          }
+          if (record?.event === 'stream.end') {
+            // Runtime ended the stream on purpose at our cursor. Resume from it,
+            // and say what Runtime said rather than blame the connection.
+            if (record.thread_id !== threadId || record.last_seq !== cursor || typeof record.retryable !== 'boolean')
+              throw new Error('Invalid Runtime stream end.');
+            const why = STREAM_END_REASONS[record.reason] ?? 'Runtime ended the stream';
+            if (!record.retryable) fatal = true;
+            report(fatal
+              ? `Runtime input stopped: ${why}, and the stream cannot resume. Recording remains unobserved.`
+              : `Runtime input paused: ${why}; reconnecting from the last cursor.`);
+            break;
           }
           if (!isCodewhaleRuntimeRecord(record) || record.thread_id !== threadId || !Number.isSafeInteger(record.seq) || record.seq < 0)
             throw new Error('Invalid Runtime envelope.');

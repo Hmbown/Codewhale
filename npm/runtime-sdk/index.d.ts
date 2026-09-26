@@ -313,10 +313,28 @@ export interface ThreadRuntimeEvent {
 
 /** Transport progress at the existing journal cursor; never a new event. */
 export interface ThreadStreamProgress {
+  schema_version?: number;
   event: "stream.progress";
+  kind?: "stream.progress";
   thread_id: string;
   seq: number;
   state: "replaying" | "live";
+}
+
+/**
+ * The final frame whenever the Runtime ends a thread stream on purpose. It is
+ * not a journal event (no `seq`). Resume with `sinceSeq: last_seq` when
+ * `retryable`; stop and fall back to the thread snapshot otherwise. A stream
+ * that ends without this frame lost its connection; resume from your cursor.
+ */
+export interface ThreadStreamEnd {
+  schema_version: number;
+  event: "stream.end";
+  kind: "stream.end";
+  thread_id: string;
+  reason: "replay_failed" | "catch_up_failed" | "runtime_shutdown" | (string & {});
+  last_seq: number;
+  retryable: boolean;
 }
 
 export interface ThreadEventOptions {
@@ -353,9 +371,9 @@ export class CodeWhaleRuntimeClient {
     runId: FleetRunId,
     options?: FleetEventOptions & { path?: string },
   ): AsyncIterable<FleetStreamEvent>;
-  threadEvents(threadId: string, options: ThreadEventOptions & { includeProgress: true }): AsyncIterable<ThreadRuntimeEvent | ThreadStreamProgress>;
-  threadEvents(threadId: string, options?: ThreadEventOptions & { includeProgress?: false }): AsyncIterable<ThreadRuntimeEvent>;
-  threadEvents(threadId: string, options: ThreadEventOptions & { includeProgress: boolean }): AsyncIterable<ThreadRuntimeEvent | ThreadStreamProgress>;
+  threadEvents(threadId: string, options: ThreadEventOptions & { includeProgress: true }): AsyncIterable<ThreadRuntimeEvent | ThreadStreamProgress | ThreadStreamEnd>;
+  threadEvents(threadId: string, options?: ThreadEventOptions & { includeProgress?: false }): AsyncIterable<ThreadRuntimeEvent | ThreadStreamEnd>;
+  threadEvents(threadId: string, options: ThreadEventOptions & { includeProgress: boolean }): AsyncIterable<ThreadRuntimeEvent | ThreadStreamProgress | ThreadStreamEnd>;
 }
 
 export function createRuntimeClient(options?: RuntimeClientOptions): CodeWhaleRuntimeClient;

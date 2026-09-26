@@ -53,3 +53,12 @@ test('thread progress fails explicitly and closes the stream when an older Runti
   await assert.rejects(collect(client.threadEvents('t', { includeProgress: true })), error => error.capability === 'thread_event_progress' && error.status === 501);
   assert.equal(canceled, true);
 });
+
+test('a server-ended thread stream yields its typed stream.end frame last', async () => {
+  const record = { seq: 17, previous_seq: 9, event: 'item.completed', thread_id: 't', timestamp: '2026-09-12T00:00:00Z', payload: {} };
+  const end = { schema_version: 1, event: 'stream.end', kind: 'stream.end', thread_id: 't', reason: 'replay_failed', last_seq: 17, retryable: true };
+  const raw = `event: item.completed\nid: 17\ndata: ${JSON.stringify(record)}\n\nevent: stream.end\ndata: ${JSON.stringify(end)}\n\n`;
+  const client = clientFor([raw], () => {}, { 'x-codewhale-stream-end': '1' });
+  // The journal frame's SSE id becomes its cursor; stream.end carries none.
+  assert.deepEqual(await collect(client.threadEvents('t', { sinceSeq: 9 })), [{ ...record, cursor: '17' }, end]);
+});
