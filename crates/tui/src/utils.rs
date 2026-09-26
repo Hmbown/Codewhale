@@ -888,6 +888,9 @@ where
 /// Truncate a string to a maximum length, adding an ellipsis if truncated.
 ///
 /// Uses char boundaries to avoid panicking on multi-byte UTF-8 characters.
+///
+/// Known limitation: when `max_len` is smaller than the ellipsis, the result
+/// is the ellipsis alone and exceeds `max_len`.
 #[must_use]
 pub fn truncate_with_ellipsis(s: &str, max_len: usize, ellipsis: &str) -> String {
     if s.len() <= max_len {
@@ -921,6 +924,50 @@ pub fn url_encode(input: &str) -> String {
         }
     }
     encoded
+}
+
+#[cfg(test)]
+mod truncate_with_ellipsis_tests {
+    use super::truncate_with_ellipsis;
+
+    #[test]
+    fn cuts_on_char_boundaries_not_mid_character() {
+        // Latin-1 supplement: é and ö are two bytes each. Byte budget 7 ends
+        // after the space (byte 6), so the `w` at byte 7 is excluded even
+        // though its boundary index fits the budget.
+        let out = truncate_with_ellipsis("héllo wörld, a longer tail", 10, "…");
+        assert_eq!(out, "héllo …");
+    }
+
+    #[test]
+    fn cuts_cjk_on_boundaries_not_mid_character() {
+        // Each CJK char is three bytes. At max_len 5 the byte budget is 2,
+        // which is not a char boundary: the pre-#3 raw byte slice panicked
+        // here ("end byte index 2 is not a char boundary"), while the new
+        // code emits only the ellipsis. At max_len 6 the budget of 3 is a
+        // boundary and holds exactly `你`.
+        assert_eq!(truncate_with_ellipsis("你好世界 and more", 5, "…"), "…");
+        assert_eq!(truncate_with_ellipsis("你好世界 and more", 6, "…"), "你…");
+    }
+
+    #[test]
+    fn short_string_is_returned_unchanged() {
+        assert_eq!(truncate_with_ellipsis("héllo", 10, "…"), "héllo");
+        assert_eq!(truncate_with_ellipsis("你好", 6, "…"), "你好");
+    }
+
+    #[test]
+    fn budget_smaller_than_ellipsis_yields_the_ellipsis() {
+        // budget saturates to 0, so the prefix is empty even though the
+        // result may exceed `max_len` — the documented limitation above.
+        assert_eq!(truncate_with_ellipsis("héllo wörld", 1, "…"), "…");
+    }
+
+    #[test]
+    fn ascii_exact_fit_is_not_truncated() {
+        assert_eq!(truncate_with_ellipsis("abcdef", 6, "..."), "abcdef");
+        assert_eq!(truncate_with_ellipsis("abcdefg", 6, "..."), "abc...");
+    }
 }
 
 /// Render a path for **user-facing display** with the home directory
