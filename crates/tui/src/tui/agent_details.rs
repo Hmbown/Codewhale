@@ -118,11 +118,7 @@ pub(crate) fn safe_agent_display_name(app: &App, agent_id: &str) -> String {
             .map(|agent| (agent.agent_id.as_str(), agent.nickname.as_deref())),
         app.ui_locale.tag(),
     );
-    app.subagent_cache
-        .iter()
-        .find(|agent| agent.agent_id == agent_id)
-        .and_then(crate::tui::sidebar::dispatched_agent_name)
-        .map(str::to_string)
+    app.agent_given_name(agent_id)
         .or_else(|| generated.get(agent_id).cloned())
         .or_else(|| app.agent_label_map.get(agent_id).cloned())
         .and_then(|name| safe_child_value(app, &name))

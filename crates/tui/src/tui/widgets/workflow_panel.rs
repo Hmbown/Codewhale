@@ -1,8 +1,9 @@
-//! WorkflowPanel — unified activity surface for workflow / sub-agent progress.
+//! WorkflowPanel — one workflow run's state, reduced from its event stream.
 //!
-//! Issue #4121 (CODEWHALE_0_8_68 §2.4). Progress lives here instead of flooding
-//! the chat transcript: a collapsible header above the composer plus an
-//! expanded phase/row body. Events are applied through [`WorkflowPanelEvent`].
+//! Issue #4121 (CODEWHALE_0_8_68 §2.4). Progress lives off the transcript: the
+//! workbar under the composer (`workbar.rs`) paints one row per run from this
+//! state, and `/workflows` holds the detail. Events are applied through
+//! [`WorkflowPanelEvent`].
 //!
 //! Issue #4122 routes the same event stream into a compact history card that
 //! reuses this state machine: collapsed summarizes lifecycle/children/phases/
@@ -13,30 +14,17 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
 use serde_json::{Value, json};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::ui_text::truncate_line_to_width;
-use crate::tui::widgets::Renderable;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
 
-/// Maximum worker rows rendered under the selected phase.
-const MAX_VISIBLE_ROWS: usize = 8;
 /// Maximum phase summary chips shown in the expanded body.
 const MAX_PHASE_SUMMARY: usize = 6;
-/// Widest the live header's short title may grow (#6503). The goal is a
-/// prompt, not a name; the header only needs enough of it to recognise the run.
-const HEADER_TITLE_MAX_COLS: usize = 48;
-/// Below this the title is noise; drop it and keep the counts.
-const HEADER_TITLE_MIN_COLS: usize = 8;
-/// Widest a live child-row name column grows before it truncates.
-const ROW_LABEL_MAX_COLS: usize = 24;
 /// Newest rejected dispatches retained by the panel. The workflow journal is
 /// the durable, unbounded source of truth; this is only a compact UI tail.
 const MAX_DISPATCH_FAILURES_RETAINED: usize = 12;
@@ -649,9 +637,6 @@ pub struct WorkflowPanel {
     pub run_id: String,
     pub label: String,
     pub lifecycle: WorkflowPanelLifecycle,
-    pub expanded: bool,
-    /// When true the panel accepts `t`/`c` keyboard shortcuts.
-    pub keyboard_focus: bool,
     pub phases: Vec<WorkflowPanelPhase>,
     pub selected_phase: usize,
     pub gates: Vec<WorkflowPanelGateLine>,
@@ -674,6 +659,10 @@ pub struct WorkflowPanel {
     /// UI locale for rendered copy. Defaults to English; hosts with app
     /// access set it after construction (#4057 wave 2).
     pub locale: Locale,
+    /// Whether the transcript already carries this run's finish line. The live
+    /// stream and the tool-complete hydration can both deliver the terminal
+    /// event; the line is written once.
+    pub finish_announced: bool,
     /// Direct-agent cards reuse the Workflow history layout but do not carry a
     /// Workflow launch receipt. Keep that distinction explicit so the shared
     /// renderer never invents unknown Workflow provenance for them (#4039).
@@ -697,8 +686,6 @@ impl WorkflowPanel {
             run_id: run_id.into(),
             label: label.into(),
             lifecycle: WorkflowPanelLifecycle::Running,
-            expanded: true, // auto-expand while running
-            keyboard_focus: false,
             phases: Vec::new(),
             selected_phase: 0,
             gates: Vec::new(),
@@ -714,6 +701,7 @@ impl WorkflowPanel {
             source_path: None,
             spillover_path: None,
             locale: Locale::En,
+            finish_announced: false,
             show_workflow_receipts: true,
         }
     }
@@ -1066,16 +1054,6 @@ impl WorkflowPanel {
         crate::elapsed::format_elapsed_ms(end.saturating_sub(self.started_at_ms))
     }
 
-    /// Compact summary line content (without card chrome). Callers in
-    /// `history.rs` wrap this with the shared tool-header + rail, whose status
-    /// word already states the lifecycle — so it is not repeated here
-    /// (`fanout running · workflow running · …`, #6503).
-    #[must_use]
-    pub fn history_header_summary(&self, width: usize) -> String {
-        let raw = format!("workflow · {}", self.summary_counts_text());
-        truncate_line_to_width(&raw, width.max(1))
-    }
-
     /// Expanded history-card body lines (phase/child summaries, links,
     /// result, failures). Empty when the card should stay compact.
     #[must_use]
@@ -1350,7 +1328,6 @@ impl WorkflowPanel {
         let mut panel = Self::new(agent_id.clone(), role.clone(), started_at_ms);
         panel.lifecycle = lifecycle;
         panel.completed_at_ms = completed_at_ms;
-        panel.expanded = false;
         panel.show_workflow_receipts = false;
         panel.result_summary = summary.clone();
         panel.error = error.clone();
@@ -1422,7 +1399,6 @@ impl WorkflowPanel {
                 };
                 self.error = error;
                 self.completed_at_ms = Some(at_ms);
-                // Preserve expanded/collapsed choice; do not auto-hide.
             }
             WorkflowPanelEvent::RunCancelled { reason, at_ms } => {
                 self.finalize_running_rows(WorkflowRowStatus::Cancelled, at_ms);
@@ -1436,9 +1412,6 @@ impl WorkflowPanel {
                 }
                 self.phases.push(WorkflowPanelPhase::new(title));
                 self.selected_phase = self.phases.len().saturating_sub(1);
-                if self.lifecycle.is_running() {
-                    self.expanded = true;
-                }
             }
             WorkflowPanelEvent::TaskStarted {
                 task_id,
@@ -1482,7 +1455,6 @@ impl WorkflowPanel {
                     phase.rows.push(row);
                 }
                 self.lifecycle = WorkflowPanelLifecycle::Running;
-                self.expanded = true;
             }
             WorkflowPanelEvent::TaskCompleted {
                 task_id,
@@ -1515,9 +1487,6 @@ impl WorkflowPanel {
                     blocked_role,
                     blocked_reason,
                 });
-                if self.lifecycle.is_running() {
-                    self.expanded = true;
-                }
             }
             WorkflowPanelEvent::TaskSchemaValidationFailed {
                 task_id,
@@ -1567,7 +1536,6 @@ impl WorkflowPanel {
                 // keep the run live so surviving siblings can still finish.
                 if self.lifecycle.is_running() {
                     self.lifecycle = WorkflowPanelLifecycle::Running;
-                    self.expanded = true;
                 }
             }
             WorkflowPanelEvent::BudgetUpdated {
@@ -1670,42 +1638,68 @@ impl WorkflowPanel {
         }
     }
 
+    /// Tokens the run has used so far: the live meter the engine streams
+    /// (`budget_updated.spent`) or, when larger, the finished agents'
+    /// receipts. `None` until something is reported — never a made-up zero.
     #[must_use]
-    pub fn toggle_expanded(&mut self) -> bool {
-        self.expanded = !self.expanded;
-        true
+    pub fn tokens_so_far(&self) -> Option<u64> {
+        let receipts: u64 = self
+            .phases
+            .iter()
+            .flat_map(|phase| phase.rows.iter())
+            .filter_map(|row| row.usage.as_ref().and_then(WorkflowRowUsage::token_total))
+            .sum();
+        let tokens = self.budget_spent.max(receipts);
+        (tokens > 0).then_some(tokens)
     }
 
-    pub fn select_next_phase(&mut self) {
-        if self.phases.is_empty() {
-            return;
+    /// The transcript's finish line for a settled run: the state word, the
+    /// facts (`name · 3/5 agents · 2m 14s · ↓1.2M`), and the result or the
+    /// reason it stopped. `None` while the run is live.
+    #[must_use]
+    pub fn finish_line(&self) -> Option<(String, String, Option<String>)> {
+        let state = match self.lifecycle {
+            WorkflowPanelLifecycle::Pending | WorkflowPanelLifecycle::Running => return None,
+            WorkflowPanelLifecycle::Succeeded => MessageId::WorkflowLineFinished,
+            WorkflowPanelLifecycle::Degraded => MessageId::WorkflowLineFinishedWithGaps,
+            WorkflowPanelLifecycle::Failed => MessageId::WorkflowLineFailed,
+            WorkflowPanelLifecycle::Cancelled => MessageId::WorkflowLineStopped,
+        };
+        let (_, total) = self.done_total();
+        let finished = self
+            .phases
+            .iter()
+            .flat_map(|phase| phase.rows.iter())
+            .filter(|row| row.status == WorkflowRowStatus::Succeeded)
+            .count();
+        let mut facts = vec![self.label.split_whitespace().collect::<Vec<_>>().join(" ")];
+        if total > 0 {
+            facts.push(
+                tr(self.locale, MessageId::WorkflowLineAgents)
+                    .replace("{done}", &finished.to_string())
+                    .replace("{total}", &total.to_string()),
+            );
         }
-        self.selected_phase = (self.selected_phase + 1) % self.phases.len();
-    }
-
-    pub fn select_prev_phase(&mut self) {
-        if self.phases.is_empty() {
-            return;
+        facts.push(self.elapsed_label());
+        if let Some(tokens) = self.tokens_so_far() {
+            facts.push(format!(
+                "↓{}",
+                crate::tui::footer_ui::format_token_count_compact(tokens)
+            ));
         }
-        self.selected_phase = self
-            .selected_phase
-            .checked_sub(1)
-            .unwrap_or(self.phases.len() - 1);
-    }
-
-    /// Interrupt finalizes every still-running child as cancelled and marks
-    /// the run cancelled. Preserves the panel until the next workflow starts.
-    pub fn finalize_interrupt(&mut self) {
-        if self.lifecycle.is_terminal() {
-            return;
+        let detail = match self.lifecycle {
+            WorkflowPanelLifecycle::Failed | WorkflowPanelLifecycle::Cancelled => {
+                self.error.clone().or_else(|| self.result_summary.clone())
+            }
+            _ => self.result_summary.clone().or_else(|| self.error.clone()),
         }
-        let at = now_ms();
-        self.finalize_running_rows(WorkflowRowStatus::Cancelled, at);
-        self.lifecycle = WorkflowPanelLifecycle::Cancelled;
-        self.completed_at_ms = Some(at);
-        if self.error.is_none() {
-            self.error = Some("interrupted".to_string());
-        }
+        .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|text| !text.is_empty());
+        Some((
+            tr(self.locale, state).into_owned(),
+            facts.join(" · "),
+            detail,
+        ))
     }
 
     #[must_use]
@@ -1760,59 +1754,6 @@ impl WorkflowPanel {
         }
     }
 
-    /// Header line (#6503): expand glyph, short title, lifecycle, settled /
-    /// total, failures and cancellations only when non-zero, elapsed, budget,
-    /// cancel hint. The title is the only elastic field: it shrinks (on a
-    /// word boundary) so the counts never fall off the right edge, and the
-    /// full goal stays in the history card's expanded `goal:` line.
-    #[must_use]
-    pub fn header_text(&self, width: usize) -> String {
-        let glyph = if self.expanded { '▼' } else { '▶' };
-        let focus = if self.keyboard_focus { "*" } else { "" };
-        let (_, total) = self.done_total();
-        let budget =
-            format_budget_chrome(self.budget_spent, self.budget_remaining, self.budget_total);
-        let cancel_hint = if self.lifecycle.is_running() {
-            " · [c] cancel"
-        } else {
-            ""
-        };
-        let elapsed = {
-            let end = self.completed_at_ms.unwrap_or_else(now_ms);
-            crate::elapsed::format_elapsed_ms(end.saturating_sub(self.started_at_ms))
-        };
-        let head = format!("{glyph}{focus} ");
-        let settled = if total > 0 {
-            format!(" · {}", self.settled_text())
-        } else {
-            String::new()
-        };
-        let tail = format!(
-            "{life}{settled}{problems} · {elapsed}{budget}{cancel_hint}",
-            life = self.lifecycle.display_label(self.locale),
-            problems = self.problem_counts_suffix(),
-        );
-        let fixed = UnicodeWidthStr::width(head.as_str())
-            + UnicodeWidthStr::width(tail.as_str())
-            + UnicodeWidthStr::width(" · ");
-        let title_budget = width.saturating_sub(fixed).min(HEADER_TITLE_MAX_COLS);
-        let title = self.label.split_whitespace().collect::<Vec<_>>().join(" ");
-        let title = if title.is_empty() {
-            "workflow".to_string()
-        } else {
-            title
-        };
-        let raw = if title_budget >= HEADER_TITLE_MIN_COLS {
-            format!(
-                "{head}{title} · {tail}",
-                title = crate::tui::ui_text::semantic_truncate(&title, title_budget)
-            )
-        } else {
-            format!("{head}{tail}")
-        };
-        truncate_line_to_width(&raw, width.max(1))
-    }
-
     fn render_dispatch_failure_lines(&self, width: usize) -> Vec<Line<'static>> {
         let shown = self
             .dispatch_failures
@@ -1854,242 +1795,6 @@ impl WorkflowPanel {
             )));
         }
         lines
-    }
-
-    /// Return the display-column span of the cancel hint in the exact header
-    /// string that `render_lines` paints, after truncation.
-    #[must_use]
-    pub fn cancel_hint_span(&self, width: u16) -> Option<(u16, u16)> {
-        let header = self.header_text(usize::from(width));
-        let start = header.find("[c] cancel")?;
-        let start = unicode_width::UnicodeWidthStr::width(&header[..start]);
-        let end = start + unicode_width::UnicodeWidthStr::width("[c] cancel");
-        Some((start as u16, end as u16))
-    }
-
-    #[must_use]
-    pub fn render_lines(&self, width: u16) -> Vec<Line<'static>> {
-        self.render_lines_bounded(width, None)
-    }
-
-    fn render_lines_bounded(&self, width: u16, max_height: Option<usize>) -> Vec<Line<'static>> {
-        if max_height == Some(0) {
-            return Vec::new();
-        }
-        let content_width = usize::from(width).max(1);
-        let mut lines = Vec::with_capacity(12);
-        lines.push(Line::from(Span::styled(
-            self.header_text(content_width),
-            Style::default()
-                .fg(self.lifecycle.color())
-                .add_modifier(Modifier::BOLD),
-        )));
-
-        if !self.expanded {
-            return lines;
-        }
-
-        if !self.gates.is_empty() {
-            lines.push(Line::from(Span::styled(
-                truncate_line_to_width(&format!("gates: {}", self.gates_summary()), content_width),
-                Style::default().fg(palette::TEXT_MUTED),
-            )));
-        }
-
-        let mut dispatch_failure_lines = self.render_dispatch_failure_lines(content_width);
-
-        // Selected phase: one labelled line, then one line per child (#6503).
-        if let Some(phase) = self.phases.get(self.selected_phase) {
-            lines.push(Line::from(Span::styled(
-                truncate_line_to_width(
-                    &self.phase_line_text(self.selected_phase, content_width),
-                    content_width,
-                ),
-                Style::default()
-                    .fg(palette::WHALE_ACTION)
-                    .add_modifier(Modifier::BOLD),
-            )));
-
-            let now = now_ms();
-            let default_route = self.default_route_receipt();
-            let label_cols = phase
-                .rows
-                .iter()
-                .take(MAX_VISIBLE_ROWS)
-                .map(|row| short_label(&row.label, ROW_LABEL_MAX_COLS).width())
-                .max()
-                .unwrap_or(0);
-            let status_cols = phase
-                .rows
-                .iter()
-                .take(MAX_VISIBLE_ROWS)
-                .map(|row| row.status.display_label(self.locale).width())
-                .max()
-                .unwrap_or(0);
-            let mut shown = 0usize;
-            for row in phase.rows.iter().take(MAX_VISIBLE_ROWS) {
-                let block = self.render_row_lines(
-                    row,
-                    RowLayout {
-                        width: content_width,
-                        label_cols,
-                        status_cols,
-                    },
-                    default_route.as_deref(),
-                    now,
-                );
-                let more_after = phase.rows.len() > shown + 1;
-                let reserved_tail = usize::from(more_after)
-                    + dispatch_failure_lines.len()
-                    + usize::from(self.error.is_some())
-                    + usize::from(self.keyboard_focus);
-                if max_height
-                    .is_some_and(|height| lines.len() + block.len() + reserved_tail > height)
-                {
-                    break;
-                }
-                lines.extend(block);
-                shown += 1;
-            }
-            if phase.rows.len() > shown {
-                lines.push(Line::from(Span::styled(
-                    format!("  … {} more", phase.rows.len() - shown),
-                    Style::default().fg(palette::TEXT_MUTED),
-                )));
-            }
-        } else if self.lifecycle.is_running() {
-            lines.push(Line::from(Span::styled(
-                truncate_line_to_width("waiting for phases…", content_width),
-                Style::default().fg(palette::TEXT_MUTED),
-            )));
-        }
-
-        lines.append(&mut dispatch_failure_lines);
-
-        if let Some(error) = self.error.as_deref() {
-            lines.push(Line::from(Span::styled(
-                truncate_line_to_width(&format!("error: {error}"), content_width),
-                Style::default().fg(palette::STATUS_ERROR),
-            )));
-        }
-
-        if self.keyboard_focus {
-            lines.push(Line::from(Span::styled(
-                truncate_line_to_width(
-                    "[enter] toggle  [del] cancel  [up/down] phase  [esc] chat",
-                    content_width,
-                ),
-                Style::default()
-                    .fg(palette::TEXT_MUTED)
-                    .add_modifier(Modifier::ITALIC),
-            )));
-        }
-
-        // Every producer above is independently useful, but the terminal owns
-        // the final hard boundary. This also covers headers and tail rows,
-        // which cannot be accounted for solely by the per-worker row budget.
-        if let Some(height) = max_height {
-            lines.truncate(height);
-        }
-        lines
-    }
-
-    /// `phase 2/3 Verify · 4 running · 1 done` — labelled counts, zero
-    /// counts omitted (#6503). Only the title is elastic: it shrinks (on a
-    /// word boundary) so the counts survive a long runtime-supplied title.
-    fn phase_line_text(&self, idx: usize, width: usize) -> String {
-        let Some(phase) = self.phases.get(idx) else {
-            return String::new();
-        };
-        let prefix = format!(
-            "{} ",
-            tr(self.locale, MessageId::WorkflowPhaseOrdinal)
-                .replace("{n}", &(idx + 1).to_string())
-                .replace("{total}", &self.phases.len().to_string())
-        );
-        let suffix = format!(" · {}", phase.counts_text(self.locale, " · "));
-        let title = phase.title.split_whitespace().collect::<Vec<_>>().join(" ");
-        crate::tui::ui_text::semantic_truncate_with_affixes(&prefix, &title, &suffix, width)
-    }
-
-    /// The launch route most children of this run share (ties go to the
-    /// earliest row). Live rows repeat their route receipt only when it
-    /// differs from this default; the full receipt for every row stays in
-    /// the history card's detail view (#6503, #4039).
-    fn default_route_receipt(&self) -> Option<String> {
-        let mut tally: Vec<(String, usize)> = Vec::new();
-        for row in self.phases.iter().flat_map(|phase| phase.rows.iter()) {
-            let receipt = route_receipt_parts(row, self.locale).join(" · ");
-            match tally.iter_mut().find(|(seen, _)| *seen == receipt) {
-                Some((_, count)) => *count += 1,
-                None => tally.push((receipt, 1)),
-            }
-        }
-        let best = tally.iter().map(|(_, count)| *count).max()?;
-        tally
-            .into_iter()
-            .find(|(_, count)| *count == best)
-            .map(|(receipt, _)| receipt)
-    }
-
-    /// One child is one line (#6503); a route receipt line follows only when
-    /// this child was launched on a route other than the run's default.
-    fn render_row_lines(
-        &self,
-        row: &WorkflowPanelRow,
-        layout: RowLayout,
-        default_route: Option<&str>,
-        now_ms: u64,
-    ) -> Vec<Line<'static>> {
-        let mut lines = vec![self.render_row_line(row, layout, now_ms)];
-        let route = route_receipt_parts(row, self.locale);
-        if self.show_workflow_receipts && default_route != Some(route.join(" · ").as_str()) {
-            lines.extend(
-                pack_receipt_lines(route, layout.width, 4)
-                    .into_iter()
-                    .map(|text| {
-                        Line::from(Span::styled(text, Style::default().fg(palette::TEXT_MUTED)))
-                    }),
-            );
-        }
-        lines
-    }
-
-    /// `  name  state  model  elapsed[  wt][  N tok][  ! error]` — only
-    /// fields that carry information: no placeholder dashes, no default
-    /// `main` checkout marker, no synthetic progress bar (#6503).
-    fn render_row_line(
-        &self,
-        row: &WorkflowPanelRow,
-        layout: RowLayout,
-        now_ms: u64,
-    ) -> Line<'static> {
-        let label = short_label(&row.label, ROW_LABEL_MAX_COLS);
-        let status = row.status.display_label(self.locale);
-        let mut fields = vec![
-            pad_to_width(&label, layout.label_cols),
-            pad_to_width(&status, layout.status_cols),
-        ];
-        if let Some(model) = row.model.as_deref().and_then(short_model_name) {
-            fields.push(model);
-        }
-        fields.push(crate::elapsed::format_elapsed_ms(row_elapsed_ms(
-            row, now_ms,
-        )));
-        if row.worktree {
-            fields.push("wt".to_string());
-        }
-        if let Some(tokens) = row.usage.as_ref().and_then(WorkflowRowUsage::token_total) {
-            fields.push(format!("{tokens} tok"));
-        }
-        if let Some(error) = row.schema_error.as_deref().or(row.error.as_deref()) {
-            fields.push(format!("! {}", short_label(error, 40)));
-        }
-        let text = format!("  {}", fields.join("  "));
-        Line::from(Span::styled(
-            truncate_line_to_width(text.trim_end(), layout.width),
-            Style::default().fg(row.status.color()),
-        ))
     }
 
     fn find_row_mut(&mut self, task_id: &str) -> Option<&mut WorkflowPanelRow> {
@@ -2203,24 +1908,6 @@ fn workflow_row_run_json(row: &WorkflowPanelRow) -> Value {
     })
 }
 
-impl Renderable for WorkflowPanel {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let lines = self.render_lines_bounded(area.width, Some(usize::from(area.height)));
-        let paragraph = Paragraph::new(lines);
-        paragraph.render(area, buf);
-    }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        if width == 0 {
-            return 0;
-        }
-        self.render_lines(width).len() as u16
-    }
-}
-
 fn lifecycle_from_status(status: &str) -> WorkflowPanelLifecycle {
     match status {
         "running" => WorkflowPanelLifecycle::Running,
@@ -2240,30 +1927,6 @@ fn count_text(locale: Locale, id: MessageId, count: usize) -> String {
 
 fn localized_field(locale: Locale, id: MessageId, value: &str) -> String {
     tr(locale, id).replace("{value}", value)
-}
-
-/// Column budget shared by every live row in one phase.
-#[derive(Debug, Clone, Copy)]
-struct RowLayout {
-    width: usize,
-    label_cols: usize,
-    status_cols: usize,
-}
-
-fn pad_to_width(text: &str, cols: usize) -> String {
-    let pad = cols.saturating_sub(text.width());
-    format!("{text}{}", " ".repeat(pad))
-}
-
-/// `deepseek/deepseek-flash` → `deepseek-flash`: the provider prefix is route
-/// provenance, which lives in the receipt, not the row.
-fn short_model_name(model: &str) -> Option<String> {
-    let name = model.trim().rsplit('/').next().unwrap_or_default().trim();
-    let name = crate::tui::app::bound_agent_activity_text(name)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    (!name.is_empty()).then(|| short_label(&name, 28))
 }
 
 /// Launch route only: role, provider/model, requested→effective reasoning,
@@ -2427,34 +2090,6 @@ fn opt_str(value: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Honest workflow budget chrome: "used / budget" (or "X left of Y").
-/// Never renders confusing "spent/0 left" when remaining is zeroed while
-/// spent is large — that read as an inverted kill-budget signal.
-#[must_use]
-pub(crate) fn format_budget_chrome(
-    spent: u64,
-    remaining: Option<u64>,
-    total: Option<u64>,
-) -> String {
-    let total = total.or_else(|| remaining.map(|left| spent.saturating_add(left)));
-    match (spent, remaining, total) {
-        (spent, _, Some(total)) if total > 0 => {
-            let left = remaining.unwrap_or_else(|| total.saturating_sub(spent));
-            format!(" budget {spent} used / {total} ({left} left)")
-        }
-        (spent, Some(remaining), None) => {
-            let total = spent.saturating_add(remaining);
-            if total == 0 {
-                String::new()
-            } else {
-                format!(" budget {spent} used / {total} ({remaining} left)")
-            }
-        }
-        (spent, None, None) if spent > 0 => format!(" budget {spent} used"),
-        _ => String::new(),
-    }
-}
-
 fn short_label(text: &str, max: usize) -> String {
     let trimmed = text.trim();
     if trimmed.width() <= max {
@@ -2524,35 +2159,11 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The run's result as one readable line — the same wording the engine puts
+/// on `run_completed.result_preview`, so the transcript and the parent receipt
+/// never describe one result two ways.
 fn summarize_result_value(value: &Value) -> Option<String> {
-    match value {
-        Value::Null => None,
-        Value::String(s) => {
-            let t = s.trim();
-            if t.is_empty() {
-                None
-            } else {
-                Some(short_label(t, 200))
-            }
-        }
-        Value::Number(n) => Some(n.to_string()),
-        Value::Bool(b) => Some(b.to_string()),
-        Value::Array(items) => Some(format!("{} item(s)", items.len())),
-        Value::Object(map) => {
-            if let Some(s) = map
-                .get("summary")
-                .or_else(|| map.get("message"))
-                .or_else(|| map.get("text"))
-                .and_then(Value::as_str)
-            {
-                let t = s.trim();
-                if !t.is_empty() {
-                    return Some(short_label(t, 200));
-                }
-            }
-            Some(format!("{} field(s)", map.len()))
-        }
-    }
+    crate::tools::workflow::workflow_result_preview(value)
 }
 
 #[cfg(test)]
@@ -2589,20 +2200,6 @@ mod tests {
         })
     }
 
-    fn rendered(panel: &WorkflowPanel, width: u16) -> String {
-        panel
-            .render_lines(width)
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     /// Detail view: the history card's expanded body, which carries every
     /// row's full receipt (#4039) now that live rows are one line (#6503).
     fn detail(panel: &WorkflowPanel, width: u16) -> String {
@@ -2622,15 +2219,10 @@ mod tests {
     /// #4039: a row's receipt states the exact role, provider, model,
     /// requested → effective reasoning, and route source the runtime reported
     /// — and keeps stating them after the session routes somewhere else.
-    /// #6503: the live panel repeats a receipt only for a row whose route
-    /// differs from the run's default; the detail view keeps all of them.
     #[test]
     fn row_route_receipt_is_exact_and_survives_a_later_model_switch() {
         let mut panel = WorkflowPanel::new("workflow_abc", "audit", 1_000);
         panel.apply_json_event(&task_started_json("t1", "deepseek", "deepseek-v4-flash"));
-        let live = rendered(&panel, 200);
-        assert!(!live.contains("via agent_profile.model"), "{live}");
-        assert!(live.contains("deepseek-v4-flash"), "{live}");
         let before = detail(&panel, 200);
         assert!(before.contains("role verifier"), "{before}");
         assert!(before.contains("deepseek/deepseek-v4-flash"), "{before}");
@@ -2645,10 +2237,6 @@ mod tests {
         let after = detail(&panel, 200);
         assert!(after.contains("deepseek/deepseek-v4-flash"), "{after}");
         assert!(after.contains("moonshot/kimi-k3"), "{after}");
-        // Live: the diverging second route is called out; the default is not.
-        let live = rendered(&panel, 200);
-        assert!(live.contains("moonshot/kimi-k3"), "{live}");
-        assert!(!live.contains("deepseek/deepseek-v4-flash"), "{live}");
         let t1 = panel
             .phases
             .iter()
@@ -2696,10 +2284,6 @@ mod tests {
 
         let text = detail(&panel, 200);
         assert!(text.contains("tokens 160 (provider-reported)"), "{text}");
-        // The live row keeps only the known total, inline.
-        let live = rendered(&panel, 200);
-        assert!(live.contains("160 tok"), "{live}");
-        assert!(!live.contains("tokens unknown"), "{live}");
         assert!(text.contains("tools 3"), "{text}");
         assert!(text.contains("tokens unknown · tools unknown"), "{text}");
         let t2 = panel
@@ -2872,36 +2456,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_renderer_never_exceeds_tiny_height_with_all_tails() {
-        let mut panel = WorkflowPanel::new("workflow_abc", "audit", 1_000);
-        panel.apply_json_event(&task_started_json("t1", "deepseek", "deepseek-v4-flash"));
-        panel.apply_json_event(&task_started_json("t2", "deepseek", "deepseek-v4-flash"));
-        panel.gates.push(WorkflowPanelGateLine {
-            gate_id: "review".to_string(),
-            role: Some("verifier".to_string()),
-            gate: Some("approval".to_string()),
-            state: "blocked".to_string(),
-            blocked_role: Some("implementer".to_string()),
-            blocked_reason: Some("needs review".to_string()),
-        });
-        panel.error = Some("terminal failure".to_string());
-        panel.keyboard_focus = true;
-
-        for height in 0..=3 {
-            let lines = panel.render_lines_bounded(40, Some(height));
-            assert!(
-                lines.len() <= height,
-                "height {height} rendered {} lines: {lines:?}",
-                lines.len()
-            );
-        }
-
-        panel.expanded = false;
-        assert!(panel.render_lines_bounded(40, Some(0)).is_empty());
-        assert_eq!(panel.render_lines_bounded(40, Some(1)).len(), 1);
-    }
-
-    #[test]
     fn receipt_fields_flatten_controls_strip_ansi_and_redact_secrets() {
         let mut panel = WorkflowPanel::new("workflow_abc", "audit", 1_000);
         panel.apply_json_event(&json!({
@@ -2956,18 +2510,6 @@ mod tests {
         panel
     }
 
-    #[test]
-    fn cancel_hint_span_matches_rendered_header_and_truncation() {
-        let panel = started_panel();
-        let header = panel.header_text(120);
-        let (start, end) = panel.cancel_hint_span(120).expect("running cancel hint");
-        let marker = header.find("[c] cancel").expect("rendered cancel hint");
-        assert_eq!(UnicodeWidthStr::width(&header[..marker]), start as usize);
-        assert_eq!(end - start, UnicodeWidthStr::width("[c] cancel") as u16);
-
-        assert!(panel.cancel_hint_span(8).is_none());
-    }
-
     /// #4208: every decorative glyph the run map emits — expand marks, role
     /// marks, lane glyphs, gates, status marks across running, waiting,
     /// failed, cancelled, and completed members — must narrow to an
@@ -3012,8 +2554,8 @@ mod tests {
             at_ms: 2_600,
         });
 
-        let mut glyphs: Vec<char> = panel.header_text(120).chars().collect();
-        for line in panel.render_lines(100) {
+        let mut glyphs: Vec<char> = panel.compact_summary_text(120).chars().collect();
+        for line in panel.render_history_card(100, true, &WorkflowHistoryExtras::default()) {
             for span in &line.spans {
                 glyphs.extend(span.content.chars());
             }
@@ -3028,243 +2570,6 @@ mod tests {
                 ch as u32
             );
         }
-    }
-
-    #[test]
-    fn budget_chrome_uses_honest_used_of_total_labels() {
-        assert_eq!(
-            format_budget_chrome(839_866, Some(0), None),
-            " budget 839866 used / 839866 (0 left)"
-        );
-        assert_eq!(
-            format_budget_chrome(1_200, Some(8_800), Some(10_000)),
-            " budget 1200 used / 10000 (8800 left)"
-        );
-        assert_eq!(
-            format_budget_chrome(500, None, Some(2_000)),
-            " budget 500 used / 2000 (1500 left)"
-        );
-        assert_eq!(format_budget_chrome(42, None, None), " budget 42 used");
-        assert_eq!(format_budget_chrome(0, None, None), "");
-    }
-
-    #[test]
-    fn header_shows_lifecycle_counts_budget_and_expand_glyph() {
-        let mut panel = started_panel();
-        panel.apply_event(WorkflowPanelEvent::BudgetUpdated {
-            total: Some(10_000),
-            spent: 1_200,
-            remaining: Some(8_800),
-            at_ms: 1_300,
-        });
-        let header = panel.header_text(120);
-        assert!(header.contains('▼'), "running auto-expands: {header}");
-        assert!(header.contains("running"), "{header}");
-        assert!(header.contains("ship v0.8.68"), "{header}");
-        assert!(header.contains("0/1 done"), "{header}");
-        // #6503: zero failure/cancel counts are not printed.
-        assert!(!header.contains("0 fail"), "{header}");
-        assert!(!header.contains("0 cancel"), "{header}");
-        assert!(
-            header.contains("budget 1200 used / 10000")
-                || header.contains("budget 1.2k used / 10k")
-                || header.contains("budget 1200 used"),
-            "{header}"
-        );
-    }
-
-    #[test]
-    fn body_shows_phases_and_selected_phase_rows() {
-        let mut panel = started_panel();
-        panel.apply_event(WorkflowPanelEvent::PhaseStarted {
-            title: "Verify".to_string(),
-            at_ms: 2_000,
-        });
-        panel.apply_event(WorkflowPanelEvent::TaskStarted {
-            task_id: "t2".to_string(),
-            label: Some("run tests".to_string()),
-            profile: Some("implementer".to_string()),
-            model: Some("pro".to_string()),
-            strength: None,
-            resolved_model: None,
-            worktree: false,
-            workspace: None,
-            route: Box::default(),
-            at_ms: 2_100,
-        });
-        // selected phase is Verify (latest)
-        let lines = panel.render_lines(100);
-        let text: Vec<String> = lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect();
-        let joined = text.join("\n");
-        assert!(joined.contains("phase 2/2 Verify · 1 running"), "{joined}");
-        assert!(joined.contains("run tests"), "{joined}");
-        assert!(joined.contains("pro"), "{joined}");
-        // The default checkout is not announced; only a worktree is.
-        assert!(!joined.contains("main"), "{joined}");
-        // Analyze scout is not in selected phase body
-        assert!(!joined.contains("scout crates"), "{joined}");
-    }
-
-    #[test]
-    fn rows_show_status_label_model_worktree_elapsed_schema() {
-        let mut panel = started_panel();
-        panel.apply_event(WorkflowPanelEvent::TaskSchemaValidationFailed {
-            task_id: "t1".to_string(),
-            message: "missing field foo".to_string(),
-            at_ms: 1_500,
-        });
-        let lines = panel.render_lines(120);
-        let joined: String = lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(joined.contains("schema"), "{joined}");
-        assert!(joined.contains("scout crates"), "{joined}");
-        assert!(joined.contains("deepseek-v4-flash"), "{joined}");
-        assert!(joined.contains("wt"), "{joined}");
-        assert!(joined.contains("missing field"), "{joined}");
-    }
-
-    #[test]
-    fn auto_expands_while_running_and_preserves_completed_until_next() {
-        let mut panel = started_panel();
-        assert!(panel.expanded);
-        panel.expanded = false;
-        // Task start while running forces re-expand
-        panel.apply_event(WorkflowPanelEvent::TaskStarted {
-            task_id: "t3".to_string(),
-            label: Some("more".to_string()),
-            profile: None,
-            model: None,
-            strength: None,
-            resolved_model: None,
-            worktree: false,
-            workspace: None,
-            route: Box::default(),
-            at_ms: 1_400,
-        });
-        assert!(panel.expanded);
-
-        panel.apply_event(WorkflowPanelEvent::TaskCompleted {
-            task_id: "t1".to_string(),
-            status: WorkflowRowStatus::Succeeded,
-            usage: None,
-            at_ms: 2_000,
-        });
-        panel.apply_event(WorkflowPanelEvent::TaskCompleted {
-            task_id: "t3".to_string(),
-            status: WorkflowRowStatus::Succeeded,
-            usage: None,
-            at_ms: 2_100,
-        });
-        panel.apply_event(WorkflowPanelEvent::RunCompleted {
-            status: WorkflowPanelLifecycle::Succeeded,
-            error: None,
-            at_ms: 2_200,
-        });
-        assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Succeeded);
-        // Still visible (preserved)
-        assert_eq!(panel.run_id, "workflow_abc");
-        let header = panel.header_text(80);
-        assert!(header.contains("success"), "{header}");
-
-        // Next workflow replaces
-        panel.apply_event(WorkflowPanelEvent::RunStarted {
-            run_id: "workflow_next".to_string(),
-            workflow_id: None,
-            workflow_goal: Some("next run".to_string()),
-            source_path: None,
-            token_budget: None,
-            at_ms: 3_000,
-        });
-        assert_eq!(panel.run_id, "workflow_next");
-        assert_eq!(panel.label, "next run");
-        assert!(panel.phases.is_empty());
-        assert!(panel.expanded);
-        assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Running);
-    }
-
-    #[test]
-    fn interrupt_finalizes_running_children_as_cancelled() {
-        let mut panel = started_panel();
-        panel.apply_event(WorkflowPanelEvent::TaskStarted {
-            task_id: "t2".to_string(),
-            label: Some("second".to_string()),
-            profile: None,
-            model: None,
-            strength: None,
-            resolved_model: None,
-            worktree: false,
-            workspace: None,
-            route: Box::default(),
-            at_ms: 1_300,
-        });
-        panel.apply_event(WorkflowPanelEvent::TaskCompleted {
-            task_id: "t1".to_string(),
-            status: WorkflowRowStatus::Succeeded,
-            usage: None,
-            at_ms: 1_400,
-        });
-        panel.finalize_interrupt();
-        assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Cancelled);
-        let t1 = panel
-            .phases
-            .iter()
-            .flat_map(|p| p.rows.iter())
-            .find(|r| r.task_id == "t1")
-            .expect("t1");
-        let t2 = panel
-            .phases
-            .iter()
-            .flat_map(|p| p.rows.iter())
-            .find(|r| r.task_id == "t2")
-            .expect("t2");
-        assert_eq!(t1.status, WorkflowRowStatus::Succeeded);
-        assert_eq!(t2.status, WorkflowRowStatus::Cancelled);
-        assert!(
-            t2.usage.is_some(),
-            "cancelled row must retain an unknown usage receipt"
-        );
-        let cancelled_receipt = row_receipt_text(t2);
-        assert!(
-            cancelled_receipt.contains("tokens unknown"),
-            "{cancelled_receipt}"
-        );
-        assert!(
-            cancelled_receipt.contains("tools unknown"),
-            "{cancelled_receipt}"
-        );
-        assert!(
-            cancelled_receipt.contains("duration unknown"),
-            "{cancelled_receipt}"
-        );
-        let (failed, cancelled) = panel.failure_cancel_counts();
-        assert_eq!(failed, 0);
-        assert_eq!(cancelled, 1);
-    }
-
-    #[test]
-    fn panel_toggle_is_independent_of_text_input_routing() {
-        let mut panel = started_panel();
-        assert!(panel.expanded);
-        assert!(panel.toggle_expanded());
-        assert!(!panel.expanded);
-        assert!(panel.toggle_expanded());
-        assert!(panel.expanded);
     }
 
     #[test]
@@ -3324,7 +2629,7 @@ mod tests {
         assert_eq!(panel.budget_spent, 100);
         assert_eq!(panel.budget_remaining, Some(4900));
         let joined: String = panel
-            .render_lines(100)
+            .render_history_card(100, true, &WorkflowHistoryExtras::default())
             .iter()
             .map(|l| {
                 l.spans
@@ -3339,16 +2644,6 @@ mod tests {
         assert!(joined.contains("done"), "{joined}");
         assert!(joined.contains("reviewer-diff"), "{joined}");
         assert!(joined.contains("review found regression"), "{joined}");
-    }
-
-    #[test]
-    fn desired_height_is_zero_width_safe_and_collapsed_is_one() {
-        let mut panel = started_panel();
-        assert_eq!(panel.desired_height(0), 0);
-        panel.expanded = false;
-        assert_eq!(panel.desired_height(80), 1);
-        panel.expanded = true;
-        assert!(panel.desired_height(80) >= 3);
     }
 
     #[test]
@@ -3381,7 +2676,7 @@ mod tests {
         let (failed, cancelled) = panel.failure_cancel_counts();
         assert_eq!(failed, 1);
         assert_eq!(cancelled, 1);
-        let header = panel.header_text(100);
+        let header = panel.compact_summary_text(100);
         assert!(header.contains("1 fail"), "{header}");
         assert!(header.contains("1 cancel"), "{header}");
         assert!(header.contains("2/2"), "{header}");
@@ -3468,11 +2763,10 @@ mod tests {
         assert_eq!(panel.done_total(), (0, 1), "rejected launch is not a child");
         assert_eq!(panel.failure_cancel_counts(), (1, 0));
         assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Running);
-        assert!(panel.expanded);
-        assert!(panel.header_text(120).contains("1 fail"));
+        assert!(panel.compact_summary_text(120).contains("1 fail"));
 
         let live = panel
-            .render_lines(120)
+            .render_history_card(120, true, &WorkflowHistoryExtras::default())
             .iter()
             .map(|line| {
                 line.spans
@@ -3514,7 +2808,7 @@ mod tests {
         let mut japanese = restored.clone();
         japanese.locale = Locale::Ja;
         let localized = japanese
-            .render_lines(120)
+            .render_history_card(120, true, &WorkflowHistoryExtras::default())
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
             .collect::<String>();
@@ -3548,10 +2842,10 @@ mod tests {
         assert!(panel.lifecycle.is_terminal());
         assert_eq!(panel.done_total(), (1, 1));
         assert_eq!(panel.failure_cancel_counts(), (1, 0));
-        assert!(panel.header_text(120).contains("degraded"));
+        assert!(panel.compact_summary_text(120).contains("degraded"));
 
         panel.locale = Locale::Ja;
-        assert!(panel.header_text(120).contains("一部失敗"));
+        assert!(panel.compact_summary_text(120).contains("一部失敗"));
     }
 
     #[test]
@@ -3586,7 +2880,7 @@ mod tests {
         assert!(!latest.message.contains("sk-dispatch-secret"));
         assert!(!latest.message.chars().any(char::is_control));
         let rendered = panel
-            .render_lines(120)
+            .render_history_card(120, true, &WorkflowHistoryExtras::default())
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
             .collect::<String>();
@@ -3932,7 +3226,7 @@ mod tests {
             at_ms: 2_100,
         });
 
-        let header = panel.header_text(140);
+        let header = panel.compact_summary_text(140);
         assert!(
             header.contains("success") || header.contains("completed"),
             "{header}"
@@ -3945,7 +3239,7 @@ mod tests {
 
         // Selected phase is Synthesize; scout labels live in earlier phases.
         panel.selected_phase = 0;
-        let scout_body = panel.render_lines(120);
+        let scout_body = panel.render_history_card(120, true, &WorkflowHistoryExtras::default());
         let scout_joined: String = scout_body
             .iter()
             .map(|l| {
@@ -4045,7 +3339,8 @@ mod tests {
         assert_eq!(panel.phases[1].title, "Verify");
 
         panel.selected_phase = 0;
-        let implement_body = panel.render_lines(140);
+        let implement_body =
+            panel.render_history_card(140, true, &WorkflowHistoryExtras::default());
         let impl_text: String = implement_body
             .iter()
             .map(|l| {
@@ -4057,13 +3352,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(impl_text.contains("implementer"), "{impl_text}");
-        assert!(
-            impl_text.contains("wt") || impl_text.contains("worktree"),
-            "implementer should show worktree marker: {impl_text}"
-        );
 
         panel.selected_phase = 1;
-        let verify_body = panel.render_lines(140);
+        let verify_body = panel.render_history_card(140, true, &WorkflowHistoryExtras::default());
         let ver_text: String = verify_body
             .iter()
             .map(|l| {
@@ -4148,7 +3439,7 @@ mod tests {
         let (failed, cancelled) = panel.failure_cancel_counts();
         assert_eq!(failed, 1, "exactly one parallel slot failed");
         assert_eq!(cancelled, 0);
-        let header = panel.header_text(140);
+        let header = panel.compact_summary_text(140);
         assert!(header.contains("1 fail"), "{header}");
 
         let card = panel.render_history_card(
@@ -4212,7 +3503,10 @@ mod tests {
 
         // A confirmed host interrupt finalizes remaining runners. The widget
         // itself never claims cancellation before that runtime event.
-        panel.finalize_interrupt();
+        panel.apply_event(WorkflowPanelEvent::RunCancelled {
+            reason: "interrupted".to_string(),
+            at_ms: now_ms(),
+        });
         assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Cancelled);
 
         let slow1 = panel
@@ -4233,196 +3527,10 @@ mod tests {
         let (failed, cancelled) = panel.failure_cancel_counts();
         assert_eq!(failed, 0);
         assert_eq!(cancelled, 1);
-        let header = panel.header_text(120);
+        let header = panel.compact_summary_text(120);
         assert!(
             header.contains("cancel") || header.contains("cancelled"),
             "{header}"
         );
-    }
-
-    /// The founder's #6503 card: a 2-phase, 5-child run, all children on the
-    /// same explore route, captured while every child is still running.
-    fn founder_card_panel() -> WorkflowPanel {
-        let goal = "Compare the freshly cloned Cline repo (refs/cline @ 8abfde69) against the \
-                    Codewhale codebase across five axes, producing concrete, evidence-backed \
-                    transferable learnings for Codewhale";
-        let mut panel = WorkflowPanel::new("workflow_6503", goal, now_ms().saturating_sub(14_000));
-        panel.apply_event(WorkflowPanelEvent::PhaseStarted {
-            title: format!("workflow: {goal}"),
-            at_ms: 1,
-        });
-        panel.apply_event(WorkflowPanelEvent::PhaseStarted {
-            title: "plan".to_string(),
-            at_ms: 2,
-        });
-        for label in [
-            "loop-prompt",
-            "tools-approval",
-            "models-context",
-            "surfaces-sdk",
-            "evals-mcp-agents",
-        ] {
-            panel.apply_json_event(&json!({
-                "type": "task_started",
-                "at_ms": now_ms().saturating_sub(14_000),
-                "task_id": label,
-                "workflow_task_label": label,
-                "model": "deepseek-flash",
-                "resolved_role": "explore",
-                "resolved_provider": "deepseek",
-                "resolved_model": "deepseek-flash",
-                "requested_reasoning": "inherit",
-                "effective_reasoning": "max",
-                "route_source": "agent_profile.model",
-                "worktree": false,
-            }));
-        }
-        panel
-    }
-
-    fn line_text(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
-
-    /// #6503 acceptance at a narrow (80) and a wide (200) terminal: one
-    /// header line with a short title, one labelled phase line, one line per
-    /// child with its model once, no placeholders, no static bar, no
-    /// repeated provenance, and running is not painted in an alarm colour.
-    #[test]
-    fn founder_workflow_card_is_one_line_per_child_at_80_and_200_columns() {
-        let mut panel = founder_card_panel();
-        let labels = [
-            "loop-prompt",
-            "tools-approval",
-            "models-context",
-            "surfaces-sdk",
-            "evals-mcp-agents",
-        ];
-        let started: Vec<u64> = labels
-            .iter()
-            .map(|label| panel.find_row_mut(label).expect("row").started_at_ms)
-            .collect();
-        for width in [80_u16, 200] {
-            // Bracket the render with the clock so the elapsed assertion
-            // holds however long the process was descheduled (#6520 review).
-            let before = now_ms();
-            let lines = panel.render_lines(width);
-            let after = now_ms();
-            let text: Vec<String> = lines.iter().map(line_text).collect();
-            let joined = text.join("\n");
-            assert_eq!(lines.len(), 7, "header + phase + 5 children:\n{joined}");
-            for line in &text {
-                assert!(line.width() <= usize::from(width), "{width}: {line:?}");
-            }
-
-            let header = &text[0];
-            assert!(header.contains("running · 0/5 done"), "{header}");
-            assert!(header.contains("Compare the freshly"), "{header}");
-            assert!(
-                !header.contains("transferable"),
-                "title stays short: {header}"
-            );
-            assert!(!header.contains("fail"), "{header}");
-            assert!(header.contains("[c] cancel"), "{header}");
-
-            assert_eq!(text[1], "phase 2/2 plan · 5 running", "{joined}");
-
-            for ((row, label), started) in text[2..].iter().zip(labels).zip(&started) {
-                assert!(row.contains(label), "{row}");
-                assert!(row.contains("running"), "{row}");
-                assert_eq!(row.matches("deepseek-flash").count(), 1, "{row}");
-                let lo = before.saturating_sub(*started) / 1000;
-                let hi = after.saturating_sub(*started) / 1000;
-                assert!(
-                    (lo..=hi)
-                        .any(|secs| row.contains(&crate::elapsed::format_elapsed_ms(secs * 1000))),
-                    "elapsed within [{lo}s, {hi}s]: {row}"
-                );
-                for noise in [
-                    "–",
-                    " - ",
-                    "==",
-                    "main",
-                    "role ",
-                    "via ",
-                    "reasoning",
-                    "deepseek/",
-                ] {
-                    assert!(!row.contains(noise), "{width}: {noise:?} in {row:?}");
-                }
-            }
-            // Columns align: every child's state starts in the same column.
-            let state_cols: Vec<usize> = text[2..]
-                .iter()
-                .map(|row| row.find("running").expect("state"))
-                .collect();
-            assert!(state_cols.windows(2).all(|w| w[0] == w[1]), "{joined}");
-
-            assert_eq!(lines[0].spans[0].style.fg, Some(palette::WHALE_ACTION));
-            for line in &lines[2..] {
-                let fg = line.spans[0].style.fg;
-                assert_ne!(
-                    fg,
-                    Some(palette::STATUS_WARNING),
-                    "running is not attention"
-                );
-                assert_ne!(fg, Some(palette::STATUS_ERROR), "running is not failure");
-            }
-        }
-    }
-
-    /// #6520 review: a long runtime-supplied phase title shrinks; the labelled
-    /// counts after it never fall off the right edge.
-    #[test]
-    fn long_phase_title_truncates_before_the_counts() {
-        let mut panel = founder_card_panel();
-        // The five running children live in phase 2; give it the long
-        // `workflow: {goal}` title a runtime can supply.
-        panel.phases[1].title = format!("workflow: {}", panel.label);
-        for width in [40_usize, 60, 80] {
-            let line = panel.phase_line_text(1, width);
-            assert!(line.width() <= width, "{width}: {line:?}");
-            assert!(line.starts_with("phase 2/2 "), "{line:?}");
-            assert!(
-                line.ends_with(" · 5 running"),
-                "{width}: counts kept: {line:?}"
-            );
-            assert!(line.contains('…'), "{width}: title truncated: {line:?}");
-        }
-    }
-
-    /// #6503: problems still surface — a failed child is labelled in the
-    /// header and phase line, painted as failure, and carries its error.
-    #[test]
-    fn founder_workflow_card_surfaces_failure_only_when_present() {
-        let mut panel = founder_card_panel();
-        panel.apply_json_event(&json!({
-            "type": "task_completed",
-            "at_ms": now_ms(),
-            "task_id": "surfaces-sdk",
-            "status": "failed",
-        }));
-        if let Some(row) = panel.find_row_mut("surfaces-sdk") {
-            row.error = Some("provider timeout".to_string());
-        }
-        for width in [80_u16, 200] {
-            let lines = panel.render_lines(width);
-            let text: Vec<String> = lines.iter().map(line_text).collect();
-            assert!(text[0].contains("1/5 done · 1 failed"), "{}", text[0]);
-            assert_eq!(text[1], "phase 2/2 plan · 4 running · 1 failed");
-            let failed = lines
-                .iter()
-                .find(|line| line_text(line).contains("surfaces-sdk"))
-                .expect("failed row");
-            assert_eq!(failed.spans[0].style.fg, Some(palette::STATUS_ERROR));
-            assert!(
-                line_text(failed).contains("! provider timeout"),
-                "{:?}",
-                text
-            );
-        }
     }
 }

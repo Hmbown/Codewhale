@@ -41,7 +41,7 @@ const FINGERPRINT_HEX_LEN: usize = 12;
 /// on the allowlist. There is deliberately no constructor that takes
 /// arbitrary text verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SafeLabel {
+pub struct SafeLabel {
     text: String,
     redacted: bool,
 }
@@ -50,7 +50,7 @@ impl SafeLabel {
     /// A generic identifier-shaped value: provider id, route id, reasoning
     /// tier. Allows `A-Z a-z 0-9 . _ : - + @` and rejects every slash. Model
     /// ids with a slash must use [`Self::catalog_model`] instead.
-    pub(crate) fn identifier(raw: &str) -> Self {
+    pub fn identifier(raw: &str) -> Self {
         let trimmed = raw.trim();
         if identifier_is_allowlisted(trimmed) {
             Self {
@@ -66,7 +66,7 @@ impl SafeLabel {
     /// id exists in the active local model catalog; a vendor-looking prefix is
     /// never authority by itself. Non-slash ids retain the generic identifier
     /// boundary for custom compatible deployments.
-    pub(crate) fn catalog_model(raw: &str) -> Self {
+    pub fn catalog_model(raw: &str) -> Self {
         let trimmed = raw.trim();
         if !trimmed.contains('/') {
             return Self::identifier(raw);
@@ -83,7 +83,7 @@ impl SafeLabel {
 
     /// A short human phrase: the same allowlist plus spaces, parentheses, and
     /// commas, for host-supplied presentation labels.
-    pub(crate) fn phrase(raw: &str) -> Self {
+    pub fn phrase(raw: &str) -> Self {
         let trimmed = raw.trim();
         if phrase_is_allowlisted(trimmed) {
             Self {
@@ -104,14 +104,14 @@ impl SafeLabel {
         }
     }
 
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.text
     }
 
     /// True when the original value failed the allowlist and only its
     /// fingerprint is being published.
-    #[cfg(test)]
-    pub(crate) fn is_redacted(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn is_redacted(&self) -> bool {
         self.redacted
     }
 }
@@ -237,18 +237,18 @@ const REDACTED_PATH: &str = "<path-redacted>";
 ///   are themselves allowlisted — the path, query, fragment, and userinfo are
 ///   never published, because a deployment path can *be* the credential;
 /// - a path-shaped token (POSIX absolute, `~/`, Windows drive, or anything
-///   containing a backslash) collapses to [`REDACTED_PATH`];
+///   containing a backslash) collapses to `REDACTED_PATH`;
 /// - a token carrying a quote character (`"`, `'`, or a backtick) is replaced
 ///   wholesale: quoted spans are where hostile identifiers hide;
 /// - anything else must be a short, ordinary word — ASCII alphanumerics plus
-///   `-`, `_`, `.`, bounded by [`MAX_ERROR_WORD_LEN`] and rejected by
-///   [`looks_opaque`] — with only a small set of sentence punctuation allowed
-///   at its edges. Everything else becomes [`REDACTED_WORD`].
+///   `-`, `_`, `.`, bounded by `MAX_ERROR_WORD_LEN` and rejected by
+///   `looks_opaque` — with only a small set of sentence punctuation allowed
+///   at its edges. Everything else becomes `REDACTED_WORD`.
 ///
 /// The result therefore contains no filesystem path, no URL path, no quoted
 /// span, no token-shaped run, and no control character, and is truncated to
-/// [`MAX_ERROR_LEN`].
-pub(crate) fn safe_error_text(raw: &str) -> String {
+/// `MAX_ERROR_LEN`.
+pub fn safe_error_text(raw: &str) -> String {
     let redacted = codewhale_config::persistence::redact_secrets(raw);
     let mut out = String::with_capacity(redacted.len().min(MAX_ERROR_LEN));
     let mut last_was_redacted = false;

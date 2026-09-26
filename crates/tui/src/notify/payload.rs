@@ -280,7 +280,7 @@ pub fn sanitize_field(text: &str) -> String {
     // drops the ESC byte but leaves the parameter tail behind — good
     // enough for a terminal that will never re-interpret it, wrong for a
     // notification banner that would render a literal `[31m`.
-    super::ui::sanitize_stream_chunk(&strip_escape_sequences(text))
+    codewhale_secrets::sanitize::sanitize_stream_chunk(&strip_escape_sequences(text))
         .lines()
         .map(|line| {
             let redacted = redact_structured(line.trim());

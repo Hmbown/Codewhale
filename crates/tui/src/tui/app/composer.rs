@@ -1749,6 +1749,20 @@ impl App {
         Some(input)
     }
 
+    /// Put a message that was never sent back in the composer as it was
+    /// first sent, skill and all, so Enter sends the same request again.
+    pub fn restore_unsent_message(&mut self, message: QueuedMessage) {
+        self.input = message.display;
+        self.resync_command_line_claim();
+        self.cursor_position = char_count(&self.input);
+        self.history_index = None;
+        self.history_navigation_draft = None;
+        self.selected_attachment_index = None;
+        self.active_skill = message.skill_instruction;
+        self.active_skill_provenance = message.skill_provenance;
+        self.needs_redraw = true;
+    }
+
     pub fn restore_last_submitted_prompt_if_empty(&mut self) -> bool {
         if !self.input.is_empty() {
             return false;

@@ -29,7 +29,7 @@ fn search_text_stays_in_modal_and_out_of_composer() {
         .spawn()
         .expect("start TUI");
     let timeout = Duration::from_secs(10);
-    tui.wait_for_text("Type a message", timeout).unwrap();
+    tui.wait_for_composer(timeout).unwrap();
     // Enter the live shell with a local command, without making a model call.
     tui.paste("/help").unwrap();
     tui.wait_for_text("❯ /help", timeout).unwrap();

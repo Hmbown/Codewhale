@@ -858,7 +858,11 @@ pub fn status_visibility(message: &str) -> StatusVisibility {
     let approval_wait_row = (message.starts_with("Still waiting for tool approval on `")
         || message.starts_with("Still waiting for user input on `"))
         && message.ends_with("s — the turn is parked here until it is answered");
-    if scheduler_row || continuation_row || agent_resume_row || approval_wait_row {
+    // #6511: a nested sub-RLM's forwarded rounds are the record of model
+    // calls the parent never saw; keep them, collapsed.
+    let nested_rlm_row = message.starts_with(crate::rlm::bridge::NESTED_RLM_STATUS_PREFIX);
+    if scheduler_row || continuation_row || agent_resume_row || approval_wait_row || nested_rlm_row
+    {
         StatusVisibility::Internal
     } else {
         StatusVisibility::User

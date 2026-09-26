@@ -517,6 +517,41 @@ fn render_info_row(
     interaction_hitboxes
 }
 
+/// Paint the workbar: live runs first (in start order), then settled ones,
+/// each with the runtime's count of follow-ups queued on its busy agents.
+fn render_workbar(f: &mut Frame, app: &App, area: Rect) {
+    let queued_for = |panel: &crate::tui::widgets::workflow_panel::WorkflowPanel| {
+        panel
+            .phases
+            .iter()
+            .flat_map(|phase| phase.rows.iter())
+            .filter(|row| row.status.is_running())
+            .filter_map(|row| app.agent_queued_follow_ups.get(&row.task_id))
+            .sum::<usize>()
+    };
+    let (live, settled): (Vec<_>, Vec<_>) = app
+        .workflow_runs
+        .iter()
+        .partition(|panel| panel.lifecycle.is_running());
+    let runs: Vec<crate::tui::widgets::workbar::WorkbarRun<'_>> = live
+        .into_iter()
+        .chain(settled)
+        .map(|panel| crate::tui::widgets::workbar::WorkbarRun {
+            panel,
+            queued: queued_for(panel),
+        })
+        .collect();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default();
+    let buf = f.buffer_mut();
+    Block::default()
+        .style(Style::default().bg(app.ui_theme.footer_bg))
+        .render(area, buf);
+    crate::tui::widgets::workbar::render(area, buf, &runs, now_ms, &app.ui_theme, app.ui_locale);
+}
+
 /// Register the chrome that already answers a click, so it also answers the
 /// pointer.
 ///
@@ -545,12 +580,8 @@ fn register_clickable_chrome_for_hover(app: &App) {
             MessageId::KbCloseMenu,
         ),
         (
-            // Only the header row is the toggle/cancel affordance. Registering
-            // the whole panel painted the link glow (accent fg + underline on
-            // every cell) across the entire card whenever the pointer rested
-            // on it, and a pointer left there when the terminal lost focus
-            // kept it lit (#6503).
-            crate::tui::mouse_ui::workflow_panel_header_area(app),
+            // A workbar row opens `/workflows`.
+            app.viewport.last_workbar_area,
             MessageId::CmdWorkflowDescription,
         ),
     ];
@@ -1211,16 +1242,9 @@ pub(crate) fn build_session_snapshot(
     Ok(session)
 }
 
-/// Strip ANSI control codes / non-printable bytes from a streaming
-/// text chunk. `pub(super)` because `tui::notifications` consumes it
-/// from `crate::tui::ui` for its per-turn message composition.
-pub(crate) fn sanitize_stream_chunk(chunk: &str) -> String {
-    // Keep printable characters and common whitespace; drop control bytes.
-    chunk
-        .chars()
-        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
-        .collect()
-}
+/// The stream sanitizer lives with the other output sanitizers in
+/// `codewhale-secrets`; the event loop reaches it through this module.
+pub(crate) use codewhale_secrets::sanitize::sanitize_stream_chunk;
 
 /// Ensure an in-flight streaming Assistant cell exists in history and return
 /// its index. Thinking cells go through `streaming_thinking::ensure_active_entry`
@@ -1596,18 +1620,14 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // flight" (one owner per fact), and nothing sits between the transcript
     // and the composer that is not a queued draft or an expanded panel.
 
-    // WorkflowPanel unified activity surface (#4121). Expanded while running
-    // (interactive drill-in above the composer); when collapsed the panel
-    // takes no rows — its persistent status lives in the top status bar as a
-    // header chip instead (#5040). Zero height when no panel.
-    let desired_workflow_panel_height = if mini {
+    // The workbar (#4121): one row per workflow run, directly under the
+    // posture bar, so live progress sits beside the controls that act on it
+    // and never between the transcript and the composer. Zero rows when no
+    // run is showing.
+    let desired_workbar_height = if mini {
         0
     } else {
-        app.workflow_panel
-            .as_ref()
-            .filter(|panel| panel.expanded)
-            .map(|panel| panel.desired_height(shell_area.width))
-            .unwrap_or(0)
+        crate::tui::widgets::workbar::desired_rows(app.workflow_runs.len())
     };
     let plugin_cta_height = if mini && !mini_cfg.keep_input {
         0
@@ -1627,8 +1647,8 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // up to three compact rows at the release floor.
     let preview_cap = if size.height >= 20 { 4 } else { 3 };
     let preview_height = desired_preview_height.min(auxiliary_budget.min(preview_cap));
-    let workflow_panel_height =
-        desired_workflow_panel_height.min(auxiliary_budget.saturating_sub(preview_height));
+    let workbar_height =
+        desired_workbar_height.min(auxiliary_budget.saturating_sub(preview_height));
 
     // Two pinned rows bracket the composer from below (SHELL-DESIGN-20260901
     // §2.0 item 3, §2.3b): the posture bar — permission · mode · live counts
@@ -1659,19 +1679,21 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         .constraints([
             Constraint::Length(strip_above_height), // Tasks + To-do above transcript (`top`)
             Constraint::Min(1),                     // Chat area
-            Constraint::Length(workflow_panel_height), // Workflow panel (#4121)
             Constraint::Length(preview_height),     // Pending input preview (0 if empty)
             Constraint::Length(plugin_cta_height),  // Live plugin CTA (0 unless matched)
             Constraint::Length(composer_height),    // Composer
             Constraint::Length(footer_height),      // Posture bar
+            Constraint::Length(workbar_height),     // Workbar: one row per workflow run
             Constraint::Length(info_height),        // Metrics line
             Constraint::Length(strip_below_height), // Roster + To-do under the chrome (`bottom`)
         ])
         .split(body_area);
     let strip_slot = if strip_below { 8 } else { 0 };
-    let plugin_cta_slot = 4;
-    let composer_slot = 5;
-    let footer_slot = 6;
+    let preview_slot = 2;
+    let plugin_cta_slot = 3;
+    let composer_slot = 4;
+    let footer_slot = 5;
+    let workbar_slot = 6;
     let info_slot = 7;
 
     if matches!(
@@ -1796,30 +1818,10 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         }
     }
 
-    // Workflow panel between chat and pending-input preview (#4121).
-    if workflow_panel_height > 0 {
-        if let Some(panel) = app.workflow_panel.as_ref() {
-            let area = body_chunks[2];
-            app.viewport.last_workflow_panel_area = Some(area);
-            app.viewport.last_workflow_cancel_area =
-                panel.cancel_hint_span(area.width).map(|(start, end)| Rect {
-                    x: area.x.saturating_add(start),
-                    y: area.y,
-                    width: end.saturating_sub(start),
-                    height: 1,
-                });
-            let buf = f.buffer_mut();
-            panel.render(area, buf);
-        }
-    } else {
-        app.viewport.last_workflow_panel_area = None;
-        app.viewport.last_workflow_cancel_area = None;
-    }
-
     // Render pending-input preview (queued/steered messages, if any).
     if preview_height > 0 {
         let buf = f.buffer_mut();
-        pending_preview.render(body_chunks[3], buf);
+        pending_preview.render(body_chunks[preview_slot], buf);
     }
 
     if plugin_cta_height > 0 {
@@ -1916,6 +1918,14 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         register_footer_count_targets(app, &facts, &count_rects);
     }
 
+    if workbar_height > 0 {
+        let area = body_chunks[workbar_slot];
+        render_workbar(f, app, area);
+        app.viewport.last_workbar_area = Some(area);
+    } else {
+        app.viewport.last_workbar_area = None;
+    }
+
     // The metrics line sits directly under the posture bar: model · ctx ·
     // cost · ttft · tok/s · ↓ tokens, with the help hint pinned right.
     let mut info_interactions = InfoLineInteractionHitboxes::default();
@@ -1949,8 +1959,11 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
             column.paint_matching(side_area, f.buffer_mut(), app.ui_theme.surface_bg);
         }
         column.paint_matching(work_chat_area, f.buffer_mut(), app.ui_theme.surface_bg);
-        column.paint_matching(body_chunks[2], f.buffer_mut(), app.ui_theme.surface_bg);
-        column.paint_matching(body_chunks[3], f.buffer_mut(), app.ui_theme.surface_bg);
+        column.paint_matching(
+            body_chunks[preview_slot],
+            f.buffer_mut(),
+            app.ui_theme.surface_bg,
+        );
         if plugin_cta_height > 0 {
             column.paint_matching(
                 body_chunks[plugin_cta_slot],
@@ -1966,6 +1979,13 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         if footer_height > 0 {
             column.paint_matching(
                 body_chunks[footer_slot],
+                f.buffer_mut(),
+                app.ui_theme.footer_bg,
+            );
+        }
+        if workbar_height > 0 {
+            column.paint_matching(
+                body_chunks[workbar_slot],
                 f.buffer_mut(),
                 app.ui_theme.footer_bg,
             );

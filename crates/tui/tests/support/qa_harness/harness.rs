@@ -294,6 +294,20 @@ impl Harness {
         self.wait_for(move |f| f.contains(&owned), timeout)
     }
 
+    /// Wait for the composer. A launch with no model key opens the provider
+    /// picker first (#6566); tests that only need the composer close it with
+    /// Esc, which returns to the composer without connecting anything.
+    pub fn wait_for_composer(&mut self, timeout: Duration) -> Result<()> {
+        const PICKER: &str = "Choose your model provider";
+        const COMPOSER: &str = "Type a message";
+        self.wait_for(|f| f.contains(PICKER) || f.contains(COMPOSER), timeout)?;
+        if self.frame().contains(PICKER) {
+            self.send(super::keys::key::esc())?;
+            self.wait_for(|f| !f.contains(PICKER) && f.contains(COMPOSER), timeout)?;
+        }
+        Ok(())
+    }
+
     /// Wait for stable output: no new bytes for `quiet_for` consecutive
     /// pump ticks, bounded by `max`. Useful for "let the UI settle".
     pub fn wait_for_idle(&mut self, quiet_for: Duration, max: Duration) -> Result<()> {

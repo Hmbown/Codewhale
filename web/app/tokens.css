@@ -1,4 +1,4 @@
-/* generated from crates/palette/src/tokens.rs + vendor/codewhale-design/tokens.json — do not edit */
+/* generated from crates/palette/src/rgb.rs + vendor/codewhale-design/tokens.json — do not edit */
 /* regenerate: scripts/export-design-tokens.py (in the codewhale repo) */
 :root {
   --whale-bg: #070c1d;

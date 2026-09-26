@@ -88,7 +88,7 @@ no hosted runtime to sell.
   2026-09-15 in favor of the canonical family. Web copies live in
   `web/public/brand/`.
 - Palette, type, shell direction, and the anti-slop rules are recorded in
-  `docs/design/DESIGN.md`; the colour tokens are owned by `crates/palette/src/tokens.rs`
+  `docs/design/DESIGN.md`; the colour tokens are owned by `crates/palette/src/rgb.rs`
   and exported to `web/app/tokens.css`.
 
 ## Evidence on Hand

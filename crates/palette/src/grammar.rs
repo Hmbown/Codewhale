@@ -135,7 +135,7 @@ pub fn chrome_style(theme: &UiTheme, ink: ChromeInk) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::themes::SELECTABLE_THEMES;
+    use crate::ids::SELECTABLE_THEMES;
 
     #[test]
     fn chrome_has_five_visual_families_with_explicit_safety_roles() {

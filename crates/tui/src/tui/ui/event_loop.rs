@@ -1029,12 +1029,14 @@ pub async fn run_tui(
         persist_offline_queue_state(&app);
     }
 
-    // Returning users recovering a missing key open the picker immediately so
-    // recovery cannot silently replace a persisted route. First-run users
-    // start on Welcome; Enter shows the provider explanation, and a second
-    // Enter opens the picker.
+    // A launch without a usable key opens the picker immediately (#6566).
+    // A returning user's picker focuses the saved route so recovery cannot
+    // silently replace it; a new user has no saved route, so the picker opens
+    // on the provider list rather than on the built-in default's missing key.
     if app.onboarding == OnboardingState::Provider && app.onboarding_missing_key_recovery {
-        open_onboarding_provider_picker(&mut app, config, &engine_handle, true).await;
+        let recover_configured_route = app.onboarding_recovers_configured_route();
+        open_onboarding_provider_picker(&mut app, config, &engine_handle, recover_configured_route)
+            .await;
     }
 
     // #4605: create the dispatch completion channel before any submit path so
@@ -2447,6 +2449,7 @@ pub(crate) async fn run_event_loop(
                         }
                     }
                     EngineEvent::TurnStarted { turn_id, route, .. } => {
+                        app.prune_settled_workflow_runs();
                         // A prior turn that died without its `TurnComplete`
                         // must not leak its provisional estimate into this one.
                         app.clear_pending_turn_cost();
@@ -2565,6 +2568,7 @@ pub(crate) async fn run_event_loop(
                         // (#6190).
                         crate::tui::ui::dispatch::settle_unaccepted_steers_at_turn_end(app);
                         let completed_turn = app.active_turn.take();
+                        app.unanswered_submission = None;
                         // The in-flight provisional estimate hands off to the
                         // authoritative cumulative price accrued below; the
                         // high-water mark keeps the displayed total monotonic
@@ -3742,24 +3746,26 @@ pub(crate) async fn run_event_loop(
                             received_engine_event = redraw_requested_before_event;
                             continue;
                         }
-                        // #4095 residual: budget_updated is high-frequency under
-                        // multi-agent fan-out. Data is already applied; pace the
-                        // repaint like AgentProgress so the panel does not churn.
-                        let is_budget = event
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .is_some_and(|t| t == "budget_updated");
-                        if is_budget {
-                            if workflow_budget_redraw_permitted(
+                        // Coalesce progress (#4095): a 75-agent fan-out streams
+                        // task and budget events far faster than a frame. The
+                        // state is already applied; only a run's start and end
+                        // paint at once, the rest share the AgentProgress pace.
+                        // The transcript is not marked here — the only cells a
+                        // workflow event touches mark it themselves.
+                        let lifecycle =
+                            event.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
+                                matches!(t, "run_started" | "run_completed" | "run_cancelled")
+                            });
+                        if lifecycle
+                            || workflow_budget_redraw_permitted(
                                 &mut app.last_workflow_budget_redraw,
                                 Instant::now(),
-                            ) {
-                                app.needs_redraw = true;
-                            } else {
-                                received_engine_event = redraw_requested_before_event;
-                            }
+                            )
+                        {
+                            app.needs_redraw = true;
+                        } else {
+                            received_engine_event = redraw_requested_before_event;
                         }
-                        transcript_batch_updated = true;
                     }
                     EngineEvent::ApprovalRequired {
                         id,
@@ -5018,15 +5024,6 @@ pub(crate) async fn run_event_loop(
                 continue;
             }
 
-            // Clicking the WorkflowPanel gives its non-text controls focus,
-            // but ordinary characters always return directly to the composer.
-            // This keeps the panel keyboard-accessible without stealing the
-            // first t/c/j/k (or any other letter) of a new chat.
-            if app.view_stack.is_empty() && handle_workflow_panel_key(app, &key) {
-                submit_initial_input_if_ready(app, config, &engine_handle).await?;
-                continue;
-            }
-
             // The Ocean work surface is a real focus owner. Route its keys
             // before global transcript/composer navigation so PageUp/Down,
             // Home/End, arrows, and row actions stay panel-local.
@@ -5215,7 +5212,8 @@ pub(crate) async fn run_event_loop(
                             onboarding::advance_onboarding_after_language(app);
                         }
                         OnboardingState::Provider => {
-                            let recover_configured_route = app.onboarding_missing_key_recovery;
+                            let recover_configured_route =
+                                app.onboarding_recovers_configured_route();
                             open_onboarding_provider_picker(
                                 app,
                                 config,
@@ -5809,8 +5807,14 @@ pub(crate) async fn run_event_loop(
                             open_agents_register(app, &engine_handle).await;
                         }
                     }
+                    // `↓ to manage` opens the workflows view while the workbar
+                    // shows runs, else the agent register.
                     crate::tui::agent_focus::AgentShellShortcut::ManageAgents => {
-                        open_agents_register(app, &engine_handle).await;
+                        if app.workflow_runs.is_empty() {
+                            open_agents_register(app, &engine_handle).await;
+                        } else {
+                            crate::tui::views::workflows_manager::open(app);
+                        }
                     }
                 }
                 continue;
@@ -6881,7 +6885,7 @@ fn telemetry_notice_may_enter_transcript(app: &App) -> bool {
 }
 
 /// Switch a first-run / missing-key session onto a live local Ollama tag.
-async fn adopt_live_local_ollama_catalog(
+pub(super) async fn adopt_live_local_ollama_catalog(
     app: &mut App,
     engine_handle: &mut EngineHandle,
     config: &mut Config,
@@ -6904,7 +6908,22 @@ async fn adopt_live_local_ollama_catalog(
     }
     app.onboarding_needs_api_key = false;
     app.onboarding_missing_key_recovery = false;
-    app.status_message = Some(format!("Local Ollama ready · {tag} (from GET /api/tags)"));
+    // A launch with no key opens the provider picker (#6566). The local model
+    // just answered that question, so close the picker and its onboarding
+    // step rather than leave a stale "connect a model" screen whose Esc would
+    // now walk back to the welcome screen.
+    if app.onboarding == OnboardingState::Provider {
+        if app.view_stack.top_kind() == Some(ModalKind::ProviderPicker) {
+            app.view_stack.pop();
+        }
+        app.onboarding = OnboardingState::None;
+    }
+    // Say plainly which model is in use and how to change it, instead of the
+    // endpoint it was discovered from (#6566).
+    let adopted = app
+        .tr(MessageId::LocalModelAdopted)
+        .replace("{model}", &tag);
+    app.status_message = Some(adopted);
     app.needs_redraw = true;
 }
 

@@ -32,6 +32,10 @@ release_crates=(
   codewhale-palette
   # Scoped memory store; tui's native memory backend. No workspace deps.
   codewhale-memory
+  # Headless runtime split out of the TUI (docs/design/TUI_DECONSTRUCTION.md).
+  # Depends on config, core, memory and models; the published tui depends on
+  # it, so it publishes after those and before tui.
+  codewhale-runtime
   codewhale-tui
   codewhale-app-server
   codewhale-cli

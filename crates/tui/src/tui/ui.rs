@@ -1635,9 +1635,9 @@ mod provider_key_validation_tests {
         assert!(!saved.contains("sk-verified"));
         assert_eq!(app.view_stack.top_kind(), Some(ModalKind::ProviderPicker));
         assert!(
-            app.status_message.as_deref().is_some_and(|status| {
-                status.contains("Connection checked (/models returned 2xx)")
-            }),
+            app.status_message
+                .as_deref()
+                .is_some_and(|status| { status.contains("The provider accepted the key") }),
             "status names connection-probe success: {:?}",
             app.status_message
         );
@@ -1670,8 +1670,8 @@ mod provider_key_validation_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            rendered.contains("Connection checked (/models returned 2xx)")
-                && rendered.contains("Pick a default model"),
+            rendered.contains("The provider accepted the key")
+                && rendered.contains("pick the model to use by default"),
             "expected model-pick stage UI, got:\n{rendered}"
         );
     }
@@ -1712,10 +1712,8 @@ mod provider_key_validation_tests {
         assert_eq!(config.provider.as_deref(), Some("openrouter"));
         assert!(
             app.status_toasts.iter().any(|toast| {
-                toast
-                    .text
-                    .contains("Connection checked (/models returned 2xx)")
-                    && !toast.text.contains("Pick a default model")
+                toast.text.contains("The provider accepted the key")
+                    && !toast.text.contains("pick the model")
             }),
             "test connection names reachability only: {:?}",
             app.status_toasts
@@ -2154,7 +2152,7 @@ api_key = "fixture-other-provider-key"
         assert!(
             app.status_message
                 .as_deref()
-                .is_some_and(|status| status.contains("API key verification failed")),
+                .is_some_and(|status| status.contains("The provider did not accept this key")),
             "status names validation failure: {:?}",
             app.status_message
         );
@@ -2171,7 +2169,12 @@ api_key = "fixture-other-provider-key"
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("Verification failed: HTTP 401: unauthorized"));
+        // #6566: a plain sentence with the next step, not the raw reply.
+        assert!(
+            rendered.contains("The provider did not accept this key"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("HTTP 401"), "{rendered}");
     }
 
     #[tokio::test]

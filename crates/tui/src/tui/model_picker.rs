@@ -46,6 +46,7 @@ use crate::tui::views::{
     ActionHint, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
     render_underwater_surface,
 };
+use crate::utils::format_context_window;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
 
@@ -3083,11 +3084,11 @@ fn model_row_meta_chips(row: &ModelPickerRow) -> Vec<String> {
             "user declared (unverified)".to_string(),
             row.metadata
                 .context_window
-                .map(|value| format_picker_context_window(u64::from(value)))
+                .map(|value| format_context_window(u64::from(value)))
                 .unwrap_or_else(|| "context unknown".into()),
             row.metadata
                 .max_output
-                .map(|value| format!("{} out", format_picker_context_window(u64::from(value))))
+                .map(|value| format!("{} out", format_context_window(u64::from(value))))
                 .unwrap_or_else(|| "output unknown".into()),
             match &row.metadata.pricing {
                 PickerPricing::Known(price) => format!("estimate {price}"),
@@ -3117,7 +3118,7 @@ fn model_row_meta_chips(row: &ModelPickerRow) -> Vec<String> {
     }
     let mut chips = Vec::new();
     if let Some(context_window) = row.metadata.context_window {
-        chips.push(format_picker_context_window(u64::from(context_window)));
+        chips.push(format_context_window(u64::from(context_window)));
     }
     // The reasoning stance is the most decision-relevant fact for a coding
     // harness, so it sits before the limits/modality chips — the chip budget
@@ -3148,7 +3149,7 @@ fn model_row_meta_chips(row: &ModelPickerRow) -> Vec<String> {
         };
         chips.push(format!(
             "{} out{suffix}",
-            format_picker_context_window(u64::from(max_output))
+            format_context_window(u64::from(max_output))
         ));
     }
     // Modality and tool facts are shown only when the catalog genuinely knows
@@ -3749,7 +3750,7 @@ fn render_picker_model_hint(
         if provider == Some(ApiProvider::OpenaiCodex) {
             parts.push(format!(
                 "{} ctx · ChatGPT route",
-                format_picker_context_window(u64::from(context_window))
+                format_context_window(u64::from(context_window))
             ));
         } else if provider == Some(ApiProvider::Moonshot)
             && id.trim().eq_ignore_ascii_case("k3")
@@ -3761,7 +3762,7 @@ fn render_picker_model_hint(
             // `context_window` setting when the plan includes 1M.
             parts.push(format!(
                 "{} ctx (plan floor; raise via context_window)",
-                format_picker_context_window(u64::from(context_window))
+                format_context_window(u64::from(context_window))
             ));
         } else {
             let suffix = if metadata.context_window_unverified {
@@ -3771,7 +3772,7 @@ fn render_picker_model_hint(
             };
             parts.push(format!(
                 "{} ctx{}",
-                format_picker_context_window(u64::from(context_window)),
+                format_context_window(u64::from(context_window)),
                 suffix
             ));
         }
@@ -3785,7 +3786,7 @@ fn render_picker_model_hint(
         };
         parts.push(format!(
             "{} out{}",
-            format_picker_context_window(u64::from(max_output)),
+            format_context_window(u64::from(max_output)),
             suffix
         ));
     }
@@ -3877,23 +3878,6 @@ fn catalog_refresh_error_label(error: CatalogRefreshError) -> &'static str {
         CatalogRefreshError::InvalidResponse => "invalid response",
         CatalogRefreshError::EmptyList => "empty list",
         CatalogRefreshError::Network => "network error",
-    }
-}
-
-pub(crate) fn format_picker_context_window(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
-        if tokens.is_multiple_of(1_000_000) {
-            format!("{}M", tokens / 1_000_000)
-        } else {
-            format!("{:.2}M", tokens as f64 / 1_000_000.0)
-                .trim_end_matches('0')
-                .trim_end_matches('.')
-                .to_string()
-        }
-    } else if tokens >= 1_000 {
-        format!("{}K", tokens / 1_000)
-    } else {
-        tokens.to_string()
     }
 }
 
@@ -5645,7 +5629,7 @@ mod tests {
         assert!(
             picker.projection.borrow().as_ref().unwrap().rows[index]
                 .meta
-                .contains(&format_picker_context_window(777_000))
+                .contains(&format_context_window(777_000))
         );
     }
 

@@ -32,6 +32,32 @@ struct PlannedToolCalls {
     batch_sandbox_policy: crate::sandbox::SandboxPolicy,
 }
 
+/// Who proposed a tool call being planned. Both sources go through the same
+/// gate; only code-mode calls skip deferred-schema hydration, so a program
+/// never activates a tool (and never re-pins the request prefix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCallSource {
+    /// Emitted by the model in its response.
+    Model,
+    /// Issued by an `execute_tools` program through its nested-call gate.
+    CodeMode,
+}
+
+/// The planning inputs an `execute_tools` program's nested calls need, so
+/// they are planned by the same `plan_tool_calls` as a direct call.
+struct NestedGateEnv<'a> {
+    client: &'a dyn crate::core::model_client::ModelClient,
+    turn: &'a mut TurnContext,
+    tool_policy: &'a ToolSurfacePolicy,
+    tool_call_budget: &'a mut ToolCallBudget,
+    fleet_denial_guard: Option<&'a FleetDenialGuard>,
+    /// Set once the live permission posture changed while a program was
+    /// running. The rest of that program's nested calls are refused (the
+    /// program's tool context was built under the old posture), and the
+    /// turn loop reports the change like any other mid-batch change.
+    authority_changed: bool,
+}
+
 struct StreamOutcome {
     current_text_raw: String,
     current_text_visible: String,
@@ -872,11 +898,17 @@ impl Engine {
             // must see mid-turn (LSP diagnostics, steer input, subagent
             // completions) are appended to history above, never spliced into
             // the frozen prefix.
+            // A zero-tool turn (plain `exec`) spends extra steps only on
+            // output-limit continuations. It has no work to wrap up or report
+            // on, so the agent wrap-up notices below would only bend a
+            // one-shot answer; at the limit it ends honestly instead.
+            let zero_tool_turn = tool_catalog.is_empty();
             // A1 soft landing: with a finite step budget, once ~80% of it is
             // spent tell the model once to stop exploring and write its final
             // report. Savings proved out by the grok-style parity work (ops
             // A1): a step-faithful harness ends mid-report far too often.
-            if !turn.stop_diagnostics.soft_landing_sent
+            if !zero_tool_turn
+                && !turn.stop_diagnostics.soft_landing_sent
                 && let Some(step_limit) = turn.step_limit()
                 && step_limit > 0
                 && turn.steps_used() >= ((step_limit as f32 * 0.8).floor() as u32).max(1)
@@ -900,7 +932,7 @@ impl Engine {
 
             if turn.at_max_steps() {
                 turn.stop_diagnostics.reason = Some(TurnStopReason::StepBudgetExhausted);
-                if step_budget_exhaustion_is_terminal && !final_report_sent {
+                if step_budget_exhaustion_is_terminal && !final_report_sent && !zero_tool_turn {
                     // A2 report-on-exhaustion: the budget died while the model
                     // still owes work. Never finish silently — grant exactly
                     // one final provider turn to write a bounded report, then
@@ -1650,6 +1682,10 @@ impl Engine {
             let stream = match stream_result {
                 Ok(s) => {
                     context_recovery_attempts = 0;
+                    // A model has the question now; a later credential
+                    // failure in this turn (a token expiring mid-turn, say)
+                    // must not take it back (#6566).
+                    turn.unanswered_user_message = None;
                     s
                 }
                 Err(e) => {
@@ -1697,6 +1733,18 @@ impl Engine {
                     );
                     let mut envelope = crate::error_taxonomy::envelope_for_llm_error(e, message);
                     envelope.message = display_message.clone();
+                    // #6566: no model saw the question. Take it back out of
+                    // the session before reporting, so the next request does
+                    // not send it twice and a resumed session does not show
+                    // it twice; the code tells the host to hand the text back.
+                    if envelope.category == ErrorCategory::Authentication
+                        && let Some(mark) = turn.unanswered_user_message.take()
+                        && self.retract_unanswered_user_message(mark)
+                    {
+                        envelope.code =
+                            crate::error_taxonomy::CREDENTIAL_REJECTED_UNSENT_CODE.to_string();
+                        self.emit_session_updated().await;
+                    }
                     turn_error = Some(display_message);
                     let _ = self.tx_event.send(Event::error(envelope)).await;
                     return (TurnOutcomeStatus::Failed, turn_error);
@@ -2251,7 +2299,13 @@ impl Engine {
                 // for sustained work instead of forcing the model through a
                 // separate open/eval/configure control surface.
 
+                // The kernel runs model-written Python, so it answers to the
+                // same command gate as `code_execution`: a narrowed tool
+                // surface (`exec --allowed-tools …`, or plain `exec`'s zero-tool
+                // surface, #6510) must not execute code through a fence.
                 if has_sendable_assistant_content
+                    && tool_policy.passes_allow_list(super::tool_catalog::CODE_EXECUTION_TOOL_NAME)
+                    && !tool_policy.denies_tool(super::tool_catalog::CODE_EXECUTION_TOOL_NAME)
                     && crate::repl::sandbox::has_repl_block(&current_text_visible)
                 {
                     let repl_blocks =
@@ -2305,6 +2359,9 @@ impl Engine {
                             self.session.model.clone(),
                             1,
                         )
+                        // A nested `rlm_query` reports on this turn's stream,
+                        // so its model calls are part of the record (#6511).
+                        .with_events(self.tx_event.clone())
                     });
                     let repl_cost_scope = crate::cost_status::scope_token();
                     let repl_started = Instant::now();
@@ -2795,10 +2852,9 @@ impl Engine {
 
             let tool_exec_lock = self.tool_exec_lock.clone();
             let mcp_pool = if !fleet_report_response
-                && tool_uses
-                    .iter()
-                    .any(|tool| McpPool::is_mcp_tool(&tool.name))
-            {
+                && tool_uses.iter().any(|tool| {
+                    McpPool::is_mcp_tool(&tool.name) || tool.name == EXECUTE_TOOLS_TOOL_NAME
+                }) {
                 match self.ensure_mcp_pool().await {
                     Ok(pool) => Some(pool),
                     Err(err) => {
@@ -2843,13 +2899,23 @@ impl Engine {
                     &mut tool_call_budget,
                     mode,
                     fleet_denial_guard.as_ref(),
+                    ToolCallSource::Model,
                 )
                 .await;
 
+            let origin_turn_id = turn.id.clone();
+            let mut nested_gate_env = NestedGateEnv {
+                client: client.as_ref(),
+                turn: &mut *turn,
+                tool_policy: &tool_policy,
+                tool_call_budget: &mut tool_call_budget,
+                fleet_denial_guard: fleet_denial_guard.as_ref(),
+                authority_changed: false,
+            };
             let (outcomes, authority_changed_during_tools) = self
                 .execute_planned_tools(
                     plans,
-                    &turn.id,
+                    &origin_turn_id,
                     &current_text_visible,
                     &tool_catalog,
                     &mut active_tool_names,
@@ -2858,6 +2924,7 @@ impl Engine {
                     mcp_pool,
                     &batch_sandbox_policy,
                     &mut mode,
+                    &mut nested_gate_env,
                 )
                 .await;
 
@@ -3042,6 +3109,7 @@ impl Engine {
         tool_call_budget: &mut ToolCallBudget,
         mode: AppMode,
         fleet_denial_guard: Option<&FleetDenialGuard>,
+        source: ToolCallSource,
     ) -> PlannedToolCalls {
         let active_tools_at_batch_start = active_tool_names.clone();
         let mut deferred_tools_hydrated_this_batch: std::collections::HashSet<String> =
@@ -3520,7 +3588,9 @@ impl Engine {
 
             let first_hydration_this_batch =
                 !deferred_tools_hydrated_this_batch.contains(&tool_name);
-            let hydration = if blocked_error.is_none() {
+            // A code-mode call reaches a tool through the program, not the
+            // request's tool array: never hydrate or activate its schema.
+            let hydration = if blocked_error.is_none() && source == ToolCallSource::Model {
                 maybe_hydrate_requested_deferred_tool(
                     &tool_name,
                     &tool_input,
@@ -3686,6 +3756,7 @@ impl Engine {
         mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
         batch_sandbox_policy: &crate::sandbox::SandboxPolicy,
         mode: &mut AppMode,
+        nested_gate_env: &mut NestedGateEnv<'_>,
     ) -> (Vec<Option<ToolExecOutcome>>, bool) {
         let mut authority_changed = false;
         // Every plan below was classified under this posture. A narrowing
@@ -4420,10 +4491,30 @@ impl Engine {
                     }
 
                     let started_at = Instant::now();
+                    let call_context = tool_context_for_call(
+                        context_override.or_else(|| batch_tool_context.clone()),
+                        &tool_id,
+                    );
                     let (mut result, cancelled_before_completion) = if let Some(result_override) =
                         result_override
                     {
                         (result_override.map(RichToolResult::plain), false)
+                    } else if tool_name == EXECUTE_TOOLS_TOOL_NAME
+                        && let Some(context) = call_context.clone()
+                    {
+                        self.execute_tools_with_nested_gate(
+                            nested_gate_env,
+                            &tool_id,
+                            tool_input.clone(),
+                            tool_exec_lock.clone(),
+                            tool_catalog,
+                            active_tool_names,
+                            tool_registry,
+                            mcp_pool.clone(),
+                            context,
+                            *mode,
+                        )
+                        .await
                     } else {
                         tokio::select! {
                             biased;
@@ -4442,13 +4533,16 @@ impl Engine {
                                 self.session.workspace.clone(),
                                 tool_registry,
                                 mcp_pool.clone(),
-                                tool_context_for_call(
-                                    context_override.or_else(|| batch_tool_context.clone()),
-                                    &tool_id,
-                                ),
+                                call_context,
                             ) => (result, false),
                         }
                     };
+                    // A posture change a program's nested gate applied is
+                    // reported exactly like one applied between calls.
+                    if std::mem::take(&mut nested_gate_env.authority_changed) {
+                        authority_changed = true;
+                        *mode = self.current_mode;
+                    }
 
                     if cancelled_before_completion {
                         result = Ok(RichToolResult::plain(
@@ -4542,6 +4636,310 @@ impl Engine {
             }
         }
         (outcomes, authority_changed)
+    }
+
+    /// Run one `execute_tools` call while serving its nested-call gate.
+    ///
+    /// The program runs on the ordinary executor; each nested call it makes
+    /// arrives here and is planned by `plan_tool_calls` (source: code mode)
+    /// and, when the plan needs it, approved through `request_tool_approval`
+    /// — the same gate and the same approval path as a direct call. The
+    /// program is suspended on its nested call for the whole decision.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_tools_with_nested_gate(
+        &mut self,
+        nested_gate_env: &mut NestedGateEnv<'_>,
+        tool_id: &str,
+        tool_input: serde_json::Value,
+        tool_exec_lock: Arc<RwLock<()>>,
+        tool_catalog: &[codewhale_models::Tool],
+        active_tool_names: &mut std::collections::HashSet<String>,
+        tool_registry: Option<&crate::tools::ToolRegistry>,
+        mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
+        mut context: crate::tools::ToolContext,
+        mode: AppMode,
+    ) -> (Result<RichToolResult, ToolError>, bool) {
+        let (gate, mut requests) = crate::tools::codemode::NestedCallGate::new(
+            mcp_pool.clone(),
+            self.tx_event.clone(),
+            self.nested_program_deadline(),
+        );
+        context.execution.nested_call_gate = Some(gate);
+        let cancel = self.cancel_token.clone();
+        let run = Self::execute_tool_with_lock(
+            tool_exec_lock,
+            false,
+            false,
+            self.tx_event.clone(),
+            Some(cancel.clone()),
+            EXECUTE_TOOLS_TOOL_NAME.to_string(),
+            Some(tool_id.to_string()),
+            tool_input,
+            self.session.workspace.clone(),
+            tool_registry,
+            mcp_pool,
+            Some(context),
+        );
+        tokio::pin!(run);
+        let mut seq = 0usize;
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return (Ok(RichToolResult::plain(interrupted_active_tool_result())), true);
+                }
+                result = &mut run => return (result, false),
+                Some(request) = requests.recv() => {
+                    seq += 1;
+                    let verdict = self
+                        .gate_nested_call(
+                            nested_gate_env,
+                            tool_id,
+                            seq,
+                            request.name,
+                            request.input,
+                            tool_catalog,
+                            active_tool_names,
+                            tool_registry,
+                            mode,
+                        )
+                        .await;
+                    let _ = request.reply.send(verdict);
+                }
+            }
+        }
+    }
+
+    /// Run deadline for an `execute_tools` program: what is left of the
+    /// turn's own wall clock (never a fixed constant, #6509). Both clocks
+    /// stop while a person decides an approval.
+    fn nested_program_deadline(&self) -> Duration {
+        self.turn_wall_clock
+            .budget()
+            .saturating_sub(self.turn_wall_clock.spent())
+            .max(Duration::from_secs(1))
+    }
+
+    /// Decide one nested `execute_tools` call through the direct-call gate.
+    #[allow(clippy::too_many_arguments)]
+    async fn gate_nested_call(
+        &mut self,
+        nested_gate_env: &mut NestedGateEnv<'_>,
+        parent_id: &str,
+        seq: usize,
+        name: String,
+        input: serde_json::Value,
+        tool_catalog: &[codewhale_models::Tool],
+        active_tool_names: &mut std::collections::HashSet<String>,
+        tool_registry: Option<&crate::tools::ToolRegistry>,
+        mode: AppMode,
+    ) -> crate::tools::codemode::NestedCallVerdict {
+        use crate::tools::codemode::{NestedCallVerdict, NestedDecision};
+
+        // The program's tool context (sandbox policy, trust) was built under
+        // the posture the program started with. Once that posture changes,
+        // no later nested call may run on it: refuse, like a direct batch
+        // planned under a stale posture, and let the model retry directly.
+        if !nested_gate_env.authority_changed && self.apply_pending_runtime_authority().await {
+            nested_gate_env.authority_changed = true;
+        }
+        if nested_gate_env.authority_changed {
+            return NestedCallVerdict::Refused {
+                error: ToolError::permission_denied(
+                    "Permissions changed while this execute_tools program was running; the nested call did not run. Return from the program and retry the remaining calls with the current permissions.",
+                ),
+                decision: NestedDecision::Refused,
+            };
+        }
+
+        let nested_id = format!("{parent_id}.{seq}");
+        let mut uses = [ToolUseState {
+            id: nested_id.clone(),
+            name,
+            input,
+            caller: None,
+            thought_signature: None,
+            input_buffer: String::new(),
+            input_parse_error: None,
+        }];
+        let PlannedToolCalls {
+            plans,
+            mut hook_contexts,
+            ..
+        } = self
+            .plan_tool_calls(
+                nested_gate_env.client,
+                nested_gate_env.turn,
+                nested_gate_env.tool_policy,
+                &mut uses,
+                tool_catalog,
+                tool_registry,
+                active_tool_names,
+                nested_gate_env.tool_call_budget,
+                mode,
+                nested_gate_env.fleet_denial_guard,
+                ToolCallSource::CodeMode,
+            )
+            .await;
+        let Some(plan) = plans.into_iter().next() else {
+            return NestedCallVerdict::Refused {
+                error: ToolError::not_available("the nested call could not be planned"),
+                decision: NestedDecision::Refused,
+            };
+        };
+        if let Some(error) = plan.blocked_error {
+            return NestedCallVerdict::Refused {
+                error,
+                decision: NestedDecision::Refused,
+            };
+        }
+        // Planning resolves a near-miss name (`Agent` -> `agent`) and hooks
+        // may rewrite the input, so the direct-only refusals the program's
+        // raw request passed are checked again on what would actually run.
+        if let Some(note) =
+            crate::tools::codemode::refusal_before_gate(&plan.name, &plan.input, true)
+        {
+            // Admitted by planning but never executed: hand the slot back.
+            nested_gate_env.tool_call_budget.refund();
+            return NestedCallVerdict::Refused {
+                error: ToolError::permission_denied(note),
+                decision: NestedDecision::Refused,
+            };
+        }
+        let hook_context = hook_contexts.remove(&nested_id);
+        if let Some(result) = plan.guard_result {
+            return NestedCallVerdict::Answered {
+                result,
+                hook_context,
+            };
+        }
+
+        let decision = if plan.approval_required {
+            emit_tool_audit(json!({
+                "event": "tool.approval_required",
+                "tool_id": nested_id.clone(),
+                "tool_name": plan.name.clone(),
+                "caller": "code_mode",
+                "parent_tool_id": parent_id,
+            }));
+            let approval_event = Event::ApprovalRequired {
+                id: nested_id.clone(),
+                tool_name: plan.name.clone(),
+                input: plan.input.clone(),
+                description: format!("execute_tools program call: {}", plan.approval_description),
+                approval_key: crate::tools::approval_cache::build_approval_key(
+                    &plan.name,
+                    &plan.input,
+                )
+                .0,
+                approval_grouping_key: crate::tools::approval_cache::build_approval_grouping_key(
+                    &plan.name,
+                    &plan.input,
+                )
+                .0,
+                intent_summary: None,
+                approval_force_prompt: plan.approval_force_prompt,
+            };
+            let answer = self
+                .request_tool_approval(&nested_id, &plan.name, approval_event)
+                .await;
+            let (decision, refusal) = match answer {
+                Ok(ApprovalResult::Approved) => (NestedDecision::Approved, None),
+                Ok(ApprovalResult::Denied) => (
+                    NestedDecision::Denied,
+                    Some(ToolError::permission_denied(format!(
+                        "Tool '{}' denied by user — this nested call was not approved and did not run. Do not retry it; present what you intended and wait for the user's approval or new instructions.",
+                        plan.name
+                    ))),
+                ),
+                Ok(ApprovalResult::RetryWithPolicy(_)) => (
+                    NestedDecision::Denied,
+                    Some(ToolError::permission_denied(format!(
+                        "Tool '{}' was answered with a sandbox escalation, which only a direct call can use; call it directly.",
+                        plan.name
+                    ))),
+                ),
+                Err(error) => (NestedDecision::Refused, Some(error)),
+            };
+            emit_tool_audit(json!({
+                "event": "tool.approval_decision",
+                "tool_id": nested_id.clone(),
+                "tool_name": plan.name.clone(),
+                "decision": decision,
+                "caller": "code_mode",
+                "parent_tool_id": parent_id,
+            }));
+            if let Some(error) = refusal {
+                return NestedCallVerdict::Refused { error, decision };
+            }
+            decision
+        } else {
+            NestedDecision::Auto
+        };
+
+        // Planning (hooks, Auto-Review) and an approval wait can outlive a
+        // posture switch. Same rule as a direct call: an approval survives
+        // an equal or broader posture; anything else is refused.
+        let posture_before_drain = self.applied_runtime_authority();
+        if self.apply_pending_runtime_authority().await {
+            nested_gate_env.authority_changed = true;
+            if decision != NestedDecision::Approved
+                || self
+                    .applied_runtime_authority()
+                    .narrows(&posture_before_drain)
+            {
+                return NestedCallVerdict::Refused {
+                    error: ToolError::permission_denied(
+                        "Permissions changed before this nested call executed; it did not run. Return from the program and retry it with the current permissions.",
+                    ),
+                    decision: NestedDecision::Refused,
+                };
+            }
+        }
+
+        // Discovery inside a program went through the same gates as a direct
+        // search (budget, allow/deny lists, hooks) but only describes tools:
+        // nothing is activated, so the session-pinned tool array and prefix
+        // never change.
+        if is_tool_search_tool(&plan.name) {
+            return match super::tool_catalog::describe_tools_for_program(&plan.input, tool_catalog)
+            {
+                Ok(result) => NestedCallVerdict::Answered {
+                    result,
+                    hook_context,
+                },
+                Err(error) => NestedCallVerdict::Refused {
+                    error,
+                    decision: NestedDecision::Refused,
+                },
+            };
+        }
+
+        // Same `/undo` snapshot rule as a direct file write (#384).
+        if should_pre_tool_snapshot(
+            self.config.snapshots_enabled,
+            false,
+            plan.name.as_str(),
+            &plan.input,
+        ) {
+            let ws = self.session.workspace.clone();
+            let tid = nested_id.clone();
+            let cap = self.config.snapshots_max_workspace_bytes;
+            let sid = self.session.id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::core::turn::pre_tool_snapshot(&ws, &tid, cap, Some(&sid))
+            })
+            .await;
+            self.emit_pending_snapshot_notices().await;
+        }
+
+        NestedCallVerdict::Run {
+            name: plan.name,
+            input: plan.input,
+            supports_parallel: plan.supports_parallel,
+            decision,
+            hook_context,
+        }
     }
 
     /// Read cancellation evidence only after the active future has been dropped,

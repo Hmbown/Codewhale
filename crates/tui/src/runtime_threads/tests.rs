@@ -13960,9 +13960,11 @@ async fn approval_timeout_denies_clears_ui_and_next_turn_can_start() -> Result<(
     let decision = tokio::time::timeout(Duration::from_secs(2), harness.recv_approval_event())
         .await
         .context("approval timeout should deny the engine")?;
+    // The engine refuses the call either way; the timeout reaches it as its
+    // own decision so the receipt records a timeout, not a person's no.
     assert_eq!(
         decision,
-        Some(MockApprovalEvent::Denied {
+        Some(MockApprovalEvent::TimedOut {
             id: "tool_timeout".to_string(),
         })
     );

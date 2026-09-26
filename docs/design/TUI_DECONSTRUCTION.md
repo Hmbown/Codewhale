@@ -46,6 +46,81 @@ The current dependencies explain the blockage:
 not detect `run_subagent`'s execution cycle. A passing name scan is therefore
 insufficient evidence of one execution implementation.
 
+## Runtime split sequence (2026-09-25, supersedes the order below)
+
+The build-graph split runs first; the protocol-client contract follows it.
+Nothing here is a claim that a step has landed: `git log` and the ratchet
+(`scripts/runtime-boundary-baseline.json`) are the record.
+
+1. **Rails.** `scripts/split/module_graph.py` computes the runtime closure
+   (everything reachable from `core`, `tools`, `runtime_api`,
+   `runtime_threads`, `client`, `llm_client`, `config` and
+   `session_manager` without passing through `tui`, `commands`,
+   `remote_control`, `context_report`, `composer_*` or `lib.rs`) and counts
+   every reference from it into UI code, UI libraries, modules that move
+   later, and UI intra-doc links. `scripts/check-command-crate-boundaries.py`
+   runs it in CI: counts may only go down (RS-0).
+2. **Create `crates/runtime` (`codewhale-runtime`) with live code.** The
+   first batch is the leaf modules that reference nothing outside the batch
+   in production or test code and touch no UI library. The crate is
+   publishable, because the published `codewhale-tui` depends on it (RS-2).
+3. **Cut the upward edges, one blocker per slice**, each lowering the
+   ratchet: palette's `ratatui` dependency becomes an optional default
+   feature (RS-3); the one `host_terminal` port carries every terminal side
+   effect the runtime needs, starting with raw-mode suspension around
+   interactive children (RS-4); voice capture splits from its slash command
+   (RS-5); the context-window formatter moves to `utils` (RS-6);
+   notification payload and sound policy move down while delivery (OSC
+   writes, taskbar, title) stays in the TUI behind the port (RS-7); then the
+   engine's terminal-chrome calls, auto-review and risk policy into
+   `core::authority`, the remaining engine leaks, the command catalog, the
+   `lib.rs` helpers, and the test-only references.
+4. **Move the strongly connected core in one rename-only change** (about 64
+   modules; a crate cannot hold half a cycle), after landing its visibility
+   and rustdoc edits in place. Then `runtime_api` and the modules above the
+   core, then the headless surfaces, then delete the path alias.
+5. **Then the client contract** (behavioral, tracked separately): one engine
+   owner in `runtime_threads`, runtime-owned queue and steer, approvals as
+   server requests, a `runtime-client` facade, one protocol method table,
+   and loop convergence.
+
+`crates/runtime` must never depend on `codewhale-tui`, `codewhale-cli`,
+ratatui, crossterm, `ansi-to-tui` or a terminal component kit. The TUI is the
+one terminal-output owner: the runtime reaches the terminal only through
+`host_terminal`, which the composition root installs for every host it
+launches today. Withholding it from stdio hosts (ACP, MCP server,
+app-server) is a later one-line change, not a code move.
+
+### Where this sequence departs from the rest of this document
+
+These three departures are deliberate; each is safe for the stated reason.
+
+1. **The config hub does not have to leave first.** Once the upward edges are
+   cut, `config` sits inside the runtime's strongly connected component, so
+   it moves with it. Splitting config into `codewhale-config` (#6034, #6143)
+   becomes internal runtime work afterwards instead of a precondition.
+2. **Converging the two loops is not a precondition for moving the engine.**
+   That rule assumed the engine would move while `run_subagent` stayed in the
+   TUI, leaving two loops in two crates. Here both move into the same crate,
+   so convergence stays a client-contract step and the one-loop guard keeps
+   scanning every crate.
+3. **The move uses one path alias**, a single root
+   `use codewhale_runtime::{...};` block in the TUI `lib.rs`, instead of
+   rewriting every caller in the moving change. A rename-only move lets
+   in-flight branches rebase across it; a content rewrite of every caller
+   conflicts with all of them. The alias is the only shim: no wrapper types,
+   no per-item re-exports except the ones `crates/cli` needs until the
+   headless surfaces move, and it is deleted by a published rewrite script
+   once the moves are done.
+
+The destination below still describes the intended layering, with one
+change: the engine, turn loop and tools move into `codewhale-runtime`
+together (there is no separate `codewhale-engine` crate), because the
+engine, tools, config and client form one dependency cycle today.
+`crates/core` stays the lower request-construction layer:
+`codewhale-command-contract` depends on it, and the runtime needs the
+contract, so putting the runtime into `core` would be a Cargo cycle.
+
 ## Intended ownership
 
 This is the proposed destination, not a claim that the boundaries exist now.
@@ -136,8 +211,9 @@ review or multiple candidate attempts only where measured failures and task
 stakes justify the extra compute. No model-evaluation runs, provider spend, or
 performance gains were established by this source audit.
 
-## Implementation order
+## Implementation order (before 2026-09-25)
 
+The runtime split sequence above replaces this order where they differ.
 Every packet names the predecessor, all consumers, changed dependency edges,
 and its verification. One owner handles shared manifests and integration.
 Keep unrelated active work intact; follow the current workspace authority.

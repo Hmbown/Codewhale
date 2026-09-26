@@ -15,7 +15,7 @@
 # Examples:
 #   scripts/dev-test.sh config
 #   scripts/dev-test.sh tui elapsed::
-#   scripts/dev-test.sh crates/tui/src/elapsed.rs
+#   scripts/dev-test.sh crates/runtime/src/elapsed.rs
 #
 # Environment:
 #   CODEWHALE_DEV_NEXTEST  auto|1|0  (default auto: use cargo-nextest when
@@ -53,6 +53,7 @@ mcp               cargo test -p codewhale-mcp --lib --locked
 paths             cargo test -p codewhale-paths --lib --locked
 protocol          cargo test -p codewhale-protocol --lib --locked
 release           cargo test -p codewhale-release --lib --locked
+runtime           cargo test -p codewhale-runtime --lib --locked
 secrets           cargo test -p codewhale-secrets --lib --locked
 state             cargo test -p codewhale-state --lib --locked
 telemetry         cargo test -p codewhale-telemetry --lib --locked
@@ -71,6 +72,7 @@ crates/tui/src/tools/               tui  tools::
 crates/tui/src/core/                tui  core::
 crates/tui/src/commands/            tui  commands::
 crates/tui/src/<file>.rs            tui  <file>::
+crates/runtime/src/<file>.rs        runtime  <file>::
 crates/tui/tests/integration/       tui-integration  <stem>
 crates/tui/tests/cucumber/          tui-cucumber  <stem>
 crates/tui/tests/                  tui-integration
@@ -141,6 +143,11 @@ if [ -e "$area" ] || printf '%s' "$area" | grep -q /; then
     crates/tui/*|crates/tui)
       area=tui
       ;;
+    crates/runtime/src/*)
+      area=runtime
+      extra=$(printf '%s' "${rel#crates/runtime/src/}" | awk -F/ '{print $1}')
+      extra=${extra%.rs}::
+      ;;
     crates/*)
       crate=$(printf '%s' "$rel" | awk -F/ '{print $2}')
       area=$crate
@@ -175,6 +182,7 @@ case $area in
   paths) pkg=codewhale-paths ;;
   protocol) pkg=codewhale-protocol ;;
   release) pkg=codewhale-release ;;
+  runtime) pkg=codewhale-runtime ;;
   secrets) pkg=codewhale-secrets ;;
   state) pkg=codewhale-state ;;
   telemetry) pkg=codewhale-telemetry ;;

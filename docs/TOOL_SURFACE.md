@@ -82,11 +82,52 @@ MCP tools are dynamic. Successfully connected servers register names such as
 must not be presented as available. MCP and plugin tools are deferred unless a
 user explicitly names them in `[tools].always_load`.
 
-`execute_tools` is deferred and engine-injected, alongside the synthetic
-interpreter tools. It runs a JavaScript program whose only host surface is
-`tools.call(name, args)`; nested calls must be read-only and auto-approved,
-and anything else aborts the program with a host-owned receipt. It is hidden
-from Plan mode and refused under a worker authority envelope.
+### Code mode (`execute_tools`)
+
+`execute_tools` is engine-injected, alongside the synthetic interpreter tools.
+It runs a JavaScript program whose only host surface is
+`await tools.call(name, args)`, and it is the default way to compose several
+tool calls — MCP and plugin tools included — without round-tripping every
+intermediate result through the conversation. It is hidden from Plan mode and
+refused under a worker authority envelope.
+
+- **One gate.** In a session turn every nested call is sent back to the turn
+  loop and planned exactly like a direct call: deny/allow lists, preparation
+  (MCP `readOnlyHint`/`destructiveHint`), `tool_call_before` hooks, ask-rules,
+  Auto-Review, repository law, and the Computer Use consent refusal. MCP calls
+  run through the session MCP pool. Approving the program grants nothing, so
+  `execute_tools` itself is auto-approved. If the permission posture changes
+  while a program runs, its remaining nested calls are refused (an approved
+  call survives only an equal or broader posture, as for a direct call) and
+  the model retries them under the new posture.
+- **Approvals suspend the program.** A nested call that needs approval raises
+  the normal approval card (named `execute_tools program call: ...`) and the
+  program waits; allow resumes it, deny fails only that nested call as an
+  exception the program can catch. Time spent waiting on a decision does not
+  count against the program's run deadline, which is the turn's remaining
+  wall clock.
+- **Receipts.** The result lists every nested call with its decision (`auto`,
+  `approved`, `denied`, `refused`) and status (`ok`, `failed`, `refused`,
+  `in_flight`). A program that hits its deadline still returns the receipt;
+  `in_flight` calls were cancelled and may have partially run. Each nested
+  result is `{content, metadata, truncated}`; an oversized result keeps that
+  shape, and `truncated` names the original size and the spillover file with
+  the full output.
+- **Discovery without re-pinning.** Inside a program,
+  `tools.call('tool_search', {query})` returns matching deferred tools with
+  their input schemas and does not activate them, so the request's tool array
+  and the session-pinned prefix do not change.
+- **Stays direct:** `agent`, `workflow`, `request_user_input`, nested
+  `execute_tools`, interactive shells, sandbox escalation, Computer Use
+  consent and scripts, and MCP sign-in (`mcp_<server>_authenticate`).
+
+Code mode is on by default (`[features] code_mode = true`), which makes
+`execute_tools` eager from the first request; direct tools and `tool_search`
+stay available either way. Set `code_mode = false` (or run with
+`--disable code_mode`) to go back to deferring `execute_tools` behind
+`tool_search`. The flag is session configuration, so the prompt prefix stays
+stable within a session. Without an engine turn (sub-agents), a program keeps
+the conservative profile: read-only, auto-approved native calls only, no MCP.
 
 ### Conversation toolbox cache
 

@@ -130,11 +130,17 @@ pub(crate) fn parse_ollama_show_response(payload: &str) -> anyhow::Result<Ollama
 /// True when this session should adopt a live local catalog into chrome.
 ///
 /// First-run and missing-key recovery paint DeepSeek by default; a live local
-/// roster must replace that costume. An already-keyed hosted route is left alone.
+/// roster must replace that costume. An already-keyed hosted route is left alone,
+/// and so is a provider picker the person has already started using: the
+/// probe answers late, and switching provider under them would close the
+/// picker mid-choice or mid-key.
 #[must_use]
-pub(crate) fn should_adopt_live_local_ollama(app: &crate::tui::app::App) -> bool {
+pub(crate) fn should_adopt_live_local_ollama(app: &mut crate::tui::app::App) -> bool {
     if app.api_provider == ApiProvider::Ollama {
         // Already on Ollama — route_runtime + #5795 own the tag; don't fight it.
+        return false;
+    }
+    if app.view_stack.provider_picker_interacted() {
         return false;
     }
     app.onboarding_needs_api_key || app.onboarding_missing_key_recovery

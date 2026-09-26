@@ -766,12 +766,19 @@ pub(crate) async fn switch_provider(
     app.note_session_route_change(&target_identity, &new_model);
     let persist_warning: Option<String> = None;
 
-    let mut switch_summary = format!(
-        "Provider switched: {} → {}",
-        previous_identity, target_identity,
-    );
+    // Re-selecting the same provider (the usual first-run key entry) is a
+    // connection, not a switch: "deepseek → deepseek" read as a glitch (#6566).
+    let mut switch_summary = if previous_identity == target_identity {
+        format!("Connected: {target_identity}")
+    } else {
+        format!("Provider switched: {previous_identity} → {target_identity}")
+    };
     switch_summary.push(char::from(10));
-    switch_summary.push_str(&format!("Model: {previous_model} → {new_model}"));
+    if previous_model == new_model {
+        switch_summary.push_str(&format!("Model: {new_model}"));
+    } else {
+        switch_summary.push_str(&format!("Model: {previous_model} → {new_model}"));
+    }
     switch_summary.push(char::from(10));
     switch_summary.push_str(&format!("Endpoint: {new_endpoint}"));
     if let Some(ref warning) = persist_warning {

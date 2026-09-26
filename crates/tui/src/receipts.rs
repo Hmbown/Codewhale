@@ -1243,7 +1243,7 @@ fn classify(step: &ToolStep, notes: &mut BTreeSet<String>) -> Classified {
             query: None,
         }),
         name if name.starts_with("mcp_") => {
-            let server = crate::tui::approval::connected_app_server(name).map(str::to_string);
+            let server = crate::mcp::connected_app_server(name).map(str::to_string);
             let plugin = server
                 .as_deref()
                 .is_some_and(|server| server.starts_with("plugin"));

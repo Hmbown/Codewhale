@@ -852,6 +852,620 @@ mod tests {
         }
     }
 
+    /// Wait for the next approval request, returning its id, tool name and
+    /// description; every other event seen on the way is kept in `seen`.
+    async fn next_approval(
+        events: &Arc<tokio::sync::RwLock<tokio::sync::mpsc::Receiver<Event>>>,
+        seen: &mut Vec<Event>,
+    ) -> (String, String, String) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut events = events.write().await;
+            while let Some(event) = events.recv().await {
+                if let Event::ApprovalRequired {
+                    id,
+                    tool_name,
+                    description,
+                    ..
+                } = &event
+                {
+                    return (id.clone(), tool_name.clone(), description.clone());
+                }
+                seen.push(event);
+            }
+            panic!("event channel closed before an approval request");
+        })
+        .await
+        .expect("approval request deadline")
+    }
+
+    /// A session turn whose model emits one `execute_tools` call (id
+    /// `exec-1`) running `code`, over a registry holding the approval-gated
+    /// counter fixture, with the engine in Ask mode and a temp receipt log.
+    struct NestedProgramTurn {
+        _tmp: tempfile::TempDir,
+        task: tokio::task::JoinHandle<(crate::core::events::TurnOutcomeStatus, Option<String>)>,
+        events: Arc<tokio::sync::RwLock<tokio::sync::mpsc::Receiver<Event>>>,
+        handle: crate::core::engine::EngineHandle,
+        executions: Arc<AtomicUsize>,
+        store: crate::approval_log::ApprovalReceiptStore,
+        session_id: String,
+        mock: Arc<MockLlmClient>,
+    }
+
+    /// What a nested-program turn adds to the default fixture.
+    #[derive(Default)]
+    struct NestedTurnOptions {
+        tools: Vec<Arc<dyn ToolSpec>>,
+        turn_wall_clock: Option<Duration>,
+        hook_executor: Option<Arc<crate::hooks::HookExecutor>>,
+    }
+
+    /// An auto-approved, read-only fixture under any name. With `hold`, an
+    /// execution signals the first `Notify` and then waits on the second.
+    struct NestedFixtureTool {
+        name: &'static str,
+        deferred: bool,
+        executions: Arc<AtomicUsize>,
+        hold: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    }
+
+    impl NestedFixtureTool {
+        fn new(name: &'static str, executions: &Arc<AtomicUsize>) -> Self {
+            Self {
+                name,
+                deferred: false,
+                executions: executions.clone(),
+                hold: None,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolSpec for NestedFixtureTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "A nested-call fixture with no filesystem, shell, or network effects."
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn capabilities(&self) -> Vec<ToolCapability> {
+            vec![ToolCapability::ReadOnly]
+        }
+
+        fn approval_requirement(&self) -> ApprovalRequirement {
+            ApprovalRequirement::Auto
+        }
+
+        fn defer_loading(&self) -> bool {
+            self.deferred
+        }
+
+        async fn execute(
+            &self,
+            _input: Value,
+            _context: &ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            if let Some((started, release)) = &self.hold {
+                started.notify_one();
+                release.notified().await;
+            }
+            Ok(ToolResult::success("fixture executed"))
+        }
+    }
+
+    fn start_nested_program_turn(code: &str) -> NestedProgramTurn {
+        start_nested_program_turn_with(code, NestedTurnOptions::default())
+    }
+
+    fn start_nested_program_turn_with(code: &str, options: NestedTurnOptions) -> NestedProgramTurn {
+        use crate::tools::codemode::EXECUTE_TOOLS_TOOL_NAME;
+
+        let tmp = tempfile::tempdir().expect("fixture directory");
+        let args = json!({ "code": code }).to_string();
+        let mock = Arc::new(MockLlmClient::new(vec![
+            canned::tool_call_turn("exec-1", EXECUTE_TOOLS_TOOL_NAME, &args),
+            canned::simple_text_turn("Program finished."),
+        ]));
+        let defaults = EngineConfig::default();
+        let (mut engine, handle) = Engine::new_with_model_client(
+            EngineConfig {
+                workspace: tmp.path().to_path_buf(),
+                snapshots_enabled: false,
+                subagents_enabled: false,
+                terminal_chrome_enabled: false,
+                turn_wall_clock: options.turn_wall_clock.unwrap_or(defaults.turn_wall_clock),
+                hook_executor: options.hook_executor,
+                ..defaults
+            },
+            &Config::default(),
+            mock.clone(),
+        );
+        engine.session.approval_mode = ApprovalMode::Suggest;
+        // Never touch the developer's real MCP config from a test.
+        engine.session.mcp_config_path = tmp.path().join("mcp.json");
+        engine.session.add_message(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Compose the counter.".into(),
+                cache_control: None,
+            }],
+        });
+        let store = crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions"));
+        engine.approval_receipt_store = Ok(store.clone());
+        let session_id = engine.session.id.clone();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = crate::tools::ToolRegistry::new(ToolContext::new(tmp.path()));
+        registry.register(Arc::new(ApprovalFixtureTool {
+            executions: executions.clone(),
+            claim_only: false,
+        }));
+        for tool in options.tools {
+            registry.register(tool);
+        }
+        let catalog = registry.to_api_tools_with_cache(true);
+        let surface = ToolSurfacePolicy::new(
+            registry,
+            Some(catalog),
+            AppMode::Agent,
+            &engine.config.tools_always_load,
+            &[],
+            false,
+            None,
+            None,
+            Some(8),
+            crate::core::engine::tool_catalog::ToolMode::Direct,
+        );
+        let events = handle.rx_event.clone();
+        let task = tokio::spawn(async move {
+            engine
+                .run_turn(&mut TurnContext::new(8), surface, None, None)
+                .await
+        });
+        NestedProgramTurn {
+            _tmp: tmp,
+            task,
+            events,
+            handle,
+            executions,
+            store,
+            session_id,
+            mock,
+        }
+    }
+
+    /// Finish the turn and return the `execute_tools` receipt JSON; every
+    /// event is appended to `seen`.
+    async fn finish_nested_program_turn(
+        turn: &mut NestedProgramTurn,
+        seen: &mut Vec<Event>,
+    ) -> Value {
+        use crate::tools::codemode::EXECUTE_TOOLS_TOOL_NAME;
+
+        tokio::time::timeout(Duration::from_secs(10), &mut turn.task)
+            .await
+            .expect("turn deadline")
+            .expect("turn");
+        {
+            let mut rx = turn.events.write().await;
+            while let Ok(event) = rx.try_recv() {
+                seen.push(event);
+            }
+        }
+        let receipt = seen
+            .iter()
+            .find_map(|event| match event {
+                Event::ToolCallComplete {
+                    name,
+                    result: Ok(result),
+                    ..
+                } if name == EXECUTE_TOOLS_TOOL_NAME => Some(result.content.clone()),
+                _ => None,
+            })
+            .expect("execute_tools completed with a receipt");
+        serde_json::from_str(&receipt).expect("receipt JSON")
+    }
+
+    /// #6562: a nested call that needs approval suspends the program and
+    /// raises the normal approval request; allow resumes it, deny fails only
+    /// that nested call, a nested MCP call runs through the session pool, and
+    /// the program's receipt names each nested call and its decision.
+    #[tokio::test]
+    async fn execute_tools_nested_approval_suspends_resumes_and_denies_one_call() {
+        let code = format!(
+            "const first = await tools.call('{COUNTER_TOOL}', {{}}); \
+             let denied = null; \
+             try {{ await tools.call('{COUNTER_TOOL}', {{}}); }} \
+             catch (e) {{ denied = String(e.message || e); }} \
+             const listed = await tools.call('list_mcp_resources', {{}}); \
+             return {{ first: first.content, denied, mcp: listed.truncated === null }};"
+        );
+        let mut turn = start_nested_program_turn(&code);
+        let events = turn.events.clone();
+        let handle = turn.handle.clone();
+        let executions = turn.executions.clone();
+
+        let mut seen = Vec::new();
+        let (id, tool_name, description) = next_approval(&events, &mut seen).await;
+        assert_eq!(id, "exec-1.1", "the program itself is not a prompt");
+        assert_eq!(tool_name, COUNTER_TOOL);
+        assert!(
+            description.contains("execute_tools program call"),
+            "{description}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut turn.task)
+                .await
+                .is_err(),
+            "the program is suspended on its nested call"
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        handle.approve_tool_call("exec-1.1").await.expect("allow");
+
+        let (id, tool_name, _) = next_approval(&events, &mut seen).await;
+        assert_eq!(id, "exec-1.2");
+        assert_eq!(tool_name, COUNTER_TOOL);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "allow resumed the program"
+        );
+        handle.deny_tool_call("exec-1.2").await.expect("deny");
+
+        let store = turn.store.clone();
+        let session_id = turn.session_id.clone();
+        let receipt = finish_nested_program_turn(&mut turn, &mut seen).await;
+        assert_eq!(receipt["success"], true, "{receipt}");
+        assert_eq!(receipt["body"]["return"]["first"], "counter executed");
+        assert!(
+            receipt["body"]["return"]["denied"]
+                .as_str()
+                .is_some_and(|message| message.contains("denied by user")),
+            "{receipt}"
+        );
+        assert_eq!(receipt["body"]["return"]["mcp"], true, "{receipt}");
+        assert_eq!(receipt["calls"][0]["decision"], "approved");
+        assert_eq!(receipt["calls"][0]["status"], "ok");
+        assert_eq!(receipt["calls"][1]["decision"], "denied");
+        assert_eq!(receipt["calls"][1]["status"], "refused");
+        assert_eq!(receipt["calls"][2]["tool"], "list_mcp_resources");
+        assert_eq!(receipt["calls"][2]["decision"], "auto");
+        assert_eq!(receipt["calls"][2]["status"], "ok");
+
+        let replay = store.replay(&session_id).expect("approval receipts");
+        assert!(replay.unmatched_asks.is_empty());
+        assert_eq!(
+            replay
+                .completed
+                .iter()
+                .map(|receipt| receipt.outcome.clone())
+                .collect::<Vec<_>>(),
+            vec![ApprovalOutcome::ApprovedOnce, ApprovalOutcome::Denied]
+        );
+    }
+
+    /// #6562: a nested call never runs on a posture the user has since
+    /// narrowed. Narrowing while a nested approval card is open fails that
+    /// call even though it was approved (same rule as a direct call), and
+    /// every later nested call in the program is refused too, because the
+    /// program's tool context was built under the old posture.
+    #[tokio::test]
+    async fn execute_tools_nested_call_is_refused_after_the_posture_narrows() {
+        let code = format!(
+            "const errors = []; \
+             for (let i = 0; i < 2; i++) {{ \
+               try {{ await tools.call('{COUNTER_TOOL}', {{}}); }} \
+               catch (e) {{ errors.push(String(e.message || e)); }} \
+             }} \
+             return {{ errors }};"
+        );
+        let mut turn = start_nested_program_turn(&code);
+        let events = turn.events.clone();
+        let handle = turn.handle.clone();
+        let executions = turn.executions.clone();
+
+        let mut seen = Vec::new();
+        let (id, _, _) = next_approval(&events, &mut seen).await;
+        assert_eq!(id, "exec-1.1");
+        // The user narrows Work/Ask to Plan while the card is open, then
+        // approves the card.
+        handle.publish_turn_authority(
+            AppMode::Plan,
+            true,
+            false,
+            false,
+            ApprovalMode::Suggest,
+            None,
+        );
+        handle.approve_tool_call("exec-1.1").await.expect("allow");
+
+        let receipt = finish_nested_program_turn(&mut turn, &mut seen).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 0, "nothing ran");
+        let errors = receipt["body"]["return"]["errors"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{receipt}"));
+        assert_eq!(errors.len(), 2, "{receipt}");
+        assert!(
+            errors[0]
+                .as_str()
+                .is_some_and(|message| message
+                    .contains("Permissions changed before this nested call executed")),
+            "{receipt}"
+        );
+        assert!(
+            errors[1].as_str().is_some_and(|message| message
+                .contains("Permissions changed while this execute_tools program was running")),
+            "{receipt}"
+        );
+        assert_eq!(receipt["calls"][0]["status"], "refused");
+        assert_eq!(receipt["calls"][1]["status"], "refused");
+        assert!(
+            !seen.iter().any(|event| matches!(
+                event,
+                Event::ApprovalRequired { id, .. } if id == "exec-1.2"
+            )),
+            "the second call is refused without a prompt"
+        );
+    }
+
+    /// #6562: a posture change between two nested calls, with no approval
+    /// card open, is caught before the next call is even planned.
+    #[tokio::test]
+    async fn execute_tools_posture_change_between_nested_calls_refuses_the_next_one() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let held = NestedFixtureTool {
+            hold: Some((started.clone(), release.clone())),
+            ..NestedFixtureTool::new("held_fixture", &executions)
+        };
+        let code = "const errors = []; let first = null; \
+             try { first = (await tools.call('held_fixture', {})).content; } \
+             catch (e) { errors.push(String(e.message || e)); } \
+             try { await tools.call('held_fixture', {}); } \
+             catch (e) { errors.push(String(e.message || e)); } \
+             return { first, errors };";
+        let mut turn = start_nested_program_turn_with(
+            code,
+            NestedTurnOptions {
+                tools: vec![Arc::new(held)],
+                ..NestedTurnOptions::default()
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(10), started.notified())
+            .await
+            .expect("the first nested call started");
+        // The user narrows the posture while the first call runs; no card
+        // is open, so only the pre-planning drain can see it.
+        turn.handle.publish_turn_authority(
+            AppMode::Plan,
+            true,
+            false,
+            false,
+            ApprovalMode::Suggest,
+            None,
+        );
+        release.notify_one();
+
+        let mut seen = Vec::new();
+        let receipt = finish_nested_program_turn(&mut turn, &mut seen).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 1, "{receipt}");
+        assert_eq!(receipt["body"]["return"]["first"], "fixture executed");
+        let errors = receipt["body"]["return"]["errors"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{receipt}"));
+        assert_eq!(errors.len(), 1, "{receipt}");
+        assert!(
+            errors[0].as_str().is_some_and(|message| message
+                .contains("Permissions changed while this execute_tools program was running")),
+            "{receipt}"
+        );
+        assert_eq!(receipt["calls"][1]["status"], "refused");
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, Event::ApprovalRequired { .. })),
+            "no call needed a card"
+        );
+    }
+
+    /// #6562: the direct-only names cannot be reached by another spelling.
+    /// A case change (`Agent`, `BASH`) is refused from the request itself;
+    /// an alias planning resolves (`WorkflowTool` -> `workflow`,
+    /// `bash-tool` -> `bash`) is refused on the resolved name, before any
+    /// card or execution.
+    #[tokio::test]
+    async fn execute_tools_refuses_direct_only_tools_reached_by_another_spelling() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let code = "const errors = []; \
+             for (const [name, args] of [['Agent', {}], ['WorkflowTool', {}], \
+                                         ['BASH', { interactive: true }], \
+                                         ['bash-tool', { interactive: true }]]) { \
+               try { await tools.call(name, args); errors.push(null); } \
+               catch (e) { errors.push(String(e.message || e)); } \
+             } \
+             return { errors };";
+        let mut turn = start_nested_program_turn_with(
+            code,
+            NestedTurnOptions {
+                tools: vec![
+                    Arc::new(NestedFixtureTool::new("agent", &executions)),
+                    Arc::new(NestedFixtureTool::new("workflow", &executions)),
+                    Arc::new(NestedFixtureTool::new("bash", &executions)),
+                ],
+                ..NestedTurnOptions::default()
+            },
+        );
+        let mut seen = Vec::new();
+        let receipt = finish_nested_program_turn(&mut turn, &mut seen).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 0, "{receipt}");
+        let errors = receipt["body"]["return"]["errors"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{receipt}"));
+        for (index, expected) in [
+            "`Agent` is not available inside execute_tools programs",
+            "`workflow` is not available inside execute_tools programs",
+            "`BASH` with interactive:true needs the terminal",
+            "`bash` with interactive:true needs the terminal",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                errors[index]
+                    .as_str()
+                    .is_some_and(|message| message.contains(expected)),
+                "call {index}: {receipt}"
+            );
+            assert_eq!(receipt["calls"][index]["status"], "refused", "{receipt}");
+        }
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, Event::ApprovalRequired { .. })),
+            "a refused spelling never reaches a card"
+        );
+    }
+
+    /// #6562: a nested tool_search describes matching tools (name and input
+    /// schema) without activating them: the next model request advertises
+    /// exactly the tools it would have without the search.
+    #[tokio::test]
+    async fn execute_tools_nested_tool_search_describes_without_activating() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let deferred = NestedFixtureTool {
+            deferred: true,
+            ..NestedFixtureTool::new("deferred_lookup_fixture", &executions)
+        };
+        let code = "const r = await tools.call('tool_search', \
+                   { query: 'deferred_lookup', match: 'regex' }); \
+             return r.content.tools;";
+        let mut turn = start_nested_program_turn_with(
+            code,
+            NestedTurnOptions {
+                tools: vec![Arc::new(deferred)],
+                ..NestedTurnOptions::default()
+            },
+        );
+        let mut seen = Vec::new();
+        let receipt = finish_nested_program_turn(&mut turn, &mut seen).await;
+        assert_eq!(receipt["success"], true, "{receipt}");
+        let tools = receipt["body"]["return"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{receipt}"));
+        assert_eq!(tools.len(), 1, "{receipt}");
+        assert_eq!(tools[0]["name"], "deferred_lookup_fixture");
+        assert_eq!(tools[0]["input_schema"]["type"], "object", "{receipt}");
+        assert_eq!(receipt["calls"][0]["tool"], "tool_search");
+        assert_eq!(receipt["calls"][0]["status"], "ok");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+        let requests = turn.mock.captured_requests();
+        assert!(requests.len() >= 2, "the turn made a follow-up request");
+        let advertised = |index: usize| -> Vec<String> {
+            requests[index]
+                .tools
+                .iter()
+                .flatten()
+                .map(|tool| tool.name.clone())
+                .collect()
+        };
+        assert!(
+            !advertised(0).contains(&"deferred_lookup_fixture".to_string()),
+            "the fixture starts deferred"
+        );
+        assert!(
+            !advertised(1).contains(&"deferred_lookup_fixture".to_string()),
+            "a nested search never activates what it found: {:?}",
+            advertised(1)
+        );
+    }
+
+    /// #6509: a gated program's deadline is what is left of the turn's own
+    /// wall clock, not a fixed constant.
+    #[tokio::test]
+    async fn execute_tools_deadline_is_the_turns_remaining_wall_clock() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let held = NestedFixtureTool {
+            hold: Some((
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(tokio::sync::Notify::new()),
+            )),
+            ..NestedFixtureTool::new("held_fixture", &executions)
+        };
+        let mut turn = start_nested_program_turn_with(
+            "await tools.call('held_fixture', {}); return 'unreachable';",
+            NestedTurnOptions {
+                tools: vec![Arc::new(held)],
+                turn_wall_clock: Some(Duration::from_secs(4)),
+                ..NestedTurnOptions::default()
+            },
+        );
+        let mut seen = Vec::new();
+        let receipt = finish_nested_program_turn(&mut turn, &mut seen).await;
+        assert_eq!(receipt["success"], false, "{receipt}");
+        assert_eq!(receipt["body"]["timed_out"], true, "{receipt}");
+        let error = receipt["body"]["error"].as_str().unwrap_or_default();
+        let seconds = error
+            .split("stopped at its ")
+            .nth(1)
+            .and_then(|rest| rest.split('s').next())
+            .and_then(|secs| secs.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("{receipt}"));
+        assert!(
+            (1..4).contains(&seconds),
+            "deadline {seconds}s must come from the 4s turn budget: {receipt}"
+        );
+        assert_eq!(receipt["calls"][0]["status"], "in_flight", "{receipt}");
+    }
+
+    /// #3026: `additionalContext` from a tool_call_before hook on a nested
+    /// call reaches the model on that call's receipt, as it would on a
+    /// direct call's result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_tools_nested_call_keeps_before_hook_context() {
+        let tmp = tempfile::tempdir().expect("hook directory");
+        let hook = crate::hooks::Hook::new(
+            crate::hooks::HookEvent::ToolCallBefore,
+            r#"printf '{"additionalContext":"nested hook note"}'"#,
+        );
+        let executor = crate::hooks::HookExecutor::new(
+            crate::hooks::HooksConfig {
+                enabled: true,
+                hooks: vec![hook],
+                ..crate::hooks::HooksConfig::default()
+            },
+            tmp.path().to_path_buf(),
+        );
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut turn = start_nested_program_turn_with(
+            "await tools.call('plain_fixture', {}); return 'done';",
+            NestedTurnOptions {
+                tools: vec![Arc::new(NestedFixtureTool::new(
+                    "plain_fixture",
+                    &executions,
+                ))],
+                hook_executor: Some(Arc::new(executor)),
+                ..NestedTurnOptions::default()
+            },
+        );
+        let mut seen = Vec::new();
+        let receipt = finish_nested_program_turn(&mut turn, &mut seen).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 1, "{receipt}");
+        assert_eq!(receipt["calls"][0]["status"], "ok", "{receipt}");
+        assert_eq!(
+            receipt["calls"][0]["hook_context"], "nested hook note",
+            "{receipt}"
+        );
+    }
+
     #[tokio::test]
     async fn required_tool_execution_uses_typed_host_decisions_not_approval_claims() {
         for source in [

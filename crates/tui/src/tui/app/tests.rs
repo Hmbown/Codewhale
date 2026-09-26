@@ -2667,15 +2667,21 @@ fn returning_user_missing_api_key_goes_to_canonical_provider_setup() {
 }
 
 #[test]
-fn first_run_user_starts_at_composer() {
+fn first_run_user_without_a_key_starts_on_connect_a_model() {
+    // #6566: a new user with no key used to land on a composer that could
+    // not answer. The one launch screen is the provider picker.
     assert_eq!(
         initial_onboarding_state(false, false, true, true, true),
-        OnboardingState::None
+        OnboardingState::Provider
     );
     assert_eq!(
         initial_onboarding_state(false, false, false, true, true),
-        OnboardingState::None
+        OnboardingState::Provider
     );
+}
+
+#[test]
+fn first_run_user_with_a_key_starts_at_composer() {
     assert_eq!(
         initial_onboarding_state(false, false, false, false, true),
         OnboardingState::None
@@ -2747,7 +2753,7 @@ fn app_new_detects_missing_api_key_with_default_config() {
 }
 
 #[test]
-fn first_run_app_starts_on_composer_when_a_key_is_missing() {
+fn first_run_app_without_a_key_opens_provider_setup() {
     let _lock = lock_test_env();
     let home = tempfile::TempDir::new().expect("isolated first-run home");
     let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path().to_string_lossy().as_ref());
@@ -2779,9 +2785,15 @@ fn first_run_app_starts_on_composer_when_a_key_is_missing() {
     .collect();
 
     let app = App::new(test_options(false), &Config::default());
-    assert_eq!(app.onboarding, OnboardingState::None);
+    // #6566: the first screen connects a model; Esc returns to the composer.
+    assert_eq!(app.onboarding, OnboardingState::Provider);
     assert!(app.onboarding_needs_api_key);
-    assert!(!app.onboarding_missing_key_recovery);
+    assert!(app.onboarding_missing_key_recovery);
+    // A new user has no saved route, so the picker opens on the provider
+    // list, not on the built-in default's missing key.
+    assert!(!app.onboarding_recovers_configured_route());
+    // Language is asked in /setup, so the launch screen is not "2/3".
+    assert!(!app.onboarding_had_language_step);
 }
 
 #[test]
@@ -7495,15 +7507,19 @@ fn launch_onboarding_scenario() {
     }
     // from launch_onboarding_starts_first_run_at_composer
     {
-        // First paint is the composer. Recovery picker is returning-user only.
+        // xAI OAuth re-auth never reopens the generic picker, first run or not.
         let (onboarding, recovery) =
             launch_onboarding_decision(false, false, false, true, false, true);
         assert_eq!(onboarding, OnboardingState::None);
         assert!(!recovery);
 
-        let (language, _) = launch_onboarding_decision(false, false, true, true, true, false);
-        assert_eq!(language, OnboardingState::None);
+        // #6566: a first run with no key opens the picker directly, with the
+        // same Esc-to-composer exit as missing-key recovery.
+        let (keyless, recovery) = launch_onboarding_decision(false, false, true, true, true, false);
+        assert_eq!(keyless, OnboardingState::Provider);
+        assert!(recovery);
 
+        // A first run with a key starts at the composer.
         let (trust, _) = launch_onboarding_decision(false, false, false, false, true, false);
         assert_eq!(trust, OnboardingState::None);
 

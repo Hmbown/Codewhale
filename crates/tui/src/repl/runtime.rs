@@ -678,13 +678,23 @@ def llm_query_batched(prompts, model=None, dependency_mode=None, safety_note=Non
             out.append(r.get("text",""))
     return out
 
+def _rlm_child_text(r, err_label):
+    # A sub-RLM can end with a partial answer AND an error (it ran out of
+    # rounds before FINAL). Keep the text and mark it incomplete; only an
+    # error with no text collapses to the error marker.
+    text = r.get("text") or ""
+    err = r.get("error")
+    if not err:
+        return text
+    if text.strip():
+        return f"{text}\n[rlm_query incomplete: {err}]"
+    return f"[{err_label}: {err}]"
+
 def rlm_query(prompt, model=None):
     """Recursive sub-RLM. The model arg is accepted for compatibility but ignored by Rust."""
     resp = _rpc({"type":"rlm","prompt":str(prompt),"model":model})
-    if isinstance(resp, dict) and resp.get("error"):
-        return f"[rlm_query error: {resp['error']}]"
     if isinstance(resp, dict):
-        return resp.get("text","")
+        return _rlm_child_text(resp, "rlm_query error")
     return str(resp)
 
 def rlm_query_batched(prompts, model=None, dependency_mode=None, safety_note=None):
@@ -706,13 +716,7 @@ def rlm_query_batched(prompts, model=None, dependency_mode=None, safety_note=Non
     results = (resp or {}).get("results", []) if isinstance(resp, dict) else []
     if len(results) != len(prompts):
         return [f"[rlm_query_batched: size mismatch ({len(results)}/{len(prompts)})]" for _ in prompts]
-    out = []
-    for r in results:
-        if r.get("error"):
-            out.append(f"[child err: {r['error']}]")
-        else:
-            out.append(r.get("text",""))
-    return out
+    return [_rlm_child_text(r, "child err") for r in results]
 
 def _slice_text(slice_value):
     if slice_value is None:
@@ -1411,6 +1415,59 @@ mod tests {
             other => panic!("expected Llm request, got {other:?}"),
         }
         drop(recorded);
+        rt.shutdown().await;
+    }
+
+    /// A sub-RLM that ran out of rounds returns its last answer AND an
+    /// error. Answers every recursive request with that shape.
+    struct ExhaustedRlmBridge;
+
+    impl RpcDispatcher for ExhaustedRlmBridge {
+        fn dispatch<'a>(
+            &'a self,
+            req: RpcRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RpcResponse> + Send + 'a>> {
+            Box::pin(async move {
+                let partial = |i: usize| SingleResp {
+                    text: if i == 1 {
+                        String::new()
+                    } else {
+                        format!("partial answer {i}")
+                    },
+                    error: Some("RLM loop exhausted after 25 iterations without FINAL".to_string()),
+                };
+                match req {
+                    RpcRequest::RlmBatch { prompts, .. } => RpcResponse::Batch(BatchResp {
+                        results: (0..prompts.len()).map(partial).collect(),
+                    }),
+                    _ => RpcResponse::Single(partial(0)),
+                }
+            })
+        }
+    }
+
+    /// #6511: the Rust loop kept the exhausted sub-RLM's last answer, but the
+    /// Python helpers returned only the error marker whenever `error` was
+    /// set, so the calling code never saw the text.
+    #[tokio::test]
+    async fn rlm_query_keeps_partial_answer_from_an_exhausted_child() {
+        let mut rt = PythonRuntime::new().await.expect("spawn");
+        let round = rt
+            .run(
+                "print(rlm_query('go'))\nfor r in rlm_query_batched(['a', 'b'], dependency_mode='independent'):\n    print(r)",
+                Some(&ExhaustedRlmBridge),
+            )
+            .await
+            .expect("execute");
+        // Windows Python prints CRLF; compare line content, not line endings.
+        let out = &round.stdout.replace("\r\n", "\n");
+        assert!(
+            out.contains("partial answer 0\n[rlm_query incomplete: RLM loop exhausted"),
+            "{out}"
+        );
+        // Batched: a child with text keeps it; one with none keeps the old marker.
+        assert!(out.matches("partial answer 0").count() == 2, "{out}");
+        assert!(out.contains("[child err: RLM loop exhausted"), "{out}");
         rt.shutdown().await;
     }
 

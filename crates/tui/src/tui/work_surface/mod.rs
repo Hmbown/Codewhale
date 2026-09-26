@@ -1768,6 +1768,37 @@ mod tests {
         assert!(row.detail.contains("step 5"), "{}", row.detail);
     }
 
+    /// #6565: when the activity detail already names the step and the tool,
+    /// the dock row says them once, not again as `using …` and `step N`.
+    #[test]
+    fn dock_agent_row_states_each_step_fact_once() {
+        let mut app = app();
+        app.current_session_id = Some(SESSION.to_string());
+        app.agent_progress
+            .insert("agent_reader".to_string(), String::new());
+        app.agent_progress_meta.insert(
+            "agent_reader".to_string(),
+            crate::tui::app::AgentProgressMeta {
+                current_activity: Some(AgentCurrentActivity::bounded(
+                    AgentCurrentActivityStatus::RunningTool,
+                    Some("step 6: finished tool 'read_file'".to_string()),
+                    Some("read_file".to_string()),
+                    Some(6),
+                )),
+                ..crate::tui::app::AgentProgressMeta::default()
+            },
+        );
+
+        let rows = super::model::project(&mut app);
+        let row = rows
+            .iter()
+            .find(|row| row.id.0 == "worker:agent_reader")
+            .expect("progress-only work row");
+        assert_eq!(row.detail.matches("step 6").count(), 1, "{}", row.detail);
+        assert_eq!(row.detail.matches("read_file").count(), 1, "{}", row.detail);
+        assert!(!row.detail.contains("using read_file"), "{}", row.detail);
+    }
+
     // === #5906: a parked husk is not an agent waiting for input ==========
 
     /// Build a child exactly the way the turn-end parking projection does:

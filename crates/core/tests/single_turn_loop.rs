@@ -23,16 +23,31 @@
 //! all three of these in one iteration:
 //!
 //! 1. **drives a model** — calls something that opens or consumes a provider
-//!    message stream / completion (an identifier ending in `stream`,
-//!    `create_message`, `completion`, or `complete`, called as a function);
+//!    message stream / completion: an identifier ending in `stream`,
+//!    `create_message`, `completion`, or `complete`; *starting* with
+//!    `create_message` (the `LlmClient` method family — `create_message`,
+//!    `create_message_stream`, `create_message_boxed`, …); or spelled
+//!    `request_…model…` (a wrapper that requests a model response);
 //! 2. **dispatches tool calls** — calls something that executes tools
-//!    (`execute_*tool*`, `dispatch_*tool*`, `run_*tool*`, …);
+//!    (`execute_*tool*`, `dispatch_*tool*`, `run_*tool*`, …), or runs
+//!    model-written code in a REPL/kernel (`repl.run(…)`, `kernel.execute(…)`)
+//!    — a code round is a tool round whatever the executor is called;
 //! 3. **assembles its own prompt** — pushes onto a message history
 //!    (`…messages…`/`…history…`/`…conversation…`/`…prompt…`.`push`/`extend`).
 //!
 //! Anything doing all three per iteration *is* a turn loop, whatever it is
 //! called. Renaming it does not hide it; only [`ALLOWED_TURN_LOOPS`] does, and
 //! that list is read back at the end of the test so a stale entry fails too.
+//!
+//! # #6511: suffix-only matching was a spelling guard too
+//!
+//! After #6242 the model-call marker was still a *suffix* list, so two loops
+//! passed by spelling: the sub-agent loop calls
+//! `request_subagent_model_response_with_retries(…)` and the RLM loop calls
+//! `client.create_message_boxed(…)` and runs its code rounds through
+//! `repl.run(…)`. CI said "exactly one turn loop" while three existed. The
+//! markers above now cover both spellings, and both loops are named interim
+//! exceptions below instead of invisible ones.
 //!
 //! # Known limitations
 //!
@@ -80,6 +95,27 @@ const ALLOWED_TURN_LOOPS: &[AllowedTurnLoop] = &[
               converges them onto `Engine::run_turn`; when it lands, delete \
               the loop and this entry together.",
     },
+    AllowedTurnLoop {
+        path: "crates/tui/src/tools/subagent/mod.rs",
+        owner: "run_subagent",
+        why: "INTERIM EXCEPTION (#6504). Sub-agents drive their own model/tool \
+              rounds through `request_subagent_model_response_with_retries` \
+              instead of `Engine::run_turn`. It was invisible to this guard \
+              until #6511 widened the model-call marker; #6504 converges the \
+              child onto the Engine. Delete the loop and this entry together.",
+    },
+    AllowedTurnLoop {
+        path: "crates/tui/src/rlm/turn.rs",
+        owner: "run_rlm_turn_impl",
+        why: "INTERIM EXCEPTION (#6511). The recursive sub-RLM (`rlm_query` \
+              from the Python REPL, `rlm/bridge.rs::dispatch_rlm`) runs \
+              paper Algorithm 1: root model writes code, the REPL runs it, \
+              the result is appended to its own history. It is bounded by \
+              MAX_RLM_ITERATIONS, forwards its events to the parent stream, \
+              keeps its whole history, and never returns an empty answer \
+              silently; converging it onto `Engine::run_turn` is the \
+              remaining work. Delete the loop and this entry together.",
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -89,6 +125,15 @@ const ALLOWED_TURN_LOOPS: &[AllowedTurnLoop] = &[
 /// A call to an identifier ending in one of these, i.e. "this iteration talks
 /// to a model".
 const MODEL_CALL_SUFFIXES: &[&str] = &["stream", "create_message", "completion", "complete"];
+
+/// A call to an identifier *starting* with one of these also talks to a model:
+/// the `LlmClient` method family (`create_message_boxed`, …) is spelled by
+/// prefix, not suffix (#6511).
+const MODEL_CALL_PREFIXES: &[&str] = &["create_message"];
+
+/// Receiver-name fragments for "this iteration runs model-written code":
+/// `repl.run(…)` / `kernel.execute(…)` is a tool round by another name.
+const CODE_RUNNER_RECEIVER_FRAGMENTS: &[&str] = &["repl", "kernel"];
 
 /// Prefix/infix pairs for "this iteration dispatches tool calls".
 const TOOL_DISPATCH_VERBS: &[&str] = &[
@@ -347,19 +392,66 @@ fn loop_bodies(chars: &[char]) -> Vec<(String, usize, usize)> {
     found
 }
 
-/// True when `body` calls an identifier ending in any of `suffixes`.
-fn calls_identifier_ending_in(body: &str, suffixes: &[&str]) -> bool {
-    suffixes.iter().any(|suffix| {
-        body.match_indices(suffix).any(|(at, _)| {
-            let after = &body[at + suffix.len()..];
-            after.trim_start().starts_with('(') && !after.starts_with(|c: char| is_ident_char(c))
+/// Every identifier in `body` that is called as a function or method, i.e.
+/// immediately followed (modulo whitespace) by `(`. Macros (`name!(`) and
+/// bare parentheses are not identifiers and are skipped.
+fn called_identifiers(body: &str) -> impl Iterator<Item = &str> {
+    body.match_indices('(').filter_map(|(at, _)| {
+        let before = body[..at].trim_end();
+        let start = before
+            .rfind(|c: char| !is_ident_char(c))
+            .map_or(0, |i| i + 1);
+        let ident = &before[start..];
+        (!ident.is_empty() && !ident.starts_with(|c: char| c.is_ascii_digit())).then_some(ident)
+    })
+}
+
+/// True when `ident` names something that requests a model response.
+fn is_model_call(ident: &str) -> bool {
+    MODEL_CALL_SUFFIXES
+        .iter()
+        .any(|suffix| ident.ends_with(suffix))
+        || MODEL_CALL_PREFIXES
+            .iter()
+            .any(|prefix| ident.starts_with(prefix))
+        || (ident.starts_with("request_") && ident.contains("model"))
+}
+
+/// True when `body` calls something that drives a model.
+fn drives_a_model(body: &str) -> bool {
+    called_identifiers(body).any(is_model_call)
+}
+
+/// The identifier a `.method(` call at byte `at` is invoked on, when the
+/// receiver is a plain identifier (`messages.push(`, `repl.run(`).
+fn method_receiver(body: &str, at: usize) -> Option<&str> {
+    let before = body[..at].trim_end().strip_suffix('.')?;
+    let receiver_end = before.trim_end();
+    let ident_start = receiver_end
+        .rfind(|c: char| !is_ident_char(c))
+        .map_or(0, |i| i + 1);
+    Some(&receiver_end[ident_start..])
+}
+
+/// True when `body` calls `.method(` on a receiver whose name contains one of
+/// `fragments`.
+fn calls_method_on(body: &str, methods: &[&str], fragments: &[&str]) -> bool {
+    methods.iter().any(|method| {
+        body.match_indices(method).any(|(at, _)| {
+            let after = &body[at + method.len()..];
+            if !after.trim_start().starts_with('(') {
+                return false;
+            }
+            method_receiver(body, at)
+                .is_some_and(|receiver| fragments.iter().any(|f| receiver.contains(f)))
         })
     })
 }
 
-/// True when `body` calls something like `execute_tool_calls(…)`.
+/// True when `body` calls something like `execute_tool_calls(…)`, or runs
+/// model-written code on a REPL/kernel (`repl.run(…)`).
 fn dispatches_tool_calls(body: &str) -> bool {
-    TOOL_DISPATCH_VERBS.iter().any(|verb| {
+    let named_tool_dispatch = TOOL_DISPATCH_VERBS.iter().any(|verb| {
         body.match_indices(verb).any(|(at, _)| {
             if at > 0 && is_ident_char(body[..at].chars().next_back().unwrap_or(' ')) {
                 return false;
@@ -371,32 +463,15 @@ fn dispatches_tool_calls(body: &str) -> bool {
             let ident_end = rest.find(|c: char| !is_ident_char(c)).unwrap_or(rest.len());
             rest[..ident_end].contains("tool")
         })
-    })
+    });
+    named_tool_dispatch
+        || calls_method_on(body, &["run", "execute"], CODE_RUNNER_RECEIVER_FRAGMENTS)
 }
 
 /// True when `body` pushes onto something whose name reads like a prompt or
 /// message history — the loop assembling its own conversation.
 fn assembles_prompt_history(body: &str) -> bool {
-    ["push", "extend"].iter().any(|method| {
-        body.match_indices(method).any(|(at, _)| {
-            let after = &body[at + method.len()..];
-            if !after.trim_start().starts_with('(') {
-                return false;
-            }
-            let before = body[..at].trim_end();
-            let Some(before) = before.strip_suffix('.') else {
-                return false;
-            };
-            let receiver_end = before.trim_end();
-            let ident_start = receiver_end
-                .rfind(|c: char| !is_ident_char(c))
-                .map_or(0, |i| i + 1);
-            let receiver = &receiver_end[ident_start..];
-            HISTORY_RECEIVER_FRAGMENTS
-                .iter()
-                .any(|fragment| receiver.contains(fragment))
-        })
-    })
+    calls_method_on(body, &["push", "extend"], HISTORY_RECEIVER_FRAGMENTS)
 }
 
 /// Name of the function that lexically encloses char offset `at`.
@@ -427,7 +502,7 @@ fn detect_turn_loops(src: &str, rel_path: &str) -> Vec<TurnLoopSite> {
     let mut sites: Vec<TurnLoopSite> = Vec::new();
     for (keyword, open, close) in loop_bodies(&chars) {
         let body: String = chars[open..=close.max(open)].iter().collect();
-        if !calls_identifier_ending_in(&body, MODEL_CALL_SUFFIXES) {
+        if !drives_a_model(&body) {
             continue;
         }
         if !dispatches_tool_calls(&body) {
@@ -650,6 +725,54 @@ fn detector_sees_a_renamed_turn_loop() {
     assert!(
         detect_turn_loops(not_a_turn_loop, "crates/whatever/src/ui.rs").is_empty(),
         "shape detector fired on a loop that never drives a model or tools"
+    );
+}
+
+/// #6511: the two spellings that hid the sub-agent and RLM loops from the
+/// suffix-only marker must both be seen.
+#[test]
+fn detector_sees_prefix_spelled_model_calls_and_repl_rounds() {
+    // Sub-agent shape: a `request_…model…` wrapper plus a tool runner.
+    let subagent = r#"
+        async fn child_loop(&mut self) {
+            loop {
+                let api = request_subagent_model_response_with_retries(&client, request).await;
+                messages.push(api.message);
+                let output = run_tool_with_person_aware_timeout(call).await;
+                messages.push(output);
+            }
+        }
+    "#;
+    let sites = detect_turn_loops(subagent, "crates/whatever/src/child.rs");
+    assert_eq!(sites.len(), 1, "missed the sub-agent spelling: {sites:#?}");
+    assert_eq!(sites[0].owner, "child_loop");
+
+    // RLM shape: `create_message_boxed` plus a REPL code round.
+    let rlm = r#"
+        async fn recursive_loop(client: Arc<dyn Client>) {
+            for iteration in 0..LIMIT {
+                let response = client.create_message_boxed(request).await;
+                let round = repl.run(&code, Some(&bridge)).await;
+                messages.push(metadata(round));
+            }
+        }
+    "#;
+    let sites = detect_turn_loops(rlm, "crates/whatever/src/rlm.rs");
+    assert_eq!(sites.len(), 1, "missed the RLM spelling: {sites:#?}");
+    assert_eq!(sites[0].owner, "recursive_loop");
+
+    // A REPL round with no model call is not a turn loop.
+    let replay = r#"
+        async fn replay(&mut self) {
+            for block in blocks {
+                let round = repl.run(&block.code, None).await;
+                history.push(round.stdout);
+            }
+        }
+    "#;
+    assert!(
+        detect_turn_loops(replay, "crates/whatever/src/replay.rs").is_empty(),
+        "a REPL replay that never calls a model is not a turn loop"
     );
 }
 

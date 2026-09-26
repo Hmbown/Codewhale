@@ -83,6 +83,10 @@
   "crates/release/src/launch.rs": {
     "std_fs": 2
   },
+  "crates/runtime/src/media_originals.rs": {
+    "path_canonicalize": 2,
+    "std_fs": 6
+  },
   "crates/secrets/src/file_lock.rs": {
     "path_canonicalize": 1
   },
@@ -125,9 +129,6 @@
   },
   "crates/tui/src/commands/groups/core/core.rs": {
     "path_canonicalize": 1
-  },
-  "crates/tui/src/commands/groups/core/voice.rs": {
-    "std_fs": 6
   },
   "crates/tui/src/commands/groups/plugins/render.rs": {
     "path_canonicalize": 1
@@ -183,9 +184,6 @@
   },
   "crates/tui/src/fleet/artifacts.rs": {
     "std_fs": 1
-  },
-  "crates/tui/src/fleet/exact.rs": {
-    "std_fs": 2
   },
   "crates/tui/src/fleet/executor.rs": {
     "std_fs": 1
@@ -250,12 +248,11 @@
     "path_canonicalize": 2,
     "std_fs": 42
   },
-  "crates/tui/src/mcp_server.rs": {
+  "crates/tui/src/mcp.rs": {
     "std_fs": 1
   },
-  "crates/tui/src/media_originals.rs": {
-    "path_canonicalize": 2,
-    "std_fs": 6
+  "crates/tui/src/mcp_server.rs": {
+    "std_fs": 1
   },
   "crates/tui/src/models_dev_live.rs": {
     "std_fs": 1
@@ -558,6 +555,9 @@
   },
   "crates/tui/src/vision/tools.rs": {
     "path_canonicalize": 2
+  },
+  "crates/tui/src/voice.rs": {
+    "std_fs": 6
   },
   "crates/tui/src/working_set.rs": {
     "path_canonicalize": 1,

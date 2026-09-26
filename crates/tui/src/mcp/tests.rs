@@ -8556,3 +8556,117 @@ fn only_a_reviewed_plugin_read_only_hint_relaxes_approval() {
         .expect("unannotated tool parses");
     assert_eq!(approval_hint_for(&bare, true), None);
 }
+
+fn stdio_server(args: Vec<String>) -> McpServerConfig {
+    serde_json::from_value(serde_json::json!({ "command": "node", "args": args }))
+        .expect("stdio server config")
+}
+
+#[test]
+fn user_server_launching_the_computer_use_bundle_is_recognized() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bundle = dir
+        .path()
+        .join("Codewhale Computer Use.app/Contents/Resources/plugin");
+    std::fs::create_dir_all(bundle.join("mcp")).expect("bundle dirs");
+    std::fs::write(bundle.join("mcp/server.mjs"), "").expect("server");
+    std::fs::write(bundle.join("plugin.json"), r#"{"name": "computer-use"}"#).expect("manifest");
+    let script = bundle.join("mcp/server.mjs").to_string_lossy().to_string();
+    assert_eq!(
+        launches_computer_use_plugin(&stdio_server(vec![script.clone()])),
+        Some(script)
+    );
+
+    // Another plugin's server with the same layout is not a duplicate.
+    let other = dir.path().join("other-plugin");
+    std::fs::create_dir_all(other.join("mcp")).expect("other dirs");
+    std::fs::write(other.join("plugin.json"), r#"{"name": "browser-tools"}"#).expect("manifest");
+    let other_script = other.join("mcp/server.mjs").to_string_lossy().to_string();
+    assert_eq!(
+        launches_computer_use_plugin(&stdio_server(vec![other_script])),
+        None
+    );
+
+    // Without a readable manifest the bundle's path shape still counts.
+    let shaped = "/opt/computer-use/mcp/server.mjs".to_string();
+    assert_eq!(
+        launches_computer_use_plugin(&stdio_server(vec![shaped.clone()])),
+        Some(shaped)
+    );
+    assert_eq!(
+        launches_computer_use_plugin(&stdio_server(vec!["/opt/tools/mcp/server.mjs".to_string()])),
+        None
+    );
+}
+
+#[test]
+fn computer_use_duplicate_warning_needs_the_builtin_bundle_enabled() {
+    // A user entry alone (no enabled built-in bundle) is never flagged.
+    let mut config = McpConfig::default();
+    config.servers.insert(
+        "codewhale-cu".to_string(),
+        stdio_server(vec!["/opt/computer-use/mcp/server.mjs".to_string()]),
+    );
+    assert!(duplicate_computer_use_servers(&config).is_empty());
+}
+
+#[test]
+fn computer_use_duplicate_warning_names_user_copies_of_the_enabled_bundle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plugin_base = dir.path().join("plugins/computer-use");
+    fs::create_dir_all(plugin_base.join("mcp")).expect("plugin dirs");
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"computer-use\"\nversion = \"1.0.0\"\n",
+    )
+    .expect("plugin manifest");
+    let (_, authority) = active_plugin_fixture(&plugin_base);
+    let mut builtin = stdio_server(vec![
+        plugin_base
+            .join("mcp/server.mjs")
+            .to_string_lossy()
+            .to_string(),
+    ]);
+    builtin.reviewed_plugin = Some(
+        ReviewedPluginMcpSource::from_authority(
+            authority,
+            None,
+            Arc::new(crate::plugins::HostEnvironment::default()),
+        )
+        .expect("reviewed source"),
+    );
+
+    let mut config = McpConfig::default();
+    config
+        .servers
+        .insert("plugin-computer-use".to_string(), builtin);
+    config.servers.insert(
+        "codewhale-cu".to_string(),
+        stdio_server(vec!["/opt/computer-use/mcp/server.mjs".to_string()]),
+    );
+    config.servers.insert(
+        "browser-tools".to_string(),
+        stdio_server(vec!["/opt/tools/mcp/server.mjs".to_string()]),
+    );
+    let mut disabled_copy = stdio_server(vec!["/srv/computer_use/mcp/server.mjs".to_string()]);
+    disabled_copy.enabled = false;
+    config.servers.insert("old-cu".to_string(), disabled_copy);
+
+    // Only the enabled user copy is named, with the argument that gave it
+    // away; the bundle itself, other plugins and disabled entries are not.
+    assert_eq!(
+        duplicate_computer_use_servers(&config),
+        vec![(
+            "codewhale-cu".to_string(),
+            "/opt/computer-use/mcp/server.mjs".to_string()
+        )]
+    );
+
+    // Disabling the built-in bundle removes the warning.
+    config
+        .servers
+        .get_mut("plugin-computer-use")
+        .expect("bundle entry")
+        .enabled = false;
+    assert!(duplicate_computer_use_servers(&config).is_empty());
+}

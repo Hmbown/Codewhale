@@ -1,8 +1,5 @@
-#[path = "../src/session_tree.rs"]
-#[allow(dead_code)] // The probe intentionally exercises only the journal hot paths.
-mod session_tree;
-
 use codewhale_models::Message;
+use codewhale_runtime::session_tree;
 use serde::{Deserialize, Serialize};
 use session_tree::SessionJournal;
 use std::io::Write;

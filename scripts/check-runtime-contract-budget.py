@@ -611,7 +611,7 @@ def check_fragment_caps() -> None:
         )
 
     # TUI must be unified with the core boundary (shared crates/core module)
-    tui_fragment = REPO_ROOT / "crates" / "tui" / "src" / "model_context" / "fragment.rs"
+    tui_fragment = REPO_ROOT / "crates" / "runtime" / "src" / "model_context" / "fragment.rs"
     try:
         tui_text = tui_fragment.read_text(encoding="utf-8")
     except FileNotFoundError as error:

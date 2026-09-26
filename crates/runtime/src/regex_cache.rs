@@ -8,7 +8,7 @@ const DEFAULT_USER_REGEX_CACHE_CAPACITY: usize = 64;
 
 static USER_REGEX_CACHE: OnceLock<UserRegexCache> = OnceLock::new();
 
-pub(crate) fn compile_user_regex(pattern: &str) -> Result<Regex, regex::Error> {
+pub fn compile_user_regex(pattern: &str) -> Result<Regex, regex::Error> {
     user_regex_cache().compile(pattern)
 }
 

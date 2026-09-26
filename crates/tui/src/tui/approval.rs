@@ -360,19 +360,6 @@ fn workspace_relative(value: &str, workspace: &Path) -> String {
     }
 }
 
-/// The connected-app server named by an `mcp_<server>_<tool>` tool name.
-/// Presentation only: server names may themselves hold `_`, so this is never
-/// a policy input.
-#[must_use]
-pub fn connected_app_server(tool_name: &str) -> Option<&str> {
-    let rest = tool_name.strip_prefix("mcp_")?;
-    match rest.split_once('_') {
-        Some((server, _)) if !server.is_empty() => Some(server),
-        _ if !rest.is_empty() => Some(rest),
-        _ => None,
-    }
-}
-
 fn description_is_repo_law_prompt(description: &str) -> bool {
     description.starts_with("Repo law holds this write:")
         && description.contains(".codewhale/constitution.json")

@@ -140,11 +140,7 @@ pub(crate) fn resolve_agent_transcript_messages(
 /// The same name the rail shows for a worker: its dispatch/session name when
 /// it has one, else the generated or labelled display name.
 pub(crate) fn agent_display_label(app: &App, agent_id: &str) -> String {
-    app.subagent_cache
-        .iter()
-        .find(|agent| agent.agent_id == agent_id)
-        .and_then(crate::tui::sidebar::dispatched_agent_name)
-        .map(str::to_string)
+    app.agent_given_name(agent_id)
         .unwrap_or_else(|| crate::tui::agent_details::safe_agent_display_name(app, agent_id))
 }
 
@@ -439,17 +435,16 @@ pub(crate) enum AgentShellShortcut {
 /// surface owns that same arrow. Rendering and dispatch both consume this
 /// predicate so the footer cannot promise an action that another owner will
 /// swallow.
+///
+/// A workflow run on the workbar counts as agents to manage: `↓` then opens
+/// `/workflows` instead of the agent register.
 pub(crate) fn shell_shortcuts_available(app: &App, completion_menu_open: bool) -> bool {
-    agents_exist(app)
+    (agents_exist(app) || !app.workflow_runs.is_empty())
         && !completion_menu_open
         && app.input.is_empty()
         && app.view_stack.is_empty()
         && app.selected_composer_attachment_index().is_none()
         && !app.work_surface.focused
-        && !app
-            .workflow_panel
-            .as_ref()
-            .is_some_and(|panel| panel.keyboard_focus)
 }
 
 /// Resolve a key only while the agent shortcut contract is actually active.

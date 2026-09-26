@@ -140,6 +140,41 @@ fn preserve_host_env(command: &mut Command) {
 }
 
 fn run_exec_stream_json(server: &MockServer) -> Vec<Value> {
+    let stdout = run_exec(
+        server,
+        &[
+            "--auto",
+            "--model",
+            TEST_MODEL,
+            "--output-format",
+            "stream-json",
+            "answer briefly",
+        ],
+    );
+    stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|err| {
+                panic!("stream-json line should parse: {err}\nline: {line}\nstdout:\n{stdout}")
+            })
+        })
+        .collect()
+}
+
+/// Run `codewhale-tui exec <exec_args>` against `server` and return stdout.
+fn run_exec(server: &MockServer, exec_args: &[&str]) -> String {
+    let (success, stdout, stderr) = run_exec_unchecked(server, exec_args);
+    assert!(
+        success,
+        "codewhale-tui exec failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    stdout
+}
+
+/// Run `codewhale-tui exec <exec_args>` and return whether it exited
+/// successfully, its stdout and its stderr.
+fn run_exec_unchecked(server: &MockServer, exec_args: &[&str]) -> (bool, String, String) {
     let workspace = TempDir::new().expect("workspace tempdir");
     let home = TempDir::new().expect("home tempdir");
 
@@ -151,12 +186,7 @@ fn run_exec_stream_json(server: &MockServer) -> Vec<Value> {
         .arg(workspace.path())
         .arg("--no-project-config")
         .arg("exec")
-        .arg("--auto")
-        .arg("--model")
-        .arg(TEST_MODEL)
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("answer briefly")
+        .args(exec_args)
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
         .env("XDG_CONFIG_HOME", home.path().join(".config"))
@@ -206,23 +236,11 @@ fn run_exec_stream_json(server: &MockServer) -> Vec<Value> {
 
     let stdout = join_pipe_reader(stdout_reader, "stdout");
     let stderr = join_pipe_reader(stderr_reader, "stderr");
-    assert!(
+    (
         status.success(),
-        "codewhale-tui exec failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&stdout),
-        String::from_utf8_lossy(&stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&stdout).into_owned();
-    stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str(line).unwrap_or_else(|err| {
-                panic!("stream-json line should parse: {err}\nline: {line}\nstdout:\n{stdout}")
-            })
-        })
-        .collect()
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+    )
 }
 
 fn read_pipe_in_background<R>(mut reader: R) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
@@ -359,4 +377,221 @@ async fn turn_usage_event_is_skipped_when_provider_reports_no_usage() {
     assert!(types.contains(&"content"), "content missing: {types:?}");
     assert_eq!(types.last(), Some(&"done"), "stream must end with done");
     assert_eq!(types.get(types.len() - 2), Some(&"metadata"));
+}
+
+/// #6510: plain `exec` bypassed the Engine — text mode sent no system prompt,
+/// `--json` sent an inline "coding assistant" line — so the output format
+/// changed the model's instructions and nothing was logged. Both now run one
+/// Engine turn with the one base prompt and no tool catalog, and `--json`
+/// keeps its documented one-shot receipt fields.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_exec_runs_one_engine_turn_under_one_prompt_authority() {
+    let server = start_mock_llm(answer_sse_with_usage("pong")).await;
+
+    let text = run_exec(&server, &["--model", TEST_MODEL, "answer briefly"]);
+    assert_eq!(text.trim(), "pong", "text mode prints the answer: {text}");
+
+    let json_stdout = run_exec(
+        &server,
+        &["--json", "--model", TEST_MODEL, "answer briefly"],
+    );
+    let receipt: Value = serde_json::from_str(&json_stdout)
+        .unwrap_or_else(|err| panic!("--json receipt should parse: {err}\n{json_stdout}"));
+    assert_eq!(receipt["mode"], "one-shot");
+    assert_eq!(receipt["model"], TEST_MODEL);
+    assert_eq!(receipt["success"], true);
+    assert_eq!(receipt["output"], "pong");
+    assert_eq!(receipt["usage"]["input_tokens"], 20);
+    assert_eq!(receipt["usage"]["output_tokens"], 8);
+    assert!(
+        receipt["tools"].as_array().is_some_and(Vec::is_empty),
+        "{receipt}"
+    );
+
+    let bodies = chat_bodies(&server).await;
+    assert_eq!(bodies.len(), 2, "one model call per run: {bodies:#?}");
+    for body in &bodies {
+        let messages = body["messages"].to_string();
+        assert!(
+            messages.contains("You are Codewhale, an agent working alongside the user"),
+            "both formats must carry the one base prompt: {messages}"
+        );
+        assert!(
+            !messages.contains("You are a coding assistant. Give concise"),
+            "the old --json-only instruction must be gone: {messages}"
+        );
+        assert!(
+            body.get("tools")
+                .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)),
+            "plain exec offers no tools: {body}"
+        );
+    }
+}
+
+/// Chat-completions bodies the mock received, in order.
+async fn chat_bodies(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .expect("request recording")
+        .into_iter()
+        .filter(|request| request.url.path() == "/v1/chat/completions")
+        .map(|request| serde_json::from_slice(&request.body).expect("request body JSON"))
+        .collect()
+}
+
+/// #6510: a limit is not a tool grant. `--max-turns`, `--disallowed-tools`
+/// and `--append-system-prompt` used to put plain exec on the full tool
+/// catalog, so `exec --max-turns 1 "hi"` became a tool-using agent.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_exec_limits_do_not_grant_tools() {
+    let server = start_mock_llm(answer_sse_with_usage("pong")).await;
+
+    for flags in [
+        &["--max-turns", "1"][..],
+        &["--disallowed-tools", "exec_shell"],
+        &["--append-system-prompt", "Be brief."],
+    ] {
+        let mut args = flags.to_vec();
+        args.extend(["--model", TEST_MODEL, "answer briefly"]);
+        let text = run_exec(&server, &args);
+        assert_eq!(text.trim(), "pong", "{flags:?}: {text}");
+    }
+
+    let bodies = chat_bodies(&server).await;
+    assert_eq!(bodies.len(), 3, "one model call per run: {bodies:#?}");
+    for body in &bodies {
+        assert!(
+            body.get("tools")
+                .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)),
+            "a limit flag must not offer tools: {body}"
+        );
+    }
+}
+
+/// #6510: plain exec now runs on the Engine, so an output-limit stop follows
+/// the Engine's one policy: the partial answer is kept, the model is asked to
+/// continue, and the run succeeds with the whole answer. The old direct call
+/// printed the partial answer and failed.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_exec_continues_past_an_output_limit_stop() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(json_response(json!({
+            "object": "list",
+            "data": [{ "id": TEST_MODEL, "object": "model" }]
+        })))
+        .mount(&server)
+        .await;
+    let truncated = [
+        sse_chunk(json!({
+            "id": "chatcmpl-cut",
+            "object": "chat.completion.chunk",
+            "model": TEST_MODEL,
+            "choices": [{"index": 0, "delta": {"content": "first half"}, "finish_reason": null}]
+        })),
+        sse_chunk(json!({
+            "id": "chatcmpl-cut",
+            "object": "chat.completion.chunk",
+            "model": TEST_MODEL,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+        })),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .join("");
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse_response(truncated))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse_response(answer_sse_without_usage(" second half")))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let json_stdout = run_exec(
+        &server,
+        &["--json", "--model", TEST_MODEL, "answer briefly"],
+    );
+    let receipt: Value = serde_json::from_str(&json_stdout)
+        .unwrap_or_else(|err| panic!("--json receipt should parse: {err}\n{json_stdout}"));
+    assert_eq!(receipt["mode"], "one-shot", "{receipt}");
+    assert_eq!(receipt["success"], true, "{receipt}");
+    let output = receipt["output"].as_str().unwrap_or_default();
+    assert!(
+        output.contains("first half") && output.contains("second half"),
+        "{receipt}"
+    );
+
+    let bodies = chat_bodies(&server).await;
+    assert_eq!(bodies.len(), 2, "one continuation request: {bodies:#?}");
+    assert!(
+        bodies[1]["messages"]
+            .to_string()
+            .contains("stopped generation at its output limit"),
+        "the continuation names the truncation: {}",
+        bodies[1]["messages"]
+    );
+}
+
+/// #6510 review: a model that keeps stopping at its output limit must not be
+/// re-asked until the turn wall clock. Plain exec caps its continuations at a
+/// small default (8 model steps) unless `--max-turns` sets another, ends the
+/// run as failed with the partial answer, and never injects the agent wrap-up
+/// notices (soft landing, final report) into a one-shot answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_exec_bounds_output_limit_continuations() {
+    let always_truncated = [
+        sse_chunk(json!({
+            "id": "chatcmpl-cut",
+            "object": "chat.completion.chunk",
+            "model": TEST_MODEL,
+            "choices": [{"index": 0, "delta": {"content": "again"}, "finish_reason": null}]
+        })),
+        sse_chunk(json!({
+            "id": "chatcmpl-cut",
+            "object": "chat.completion.chunk",
+            "model": TEST_MODEL,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+        })),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .join("");
+
+    for (flags, expected_requests) in [(&[][..], 8usize), (&["--max-turns", "2"][..], 2)] {
+        let server = start_mock_llm(always_truncated.clone()).await;
+        let mut args = flags.to_vec();
+        args.extend(["--json", "--model", TEST_MODEL, "answer briefly"]);
+        let (success, stdout, stderr) = run_exec_unchecked(&server, &args);
+        assert!(
+            !success,
+            "{flags:?}: a capped run must not exit 0\n{stderr}"
+        );
+        let receipt: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|err| panic!("--json receipt should parse: {err}\n{stdout}"));
+        assert_eq!(receipt["mode"], "one-shot", "{receipt}");
+        assert_eq!(receipt["success"], false, "{receipt}");
+        assert!(
+            receipt["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("again")),
+            "the partial answer is kept: {receipt}"
+        );
+
+        let bodies = chat_bodies(&server).await;
+        assert_eq!(bodies.len(), expected_requests, "{flags:?}: {bodies:#?}");
+        for body in &bodies {
+            let messages = body["messages"].to_string();
+            assert!(
+                !messages.contains("Step budget soft landing")
+                    && !messages.contains("Write your final report now"),
+                "{flags:?}: no agent wrap-up notice in a one-shot answer: {messages}"
+            );
+        }
+    }
 }

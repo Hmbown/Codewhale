@@ -320,12 +320,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             ));
             if let Some(queued) = queued.as_deref() {
                 // Truthful `· N queued`: follow-ups the running child has not
-                // yet folded into its next round. Accent so it reads as live
-                // pending work, not as part of the receipt.
+                // yet folded into its next round. Amber: a message is waiting
+                // on a busy agent, the one thing on this row that needs you.
                 spans.push(Span::styled(
                     queued.to_string(),
                     Style::default()
-                        .fg(app.ui_theme.accent_action)
+                        .fg(app.ui_theme.warning)
                         .bg(normal.bg.unwrap_or(app.ui_theme.panel_bg)),
                 ));
             }

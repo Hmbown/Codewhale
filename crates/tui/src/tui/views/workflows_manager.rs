@@ -64,6 +64,16 @@ fn child_state_glyph(state: &str) -> &'static str {
     }
 }
 
+/// Open `/workflows` unless it is already on top. `/workflows`, the
+/// workbar's `↓ to manage`, and a click on a workbar row all land here.
+pub(crate) fn open(app: &mut App) {
+    if app.view_stack.top_kind() != Some(ModalKind::WorkflowsManager) {
+        let view = WorkflowsManagerView::new(app);
+        app.view_stack.push(view);
+    }
+    app.needs_redraw = true;
+}
+
 pub struct WorkflowsManagerView {
     /// Newest first, so the live run is the first thing read.
     runs: Vec<HostWorkflowRunDetail>,

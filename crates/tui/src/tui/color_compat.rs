@@ -432,7 +432,7 @@ fn enforce_cell_contrast(
     cell.fg = palette::enforce_contrast(cell.fg, surface, palette::AA_BODY_CONTRAST);
 }
 
-fn adapt_cell_colors(
+pub(crate) fn adapt_cell_colors(
     cell: &mut Cell,
     depth: ColorDepth,
     palette_mode: PaletteMode,

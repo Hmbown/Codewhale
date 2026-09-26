@@ -696,11 +696,8 @@ fn ask_rule_save_preview_formats_shell_rule() {
 
     let preview = request.ask_rule_save_preview().expect("save preview");
     assert_eq!(preview.rule_count, 1);
-    assert_eq!(preview.summary(), "1 ask rule");
-    assert_eq!(
-        preview.entries,
-        vec!["tool=exec_shell command=cargo test --workspace"]
-    );
+    assert_eq!(preview.summary(), "always ask first");
+    assert_eq!(preview.entries, vec!["run cargo test --workspace"]);
     assert_eq!(preview.omitted, 0);
 }
 
@@ -713,12 +710,10 @@ fn safe_shell_request_builds_exact_workspace_allow_rule() {
     assert!(request.can_save_allow_rule());
     assert_eq!(request.persistent_allow_rules, vec![expected]);
     let preview = request.allow_rule_save_preview().expect("allow preview");
-    assert_eq!(preview.summary(), "1 allow rule");
+    assert_eq!(preview.summary(), "always allow");
     assert_eq!(
         preview.entries,
-        vec![
-            "tool=exec_shell command=cargo test --workspace command_exact=true workspace=/workspace"
-        ]
+        vec!["run exactly cargo test --workspace in /workspace"]
     );
 }
 
@@ -776,7 +771,7 @@ fn file_write_builds_exact_workspace_allow_rule() {
             .allow_rule_save_preview()
             .expect("allow preview")
             .entries,
-        vec!["tool=write_file path=src/main.rs workspace=/workspace"]
+        vec!["write src/main.rs in /workspace"]
     );
 }
 
@@ -796,13 +791,13 @@ fn ask_rule_save_preview_formats_write_and_edit_file_paths() {
             .ask_rule_save_preview()
             .expect("write save preview")
             .entries,
-        vec!["tool=write_file path=src/main.rs"]
+        vec!["write src/main.rs"]
     );
     assert_eq!(
         edit.ask_rule_save_preview()
             .expect("edit save preview")
             .entries,
-        vec!["tool=edit_file path=src/lib.rs"]
+        vec!["edit src/lib.rs"]
     );
 }
 
@@ -891,14 +886,8 @@ diff --git a/src/b.rs b/src/b.rs
     );
     assert!(request.can_save_ask_rule());
     let preview = request.ask_rule_save_preview().expect("save preview");
-    assert_eq!(preview.summary(), "2 ask rules");
-    assert_eq!(
-        preview.entries,
-        vec![
-            "tool=apply_patch path=src/a.rs",
-            "tool=apply_patch path=src/b.rs"
-        ]
-    );
+    assert_eq!(preview.summary(), "always ask first");
+    assert_eq!(preview.entries, vec!["change src/a.rs", "change src/b.rs"]);
     assert_eq!(
         request.persistent_allow_rules,
         vec![
@@ -1025,14 +1014,8 @@ fn ask_rule_save_preview_truncates_rule_list() {
 
     let preview = build_permission_rule_save_preview(&rules, 2).expect("save preview");
     assert_eq!(preview.rule_count, 4);
-    assert_eq!(preview.summary(), "4 ask rules");
-    assert_eq!(
-        preview.entries,
-        vec![
-            "tool=apply_patch path=src/a.rs",
-            "tool=apply_patch path=src/b.rs"
-        ]
-    );
+    assert_eq!(preview.summary(), "always ask first");
+    assert_eq!(preview.entries, vec!["change src/a.rs", "change src/b.rs"]);
     assert_eq!(preview.omitted, 2);
 }
 
@@ -1102,6 +1085,7 @@ fn benign_y_one_step_approves() {
 #[test]
 fn save_ask_rule_shortcut_approves_once_with_rule() {
     let mut view = ApprovalView::new(shell_request());
+    render_lines(&view, 120, 40);
 
     let action = view.handle_key(create_key_event(KeyCode::Char('s')));
     let ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
@@ -1125,6 +1109,7 @@ fn save_file_ask_rule_shortcut_emits_file_rule() {
     // `S` on a write_file approval approves once and carries the exact
     // workspace-relative file rule for persistence.
     let mut view = ApprovalView::new(destructive_request());
+    render_lines(&view, 120, 40);
 
     let action = view.handle_key(create_key_event(KeyCode::Char('S')));
     let ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
@@ -1146,6 +1131,7 @@ fn save_file_ask_rule_shortcut_emits_file_rule() {
 #[test]
 fn persistent_allow_option_approves_once_with_exact_repo_rule() {
     let mut view = ApprovalView::new(shell_request());
+    render_lines(&view, 120, 40);
 
     let action = view.handle_key(create_key_event(KeyCode::Char('p')));
     let ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
@@ -1165,6 +1151,56 @@ fn persistent_allow_option_approves_once_with_exact_repo_rule() {
                 .into_exact_workspace_allow("/workspace")
         ]
     );
+}
+
+/// The save offers work only while the card shows what the rule covers:
+/// never before the first paint, never on a band too small for the save
+/// preview, never while collapsed to its banner.
+#[test]
+fn save_shortcuts_fail_closed_while_the_save_preview_is_off_screen() {
+    let saves = |view: &mut ApprovalView| {
+        [KeyCode::Char('p'), KeyCode::Char('s')].map(|code| {
+            matches!(
+                view.clone().handle_key(create_key_event(code)),
+                ViewAction::EmitAndClose(ViewEvent::ApprovalDecision { .. })
+            )
+        })
+    };
+    let mut view = ApprovalView::new(shell_request());
+    assert_eq!(saves(&mut view), [false, false], "before the first paint");
+
+    render_lines(&view, 120, 40);
+    assert_eq!(saves(&mut view), [true, true], "preview on screen");
+
+    let lines = render_lines(&view, 40, 9).join("\n");
+    assert!(!lines.contains("Save:"), "{lines}");
+    assert!(!lines.contains("[p]"), "{lines}");
+    assert_eq!(saves(&mut view), [false, false], "band too small: {lines}");
+
+    render_lines(&view, 120, 40);
+    view.handle_key(create_key_event(KeyCode::Tab));
+    render_lines(&view, 120, 40);
+    assert_eq!(saves(&mut view), [false, false], "collapsed banner");
+}
+
+/// With the save offer hidden, arrow keys skip its row and a stale selection
+/// on it commits nothing.
+#[test]
+fn hidden_save_offer_is_skipped_by_navigation_and_enter() {
+    let mut view = ApprovalView::new(shell_request());
+    render_lines(&view, 120, 40);
+    view.select_prev();
+    assert_eq!(view.current_option(), ApprovalOption::AllowExactRepo);
+
+    render_lines(&view, 40, 9);
+    assert!(matches!(
+        view.handle_key(create_key_event(KeyCode::Enter)),
+        ViewAction::None
+    ));
+    view.select_prev();
+    assert_eq!(view.current_option(), ApprovalOption::ApproveAlways);
+    view.select_next();
+    assert_eq!(view.current_option(), ApprovalOption::Deny);
 }
 
 #[test]
@@ -1253,10 +1289,15 @@ fn mouse_click_renders_and_approves_inline_option() {
     ));
 }
 
+/// A tiny frame keeps every one-off action and its hitbox. Where it has no
+/// room for the save preview (most locales at 40x12) it withholds the
+/// persistent save (`[p]`, index 2): its hitbox is empty and nothing clicks
+/// it. Where it offers the save, the preview is on screen.
 #[test]
 fn tiny_localized_approval_keeps_every_action_and_hitbox() {
     const WIDTH: u16 = 40;
     const HEIGHT: u16 = 12;
+    const PERSISTENT: usize = 2;
     let expected = [
         ReviewDecision::Approved,
         ReviewDecision::ApprovedForSession,
@@ -1284,13 +1325,33 @@ fn tiny_localized_approval_keeps_every_action_and_hitbox() {
 
             let hitboxes = view.row_hitboxes.borrow().clone();
             assert_eq!(hitboxes.len(), expected.len(), "{locale:?}: {hitboxes:?}");
-            for hitbox in &hitboxes {
+            let offered = hitboxes[PERSISTENT] != ratatui::layout::Rect::default();
+            let screen = terminal.backend().buffer().clone();
+            let text: String = screen.content.iter().map(|cell| cell.symbol()).collect();
+            assert_eq!(offered, text.contains("Save:"), "{locale:?}:\n{text}");
+            let shown: Vec<ratatui::layout::Rect> = hitboxes
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| offered || *i != PERSISTENT)
+                .map(|(_, rect)| *rect)
+                .collect();
+            for hitbox in &shown {
                 assert!(hitbox.height > 0, "{locale:?}: {hitboxes:?}");
                 assert!(hitbox.right() <= WIDTH, "{locale:?}: {hitboxes:?}");
                 assert!(hitbox.bottom() <= HEIGHT, "{locale:?}: {hitboxes:?}");
             }
-            for pair in hitboxes.windows(2) {
+            for pair in shown.windows(2) {
                 assert!(pair[0].bottom() <= pair[1].y, "{locale:?}: {hitboxes:?}");
+            }
+            if index == PERSISTENT && !offered {
+                assert!(
+                    matches!(
+                        view.handle_key(create_key_event(KeyCode::Char('p'))),
+                        ViewAction::None
+                    ),
+                    "{locale:?}: [p] without its save preview"
+                );
+                continue;
             }
 
             let rect = hitboxes[index];
@@ -1928,7 +1989,7 @@ fn render_critical_shows_warning_badge_and_policy_semantics() {
     );
     assert_approval_key_badges_visible(&joined);
     assert!(
-        joined.contains("Your permissions, a review rule"),
+        joined.contains("Your settings ask you to confirm this step first"),
         "missing permission/review-rule semantics:\n{joined}"
     );
     assert!(

@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{ApiError, RuntimeApiState};
-use crate::commands::voice as voice_core;
+use crate::voice as voice_core;
 use voice_core::{DictateError, DictateMode};
 
 /// One mic per host — serialize captures so concurrent dictate requests get

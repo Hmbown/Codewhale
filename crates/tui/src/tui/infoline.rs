@@ -407,7 +407,7 @@ fn chrome(theme: &UiTheme, ink: ChromeInk) -> Style {
 }
 
 /// Recorded hitboxes for one rendered row. Mirrors the
-/// `viewport.last_workflow_cancel_area` storage pattern: render computes the
+/// `viewport.last_workbar_area` storage pattern: render computes the
 /// rects, the caller stores them, `mouse_ui` hit-tests against them.
 #[derive(Debug, Clone)]
 pub struct InfoLineHitbox {

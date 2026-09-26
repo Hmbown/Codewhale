@@ -77,6 +77,9 @@ pub enum FauxStep {
     /// [v0.4.9-v0.5.1 regression range](https://github.com/Hmbown/CodeWhale/compare/v0.4.9...v0.5.1)
     /// where that content was dropped.
     Factory(Box<dyn Fn(&MessageRequest) -> CannedTurn + Send + Sync>),
+    /// Fail the request itself with this message, as a provider that refuses
+    /// it (a 401 for a bad key, say) does before any stream starts.
+    Error(String),
 }
 
 /// A queue-driven mock LLM client.
@@ -153,6 +156,14 @@ impl MockLlmClient {
             .push_back(FauxStep::Factory(Box::new(factory)));
     }
 
+    /// Push a request failure onto the back of the queue.
+    pub fn push_error(&self, message: impl Into<String>) {
+        self.canned
+            .lock()
+            .expect("MockLlmClient.canned mutex poisoned")
+            .push_back(FauxStep::Error(message.into()));
+    }
+
     /// Push a canned non-streaming `MessageResponse`. Consumed by
     /// [`LlmClient::create_message`] (FIFO).
     pub fn push_message_response(&self, response: MessageResponse) {
@@ -213,10 +224,11 @@ impl MockLlmClient {
             .pop_front()
     }
 
-    fn turn_from_step(&self, step: FauxStep, request: &MessageRequest) -> CannedTurn {
+    fn turn_from_step(&self, step: FauxStep, request: &MessageRequest) -> Result<CannedTurn> {
         match step {
-            FauxStep::Canned(turn) => turn,
-            FauxStep::Factory(factory) => factory(request),
+            FauxStep::Canned(turn) => Ok(turn),
+            FauxStep::Factory(factory) => Ok(factory(request)),
+            FauxStep::Error(message) => Err(anyhow!(message)),
         }
     }
 
@@ -252,7 +264,7 @@ impl LlmClient for MockLlmClient {
             ));
         };
 
-        let turn = self.turn_from_step(step, &request);
+        let turn = self.turn_from_step(step, &request)?;
         Ok(synthesize_message_response(turn, &self.model))
     }
 
@@ -266,7 +278,7 @@ impl LlmClient for MockLlmClient {
             ));
         };
 
-        let turn = self.turn_from_step(step, &request);
+        let turn = self.turn_from_step(step, &request)?;
         Ok(stream_from_canned(turn))
     }
 

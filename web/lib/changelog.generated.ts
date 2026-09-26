@@ -41,9 +41,10 @@ export const CHANGELOG: ChangelogRelease[] = [
         "heading": "Added",
         "items": [
           "Official model routing: /router (also /model router) sets up the Auto router with presets: Jev (TypeSafe's decision model, via OpenRouter or a TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes one test call before it saves, /status shows the router's choice, cost and latency, and a failing router is shown as failing (#6525).",
-          "Receipts: /receipts, codewhale receipts [ID|--last] [--format md|json], and GET /v1/threads/{id}/receipt (plus a per-turn form) list what a session did, one line per action: files changed with line counts, commands with exit codes, web and MCP calls, agents, approvals and who gave them, and failures. They also count what ran without asking and name the posture each turn ran under, read from the turn's own record. A call Codewhale blocked before it started (Auto-Review or…"
+          "Receipts: /receipts, codewhale receipts [ID|--last] [--format md|json], and GET /v1/threads/{id}/receipt (plus a per-turn form) list what a session did, one line per action: files changed with line counts, commands with exit codes, web and MCP calls, agents, approvals and who gave them, and failures. They also count what ran without asking and name the posture each turn ran under, read from the turn's own record. A call Codewhale blocked before it started (Auto-Review or…",
+          "Code mode composes MCP and plugin tools and is on by default: execute_tools programs can call MCP tools, and each nested call passes the same approval gate as a direct call, pausing the program for approval when needed. Every nested call keeps its receipt, including calls that finish before a deadline, and code_mode = false turns it off. codewhale mcp list and codewhale doctor warn when a user MCP server duplicates the built-in Computer Use bundle (#6562, #6509)."
         ],
-        "itemCount": 2
+        "itemCount": 3
       },
       {
         "heading": "Fixed",
@@ -61,7 +62,7 @@ export const CHANGELOG: ChangelogRelease[] = [
           "Upgrading Codewhale no longer turns off the built-in Computer Use. Each build writes the built-in bundle to its own directory, so an upgrade used to present it as never reviewed and disabled. Now the review and enablement carry to the new build when its capabilities are unchanged. Changed capabilities show capabilities-changed and wait for review, and a revoked trust never carries (#6303).",
           "\"Allow for this conversation\" records a grant for that tool and argument class instead of switching the whole thread to Full Access, so the call you just approved is no longer failed by a Permissions change. An approval also survives a Permissions change that only widens what is allowed, grants end when a thread is archived or deleted, and web.run open grants are scoped by host. Full Access covers MCP tools that declare themselves destructive in every host, including…"
         ],
-        "itemCount": 19
+        "itemCount": 22
       },
       {
         "heading": "Removed",

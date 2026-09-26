@@ -226,6 +226,106 @@ fn frame_cursor_is_hidden_during_diff_then_positioned_before_reveal() {
 }
 
 #[test]
+fn workbar_rows_sit_under_the_status_row_one_per_workflow() {
+    let mut app = crate::test_support::test_app_with_options(crate::tui::app::TuiOptions {
+        model: "deepseek-v4-flash".to_string(),
+        start_in_agent_mode: true,
+        ..crate::test_support::test_tui_options(PathBuf::from("."))
+    });
+    app.onboarding = crate::tui::app::OnboardingState::None;
+    app.launch.visible = false;
+    app.ui_locale = codewhale_localization::Locale::En;
+    app.onboarding_needs_api_key = false;
+    // Pin the widest posture chip (`files: workspace (unenforced)`), which
+    // Linux and Windows hosts paint and macOS does not, so every host sheds
+    // the status row the same way.
+    app.sandbox_backend = None;
+    app.current_session_id = Some("session-wb".to_string());
+    app.history.push(HistoryCell::User {
+        content: "Established conversation".to_string(),
+    });
+    for (run, goal) in [
+        ("run-a", "Audit the parser"),
+        ("run-b", "Port the fixtures"),
+    ] {
+        assert!(apply_owned_workflow_ui_event(
+            &mut app,
+            "session-wb",
+            run,
+            &serde_json::json!({"type": "run_started", "workflow_goal": goal, "at_ms": 1}),
+        ));
+        for index in 0..3 {
+            apply_owned_workflow_ui_event(
+                &mut app,
+                "session-wb",
+                run,
+                &serde_json::json!({
+                    "type": "task_started",
+                    "task_id": format!("{run}-{index}"),
+                    "workflow_task_label": format!("agent {index}"),
+                    "at_ms": 2,
+                }),
+            );
+        }
+    }
+    apply_owned_workflow_ui_event(
+        &mut app,
+        "session-wb",
+        "run-a",
+        &serde_json::json!({"type": "task_completed", "task_id": "run-a-0", "status": "succeeded", "at_ms": 3}),
+    );
+    app.is_loading = true;
+    app.turn_started_at = Some(Instant::now());
+
+    let config = Config::default();
+    let (width, height) = (140u16, 30u16);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| {
+            let _ = super::frame::render(frame, &mut app, &config);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let rows: Vec<String> = (0..height)
+        .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect();
+
+    // No progress card sits between the transcript and the composer, and the
+    // transcript carries no run rows.
+    let composer = app.viewport.last_composer_area.expect("composer area");
+    let status = usize::from(composer.y + composer.height);
+    assert!(
+        rows[status].contains("Esc to interrupt") && rows[status].contains("to manage"),
+        "the status row keeps Esc and names the manage key: {:?}",
+        rows[status]
+    );
+    // The workbar sits between two rules: rule, one row per run, rule.
+    let rule = "─".repeat(usize::from(width));
+    assert_eq!(rows[status + 1], rule, "rule above the workbar");
+    assert!(
+        rows[status + 2].contains("Audit the parser") && rows[status + 2].contains("1/3 so far"),
+        "first workbar row: {:?}",
+        rows[status + 2]
+    );
+    assert!(
+        rows[status + 3].contains("Port the fixtures") && rows[status + 3].contains("0/3 so far"),
+        "second workbar row: {:?}",
+        rows[status + 3]
+    );
+    assert_eq!(rows[status + 4], rule, "rule below the workbar");
+    assert!(
+        rows[..usize::from(composer.y)]
+            .iter()
+            .all(|row| !row.contains("so far")),
+        "progress stays out of the transcript"
+    );
+    assert_eq!(
+        app.viewport.last_workbar_area.map(|area| area.height),
+        Some(4)
+    );
+}
+
+#[test]
 fn composer_rows_stay_pinned_across_turn_state_transitions() {
     // The Tideline shell: the stage, one merged footer row, and the info line
     // footer row (slots 6+8 collapsed, spec §3). In an established session,
@@ -721,7 +821,7 @@ fn focus_test_app() -> App {
     app.onboarding = crate::tui::app::OnboardingState::None;
     app.launch.visible = false;
     app.work_surface.focused = false;
-    app.workflow_panel = None;
+    app.workflow_runs.clear();
     app
 }
 
@@ -2299,7 +2399,7 @@ fn workflow_ui_events_apply_only_to_the_active_session_owner() {
         &a_started,
     ));
     assert!(
-        app.workflow_panel.is_none(),
+        app.workflow_runs.is_empty(),
         "foreign event must not mutate B"
     );
 
@@ -2314,12 +2414,7 @@ fn workflow_ui_events_apply_only_to_the_active_session_owner() {
         "workflow-b",
         &b_started,
     ));
-    assert_eq!(
-        app.workflow_panel
-            .as_ref()
-            .map(|panel| panel.run_id.as_str()),
-        Some("workflow-b")
-    );
+    assert!(app.workflow_run("workflow-b").is_some());
 
     // A -> B -> A restores A's event lane with a new chronological start; it
     // never replays an older start through B.
@@ -2336,10 +2431,9 @@ fn workflow_ui_events_apply_only_to_the_active_session_owner() {
         &a_resumed,
     ));
     assert_eq!(
-        app.workflow_panel
-            .as_ref()
-            .map(|panel| panel.run_id.as_str()),
-        Some("workflow-a")
+        app.workflow_run("workflow-a")
+            .map(|panel| panel.label.as_str()),
+        Some("A workflow resumed")
     );
 }
 
@@ -2421,63 +2515,6 @@ fn successful_workflow_run_raises_no_failure_toast() {
     assert!(
         app.sticky_status.is_none(),
         "a successful run must not raise a failure toast"
-    );
-}
-
-#[test]
-fn workflow_panel_plain_letters_return_to_composer() {
-    let mut app = create_test_app();
-    app.workflow_panel = Some(crate::tui::widgets::workflow_panel::WorkflowPanel::new(
-        "workflow_typing",
-        "typing regression",
-        0,
-    ));
-
-    for ch in ['t', 'c', 'j', 'k'] {
-        app.workflow_panel
-            .as_mut()
-            .expect("workflow panel")
-            .keyboard_focus = true;
-        let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
-        assert!(
-            !handle_workflow_panel_key(&mut app, &key),
-            "plain {ch:?} must fall through to the composer"
-        );
-        assert!(
-            !app.workflow_panel
-                .as_ref()
-                .expect("workflow panel")
-                .keyboard_focus,
-            "typing releases panel focus"
-        );
-        app.insert_char(ch);
-    }
-
-    assert_eq!(app.input, "tcjk");
-}
-
-#[test]
-fn workflow_panel_uses_non_text_keys_for_controls() {
-    let mut app = create_test_app();
-    let mut panel = crate::tui::widgets::workflow_panel::WorkflowPanel::new(
-        "workflow_keys",
-        "keyboard controls",
-        0,
-    );
-    panel.keyboard_focus = true;
-    let was_expanded = panel.expanded;
-    app.workflow_panel = Some(panel);
-
-    assert!(handle_workflow_panel_key(
-        &mut app,
-        &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
-    ));
-    assert_ne!(
-        app.workflow_panel
-            .as_ref()
-            .expect("workflow panel")
-            .expanded,
-        was_expanded
     );
 }
 
@@ -7937,6 +7974,8 @@ fn child_approval_card_hides_always_allow_in_repo() {
             .as_any_mut()
             .downcast_mut::<ApprovalView>()
             .expect("approval view");
+        let area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        approval.render(area, &mut ratatui::buffer::Buffer::empty(area));
         let action = approval.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
         assert_eq!(
             matches!(action, ViewAction::EmitAndClose(_)),
@@ -10251,6 +10290,85 @@ async fn provider_switch_clears_turn_cache_history() {
     assert!(app.session.turn_cache_history.is_empty());
 }
 
+/// #6566: re-selecting the provider already in use (first-run key entry)
+/// reads as a connection, not as a switch from a provider to itself.
+#[tokio::test]
+async fn reselecting_the_same_provider_says_connected_not_switched() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Deepseek;
+    let mut engine = mock_engine_handle();
+    let mut config = Config {
+        provider: Some("deepseek".to_string()),
+        api_key: Some("test-key".to_string()),
+        ..Default::default()
+    };
+
+    switch_provider(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ApiProvider::Deepseek,
+        None,
+    )
+    .await;
+
+    let summary = app
+        .history
+        .iter()
+        .rev()
+        .find_map(|cell| match cell {
+            HistoryCell::System { content } if content.contains("Endpoint:") => {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+        .expect("route summary");
+    let first_line = summary.lines().next().unwrap_or_default();
+    assert!(first_line.starts_with("Connected: "), "{summary}");
+    assert!(!first_line.contains('→'), "{summary}");
+}
+
+/// #6566: a local Ollama model adopted while the connect-a-model picker is
+/// open answers that screen: the picker and its onboarding step close, and
+/// the footer names the model and how to change it.
+#[tokio::test]
+async fn adopting_a_local_model_closes_the_connect_picker_and_names_it() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = create_test_app();
+    let mut engine = mock_engine_handle();
+    let mut config = Config::default();
+    app.onboarding = crate::tui::app::OnboardingState::Provider;
+    app.onboarding_needs_api_key = true;
+    app.view_stack
+        .push(ProviderPickerView::new(ApiProvider::Deepseek, &config));
+    let catalog = crate::local_ollama::LiveLocalOllamaCatalog {
+        endpoint_v1: "http://localhost:11434/v1".to_string(),
+        tags: vec!["fixture-local:tag".to_string()],
+        chat_tag: Some("fixture-local:tag".to_string()),
+    };
+
+    super::event_loop::adopt_live_local_ollama_catalog(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        catalog,
+    )
+    .await;
+
+    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert_eq!(app.onboarding, crate::tui::app::OnboardingState::None);
+    assert_ne!(
+        app.view_stack.top_kind(),
+        Some(crate::tui::views::ModalKind::ProviderPicker)
+    );
+    let status = app.status_message.clone().unwrap_or_default();
+    assert!(
+        status.contains("fixture-local:tag") && status.contains("F3"),
+        "{status}"
+    );
+}
+
 #[tokio::test]
 async fn provider_switch_to_deepseek_canonicalizes_openrouter_default_model() {
     let _home = SettingsHomeGuard::new();
@@ -10724,6 +10842,37 @@ api_key = "arcee-key"
     let pending = app.pending_route_save.as_ref().expect("pending save");
     assert_eq!(pending.provider_identity, "xiaomi-mimo");
     assert_eq!(pending.model, "mimo-v2.5-pro");
+}
+
+/// The first-run Ollama probe answers in the background. Once the person has
+/// pressed a key in the provider picker (choosing a provider, typing a key),
+/// the probe must not switch to Ollama and close the picker under them.
+#[test]
+fn local_ollama_probe_leaves_a_picker_the_person_is_using_alone() {
+    let config = Config::default();
+    let mut app = create_test_app();
+    app.api_provider = ApiProvider::Deepseek;
+    app.onboarding_needs_api_key = true;
+    app.onboarding = OnboardingState::Provider;
+    app.view_stack.push(ProviderPickerView::new_for_onboarding(
+        ApiProvider::Deepseek,
+        None,
+        &config,
+        None,
+    ));
+    assert!(
+        crate::local_ollama::should_adopt_live_local_ollama(&mut app),
+        "an untouched first-run picker still adopts a live local model"
+    );
+
+    let _ = app
+        .view_stack
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert!(
+        !crate::local_ollama::should_adopt_live_local_ollama(&mut app),
+        "a picker the person has used is not closed by the background probe"
+    );
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::ProviderPicker));
 }
 
 /// The provider step is the first run's explicit startup-route decision, not
@@ -11574,6 +11723,8 @@ async fn immediate_submit_custom_provider_missing_key_preflight_shows_auth_next_
     provider.api_key = None;
     provider.api_key_env = Some("CODEWHALE_TEST_MISSING_LM_STUDIO_KEY".to_string());
     let mut app = create_test_app();
+    // A returning user: the saved route lost its key.
+    app.onboarding_had_provider_step = false;
     app.set_provider_identity(ApiProvider::Custom, "lm-studio");
     app.set_model_selection("local-model".to_string());
     app.input = "preserve 用户 input".to_string();
@@ -11594,12 +11745,12 @@ async fn immediate_submit_custom_provider_missing_key_preflight_shows_auth_next_
     .await
     .expect("provider preflight failures must remain inside the TUI");
 
-    // Echo first: missing-key must paint HistoryCell::User, not restore the
-    // composer as the only place the turn exists.
-    assert!(
-        app.input.is_empty(),
-        "auth failure must not restore the composer when the echo landed: {:?}",
-        app.input
+    // #6566: the unsent message is neither lost nor doubled. It is back in
+    // the composer, and no echo of it stays in the transcript, so pressing
+    // Enter once a model is connected shows it exactly once.
+    assert_eq!(
+        app.input, "preserve 用户 input",
+        "a message that was never sent must return to the composer"
     );
     assert!(app.api_messages.is_empty());
     assert_eq!(
@@ -11607,8 +11758,15 @@ async fn immediate_submit_custom_provider_missing_key_preflight_shows_auth_next_
             .iter()
             .filter(|cell| matches!(cell, HistoryCell::User { content } if content == "preserve 用户 input"))
             .count(),
-        1,
-        "missing-key submit must keep exactly one user echo: {:?}",
+        0,
+        "an unsent message must not stay in the transcript as if it were sent: {:?}",
+        app.history
+    );
+    assert!(
+        app.history.iter().any(
+            |cell| matches!(cell, HistoryCell::System { content } if content.starts_with("No model is connected"))
+        ),
+        "one transcript line says why: {:?}",
         app.history
     );
     assert!(app.last_submitted_prompt.is_none());
@@ -20501,6 +20659,56 @@ fn completed_exec_tool_result_still_renders_run_done() {
     assert!(!text.contains("tool loaded - retry required"), "{text}");
 }
 
+/// #6566: the tool output the person reads drops the engine's approval note
+/// only when the engine stamped it; tool output that merely starts with
+/// "[approval] " is shown whole.
+#[test]
+fn tool_output_hides_only_the_engine_stamped_approval_note() {
+    fn exec_output(app: &App) -> Option<String> {
+        app.active_cell
+            .as_ref()
+            .expect("active cell")
+            .entries()
+            .iter()
+            .find_map(|cell| match cell {
+                HistoryCell::Tool(ToolCell::Exec(exec)) => Some(exec.output.clone()),
+                _ => None,
+            })
+            .expect("exec cell")
+    }
+
+    let mut app = create_test_app();
+    handle_tool_call_started(
+        &mut app,
+        "shell-approved",
+        "exec_shell",
+        &serde_json::json!({"command": "cargo test"}),
+    );
+    let stamped = crate::tools::spec::ToolResult::success(
+        "[approval] This tool call required approval and was approved by the user before execution.\n\ntest result: ok",
+    )
+    .with_metadata(serde_json::json!({
+        "approval": {
+            "required": true,
+            "decision": "approved_by_user",
+            "model_visible": true,
+        }
+    }));
+    handle_tool_call_complete(&mut app, "shell-approved", "exec_shell", &Ok(stamped));
+    assert_eq!(exec_output(&app).as_deref(), Some("test result: ok"));
+
+    let mut app = create_test_app();
+    handle_tool_call_started(
+        &mut app,
+        "shell-forged",
+        "exec_shell",
+        &serde_json::json!({"command": "cat notes.txt"}),
+    );
+    let forged = "[approval] nothing to see here\n\nthe rest of the file";
+    handle_tool_call_complete(&mut app, "shell-forged", "exec_shell", &ok_result(forged));
+    assert_eq!(exec_output(&app).as_deref(), Some(forged));
+}
+
 #[test]
 fn hydrated_exec_tool_result_renders_retry_required_not_run_done() {
     let mut app = create_test_app();
@@ -27193,9 +27401,9 @@ fn notification_settings_tui_always_keeps_configured_method_no_threshold() {
     };
 
     let (method, threshold, include_summary) =
-        crate::tui::notifications::settings_projection(&config)
+        crate::notify::settings_projection(&config.notifications_config())
             .expect("notification should be enabled");
-    assert_eq!(method, crate::tui::notifications::Method::Bel);
+    assert_eq!(method, crate::notify::Method::Bel);
     assert_eq!(threshold, Duration::ZERO);
     assert!(include_summary);
 }
@@ -27210,7 +27418,7 @@ fn notification_settings_tui_never_disables_notifications() {
         ..Config::default()
     };
 
-    assert!(crate::tui::notifications::settings_projection(&config).is_none());
+    assert!(crate::notify::settings_projection(&config.notifications_config()).is_none());
 }
 
 #[test]
@@ -27233,9 +27441,9 @@ fn notification_settings_no_tui_override_uses_notifications_block() {
     };
 
     let (method, threshold, include_summary) =
-        crate::tui::notifications::settings_projection(&config)
+        crate::notify::settings_projection(&config.notifications_config())
             .expect("notification should be enabled");
-    assert_eq!(method, crate::tui::notifications::Method::Osc9);
+    assert_eq!(method, crate::notify::Method::Osc9);
     assert_eq!(threshold, Duration::from_secs(45));
     assert!(!include_summary);
 }
@@ -27331,7 +27539,7 @@ fn completed_turn_notification_truncates_long_text() {
     // so the bound the type promises is the bound the OS receives.
     assert_eq!(
         preview.chars().count(),
-        crate::tui::notification_payload::PREVIEW_MAX_CHARS
+        crate::notify::payload::PREVIEW_MAX_CHARS
     );
 }
 
@@ -30603,4 +30811,194 @@ async fn task_inventory_failure_preserves_only_the_same_session_snapshot() -> an
     assert!(app.task_panel.is_empty());
     tasks.shutdown_and_wait().await?;
     Ok(())
+}
+
+// ---- #6566 / #6565: first run, key errors, background agents ----
+
+/// #6566: a turn the provider refused for its key, before any output, gives
+/// the message back in the composer with one plain next step. The engine has
+/// already taken the question out of the session, so sending it again does
+/// not send it twice.
+#[test]
+fn credential_rejected_turn_restores_the_prompt_with_one_next_step() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.last_submitted_prompt = Some("explain this repo".to_string());
+    app.add_message(HistoryCell::User {
+        content: "explain this repo".to_string(),
+    });
+    // As the dispatch recorded it: the message, a skill it invoked, and the
+    // bubble that shows it.
+    app.unanswered_submission = Some(crate::tui::app::UnansweredSubmission {
+        message: crate::tui::app::QueuedMessage::new(
+            "explain this repo".to_string(),
+            Some("skill: repo tour".to_string()),
+        ),
+        history_cell: app.history.len() - 1,
+    });
+
+    let mut envelope = ErrorEnvelope::fatal_auth("Authentication failed: invalid API key");
+    envelope.code = crate::error_taxonomy::CREDENTIAL_REJECTED_UNSENT_CODE.to_string();
+    apply_engine_error_to_app(&mut app, envelope);
+
+    assert_eq!(app.input, "explain this repo");
+    // The whole request comes back, so Enter resends it as first sent...
+    assert_eq!(app.active_skill.as_deref(), Some("skill: repo tour"));
+    assert!(app.unanswered_submission.is_none());
+    // ...and its bubble is gone, so it shows once after that Enter.
+    assert!(
+        !app.history
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::User { .. })),
+        "{:?}",
+        app.history
+    );
+    assert!(
+        app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::System { content } if content.contains("did not accept the key")
+                && content.contains("/provider")
+        )),
+        "{:?}",
+        app.history
+    );
+}
+
+/// A draft the person already started is not overwritten by the unsent
+/// message, and the bubble that holds that message's text stays.
+#[test]
+fn credential_rejected_turn_keeps_a_started_draft_and_the_bubble() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.add_message(HistoryCell::User {
+        content: "explain this repo".to_string(),
+    });
+    app.unanswered_submission = Some(crate::tui::app::UnansweredSubmission {
+        message: crate::tui::app::QueuedMessage::new("explain this repo".to_string(), None),
+        history_cell: app.history.len() - 1,
+    });
+    app.input = "and the tests".to_string();
+
+    let mut envelope = ErrorEnvelope::fatal_auth("Authentication failed: invalid API key");
+    envelope.code = crate::error_taxonomy::CREDENTIAL_REJECTED_UNSENT_CODE.to_string();
+    apply_engine_error_to_app(&mut app, envelope);
+
+    assert_eq!(app.input, "and the tests");
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::User { content } if content == "explain this repo"
+    )));
+}
+
+/// An authentication error the engine did not mark as unsent (the model had
+/// already answered, say) keeps the message where it is: no restore and no
+/// claim that the model never got it.
+#[test]
+fn credential_rejection_after_output_keeps_the_composer_empty() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.last_submitted_prompt = Some("explain this repo".to_string());
+    app.add_message(HistoryCell::User {
+        content: "explain this repo".to_string(),
+    });
+    app.add_message(HistoryCell::Assistant {
+        content: "Looking at the repo".to_string(),
+        streaming: false,
+    });
+
+    apply_engine_error_to_app(
+        &mut app,
+        ErrorEnvelope::fatal_auth("Authentication failed: invalid API key"),
+    );
+
+    assert!(app.input.is_empty(), "{:?}", app.input);
+    assert!(!app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::System { content } if content.contains("did not accept the key")
+    )));
+}
+
+/// #6565: a child's unanswered approval reaches the footer as "waiting on
+/// you", not as "agents underway".
+#[test]
+fn pending_child_approval_drives_the_phase_to_waiting_on_you() {
+    use crate::tui::underwater::ShellPhase;
+
+    let mut app = create_test_app();
+    app.is_loading = true;
+    assert_eq!(ShellPhase::from_app(&app), ShellPhase::Working);
+
+    app.pending_child_requests.insert(
+        "agent:agent_a1:approval:1:1".to_string(),
+        crate::tui::pending_requests::PendingChildRequest {
+            agent_id: "agent_a1".to_string(),
+            tool_name: "exec_shell".to_string(),
+            description: "Run tests".to_string(),
+            input: serde_json::json!({ "command": "cargo test" }),
+            approval_key: "exec_shell:cargo-test".to_string(),
+            approval_grouping_key: "exec_shell".to_string(),
+            intent_summary: None,
+            requested_at: std::time::Instant::now(),
+        },
+    );
+
+    let phase = ShellPhase::from_app(&app);
+    assert_eq!(phase, ShellPhase::Waiting);
+    assert_eq!(phase.label(app.ui_locale), "needs you");
+}
+
+/// #6565: the label a workflow gives a child is its one name. It replaces the
+/// counter placeholder the child got before the workflow event arrived, and
+/// the status line, card owner and roster all read it.
+#[test]
+fn workflow_task_label_is_the_one_name_for_that_agent() {
+    use crate::tui::widgets::workflow_panel::WorkflowPanelEvent;
+
+    let mut app = create_test_app();
+    // Progress arrived first and assigned the placeholder.
+    assert_eq!(app.ensure_agent_label("agent_wf1"), "Agent 1");
+
+    app.apply_workflow_panel_event(
+        "run-1",
+        WorkflowPanelEvent::TaskStarted {
+            task_id: "agent_wf1".to_string(),
+            label: Some("audit docs".to_string()),
+            profile: Some("explore".to_string()),
+            model: None,
+            strength: None,
+            resolved_model: None,
+            worktree: false,
+            workspace: None,
+            route: Box::default(),
+            at_ms: 1_000,
+        },
+    );
+
+    assert_eq!(app.ensure_agent_label("agent_wf1"), "audit docs");
+    assert_eq!(app.agent_display_label("agent_wf1"), "audit docs");
+    assert_eq!(
+        crate::tui::agent_focus::agent_display_label(&app, "agent_wf1"),
+        "audit docs"
+    );
+    assert_eq!(
+        crate::tui::pending_requests::owner_for(&mut app, "agent_wf1").label,
+        "audit docs"
+    );
+
+    // A parallel task with the same label gets a name the person can tell
+    // apart on the approval card; hearing about either task again keeps it.
+    app.note_workflow_agent_label("agent_wf2", "audit docs");
+    assert_eq!(app.ensure_agent_label("agent_wf2"), "audit docs · 2");
+    assert_eq!(
+        crate::tui::pending_requests::owner_for(&mut app, "agent_wf2").label,
+        "audit docs · 2"
+    );
+    app.note_workflow_agent_label("agent_wf2", "audit docs");
+    app.note_workflow_agent_label("agent_wf1", "audit docs");
+    assert_eq!(app.agent_display_label("agent_wf1"), "audit docs");
+    assert_eq!(app.agent_display_label("agent_wf2"), "audit docs · 2");
+    assert_eq!(
+        app.agent_given_name("agent_wf2").as_deref(),
+        Some("audit docs · 2")
+    );
 }

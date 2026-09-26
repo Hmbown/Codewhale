@@ -1,7 +1,7 @@
 // Generated from docs/INSTALL.md by scripts/derive-install.mjs. Do not edit.
 
 export const INSTALL_GUIDE = {
-  "sourceHash": "13173d3ea0d7bac808315d52a8e1c98950698d920a4675b8b5ef9c48c9f12444",
+  "sourceHash": "158b2b791f3194810c4288e2dbade45c4f637ae1868156b313cfc7308d0edb46",
   "anchors": [
     "installing-codewhale",
     "60-second-quickstart-linux-or-macos",
@@ -342,7 +342,7 @@ export const INSTALL_GUIDE = {
     },
     {
       "kind": "html",
-      "text": "<p><code>--auto</code> auto-approves shell commands, so use it only in a repo or sandbox you\ntrust.</p>\n<h3 id=\"resuming\">Resuming</h3>\n"
+      "text": "<p><code>--auto</code> auto-approves shell commands, so use it only in a repo or sandbox you\ntrust.</p>\n<p>Plain <code>exec</code> offers the model no tools. Only <code>--auto</code>, <code>--yolo</code>,\n<code>--allowed-tools</code> or resuming a session opens a tool surface; limits such as\n<code>--max-turns</code>, <code>--disallowed-tools</code>, <code>--sandbox</code> and the output format never\nadd tools (tool-only flags print a warning). If the provider stops a reply at\nits output limit, the model is asked to continue and the printed answer is the\nwhole reply. A plain run takes at most 8 model steps unless <code>--max-turns</code> sets\nanother limit; a reply still cut off at that limit fails the run.</p>\n<h3 id=\"resuming\">Resuming</h3>\n"
     },
     {
       "kind": "code",

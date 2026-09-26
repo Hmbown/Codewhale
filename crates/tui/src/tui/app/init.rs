@@ -949,6 +949,7 @@ impl App {
             agent_activity_started_at: None,
             agent_counter: 0,
             agent_label_map: HashMap::new(),
+            workflow_agent_labels: HashMap::new(),
             agent_focus: None,
             agent_queued_follow_ups: HashMap::new(),
             agent_role_counters: HashMap::new(),
@@ -967,7 +968,11 @@ impl App {
             onboarding_workspace_trust_gate,
             onboarding_missing_key_recovery,
             onboarding_explore_offline: false,
-            onboarding_had_language_step: onboarding_needs_language,
+            // Language is asked in /setup, never at launch: counting it here
+            // made the one launch screen read "Getting started · 2/3" with no
+            // step 1 in sight (#6566).
+            onboarding_had_language_step: onboarding_needs_language
+                && onboarding == OnboardingState::Language,
             onboarding_had_provider_step: !was_onboarded && needs_api_key,
             onboarding_had_trust_step: !was_onboarded && needs_workspace_trust,
             api_key_env_only,
@@ -1115,7 +1120,7 @@ impl App {
                 settings.contextual_tips,
             ),
             footer_hint_uses: settings.footer_hint_uses.clone(),
-            workflow_panel: None,
+            workflow_runs: Vec::new(),
             session_started_at: chrono::Utc::now(),
             needs_redraw: true,
             fleet_roster_stale: false,
@@ -1130,6 +1135,7 @@ impl App {
             user_scrolled_during_stream: false,
             last_send_at: None,
             last_submitted_prompt: None,
+            unanswered_submission: None,
             auto_submit_initial_input,
             quit_armed_until: None,
             prefix_change_count: 0,

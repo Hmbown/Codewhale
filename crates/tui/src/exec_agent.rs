@@ -18,6 +18,13 @@ pub(crate) fn exec_max_steps(max_turns: Option<u32>) -> u32 {
     crate::core::engine::turn_budget::resolve_max_model_steps(max_turns)
 }
 
+/// Model-step ceiling for a plain (zero-tool) `exec` run without
+/// `--max-turns`. Its only extra steps are output-limit continuations, which
+/// have no progress signal of their own; without this a model stuck at the
+/// output limit would be re-asked, with growing history, until the turn wall
+/// clock (#6510 review).
+pub(crate) const ONE_SHOT_DEFAULT_MAX_STEPS: u32 = 8;
+
 /// Default-denied tools for headless `exec`, on top of the operator's own
 /// `--disallowed-tools` flag.
 ///
@@ -299,6 +306,10 @@ pub(crate) async fn run_exec_agent(
     tool_authority_json: Option<String>,
     exec_hooks_enabled: bool,
     plugin_registry: std::sync::Arc<crate::plugins::PluginRegistry>,
+    // #6510: plain `exec` (no tool-surface flag). The caller passes an empty
+    // allowlist; this also skips workspace snapshots, LSP and the automation
+    // store, and writes the one-shot `--json` receipt shape.
+    one_shot: bool,
 ) -> Result<()> {
     use crate::compaction::CompactionConfig;
     use crate::core::engine::{EngineConfig, spawn_engine};
@@ -317,8 +328,9 @@ pub(crate) async fn run_exec_agent(
     // and explicit `always` are truthful outside the interactive TUI. With no
     // focus-reporting channel, fail closed to focused; only explicit `always`
     // may authorize a headless desktop notification.
-    crate::tui::notifications::set_terminal_focused(true);
-    let _ = crate::tui::notifications::settings(config);
+    let terminal = crate::host_terminal::host();
+    terminal.set_terminal_focused(true);
+    terminal.apply_notification_settings(&config.notifications_config());
 
     validate_exec_tool_authority_resume(tool_authority_json.as_deref(), resume_session.is_some())?;
     let fleet_authority = tool_authority_json
@@ -405,8 +417,8 @@ pub(crate) async fn run_exec_agent(
     // receipt claimed no Auto was in play.
     let reasoning_effort_auto = route.auto_controls_reasoning;
     // Resolve Auto against this run's prompt at the CLI boundary, exactly like
-    // `run_one_shot`/`run_one_shot_json` and the interactive launch path do,
-    // so the tier the engine (and the receipt below) sees is concrete.
+    // the interactive launch path does, so the tier the engine (and the
+    // receipt below) sees is concrete.
     let effective_reasoning_effort = route.reasoning_effort.and_then(|effort| {
         cli_reasoning_effort_value_for_prompt(&execution_config, &effective_model, effort)
     });
@@ -442,7 +454,7 @@ pub(crate) async fn run_exec_agent(
 
     let network_policy = exec_network_policy(&execution_config, outer_network_access);
 
-    let lsp_config = (!fleet_authority_active)
+    let lsp_config = (!fleet_authority_active && !one_shot)
         .then(|| {
             execution_config
                 .lsp
@@ -496,7 +508,7 @@ pub(crate) async fn run_exec_agent(
         && explicit_sandbox
             .is_some_and(|sandbox| sandbox.eq_ignore_ascii_case("danger-full-access"));
     let exec_shell_manager = crate::tools::shell::new_shared_shell_manager(workspace.clone());
-    let exec_automations = exec_automation_services(fleet_authority_active)?;
+    let exec_automations = exec_automation_services(fleet_authority_active || one_shot)?;
     let runtime_services = crate::tools::spec::RuntimeToolServices {
         shell_manager: Some(exec_shell_manager.clone()),
         persist_services_enabled,
@@ -559,7 +571,9 @@ pub(crate) async fn run_exec_agent(
             execution_config.subagent_max_spawn_depth_for_provider(effective_provider)
         },
         network_policy,
-        snapshots_enabled: !fleet_authority_active && execution_config.snapshots_config().enabled,
+        snapshots_enabled: !fleet_authority_active
+            && !one_shot
+            && execution_config.snapshots_config().enabled,
         snapshots_max_workspace_bytes: execution_config
             .snapshots_config()
             .max_workspace_gb
@@ -762,7 +776,7 @@ pub(crate) async fn run_exec_agent(
     });
 
     let mut summary = ExecSummary {
-        mode: "agent".to_string(),
+        mode: if one_shot { "one-shot" } else { "agent" }.to_string(),
         provider: effective_provider_name.clone(),
         model: effective_model.clone(),
         prompt: prompt.to_string(),
@@ -785,6 +799,7 @@ pub(crate) async fn run_exec_agent(
     let mut latest_workspace = workspace.clone();
     let mut tool_starts: HashMap<String, (Instant, String)> = HashMap::new();
     let mut turn_usage_seq: u32 = 0;
+    let mut settled_usage: Option<codewhale_models::Usage> = None;
 
     let mut stdout = io::stdout();
     let mut ends_with_newline = false;
@@ -1112,6 +1127,7 @@ pub(crate) async fn run_exec_agent(
                 ..
             } => {
                 let (terminal_status, terminal_error) = (status, error);
+                settled_usage = Some(usage.clone());
                 #[cfg(unix)]
                 let (mut terminal_status, mut terminal_error) = (terminal_status, terminal_error);
                 if matches!(
@@ -1438,6 +1454,9 @@ pub(crate) async fn run_exec_agent(
         tracing::warn!(target: "lifecycle_outbox", %error, "exec lifecycle outbox did not drain before exit");
     }
 
+    if one_shot {
+        summary.record_one_shot_outcome(settled_usage);
+    }
     if json_output {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     }

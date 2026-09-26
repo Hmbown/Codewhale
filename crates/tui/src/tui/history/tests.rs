@@ -1590,10 +1590,11 @@ fn a_web_search_receipt_names_its_source_and_any_degradation() {
     }
 }
 
-/// A workflow card stands in for a whole fan-out the user cannot see. The run
-/// card reports lifecycle, child count, phases and failures without repeating
-/// the header in the body; the expanded card adds the goal, the child labels,
-/// the final result and the error; the status card lists the runs it found.
+/// A workflow's transcript is its start and its finish; live progress is the
+/// workbar's. A foreground `run` card that returned its settled record says
+/// both — started, then finished with agents — without repeating the header
+/// in a body; the expanded card adds the goal, the child labels, the final
+/// result and the error; the status card lists the runs it found.
 ///
 /// Replaces three tests, and drops assertions of the form
 /// `contains('s') || contains('m')` — true of essentially any English string.
@@ -1621,11 +1622,12 @@ fn workflow_cards_report_lifecycle_children_phases_and_failures() {
     run.input_summary = Some("action: run".to_string());
     run.output = Some(run_output);
     let text = lines_text(&run.lines_with_mode(120, true, RenderMode::Live));
+    assert!(text.contains("started"), "the start line: {text:?}");
     assert!(
-        text.contains("/3 done"),
-        "settled/total child count: {text:?}"
+        text.contains("finished") && text.contains("/3 agents"),
+        "the finish line with finished/total agents: {text:?}"
     );
-    assert!(text.contains("phase"), "phase count: {text:?}");
+    assert_eq!(text.lines().count(), 2, "start and finish only: {text:?}");
     // #6503: a run with no failures does not announce `0 fail`.
     assert!(!text.contains("fail"), "no zero failure count: {text:?}");
     assert!(
@@ -1714,7 +1716,10 @@ fn degraded_workflow_receipt_is_terminal_warning_not_running_or_success() {
 
     let lines = run.lines_with_mode(120, false, RenderMode::Live);
     let text = lines_text(&lines);
-    assert!(text.contains("issue"), "warning receipt missing: {text:?}");
+    assert!(
+        text.contains("finished with gaps"),
+        "warning receipt missing: {text:?}"
+    );
     assert!(
         !text.to_lowercase().contains(" done"),
         "must not read as success: {text:?}"
@@ -1727,7 +1732,7 @@ fn degraded_workflow_receipt_is_terminal_warning_not_running_or_success() {
     let warning = lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.as_ref() == "issue")
+        .find(|span| span.content.as_ref() == "finished with gaps")
         .expect("terminal warning status span");
     assert_eq!(
         warning.style.fg,

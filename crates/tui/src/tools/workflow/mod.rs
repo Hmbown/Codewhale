@@ -531,6 +531,10 @@ enum WorkflowUiEventKind {
         /// Run-wide usage totals reconciled from per-task telemetry (#2974).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<WorkflowRunUsage>,
+        /// One readable line naming what the run returned, so the transcript's
+        /// finish line can state the result without the full record.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_preview: Option<String>,
     },
     RunCancelled {
         reason: String,
@@ -2164,6 +2168,7 @@ async fn run_workflow_vm(
                         status: record.status,
                         error: record.error.clone(),
                         usage: run_usage.clone(),
+                        result_preview: record.result.as_ref().and_then(workflow_result_preview),
                     },
                 );
                 record.push_event(budget_event.clone());
@@ -2214,6 +2219,7 @@ async fn run_workflow_vm(
                         status: record.status,
                         error: record.error.clone(),
                         usage: record.usage.clone(),
+                        result_preview: record.result.as_ref().and_then(workflow_result_preview),
                     }
                 },
             );
@@ -2522,6 +2528,59 @@ fn bounded_run_record_value(
     }
 
     (value, bounds)
+}
+
+/// One readable line for what a run returned: the text itself, an object's
+/// own `summary`/`message`/`text`, or the slot names with the empty ones
+/// named — never raw JSON and never a bare "N field(s)". Bounded.
+pub(crate) fn workflow_result_preview(value: &Value) -> Option<String> {
+    const MAX: usize = 200;
+    let preview = match value {
+        Value::Null => return None,
+        Value::String(text) => text.split_whitespace().collect::<Vec<_>>().join(" "),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Array(items) => {
+            let empty = items.iter().filter(|item| item.is_null()).count();
+            let noun = if items.len() == 1 { "item" } else { "items" };
+            if empty > 0 {
+                format!("{} {noun}, {empty} empty", items.len())
+            } else {
+                format!("{} {noun}", items.len())
+            }
+        }
+        Value::Object(map) => {
+            if let Some(text) = ["summary", "message", "text"]
+                .iter()
+                .find_map(|key| map.get(*key).and_then(Value::as_str))
+                .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|text| !text.is_empty())
+            {
+                text
+            } else {
+                let filled: Vec<&str> = map
+                    .iter()
+                    .filter(|(_, v)| !v.is_null())
+                    .map(|(k, _)| k.as_str())
+                    .collect();
+                let empty: Vec<&str> = map
+                    .iter()
+                    .filter(|(_, v)| v.is_null())
+                    .map(|(k, _)| k.as_str())
+                    .collect();
+                match (filled.is_empty(), empty.is_empty()) {
+                    (true, true) => return None,
+                    (false, true) => filled.join(", "),
+                    (true, false) => format!("empty: {}", empty.join(", ")),
+                    (false, false) => {
+                        format!("{} · empty: {}", filled.join(", "), empty.join(", "))
+                    }
+                }
+            }
+        }
+    };
+    let preview = preview.trim();
+    (!preview.is_empty()).then(|| truncate_chars(preview, MAX))
 }
 
 /// Char-boundary-safe truncation with an ellipsis (precedent:
@@ -11384,6 +11443,7 @@ FINAL RECEIPT
                 status: WorkflowRunStatus::Completed,
                 error: None,
                 usage: None,
+                result_preview: None,
             },
         ))
         .expect("serialize plain run_completed");

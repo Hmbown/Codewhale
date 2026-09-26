@@ -171,15 +171,16 @@ fn collect_pending_work(app: &App) -> PendingWork {
             .unwrap_or_else(|| agent.agent_type.as_str());
         // The name this lane was dispatched under is what the operator
         // thinks in; the whale nickname only names an unnamed one (#5287).
-        let name = crate::tui::sidebar::dispatched_agent_name(agent)
+        let name = app
+            .agent_given_name(&agent.agent_id)
             .or_else(|| {
                 agent
                     .nickname
-                    .as_deref()
+                    .clone()
                     .filter(|name| !name.trim().is_empty() && *name != agent.agent_id)
             })
-            .or_else(|| app.agent_label_map.get(&agent.agent_id).map(String::as_str));
-        let label = match name {
+            .or_else(|| app.agent_label_map.get(&agent.agent_id).cloned());
+        let label = match name.as_deref() {
             Some(name) if name != role => format!("{name}·{role}"),
             _ => role.to_string(),
         };
