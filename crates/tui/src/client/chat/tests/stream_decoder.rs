@@ -1231,7 +1231,7 @@ fn cache_inspect_reports_turn_meta_dedup_metadata() {
 
 #[test]
 fn request_builder_truncates_large_tool_result_for_wire() {
-    let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
+    let long_output = format!("{}{}", "A".repeat(70_000), "Z".repeat(70_000));
     let messages = vec![
         tool_use_message(
             "tool-long",
@@ -1247,18 +1247,27 @@ fn request_builder_truncates_large_tool_result_for_wire() {
     assert!(sent.contains("[TOOL_RESULT_TRUNCATED]"), "got: {sent}");
     assert!(sent.contains("tool_name: shell_command"), "got: {sent}");
     assert!(sent.contains("command_or_query: cargo test"), "got: {sent}");
-    assert!(sent.contains("original_chars: 14000"), "got: {sent}");
+    assert!(sent.contains("original_chars: 140000"), "got: {sent}");
     assert!(sent.contains("sha256:"), "got: {sent}");
     assert!(
         sent.contains("exact_detail: unavailable; no session-owned artifact was recorded"),
         "got: {sent}"
     );
     assert!(!sent.contains("retrieve_tool_result"), "got: {sent}");
-    assert!(sent.contains(&"A".repeat(4_000)), "got: {sent}");
-    assert!(sent.contains(&"Z".repeat(4_000)), "got: {sent}");
+    // The wire backstop is the ceiling of the one inline budget (#6508):
+    // a result the engine kept whole is never cut here.
+    let budget = tool_result_sent_char_budget();
+    assert!(budget >= 100_000);
+    let excerpt = budget - TOOL_RESULT_EXCERPT_FRAME_CHARS;
+    let head = excerpt * 2 / 3;
+    assert!(sent.contains(&"A".repeat(head)), "head kept");
+    assert!(sent.contains(&"Z".repeat(excerpt - head)), "tail kept");
     assert!(
-        sent.contains("truncated 6000 chars from middle"),
-        "got: {sent}"
+        sent.contains(&format!(
+            "truncated {} chars from middle",
+            140_000 - excerpt
+        )),
+        "omitted count"
     );
     assert_ne!(sent, long_output);
 }
@@ -1288,7 +1297,7 @@ fn request_builder_keeps_unowned_extreme_tool_output_bounded_without_false_hint(
         assert!(sent.contains("exact_detail: unavailable"), "got: {sent}");
         assert!(!sent.contains("retrieve_tool_result"), "got: {sent}");
         assert!(
-            sent.chars().count() <= TOOL_RESULT_SENT_CHAR_BUDGET,
+            sent.chars().count() <= tool_result_sent_char_budget(),
             "truncated result should stay bounded, sent {} chars",
             sent.chars().count()
         );
@@ -1323,7 +1332,7 @@ fn request_builder_does_not_dedup_short_tool_results_for_wire() {
 fn request_builder_deduplicates_medium_identical_tool_results_to_earlier_message() {
     with_tool_result_sha_spillover_root(|| {
         // 2,000 chars is intentionally above TOOL_RESULT_DEDUP_MIN_CHARS
-        // (1,024) but below TOOL_RESULT_SENT_CHAR_BUDGET (12,000). This
+        // (1,024) but below the wire backstop budget. This
         // verifies the cache-saving path for repeated medium outputs that
         // do not otherwise need truncation.
         let output = "A".repeat(2_000);
@@ -1408,7 +1417,7 @@ fn large_unowned_results_stay_bounded_without_false_retrieval_handles() {
     // session-owned artifact receipt before this provider-wire fallback.
     // If legacy/raw history reaches here, it may be excerpted but must not
     // advertise the process-wide SHA store as retrievable.
-    let big_diff = "D".repeat(20_000);
+    let big_diff = "D".repeat(120_000);
     let sha = sha256_hex(big_diff.as_bytes());
 
     let messages = vec![
@@ -1463,7 +1472,7 @@ fn large_unowned_results_stay_bounded_without_false_retrieval_handles() {
 
 #[test]
 fn tool_result_budget_is_wire_only_and_does_not_mutate_session_message() {
-    let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
+    let long_output = format!("{}{}", "A".repeat(70_000), "Z".repeat(70_000));
     let messages = vec![
         tool_use_message(
             "tool-long",
@@ -1485,7 +1494,7 @@ fn tool_result_budget_is_wire_only_and_does_not_mutate_session_message() {
 
 #[test]
 fn cache_inspect_reports_bounded_unowned_tool_result_metadata() {
-    let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
+    let long_output = format!("{}{}", "A".repeat(70_000), "Z".repeat(70_000));
     let request = MessageRequest {
         model: "deepseek-v4-flash".to_string(),
         messages: vec![
@@ -1515,7 +1524,7 @@ fn cache_inspect_reports_bounded_unowned_tool_result_metadata() {
 
     assert_eq!(tool_layers.len(), 2);
     for layer in tool_layers {
-        assert_eq!(layer.original_chars, 14_000);
+        assert_eq!(layer.original_chars, 140_000);
         assert!(layer.sent_chars < layer.original_chars);
         assert!(layer.truncated);
         assert!(!layer.deduplicated);

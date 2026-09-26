@@ -15,31 +15,63 @@ use codewhale_models::SystemPrompt;
 use serde_json::Value;
 /// Allow a few emergency recovery attempts before failing the turn.
 pub(super) const MAX_CONTEXT_RECOVERY_ATTEMPTS: u8 = 2;
-/// Hard cap for any tool output inserted into model context.
-const TOOL_RESULT_CONTEXT_HARD_LIMIT_CHARS: usize = 12_000;
-/// Soft cap for known noisy tools inserted into model context.
-const TOOL_RESULT_CONTEXT_SOFT_LIMIT_CHARS: usize = 2_000;
-/// Snippet length kept when compacting tool output for model context.
-const TOOL_RESULT_CONTEXT_SNIPPET_CHARS: usize = 900;
-/// Hard cap for tool output inserted into a large-context model.
-const LARGE_CONTEXT_TOOL_RESULT_HARD_LIMIT_CHARS: usize = 48_000;
-/// Soft cap for known noisy tools inserted into a large-context model.
-const LARGE_CONTEXT_TOOL_RESULT_SOFT_LIMIT_CHARS: usize = 8_000;
-/// Snippet length kept when compacting large-context noisy output.
-const LARGE_CONTEXT_TOOL_RESULT_SNIPPET_CHARS: usize = 4_000;
-/// Context window size at which tool output limits can be relaxed.
-const LARGE_CONTEXT_WINDOW_TOKENS: u32 = 500_000;
 /// Max chars to keep from metadata-provided output summaries.
 const TOOL_RESULT_METADATA_SUMMARY_CHARS: usize = 320;
 
 #[cfg(test)]
 pub(super) use crate::compaction::COMPACTION_SUMMARY_MARKER;
 
-#[derive(Debug, Clone, Copy)]
-struct ToolResultContextLimits {
-    hard_limit_chars: usize,
-    noisy_soft_limit_chars: usize,
-    snippet_chars: usize,
+/// What the model sees of one tool result (#6508).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolResultContextView {
+    pub(crate) text: String,
+    /// The view leaves out bytes of the result and no session artifact holds
+    /// them yet. The engine saves the full output before the result fans out,
+    /// so the view it builds afterwards can name a ref instead.
+    pub(crate) needs_full_output_artifact: bool,
+}
+
+impl ToolResultContextView {
+    fn whole(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            needs_full_output_artifact: false,
+        }
+    }
+}
+
+/// A structured summary and whether it left anything of the raw result out.
+struct ContextSummary {
+    text: String,
+    lossy: bool,
+}
+
+/// Where the full output of a tool call can be read back, from its metadata.
+struct RecoveryRef<'a> {
+    path: &'a str,
+    /// The `art_<id>` ref `retrieve_tool_result` resolves. `None` for a
+    /// legacy spill, which no tool call reaches.
+    artifact_id: Option<&'a str>,
+}
+
+fn recovery_ref(metadata: Option<&Value>) -> Option<RecoveryRef<'_>> {
+    let obj = metadata?.as_object()?;
+    let text = |key: &str| {
+        obj.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(artifact_id) = text("artifact_id").filter(|id| id.starts_with("art_")) {
+        let path = text("artifact_path").or_else(|| text("spillover_path"))?;
+        return Some(RecoveryRef {
+            path,
+            artifact_id: Some(artifact_id),
+        });
+    }
+    text("spillover_path").map(|path| RecoveryRef {
+        path,
+        artifact_id: None,
+    })
 }
 
 pub(super) fn summarize_text(text: &str, limit: usize) -> String {
@@ -50,6 +82,20 @@ pub(super) fn summarize_text(text: &str, limit: usize) -> String {
     let mut out: String = text.chars().take(take).collect();
     out.push_str("...");
     out
+}
+
+/// [`summarize_text`] that records whether it cut anything.
+fn keep_text(text: &str, limit: usize, lossy: &mut bool) -> String {
+    let kept = summarize_text(text, limit);
+    *lossy |= kept.len() != text.len();
+    kept
+}
+
+/// [`summarize_text_head_tail`] that records whether it cut anything.
+fn keep_head_tail(text: &str, limit: usize, lossy: &mut bool) -> String {
+    let kept = summarize_text_head_tail(text, limit);
+    *lossy |= kept.len() != text.len();
+    kept
 }
 
 fn summarize_text_head_tail(text: &str, limit: usize) -> String {
@@ -76,26 +122,6 @@ fn summarize_text_head_tail(text: &str, limit: usize) -> String {
     format!("{head}{marker}{tail}")
 }
 
-fn tool_result_is_noisy(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "exec_shell"
-            | "exec_shell_wait"
-            | "exec_shell_interact"
-            | "exec_shell_cancel"
-            | "task_shell_start"
-            | "task_shell_wait"
-            | "run_tests"
-            | "run_verifiers"
-            | "task_gate_run"
-            | "multi_tool_use.parallel"
-            | "Web"
-            | "web_search"
-            | "web.run"
-            | "fetch_url"
-    )
-}
-
 fn tool_result_metadata_summary(metadata: Option<&serde_json::Value>) -> Option<String> {
     let obj = metadata?.as_object()?;
     for key in ["summary", "stdout_summary", "stderr_summary", "message"] {
@@ -109,7 +135,7 @@ fn tool_result_metadata_summary(metadata: Option<&serde_json::Value>) -> Option<
     None
 }
 
-fn summarize_subagent_status(status: &serde_json::Value) -> String {
+fn summarize_subagent_status(status: &serde_json::Value, lossy: &mut bool) -> String {
     if let Some(raw) = status.as_str() {
         return raw.to_string();
     }
@@ -117,22 +143,27 @@ fn summarize_subagent_status(status: &serde_json::Value) -> String {
         && let Some((kind, value)) = obj.iter().next()
     {
         if let Some(reason) = value.as_str().filter(|s| !s.trim().is_empty()) {
-            return format!("{kind}({})", summarize_text(reason.trim(), 120));
+            return format!("{kind}({})", keep_text(reason.trim(), 120, lossy));
         }
         return kind.to_string();
     }
     status.to_string()
 }
 
-fn summarize_subagent_snapshot(snapshot: &serde_json::Value, index: usize) -> String {
+fn summarize_subagent_snapshot(
+    snapshot: &serde_json::Value,
+    index: usize,
+    result_limit: usize,
+    lossy: &mut bool,
+) -> String {
     if let Some(inner) = snapshot.get("snapshot") {
-        return summarize_subagent_snapshot(inner, index);
+        return summarize_subagent_snapshot(inner, index, result_limit, lossy);
     }
 
     let Some(obj) = snapshot.as_object() else {
         return format!(
             "- item {index}: {}",
-            summarize_text(&snapshot.to_string(), 240)
+            keep_text(&snapshot.to_string(), result_limit, lossy)
         );
     };
 
@@ -146,7 +177,7 @@ fn summarize_subagent_snapshot(snapshot: &serde_json::Value, index: usize) -> St
         .unwrap_or("agent");
     let status = obj
         .get("status")
-        .map(summarize_subagent_status)
+        .map(|status| summarize_subagent_status(status, lossy))
         .unwrap_or_else(|| "unknown".to_string());
     let objective = obj
         .get("assignment")
@@ -154,13 +185,13 @@ fn summarize_subagent_snapshot(snapshot: &serde_json::Value, index: usize) -> St
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| summarize_text(s, 220));
+        .map(|s| keep_text(s, 220, lossy));
     let result = obj
         .get("result")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| summarize_text(s, 1_600));
+        .map(|s| keep_text(s, result_limit, lossy));
     let steps = obj.get("steps_taken").and_then(serde_json::Value::as_u64);
     let duration_ms = obj.get("duration_ms").and_then(serde_json::Value::as_u64);
 
@@ -194,7 +225,16 @@ fn looks_like_subagent_snapshot(value: &serde_json::Value) -> bool {
         .is_some_and(|obj| obj.contains_key("agent_id") || obj.contains_key("agent_type"))
 }
 
-fn compact_subagent_tool_result_for_context(tool_name: &str, raw: &str) -> Option<String> {
+/// Sub-agent snapshots shown in full before the rest are only counted.
+const SUBAGENT_SNAPSHOTS_SHOWN: usize = 8;
+/// Floor for one sub-agent's result text on the smallest routes.
+const SUBAGENT_RESULT_MIN_CHARS: usize = 1_600;
+
+fn compact_subagent_tool_result_for_context(
+    tool_name: &str,
+    raw: &str,
+    budget: usize,
+) -> Option<ContextSummary> {
     if tool_name != "agent" {
         return None;
     }
@@ -220,23 +260,36 @@ fn compact_subagent_tool_result_for_context(tool_name: &str, raw: &str) -> Optio
         return None;
     }
 
+    // Each shown result gets an equal share of half the route budget, so a
+    // child's report is not cut at a fixed size on a large route.
+    let shown = snapshots.len().min(SUBAGENT_SNAPSHOTS_SHOWN);
+    let result_limit = (budget / 2 / shown.max(1)).max(SUBAGENT_RESULT_MIN_CHARS);
+    let mut lossy = snapshots.len() > SUBAGENT_SNAPSHOTS_SHOWN;
     let mut out = String::from("[sub-agent result summarized for parent context]\n");
     out.push_str(
         "Child results are self-reports; verify side effects with `File` actions like `read` or `list` before claiming success.\n",
     );
     out.push_str("Use `handle_read` on `transcript_handle` for bounded transcript slices when the returned summary is not enough.\n");
     for (idx, snapshot) in snapshots.iter().enumerate() {
-        if idx >= 8 {
+        if idx >= SUBAGENT_SNAPSHOTS_SHOWN {
             out.push_str(&format!(
                 "- ... {} more sub-agent result(s) omitted from context summary\n",
                 snapshots.len().saturating_sub(idx)
             ));
             break;
         }
-        out.push_str(&summarize_subagent_snapshot(snapshot, idx + 1));
+        out.push_str(&summarize_subagent_snapshot(
+            snapshot,
+            idx + 1,
+            result_limit,
+            &mut lossy,
+        ));
         out.push('\n');
     }
-    Some(out.trim_end().to_string())
+    Some(ContextSummary {
+        text: out.trim_end().to_string(),
+        lossy,
+    })
 }
 
 fn json_text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
@@ -266,14 +319,24 @@ fn json_number_text(value: &Value, key: &str) -> Option<String> {
         })
 }
 
-fn compact_run_tests_result_for_context(raw: &str) -> Option<String> {
+/// Characters a structured summary keeps for its own header lines and the
+/// recovery footer, before the rest of the budget goes to output streams.
+const STRUCTURED_SUMMARY_FRAME_CHARS: usize = 1_000;
+/// Floor for one stream or gate detail on the smallest routes.
+const STRUCTURED_DETAIL_MIN_CHARS: usize = 600;
+
+fn compact_run_tests_result_for_context(
+    raw: &str,
+    metadata: Option<&Value>,
+    budget: usize,
+) -> Option<ContextSummary> {
     let parsed: Value = serde_json::from_str(raw).ok()?;
     let success = parsed.get("success")?.as_bool()?;
     let exit_code = json_number_text(&parsed, "exit_code").unwrap_or_else(|| "?".to_string());
     let command = json_text(&parsed, "command").unwrap_or("(unknown command)");
     let stdout = json_text(&parsed, "stdout");
     let stderr = json_text(&parsed, "stderr");
-    let stream_limit = if success { 500 } else { 1_000 };
+    let mut lossy = false;
 
     let mut lines = vec![
         "[run_tests result summarized for context]".to_string(),
@@ -281,21 +344,34 @@ fn compact_run_tests_result_for_context(raw: &str) -> Option<String> {
             "status: {}, exit_code: {exit_code}",
             if success { "passed" } else { "failed" }
         ),
-        format!("command: {}", summarize_text(command, 300)),
+        format!("command: {}", keep_text(command, 300, &mut lossy)),
     ];
+    // The cargo failure summary names the failing tests. It leads, so the
+    // names stay inline however long the streams are.
+    if let Some(summary) = metadata.and_then(|metadata| json_text(metadata, "summary")) {
+        lines.push(format!("failure summary: {summary}"));
+    }
+    let header_chars: usize = lines.iter().map(|line| line.chars().count() + 1).sum();
+    let streams = usize::from(stderr.is_some()) + usize::from(stdout.is_some());
+    let stream_limit = (budget.saturating_sub(header_chars + STRUCTURED_SUMMARY_FRAME_CHARS)
+        / streams.max(1))
+    .max(STRUCTURED_DETAIL_MIN_CHARS);
     if let Some(stderr) = stderr {
         lines.push(format!(
             "stderr: {}",
-            summarize_text_head_tail(stderr, stream_limit)
+            keep_head_tail(stderr, stream_limit, &mut lossy)
         ));
     }
     if let Some(stdout) = stdout {
         lines.push(format!(
             "stdout: {}",
-            summarize_text_head_tail(stdout, stream_limit)
+            keep_head_tail(stdout, stream_limit, &mut lossy)
         ));
     }
-    Some(lines.join("\n"))
+    Some(ContextSummary {
+        text: lines.join("\n"),
+        lossy,
+    })
 }
 
 fn run_verifier_status_rank(status: Option<&str>) -> u8 {
@@ -307,7 +383,10 @@ fn run_verifier_status_rank(status: Option<&str>) -> u8 {
     }
 }
 
-fn compact_run_verifiers_result_for_context(raw: &str) -> Option<String> {
+/// Gates listed one per line before the rest are only counted.
+const VERIFIER_GATES_SHOWN: usize = 12;
+
+fn compact_run_verifiers_result_for_context(raw: &str, budget: usize) -> Option<ContextSummary> {
     let parsed: Value = serde_json::from_str(raw).ok()?;
     let gates = parsed.get("gates")?.as_array()?;
     let summary = json_text(&parsed, "summary")
@@ -326,6 +405,7 @@ fn compact_run_verifiers_result_for_context(raw: &str) -> Option<String> {
             .then_with(|| json_text(a, "name").cmp(&json_text(b, "name")))
     });
 
+    let mut lossy = ordered.len() > VERIFIER_GATES_SHOWN;
     let mut lines = vec![
         "[run_verifiers result summarized for context]".to_string(),
         format!("summary: {summary}"),
@@ -339,16 +419,20 @@ fn compact_run_verifiers_result_for_context(raw: &str) -> Option<String> {
             level.unwrap_or("?")
         ));
     }
+    if let Some(log_path) = json_text(&parsed, "log_path") {
+        lines.push(format!("log_path: {log_path}"));
+    }
 
-    for (idx, gate) in ordered.iter().enumerate() {
-        if idx >= 12 {
-            lines.push(format!(
-                "- ... {} more gate(s) omitted from context summary",
-                ordered.len().saturating_sub(idx)
-            ));
-            break;
-        }
+    let shown = ordered.iter().take(VERIFIER_GATES_SHOWN);
+    let detailed = shown
+        .clone()
+        .filter(|gate| json_text(gate, "status") != Some("passed"))
+        .count();
+    let detail_limit = (budget.saturating_sub(STRUCTURED_SUMMARY_FRAME_CHARS * 2)
+        / detailed.max(1))
+    .max(STRUCTURED_DETAIL_MIN_CHARS);
 
+    for gate in shown {
         let name = json_text(gate, "name").unwrap_or("gate");
         let ecosystem = json_text(gate, "ecosystem").unwrap_or("unknown");
         let status = json_text(gate, "status").unwrap_or("unknown");
@@ -356,27 +440,54 @@ fn compact_run_verifiers_result_for_context(raw: &str) -> Option<String> {
             .map(|code| format!(" exit={code}"))
             .unwrap_or_default();
         lines.push(format!("- {name} ({ecosystem}): {status}{exit}"));
+        if let Some(log_path) = json_text(gate, "log_path") {
+            lines.push(format!("  log_path: {log_path}"));
+        }
 
-        if status != "passed" {
-            if let Some(command) = json_text(gate, "command") {
-                lines.push(format!("  command: {}", summarize_text(command, 240)));
-            }
-            if let Some(detail) = json_text(gate, "skipped_reason")
-                .or_else(|| json_text(gate, "stderr"))
-                .or_else(|| json_text(gate, "stdout"))
-            {
-                lines.push(format!(
-                    "  detail: {}",
-                    summarize_text_head_tail(detail, 600)
-                ));
-            }
+        let stdout = json_text(gate, "stdout");
+        let stderr = json_text(gate, "stderr");
+        if status == "passed" {
+            // A passing gate's output stays out of context; the saved full
+            // output keeps it readable.
+            lossy |= stdout.is_some() || stderr.is_some();
+            continue;
+        }
+        if let Some(command) = json_text(gate, "command") {
+            lines.push(format!(
+                "  command: {}",
+                keep_text(command, 240, &mut lossy)
+            ));
+        }
+        // One detail per gate: the skip reason, else stderr, else stdout.
+        let (detail, other_streams) = match json_text(gate, "skipped_reason") {
+            Some(reason) => (Some(reason), stderr.is_some() || stdout.is_some()),
+            None => match stderr {
+                Some(stderr) => (Some(stderr), stdout.is_some()),
+                None => (stdout, false),
+            },
+        };
+        lossy |= other_streams;
+        if let Some(detail) = detail {
+            lines.push(format!(
+                "  detail: {}",
+                keep_head_tail(detail, detail_limit, &mut lossy)
+            ));
         }
     }
+    if ordered.len() > VERIFIER_GATES_SHOWN {
+        lines.push(format!(
+            "- ... {} more gate(s) omitted from context summary",
+            ordered.len() - VERIFIER_GATES_SHOWN
+        ));
+    }
 
-    Some(lines.join("\n"))
+    Some(ContextSummary {
+        text: lines.join("\n"),
+        lossy,
+    })
 }
 
-fn compact_task_gate_run_result_for_context(raw: &str) -> Option<String> {
+fn compact_task_gate_run_result_for_context(raw: &str) -> Option<ContextSummary> {
     let parsed: Value = serde_json::from_str(raw).ok()?;
     let gate = parsed.get("gate")?;
     let gate_name = json_text(gate, "gate").unwrap_or("gate");
@@ -388,62 +499,42 @@ fn compact_task_gate_run_result_for_context(raw: &str) -> Option<String> {
     let exit = json_number_text(gate, "exit_code")
         .map(|code| format!(", exit_code: {code}"))
         .unwrap_or_default();
+    let mut lossy = false;
 
     let mut lines = vec![
         "[task_gate_run result summarized for context]".to_string(),
         format!("gate: {gate_name}, status: {status}{exit}"),
-        format!("command: {}", summarize_text(command, 300)),
+        format!("command: {}", keep_text(command, 300, &mut lossy)),
     ];
     if let Some(summary) = summary {
-        lines.push(format!("summary: {}", summarize_text(summary, 800)));
+        lines.push(format!("summary: {}", keep_text(summary, 800, &mut lossy)));
     }
     if let Some(log_path) = json_text(gate, "log_path") {
         lines.push(format!("log_path: {log_path}"));
     }
-    Some(lines.join("\n"))
+    Some(ContextSummary {
+        text: lines.join("\n"),
+        lossy,
+    })
 }
 
-fn compact_structured_tool_result_for_context(tool_name: &str, raw: &str) -> Option<String> {
+fn compact_structured_tool_result_for_context(
+    tool_name: &str,
+    raw: &str,
+    metadata: Option<&Value>,
+    budget: usize,
+) -> Option<ContextSummary> {
     match tool_name {
-        "run_tests" => compact_run_tests_result_for_context(raw),
-        "run_verifiers" => compact_run_verifiers_result_for_context(raw),
+        "run_tests" => compact_run_tests_result_for_context(raw, metadata, budget),
+        "run_verifiers" => compact_run_verifiers_result_for_context(raw, budget),
         // `tasks` is the unified durable-task tool (piagent phase B); its
         // gate_run action emits the same gate payload as the legacy
         // `task_gate_run` alias. The compactor returns None unless the
         // content actually parses as a gate result, so non-gate `tasks`
-        // results fall through to the generic limits unchanged.
+        // results fall through to the generic path unchanged.
         "task_gate_run" | "tasks" => compact_task_gate_run_result_for_context(raw),
         _ => None,
     }
-}
-
-fn tool_result_context_limits_for_window(context_window: u32) -> ToolResultContextLimits {
-    let is_large_context = context_window >= LARGE_CONTEXT_WINDOW_TOKENS;
-
-    let mut limits = if is_large_context {
-        ToolResultContextLimits {
-            hard_limit_chars: LARGE_CONTEXT_TOOL_RESULT_HARD_LIMIT_CHARS,
-            noisy_soft_limit_chars: LARGE_CONTEXT_TOOL_RESULT_SOFT_LIMIT_CHARS,
-            snippet_chars: LARGE_CONTEXT_TOOL_RESULT_SNIPPET_CHARS,
-        }
-    } else {
-        ToolResultContextLimits {
-            hard_limit_chars: TOOL_RESULT_CONTEXT_HARD_LIMIT_CHARS,
-            noisy_soft_limit_chars: TOOL_RESULT_CONTEXT_SOFT_LIMIT_CHARS,
-            snippet_chars: TOOL_RESULT_CONTEXT_SNIPPET_CHARS,
-        }
-    };
-    if let Some(bytes) =
-        crate::tools::large_output_router::WorkshopConfig::active_tool_result_max_bytes()
-    {
-        // Opt-in long-context profiles may raise the model-visible budget.
-        // Never lower the compile-time floor; cap at 2 MiB (#5367).
-        let raised = bytes.clamp(limits.hard_limit_chars, 2 * 1024 * 1024);
-        limits.hard_limit_chars = raised;
-        limits.snippet_chars = (raised / 3).max(limits.snippet_chars);
-        limits.noisy_soft_limit_chars = limits.noisy_soft_limit_chars.max(raised / 6);
-    }
-    limits
 }
 
 #[cfg(test)]
@@ -462,73 +553,138 @@ pub(crate) fn compact_tool_result_for_route(
     tool_name: &str,
     output: &ToolResult,
 ) -> String {
+    tool_result_context_view(provider, model, route_limits, tool_name, output).text
+}
+
+/// The model's view of one tool result (#6508).
+///
+/// There is one size authority: [`crate::route_budget::route_inline_char_budget`].
+/// A result within it reaches the model whole, whatever the tool. A larger
+/// one is cut to a head and tail around a footer that names where the full
+/// output lives and the `art_<id>` ref `retrieve_tool_result` reads it back
+/// with. The view never writes anything: when it would leave bytes out and no
+/// artifact holds them, it says so through `needs_full_output_artifact`, and
+/// the engine saves the full output and builds the view again.
+///
+/// Structured summaries (`run_tests`, `run_verifiers`, gate results,
+/// sub-agent snapshots) keep their shape, scale their detail with the same
+/// budget, and follow the same rule whenever they leave something out.
+pub(crate) fn tool_result_context_view(
+    provider: ApiProvider,
+    model: &str,
+    route_limits: Option<RouteLimits>,
+    tool_name: &str,
+    output: &ToolResult,
+) -> ToolResultContextView {
     let raw = output.content.trim();
     if raw.is_empty() {
-        return String::new();
+        return ToolResultContextView::whole(String::new());
     }
+    let metadata = output.metadata.as_ref();
 
     // A result already bounded by the adaptive evidence envelope is an
     // honest, context-sized preview whose footer names the artifact path and
     // a recovery instruction. Re-compacting it would strip that recovery
     // contract and double-truncate the output, so pass it through unchanged.
-    if output
-        .metadata
-        .as_ref()
+    if metadata
         .and_then(|metadata| metadata.get("evidence_available"))
-        .and_then(serde_json::Value::as_bool)
+        .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return raw.to_string();
+        return ToolResultContextView::whole(raw);
     }
 
     // The `read` primitive already bounds itself to an explicit per-call byte
     // budget and, when that budget truncates the file, ends with a footer
     // naming the exact offset to continue from. Compacting it a second time
     // would drop content the caller deliberately budgeted for *and* delete the
-    // continuation contract, leaving the model with a head/tail snippet and no
-    // way to page. A result that stayed inside its declared budget therefore
-    // passes through; one that somehow exceeded it still falls through to the
-    // ordinary limits below.
-    if output
-        .metadata
-        .as_ref()
+    // continuation contract. A result that stayed inside its declared budget
+    // therefore passes through; one that exceeded it takes the path below.
+    if metadata
         .and_then(|metadata| metadata.get("read_budget_bytes"))
-        .and_then(serde_json::Value::as_u64)
+        .and_then(Value::as_u64)
         .is_some_and(|budget| raw.len() as u64 <= budget)
     {
-        return raw.to_string();
+        return ToolResultContextView::whole(raw);
     }
 
-    if let Some(summary) = compact_subagent_tool_result_for_context(tool_name, raw) {
-        return summary;
-    }
+    let budget =
+        crate::route_budget::route_inline_char_budget_for_route(provider, model, route_limits);
+    let recovery = recovery_ref(metadata);
+    let recovery_path = recovery.as_ref().map(|recovery| recovery.path);
+    let retrieval_ref = recovery.as_ref().and_then(|recovery| recovery.artifact_id);
 
-    if let Some(summary) = compact_structured_tool_result_for_context(tool_name, raw) {
-        return summary;
-    }
-
-    let context_window =
-        crate::route_budget::route_context_window_tokens(provider, model, route_limits);
-    let limits = tool_result_context_limits_for_window(context_window);
-    let raw_chars = raw.chars().count();
-    let should_compact = raw_chars > limits.hard_limit_chars
-        || (tool_result_is_noisy(tool_name) && raw_chars > limits.noisy_soft_limit_chars);
-    if !should_compact {
-        return raw.to_string();
-    }
-
-    let snippet = summarize_text_head_tail(raw, limits.snippet_chars);
-    let omitted = raw_chars.saturating_sub(snippet.chars().count());
-    let summary = tool_result_metadata_summary(output.metadata.as_ref());
-
+    let summary = compact_subagent_tool_result_for_context(tool_name, raw, budget)
+        .or_else(|| compact_structured_tool_result_for_context(tool_name, raw, metadata, budget));
     if let Some(summary) = summary {
-        format!(
-            "[{tool_name} output compacted to protect context]\nSummary: {summary}\nSnippet: {snippet}\n(Original: {raw_chars} chars, omitted: {omitted} chars.)"
+        return summary_view(summary, budget, recovery.as_ref());
+    }
+
+    // Spillover already saved the full output and left a preview. Re-fit that
+    // preview to the budget and keep its ref; never save the preview itself.
+    if let Some(metadata) =
+        metadata.filter(|metadata| metadata.get("retained_head_bytes").is_some())
+        && let Some(text) = crate::tools::truncate::refit_spilled_preview(
+            &output.content,
+            metadata,
+            budget,
+            recovery_path,
+            retrieval_ref,
         )
-    } else {
-        format!(
-            "[{tool_name} output compacted to protect context]\nSnippet: {snippet}\n(Original: {raw_chars} chars, omitted: {omitted} chars.)"
-        )
+    {
+        return ToolResultContextView::whole(text.trim().to_string());
+    }
+
+    if raw.chars().count() <= budget {
+        return ToolResultContextView::whole(raw);
+    }
+
+    let lead = tool_result_metadata_summary(metadata)
+        .map(|summary| format!("Summary: {summary}\n"))
+        .unwrap_or_default();
+    let body = crate::tools::truncate::fit_to_inline_budget(
+        raw,
+        budget.saturating_sub(lead.chars().count()),
+        recovery_path,
+        retrieval_ref,
+    );
+    ToolResultContextView {
+        text: format!("{lead}{body}"),
+        needs_full_output_artifact: recovery.is_none(),
+    }
+}
+
+/// Finish a structured summary: when it left anything out, end it with the
+/// same recovery instruction every other cut carries.
+fn summary_view(
+    summary: ContextSummary,
+    budget: usize,
+    recovery: Option<&RecoveryRef<'_>>,
+) -> ToolResultContextView {
+    if !summary.lossy {
+        return ToolResultContextView::whole(summary.text);
+    }
+    let recovery_path = recovery.map(|recovery| recovery.path);
+    let retrieval_ref = recovery.and_then(|recovery| recovery.artifact_id);
+    let footer = match recovery_path {
+        Some(path) => format!(
+            "[full output at {path}; {}]",
+            crate::tools::truncate::spillover_recovery_instruction(retrieval_ref)
+        ),
+        None => format!(
+            "[the full output could not be saved; {}]",
+            crate::tools::truncate::spillover_recovery_instruction(None)
+        ),
+    };
+    let text = crate::tools::truncate::fit_to_inline_budget(
+        &summary.text,
+        budget.saturating_sub(footer.chars().count() + 1),
+        recovery_path,
+        retrieval_ref,
+    );
+    ToolResultContextView {
+        text: format!("{text}\n{footer}"),
+        needs_full_output_artifact: recovery.is_none(),
     }
 }
 

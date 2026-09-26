@@ -11188,13 +11188,16 @@ fn model_tool_catalog_applies_native_and_mcp_deferral() {
 
 #[test]
 fn registry_sync_results_are_bounded_like_every_other_tool() {
-    // The full-catalog bypass is gone: an oversized registry payload now
-    // flows through the same generic compaction as any other tool result,
-    // because the model-visible catalog is already bounded to eight
-    // matches by the tool itself.
+    // The full-catalog bypass is gone: an oversized registry payload flows
+    // through the same route budget as any other tool result.
+    let budget = crate::route_budget::route_inline_char_budget_for_route(
+        ApiProvider::Deepseek,
+        "small-context-model",
+        None,
+    );
     let raw = format!(
         "{{\"instruction\":\"compare all\",\"servers\":[{{\"name\":\"{}\"}}]}}",
-        "a".repeat(40_000),
+        "a".repeat(budget + 1_000),
     );
     let output = ToolResult::success(raw.clone());
 
@@ -11207,7 +11210,8 @@ fn registry_sync_results_are_bounded_like_every_other_tool() {
     );
 
     assert_ne!(context, raw);
-    assert!(context.contains("output compacted to protect context"));
+    assert!(context.chars().count() <= budget);
+    assert!(context.contains(crate::tools::truncate::SPILLOVER_RECOVERY_HINT));
 }
 
 #[test]
@@ -18212,43 +18216,235 @@ fn internal_context_budget_uses_the_wire_cap_across_window_sizes() {
     assert_eq!(small_window_budget, expected_small);
 }
 
-#[test]
-fn v4_keeps_large_file_reads_but_compacts_noisy_shell_output() {
-    let content = "0123456789abcdef\n".repeat(2_000);
-    let output = ToolResult::success(content.clone());
+const ROUTE_128K: &str = "deepseek-v3.2-128k";
+const SESSION_6508: &str = "session-6508";
 
-    let v4_context = compact_tool_result_for_context("deepseek-v4-pro", "read_file", &output);
-    assert_eq!(v4_context, content.trim());
+fn budget_128k() -> usize {
+    crate::route_budget::route_inline_char_budget_for_route(ApiProvider::Deepseek, ROUTE_128K, None)
+}
 
-    let v4_shell_context =
-        compact_tool_result_for_context("deepseek-v4-pro", "exec_shell", &output);
-    assert!(v4_shell_context.contains("exec_shell output compacted to protect context"));
-    assert!(v4_shell_context.len() < v4_context.len());
+fn view_128k(tool_name: &str, output: &ToolResult) -> super::context::ToolResultContextView {
+    super::context::tool_result_context_view(
+        ApiProvider::Deepseek,
+        ROUTE_128K,
+        None,
+        tool_name,
+        output,
+    )
+}
 
-    let legacy_context =
-        compact_tool_result_for_context("deepseek-v3.2-128k", "read_file", &output);
-    assert!(legacy_context.contains("output compacted to protect context"));
-    assert!(legacy_context.len() < v4_context.len());
+/// Run `f` with the spillover and session-artifact roots under a temp home.
+fn with_artifact_home<R>(f: impl FnOnce(&Path) -> R) -> R {
+    let _spill_guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let home = tempdir().expect("tempdir");
+    let path = home.path().to_path_buf();
+    crate::tools::truncate::with_test_home(&path, || f(&path))
+}
+
+fn session_artifact_files(home: &Path) -> Vec<PathBuf> {
+    let dir = home
+        .join(".codewhale")
+        .join("sessions")
+        .join(SESSION_6508)
+        .join("artifacts");
+    fs::read_dir(dir)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default()
 }
 
 #[test]
-fn web_tool_surfaces_use_the_noisy_soft_limit() {
-    // This stays below the ordinary 12K hard limit but exceeds the 2K noisy
-    // soft limit, so the assertion proves the tool name triggered compaction.
-    let content = "w".repeat(4_000);
+fn under_budget_results_pass_through_whole_for_every_tool() {
+    // #6508: one budget, sized by the route, decides what the model sees.
+    // There is no per-tool-name soft limit: a web answer or a shell log that
+    // fits the budget reaches the model byte for byte.
+    // 3% of a 128K window is 15,360 characters (an operator opt-in can only
+    // raise it; see route_budget's tests for the exact values).
+    assert!(budget_128k() >= 15_360);
+    let content = "w".repeat(14_000);
     let output = ToolResult::success(content.clone());
-
-    let file_context = compact_tool_result_for_context("deepseek-v3.2-128k", "read_file", &output);
-    assert_eq!(file_context, content);
-
-    for tool_name in ["Web", "web_search", "web.run", "fetch_url"] {
-        let web_context = compact_tool_result_for_context("deepseek-v3.2-128k", tool_name, &output);
-        assert!(
-            web_context.contains(&format!("{tool_name} output compacted to protect context")),
-            "{tool_name} did not use the noisy soft limit: {web_context}"
-        );
-        assert!(web_context.len() < file_context.len());
+    for tool_name in [
+        "exec_shell",
+        "web_search",
+        "Web",
+        "web.run",
+        "fetch_url",
+        "read_file",
+        "run_tests",
+    ] {
+        let view = view_128k(tool_name, &output);
+        assert_eq!(view.text, content, "{tool_name} was cut under the budget");
+        assert!(!view.needs_full_output_artifact);
     }
+}
+
+#[test]
+fn over_budget_result_without_a_saved_copy_says_so_and_asks_for_one() {
+    // The view never writes. Without a saved copy it asks the engine for
+    // one, and until then it promises no ref it cannot honour.
+    let raw = "shell line\n".repeat(4_000);
+    let output = ToolResult::success(raw.clone());
+    let view = view_128k("exec_shell", &output);
+
+    assert!(view.needs_full_output_artifact);
+    assert!(view.text.chars().count() <= budget_128k());
+    assert!(view.text.contains("the full output could not be saved"));
+    assert!(view.text.contains("no tool call reaches this copy"));
+    assert!(!view.text.contains("retrieve_tool_result"));
+}
+
+#[test]
+fn over_budget_result_writes_the_full_output_and_names_its_ref() {
+    with_artifact_home(|home| {
+        let raw = format!("FIRST LINE\n{}LAST LINE", "shell line\n".repeat(4_000));
+        let mut output = ToolResult::success(raw.clone());
+        assert!(view_128k("exec_shell", &output).needs_full_output_artifact);
+
+        assert!(
+            crate::tools::truncate::preserve_full_output_for_model_context(
+                &mut output,
+                "call-over",
+                "exec_shell",
+                SESSION_6508,
+            )
+        );
+        // The UI cell keeps the whole result; only metadata changed.
+        assert_eq!(output.content, raw);
+
+        let view = view_128k("exec_shell", &output);
+        assert!(!view.needs_full_output_artifact);
+        assert!(view.text.chars().count() <= budget_128k());
+        assert!(view.text.starts_with("FIRST LINE"));
+        assert!(view.text.ends_with("LAST LINE"));
+        assert!(view.text.contains("omitted range recovery:"));
+        assert!(view.text.contains("ref=\"art_call-over\""));
+
+        let files = session_artifact_files(home);
+        assert_eq!(files.len(), 1);
+        assert_eq!(fs::read_to_string(&files[0]).expect("artifact"), raw);
+    });
+}
+
+#[test]
+fn spilled_preview_is_refit_not_recut() {
+    // Spillover already saved the full output and left a ~40 KB preview. The
+    // model view re-fits that preview to the budget with the same ref, and no
+    // second artifact (which could only hold the preview) is written.
+    with_artifact_home(|home| {
+        let raw = format!(
+            "HEAD START\n{}TAIL END",
+            "spilled output line\n".repeat(16_000)
+        );
+        let mut output = ToolResult::success(raw.clone());
+        assert!(
+            crate::tools::truncate::apply_spillover_with_artifact(
+                &mut output,
+                "call-spill",
+                "exec_shell",
+                SESSION_6508,
+            )
+            .is_some()
+        );
+        assert_eq!(session_artifact_files(home).len(), 1);
+
+        let view = view_128k("exec_shell", &output);
+        assert!(!view.needs_full_output_artifact);
+        assert!(view.text.chars().count() <= budget_128k());
+        assert!(view.text.starts_with("HEAD START"));
+        assert!(view.text.ends_with("TAIL END"));
+        assert_eq!(
+            view.text.matches("omitted range recovery:").count(),
+            1,
+            "exactly one footer: {}",
+            &view.text[..200]
+        );
+        assert!(view.text.contains("ref=\"art_call-spill\""));
+        assert_eq!(session_artifact_files(home).len(), 1);
+    });
+}
+
+#[test]
+fn legacy_spill_without_ref_says_no_tool_call_reaches_it() {
+    let head = "h".repeat(32 * 1024);
+    let tail = "t".repeat(8 * 1024);
+    let preview = format!("{head}\n\n… footer …\n\n…\n{tail}");
+    let output = ToolResult::success(preview).with_metadata(json!({
+        "spillover_path": "/tmp/tool_outputs/call-legacy.txt",
+        "retained_head_bytes": head.len(),
+        "retained_tail_bytes": tail.len(),
+        "original_byte_count": 300_000,
+        "truncated": true
+    }));
+
+    let view = view_128k("exec_shell", &output);
+    assert!(!view.needs_full_output_artifact);
+    assert!(view.text.chars().count() <= budget_128k());
+    assert!(view.text.contains("/tmp/tool_outputs/call-legacy.txt"));
+    assert!(view.text.contains("no tool call reaches this copy"));
+    assert!(!view.text.contains("retrieve_tool_result"));
+}
+
+#[test]
+fn structured_run_tests_summary_is_recoverable_and_leads_with_failures() {
+    with_artifact_home(|home| {
+        let stdout = format!(
+            "{}test result: FAILED. 1 failed",
+            "test ok ... ok\n".repeat(3_000)
+        );
+        let raw = json!({
+            "success": false,
+            "exit_code": 101,
+            "stdout": stdout,
+            "stderr": "",
+            "command": "(cd /repo && cargo test)"
+        })
+        .to_string();
+        let mut output = ToolResult::success(raw.clone()).with_metadata(json!({
+            "summary": "1 test failed: tools::git::tests::diff_keeps_the_last_file"
+        }));
+        assert!(view_128k("run_tests", &output).needs_full_output_artifact);
+        assert!(
+            crate::tools::truncate::preserve_full_output_for_model_context(
+                &mut output,
+                "call-tests",
+                "run_tests",
+                SESSION_6508,
+            )
+        );
+
+        let view = view_128k("run_tests", &output);
+        assert!(!view.needs_full_output_artifact);
+        assert!(view.text.chars().count() <= budget_128k());
+        let failures = view
+            .text
+            .find("failure summary: 1 test failed: tools::git::tests::diff_keeps_the_last_file")
+            .expect("failure summary inline");
+        assert!(failures < view.text.find("stdout:").expect("stdout"));
+        assert!(view.text.contains("test result: FAILED"));
+        assert!(view.text.contains("ref=\"art_call-tests\""));
+
+        let files = session_artifact_files(home);
+        assert_eq!(files.len(), 1);
+        assert_eq!(fs::read_to_string(&files[0]).expect("artifact"), raw);
+    });
+}
+
+#[test]
+fn display_compaction_never_writes_artifacts() {
+    // The TUI builds its API-message copy with the same pure view.
+    with_artifact_home(|home| {
+        let output = ToolResult::success("x".repeat(60_000));
+        let text = compact_tool_result_for_route(
+            ApiProvider::Deepseek,
+            ROUTE_128K,
+            None,
+            "exec_shell",
+            &output,
+        );
+        assert!(text.chars().count() <= budget_128k());
+        assert!(session_artifact_files(home).is_empty());
+    });
 }
 
 #[test]
@@ -18294,14 +18490,15 @@ fn budgeted_read_result_is_not_truncated_a_second_time_by_the_context_compactor(
     // which is what proves the metadata (not the tool name) did the work.
     let unbudgeted = ToolResult::success(content.clone());
     let compacted = compact_tool_result_for_context("deepseek-v3.2-128k", "read", &unbudgeted);
-    assert!(compacted.contains("output compacted to protect context"));
+    assert!(compacted.contains(crate::tools::truncate::SPILLOVER_RECOVERY_HINT));
+    assert!(compacted.len() < content.len());
 
     // A result that overran its own declared budget is not exempt.
     let overrun = ToolResult::success(content).with_metadata(json!({
         "read_budget_bytes": 1_000
     }));
     let compacted_overrun = compact_tool_result_for_context("deepseek-v3.2-128k", "read", &overrun);
-    assert!(compacted_overrun.contains("output compacted to protect context"));
+    assert!(compacted_overrun.contains(crate::tools::truncate::SPILLOVER_RECOVERY_HINT));
 }
 
 #[test]
@@ -18314,6 +18511,15 @@ fn codex_tool_retention_uses_oauth_route_window_not_asmall_contract_model_window
         output_tokens: None,
     };
 
+    // The budget follows the route's 272K window (3% of it, 32,640
+    // characters), so this 21.6K result reaches the model whole.
+    assert!(
+        crate::route_budget::route_inline_char_budget_for_route(
+            ApiProvider::OpenaiCodex,
+            "gpt-5.5",
+            Some(limits),
+        ) >= 32_640
+    );
     let context = compact_tool_result_for_route(
         ApiProvider::OpenaiCodex,
         "gpt-5.5",
@@ -18322,8 +18528,7 @@ fn codex_tool_retention_uses_oauth_route_window_not_asmall_contract_model_window
         &output,
     );
 
-    assert!(context.contains("output compacted to protect context"));
-    assert!(context.len() < content.len());
+    assert_eq!(context, content.trim());
 }
 
 #[test]

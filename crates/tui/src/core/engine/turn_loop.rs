@@ -4591,6 +4591,30 @@ impl Engine {
                         }));
                     }
 
+                    // #6508: the model sees at most the route's inline budget
+                    // of any result. When its view would leave bytes out and
+                    // spillover saved nothing, save the full output now,
+                    // before the result fans out, so the view names a ref
+                    // `retrieve_tool_result` reads the rest back with and the
+                    // UI registers the artifact.
+                    if let Ok(tool_result) = result.as_mut()
+                        && super::context::tool_result_context_view(
+                            self.api_provider,
+                            &self.session.model,
+                            self.active_route_limits,
+                            &tool_name,
+                            &tool_result.result,
+                        )
+                        .needs_full_output_artifact
+                    {
+                        crate::tools::truncate::preserve_full_output_for_model_context(
+                            &mut tool_result.result,
+                            &tool_id,
+                            &tool_name,
+                            &self.session.id,
+                        );
+                    }
+
                     let result = match result {
                         Ok(rich) => Ok(super::tool_media::project(
                             rich,

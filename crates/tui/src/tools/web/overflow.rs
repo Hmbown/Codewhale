@@ -19,15 +19,10 @@ pub(crate) struct BoundedText {
     pub(crate) artifact: Option<OverflowArtifact>,
 }
 
+/// The route's inline budget for one tool result; the same number the engine
+/// measures every tool result against (#6508).
 pub(crate) fn inline_char_budget(context: &ToolContext) -> usize {
-    context
-        .route_context_window
-        .map(|tokens| {
-            let chars = u64::from(tokens).saturating_mul(4).saturating_mul(3) / 100;
-            usize::try_from(chars).unwrap_or(100_000)
-        })
-        .unwrap_or(100_000)
-        .clamp(1, 100_000)
+    crate::route_budget::route_inline_char_budget(context.route_context_window)
 }
 
 pub(crate) fn bound_text<F>(
@@ -56,22 +51,17 @@ where
                 ))
             })?;
     let relative = crate::artifacts::format_artifact_relative_path(&relative_path);
-    let mut head = content
-        .chars()
-        .take(budget.saturating_sub(256))
-        .collect::<String>();
-    let mut footer = overflow_footer(subject, &relative, head.len(), content.len());
-    let allowed_head = budget.saturating_sub(footer.chars().count());
-    head = content.chars().take(allowed_head).collect();
-    footer = overflow_footer(subject, &relative, head.len(), content.len());
-    while !head.is_empty() && head.chars().count() + footer.chars().count() > budget {
-        head.pop();
-        footer = overflow_footer(subject, &relative, head.len(), content.len());
-    }
+    let absolute = absolute_path.display().to_string();
+    let inline = crate::tools::truncate::fit_to_inline_budget(
+        &content,
+        budget,
+        Some(&absolute),
+        Some(&relative),
+    );
     let preview = content.chars().take(200).collect();
 
     Ok(BoundedText {
-        content: format!("{head}{footer}"),
+        content: inline,
         artifact: Some(OverflowArtifact {
             session_id: context.state_namespace.clone(),
             absolute_path,
@@ -80,10 +70,4 @@ where
             preview,
         }),
     })
-}
-
-fn overflow_footer(subject: &str, relative: &str, head_bytes: usize, total_bytes: usize) -> String {
-    format!(
-        "\n\n[Content overflow: first {head_bytes} of {total_bytes} bytes shown; full {subject} saved to {relative}. Recovery: call retrieve_tool_result with ref={relative}.]"
-    )
 }

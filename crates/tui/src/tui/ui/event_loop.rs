@@ -2345,8 +2345,7 @@ pub(crate) async fn run_event_loop(
                         if is_model_visible_tool_call(&id) {
                             let tool_content = match &result {
                                 Ok(output) => sanitize_stream_chunk(
-                                    &tool_result_content_for_api_message(app, &id, &name, output)
-                                        .await,
+                                    &tool_result_content_for_api_message(app, &name, output),
                                 ),
                                 Err(err) => sanitize_stream_chunk(&format!("Error: {err}")),
                             };

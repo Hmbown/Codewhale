@@ -8621,84 +8621,40 @@ fn setup_presets_cannot_override_managed_runtime_requirements() {
     );
 }
 
-#[tokio::test]
-async fn tool_result_api_content_never_advertises_unowned_live_output_as_retrievable() {
-    let mut app = App::new(create_test_options(), &Config::default());
-    app.api_messages_mut().push(Message {
-        role: Role::Assistant,
-        content: vec![ContentBlock::ToolUse {
-            id: "call-live-big".to_string(),
-            name: "exec_shell".to_string(),
-            input: serde_json::json!({"command": "cargo test"}),
-            caller: None,
-            thought_signature: None,
-        }],
-    });
-
-    let raw = "LIVE_RAW_SENTINEL\n".repeat(900);
-    let output = crate::tools::spec::ToolResult::success(raw.clone());
-    let content =
-        tool_result_content_for_api_message(&app, "call-live-big", "exec_shell", &output).await;
-
-    assert!(content.contains("[TOOL_OUTPUT_RECEIPT]"));
-    assert!(content.contains("tool: exec_shell"));
-    assert!(content.contains("tool_call_id: call-live-big"));
-    assert!(content.contains("full output in the tool details view"));
-    assert!(!content.contains("detail_handle"));
-    assert!(!content.contains("storage:"));
-    assert!(!content.contains("retrieve_tool_result"));
-    assert!(!content.contains(&raw));
-    assert!(
-        content.chars().count()
-            < crate::tool_output_receipts::RAW_TOOL_OUTPUT_RECEIPT_THRESHOLD_CHARS
-    );
-}
-
 #[test]
-fn live_tool_receipt_messages_clones_only_matching_tool_use() {
-    let mut app = App::new(create_test_options(), &Config::default());
-    app.api_messages_mut().push(Message {
-        role: Role::Assistant,
-        content: vec![ContentBlock::ToolUse {
-            id: "call-old".to_string(),
-            name: "exec_shell".to_string(),
-            input: serde_json::json!({"command": "old"}),
-            caller: None,
-            thought_signature: None,
-        }],
-    });
-    app.api_messages_mut().push(Message {
-        role: Role::User,
-        content: vec![ContentBlock::ToolResult {
-            tool_use_id: "call-old".to_string(),
-            content: "OLD_RAW\n".repeat(2_000),
-            is_error: None,
-            content_blocks: None,
-        }],
-    });
-    app.api_messages_mut().push(Message {
-        role: Role::Assistant,
-        content: vec![ContentBlock::ToolUse {
-            id: "call-new".to_string(),
-            name: "read_file".to_string(),
-            input: serde_json::json!({"path": "src/main.rs"}),
-            caller: None,
-            thought_signature: None,
-        }],
-    });
+fn tool_result_api_content_is_the_engine_model_view() {
+    // #6508: the TUI's API-message mirror (what `SyncSession` sends back to
+    // the engine) must hold exactly what the engine gave the model. It used
+    // to swap anything over 12,000 characters for a 240-character receipt
+    // that told the model to open a tool details view it cannot open.
+    let app = App::new(create_test_options(), &Config::default());
+    let budget = crate::route_budget::route_inline_char_budget_for_route(
+        app.api_provider,
+        &app.model,
+        app.active_route_limits,
+    );
+    let line = "LIVE_RAW_SENTINEL\n";
+    let within = line.repeat((budget - 1) / line.len());
+    let output = crate::tools::spec::ToolResult::success(within.clone());
+    let content = tool_result_content_for_api_message(&app, "exec_shell", &output);
+    assert_eq!(content, within.trim());
+    assert!(!content.contains("[TOOL_OUTPUT_RECEIPT]"));
 
-    let messages = live_tool_receipt_messages(&app, "call-new", "NEW_RAW", true);
-
-    assert_eq!(messages.len(), 2);
-    assert!(matches!(
-        &messages[0].content[0],
-        ContentBlock::ToolUse { id, name, ..} if id == "call-new" && name == "read_file"
-    ));
-    assert!(matches!(
-        &messages[1].content[0],
-        ContentBlock::ToolResult { tool_use_id, content, .. }
-            if tool_use_id == "call-new" && content == "NEW_RAW"
-    ));
+    let over = line.repeat(budget / line.len() + 100);
+    let output = crate::tools::spec::ToolResult::success(over);
+    let content = tool_result_content_for_api_message(&app, "exec_shell", &output);
+    assert_eq!(
+        content,
+        crate::core::engine::compact_tool_result_for_route(
+            app.api_provider,
+            &app.model,
+            app.active_route_limits,
+            "exec_shell",
+            &output,
+        )
+    );
+    assert!(content.chars().count() <= budget);
+    assert!(!content.contains("[TOOL_OUTPUT_RECEIPT]"));
 }
 
 fn text_message(role: &str, text: &str) -> Message {
