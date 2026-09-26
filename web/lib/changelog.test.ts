@@ -14,8 +14,8 @@ const root = new URL("../../", import.meta.url);
 
 describe("changelog derivation", () => {
   it("keeps lib/changelog.generated.ts in exact parity with CHANGELOG.md", () => {
-    // The drift gate: a clean re-derivation must reproduce the tracked file
-    // byte for byte, so the /changelog route can never show a stale record.
+    // The file is derived, not tracked (vitest.global-setup.ts writes it), so
+    // this proves the derivation the build runs is the one the page imports.
     const source = readFileSync(new URL("CHANGELOG.md", root), "utf8");
     const committed = readFileSync(new URL("../lib/changelog.generated.ts", import.meta.url), "utf8");
     expect(renderChangelogModule(parseChangelog(source))).toBe(committed);
