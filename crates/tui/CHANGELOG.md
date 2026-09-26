@@ -51,6 +51,13 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Fixed
 
+- Tool output is no longer cut off where you can't get it back. Search
+  answers, test runs, git, verifier and web results reach the model whole up
+  to one budget sized to the model's context window, and anything beyond it
+  can be read back with `retrieve_tool_result`. Native search now asks for
+  answers up to 8,192 tokens (was 2,048–4,096) and waits long enough for
+  them to arrive, and an answer the provider still cuts short is marked as
+  cut ([#6508](https://github.com/Hmbown/Codewhale/issues/6508)).
 - `codewhale exec --auto` no longer exits 141 with no output when a child
   it writes to, such as a stdio MCP server, closes its pipe early. Headless
   exec now ignores SIGPIPE while it runs, as the interactive TUI already did,

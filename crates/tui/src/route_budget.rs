@@ -51,6 +51,64 @@ pub(crate) fn route_context_window_tokens(
         .unwrap_or_else(|| provider_capability(provider, model).context_window)
 }
 
+/// Share of the route's context window (in estimated characters) one tool
+/// result may occupy inline.
+const TOOL_OUTPUT_INLINE_WINDOW_PERCENT: u64 = 3;
+/// Inline ceiling for one tool result when the route is unknown, and the cap
+/// for every route unless the operator opted into a larger budget.
+const TOOL_OUTPUT_INLINE_MAX_CHARS: usize = 100_000;
+/// Hard ceiling on an operator-raised inline tool-result budget (#5367).
+const TOOL_OUTPUT_INLINE_OPT_IN_MAX_CHARS: usize = 2 * 1024 * 1024;
+
+/// The one budget for how much of a tool result the model sees inline (#6508).
+///
+/// Every tool result is measured against this number: 3% of the route's
+/// context window (at about 4 characters per token), capped at 100,000
+/// characters, or the full cap when the window is unknown. An opt-in
+/// `tool_result_max_bytes` workshop setting may raise it, up to 2 MiB.
+/// Anything past it is cut only after the raw output has been saved as a
+/// session artifact that `retrieve_tool_result` can read back.
+#[must_use]
+pub(crate) fn route_inline_char_budget(window_tokens: Option<u32>) -> usize {
+    route_inline_char_budget_with_raise(
+        window_tokens,
+        crate::tools::large_output_router::WorkshopConfig::active_tool_result_max_bytes(),
+    )
+}
+
+#[must_use]
+fn route_inline_char_budget_with_raise(window_tokens: Option<u32>, raise: Option<usize>) -> usize {
+    let base = window_tokens
+        .filter(|tokens| *tokens > 0)
+        .map(|tokens| {
+            let chars = u64::from(tokens)
+                .saturating_mul(4)
+                .saturating_mul(TOOL_OUTPUT_INLINE_WINDOW_PERCENT)
+                / 100;
+            usize::try_from(chars).unwrap_or(TOOL_OUTPUT_INLINE_MAX_CHARS)
+        })
+        .unwrap_or(TOOL_OUTPUT_INLINE_MAX_CHARS)
+        .clamp(1, TOOL_OUTPUT_INLINE_MAX_CHARS);
+    match raise {
+        Some(bytes) if bytes > base => bytes.min(TOOL_OUTPUT_INLINE_OPT_IN_MAX_CHARS),
+        _ => base,
+    }
+}
+
+/// [`route_inline_char_budget`] for a resolved provider/model route.
+#[must_use]
+pub(crate) fn route_inline_char_budget_for_route(
+    provider: ApiProvider,
+    model: &str,
+    route_limits: Option<RouteLimits>,
+) -> usize {
+    route_inline_char_budget(Some(route_context_window_tokens(
+        provider,
+        model,
+        route_limits,
+    )))
+}
+
 /// Provider/offering output cap, when the resolved route reports one.
 #[must_use]
 pub(crate) fn route_output_limit_tokens(route_limits: Option<RouteLimits>) -> Option<u32> {
@@ -422,6 +480,23 @@ pub(crate) fn auto_compact_default_for_route(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn route_inline_char_budget_is_three_percent_of_the_window_capped() {
+        use super::route_inline_char_budget_with_raise as budget;
+        assert_eq!(budget(Some(128_000), None), 15_360);
+        assert_eq!(budget(Some(10_000), None), 1_200);
+        assert_eq!(budget(None, None), 100_000);
+        assert_eq!(budget(Some(0), None), 100_000);
+        assert_eq!(budget(Some(1_000_000), None), 100_000);
+        // An operator opt-in raises the budget, never lowers it, and stops at 2 MiB.
+        assert_eq!(budget(Some(128_000), Some(80_000)), 80_000);
+        assert_eq!(budget(Some(128_000), Some(1_000)), 15_360);
+        assert_eq!(
+            budget(Some(128_000), Some(64 * 1024 * 1024)),
+            2 * 1024 * 1024
+        );
+    }
+
     use super::*;
 
     #[test]

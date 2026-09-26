@@ -49,6 +49,7 @@ pub(super) fn parse(payload: &Value) -> ProviderNativeSearchResponse {
     ProviderNativeSearchResponse {
         answer: None,
         citations,
+        truncated: false,
     }
 }
 

@@ -1979,15 +1979,17 @@ fn push_text_part(parts: &mut Vec<Value>, text: &str) {
 
 pub(crate) const CACHE_WARMUP_USER_TAIL: &str = "请只回复 OK";
 pub(crate) const CACHE_WARMUP_MAX_TOKENS: u32 = 8;
-const TOOL_RESULT_SENT_CHAR_BUDGET: usize = 12_000;
-
+/// Wire backstop for tool results (#6508). The engine already fits every
+/// result it gives the model to the route's inline budget, and marks any cut
+/// with a recovery footer. This pass only catches history that never went
+/// through the engine (legacy or restored raw results), so it uses the
+/// largest value that budget can take — it never cuts a result the engine
+/// kept whole.
 fn tool_result_sent_char_budget() -> usize {
-    crate::tools::large_output_router::WorkshopConfig::active_tool_result_max_bytes()
-        .map(|bytes| bytes.clamp(TOOL_RESULT_SENT_CHAR_BUDGET, 2 * 1024 * 1024))
-        .unwrap_or(TOOL_RESULT_SENT_CHAR_BUDGET)
+    crate::route_budget::route_inline_char_budget(None)
 }
-const TOOL_RESULT_HEAD_CHARS: usize = 4_000;
-const TOOL_RESULT_TAIL_CHARS: usize = 4_000;
+/// Characters of an excerpted wire result spent on its labelled header.
+const TOOL_RESULT_EXCERPT_FRAME_CHARS: usize = 1_024;
 /// Tool results shorter than this stay inline even when repeated. The
 /// extra prompt bytes are cheaper than adding an earlier-message reference
 /// for tiny command outputs.
@@ -2559,8 +2561,10 @@ fn compact_tool_result_for_wire(
         };
     }
 
-    let head = first_chars(content, TOOL_RESULT_HEAD_CHARS);
-    let tail = last_chars(content, TOOL_RESULT_TAIL_CHARS);
+    let excerpt_chars = sent_budget.saturating_sub(TOOL_RESULT_EXCERPT_FRAME_CHARS);
+    let head_chars = excerpt_chars * 2 / 3;
+    let head = first_chars(content, head_chars);
+    let tail = last_chars(content, excerpt_chars - head_chars);
     let kept = head.chars().count() + tail.chars().count();
     let omitted = original_chars.saturating_sub(kept);
     let compacted = format!(

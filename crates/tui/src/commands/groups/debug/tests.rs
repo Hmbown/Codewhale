@@ -723,63 +723,77 @@ fn cache_inspect_reports_divergence_from_previous_request() {
     assert!(second.contains("Message #1 assistant: history"));
 }
 
+fn push_repeated_shell_results(app: &mut App, output: &str) {
+    for id in ["tool-1", "tool-2"] {
+        app.api_messages_mut().push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: "shell_command".to_string(),
+                input: serde_json::json!({"command": "cargo test"}),
+                caller: None,
+                thought_signature: None,
+            }],
+        });
+        app.api_messages_mut().push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: output.to_string(),
+                is_error: None,
+                content_blocks: None,
+            }],
+        });
+    }
+}
+
 #[test]
 fn cache_inspect_displays_tool_result_budget_metadata() {
+    // Past the 100,000-char wire backstop (#6508), so each sighting is
+    // excerpted rather than sent whole or deduplicated.
     let mut app = create_test_app();
-    let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
-    app.api_messages_mut().push(Message {
-        role: Role::Assistant,
-        content: vec![ContentBlock::ToolUse {
-            id: "tool-1".to_string(),
-            name: "shell_command".to_string(),
-            input: serde_json::json!({"command": "cargo test"}),
-            caller: None,
-            thought_signature: None,
-        }],
-    });
-    app.api_messages_mut().push(Message {
-        role: Role::User,
-        content: vec![ContentBlock::ToolResult {
-            tool_use_id: "tool-1".to_string(),
-            content: long_output.clone(),
-            is_error: None,
-            content_blocks: None,
-        }],
-    });
-    app.api_messages_mut().push(Message {
-        role: Role::Assistant,
-        content: vec![ContentBlock::ToolUse {
-            id: "tool-2".to_string(),
-            name: "shell_command".to_string(),
-            input: serde_json::json!({"command": "cargo test"}),
-            caller: None,
-            thought_signature: None,
-        }],
-    });
-    app.api_messages_mut().push(Message {
-        role: Role::User,
-        content: vec![ContentBlock::ToolResult {
-            tool_use_id: "tool-2".to_string(),
-            content: long_output,
-            is_error: None,
-            content_blocks: None,
-        }],
-    });
+    let long_output = format!("{}{}", "A".repeat(60_000), "Z".repeat(60_000));
+    push_repeated_shell_results(&mut app, &long_output);
 
     let result = cache(&mut app, Some("inspect"));
     let msg = result.message.expect("inspect output");
 
     let tool_budget_lines: Vec<_> = msg
         .lines()
-        .filter(|line| line.contains("original_chars=14000"))
+        .filter(|line| line.contains("original_chars=120000"))
         .collect();
     assert_eq!(tool_budget_lines.len(), 2, "got: {msg}");
 
     for sighting in tool_budget_lines {
         assert!(sighting.contains("sent_chars="), "got: {msg}");
+        assert!(!sighting.contains("sent_chars=120000"), "got: {msg}");
         assert!(sighting.contains("truncated=true"), "got: {msg}");
         assert!(sighting.contains("deduplicated=false"), "got: {msg}");
     }
+}
+
+#[test]
+fn cache_inspect_shows_repeated_in_budget_tool_result_sent_whole_then_deduplicated() {
+    // Under the wire backstop (#6508), a repeated result is sent whole the
+    // first time and replaced by a reference to that copy the second time.
+    let mut app = create_test_app();
+    let output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
+    push_repeated_shell_results(&mut app, &output);
+
+    let result = cache(&mut app, Some("inspect"));
+    let msg = result.message.expect("inspect output");
+
+    let lines: Vec<_> = msg
+        .lines()
+        .filter(|line| line.contains("original_chars=14000"))
+        .collect();
+    assert_eq!(lines.len(), 2, "got: {msg}");
+    assert!(lines[0].contains("sent_chars=14000"), "got: {msg}");
+    assert!(lines[0].contains("truncated=false"), "got: {msg}");
+    assert!(lines[0].contains("deduplicated=false"), "got: {msg}");
+    assert!(lines[1].contains("truncated=false"), "got: {msg}");
+    assert!(lines[1].contains("deduplicated=true"), "got: {msg}");
+    assert!(!lines[1].contains("sent_chars=14000"), "got: {msg}");
 }
 
 #[test]

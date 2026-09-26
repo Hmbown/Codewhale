@@ -738,47 +738,13 @@ fn active_turn_has_running_tool(app: &App) -> bool {
 // Per-turn notification composition (settings, message body, summary)
 // moved to `tui/notifications.rs` alongside the dispatch primitives.
 
-async fn tool_result_content_for_api_message(
-    app: &App,
-    id: &str,
-    name: &str,
-    output: &ToolResult,
-) -> String {
-    let raw = output.content.trim();
-    if raw.is_empty() {
-        return String::new();
-    }
-
-    if matches!(
-        name,
-        "run_tests" | "run_verifiers" | "task_gate_run" | "tasks"
-    ) {
-        return crate::core::engine::compact_tool_result_for_route(
-            app.api_provider,
-            &app.model,
-            app.active_route_limits,
-            name,
-            output,
-        );
-    }
-
-    if raw.chars().count() > crate::tool_output_receipts::RAW_TOOL_OUTPUT_RECEIPT_THRESHOLD_CHARS {
-        let messages = live_tool_receipt_messages(app, id, raw, output.success);
-        let artifacts = app.session_artifacts.clone();
-        let raw = raw.to_string();
-        match tokio::task::spawn_blocking(move || {
-            compact_live_tool_receipt(messages, artifacts, raw)
-        })
-        .await
-        {
-            Ok(Some(receipt)) => return receipt,
-            Ok(None) => {}
-            Err(err) => {
-                crate::logging::warn(format!("live tool-output receipt compaction failed: {err}"));
-            }
-        }
-    }
-
+/// The TUI's copy of a tool result for its API-message mirror. It is the same
+/// view the engine gives the model (#6508): whole within the route's inline
+/// budget, otherwise cut around a footer that names the saved full output.
+/// A separate receipt here used to replace anything over 12,000 characters
+/// with a 240-character preview, and that copy is what `SyncSession` sends
+/// back to the engine.
+fn tool_result_content_for_api_message(app: &App, name: &str, output: &ToolResult) -> String {
     crate::core::engine::compact_tool_result_for_route(
         app.api_provider,
         &app.model,
