@@ -44,6 +44,13 @@ const SERPLY_ENDPOINT: &str = "https://api.serply.io/v1/search";
 const ERROR_BODY_PREVIEW_BYTES: usize = 512;
 const PROVIDER_NATIVE_MIN_TIMEOUT_MS: u64 = 45_000;
 const KIMI_K3_FORMULA_MIN_TIMEOUT_MS: u64 = 180_000;
+/// Time a native-search attempt allows for its search round-trips before the
+/// answer is generated (#6508).
+const NATIVE_SEARCH_ROUND_TRIP_ALLOWANCE_MS: u64 = 30_000;
+/// Conservative generation rate for a native-search answer. The request is
+/// non-streaming, so the attempt must outlast the whole generation or the
+/// answer is lost to the timeout rather than returned whole.
+const NATIVE_SEARCH_ASSUMED_TOKENS_PER_SEC: u64 = 40;
 const VOLCENGINE_MIN_TIMEOUT_MS: u64 = 90_000;
 
 /// The recency and locale knobs an adapter forwards to its backend.
@@ -1087,10 +1094,9 @@ fn search_timeout_budgets(
             // Provider-native search performs a model-backed request. Give it
             // a dedicated minimum without donating unused time to the
             // configured/local fallback selected by the caller.
-            let provider_budget = requested_timeout.max(
-                provider_native_timeout_floor
-                    .unwrap_or(Duration::from_millis(PROVIDER_NATIVE_MIN_TIMEOUT_MS)),
-            );
+            let provider_budget = requested_timeout
+                .max(Duration::from_millis(PROVIDER_NATIVE_MIN_TIMEOUT_MS))
+                .max(provider_native_timeout_floor.unwrap_or_default());
             (
                 provider_budget.saturating_add(requested_timeout),
                 Some(provider_budget),
@@ -1104,12 +1110,26 @@ fn search_timeout_budgets(
 fn provider_native_timeout_floor(
     client: &crate::client::ProviderNativeSearchClient,
 ) -> Option<Duration> {
-    crate::config::is_exact_direct_moonshot_k3_route(
+    let k3_formula = crate::config::is_exact_direct_moonshot_k3_route(
         client.provider(),
         client.base_url(),
         client.model(),
     )
-    .then_some(Duration::from_millis(KIMI_K3_FORMULA_MIN_TIMEOUT_MS))
+    .then_some(Duration::from_millis(KIMI_K3_FORMULA_MIN_TIMEOUT_MS));
+    let answer = client
+        .requested_answer_output_tokens()
+        .map(native_answer_time_budget);
+    k3_formula.max(answer)
+}
+
+/// Time a native-search attempt needs to return an answer of `output_tokens`
+/// whole: the search round-trips plus generation at a conservative rate
+/// (#6508). Without it, raising the requested answer length only moved the
+/// cut from the provider's token limit to this tool's timeout.
+fn native_answer_time_budget(output_tokens: u32) -> Duration {
+    let generation_ms =
+        u64::from(output_tokens).saturating_mul(1_000) / NATIVE_SEARCH_ASSUMED_TOKENS_PER_SEC;
+    Duration::from_millis(NATIVE_SEARCH_ROUND_TRIP_ALLOWANCE_MS.saturating_add(generation_ms))
 }
 
 fn register_search_citations(response: &mut SearchResponse, context: &ToolContext) {
@@ -2430,12 +2450,13 @@ mod tests {
         ERROR_BODY_PREVIEW_BYTES, KIMI_K3_FORMULA_MIN_TIMEOUT_MS, QueryFilters, ScrapeEndpoints,
         SearchProbeTargetError, WebSearchTool, acquire_model_backed_search_inference_participant,
         baidu_search_payload, bocha_error_message, domain_matches, duckduckgo_search_url,
-        extract_search_query, finalize_search_response, optional_search_max_results,
-        parse_baidu_results, parse_bocha_results, parse_metaso_results, parse_searxng_results,
-        parse_serply_results, parse_sofya_results, parse_tavily_results, parse_volcengine_results,
-        register_search_citations, rerank, run_scrape_search_with_endpoints, sanitize_error_body,
-        search_probe_target, search_timeout_budgets, searxng_score, searxng_search_url,
-        serply_search_url, truncate_error_body, volcengine_extract_text,
+        extract_search_query, finalize_search_response, native_answer_time_budget,
+        optional_search_max_results, parse_baidu_results, parse_bocha_results,
+        parse_metaso_results, parse_searxng_results, parse_serply_results, parse_sofya_results,
+        parse_tavily_results, parse_volcengine_results, register_search_citations, rerank,
+        run_scrape_search_with_endpoints, sanitize_error_body, search_probe_target,
+        search_timeout_budgets, searxng_score, searxng_search_url, serply_search_url,
+        truncate_error_body, volcengine_extract_text,
     };
     use crate::config::SearchProvider;
     use crate::tools::web::contract::{
@@ -2464,6 +2485,64 @@ mod tests {
         assert_eq!(total, Duration::from_millis(195_000));
         assert_eq!(first, Some(Duration::from_millis(180_000)));
         assert_eq!(fallback, Some(requested));
+    }
+
+    #[test]
+    fn provider_native_budget_covers_the_requested_answer_length() {
+        // #6508: native search asks for up to 8,192 output tokens in one
+        // non-streaming request. The attempt must outlast generating them at
+        // the assumed rate, or a long answer times out instead of arriving.
+        let requested = Duration::from_millis(15_000);
+        for tokens in [128_u32, 2_048, 4_096, 8_192] {
+            let floor = native_answer_time_budget(tokens);
+            let generation = Duration::from_millis(
+                u64::from(tokens) * 1_000 / super::NATIVE_SEARCH_ASSUMED_TOKENS_PER_SEC,
+            );
+            assert!(floor >= generation, "{tokens} tokens: {floor:?}");
+            let (total, first, fallback) =
+                search_timeout_budgets(BackendId::ProviderNative, requested, Some(floor));
+            let first = first.expect("provider-native gets a dedicated attempt");
+            assert!(first >= floor, "{tokens} tokens: attempt {first:?}");
+            // The minimum never drops below the pre-#6508 floor.
+            assert!(first >= Duration::from_millis(45_000));
+            assert_eq!(total, first + requested);
+            assert_eq!(fallback, Some(requested));
+        }
+        // 8,192 tokens at 40/s plus the round-trip allowance: ~4 minutes.
+        assert_eq!(
+            native_answer_time_budget(8_192),
+            Duration::from_millis(234_800)
+        );
+    }
+
+    #[test]
+    fn provider_native_floor_follows_what_the_client_requests() {
+        use crate::config::{Config, ProviderConfig, ProvidersConfig};
+        let config = Config {
+            provider: Some("anthropic".to_string()),
+            providers: Some(ProvidersConfig {
+                anthropic: ProviderConfig {
+                    api_key: Some("anthropic-test-key".to_string()),
+                    base_url: Some("https://api.anthropic.com".to_string()),
+                    model: Some("claude-opus-4-8".to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        };
+        let client = crate::client::ProviderNativeSearchClient::new(
+            crate::client::CodewhaleClient::new(&config).expect("Anthropic client"),
+        )
+        .expect("Anthropic native adapter");
+        let tokens = client
+            .requested_answer_output_tokens()
+            .expect("Anthropic requests an explicit answer length");
+        assert!(tokens > 2_048, "catalogued model asks for more: {tokens}");
+        assert_eq!(
+            super::provider_native_timeout_floor(&client),
+            Some(native_answer_time_budget(tokens))
+        );
     }
 
     #[test]

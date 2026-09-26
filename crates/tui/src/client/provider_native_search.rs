@@ -51,10 +51,13 @@ const PRIOR_NATIVE_SEARCH_OUTPUT_TOKENS: u32 = 2_048;
 
 /// Ceiling on the output a native-search request asks for (#6508). These are
 /// single-shot, non-streaming requests: nothing arrives until the whole answer
-/// is generated, so a very long generation risks the HTTP request timeout
-/// before any byte comes back. It is not a context or API limit; the model's
-/// own output ceiling still applies beneath it.
-const NATIVE_SEARCH_MAX_OUTPUT_TOKENS: u32 = 16_384;
+/// is generated, so web_search gives the attempt enough time to generate what
+/// was asked for (`tools::web_search::native_answer_time_budget`). The clamp
+/// bounds that wait: at the budget's assumed generation rate, 8,192 tokens is
+/// about four minutes before a stalled provider falls back to another backend.
+/// It is not a context or API limit; the model's own output ceiling still
+/// applies beneath it.
+const NATIVE_SEARCH_MAX_OUTPUT_TOKENS: u32 = 8_192;
 
 impl ProviderNativeSearchClient {
     #[must_use]
@@ -103,6 +106,23 @@ impl ProviderNativeSearchClient {
             fallback
         };
         wanted.min(route_cap)
+    }
+
+    /// Output tokens this client asks for per native-search answer, or `None`
+    /// for adapters that leave the answer length to the provider's default
+    /// (the Responses and Z.ai adapters). web_search sizes the attempt's time
+    /// budget from this, so the request and the wait cannot disagree.
+    #[must_use]
+    pub(crate) fn requested_answer_output_tokens(&self) -> Option<u32> {
+        match self.inner.api_provider {
+            ApiProvider::Anthropic | ApiProvider::XiaomiMimo => {
+                Some(self.answer_output_tokens(PRIOR_NATIVE_SEARCH_OUTPUT_TOKENS))
+            }
+            ApiProvider::Moonshot => {
+                Some(self.answer_output_tokens(kimi::PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS))
+            }
+            _ => None,
+        }
     }
 
     #[must_use]
@@ -179,12 +199,14 @@ impl ProviderNativeSearchClient {
             ApiProvider::Anthropic => build_anthropic_search_body(
                 &self.inner.default_model,
                 request,
-                self.answer_output_tokens(PRIOR_NATIVE_SEARCH_OUTPUT_TOKENS),
+                self.requested_answer_output_tokens()
+                    .unwrap_or(PRIOR_NATIVE_SEARCH_OUTPUT_TOKENS),
             ),
             ApiProvider::XiaomiMimo => build_mimo_search_body(
                 &self.inner.default_model,
                 request,
-                self.answer_output_tokens(PRIOR_NATIVE_SEARCH_OUTPUT_TOKENS),
+                self.requested_answer_output_tokens()
+                    .unwrap_or(PRIOR_NATIVE_SEARCH_OUTPUT_TOKENS),
             ),
             ApiProvider::Zai => zai::build_body(request, &self.inner.base_url)?,
             _ => bail!("active provider has no native web-search adapter"),
@@ -777,11 +799,11 @@ mod tests {
 
     #[test]
     fn mimo_payload_forces_bounded_web_search_plugin() {
-        let body = build_mimo_search_body("mimo-v2.5-pro", &request(), 16_384);
+        let body = build_mimo_search_body("mimo-v2.5-pro", &request(), 8_192);
         assert_eq!(body["tools"][0]["type"], "web_search");
         assert_eq!(body["tools"][0]["force_search"], true);
         assert_eq!(body["tools"][0]["limit"], 3);
-        assert_eq!(body["max_completion_tokens"], 16_384);
+        assert_eq!(body["max_completion_tokens"], 8_192);
         assert_eq!(body["thinking"]["type"], "disabled");
     }
 
@@ -804,15 +826,20 @@ mod tests {
     }
 
     #[test]
-    fn answer_output_tokens_is_the_model_ceiling_up_to_16k() {
+    fn answer_output_tokens_is_the_model_ceiling_up_to_the_clamp() {
         // #6508: native answers were requested at 2,048 tokens and silently
-        // cut. A catalogued model now gets its route ceiling, up to 16,384.
+        // cut. A catalogued model now gets its route ceiling, up to the clamp.
         let client = anthropic_client("claude-opus-4-8");
         let route_cap = client.inner.effective_max_output_tokens("claude-opus-4-8");
         assert!(route_cap > PRIOR_NATIVE_SEARCH_OUTPUT_TOKENS);
         assert_eq!(
             client.answer_output_tokens(PRIOR_NATIVE_SEARCH_OUTPUT_TOKENS),
             NATIVE_SEARCH_MAX_OUTPUT_TOKENS.min(route_cap)
+        );
+        // web_search budgets time from the same number the body carries.
+        assert_eq!(
+            client.requested_answer_output_tokens(),
+            Some(NATIVE_SEARCH_MAX_OUTPUT_TOKENS.min(route_cap))
         );
 
         // A model the catalogue does not describe keeps the old request size

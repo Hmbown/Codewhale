@@ -48,7 +48,7 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Fixed",
         "items": [
-          "Tool output is no longer cut off where you can't get it back. Search answers, test runs, git, verifier and web results reach the model whole up to one budget sized to the model's context window, and anything beyond it can be read back with retrieve_tool_result. Native search answers are no longer capped at 2,048–4,096 tokens, and an answer the provider cuts short is marked as cut (#6508).",
+          "Tool output is no longer cut off where you can't get it back. Search answers, test runs, git, verifier and web results reach the model whole up to one budget sized to the model's context window, and anything beyond it can be read back with retrieve_tool_result. Native search now asks for answers up to 8,192 tokens (was 2,048–4,096) and waits long enough for them to arrive, and an answer the provider still cuts short is marked as cut (#6508).",
           "The installation page is generated from docs/INSTALL.md, so the website and the guide can no longer disagree; broken anchors and unsafe links fail the build (#6450).",
           "codewhale config set refuses a value of the wrong type for a known setting (a word for an on/off switch, text for a number, a choice outside the list) instead of saving it (#6568, thanks @dajiaohuang).",
           "A turn that stops producing output now reports itself: the turn loop records its phase and last progress, and an overdue phase surfaces instead of hanging silently until the stream idle timeout. A delegated agent's final result is never dropped when the host is busy, so a finished child no longer leaves a ghost Running row behind (#6184).",

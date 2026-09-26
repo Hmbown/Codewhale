@@ -18,7 +18,7 @@ const MAX_NATIVE_SEARCH_ROUNDS: usize = 4;
 const MAX_NATIVE_SEARCH_TOOL_CALLS: usize = 8;
 /// What the Kimi adapters requested before #6508, kept for a model whose
 /// output ceiling the catalogue does not document.
-const PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS: u32 = 4_096;
+pub(super) const PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS: u32 = 4_096;
 const WEB_SEARCH_FORMULA_URI: &str = "moonshot/web-search:latest";
 const WEB_SEARCH_FORMULA_FUNCTION: &str = "web_search";
 
@@ -71,8 +71,9 @@ async fn search_builtin(
     })];
     let mut tool_calls_executed = 0;
     let url = api_url(&client.inner.base_url, "chat/completions");
-    let max_completion_tokens =
-        client.answer_output_tokens(PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS);
+    let max_completion_tokens = client
+        .requested_answer_output_tokens()
+        .unwrap_or(PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS);
 
     for _ in 0..MAX_NATIVE_SEARCH_ROUNDS {
         let body = json!({
@@ -148,8 +149,9 @@ async fn search_formula(
     })];
     let mut tool_calls_executed = 0;
     let chat_url = api_url(&client.inner.base_url, "chat/completions");
-    let max_completion_tokens =
-        client.answer_output_tokens(PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS);
+    let max_completion_tokens = client
+        .requested_answer_output_tokens()
+        .unwrap_or(PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS);
     let fiber_url = api_url(&client.inner.base_url, &format!("{formula_path}/fibers"));
 
     for _ in 0..MAX_NATIVE_SEARCH_ROUNDS {
@@ -477,8 +479,9 @@ mod tests {
             crate::client::CodewhaleClient::new(&config).expect("test Moonshot client"),
         )
         .expect("Moonshot native adapter");
-        let expected_completion_tokens =
-            client.answer_output_tokens(PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS);
+        let expected_completion_tokens = client
+            .requested_answer_output_tokens()
+            .expect("Kimi requests an explicit answer length");
         Mock::given(method("GET"))
             .and(path("/v1/formulas/moonshot/web-search:latest/tools"))
             .and(header("authorization", "Bearer moonshot-test-key"))
