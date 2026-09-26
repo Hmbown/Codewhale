@@ -142,7 +142,7 @@ fn model_only_rows_use_namespaced_keys_and_preserve_unpriced_facts() {
         } else {
             (
                 bundled_offerings_from_models_dev(&catalog),
-                "moonshotai",
+                "moonshot",
                 CatalogSource::Bundled,
             )
         };
@@ -178,11 +178,8 @@ fn model_only_rows_use_namespaced_keys_and_preserve_unpriced_facts() {
                 && !row.default_for_provider
                 && row.reasoning_options.is_empty()
         }));
-        find(
-            &rows,
-            if live { "xiaomi-mimo" } else { "xiaomi" },
-            "synthetic-chat",
-        );
+        // Vendor namespaces normalize offline too (#6396 slice B).
+        find(&rows, "xiaomi-mimo", "synthetic-chat");
         find(&rows, "new-vendor", "solo");
         assert!(crate::ProviderKind::parse("new-vendor").is_none());
     }
@@ -858,6 +855,58 @@ fn bundled_deepseek_flash_routes_support_image_input() {
         crate::route::CapabilityState::Unsupported,
         "a Flash correction must not widen other routes"
     );
+}
+
+#[test]
+fn bundled_seed_canonical_entries_use_upstream_keys_and_yield_to_provider_rows() {
+    // #6396 slice B: canonical entries carry upstream `vendor/model` keys. The
+    // hand-qualified xiaomi-mimo provider rows still win offline, and a vendor
+    // namespace never leaks out as its own (non-route) provider.
+    let catalog = bundled_models_dev_catalog();
+    for key in ["xiaomi/mimo-v2.6-pro", "xiaomi/mimo-v2.6-flash"] {
+        assert!(catalog.model(key).is_some(), "{key} canonical entry");
+    }
+    let rows = bundled_catalog_offerings();
+    assert!(
+        rows.iter().all(|row| row.provider != "xiaomi"),
+        "vendor namespace must normalize onto xiaomi-mimo"
+    );
+    for model in ["mimo-v2.6-pro", "mimo-v2.6-flash"] {
+        let row = find(&rows, "xiaomi-mimo", model);
+        assert_eq!(
+            row.canonical_model, None,
+            "{model} comes from the provider row"
+        );
+        assert_eq!(
+            crate::models_dev::image_input_support(row.modalities.as_ref()),
+            crate::route::CapabilityState::Unsupported,
+            "{model} keeps the verified text-only qualification"
+        );
+    }
+}
+
+#[test]
+fn bundled_seed_cold_start_joins_namespaced_entries_without_provider_rows() {
+    // #6396: with the provider rows gone, the upstream-shaped canonical
+    // entries alone still put MiMo 2.6 on the xiaomi-mimo route offline.
+    let mut catalog = bundled_models_dev_catalog().clone();
+    let mimo = catalog
+        .providers
+        .get_mut("xiaomi-mimo")
+        .expect("xiaomi-mimo provider");
+    mimo.models.remove("mimo-v2.6-pro");
+    mimo.models.remove("mimo-v2.6-flash");
+    let rows = bundled_offerings_from_models_dev(&catalog);
+    for model in ["mimo-v2.6-pro", "mimo-v2.6-flash"] {
+        let row = find(&rows, "xiaomi-mimo", model);
+        let canonical = format!("xiaomi/{model}");
+        assert_eq!(row.canonical_model.as_deref(), Some(canonical.as_str()));
+        assert_eq!(row.source, CatalogSource::Bundled);
+        assert_eq!(row.reasoning, Some(true));
+        assert_eq!(row.tool_call, Some(true));
+        assert!(row.cost.is_none(), "MiMo stays unpriced offline");
+        assert!(!row.default_for_provider);
+    }
 }
 
 #[test]

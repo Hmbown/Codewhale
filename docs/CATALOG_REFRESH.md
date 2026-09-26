@@ -167,7 +167,12 @@ Design constraints of the script (intentional):
 1. Fetch Models.dev to a local file (curl / browser), or use
    `CODEWHALE_MODELS_DEV_PATH` against a saved copy.
 2. Scrub to the allowlisted shape (`models`, `providers`, optional `_meta`).
-   Prefer the script’s public-document rules as the checklist.
+   Prefer the script’s public-document rules as the checklist. Key new
+   canonical `models` entries the way upstream does (`vendor/model`, e.g.
+   `xiaomi/mimo-v2.6-pro`), copied unedited onto the fields `ModelsDevModel`
+   reads. Offline, the vendor namespace normalizes onto the CodeWhale provider
+   id and the entry becomes a route row only where no provider row exists
+   (#6396), so a provider row is needed only to narrow or add facts.
 3. Keep seed **compact** — verified defaults for shipped providers, not a
    full dump (see `_meta` on the existing asset).
 4. `python3 scripts/catalog_models_dev.py snapshot --check <path>`.
