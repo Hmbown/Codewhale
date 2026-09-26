@@ -19220,6 +19220,69 @@ fn an_item_written_while_the_index_is_being_built_is_published_once() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The runtime saves one item id several times (in progress, then completed or
+/// failed). Once the index is warm, every one of those saves reaches the
+/// published map, and the item must still come back once, not once per save.
+#[test]
+fn an_item_saved_again_after_the_index_is_warm_is_listed_once() {
+    let dir = test_runtime_dir();
+    let store = RuntimeThreadStore::open(dir.clone()).expect("open store");
+    let turn_id = "trn_resaved".to_string();
+
+    store.ensure_item_index().expect("warm the index");
+    for status in [
+        TurnItemLifecycleStatus::InProgress,
+        TurnItemLifecycleStatus::Completed,
+    ] {
+        store
+            .save_item(&sample_item(&turn_id, "itm_resaved", status))
+            .expect("save item");
+    }
+    // A batch write of the same id takes the same path.
+    let again = sample_item(&turn_id, "itm_resaved", TurnItemLifecycleStatus::Completed);
+    store.save_items_batch(&[&again]).expect("batch save item");
+
+    let read = store
+        .list_items_for_turns_map(std::slice::from_ref(&turn_id))
+        .expect("read the turn");
+    let items = &read[&turn_id];
+    assert_eq!(items.len(), 1, "one item id, one item");
+    assert_eq!(items[0].status, TurnItemLifecycleStatus::Completed);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A turn can still name an item whose file was removed. The thread list skips
+/// that id and keeps looking, instead of failing the whole summary page.
+#[tokio::test]
+async fn thread_list_facts_skips_an_item_file_that_is_gone() -> Result<()> {
+    let dir = test_runtime_dir();
+    let manager = test_manager(dir.clone())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            workspace: Some(dir.clone()),
+            ..CreateThreadRequest::default()
+        })
+        .await?;
+
+    let mut turn = sample_turn(&thread.id, "trn_gone", RuntimeTurnStatus::Completed);
+    let mut reply = sample_item("trn_gone", "itm_reply", TurnItemLifecycleStatus::Completed);
+    reply.kind = TurnItemKind::AgentMessage;
+    reply.summary = "kept reply".to_string();
+    reply.detail = Some("kept reply".to_string());
+    turn.item_ids = vec![reply.id.clone(), "itm_removed".to_string()];
+    manager.store.save_item(&reply)?;
+    manager.store.save_turn(&turn)?;
+
+    let facts = manager
+        .thread_list_facts(std::slice::from_ref(&thread.id))
+        .await?;
+    assert_eq!(facts[&thread.id].preview.as_deref(), Some("kept reply"));
+
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
 /// The summary route settles recovered turns through
 /// `flush_recovery_receipts` now that its rows no longer go through
 /// `get_thread_detail`. That settled state is what the page's attention count

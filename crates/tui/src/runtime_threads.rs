@@ -2840,13 +2840,18 @@ impl RuntimeThreadStore {
             }
             return;
         }
-        index
+        // The runtime saves one item id many times (in progress, then
+        // completed or failed), and a write that raced the directory read may
+        // already be in the map from that read. An id is listed once per turn.
+        let item_ids = index
             .by_turn
             .as_mut()
             .expect("checked above")
             .entry(turn_id.to_string())
-            .or_default()
-            .push(item_id.to_string());
+            .or_default();
+        if !item_ids.iter().any(|known| known == item_id) {
+            item_ids.push(item_id.to_string());
+        }
     }
 
     /// The newest message text for each row of the thread list, read from the
@@ -2938,6 +2943,12 @@ impl RuntimeThreadStore {
     /// the runtime writes each item as its turn produces it.
     fn newest_message_text_in_turn(&self, turn: &TurnRecord) -> Result<Option<String>> {
         for item_id in turn.item_ids.iter().rev() {
+            // A turn can name an item whose file was since removed; the
+            // directory walk this replaced never saw such an id, so it must
+            // not fail the whole summary page either.
+            if !self.item_path(item_id)?.exists() {
+                continue;
+            }
             let item = self.load_item(item_id)?;
             if !matches!(
                 item.kind,
