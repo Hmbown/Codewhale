@@ -296,7 +296,7 @@ data, so `rg 'a && b' src` is one search. Other redirects, `$` or backtick
 expansion, subshells, backgrounding, inline environment assignments, and any
 other program (such as `python`, `awk`, `jq` or `cargo`) are refused. Options
 and path operands are still checked, and each `gh` or `npm` read needs the
-network grant even inside a pipeline.
+network grant wherever it appears in the command.
 
 A refused command comes back to the agent as an error result that names the
 rule, for example
@@ -632,7 +632,8 @@ seconds. An explicit value may go above that built-in default, for long
 unattended work; an operator-configured `default_wall_time_secs` is both the
 default and a ceiling, and role, parent, and saved-run deadlines still only
 narrow. It covers model requests and tools. The effective absolute deadline
-is persisted.
+is persisted, and saved again when a queued agent launches, so a later
+continuation is bounded by the deadline the agent actually worked to.
 
 The work clock starts when the agent gets a launch slot. An agent that waits
 in the launch queue waits at most `wall_time_secs`; if no slot opens in that

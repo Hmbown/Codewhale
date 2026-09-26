@@ -12392,6 +12392,15 @@ async fn run_subagent_task_inner(mut task: SubAgentTask) {
         deadline = now + Duration::from_millis(deadline_ms.saturating_sub(now_ms));
         task.runtime.worker_profile.wall_deadline_ms = Some(deadline_ms);
         work_started_at = now;
+        // Continuation reads the saved deadline, so save the restarted one;
+        // otherwise a child that launched late would be refused as out of
+        // budget while most of its work budget was left.
+        let mut manager = task.manager_handle.write().await;
+        if let Some(record) = manager.worker_records.get_mut(&task.agent_id) {
+            record.spec.runtime_profile.wall_deadline_ms = Some(deadline_ms);
+            record.updated_at_ms = now_ms;
+            manager.persist_state_debounced();
+        }
     }
 
     let turn_end_parking = task

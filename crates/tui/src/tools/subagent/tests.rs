@@ -25072,6 +25072,7 @@ async fn late_launch_permit_still_gets_the_full_work_budget() {
 
     let gate = Arc::new(governor::DynamicGate::new(1));
     let held = Arc::clone(&gate).try_acquire().expect("hold the only slot");
+    let spawned_at_ms = epoch_millis_now();
     let task_handle = tokio::spawn(run_subagent_task(SubAgentTask {
         manager_handle: Arc::clone(&manager),
         runtime,
@@ -25107,4 +25108,21 @@ async fn late_launch_permit_still_gets_the_full_work_budget() {
         snapshot.status
     );
     assert_eq!(snapshot.result.as_deref(), Some("done after launch"));
+
+    // Continuation reads the saved deadline (`source_deadline`). It must be
+    // the one restarted at launch, not the spawn-time one, or continuing this
+    // child would be refused as out of budget.
+    let saved_deadline_ms = manager
+        .read()
+        .await
+        .worker_records
+        .get(&agent_id)
+        .and_then(|record| record.spec.runtime_profile.wall_deadline_ms)
+        .expect("launch saves the restarted deadline");
+    let wall_ms = u64::try_from(WALL_TIME.as_millis()).expect("wall ms");
+    let hold_ms = u64::try_from(QUEUE_HOLD.as_millis()).expect("hold ms");
+    assert!(
+        saved_deadline_ms >= spawned_at_ms + hold_ms + wall_ms,
+        "saved deadline {saved_deadline_ms} must start from launch, not spawn ({spawned_at_ms})"
+    );
 }
