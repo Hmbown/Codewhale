@@ -2,7 +2,7 @@ import Link from "next/link";
 import { getFacts } from "@/lib/facts";
 import { buildPageMetadata } from "@/lib/page-meta";
 import { MODELS_COPY } from "@/lib/content/models";
-import { Icon, type IconName } from "@/components/icon";
+import { Icon } from "@/components/icon";
 import { ModelsTable } from "@/components/models-table";
 import { PageHeader, Section } from "@/components/page-header";
 import type { LocalizedText } from "@/lib/content/vocabulary";
@@ -16,8 +16,6 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
     title: pickText(MODELS_COPY.metaTitle, locale),
     description: pickText(MODELS_COPY.metaDescription, locale) });
 }
-
-const PATTERN_ICONS: IconName[] = ["key", "cpu", "layers"];
 
 /**
  * /models — connect a provider, then the source's own model and provider
@@ -53,22 +51,23 @@ export default async function ModelsPage({ params }: { params: Promise<{ locale:
       />
 
       <div className="page-body">
-        <Section id="models-setup" title={t(MODELS_COPY.setupTitle)} scope={t(MODELS_COPY.setupLead)}>
-          <ul className="dir-list dir-list-card" role="list">
-            {MODELS_COPY.patterns.map((pattern, index) => (
-              <li key={pattern.reference}>
-                <Link href={providerDocs} className="dir-row">
-                  <span className="dir-mark" aria-hidden="true"><Icon name={PATTERN_ICONS[index] ?? "key"} /></span>
-                  <span className="dir-text">
-                    <span className="dir-title">{t(pattern.title)}</span>
-                    <span className="dir-purpose">{t(pattern.detail)}</span>
-                    <span className="dir-meta">{pattern.reference}</span>
-                  </span>
-                  <span className="dir-action" aria-hidden="true"><Icon name="external" /></span>
-                </Link>
-              </li>
+        <Section
+          id="models-setup"
+          layout="split"
+          title={t(MODELS_COPY.setupTitle)}
+          scope={t(MODELS_COPY.setupLead)}
+          link={docsLink}
+        >
+          <dl className="ruled-list">
+            {MODELS_COPY.patterns.map((pattern) => (
+              <div key={pattern.reference}>
+                <dt>{pattern.reference}</dt>
+                <dd>
+                  <strong>{t(pattern.title)}</strong> · {t(pattern.detail)}
+                </dd>
+              </div>
             ))}
-          </ul>
+          </dl>
         </Section>
 
         <Section id="models-title" title={t(MODELS_COPY.modelsTitle)} scope={t(MODELS_COPY.modelsLead)} link={docsLink}>

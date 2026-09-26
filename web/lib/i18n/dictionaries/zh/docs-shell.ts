@@ -31,6 +31,7 @@ export const docsShell: DocsShellDict = {
   topicsHeading: "按主题",
   webGuideTag: "网页",
   sourceDocTag: "源文档",
+  sourceDetails: "详情",
   emptyTitle: "没有匹配的条目",
   emptyBody: "换一个关键词试试——中英文都可以搜索——或浏览 GitHub 上的完整文档目录。",
   emptyCta: "GitHub 文档目录 ↗",

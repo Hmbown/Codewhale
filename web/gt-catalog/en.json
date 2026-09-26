@@ -62,6 +62,8 @@
     "sourceCandidate": "Unreleased",
     "publishedRelease": "released",
     "figcaptionSourceCandidate": "unreleased",
+    "chapterTerminal": "Your terminal",
+    "chapterTerminalTitle": "Start with something you want to make",
     "gainHeading": "What you can do with Codewhale",
     "gainLede": "Ask for a concrete result: fix a bug, understand a project, or turn a repeated task into a workflow. Start with one agent and split larger jobs when useful.",
     "gain": [
@@ -78,6 +80,7 @@
         "Set permissions before work starts, respond to approval requests, and interrupt a running task. Review the conversation and tool results before continuing."
       ]
     ],
+    "chapterModels": "Your models",
     "modelsHeading": "A choice of models for every task",
     "modelsBody": "Choose the provider and model for each session: connect with an API key, use a supported provider sign-in, or run a local model. Your Codewhale account and your model connection serve different purposes.",
     "modelsFacts": [
@@ -99,6 +102,7 @@
     "startLede": "Install the published release, connect a model, then try one task in your project folder. A team of agents is optional; start with one and add more when the work can be split.",
     "startGuideLink": "Read the getting-started guide",
     "startVocabularyLink": "Look up a term",
+    "chapterAvailability": "Where it runs",
     "availabilityHeading": "Where you can use Codewhale",
     "availabilityLede": "The terminal and local browser client are available now. Desktop and hosted web apps are being developed around the same session model; their availability is listed separately below.",
     "availability": [
@@ -193,6 +197,7 @@
     "topicsHeading": "By topic",
     "webGuideTag": "Web guide",
     "sourceDocTag": "Source doc",
+    "sourceDetails": "Details",
     "emptyTitle": "No matching entry",
     "emptyBody": "Try a different word — searches match English and Chinese — or browse the complete docs directory on GitHub.",
     "emptyCta": "GitHub docs directory ↗",
@@ -1908,9 +1913,10 @@
     "reload": "Reload the page",
     "homeLink": "Back to the home page",
     "docsIndexLink": "Open the documentation index",
-    "notFoundTitle": "This page isn’t here",
-    "notFoundBody": "The link may be out of date, or the address has a typo. Start again from the home page or the documentation.",
-    "notFoundHomeLink": "Go to the home page",
+    "notFoundTitle": "We all make typos.",
+    "notFoundBody": "This page doesn’t exist yet.\nNeither does this game.",
+    "notFoundHomeLink": "Return to base",
+    "notFoundPosterAlt": "A blue whale in tactical gear on the fictional Codwhale: Modern Whalefare game poster.",
     "unavailableTitle": "The live record has not loaded",
     "unavailableBody": "The source did not answer the last refresh, or this page has not refreshed since it was built. Nothing is shown in its place.",
     "offlineTitle": "You are offline",

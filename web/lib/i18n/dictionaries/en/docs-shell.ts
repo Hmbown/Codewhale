@@ -33,6 +33,7 @@ export const docsShell: DocsShellDict = {
   topicsHeading: "By topic",
   webGuideTag: "Web guide",
   sourceDocTag: "Source doc",
+  sourceDetails: "Details",
   emptyTitle: "No matching entry",
   emptyBody:
     "Try a different word — searches match English and Chinese — or browse the complete docs directory on GitHub.",

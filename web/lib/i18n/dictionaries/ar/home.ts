@@ -28,6 +28,8 @@ export const home: HomeDict = {
   sourceCandidate: "غير منشور",
   publishedRelease: "منشور",
   figcaptionSourceCandidate: "غير منشور",
+  chapterTerminal: "طرفيتك",
+  chapterTerminalTitle: "ابدأ بشيء تريد صنعه",
   gainHeading:
     "ما يمكنك فعله باستخدام Codewhale",
   gainLede:
@@ -46,6 +48,7 @@ export const home: HomeDict = {
       "استخدم نماذج مستضافة أو محلية لوكلائك، بحيث تتولى النماذج والأدوار المختلفة أجزاء العمل المناسبة لها."
     ]
   ],
+  chapterModels: "نماذجك",
   modelsHeading: "خيارات من النماذج لكل مهمة",
   modelsBody:
     "اتصل مباشرة بمزوّد نماذج مستضافة، أو استخدم بوابة للوصول إلى عدة مزوّدين، أو شغّل نموذجًا محليًا، ثم اختر النموذج الذي تستخدمه كل جلسة أثناء عملك.",
@@ -60,6 +63,7 @@ export const home: HomeDict = {
     "بعد تثبيت Codewhale وربط نموذج، يمكنك وصف مهمتك الأولى في الطرفية وإضافة Fleet عندما تريد أن يتشارك عدة وكلاء العمل.",
   startGuideLink: "اقرأ دليل البداية ←",
   startVocabularyLink: "اطّلع على مفردات المنتج ←",
+  chapterAvailability: "أين يعمل",
   availabilityHeading: "أين يمكنك استخدام Codewhale",
   availabilityLede:
     "يمكنك استخدام Codewhale في طرفيتك اليوم، بينما نعمل على تطوير تطبيق الويب وتطبيق سطح المكتب وأجهزة الكمبيوتر السحابية.",

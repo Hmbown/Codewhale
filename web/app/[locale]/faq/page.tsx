@@ -763,8 +763,11 @@ export default async function FaqPage({ params }: { params: Promise<{ locale: st
         dangerouslySetInnerHTML={{ __html: serializeJsonLd(jsonLd) }}
       />
       <PageHeader
+        seal="问"
         kicker={t.eyebrow}
         title={t.title}
+        titleAside={t.titleAside}
+        titleAsideLang={t.titleAsideLang}
         lede={t.lead}
         pose="talk"
       />

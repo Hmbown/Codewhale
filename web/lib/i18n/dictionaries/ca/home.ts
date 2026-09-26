@@ -28,6 +28,8 @@ export const home: HomeDict = {
   sourceCandidate: "Sense publicar",
   publishedRelease: "publicada",
   figcaptionSourceCandidate: "sense publicar",
+  chapterTerminal: "El teu terminal",
+  chapterTerminalTitle: "Comença amb alguna cosa que vulguis crear",
   gainHeading:
     "Què pots fer amb Codewhale",
   gainLede:
@@ -46,6 +48,7 @@ export const home: HomeDict = {
       "Fes servir models allotjats o locals per als teus agents, amb models i rols diferents que s’encarreguin de les parts de la feina per a les quals són adequats."
     ]
   ],
+  chapterModels: "Els teus models",
   modelsHeading: "Opcions de models per a cada tasca",
   modelsBody:
     "Connecta’t directament a un proveïdor de models allotjats, fes servir una passarel·la per accedir a diversos proveïdors o executa un model en local, i tria quin model fa servir cada sessió mentre treballes.",
@@ -60,6 +63,7 @@ export const home: HomeDict = {
     "Un cop hagis instal·lat Codewhale i connectat un model, pots descriure la teva primera tasca al terminal i afegir un Fleet quan vulguis repartir la feina entre diversos agents.",
   startGuideLink: "Llegeix la guia d’inici",
   startVocabularyLink: "Consulta el vocabulari del producte",
+  chapterAvailability: "On funciona",
   availabilityHeading: "On pots fer servir Codewhale",
   availabilityLede:
     "Ja pots fer servir Codewhale al teu terminal mentre desenvolupem l’aplicació web, l’aplicació d’escriptori i els ordinadors al núvol.",

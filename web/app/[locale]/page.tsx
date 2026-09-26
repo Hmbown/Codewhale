@@ -1,11 +1,13 @@
 import { Fragment } from "react";
-import Image from "next/image";
 import Link from "next/link";
 import { GettingStartedSteps } from "@/components/getting-started-steps";
 import { HeroInstall } from "@/components/hero-install";
 import { Icon, type IconName } from "@/components/icon";
 import { InstallCodeBlock } from "@/components/install-code-block";
+import { Section } from "@/components/page-header";
 import { Status, type StatusTone } from "@/components/status-badge";
+import { Strata } from "@/components/strata";
+import { TerminalCapture } from "@/components/terminal-capture";
 import { WhalePose } from "@/components/whale-pose";
 import { getFacts } from "@/lib/facts";
 import { GETTING_STARTED_STEPS } from "@/lib/content/getting-started";
@@ -25,22 +27,23 @@ import { TERMINAL_SCREENSHOT } from "@/lib/media-manifest";
 // caching. `getFacts()` rejects legacy or older KV snapshots.
 export const revalidate = 300;
 
-// Row order is shared by every locale's `gain`, `surfaces` and
-// `availability` lists, so the marks and states follow the row, not a word.
+// Row order is shared by every locale's `gain` and `availability` lists, so
+// the marks and states follow the row, not a word.
 const GAIN_ICONS: IconName[] = ["terminal", "repeat", "shield"];
-const SURFACE_ICONS: IconName[] = ["terminal", "plug", "monitor", "folder", "users"];
 // Released · development preview · development build · in development.
 const AVAILABILITY_TONES: StatusTone[] = ["ready", "attention", "idle", "idle"];
 
 /**
- * The whale-road homepage: the promise and the install plate in the sky,
- * the whale resting on one calm horizon, and everything else in the sea
- * below it, which continues into the footer.
+ * The whale-road homepage: the promise and the install plate in the sky over
+ * the rising water, the whale resting on one calm horizon, and everything
+ * else in the sea below it. Chapters read as an editorial folio: a numbered
+ * running head, a title at section scale, and a ruled list beside it. One
+ * waterline band takes the page from the shallows into deep water.
  *
  * Every visible string resolves through `getHome(locale)`. The only literals
  * left here are code-owned per docs/VOICE.md: the product control vocabulary
  * (`Plan · Work · Operate`, `Ask · Auto-Review · Full Access`), package
- * channel proper nouns, and the screenshot path.
+ * channel proper nouns, and the chapter numerals.
  */
 export default async function HomePage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
@@ -68,9 +71,12 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
       />
 
       {/* THE SKY — the promise, the one primary action, the install plate,
-          and the whale resting on the horizon. */}
+          and the whale resting on the horizon over the rising water. */}
       <section className="home-hero" aria-labelledby="home-title">
         <div className="home-sky">
+          <div className="home-strata" aria-hidden="true">
+            <Strata variant="hero" />
+          </div>
           <div className="home-hero-inner">
             <div className="home-hero-copy">
               <h1 id="home-title" className="home-title">{d.heroTitle}</h1>
@@ -103,65 +109,63 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
         <div className="horizon" aria-hidden="true" />
       </section>
 
-      {/* THE SEA — deep water in dark, continuing into the footer; shallow
-          water settling back to paper in light. */}
-      <div className="home-sea sea-continues">
+      {/* THE SEA — the shallows under the horizon, then one waterline band
+          into deep water that continues into the footer. */}
+      <div className="home-sea">
         <div className="sea-texture" aria-hidden="true" />
         <div className="home-reflection" aria-hidden="true">
           <WhalePose pose="rest" />
         </div>
 
         <div className="home-sea-body">
-          {/* The real terminal, just under the surface. Exact-build PTY
-              capture of an empty session: no fabricated conversation,
-              connected tools or completion metrics. */}
-          <section className="home-section" aria-label={d.shotPreview}>
-            <figure className="figure home-shot">
-              <div className="figure-frame">
-                <Image
-                  src={TERMINAL_SCREENSHOT.src}
-                  alt={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
-                  width={TERMINAL_SCREENSHOT.width}
-                  height={TERMINAL_SCREENSHOT.height}
-                  sizes="(max-width: 62rem) calc(100vw - 2rem), 60rem"
-                  unoptimized
-                />
+          {/* 01 — The real terminal, just under the surface: live text from
+              an exact-build PTY cell capture of a first session. No
+              fabricated conversation, connected tools or completion
+              metrics. */}
+          <section className="home-section home-shot-section" aria-labelledby="home-terminal">
+            <div className="home-shot">
+              <div className="section-head-text">
+                <p className="section-label">01 / {d.chapterTerminal}</p>
+                <h2 className="section-title" id="home-terminal">{d.chapterTerminalTitle}</h2>
               </div>
-              <figcaption className="figure-caption">
-                <span>
-                  {d.shotPreview} · {fill(d.shotBuild, { version: TERMINAL_SCREENSHOT.version })}
-                </span>
-                {/* Each fact is its own translated unit; nothing is
-                    concatenated around a token. */}
-                <span
-                  className="status-line"
-                  data-source-state={sourceIsPublished ? "published release" : "source candidate"}
-                  data-source-state-label={sourceIsPublished ? d.publishedRelease : d.figcaptionSourceCandidate}
-                >
-                  <Status tone={publishedRelease ? "ready" : "idle"}>
-                    {publishedRelease
-                      ? fill(d.latestRelease, { tag: publishedRelease.tag })
-                      : d.releaseUnavailable}
-                  </Status>
-                  <span>{`${sourceIsPublished ? d.currentSource : d.sourceCandidate} v${sourceVersion}`}</span>
-                  <span>{facts.license ?? "MIT"}</span>
-                </span>
-              </figcaption>
-            </figure>
+              <figure className="figure">
+                <div className="figure-frame">
+                  <TerminalCapture
+                    frame="home"
+                    regionLabel={d.shotPreview}
+                    label={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
+                  />
+                </div>
+                <figcaption className="figure-caption">
+                  <span>
+                    {d.shotPreview} · {fill(d.shotBuild, { version: TERMINAL_SCREENSHOT.version })}
+                  </span>
+                  {/* Each fact is its own translated unit; nothing is
+                      concatenated around a token. */}
+                  <span
+                    className="status-line"
+                    data-source-state={sourceIsPublished ? "published release" : "source candidate"}
+                    data-source-state-label={sourceIsPublished ? d.publishedRelease : d.figcaptionSourceCandidate}
+                  >
+                    <Status tone={publishedRelease ? "ready" : "idle"}>
+                      {publishedRelease
+                        ? fill(d.latestRelease, { tag: publishedRelease.tag })
+                        : d.releaseUnavailable}
+                    </Status>
+                    <span>{`${sourceIsPublished ? d.currentSource : d.sourceCandidate} v${sourceVersion}`}</span>
+                    <span>{facts.license ?? "MIT"}</span>
+                  </span>
+                </figcaption>
+              </figure>
+            </div>
           </section>
 
-          {/* WHAT YOU CAN DO */}
-          <section className="home-section" aria-labelledby="home-gain">
-            <div className="section-head">
-              <div className="section-head-text">
-                <h2 className="section-title" id="home-gain">{d.gainHeading}</h2>
-                <p className="section-scope">{d.gainLede}</p>
-              </div>
-            </div>
-            <div className="grid-3">
+          {/* WHAT YOU CAN DO — three ruled columns. */}
+          <Section id="home-gain" title={d.gainHeading} scope={d.gainLede} className="home-section">
+            <div className="ruled-cols">
               {d.gain.map(([title, body], index) => (
-                <div key={title} className="tile">
-                  <span className="tile-icon" aria-hidden="true">
+                <div key={title}>
+                  <span className="ruled-icon" aria-hidden="true">
                     <Icon name={GAIN_ICONS[index] ?? "terminal"} />
                   </span>
                   <h3>{title}</h3>
@@ -169,70 +173,68 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                 </div>
               ))}
             </div>
-          </section>
+          </Section>
 
           {/* TOOLS, CONNECTED APPS, SAVED WORK */}
-          <section className="home-section" aria-labelledby="home-surfaces">
-            <div className="section-head">
-              <div className="section-head-text">
-                <h2 className="section-title" id="home-surfaces">{d.surfacesHeading}</h2>
-              </div>
+          <Section
+            id="home-surfaces"
+            layout="split"
+            className="home-section"
+            title={d.surfacesHeading}
+            link={
               <Link href={`/${locale}/runtime`} className="section-link">
                 {d.runtimeLink}
                 <Icon name="arrow-right" className="icon icon-flip" />
               </Link>
-            </div>
-            <ul className="dir-list dir-list-card" role="list">
-              {d.surfaces.map(([name, description], index) => (
-                <li key={name}>
-                  <div className="dir-row">
-                    <span className="dir-mark" aria-hidden="true">
-                      <Icon name={SURFACE_ICONS[index] ?? "terminal"} />
-                    </span>
-                    <span className="dir-text">
-                      <span className="dir-title">{name}</span>
-                      <span className="dir-purpose">{description}</span>
-                    </span>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          </section>
-
-          {/* YOUR MODELS */}
-          <section className="home-section" aria-labelledby="home-models">
-            <div className="split">
-              <div className="section-head-text">
-                <h2 className="section-title" id="home-models">{d.modelsHeading}</h2>
-                <p className="section-scope">{d.modelsBody}</p>
-                <Link href={`/${locale}/models`} className="section-link">
-                  {d.modelsLink}
-                  <Icon name="arrow-right" className="icon icon-flip" />
-                </Link>
-              </div>
-              <dl className="def-rows">
-                {d.modelsFacts.map(([kind, description]) => (
-                  <div key={kind} className="def-row">
-                    <dt>{kind}</dt>
-                    <dd>{description}</dd>
-                  </div>
-                ))}
-                <div className="def-row home-modes">
-                  <dt>Plan · Work · Operate</dt>
-                  <dd>Ask · Auto-Review · Full Access</dd>
+            }
+          >
+            <dl className="ruled-list">
+              {d.surfaces.map(([name, description]) => (
+                <div key={name}>
+                  <dt>{name}</dt>
+                  <dd>{description}</dd>
                 </div>
-              </dl>
-            </div>
-          </section>
+              ))}
+            </dl>
+          </Section>
 
-          {/* START */}
-          <section className="home-section product-start" aria-labelledby="home-start">
-            <div className="section-head">
-              <div className="section-head-text">
-                <h2 className="section-title" id="home-start">{d.startHeading}</h2>
-                <p className="section-scope">{d.startLede}</p>
+          {/* 02 — YOUR MODELS */}
+          <Section
+            id="home-models"
+            layout="split"
+            className="home-section"
+            label={`02 / ${d.chapterModels}`}
+            title={d.modelsHeading}
+            scope={d.modelsBody}
+            link={
+              <Link href={`/${locale}/models`} className="section-link">
+                {d.modelsLink}
+                <Icon name="arrow-right" className="icon icon-flip" />
+              </Link>
+            }
+          >
+            <dl className="ruled-list">
+              {d.modelsFacts.map(([kind, description]) => (
+                <div key={kind}>
+                  <dt>{kind}</dt>
+                  <dd>{description}</dd>
+                </div>
+              ))}
+              <div className="home-modes">
+                <dt>Plan · Work · Operate</dt>
+                <dd>Ask · Auto-Review · Full Access</dd>
               </div>
-            </div>
+            </dl>
+          </Section>
+
+          {/* 03 — START */}
+          <Section
+            id="home-start"
+            className="home-section product-start"
+            label={`03 / ${d.getCodewhale}`}
+            title={d.startHeading}
+            scope={d.startLede}
+          >
             <GettingStartedSteps locale={locale} />
             <div className="product-start-links">
               <Link href={`/${locale}/docs/guide`} className="section-link">
@@ -244,19 +246,36 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
                 <Icon name="arrow-right" className="icon icon-flip" />
               </Link>
             </div>
-          </section>
+          </Section>
+        </div>
 
-          {/* WHERE IT RUNS TODAY — each surface with a mark and a word. */}
-          <section className="home-section" aria-labelledby="home-availability">
-            <div className="section-head">
-              <div className="section-head-text">
-                <h2 className="section-title" id="home-availability">{d.availabilityHeading}</h2>
-                <p className="section-scope">{d.availabilityLede}</p>
-              </div>
-            </div>
-            <dl className="def-rows">
+        {/* THE WATERLINE — the shallows give way to deep water, which
+            continues through the footer. */}
+        <div className="waterline waterline-deep" aria-hidden="true">
+          <Strata variant="band" />
+        </div>
+      </div>
+
+      <div className="home-deep stage sea-continues">
+        <div className="home-sea-body">
+          {/* 04 — WHERE IT RUNS TODAY — each surface with a mark and a word. */}
+          <Section
+            id="home-availability"
+            layout="split"
+            className="home-section"
+            label={`04 / ${d.chapterAvailability}`}
+            title={d.availabilityHeading}
+            scope={d.availabilityLede}
+            link={
+              <a href={APP_SIGNUP_URL} className="section-link" data-usage="signup">
+                {d.accountLink}
+                <Icon name="arrow-right" className="icon icon-flip" />
+              </a>
+            }
+          >
+            <dl className="ruled-list">
               {d.availability.map(([surface, status, detail], index) => (
-                <div key={surface} className="def-row">
+                <div key={surface}>
                   <dt>{surface}</dt>
                   <dd>
                     <Status tone={AVAILABILITY_TONES[index] ?? "idle"}>{status}</Status>
@@ -266,13 +285,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
               ))}
             </dl>
             <p className="section-scope mt-4">{d.availabilityNote}</p>
-            <div className="actions mt-3">
-              <a href={APP_SIGNUP_URL} className="section-link" data-usage="signup">
-                {d.accountLink}
-                <Icon name="arrow-right" className="icon icon-flip" />
-              </a>
-            </div>
-          </section>
+          </Section>
 
           {/* INSTALL — the command again, where the page ends. */}
           <section className="home-section" aria-labelledby="home-install">
@@ -295,9 +308,9 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
             </div>
           </section>
 
-          {/* COMMUNITY */}
+          {/* COMMUNITY — a list that needs its marks keeps the boxed rows. */}
           <section className="home-section" aria-labelledby="home-community">
-            <div className="split">
+            <div className="section-split">
               <div className="section-head-text">
                 <h2 className="section-title" id="home-community">{d.communityHeading}</h2>
                 <p className="section-scope">{d.communityBody}</p>

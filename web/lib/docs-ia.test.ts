@@ -365,7 +365,9 @@ describe("homepage integration", () => {
     // (plain "Unreleased", per docs/design/WEB_VOICE.md).
     expect(homepage).toContain("d.sourceCandidate");
     expect(getHome("en").sourceCandidate).toBe("Unreleased");
-    expect(homepage).toContain("src={TERMINAL_SCREENSHOT.src}");
+    // The terminal is the live capture, labelled with the captured build.
+    expect(homepage).toContain("<TerminalCapture");
+    expect(homepage).toContain("TERMINAL_SCREENSHOT.version");
     for (const label of ["Plan", "Work", "Operate", "Ask", "Auto-Review", "Full Access"]) {
       expect(homepage).toContain(label);
     }

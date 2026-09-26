@@ -246,28 +246,27 @@
 .mm-action.paper-install-cta { margin-top: 1.5rem; }
 
 /* ---------- footer — the sea below the horizon ---------- */
-/* The footer is the stage in both appearances. Its top edge is the page's
-   one horizon: a straight line of light, the sea bright at the waterline
-   and deep within a few rows. */
+/* Every page descends into the footer through one waterline band
+   (components/strata.tsx): the page's ground above, the logo's deep blue at
+   its floor. The band's floor is the footer's horizon, a straight line of
+   light, and below it the sea, bright at the waterline and deep within a few
+   rows, in both appearances. */
 .site-footer {
+  position: relative;
+  color: var(--muted);
+}
+/* The band stands on the page's own ground (--page-ground is resolved on
+   :root, before the footer re-declares the stage roles). */
+.site-footer > .waterline { background: var(--page-ground); }
+/* A page whose main already ends in deep water (the home sea) keeps that
+   water behind the band instead of the page ground. */
+main:has(.sea-continues:last-child) + .site-footer > .waterline { background: var(--ocean-floor); }
+.site-footer-sea {
   position: relative;
   overflow: hidden;
   background: var(--sea), var(--ocean-floor);
-  color: var(--muted);
 }
-.site-footer > .horizon { position: absolute; inset: 0 0 auto; z-index: 1; }
-
-/* In dark, a page whose main already ends in the sea continues into the
-   footer with no second horizon. In light the home sea settles back to
-   paper, so the footer keeps its own horizon. */
-:root[data-theme="dark"] main:has(.sea-continues:last-child) + .site-footer { background: var(--ocean-floor); }
-:root[data-theme="dark"] main:has(.sea-continues:last-child) + .site-footer > .horizon,
-:root[data-theme="dark"] main:has(.sea-continues:last-child) + .site-footer > .sea-texture { display: none; }
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) main:has(.sea-continues:last-child) + .site-footer { background: var(--ocean-floor); }
-  :root:not([data-theme="light"]) main:has(.sea-continues:last-child) + .site-footer > .horizon,
-  :root:not([data-theme="light"]) main:has(.sea-continues:last-child) + .site-footer > .sea-texture { display: none; }
-}
+.site-footer-sea > .horizon { position: absolute; inset: 0 0 auto; z-index: 1; }
 
 .site-footer-main,
 .site-footer-meta {
@@ -348,8 +347,10 @@
 }
 
 @media print {
-  .site-footer { background: none; color: inherit; border-top: 1px solid currentColor; }
-  .site-footer > .horizon { display: none; }
+  .site-footer { color: inherit; border-top: 1px solid currentColor; }
+  .site-footer-sea { background: none; }
+  .site-footer > .waterline,
+  .site-footer-sea > .horizon { display: none; }
 }
 
 /* ---------- usage counting: the privacy page's control ---------- */

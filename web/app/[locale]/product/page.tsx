@@ -22,7 +22,6 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
 // Row order is fixed by PRODUCT_COPY and the home dictionary, so marks and
 // states follow the row, not a translated word.
 const GAIN_ICONS: IconName[] = ["layers", "users", "shield"];
-const SURFACE_ICONS: IconName[] = ["terminal", "plug", "monitor", "folder", "users"];
 // Terminal released · local browser ships with it · hosted web preview ·
 // desktop development build · cloud computers in development.
 const AVAILABILITY_TONES: StatusTone[] = ["ready", "ready", "attention", "idle", "idle"];
@@ -69,10 +68,10 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
             </Link>
           }
         >
-          <div className="grid-3">
+          <div className="ruled-cols">
             {PRODUCT_COPY.gain.map((row, index) => (
-              <div key={row.title.en} className="tile">
-                <span className="tile-icon" aria-hidden="true">
+              <div key={row.title.en}>
+                <span className="ruled-icon" aria-hidden="true">
                   <Icon name={GAIN_ICONS[index] ?? "layers"} />
                 </span>
                 <h3>{t(row.title)}</h3>
@@ -84,6 +83,7 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
 
         <Section
           id="product-surfaces"
+          layout="split"
           title={t(PRODUCT_COPY.surfacesHeading)}
           scope={t(PRODUCT_COPY.surfacesLede)}
           link={
@@ -93,36 +93,34 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
             </Link>
           }
         >
-          <ul className="dir-list dir-list-card" role="list">
-            {home.surfaces.map(([name, description], index) => (
-              <li key={name}>
-                <div className="dir-row">
-                  <span className="dir-mark" aria-hidden="true">
-                    <Icon name={SURFACE_ICONS[index] ?? "terminal"} />
-                  </span>
-                  <span className="dir-text">
-                    <span className="dir-title">{name}</span>
-                    <span className="dir-purpose">{description}</span>
-                  </span>
-                </div>
-              </li>
+          <dl className="ruled-list">
+            {home.surfaces.map(([name, description]) => (
+              <div key={name}>
+                <dt>{name}</dt>
+                <dd>{description}</dd>
+              </div>
             ))}
-          </ul>
+          </dl>
         </Section>
 
-        <Section id="product-control" title={t(PRODUCT_COPY.controlHeading)} scope={t(PRODUCT_COPY.controlLede)}>
-          <div className="grid-2">
-            <dl className="def-rows">
+        <Section
+          id="product-control"
+          layout="split"
+          title={t(PRODUCT_COPY.controlHeading)}
+          scope={t(PRODUCT_COPY.controlLede)}
+        >
+          <div className="stack">
+            <dl className="ruled-list">
               {PRODUCT_COPY.modes.map((row) => (
-                <div key={row.title.en} className="def-row">
+                <div key={row.title.en}>
                   <dt>{t(row.title)}</dt>
                   <dd>{t(row.body)}</dd>
                 </div>
               ))}
             </dl>
-            <dl className="def-rows">
+            <dl className="ruled-list">
               {PRODUCT_COPY.permissions.map((row) => (
-                <div key={row.title.en} className="def-row">
+                <div key={row.title.en}>
                   <dt>{t(row.title)}</dt>
                   <dd>{t(row.body)}</dd>
                 </div>
@@ -133,12 +131,13 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
 
         <Section
           id="product-availability"
+          layout="split"
           title={t(PRODUCT_COPY.availabilityHeading)}
           scope={t(PRODUCT_COPY.availabilityLede)}
         >
-          <dl className="def-rows">
+          <dl className="ruled-list">
             {PRODUCT_COPY.availability.map((row, index) => (
-              <div key={row.surface.en} className="def-row">
+              <div key={row.surface.en}>
                 <dt>{t(row.surface)}</dt>
                 <dd>
                   <Status tone={AVAILABILITY_TONES[index] ?? "idle"}>{t(row.status)}</Status>

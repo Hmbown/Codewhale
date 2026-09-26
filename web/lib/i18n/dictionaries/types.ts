@@ -159,12 +159,18 @@ export interface HomeDict {
   /** "released" / "unreleased" — the machine-readable source-state label. */
   publishedRelease: string;
   figcaptionSourceCandidate: string;
+  /** Running head of the terminal chapter ("01 / Your terminal"). */
+  chapterTerminal: string;
+  /** Title of the terminal chapter, above the live capture. */
+  chapterTerminalTitle: string;
 
   /** What a person gains: heading, lede, and three [title, body] columns. */
   gainHeading: string;
   gainLede: string;
   gain: [string, string][];
 
+  /** Running head of the models chapter ("02 / Your models"). */
+  chapterModels: string;
   modelsHeading: string;
   modelsBody: string;
   /** Three [route kind, description] rows. */
@@ -176,6 +182,8 @@ export interface HomeDict {
   startGuideLink: string;
   startVocabularyLink: string;
 
+  /** Running head of the availability chapter ("04 / Where it runs"). */
+  chapterAvailability: string;
   availabilityHeading: string;
   availabilityLede: string;
   availability: [string, string, string][];
@@ -266,6 +274,8 @@ export interface DocsShellDict {
   webGuideTag: string;
   /** Row tag for a GitHub source document. */
   sourceDocTag: string;
+  /** Per-row disclosure that reveals the repository files a topic comes from. */
+  sourceDetails: string;
   emptyTitle: string;
   emptyBody: string;
   emptyCta: string;
@@ -317,6 +327,8 @@ export interface StatesDict {
   notFoundTitle: string;
   notFoundBody: string;
   notFoundHomeLink: string;
+  /** Alt text for the 404 poster (public/codwhale-404.webp). */
+  notFoundPosterAlt: string;
   /**
    * A data-bearing page whose source was not asked (build-time prerender)
    * or refused (rate limit, outage). Distinct from `empty`, which asserts
@@ -465,6 +477,10 @@ export interface FaqDict {
   eyebrow: string;
   /** Page H1. */
   title: string;
+  /** The H1 again in the other script, set beside it (the bilingual Han title). */
+  titleAside: string;
+  /** BCP 47 language of `titleAside`. */
+  titleAsideLang: string;
   lead: string;
   notCovered: string;
   openIssue: string;

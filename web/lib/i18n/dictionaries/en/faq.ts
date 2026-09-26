@@ -12,6 +12,8 @@ export const faq: FaqDict = {
     "Codewhale frequently asked questions: install, config, providers, models, modes, security, and privacy. Answers sourced from real code, docs, and GitHub issues.",
   eyebrow: "FAQ",
   title: "Frequently asked questions",
+  titleAside: "常见问题",
+  titleAsideLang: "zh",
   lead: "Answers sourced from real code, docs, release notes, and GitHub issues. Sources are cited below each answer. If your question isn't covered, open an issue on GitHub.",
   notCovered: "Didn't find your question?",
   openIssue: "Open an issue",
