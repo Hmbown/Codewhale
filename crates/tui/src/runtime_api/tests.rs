@@ -20180,3 +20180,33 @@ async fn jobs_api_pty_resize_raw_input_and_nonblocking_poll() -> Result<()> {
     handle.abort();
     Ok(())
 }
+
+#[test]
+fn the_mobile_page_follows_agents_by_name() {
+    // #6565 / #6474: the mobile page never subscribed to agent events.
+    let html = super::MOBILE_HTML;
+    for event in [
+        "\"agent.spawned\"",
+        "\"agent.progress\"",
+        "\"agent.completed\"",
+    ] {
+        assert!(html.contains(event), "subscribes to {event}");
+    }
+    assert!(html.contains("id=\"agents\""), "has an agents strip");
+    assert!(
+        html.contains("payload.agent_name"),
+        "names agents by their name"
+    );
+    assert!(
+        html.contains("if (name === \"agent.completed\")"),
+        "eventText renders completion"
+    );
+    assert!(
+        html.contains("state.agents.clear()"),
+        "a new thread starts a new strip"
+    );
+    assert!(
+        !html.contains("\"Sub-agent \" + payload.agent_id"),
+        "never shows the raw id"
+    );
+}

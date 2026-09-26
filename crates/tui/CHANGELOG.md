@@ -213,6 +213,12 @@ quieter, and Fleet runs can be checked before they spend anything.
   Each agent also has one name: a workflow task's label or its dispatch name
   appears on the rows, the notification and the runtime API alike, never its
   internal id ([#6565](https://github.com/Hmbown/Codewhale/issues/6565)).
+- The mobile page shows the thread's agents: a strip naming each one, its
+  state, and what it is doing or what it found, rebuilt when the page
+  reconnects. Sub-agent prompt caching now counts toward the session. PRICE
+  and `/cache` show the parent, agents and combined hit rates, each labelled,
+  and the footer `cache N%` still means this conversation's own requests
+  ([#6565](https://github.com/Hmbown/Codewhale/issues/6565)).
 
 ### Plugins
 

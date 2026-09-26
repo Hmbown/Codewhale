@@ -1099,6 +1099,13 @@ pub struct SessionState {
     /// the ordinary input rate, so folding it into misses understated spend.
     pub total_cache_write_tokens: u32,
     pub total_output_tokens: u32,
+    /// Prompt-cache classes the session's sub-agents and other background
+    /// routes reported, from their drained cost batches (#6565). The same
+    /// per-runtime-session scope as the parent's totals above. `None` until a
+    /// background route reports cache telemetry: absent, never 0%.
+    pub subagent_cache_hit_tokens: Option<u64>,
+    pub subagent_cache_miss_tokens: Option<u64>,
+    pub subagent_cache_write_tokens: Option<u64>,
     /// Turns whose route was money-metered and produced an authoritative
     /// price. These are exactly the turns inside `session_cost`.
     pub cost_priced_turns: u32,
@@ -1264,6 +1271,9 @@ impl Default for SessionState {
             total_cache_miss_tokens: 0,
             total_cache_write_tokens: 0,
             total_output_tokens: 0,
+            subagent_cache_hit_tokens: None,
+            subagent_cache_miss_tokens: None,
+            subagent_cache_write_tokens: None,
             cost_priced_turns: 0,
             cost_unpriced_turns: 0,
             cost_cny_priced_turns: 0,
@@ -1294,6 +1304,9 @@ impl SessionState {
         self.total_cache_miss_tokens = 0;
         self.total_cache_write_tokens = 0;
         self.total_output_tokens = 0;
+        self.subagent_cache_hit_tokens = None;
+        self.subagent_cache_miss_tokens = None;
+        self.subagent_cache_write_tokens = None;
         self.clear_pending_turn_usage();
     }
 
@@ -4037,6 +4050,23 @@ impl App {
         if pool.estimate.is_positive() {
             self.accrue_subagent_cost_estimate(pool.estimate);
         }
+        let add = |slot: &mut Option<u64>, tokens: Option<u64>| {
+            if let Some(tokens) = tokens {
+                *slot = Some(slot.unwrap_or(0).saturating_add(tokens));
+            }
+        };
+        add(
+            &mut self.session.subagent_cache_hit_tokens,
+            pool.cache_hit_tokens,
+        );
+        add(
+            &mut self.session.subagent_cache_miss_tokens,
+            pool.cache_miss_tokens,
+        );
+        add(
+            &mut self.session.subagent_cache_write_tokens,
+            pool.cache_write_tokens,
+        );
         self.absorb_background_cost_coverage(pool);
         runtime_usage_arrived
     }

@@ -239,12 +239,12 @@ pub(super) fn price_rows(app: &mut App) -> Vec<WorkRow> {
             });
         }
     }
-    let metrics = crate::tui::session_metrics::snapshot_from_app(app);
-    if let Some(pct) = metrics.cache_hit_percent {
+    let rates = crate::tui::session_metrics::cache_rates(app);
+    if let Some(rates) = rates.labelled("parent", "agents", "combined") {
         out.push(WorkRow {
             id: WorkRowId("price:cache".to_string()),
             mark: "·",
-            label: format!("cache hit · {pct}%"),
+            label: format!("cache hit · {rates}"),
             detail: "/cache for per-turn cache telemetry".to_string(),
             tone: WorkTone::Muted,
             selectable: true,
