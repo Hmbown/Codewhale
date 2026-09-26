@@ -10,6 +10,7 @@ permissions:
 jobs:
   lockdown:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Auto-close spam patterns from new accounts
         uses: actions/github-script@v9

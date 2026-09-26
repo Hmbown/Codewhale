@@ -550,6 +550,9 @@ pub struct AgentProgressMeta {
     /// `WorkState` envelope. `None` until a real list is published — the
     /// strip never invents a `0 left` chip for agents with no checklist.
     pub todos_remaining: Option<u32>,
+    /// The engine's name for this agent from its spawn or completion event
+    /// (`subagent_display_name`), used until a manager snapshot arrives.
+    pub display_name: Option<String>,
 }
 
 /// Per-turn LSP repair-loop summary for the Turn Inspector (#4107).
@@ -1936,11 +1939,6 @@ pub struct App {
     /// Maps raw agent_id to a stable user-facing label (#3030).
     /// Populated when `AgentSpawned` fires; read by sidebar rendering.
     pub agent_label_map: HashMap<String, String>,
-    /// The label a workflow gave each child task (`task_id` == `agent_id`),
-    /// from its `task_started` event. It outranks role- and counter-derived
-    /// labels on every surface, so the card, status, roster and dock name a
-    /// workflow child the same way (#6565).
-    pub workflow_agent_labels: HashMap<String, String>,
     /// The child whose full transcript currently owns the main conversation
     /// area and whose fork the composer addresses (`None` = main session).
     pub agent_focus: Option<crate::tui::agent_focus::AgentFocus>,
@@ -1957,10 +1955,6 @@ pub struct App {
     /// `/agents list` asked for a one-shot transcript listing. Cleared by the
     /// `AgentList` handler that prints it.
     pub agent_roster_print_requested: bool,
-    /// Per-role sequence counters for unnamed children (#3030). Two concurrent
-    /// builders render as `builder · 1` and `builder · 2` instead of sharing a
-    /// bare, indistinguishable role label.
-    pub agent_role_counters: HashMap<String, u64>,
     /// Last time a sub-agent progress event triggered a redraw.
     /// Used to throttle redraws under high sub-agent concurrency (#3033).
     pub last_agent_progress_redraw: Option<Instant>,
@@ -4443,55 +4437,6 @@ impl App {
         (!name.is_empty() && name != agent.agent_id).then(|| name.to_string())
     }
 
-    /// Resolve the most specific member/role token for an agent, in priority
-    /// order: resolved profile id, advisory assignment role, requested alias,
-    /// canonical route role, then Fleet type. `None` only for a
-    /// progress-only agent whose dispatch metadata has not arrived yet.
-    fn agent_role_label(&self, agent_id: &str) -> Option<String> {
-        let agent = self
-            .subagent_cache
-            .iter()
-            .find(|agent| agent.agent_id == agent_id)?;
-        agent
-            .child_route
-            .as_ref()
-            .and_then(|route| route.resolved_profile_id.as_deref())
-            .map(str::trim)
-            .filter(|profile| !profile.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                agent
-                    .assignment
-                    .role
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|role| !role.is_empty())
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                agent
-                    .child_route
-                    .as_ref()
-                    .and_then(|route| route.requested_profile.as_deref())
-                    .map(str::trim)
-                    .filter(|profile| !profile.is_empty())
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                agent
-                    .child_route
-                    .as_ref()
-                    .map(|route| route.canonical_role.trim())
-                    .filter(|role| !role.is_empty())
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                let role = agent.agent_type.as_str().trim();
-                (!role.is_empty()).then(|| role.to_string())
-            })
-            .map(|role| crate::fleet::role::public_role_label(&role))
-    }
-
     /// `true` for the `Agent N` counter placeholder assigned before a child's
     /// dispatch metadata arrives. Placeholders are the only label that may be
     /// upgraded once the child's identity is observed.
@@ -4501,27 +4446,41 @@ impl App {
             .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
     }
 
-    /// Resolve the identity-backed label for an agent, or `None` when no
-    /// identity field is populated (so the caller falls back to a counter
-    /// placeholder). Named children keep their name and gain a role suffix
-    /// when the role is not already part of the name; unnamed children are
-    /// disambiguated with a per-role sequence counter.
+    /// The engine's name for an agent (#6565): resolved from the manager
+    /// snapshot when there is one, else from the name its spawn or completion
+    /// event carried. `None` only for a progress-only agent whose identity has
+    /// not arrived yet, so the caller falls back to a counter placeholder.
+    fn engine_agent_name(&self, agent_id: &str) -> Option<String> {
+        self.subagent_cache
+            .iter()
+            .find(|agent| agent.agent_id == agent_id)
+            .map(crate::tools::subagent::subagent_result_display_name)
+            .or_else(|| {
+                self.agent_progress_meta
+                    .get(agent_id)
+                    .and_then(|meta| meta.display_name.clone())
+            })
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty() && name != agent_id)
+    }
+
+    /// The engine's name, made unique among the labels already shown: two
+    /// parallel "review" tasks read "review" and "review · 2", the only thing
+    /// the TUI adds to the engine's name.
     fn resolved_identity_label(&mut self, agent_id: &str) -> Option<String> {
-        if let Some(label) = self.workflow_agent_labels.get(agent_id) {
-            return Some(label.clone());
+        let name = self.engine_agent_name(agent_id)?;
+        let shown_by_another = |candidate: &str| {
+            self.agent_label_map
+                .iter()
+                .any(|(id, shown)| id != agent_id && shown == candidate)
+        };
+        let mut unique = name.clone();
+        let mut sequence = 1u64;
+        while shown_by_another(&unique) {
+            sequence += 1;
+            unique = format!("{name} · {sequence}");
         }
-        let name = self.agent_session_name(agent_id);
-        let role = self.agent_role_label(agent_id);
-        match (name, role) {
-            (Some(name), Some(role)) if !name.contains(&role) => Some(format!("{name} · {role}")),
-            (Some(name), _) => Some(name),
-            (None, Some(role)) => {
-                let next = self.agent_role_counters.entry(role.clone()).or_insert(0);
-                *next += 1;
-                Some(format!("{role} · {next}"))
-            }
-            (None, None) => None,
-        }
+        Some(unique)
     }
 
     fn next_agent_placeholder(&mut self) -> String {
@@ -4529,56 +4488,17 @@ impl App {
         format!("Agent {}", self.agent_counter)
     }
 
-    /// Record the label a workflow gave a child (#6565). It replaces whatever
-    /// label the child got before the workflow event arrived — a counter
-    /// placeholder or a role-derived name — so no surface keeps the old one.
-    ///
-    /// A script can give parallel tasks the same label ("review"). The person
-    /// still has to tell them apart on the approval card and in the footer,
-    /// so a label another agent already shows gets a sequence suffix
-    /// ("review · 2"), the way unnamed children get role counters.
-    pub(crate) fn note_workflow_agent_label(&mut self, agent_id: &str, label: &str) {
-        let label = label.trim();
-        if agent_id.trim().is_empty() || label.is_empty() {
-            return;
-        }
-        let already_given = self
-            .workflow_agent_labels
-            .get(agent_id)
-            .is_some_and(|given| {
-                given == label
-                    || given
-                        .strip_prefix(label)
-                        .and_then(|rest| rest.strip_prefix(" · "))
-                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-            });
-        if already_given {
-            return;
-        }
-        let shown_by_another = |candidate: &str| {
-            self.agent_label_map
-                .iter()
-                .any(|(id, shown)| id != agent_id && shown == candidate)
-        };
-        let mut unique = label.to_string();
-        let mut sequence = 1u64;
-        while shown_by_another(&unique) {
-            sequence += 1;
-            unique = format!("{label} · {sequence}");
-        }
-        self.workflow_agent_labels
-            .insert(agent_id.to_string(), unique.clone());
-        self.agent_label_map.insert(agent_id.to_string(), unique);
-    }
-
-    /// The name this agent was given: its workflow task label, else its
-    /// dispatch (session) name — the same order `resolved_identity_label`
-    /// uses. Every surface that names an agent leads with this, so they
-    /// cannot disagree (#6565).
+    /// The name this agent was *given*: its workflow task label or another
+    /// explicit nickname, else its dispatch (session) name. `None` for an
+    /// agent that goes by its role, so a surface can fall back to its own
+    /// placeholder (a generated whale name on the sidebar).
     pub(crate) fn agent_given_name(&self, agent_id: &str) -> Option<String> {
-        self.workflow_agent_labels
-            .get(agent_id)
-            .cloned()
+        let agent = self
+            .subagent_cache
+            .iter()
+            .find(|agent| agent.agent_id == agent_id)?;
+        crate::tools::subagent::explicit_nickname(agent_id, agent.nickname.as_deref())
+            .map(str::to_string)
             .or_else(|| self.agent_session_name(agent_id))
     }
 
@@ -5451,14 +5371,6 @@ impl App {
         };
         if event_run_id.trim().is_empty() {
             return false;
-        }
-        if let WorkflowPanelEvent::TaskStarted {
-            task_id,
-            label: Some(label),
-            ..
-        } = &event
-        {
-            self.note_workflow_agent_label(task_id, label);
         }
         if let WorkflowPanelEvent::RunStarted { run_id, .. } = &event
             && run_id != event_run_id

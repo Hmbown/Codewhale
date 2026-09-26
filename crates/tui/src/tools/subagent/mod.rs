@@ -120,8 +120,12 @@ pub use coord::{
 };
 #[allow(unused_imports)]
 pub use mailbox::{Mailbox, MailboxEnvelope, MailboxMessage, MailboxReceiver};
+pub(crate) use naming::explicit_nickname;
 use naming::generated_whale_name_base;
 pub(crate) use naming::localized_whale_display_names;
+pub(crate) use naming::subagent_display_name;
+pub(crate) use naming::subagent_result_display_name;
+pub(crate) use naming::subagent_role_label;
 #[allow(unused_imports)] // compatibility path; some consumers exist only in test builds today
 pub use naming::{
     WHALE_NICKNAMES, assign_unique_whale_name_in_locale, whale_name_for_id_in_locale,
@@ -2372,6 +2376,7 @@ impl SubAgentTerminalDeliveryContext {
                     spawn_depth: Some(result.spawn_depth),
                     continuable: Some(subagent_checkpoint_is_continuable(result)),
                     usage: result.usage.clone(),
+                    display_name: Some(subagent_result_display_name(result)),
                 },
             );
         }
@@ -7929,6 +7934,16 @@ impl SubAgentManager {
                 // honestly absent rather than guessed. The model — the half
                 // that determines billing — is present either way.
                 route_source: None,
+                display_name: Some(subagent_display_name(
+                    &agent_id,
+                    agent.nickname.as_deref(),
+                    Some(agent.session_name.as_str()),
+                    &subagent_role_label(
+                        options.child_route.as_ref(),
+                        agent.assignment.role.as_deref(),
+                        &agent.agent_type,
+                    ),
+                )),
             });
         }
 
@@ -11383,7 +11398,14 @@ async fn spawn_subagent_from_input(
             model: Some(effective_model),
             model_route: Some(model_route),
             child_route: Some(child_route),
-            nickname: None,
+            // A workflow child goes by its task label everywhere: the label is
+            // its explicit nickname, so every snapshot, event and host reads
+            // the same name (#6565).
+            nickname: workflow_identity
+                .and_then(|identity| identity.workflow_task_label.as_deref())
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .map(str::to_string),
             fork_context,
             max_output_tokens: spawn_request
                 .max_output_tokens
@@ -11680,6 +11702,15 @@ pub(crate) async fn spawn_workflow_task(
     // Suggest-level file edits for write-capable roles. Shell / network / MCP
     // still require parent auto-approve (or fail closed).
     runtime.accept_edits = true;
+    // Prefer the identity values the driver stamped; fall back to task options.
+    // The label is resolved before the spawn so the child carries it as its
+    // name from the first event on (#6565).
+    let mut identity = identity;
+    identity.workflow_task_label = identity
+        .workflow_task_label
+        .take()
+        .filter(|label| !label.trim().is_empty())
+        .or(request_label);
     let (result, mut metadata) = spawn_subagent_from_input(
         input,
         manager,
@@ -11688,11 +11719,7 @@ pub(crate) async fn spawn_workflow_task(
         Some(&identity),
     )
     .await?;
-    // Prefer the identity values the driver stamped; fall back to task options.
-    let workflow_task_label = identity
-        .workflow_task_label
-        .filter(|label| !label.trim().is_empty())
-        .or(request_label);
+    let workflow_task_label = identity.workflow_task_label;
     let workflow_phase_id = identity
         .workflow_phase_id
         .filter(|phase| !phase.trim().is_empty())

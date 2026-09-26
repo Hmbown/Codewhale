@@ -2012,6 +2012,8 @@
   "AgentFocusPlaceholder": "{agent} にメッセージ · Esc でメインに戻る",
   "AgentFocusNoTranscript": "{agent} のトランスクリプトはまだありません。ワーカーがやり取りを始めるとここに表示されます。",
   "AgentFocusOmitted": "以前のメッセージ（{count} 件）はメモリ内トランスクリプトから省略されています。",
+  "AgentFocusResult": "結果",
+  "AgentFocusStopReason": "停止した理由",
   "AgentFocusFollowUpDelivered": "{agent} 宛にキューしました。次のラウンドで読み取られます。",
   "AgentFocusFollowUpQueued": "{agent} 宛にキュー済み",
   "AgentFocusFollowUpContinued": "{agent} は完了済みだったため、新しいフォーク（{target}）で続行しました。この画面はフォークを追跡します。",

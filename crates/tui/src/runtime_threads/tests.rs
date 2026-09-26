@@ -672,6 +672,388 @@ mod recovery {
         Ok(())
     }
 
+    /// A fork's checkpoint has to describe the document as a reader sees it.
+    ///
+    /// A saved session is repaired on the way out, and `resume_session` writes
+    /// that repair back: tool calls and results are re-paired, and a prefix
+    /// written from turn records can hold a shape the repair changes. A
+    /// fingerprint taken over the written shape then describes bytes no reader
+    /// sees — `thread_holding_session` rejects the fork's own thread, resuming
+    /// the session starts a second one, and that second thread's save leaves
+    /// the first stale, so the branch's next message fails with "Saved session
+    /// … changed after this thread's checkpoint".
+    #[tokio::test]
+    async fn a_fork_fingerprints_the_document_its_readers_see() -> Result<()> {
+        let _env = crate::test_support::lock_test_env();
+        let dir = tempfile::tempdir()?;
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+        let manager = RuntimeThreadManager::open(
+            config(),
+            dir.path().to_path_buf(),
+            test_manager_config(dir.path().join("runtime")),
+        )?;
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let base = Utc::now();
+        let at = |seconds: i64| Some(base + chrono::Duration::seconds(seconds));
+
+        fn tool_metadata(call: &str, name: &str, input: &str) -> Value {
+            json!({
+                "tool_use_id": call,
+                "tool_name": name,
+                "tool_input": input,
+                "tool_result_for": call,
+                "is_error": false,
+            })
+        }
+        let write_call = "call_write_fingerprint";
+        let bash_call = "call_bash_fingerprint";
+        let turn_one = "turn_fingerprint_one";
+        let turn_two = "turn_fingerprint_two";
+
+        let text_item = |id: &str, turn: &str, order: i64, kind: TurnItemKind, text: &str| {
+            let mut item = sample_item(turn, id, TurnItemLifecycleStatus::Completed);
+            item.kind = kind;
+            item.started_at = at(order);
+            item.ended_at = item.started_at;
+            item.summary = text.to_string();
+            item.detail = Some(text.to_string());
+            item
+        };
+        // Two tool calls in one turn: the shapes a reconstruction and the
+        // session repair do not have to agree on.
+        let mut write_item = sample_item(turn_one, "item_f1", TurnItemLifecycleStatus::Completed);
+        write_item.kind = TurnItemKind::FileChange;
+        write_item.started_at = at(2);
+        write_item.ended_at = write_item.started_at;
+        write_item.detail = Some("Successfully wrote 5 bytes to test.txt".to_string());
+        write_item.metadata = Some(tool_metadata(
+            write_call,
+            "write",
+            "{\"path\":\"test.txt\",\"content\":\"x\\n\"}",
+        ));
+        let mut bash_item = sample_item(turn_one, "item_t1", TurnItemLifecycleStatus::Completed);
+        bash_item.kind = TurnItemKind::ToolCall;
+        bash_item.started_at = at(3);
+        bash_item.ended_at = bash_item.started_at;
+        bash_item.detail = Some("test.txt\n".to_string());
+        bash_item.metadata = Some(tool_metadata(
+            bash_call,
+            "bash",
+            "{\"command\":\"ls -l test.txt\"}",
+        ));
+        // A third call whose result never arrived — an interrupted turn. The
+        // records keep the call, and the session repair pairs it on the way
+        // out, so what a reader sees is not what was written.
+        let mut interrupted = sample_item(turn_one, "item_t2", TurnItemLifecycleStatus::Failed);
+        interrupted.kind = TurnItemKind::ToolCall;
+        interrupted.started_at = at(4);
+        interrupted.ended_at = interrupted.started_at;
+        interrupted.summary = "bash (interrupted)".to_string();
+        interrupted.metadata = Some(json!({
+            "tool_use_id": "call_interrupted",
+            "tool_name": "bash",
+            "tool_input": "{\"command\":\"sleep 30\"}",
+        }));
+
+        for item in [
+            text_item(
+                "item_u1",
+                turn_one,
+                0,
+                TurnItemKind::UserMessage,
+                "write test.txt",
+            ),
+            text_item(
+                "item_r1",
+                turn_one,
+                1,
+                TurnItemKind::AgentReasoning,
+                "I will write it.",
+            ),
+            write_item,
+            bash_item,
+            interrupted,
+            text_item(
+                "item_a1",
+                turn_one,
+                5,
+                TurnItemKind::AgentMessage,
+                "created test.txt",
+            ),
+            text_item(
+                "item_u2",
+                turn_two,
+                5,
+                TurnItemKind::UserMessage,
+                "now read it",
+            ),
+            text_item(
+                "item_a2",
+                turn_two,
+                6,
+                TurnItemKind::AgentMessage,
+                "read it",
+            ),
+            text_item(
+                "item_c1",
+                turn_two,
+                7,
+                TurnItemKind::ContextCompaction,
+                "Made room: 1383 → 21 messages",
+            ),
+        ] {
+            manager.store.save_item(&item)?;
+        }
+        for (turn_id, order) in [(turn_one, 0), (turn_two, 10)] {
+            let mut turn = sample_turn(&thread.id, turn_id, RuntimeTurnStatus::Completed);
+            turn.started_at = at(order);
+            turn.ended_at = turn.started_at;
+            manager.store.save_turn(&turn)?;
+        }
+        let mut stored = manager.get_thread(&thread.id).await?;
+        stored.latest_turn_id = Some(turn_two.to_string());
+        manager.store.save_thread(&stored)?;
+
+        // The compacted source's document: the prompts verbatim, the work
+        // between them summarized away — what a branch rebuilds from the
+        // records instead of slicing.
+        let compacted: Vec<Message> = serde_json::from_value(json!([
+            {"role":"user","content":[{"type":"text","text":"write test.txt"}]},
+            {"role":"user","content":[{"type":"text","text":"now read it"}]}
+        ]))?;
+        let saved = crate::session_manager::create_saved_session_with_id_and_mode(
+            Uuid::new_v4().to_string(),
+            &compacted,
+            &thread.model,
+            dir.path(),
+            0,
+            None,
+            Some("agent"),
+        );
+        let sessions = crate::session_manager::SessionManager::new(
+            crate::session_manager::default_sessions_dir()?,
+        )?;
+        {
+            let _admission = manager.session_checkpoint_guard().await;
+            sessions.save_session(&saved)?;
+            manager
+                .set_thread_session_checkpoint(&thread.id, &saved)
+                .await?;
+        }
+
+        // Undo the last turn: the fork keeps the first one, tool calls and all.
+        let (fork, _, _, _) = manager.fork_at_user_message(&thread.id, 0).await?;
+        let session_id = fork
+            .session_id
+            .clone()
+            .context("a published fork owns a session document")?;
+        let checkpoint = fork
+            .saved_session_checkpoint
+            .as_ref()
+            .context("a published fork carries a checkpoint")?;
+
+        // What every reader sees: `resume_session` repairs the document and
+        // writes the repair back, which is the shape the fingerprint must name.
+        let read_back = sessions.resume_session(&session_id)?.session;
+        assert_eq!(
+            checkpoint.messages_sha256,
+            session_messages_sha256(&read_back.messages)?,
+            "the fork's checkpoint must describe the document as readers see it: {:#?}",
+            read_back.messages
+        );
+
+        // And the thread that holds the session is recognised, so opening the
+        // session again reuses it instead of adding a second thread whose save
+        // would leave this one stale.
+        assert_eq!(
+            manager
+                .thread_holding_session(&session_id, &read_back)
+                .map(|held| held.id),
+            Some(fork.id.clone()),
+            "resuming the fork's session must find the fork's own thread"
+        );
+        Ok(())
+    }
+    ///
+    /// Compaction rewrites the model-visible history in place: the prompts stay
+    /// A fork of a *compacted* conversation keeps the whole exchange.
+    ///
+    /// Compaction rewrites the model-visible history in place: the prompts stay
+    /// verbatim, the answers and the tool work around them are summarized into
+    /// the session's system prompt. Slicing that abbreviation into a fork's own
+    /// document claims, through its checkpoint, coverage the document does not
+    /// carry — a client then reads a run of prompts with the agent's answers
+    /// missing, and `restore_thread_messages` cannot rebuild them either,
+    /// because the checkpoint tells it the prefix covers those turns already.
+    ///
+    /// The records keep every item of every turn, so the fork rebuilds the kept
+    /// exchanges instead of copying the summary's view of them.
+    #[tokio::test]
+    async fn fork_of_a_compacted_conversation_keeps_the_agent_output() -> Result<()> {
+        let _env = crate::test_support::lock_test_env();
+        let dir = tempfile::tempdir()?;
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+        let manager = RuntimeThreadManager::open(
+            config(),
+            dir.path().to_path_buf(),
+            test_manager_config(dir.path().join("runtime")),
+        )?;
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let base = Utc::now();
+        let at = |seconds: i64| Some(base + chrono::Duration::seconds(seconds));
+
+        let text_item = |id: &str, turn: &str, order: i64, kind: TurnItemKind, text: &str| {
+            let mut item = sample_item(turn, id, TurnItemLifecycleStatus::Completed);
+            item.kind = kind;
+            item.started_at = at(order);
+            item.ended_at = item.started_at;
+            item.summary = text.to_string();
+            item.detail = Some(text.to_string());
+            item
+        };
+
+        let turn_one = "turn_before_compaction";
+        let turn_two = "turn_of_compaction";
+        for item in [
+            text_item(
+                "item_u1",
+                turn_one,
+                0,
+                TurnItemKind::UserMessage,
+                "write test.txt",
+            ),
+            text_item(
+                "item_a1",
+                turn_one,
+                1,
+                TurnItemKind::AgentMessage,
+                "created test.txt",
+            ),
+            text_item(
+                "item_u2",
+                turn_two,
+                2,
+                TurnItemKind::UserMessage,
+                "write test2.txt",
+            ),
+            text_item(
+                "item_a2",
+                turn_two,
+                3,
+                TurnItemKind::AgentMessage,
+                "created test2.txt",
+            ),
+            text_item(
+                "item_c1",
+                turn_two,
+                4,
+                TurnItemKind::ContextCompaction,
+                "Made room: 1383 → 21 messages",
+            ),
+        ] {
+            manager.store.save_item(&item)?;
+        }
+        for (turn_id, order) in [(turn_one, 0), (turn_two, 10)] {
+            let mut turn = sample_turn(&thread.id, turn_id, RuntimeTurnStatus::Completed);
+            turn.started_at = at(order);
+            turn.ended_at = turn.started_at;
+            manager.store.save_turn(&turn)?;
+        }
+        let mut stored = manager.get_thread(&thread.id).await?;
+        stored.latest_turn_id = Some(turn_two.to_string());
+        manager.store.save_thread(&stored)?;
+
+        // What the engine persisted once compaction had run: the two prompts
+        // verbatim, and none of the work that happened between them. The
+        // summary itself rides in the session's system prompt, which is why the
+        // saved messages read as a bare list of what was asked.
+        let compacted: Vec<Message> = serde_json::from_value(json!([
+            {"role":"user","content":[{"type":"text","text":"write test.txt"}]},
+            {"role":"user","content":[{"type":"text","text":"write test2.txt"}]}
+        ]))?;
+        let saved = crate::session_manager::create_saved_session_with_id_and_mode(
+            Uuid::new_v4().to_string(),
+            &compacted,
+            &thread.model,
+            dir.path(),
+            0,
+            None,
+            Some("agent"),
+        );
+        let sessions = crate::session_manager::SessionManager::new(
+            crate::session_manager::default_sessions_dir()?,
+        )?;
+        {
+            let _admission = manager.session_checkpoint_guard().await;
+            sessions.save_session(&saved)?;
+            manager
+                .set_thread_session_checkpoint(&thread.id, &saved)
+                .await?;
+        }
+
+        // Branch at the last turn, the way the transcript's "continue from
+        // here" row does: the whole conversation is kept, and every bit of it
+        // has to survive into the fork's own document.
+        let (fork, _, _, _) = manager.fork_at_user_turn(&thread.id, turn_two).await?;
+        let fork_session_id = fork
+            .session_id
+            .clone()
+            .context("a published fork owns a session document")?;
+        assert_ne!(fork_session_id, saved.metadata.id);
+        let document = sessions.load_session(&fork_session_id)?;
+        let roles: Vec<&str> = document
+            .messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect();
+        assert_eq!(
+            roles,
+            ["user", "assistant", "user", "assistant"],
+            "the fork's document is the exchange, not the {} saved prompts: {:#?}",
+            compacted.len(),
+            document.messages
+        );
+        let restored = manager.restore_thread_messages(&fork)?;
+        assert_eq!(
+            document.messages, restored,
+            "the document a client reads is the conversation the engine restores"
+        );
+        let rendered = serde_json::to_string(&document.messages)?;
+        for answer in ["created test.txt", "created test2.txt"] {
+            assert!(
+                rendered.contains(answer),
+                "the agent's answer {answer:?} survives the fork: {:#?}",
+                document.messages
+            );
+        }
+
+        // A depth-relative cut of the same compacted source — the shape undo
+        // and retry use — keeps the exchange it did not drop, likewise whole.
+        let (undo_fork, _, _, _) = manager.fork_at_user_message(&thread.id, 0).await?;
+        let undo_document = sessions.load_session(
+            undo_fork
+                .session_id
+                .as_deref()
+                .context("a published fork owns a session document")?,
+        )?;
+        let undo_roles: Vec<&str> = undo_document
+            .messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect();
+        assert_eq!(
+            undo_roles,
+            ["user", "assistant"],
+            "a depth-relative cut keeps the first turn's exchange: {:#?}",
+            undo_document.messages
+        );
+        Ok(())
+    }
+
     async fn control_case(interrupt: bool, follow_up: bool) -> Result<()> {
         let _env = crate::test_support::lock_test_env();
         let dir = tempfile::tempdir()?;
@@ -8801,6 +9183,7 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
             for owner in [thread_id.clone(), foreign_id] {
                 let _ = tx_event
                     .send(EngineEvent::AgentSpawned {
+                        display_name: None,
                         owner_session_id: owner.clone(),
                         id: "worker_spawn".into(),
                         prompt: "private prompt".into(),
@@ -8839,6 +9222,8 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
                 ] {
                     let _ = tx_event
                         .send(EngineEvent::AgentComplete {
+                            // #6565: hosts name the agent the way the TUI does.
+                            display_name: (id == "worker_completed").then(|| "audit docs".into()),
                             owner_session_id: owner.clone(),
                             id: id.into(),
                             result: "Completed successfully".into(),
@@ -8915,6 +9300,26 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
             .unwrap()
             .contains("outcome unconfirmed")
     );
+    assert_eq!(workers[2].payload["agent_name"], "audit docs");
+    assert!(
+        workers[2].payload["item"]["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("Sub-agent audit docs completed")
+    );
+    let notices = manager.list_notices(&thread.id);
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice.detail == "audit docs finished"),
+        "{notices:?}"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice.detail == "worker_failed failed"),
+        "{notices:?}"
+    );
     assert!(
         manager
             .events_since(&foreign.id, None)?
@@ -8952,6 +9357,7 @@ async fn preturn_control_status_does_not_make_empty_turn_succeed() -> Result<()>
         if matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             let _ = tx_event
                 .send(EngineEvent::AgentComplete {
+                    display_name: None,
                     owner_session_id: thread_id,
                     id: "stale_agent".to_string(),
                     result: "stale completion".to_string(),
@@ -16060,6 +16466,177 @@ async fn fork_at_user_message_depth_one_drops_two_turns() -> Result<()> {
 }
 
 #[tokio::test]
+async fn fork_at_user_turn_leaves_a_running_turn_alone() -> Result<()> {
+    // A conversation can be branched while it is working: a person watching a
+    // turn go the wrong way should not have to stop it (and lose what it has
+    // already done) before taking a different path. Two things must hold —
+    // the fork is cut at the named turn, and the running turn is untouched and
+    // still running in the thread it belongs to.
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            model: None,
+            workspace: None,
+            mode: None,
+            allow_shell: None,
+            trust_mode: None,
+            auto_approve: None,
+            archived: false,
+            system_prompt: None,
+            task_id: None,
+            ..Default::default()
+        })
+        .await?;
+    let turn_ids =
+        seed_turns_with_user_messages(&manager, &thread.id, &["first", "second", "third"])?;
+
+    // The newest turn is still in flight: its record exists, its answer does not.
+    let mut running = manager
+        .store
+        .list_turns_for_thread(&thread.id)?
+        .into_iter()
+        .find(|turn| turn.id == turn_ids[2])
+        .context("seeded third turn")?;
+    running.status = RuntimeTurnStatus::InProgress;
+    running.ended_at = None;
+    running.usage = None;
+    let running_item_ids = running.item_ids.clone();
+    manager.store.save_turn(&running)?;
+    let source_before = manager.get_thread(&thread.id).await?;
+
+    let (forked, original_text, _, _) = manager.fork_at_user_turn(&thread.id, &turn_ids[1]).await?;
+
+    // The branch keeps the turn it names, and hands back the question the
+    // running turn is answering — that is what a person wants next.
+    assert_eq!(original_text.as_deref(), Some("third"));
+    let forked_turns = manager.store.list_turns_for_thread(&forked.id)?;
+    let summaries: Vec<&str> = forked_turns
+        .iter()
+        .map(|turn| turn.input_summary.as_str())
+        .collect();
+    assert_eq!(summaries, vec!["first", "second"]);
+
+    // The source thread is exactly as it was, including the turn in flight:
+    // forking never interrupts one, it only copies a prefix.
+    let source_turns = manager.store.list_turns_for_thread(&thread.id)?;
+    assert_eq!(source_turns.len(), 3, "the source keeps every turn");
+    let still_running = source_turns
+        .iter()
+        .find(|turn| turn.id == turn_ids[2])
+        .context("the running turn is still there")?;
+    assert_eq!(still_running.status, RuntimeTurnStatus::InProgress);
+    assert_eq!(still_running.item_ids, running_item_ids);
+    assert_eq!(
+        manager.get_thread(&thread.id).await?,
+        source_before,
+        "the source thread's own record is not rewritten by a fork"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fork_at_user_turn_receipt_skips_a_compaction_turn_after_the_anchor() -> Result<()> {
+    // A manual `/compact` is a turn of its own whose only item is the
+    // compaction: no prompt. Branching at the turn before it must still drop
+    // it (the fork keeps only the anchor and what precedes it), but the
+    // receipt belongs to the next *user* turn — the question that was asked
+    // next — not to the prompt-less compaction that happens to sit between.
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            model: None,
+            workspace: None,
+            mode: None,
+            allow_shell: None,
+            trust_mode: None,
+            auto_approve: None,
+            archived: false,
+            system_prompt: None,
+            task_id: None,
+            ..Default::default()
+        })
+        .await?;
+    let turn_ids =
+        seed_turns_with_user_messages(&manager, &thread.id, &["first", "second", "third"])?;
+    let seeded = manager.store.list_turns_for_thread(&thread.id)?;
+    let anchor = seeded
+        .iter()
+        .find(|turn| turn.id == turn_ids[1])
+        .context("seeded second turn")?;
+
+    // The compaction turn lands between the anchor and the next user turn.
+    let compaction_at = anchor.created_at + chrono::Duration::microseconds(500);
+    let compaction_item_id = "item_compaction_between".to_string();
+    manager.store.save_item(&TurnItemRecord {
+        schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+        id: compaction_item_id.clone(),
+        turn_id: "turn_compaction_between".to_string(),
+        kind: TurnItemKind::ContextCompaction,
+        status: TurnItemLifecycleStatus::Completed,
+        summary: "Context compacted".to_string(),
+        detail: Some("summary of first and second".to_string()),
+        metadata: None,
+        artifact_refs: Vec::new(),
+        started_at: Some(compaction_at),
+        ended_at: Some(compaction_at),
+    })?;
+    let mut compaction_turn = anchor.clone();
+    compaction_turn.id = "turn_compaction_between".to_string();
+    compaction_turn.input_summary = "Context compacted".to_string();
+    compaction_turn.created_at = compaction_at;
+    compaction_turn.started_at = Some(compaction_at);
+    compaction_turn.ended_at = Some(compaction_at);
+    compaction_turn.item_ids = vec![compaction_item_id];
+    manager.store.save_turn(&compaction_turn)?;
+
+    // The next user turn carries its own allowance, which travels with it.
+    let mut next_user_turn = seeded
+        .iter()
+        .find(|turn| turn.id == turn_ids[2])
+        .context("seeded third turn")?
+        .clone();
+    next_user_turn.max_output_tokens = std::num::NonZeroU32::new(4096);
+    next_user_turn.schema_version = OUTPUT_LIMIT_RUNTIME_SCHEMA_VERSION;
+    manager.store.save_turn(&next_user_turn)?;
+
+    let order: Vec<String> = manager
+        .store
+        .list_turns_for_thread(&thread.id)?
+        .into_iter()
+        .map(|turn| turn.id)
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            turn_ids[0].clone(),
+            turn_ids[1].clone(),
+            "turn_compaction_between".to_string(),
+            turn_ids[2].clone(),
+        ],
+        "the compaction turn sits right after the anchor"
+    );
+
+    let (forked, original_text, original_images, max_output_tokens) =
+        manager.fork_at_user_turn(&thread.id, &turn_ids[1]).await?;
+
+    assert_eq!(original_text.as_deref(), Some("third"));
+    assert!(original_images.is_empty());
+    assert_eq!(max_output_tokens, std::num::NonZeroU32::new(4096));
+    let summaries: Vec<String> = manager
+        .store
+        .list_turns_for_thread(&forked.id)?
+        .into_iter()
+        .map(|turn| turn.input_summary)
+        .collect();
+    assert_eq!(
+        summaries,
+        vec!["first".to_string(), "second".to_string()],
+        "the fork keeps the anchor and drops the compaction after it"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn fork_at_user_message_out_of_range_errors() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
     let thread = manager
@@ -17746,6 +18323,7 @@ async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result
     harness
         .tx_event
         .send(EngineEvent::AgentComplete {
+            display_name: None,
             owner_session_id: thread.id.clone(),
             id: "agent_done".to_string(),
             result: "did the thing".to_string(),
@@ -18583,6 +19161,46 @@ mod adoption_refusal {
         assert!(!binding.is_adoptable_empty_store()?);
         Ok(())
     }
+}
+
+/// The exact-prefix search a fork's alignment runs, in one pass.
+///
+/// It replaces a rebuild-per-prefix search that was quadratic in the
+/// transcript (measured at ~9 s on a 5 MB session), so what it must keep is
+/// the *answer*: the first prefix whose projection is the kept one, and no
+/// match at all when the transcript drifted.
+#[test]
+fn exact_prefix_boundary_finds_the_first_matching_prefix() {
+    let user = |text: &str| Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+    };
+    let messages = vec![user("first"), user("second"), user("third")];
+    let projection = |messages: &[Message]| session_recovery_projection(messages);
+
+    // A boundary in the middle: the kept projection names the first two turns.
+    assert_eq!(
+        exact_prefix_boundary(&messages, &projection(&messages[..2])),
+        Some(2)
+    );
+    // Every message, and none of them.
+    assert_eq!(
+        exact_prefix_boundary(&messages, &projection(&messages)),
+        Some(3)
+    );
+    assert_eq!(exact_prefix_boundary(&messages, &[]), Some(0));
+    // A prefix the transcript cannot produce is no match, not a neighbour.
+    assert_eq!(
+        exact_prefix_boundary(&messages, &projection(&[user("other")])),
+        None
+    );
+    // A projection that runs past the end of the transcript is no match either.
+    let mut longer = projection(&messages);
+    longer.push(serde_json::json!(["user", "beyond"]));
+    assert_eq!(exact_prefix_boundary(&messages, &longer), None);
 }
 
 #[test]

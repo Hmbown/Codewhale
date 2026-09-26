@@ -2012,6 +2012,8 @@
   "AgentFocusPlaceholder": "Message pour {agent} · Échap revient au principal",
   "AgentFocusNoTranscript": "Aucune transcription pour {agent} pour l'instant. Les messages apparaissent ici au fil des échanges du worker.",
   "AgentFocusOmitted": "Les messages précédents ({count}) sont omis de la transcription en mémoire.",
+  "AgentFocusResult": "Résultat",
+  "AgentFocusStopReason": "Pourquoi il s'est arrêté",
   "AgentFocusFollowUpDelivered": "En file pour {agent} : il lira le message à son prochain tour.",
   "AgentFocusFollowUpQueued": "En file pour {agent}",
   "AgentFocusFollowUpContinued": "{agent} avait terminé ; poursuivi sur un nouveau fork ({target}). Cette vue suit désormais le fork.",
