@@ -36,7 +36,7 @@
   },
   {
     "reason": "unknown_billing_basis",
-    "review": "No mode/credential product is supplied. Both MiniMax dialects share a PAYG/plan endpoint that cannot prove product (route_billing.rs:253,402; pricing.rs:534); Ollama Cloud is unclassified possible spend, not local/free (pricing.rs:411). Generic Custom and six non-Baseten compatible defaults are transport descriptors without a reviewed product; production envelope refuses Unknown at cost_status.rs:239. AICraft is the sixth compatible default: dc170add3 restored its row from the closed PR #6171 with endpoint, credential env and bootstrap model only, and no billing product or pricing row was reviewed for it. Its default is claude-4.6-sonnet, which has no bundled/hand row either; that omission is recorded here on the shape of the descriptor, and a real source review of AICraft's billing basis is still owed.",
+    "review": "No mode/credential product is supplied. Both MiniMax dialects share a PAYG/plan endpoint that cannot prove product (route_billing.rs:253,402; pricing.rs:534); Ollama Cloud is unclassified possible spend, not local/free (pricing.rs:411). Generic Custom and seven non-Baseten compatible defaults are transport descriptors without a reviewed product; production envelope refuses Unknown at cost_status.rs:239. AICraft is the sixth compatible default: dc170add3 restored its row from the closed PR #6171 with endpoint, credential env and bootstrap model only, and no billing product or pricing row was reviewed for it. Its default is claude-4.6-sonnet, which has no bundled/hand row either; that omission is recorded here on the shape of the descriptor, and a real source review of AICraft's billing basis is still owed. Yolo-Auto is the seventh: its row carries endpoint, credential env and bootstrap model only, the gateway sells flat-rate subscription tiers with no published per-token catalog to review, and the URL proves no plan product, so the route stays Unknown rather than being guessed into subscription or local-no-bill; a source review of Yolo-Auto's billing basis is owed.",
     "routes": [
       ["aicraft", "claude-4.6-sonnet", "https://aicraftapi.com/v1", "chat_completions", "unknown"],
       ["cerebras", "llama-3.3-70b", "https://api.cerebras.ai/v1", "chat_completions", "unknown"],
@@ -47,7 +47,8 @@
       ["minimax", "MiniMax-M3", "https://api.minimax.io/v1", "chat_completions", "unknown"],
       ["minimax-anthropic", "MiniMax-M3", "https://api.minimax.io/anthropic", "anthropic_messages", "unknown"],
       ["ollama-cloud", "gpt-oss:120b", "https://ollama.com/v1", "chat_completions", "unknown"],
-      ["sensenova", "deepseek-v4-flash", "https://token.sensenova.cn/v1", "chat_completions", "unknown"]
+      ["sensenova", "deepseek-v4-flash", "https://token.sensenova.cn/v1", "chat_completions", "unknown"],
+      ["yolo-auto", "yolo", "https://yolo-auto.com/v1", "chat_completions", "unknown"]
     ]
   },
   {

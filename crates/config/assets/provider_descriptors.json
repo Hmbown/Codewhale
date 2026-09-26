@@ -99,6 +99,18 @@
         "meituan-sensenova",
         "meituan-sensenova-cn"
       ]
+    },
+    {
+      "id": "yolo-auto",
+      "label": "Yolo-Auto",
+      "wire": "openai-compatible",
+      "base_url": "https://yolo-auto.com/v1",
+      "api_key_env": "YOLO_AUTO_API_KEY",
+      "default_model": "yolo",
+      "discovery": "models_endpoint",
+      "aliases": [
+        "yolo"
+      ]
     }
   ]
 }
