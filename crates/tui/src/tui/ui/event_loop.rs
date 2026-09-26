@@ -1861,6 +1861,10 @@ pub(crate) async fn run_event_loop(
             if refresh_active_task_panel(app, &task_manager).await {
                 app.needs_redraw = true;
             }
+            // Shells and tasks that finished join the batched notice; a batch
+            // held for finite work or a busy parent turn goes out once that
+            // work settles (#6565).
+            flush_background_finished(app, config, false);
             if refresh_automation_panel(app).await {
                 app.needs_redraw = true;
             }
@@ -2841,6 +2845,10 @@ pub(crate) async fn run_event_loop(
                                 .insert("routed_usage_receipt_missing".to_string());
                         }
 
+                        // The parent turn is idle now: background work held
+                        // for it is announced (#6565).
+                        flush_background_finished(app, config, true);
+
                         // Emit OSC 9 / BEL desktop notification for long turns, and
                         // always stop the title animation that began on TurnStarted.
                         if status == crate::core::events::TurnOutcomeStatus::Completed {
@@ -3604,36 +3612,21 @@ pub(crate) async fn run_event_loop(
                         }
                         let should_recapture_terminal =
                             !has_other_running_subagents && app.use_alt_screen();
-                        let subagent_notification_mode =
-                            config.notifications_config().subagent_completion;
-                        let workflow_tool_running = workflow_tool_is_running(app);
-                        if let Some(terminal_status) = terminal_status.as_ref()
-                            && should_notify_subagent_completion(
-                                subagent_notification_mode,
-                                has_other_running_subagents,
-                                workflow_tool_running,
-                            )
-                            && let Some((method, threshold, include_summary)) =
-                                notifications::settings(config)
-                        {
-                            let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
+                        // #6565: the finished child joins the batch under the
+                        // name every surface shows; the notice names every
+                        // child of the batch and waits only on finite work.
+                        if let Some(terminal_status) = terminal_status.as_ref() {
                             let label = app.ensure_agent_label(&id);
-                            let payload = notifications::subagent_terminal_payload(
-                                app.ui_locale,
-                                &label,
-                                &result,
-                                terminal_status,
-                                include_summary,
-                                subagent_elapsed,
-                            );
-                            crate::tui::notifications::notify_done(
-                                method,
-                                in_tmux,
-                                &payload,
-                                threshold,
-                                subagent_elapsed,
+                            app.background_finished.push(
+                                crate::tui::background_finished::FinishedWork::agent(
+                                    &label,
+                                    terminal_status,
+                                    &result,
+                                    subagent_elapsed,
+                                ),
                             );
                         }
+                        flush_background_finished(app, config, false);
                         if should_recapture_terminal && event_broker.is_paused() {
                             resume_terminal(
                                 terminal,
@@ -3672,6 +3665,7 @@ pub(crate) async fn run_event_loop(
                     ) =>
                     {
                         app.agent_queued_follow_ups = queued_follow_ups;
+                        app.subagent_cache_received_at = Some(Instant::now());
                         app.agent_roster = roster;
                         app.agent_roster_session_id = Some(owner_session_id);
                         if std::mem::take(&mut app.agent_roster_print_requested) {

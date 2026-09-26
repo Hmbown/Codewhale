@@ -731,6 +731,15 @@ pub struct SubAgentResult {
     /// keeping the records reachable via `include_archived=true`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub from_prior_session: bool,
+    /// Milliseconds since this running agent last showed the manager any
+    /// progress, at snapshot time: the same clock the heartbeat reads when it
+    /// auto-stops a stalled child (#6565). `None` once settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_ms: Option<u64>,
+    /// The heartbeat bound the manager enforces on that clock: a running
+    /// child idle this long is stopped. `None` once settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3510,6 +3519,8 @@ impl SubAgent {
             // this in when it produces a snapshot via its own
             // `snapshot_for_listing` helper (#405).
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         }
     }
 }
@@ -8251,6 +8262,12 @@ impl SubAgentManager {
         let mut snap = agent.snapshot();
         snap.started_at = Some(agent.started_at);
         snap.from_prior_session = self.is_from_prior_session(agent);
+        if agent.status == SubAgentStatus::Running {
+            let millis =
+                |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+            snap.idle_ms = Some(millis(agent.last_activity_at.elapsed()));
+            snap.heartbeat_timeout_ms = Some(millis(self.running_heartbeat_timeout));
+        }
         if let Some(record) = self.worker_records.get(&agent.id) {
             snap.usage = Some(record.usage.clone());
             snap.worker_status = Some(record.status);
@@ -13830,6 +13847,8 @@ async fn cancelled_subagent_result(
         duration_ms,
         started_at: Some(started_at),
         from_prior_session: false,
+        idle_ms: None,
+        heartbeat_timeout_ms: None,
     }
 }
 
@@ -14616,6 +14635,8 @@ async fn run_subagent(
                             duration_ms,
                             started_at: Some(started_at),
                             from_prior_session: false,
+                            idle_ms: None,
+                            heartbeat_timeout_ms: None,
                         });
                     }
                 }
@@ -15241,6 +15262,8 @@ async fn run_subagent(
         duration_ms,
         started_at: Some(started_at),
         from_prior_session: false,
+        idle_ms: None,
+        heartbeat_timeout_ms: None,
     };
     Ok(match budget_failure_reason {
         Some(cause) => budget_partial_result_with_note(

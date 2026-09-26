@@ -2462,6 +2462,10 @@ reasoning contract, and all four membership ids omit generic sampling fields.
 - `notifications.sound_file`: custom local WAV path for `sound = "file"` or legacy
   `completion_sound = "file"`.
 - `notifications.subagent_completion`: `always`, `final-only` (default), `off`.
+  Covers all background work that finishes: sub-agents, background shells and
+  durable tasks. `final-only` sends one notice naming everything that finished
+  once no agent, workflow or durable task is still running; a running shell
+  (a dev server, a watcher) never holds it back. `always` sends one per item.
 - `notifications.quiet`: boolean, default `false`.
 - `notifications.events`: six boolean categories, all enabled by default; see below.
 - `notifications.completion_sound`: legacy completion cue, default `off`, with the

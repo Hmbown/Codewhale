@@ -186,6 +186,8 @@ pub(super) fn make_snapshot(status: SubAgentStatus) -> SubAgentResult {
         duration_ms: 0,
         started_at: None,
         from_prior_session: false,
+        idle_ms: None,
+        heartbeat_timeout_ms: None,
     }
 }
 

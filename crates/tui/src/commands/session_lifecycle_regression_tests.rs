@@ -485,6 +485,7 @@ fn load_rejects_an_active_runtime_before_reading_or_mutating() {
         content: vec![],
     });
     app.task_panel.push(crate::tui::app::TaskPanelEntry {
+        exit_code: None,
         id: "queued-late-producer".to_string(),
         status: "queued".to_string(),
         prompt_summary: "queued".to_string(),

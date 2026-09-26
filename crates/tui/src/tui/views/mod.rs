@@ -5860,6 +5860,8 @@ fn live_subagent_result(
         duration_ms: 0,
         started_at: None,
         from_prior_session: false,
+        idle_ms: None,
+        heartbeat_timeout_ms: None,
     }
 }
 
@@ -7382,6 +7384,8 @@ mod tests {
             duration_ms: 10,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         }
     }
 

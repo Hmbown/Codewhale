@@ -849,6 +849,7 @@ pub(super) fn task_mode_label(mode: AppMode) -> &'static str {
 
 pub(super) fn task_summary_to_panel_entry(summary: TaskSummary) -> TaskPanelEntry {
     TaskPanelEntry {
+        exit_code: None,
         id: summary.id,
         status: task_status_label(summary.status).to_string(),
         prompt_summary: summary.prompt_summary,
@@ -1136,6 +1137,8 @@ mod tests {
             duration_ms: 0,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         }
     }
 

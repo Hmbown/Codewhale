@@ -594,6 +594,8 @@ mod tests {
             duration_ms: 2_500,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         }
     }
 

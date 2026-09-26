@@ -200,6 +200,15 @@ quieter, and Fleet runs can be checked before they spend anything.
   Each agent also has one name: a workflow task's label or its dispatch name
   appears on the rows, the notification and the runtime API alike, never its
   internal id ([#6565](https://github.com/Hmbown/Codewhale/issues/6565)).
+- Background work tells you when it ends. One notice names every agent,
+  shell and task that finished, and says "2 done · 1 failed" when something
+  did not succeed. A running dev server no longer holds that notice back. A
+  failed, killed or timed-out background shell is reported like a completed
+  one, with its exit code. Finished shells stay listed under "Finished",
+  muted and led by their command, and finished tasks no longer look live or
+  reopen the dock. An agent that has shown no progress for a minute says
+  "quiet 2m · auto-stop at 5m", using the engine's own clock and limit
+  ([#6565](https://github.com/Hmbown/Codewhale/issues/6565)).
 
 ### Plugins
 

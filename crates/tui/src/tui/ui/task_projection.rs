@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::tui::automation_panel::AutomationScan;
+use crate::tui::background_finished::{FinishedOutcome, FinishedWork, MAX_FINISHED_SHELLS};
 
 pub(super) async fn refresh_active_task_panel(
     app: &mut App,
@@ -48,13 +49,40 @@ pub(super) async fn refresh_active_task_panel(
         .filter(|entry| matches!(entry.status.as_str(), "queued" | "running"))
         .map(|entry| entry.id.as_str())
         .collect::<HashSet<_>>();
-    let durable_background_completed = newly_completed_id(
-        previously_active_durable_ids,
-        tasks
-            .iter()
-            .filter(|task| task.status == TaskStatus::Completed)
-            .map(|task| task.id.as_str()),
-    );
+    // #6565: a durable task that failed or was cancelled is as much news as
+    // one that completed; each lands in the batched notice by its summary.
+    let newly_finished_tasks = tasks
+        .iter()
+        .filter(|task| previously_active_durable_ids.contains(task.id.as_str()))
+        .filter_map(|task| {
+            let (outcome, word) = match task.status {
+                TaskStatus::Completed => (FinishedOutcome::Done, "done"),
+                TaskStatus::Failed => (FinishedOutcome::Failed, "failed"),
+                TaskStatus::Canceled => (FinishedOutcome::Stopped, "cancelled"),
+                TaskStatus::Queued | TaskStatus::Running => return None,
+            };
+            let summary = match task.duration_ms {
+                Some(ms) => format!("{word} · {}", crate::agent_roster::format_duration(ms)),
+                None => word.to_string(),
+            };
+            let summary = match task.error.as_deref().map(str::trim) {
+                Some(error) if !error.is_empty() && outcome != FinishedOutcome::Done => {
+                    format!("{summary} · {}", bound_agent_activity_text(error))
+                }
+                _ => summary,
+            };
+            Some(FinishedWork::task(
+                &task.prompt_summary,
+                outcome,
+                summary,
+                std::time::Duration::from_millis(task.duration_ms.unwrap_or_default()),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let durable_background_completed = newly_finished_tasks
+        .iter()
+        .any(|task| task.outcome == FinishedOutcome::Done);
+    app.background_finished.extend(newly_finished_tasks);
     let mut lifecycle_changed = false;
     if let (Some(work), Some(session_id)) = (
         app.runtime_services.work.as_ref(),
@@ -115,72 +143,91 @@ pub(super) async fn refresh_active_task_panel(
 
     // #3804: this is a render-only read of shell jobs and must not block the
     // async UI loop on the shell manager's std::sync Mutex. Use try_lock; on
-    // contention, retain the previous frame's background shell entries so
-    // running shells don't flicker out of the Work panel. Shell ownership,
+    // contention, fail closed (no shell rows this frame) rather than show a
+    // snapshot that may belong to a replaced session. Shell ownership,
     // cancellation, approval state, and output capture never depend on this
     // refresh succeeding.
-    let prev_shell_entries: Vec<TaskPanelEntry> = app
+    let prev_live_shell_ids = app
         .task_panel
         .iter()
-        .filter(|entry| matches!(entry.kind, TaskPanelEntryKind::Background))
-        .cloned()
-        .collect();
-    let prev_shell_ids = prev_shell_entries
-        .iter()
+        .filter(|entry| crate::tui::background_indicator::is_live_shell_entry(entry))
         .map(|entry| entry.id.clone())
         .collect::<HashSet<_>>();
-    let (shell_entries, shell_background_completed): (Vec<TaskPanelEntry>, bool) = match app
-        .runtime_services
-        .shell_manager
-        .as_ref()
-    {
+    let jobs = match app.runtime_services.shell_manager.as_ref() {
         Some(shell_mgr) => match shell_mgr.try_lock() {
-            Ok(mut mgr) => {
-                let jobs = mgr
-                    .list_jobs_for_session(app.current_session_id.as_deref().unwrap_or_default());
-                let completed = newly_completed_id(
-                    prev_shell_ids.iter().map(String::as_str).collect(),
-                    jobs.iter()
-                        .filter(|job| {
-                            matches!(job.status, crate::tools::shell::ShellStatus::Completed)
-                        })
-                        .map(|job| job.id.as_str()),
-                );
-                let entries = jobs
-                    .into_iter()
-                    .filter(|job| matches!(job.status, crate::tools::shell::ShellStatus::Running))
-                    .map(|job| TaskPanelEntry {
-                        id: job.id,
-                        status: "running".to_string(),
-                        prompt_summary: format!("shell: {}", job.command),
-                        duration_ms: Some(job.elapsed_ms),
-                        kind: TaskPanelEntryKind::Background,
-                        stale: job.stale,
-                        elapsed_since_output_ms: job.elapsed_since_output_ms,
-                        owner_agent_id: job.owner_agent_id,
-                        owner_agent_name: job.owner_agent_name,
-                        current_tool: None,
-                        role: None,
-                        files_touched: 0,
-                    })
-                    .collect();
-                (entries, completed)
-            }
-            // Contended: keep the last known snapshot rather than blocking.
-            // A retained frame could belong to the session that was just
-            // replaced. Fail closed on contention instead of showing it
-            // in the new conversation.
-            Err(_) => (Vec::new(), false),
+            Ok(mut mgr) => Some(
+                mgr.list_jobs_for_session(app.current_session_id.as_deref().unwrap_or_default()),
+            ),
+            Err(_) => None,
         },
-        None => (Vec::new(), false),
+        None => None,
     };
-    entries.extend(shell_entries);
+    let jobs = jobs.unwrap_or_default();
+    // #6565: every terminal status is a completion a person should hear
+    // about (a failed, killed or timed-out shell used to vanish silently),
+    // and a finished shell stays listed, muted, with how it ended.
+    let finished_now = newly_terminal(&prev_live_shell_ids, &jobs);
+    for job in &finished_now {
+        app.finished_shell_ids.retain(|id| id != &job.id);
+        app.finished_shell_ids.push_back(job.id.clone());
+        let (outcome, summary) = shell_outcome(job);
+        let toast = format!("shell · {} · {summary}", job.command.trim());
+        let level = if outcome == FinishedOutcome::Done {
+            crate::tui::app::StatusToastLevel::Info
+        } else {
+            crate::tui::app::StatusToastLevel::Warning
+        };
+        app.push_status_toast(bound_agent_activity_text(&toast), level, Some(6_000));
+        app.background_finished.push(FinishedWork::shell(
+            &job.command,
+            outcome,
+            summary,
+            std::time::Duration::from_millis(job.elapsed_ms),
+        ));
+    }
+    while app.finished_shell_ids.len() > MAX_FINISHED_SHELLS {
+        app.finished_shell_ids.pop_front();
+    }
+    let finished_order = app.finished_shell_ids.iter().cloned().collect::<Vec<_>>();
+    let shell_entry = |job: &crate::tools::shell::ShellJobSnapshot| TaskPanelEntry {
+        id: job.id.clone(),
+        status: shell_status_token(&job.status).to_string(),
+        prompt_summary: format!("shell: {}", job.command),
+        duration_ms: Some(job.elapsed_ms),
+        kind: TaskPanelEntryKind::Background,
+        stale: job.stale,
+        elapsed_since_output_ms: job.elapsed_since_output_ms,
+        owner_agent_id: job.owner_agent_id.clone(),
+        owner_agent_name: job.owner_agent_name.clone(),
+        current_tool: None,
+        role: None,
+        files_touched: 0,
+        exit_code: job.exit_code,
+    };
+    entries.extend(
+        jobs.iter()
+            .filter(|job| matches!(job.status, crate::tools::shell::ShellStatus::Running))
+            .map(shell_entry),
+    );
+    // Finished shells in the order they finished, so the list is stable and
+    // an idle tick with nothing new changes nothing (#3757).
+    entries.extend(
+        finished_order
+            .iter()
+            .filter_map(|id| jobs.iter().find(|job| &job.id == id))
+            .filter(|job| !matches!(job.status, crate::tools::shell::ShellStatus::Running))
+            .map(shell_entry),
+    );
+    let shell_background_completed = !finished_now.is_empty();
 
     // Report whether anything visible changed so the idle tick can skip the
     // redraw: an unconditional 2.5 s repaint kept the app from ever going
     // quiescent (#3757).
-    let changed =
-        namespace_changed || was_unavailable || lifecycle_changed || app.task_panel != entries;
+    let changed = namespace_changed
+        || was_unavailable
+        || lifecycle_changed
+        || shell_background_completed
+        || app.task_panel != entries;
     app.task_panel = entries;
     let tip_shown = (durable_background_completed || shell_background_completed)
         && app.maybe_show_behavioral_tip(
@@ -189,13 +236,53 @@ pub(super) async fn refresh_active_task_panel(
     changed || tip_shown
 }
 
-pub(super) fn newly_completed_id<'a>(
-    previously_active_ids: HashSet<&'a str>,
-    completed_ids: impl IntoIterator<Item = &'a str>,
-) -> bool {
-    completed_ids
-        .into_iter()
-        .any(|id| previously_active_ids.contains(id))
+/// The wire token a shell status shows as in the task panel.
+pub(crate) fn shell_status_token(status: &crate::tools::shell::ShellStatus) -> &'static str {
+    use crate::tools::shell::ShellStatus;
+    match status {
+        ShellStatus::Running => "running",
+        ShellStatus::Completed => "completed",
+        ShellStatus::Failed => "failed",
+        ShellStatus::Killed => "killed",
+        ShellStatus::TimedOut => "timed_out",
+    }
+}
+
+/// How a finished shell ended, in the words its row and notice use:
+/// `exit 0 · 12s`, `failed · exit 2`, `killed`, `timed out`.
+pub(crate) fn shell_outcome(
+    job: &crate::tools::shell::ShellJobSnapshot,
+) -> (FinishedOutcome, String) {
+    use crate::tools::shell::ShellStatus;
+    let exit = job.exit_code.map(|code| format!("exit {code}"));
+    let took = crate::agent_roster::format_duration(job.elapsed_ms);
+    match job.status {
+        ShellStatus::Completed | ShellStatus::Running => (
+            FinishedOutcome::Done,
+            format!("{} · {took}", exit.unwrap_or_else(|| "done".to_string())),
+        ),
+        ShellStatus::Failed => (
+            FinishedOutcome::Failed,
+            match exit {
+                Some(exit) => format!("failed · {exit}"),
+                None => "failed".to_string(),
+            },
+        ),
+        ShellStatus::Killed => (FinishedOutcome::Stopped, "killed".to_string()),
+        ShellStatus::TimedOut => (FinishedOutcome::Stopped, "timed out".to_string()),
+    }
+}
+
+/// Shells that were live last refresh and have reached any terminal status
+/// now: completed, failed, killed or timed out.
+pub(super) fn newly_terminal<'a>(
+    previously_live_ids: &HashSet<String>,
+    jobs: &'a [crate::tools::shell::ShellJobSnapshot],
+) -> Vec<&'a crate::tools::shell::ShellJobSnapshot> {
+    jobs.iter()
+        .filter(|job| !matches!(job.status, crate::tools::shell::ShellStatus::Running))
+        .filter(|job| previously_live_ids.contains(&job.id))
+        .collect()
 }
 
 /// Newest runs scanned per automation when refreshing the automation
@@ -518,6 +605,7 @@ pub(super) fn active_rlm_task_entries(app: &App) -> Vec<TaskPanelEntry> {
                 .filter(|summary| !summary.trim().is_empty())
                 .unwrap_or("running chunked analysis");
             Some(TaskPanelEntry {
+                exit_code: None,
                 id: format!("rlm-{}", idx + 1),
                 status: "running".to_string(),
                 prompt_summary: format!("RLM: {summary}"),

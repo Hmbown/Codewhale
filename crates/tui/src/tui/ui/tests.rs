@@ -8,8 +8,8 @@ use super::observer_hooks::{
     turn_end_observer_metadata,
 };
 use super::task_projection::{
-    ShellExecLiveUpdate, active_rlm_task_entries, newly_completed_id,
-    refresh_shell_exec_live_output, shell_exec_live_update,
+    ShellExecLiveUpdate, active_rlm_task_entries, newly_terminal, refresh_shell_exec_live_output,
+    shell_exec_live_update,
 };
 use super::*;
 use crate::config::{
@@ -15394,14 +15394,82 @@ fn rail_command_reports_off_without_claiming_visibility() {
     );
 }
 
+fn shell_job(
+    id: &str,
+    command: &str,
+    status: crate::tools::shell::ShellStatus,
+    exit_code: Option<i64>,
+) -> crate::tools::shell::ShellJobSnapshot {
+    crate::tools::shell::ShellJobSnapshot {
+        id: id.to_string(),
+        job_id: id.to_string(),
+        command: command.to_string(),
+        cwd: std::path::PathBuf::from("/tmp"),
+        status,
+        exit_code,
+        elapsed_ms: 12_000,
+        stdout_tail: String::new(),
+        stderr_tail: String::new(),
+        stdout_len: 0,
+        stderr_len: 0,
+        stdin_available: false,
+        stale: false,
+        elapsed_since_output_ms: None,
+        linked_task_id: None,
+        owner_agent_id: None,
+        owner_agent_name: None,
+        origin_tool_call_id: None,
+        origin_turn_id: None,
+        owner_session_id: String::new(),
+    }
+}
+
 #[test]
-fn background_receipt_tip_only_detects_a_visible_active_to_completed_transition() {
-    let active = HashSet::from(["task_running", "shell_running"]);
-    assert!(newly_completed_id(
-        active.clone(),
-        ["task_old", "task_running"]
-    ));
-    assert!(!newly_completed_id(active, ["task_old", "task_unseen"]));
+fn every_terminal_shell_status_is_a_completion_with_its_exit_facts() {
+    use crate::tools::shell::ShellStatus;
+    use crate::tui::background_finished::FinishedOutcome;
+    // #6565: only `Completed` used to count; a failed, killed or timed-out
+    // shell produced no signal at all.
+    let live = HashSet::from(
+        [
+            "shell_ok",
+            "shell_fail",
+            "shell_kill",
+            "shell_timeout",
+            "shell_live",
+        ]
+        .map(String::from),
+    );
+    let jobs = vec![
+        shell_job("shell_ok", "cargo build", ShellStatus::Completed, Some(0)),
+        shell_job("shell_fail", "npm test", ShellStatus::Failed, Some(2)),
+        shell_job("shell_kill", "sleep 99", ShellStatus::Killed, None),
+        shell_job("shell_timeout", "make e2e", ShellStatus::TimedOut, None),
+        shell_job("shell_live", "npm run dev", ShellStatus::Running, None),
+        shell_job("shell_old", "ls", ShellStatus::Completed, Some(0)),
+    ];
+    let finished = newly_terminal(&live, &jobs);
+    let ids = finished
+        .iter()
+        .map(|job| job.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        ["shell_ok", "shell_fail", "shell_kill", "shell_timeout"]
+    );
+    let outcomes = finished
+        .iter()
+        .map(|job| super::task_projection::shell_outcome(job))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes,
+        [
+            (FinishedOutcome::Done, "exit 0 · 12s".to_string()),
+            (FinishedOutcome::Failed, "failed · exit 2".to_string()),
+            (FinishedOutcome::Stopped, "killed".to_string()),
+            (FinishedOutcome::Stopped, "timed out".to_string()),
+        ]
+    );
 }
 
 #[test]
@@ -15412,6 +15480,7 @@ fn ctrl_x_jobs_prefill_only_catches_running_shell_jobs_in_tasks_sidebar() {
     app.input = "draft".to_string();
     app.cursor_position = app.input.len();
     app.task_panel.push(TaskPanelEntry {
+        exit_code: None,
         id: "shell_active".to_string(),
         status: "running".to_string(),
         prompt_summary: "shell: cargo test".to_string(),
@@ -15443,6 +15512,7 @@ fn ctrl_x_jobs_prefill_falls_through_outside_tasks_sidebar_shell_jobs() {
     non_shell.input = "draft".to_string();
     non_shell.cursor_position = non_shell.input.len();
     non_shell.task_panel.push(TaskPanelEntry {
+        exit_code: None,
         id: "task_active".to_string(),
         status: "running".to_string(),
         prompt_summary: "summarize the release notes".to_string(),
@@ -15466,6 +15536,7 @@ fn ctrl_x_jobs_prefill_falls_through_outside_tasks_sidebar_shell_jobs() {
     other_sidebar.input = "draft".to_string();
     other_sidebar.cursor_position = other_sidebar.input.len();
     other_sidebar.task_panel.push(TaskPanelEntry {
+        exit_code: None,
         id: "shell_active".to_string(),
         status: "running".to_string(),
         prompt_summary: "shell: cargo test".to_string(),
@@ -15518,6 +15589,8 @@ fn make_subagent(
         duration_ms: 0,
         started_at: None,
         from_prior_session: false,
+        idle_ms: None,
+        heartbeat_timeout_ms: None,
     }
 }
 
@@ -27483,10 +27556,28 @@ fn completed_turn_notification_leads_with_user_locale() {
     assert_eq!(payload.preview(), Some("完了しました。"));
 }
 
+/// The notice for one finished agent (#6565: every agent notice now goes
+/// through the batched background payload).
+fn single_agent_payload(
+    name: &str,
+    result: &str,
+    status: &crate::tools::subagent::SubAgentStatus,
+    include_summary: bool,
+    elapsed: Duration,
+) -> crate::tui::notifications::NotificationPayload {
+    crate::tui::background_finished::background_finished_payload(
+        codewhale_localization::Locale::En,
+        &[crate::tui::background_finished::FinishedWork::agent(
+            name, status, result, elapsed,
+        )],
+        include_summary,
+    )
+    .expect("one finished agent has a notice")
+}
+
 #[test]
 fn subagent_completion_notification_uses_summary_line_not_sentinel() {
-    let payload = crate::tui::notifications::subagent_terminal_payload(
-        codewhale_localization::Locale::En,
+    let payload = single_agent_payload(
         "agent_live",
         "Finished the docs audit.\n<codewhale:subagent.done>{}</codewhale:subagent.done>",
         &crate::tools::subagent::SubAgentStatus::Completed,
@@ -27502,8 +27593,7 @@ fn subagent_completion_notification_uses_summary_line_not_sentinel() {
 
 #[test]
 fn subagent_completion_notification_can_include_elapsed_summary() {
-    let payload = crate::tui::notifications::subagent_terminal_payload(
-        codewhale_localization::Locale::En,
+    let payload = single_agent_payload(
         "agent_live",
         "",
         &crate::tools::subagent::SubAgentStatus::Completed,
@@ -27520,8 +27610,7 @@ fn subagent_completion_notification_can_include_elapsed_summary() {
 fn subagent_notification_names_the_agent_and_previews_its_answer() {
     // #6565: the notice used the raw id as detail and the report's first
     // line (often `## Summary`) as preview.
-    let payload = crate::tui::notifications::subagent_terminal_payload(
-        codewhale_localization::Locale::En,
+    let payload = single_agent_payload(
         "audit docs",
         "## Summary\n\nThree links are stale. Two are in README.md.\n<codewhale:subagent.done>{}</codewhale:subagent.done>",
         &crate::tools::subagent::SubAgentStatus::Completed,
@@ -27530,13 +27619,15 @@ fn subagent_notification_names_the_agent_and_previews_its_answer() {
     );
     assert_eq!(payload.headline(), "Agent complete");
     assert_eq!(payload.detail(), Some("audit docs"));
-    assert_eq!(payload.preview(), Some("Three links are stale."));
+    assert_eq!(
+        payload.preview(),
+        Some("Three links are stale. … open Codewhale for the full result")
+    );
 }
 
 #[test]
 fn subagent_cancelled_notification_never_claims_completion() {
-    let payload = crate::tui::notifications::subagent_terminal_payload(
-        codewhale_localization::Locale::En,
+    let payload = single_agent_payload(
         "agent_stopped",
         "Cancelled\n<codewhale:subagent.done>{\"status\":\"cancelled\"}</codewhale:subagent.done>",
         &crate::tools::subagent::SubAgentStatus::Cancelled,
@@ -28013,6 +28104,7 @@ mod work_sidebar_projection_tests {
         // status constants used in sidebar rendering match the values produced
         // by ShellJobSnapshot / TaskSummary conversions.
         let entry = crate::tui::app::TaskPanelEntry {
+            exit_code: None,
             id: "test-id".to_string(),
             status: "completed".to_string(),
             prompt_summary: "echo hello".to_string(),
@@ -28200,6 +28292,7 @@ fn status_animation_ticks_for_a_visible_background_task() {
     app.work_surface.panel = crate::tui::work_surface::RailPanel::Tasks;
     app.work_surface.last_area = Some(Rect::new(80, 0, 20, 20));
     app.task_panel.push(TaskPanelEntry {
+        exit_code: None,
         id: "shell_smooth".to_string(),
         status: "running".to_string(),
         prompt_summary: "shell: cargo test --locked".to_string(),
@@ -28281,32 +28374,39 @@ fn translation_placeholder_keeps_a_calm_refresh_without_repainting_still_mode() 
 }
 
 #[test]
-fn subagent_completion_notification_modes_gate_correctly() {
-    use crate::config::SubagentCompletionNotification as Mode;
-    // off: never notify.
-    assert!(!should_notify_subagent_completion(Mode::Off, false, false));
-    assert!(!should_notify_subagent_completion(Mode::Off, true, true));
-    // always: notify regardless of what else is running.
-    assert!(should_notify_subagent_completion(Mode::Always, true, true));
-    assert!(should_notify_subagent_completion(
-        Mode::Always,
-        false,
-        false
-    ));
-    // final-only: only when nothing else is running and no workflow is active.
-    assert!(should_notify_subagent_completion(
-        Mode::FinalOnly,
-        false,
-        false
-    ));
-    assert!(
-        !should_notify_subagent_completion(Mode::FinalOnly, true, false),
-        "final-only stays quiet while other subagents run"
+fn background_notice_waits_for_finite_work_and_a_busy_parent() {
+    use crate::tui::background_finished::{FinishedOutcome, FinishedWork};
+    // #6565: `final-only` used to fire only for the last child, by raw id.
+    // It now holds a batch while finite work runs and releases it after.
+    let mut app = create_test_app();
+    let config = Config::default();
+    let mut running = make_subagent(
+        "agent_busy",
+        crate::tools::subagent::SubAgentStatus::Running,
     );
-    assert!(
-        !should_notify_subagent_completion(Mode::FinalOnly, false, true),
-        "final-only stays quiet while a workflow run is active"
-    );
+    running.started_at = Some(Instant::now());
+    app.subagent_cache.push(running);
+    app.background_finished.push(FinishedWork::agent(
+        "explore",
+        &crate::tools::subagent::SubAgentStatus::Completed,
+        "Found it.",
+        Duration::from_secs(3),
+    ));
+    flush_background_finished(&mut app, &config, false);
+    assert_eq!(app.background_finished.len(), 1, "another agent is running");
+
+    // A shell-only batch waits for a busy parent turn.
+    app.subagent_cache.clear();
+    app.background_finished.clear();
+    app.is_loading = true;
+    app.background_finished.push(FinishedWork::shell(
+        "cargo build",
+        FinishedOutcome::Done,
+        "exit 0 · 12s".to_string(),
+        Duration::from_secs(12),
+    ));
+    flush_background_finished(&mut app, &config, false);
+    assert_eq!(app.background_finished.len(), 1, "the parent turn is busy");
 }
 
 #[test]

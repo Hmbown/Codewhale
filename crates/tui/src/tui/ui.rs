@@ -1298,19 +1298,59 @@ pub(crate) fn clamp_event_poll_timeout(timeout: Duration) -> Duration {
     timeout.max(MIN_EVENT_POLL_TIMEOUT)
 }
 
-/// Decide whether an `AgentComplete` event should fire a subagent-completion
-/// desktop notification, per the `[notifications].subagent_completion` mode.
+/// Announce the background work that finished since the last notice, when
+/// the `[notifications].subagent_completion` mode says it is time (#6565).
+///
+/// Finite work still live (running agents that are not suspect ghosts, a
+/// running workflow, queued or running durable tasks) holds a `final-only`
+/// batch; a running background shell never does. `parent_idle` forces the
+/// parent-turn half of the rule open, for the moment a turn completes.
 /// `settings()` still has the final say (method=off / condition=never).
-fn should_notify_subagent_completion(
-    mode: crate::config::SubagentCompletionNotification,
-    has_other_running_subagents: bool,
-    workflow_tool_running: bool,
-) -> bool {
-    use crate::config::SubagentCompletionNotification as Mode;
-    match mode {
-        Mode::Off => false,
-        Mode::Always => true,
-        Mode::FinalOnly => !has_other_running_subagents && !workflow_tool_running,
+pub(crate) fn flush_background_finished(app: &mut App, config: &Config, parent_idle: bool) {
+    use crate::tui::background_finished::{background_finished_payload, ready_to_flush};
+    if app.background_finished.is_empty() {
+        return;
+    }
+    let mode = config.notifications_config().subagent_completion;
+    let finite_work_live = session_state::live_running_agent_count(app, Instant::now()) > 0
+        || frame::workflow_tool_is_running(app)
+        || app.task_panel.iter().any(|entry| {
+            !entry.prompt_summary.starts_with("shell: ")
+                && !entry.id.starts_with("shell_")
+                && matches!(entry.status.as_str(), "queued" | "running")
+        });
+    let parent_busy = app.is_loading && !parent_idle;
+    if !ready_to_flush(
+        mode,
+        &app.background_finished,
+        finite_work_live,
+        parent_busy,
+    ) {
+        return;
+    }
+    let batch = std::mem::take(&mut app.background_finished);
+    if mode == crate::config::SubagentCompletionNotification::Off {
+        return;
+    }
+    let Some((method, threshold, include_summary)) = notifications::settings(config) else {
+        return;
+    };
+    let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
+    let notices: Vec<&[crate::tui::background_finished::FinishedWork]> =
+        if mode == crate::config::SubagentCompletionNotification::Always {
+            batch.chunks(1).collect()
+        } else {
+            vec![batch.as_slice()]
+        };
+    for items in notices {
+        let elapsed = items
+            .iter()
+            .map(|item| item.elapsed)
+            .max()
+            .unwrap_or_default();
+        if let Some(payload) = background_finished_payload(app.ui_locale, items, include_summary) {
+            notifications::notify_done(method, in_tmux, &payload, threshold, elapsed);
+        }
     }
 }
 

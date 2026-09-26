@@ -22,6 +22,7 @@ pub mod auto_review;
 pub mod auto_router;
 pub mod automation_panel;
 mod automation_routing;
+pub mod background_finished;
 pub mod background_indicator;
 pub mod backtrack;
 pub mod behavioral_tips;

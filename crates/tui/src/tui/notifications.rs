@@ -973,33 +973,6 @@ pub fn completed_turn_payload(
     NotificationPayload::turn_complete(&headline).with_preview(preview.as_deref())
 }
 
-/// Compose a notification payload for a terminal sub-agent outcome. The
-/// agent's name (the same label every other surface shows, never its raw id)
-/// is the detail line, and the headline of its result is the (redacted,
-/// bounded) preview: the first sentence of prose, not a `## Summary` heading
-/// (#6565). The headline reflects the actual status so a Stop/failed worker is
-/// never announced as successfully complete (#4408).
-pub fn subagent_terminal_payload(
-    locale: Locale,
-    label: &str,
-    result: &str,
-    status: &SubAgentStatus,
-    include_summary: bool,
-    elapsed: Duration,
-) -> NotificationPayload {
-    let headline = completion_status(
-        &tr(locale, subagent_terminal_label(status)),
-        include_summary,
-        elapsed,
-        None,
-    );
-    let preview = crate::agent_roster::result_headline(result)
-        .as_deref()
-        .and_then(text_summary);
-
-    NotificationPayload::subagent_terminal(&headline, label).with_preview(preview.as_deref())
-}
-
 pub(crate) fn subagent_terminal_label(status: &SubAgentStatus) -> MessageId {
     match status {
         SubAgentStatus::Completed => MessageId::NotificationSubagentComplete,
@@ -1044,7 +1017,7 @@ pub fn elevation_needed_payload(
     )
 }
 
-fn completion_status(
+pub(crate) fn completion_status(
     label: &str,
     include_summary: bool,
     elapsed: Duration,

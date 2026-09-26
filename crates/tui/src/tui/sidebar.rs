@@ -503,6 +503,8 @@ mod tests {
             duration_ms: 100,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         }
     }
 
