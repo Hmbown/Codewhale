@@ -186,6 +186,9 @@ Three rules keep conditions from lying:
 - **`exit_code` needs a real exit code.** It matches only when the event
   actually observed a process exit code — `tool_call_after`, or `on_error` for
   a tool failure, in both cases for a process-backed tool such as `bash`.
+  A command that exits nonzero reports its code too, even though `bash`
+  returns it as a failed call. A timed-out or killed command usually has no
+  exit code; `DEEPSEEK_TOOL_STATUS` says which it was.
   A tool that reports no exit code never matches an `exit_code` condition; the
   condition is not satisfied by a default, a zero, or a success flag. The value
   is a 64-bit integer, so a Windows crash code such as `3221225477`
@@ -306,7 +309,8 @@ rebrand.
 | `DEEPSEEK_TOOL_ARGS` | `tool_call_before`, `shell_env` | tool input JSON preview, capped at 10 000 bytes |
 | `DEEPSEEK_TOOL_RESULT` | `tool_call_after`, `on_error` (tool failures) | truncated at 10 000 bytes |
 | `DEEPSEEK_TOOL_SUCCESS` | `tool_call_after`, `on_error` (tool failures) | `true` / `false` |
-| `DEEPSEEK_TOOL_EXIT_CODE` | `tool_call_after` and `on_error` **when the tool reported one** | absent otherwise — never synthesized; 64-bit, so Windows crash codes such as `3221225477` survive |
+| `DEEPSEEK_TOOL_EXIT_CODE` | `tool_call_after` and `on_error` **when the tool reported one** | absent otherwise — never synthesized; set for a failing command as well as a passing one; 64-bit, so Windows crash codes such as `3221225477` survive |
+| `DEEPSEEK_TOOL_STATUS` | `tool_call_after` and `on_error` **when a shell tool reported one** | `completed`, `failed`, `timed_out`, `killed`, or `running` (moved to the background); absent for other tools |
 | `DEEPSEEK_SESSION_COST` | when cost is supplied | USD, six decimal places |
 
 **Mode-spelling note.** UI-fired events (`session_start`, `session_end`,

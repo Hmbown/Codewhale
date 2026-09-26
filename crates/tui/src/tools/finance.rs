@@ -819,7 +819,7 @@ mod tests {
             .expect_err("double upstream failure should error");
 
         match err {
-            ToolError::ExecutionFailed { message } => {
+            ToolError::ExecutionFailed { message, .. } => {
                 assert!(message.contains(QUOTE_SOURCE));
                 assert!(message.contains("HTTP 401"));
                 assert!(message.contains(CHART_SOURCE));
@@ -853,7 +853,7 @@ mod tests {
             .expect_err("mixed upstream/not-found failures should not look like an invalid symbol");
 
         match err {
-            ToolError::ExecutionFailed { message } => {
+            ToolError::ExecutionFailed { message, .. } => {
                 assert!(message.contains(QUOTE_SOURCE));
                 assert!(message.contains("HTTP 503"));
                 assert!(message.contains(CHART_SOURCE));
@@ -887,7 +887,7 @@ mod tests {
             .expect_err("quote auth failures should not collapse into invalid input");
 
         match err {
-            ToolError::ExecutionFailed { message } => {
+            ToolError::ExecutionFailed { message, .. } => {
                 assert!(message.contains(QUOTE_SOURCE));
                 assert!(message.contains("HTTP 401"));
                 assert!(message.contains(CHART_SOURCE));

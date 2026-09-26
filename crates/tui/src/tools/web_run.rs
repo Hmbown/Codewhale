@@ -829,7 +829,7 @@ fn open_target_url(namespace: &str, ref_id: &str) -> Option<String> {
 fn source_failure(namespace: &str, url: &str, error: ToolError) -> Result<SourceEntry, ToolError> {
     let (status, reason) = match &error {
         ToolError::Timeout { .. } => (SourceStatus::Transient, error.to_string()),
-        ToolError::ExecutionFailed { message } => {
+        ToolError::ExecutionFailed { message, .. } => {
             let status = match http_status_of(message) {
                 Some(code) if code == 429 || (500..600).contains(&code) => SourceStatus::Transient,
                 Some(_) => SourceStatus::Unavailable,

@@ -32,8 +32,8 @@ pub use config::{
 };
 pub(crate) use executor::{
     HOOK_CONTEXT_AGGREGATE_MAX_CHARS, HOOK_LABEL_MAX_CHARS, generic_unavailable_detail,
-    parse_tool_call_before_stdout, reported_tool_exit_code, sanitize_hook_denial_reason,
-    sanitize_hook_label, sanitize_hook_line, sanitize_hook_text,
+    parse_tool_call_before_stdout, sanitize_hook_denial_reason, sanitize_hook_label,
+    sanitize_hook_line, sanitize_hook_text,
 };
 #[cfg(test)]
 pub(crate) use executor::{

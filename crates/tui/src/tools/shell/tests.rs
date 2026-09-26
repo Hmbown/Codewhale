@@ -270,6 +270,11 @@ fn contract_bash_nonzero_is_an_error_with_status_after_output() {
             .to_string()
             .ends_with("before\n\nCommand exited with code 7")
     );
+    // The error keeps the metadata a success carries, so hooks still see the
+    // exit code and status of a failing command.
+    let metadata = error.metadata().expect("failure metadata");
+    assert_eq!(metadata["exit_code"], 7);
+    assert_eq!(metadata["status"], "Failed");
 }
 
 #[cfg(unix)]
@@ -451,6 +456,8 @@ async fn lowercase_bash_timeout_uses_seconds_and_fails() {
             .contains("Command timed out after 0.01 seconds"),
         "{error}"
     );
+    let metadata = error.metadata().expect("timeout metadata");
+    assert_eq!(metadata["status"], "TimedOut");
 }
 
 fn execute_shell(

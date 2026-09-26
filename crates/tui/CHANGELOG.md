@@ -51,10 +51,13 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Fixed
 
-- Hooks: `tool_call_after` on a Runtime API thread now sets
-  `DEEPSEEK_TOOL_EXIT_CODE` for a shell command, as it already did in the TUI,
-  so `exit_code` conditions match there too. The Runtime API path passed no
-  exit code at all
+- Hooks: `tool_call_after` and `on_error` now get a shell command's exit code
+  in `DEEPSEEK_TOOL_EXIT_CODE` on Runtime API threads as well as in the TUI,
+  and for a failing command as well as a passing one, so `exit_code`
+  conditions match. The Runtime API path passed no exit code at all, and a
+  command that exited nonzero, timed out, or was killed reached hooks with no
+  exit code on either surface. The new `DEEPSEEK_TOOL_STATUS` says how the
+  command ended (`completed`, `failed`, `timed_out`, `killed`)
   ([#6582](https://github.com/Hmbown/Codewhale/issues/6582)).
 - A top-level `base_url` or `api_key` in `config.toml` now means one thing
   everywhere. Every reader used its own rule for which routes inherited it,

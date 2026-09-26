@@ -462,7 +462,7 @@ pub(super) fn format_tool_error_with_schema(
             "Path escapes workspace: {}. Use a workspace-relative path or enable trust mode.",
             path.display()
         ),
-        ToolError::ExecutionFailed { message } => message.clone(),
+        ToolError::ExecutionFailed { message, .. } => message.clone(),
         ToolError::Timeout { seconds } => format!(
             "Tool '{tool_name}' timed out after {seconds}s. Try a narrower scope or a longer timeout."
         ),

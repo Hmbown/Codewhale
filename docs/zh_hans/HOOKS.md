@@ -161,7 +161,8 @@ Observer 并**不**意味着无副作用。observer hook 是以你的凭据运�
 | `DEEPSEEK_TOOL_ARGS` | `tool_call_before`、`shell_env` | 工具输入 JSON 预览，上限 10 000 字节 |
 | `DEEPSEEK_TOOL_RESULT` | `tool_call_after`、`on_error`（工具失败） | 截断至 10 000 字节 |
 | `DEEPSEEK_TOOL_SUCCESS` | `tool_call_after`、`on_error`（工具失败） | `true` / `false` |
-| `DEEPSEEK_TOOL_EXIT_CODE` | `tool_call_after` 和 `on_error` **当工具报告了退出码时** | 否则不存在——绝不合成；64 位，因此 `3221225477` 这样的 Windows 崩溃码能完好保留 |
+| `DEEPSEEK_TOOL_EXIT_CODE` | `tool_call_after` 和 `on_error` **当工具报告了退出码时** | 否则不存在——绝不合成；命令失败时同样设置；64 位，因此 `3221225477` 这样的 Windows 崩溃码能完好保留 |
+| `DEEPSEEK_TOOL_STATUS` | `tool_call_after` 和 `on_error` **当 shell 工具报告了状态时** | `completed`、`failed`、`timed_out`、`killed` 或 `running`（已转入后台）；其他工具不存在 |
 | `DEEPSEEK_SESSION_COST` | 提供成本时 | USD，六位小数 |
 
 **模式拼写说明。** UI 触发的事件（`session_start`、`session_end`、`message_submit`、`tool_call_after`、`mode_change`、`on_error`、`turn_end`、`subagent_*`）会将 `DEEPSEEK_MODE` 设为 UI 标签——`ACT`、`PLAN`、`OPERATE`。`tool_call_before` 在引擎内部触发，并使用引擎自己的模式拼写（`Agent`、`Plan`、`Operate`）。`mode` 条件不区分大小写比较，因此 `{ type = "mode", mode = "plan" }` 两者都能匹配，但精确字符串匹配 `$DEEPSEEK_MODE` 的 hook 应同时接受两种拼写。

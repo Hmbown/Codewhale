@@ -42,6 +42,11 @@ pub struct HookContext {
     /// (`0xC0000005`) is a real value `exec_shell` reports, and narrowing it
     /// to `i32` used to discard exactly the failures a hook most wants to see.
     pub tool_exit_code: Option<i64>,
+    /// How a process-backed tool ended (`completed`, `failed`, `timed_out`,
+    /// `killed`, `running`), when it reported one. A timed-out or killed
+    /// command usually has no exit code, so this is how a hook tells it apart
+    /// from a tool that reported nothing.
+    pub tool_status: Option<String>,
     /// Whether tool succeeded
     pub tool_success: Option<bool>,
     /// Current mode
@@ -95,6 +100,22 @@ impl HookContext {
         self.tool_success = Some(success);
         self.tool_exit_code = exit_code;
         self
+    }
+
+    /// Record a settled tool call: its text, success flag, and — when the
+    /// tool reported them, on success or failure — its exit code and status.
+    /// The TUI and Runtime API completion hooks both build their context here.
+    pub fn with_tool_outcome(
+        self,
+        result: &Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError>,
+    ) -> Self {
+        let (text, success) = match result {
+            Ok(output) => (output.content.clone(), output.success),
+            Err(error) => (error.to_string(), false),
+        };
+        let mut context = self.with_tool_result(&text, success, reported_tool_exit_code(result));
+        context.tool_status = reported_tool_status(result).map(str::to_string);
+        context
     }
 
     pub fn with_mode(mut self, mode: &str) -> Self {
@@ -200,6 +221,9 @@ impl HookContext {
         }
         if let Some(success) = self.tool_success {
             env.insert("DEEPSEEK_TOOL_SUCCESS".to_string(), success.to_string());
+        }
+        if let Some(ref status) = self.tool_status {
+            env.insert("DEEPSEEK_TOOL_STATUS".to_string(), status.clone());
         }
         if let Some(ref mode) = self.mode {
             env.insert("DEEPSEEK_MODE".to_string(), mode.clone());
@@ -2956,23 +2980,54 @@ fn parse_env_lines(stdout: &str) -> HashMap<String, String> {
     out
 }
 
+/// Metadata a settled tool call reported, whether it succeeded or failed.
+///
+/// `bash` reports a nonzero exit, timeout, or kill as an error, so the error
+/// carries the metadata then; reading only `Ok` results lost the exit code of
+/// every failing command.
+fn reported_tool_metadata(
+    result: &Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError>,
+) -> Option<&serde_json::Value> {
+    match result {
+        Ok(output) => output.metadata.as_ref(),
+        Err(error) => error.metadata(),
+    }
+}
+
+/// Read how a process-backed tool ended, for `DEEPSEEK_TOOL_STATUS`.
+///
+/// Only the shell statuses the tools record count; anything else stays `None`
+/// rather than passing an arbitrary metadata string into a hook's environment.
+fn reported_tool_status(
+    result: &Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError>,
+) -> Option<&'static str> {
+    match reported_tool_metadata(result)?.get("status")?.as_str()? {
+        "Completed" => Some("completed"),
+        "Failed" => Some("failed"),
+        "TimedOut" => Some("timed_out"),
+        "Killed" => Some("killed"),
+        "Running" => Some("running"),
+        _ => None,
+    }
+}
+
 /// Read the process exit code a tool reported, when it reported one.
 ///
 /// The one source for `DEEPSEEK_TOOL_EXIT_CODE`: the TUI and the Runtime API
-/// thread path both hand it to [`HookContext::with_tool_result`].
+/// thread path both reach it through [`HookContext::with_tool_outcome`].
 ///
-/// Only process-backed tools (`exec_shell`, task runners) carry one, and only
-/// a real, integer-valued `exit_code` counts. Everything else stays `None` so
+/// Only process-backed tools (`exec_shell`, `bash`, task runners) carry one,
+/// on a successful result or a failed one, and only a real, integer-valued
+/// `exit_code` counts. Everything else stays `None` so
 /// an `exit_code` condition never matches on a fabricated value.
 /// Reported as `i64`, not `i32`: a Windows crash code such as `3221225477`
 /// (`0xC0000005`) is a real value the shell tool records in its metadata, and
 /// narrowing it dropped exactly those codes — the hook saw no exit code at all
 /// for the crashes it most wanted to catch.
-pub(crate) fn reported_tool_exit_code(
+fn reported_tool_exit_code(
     result: &Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError>,
 ) -> Option<i64> {
-    let metadata = result.as_ref().ok()?.metadata.as_ref()?;
-    let code = metadata.get("exit_code")?;
+    let code = reported_tool_metadata(result)?.get("exit_code")?;
     if code.is_null() {
         return None;
     }
@@ -3048,6 +3103,34 @@ mod tests {
         let errored: Result<ToolResult, ToolError> =
             Err(ToolError::execution_failed("no such tool"));
         assert_eq!(reported_tool_exit_code(&errored), None);
+        assert_eq!(reported_tool_status(&errored), None);
+
+        // A failed command reported as an error still carries its code and
+        // status.
+        let failed_command: Result<ToolResult, ToolError> =
+            Err(ToolError::execution_failed_with_metadata(
+                "Command exited with code 127",
+                serde_json::json!({ "exit_code": 127, "status": "Failed" }),
+            ));
+        assert_eq!(reported_tool_exit_code(&failed_command), Some(127));
+        assert_eq!(reported_tool_status(&failed_command), Some("failed"));
+
+        // A timeout has a status but no exit code; the code is not invented.
+        let timed_out: Result<ToolResult, ToolError> =
+            Err(ToolError::execution_failed_with_metadata(
+                "Command timed out after 1 seconds",
+                serde_json::json!({ "exit_code": null, "status": "TimedOut" }),
+            ));
+        assert_eq!(reported_tool_exit_code(&timed_out), None);
+        assert_eq!(reported_tool_status(&timed_out), Some("timed_out"));
+
+        // An unknown status string is not passed through.
+        let odd_status = Ok(ToolResult {
+            content: String::new(),
+            success: true,
+            metadata: Some(serde_json::json!({ "status": "$(boom)" })),
+        });
+        assert_eq!(reported_tool_status(&odd_status), None);
     }
 
     #[test]

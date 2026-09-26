@@ -16,7 +16,7 @@ async fn missing_pdf_path_precedes_unavailable_helper() {
     .expect_err("missing path must fail before the missing helper is launched");
 
     match error {
-        ToolError::ExecutionFailed { message } => {
+        ToolError::ExecutionFailed { message, .. } => {
             assert!(message.contains("Failed to read"), "{message}");
             assert!(message.contains("missing.pdf"), "{message}");
         }

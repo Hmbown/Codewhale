@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::hooks::{HookEvent, reported_tool_exit_code};
+use crate::hooks::HookEvent;
 use crate::tools::ReviewOutput;
 use crate::tools::apply_patch::{NormalizedApplyPatchInput, normalize_apply_patch_input};
 use crate::tools::canonical_action::canonical_action_alias;
@@ -659,33 +659,26 @@ fn fire_tool_completion_hooks(
         return;
     }
 
-    let (result_text, success): (String, bool) = match result.as_ref() {
-        Ok(tool_result) => (tool_result.content.clone(), tool_result.success),
-        Err(err) => (err.to_string(), false),
-    };
-    let exit_code = reported_tool_exit_code(result);
+    let context = app
+        .base_hook_context()
+        .with_tool_name(name)
+        .with_tool_call_id(id)
+        .with_tool_outcome(result);
+    let failed = context.tool_success == Some(false);
+    let error_context = (wants_error && failed).then(|| {
+        let text = context.tool_result.as_deref().unwrap_or_default();
+        let message = format!("tool `{name}` failed: {text}");
+        context.clone().with_error(&message)
+    });
 
-    if wants_after {
-        let context = app
-            .base_hook_context()
-            .with_tool_name(name)
-            .with_tool_call_id(id)
-            .with_tool_result(&result_text, success, exit_code);
-        if let Err(error) = app.submit_hooks(HookEvent::ToolCallAfter, context) {
-            app.surface_observer_hook_submission_failure(error);
-        }
+    if wants_after && let Err(error) = app.submit_hooks(HookEvent::ToolCallAfter, context) {
+        app.surface_observer_hook_submission_failure(error);
     }
 
-    if wants_error && !success {
-        let context = app
-            .base_hook_context()
-            .with_tool_name(name)
-            .with_tool_call_id(id)
-            .with_tool_result(&result_text, success, exit_code)
-            .with_error(&format!("tool `{name}` failed: {result_text}"));
-        if let Err(error) = app.submit_hooks(crate::hooks::HookEvent::OnError, context) {
-            app.surface_observer_hook_submission_failure(error);
-        }
+    if let Some(context) = error_context
+        && let Err(error) = app.submit_hooks(crate::hooks::HookEvent::OnError, context)
+    {
+        app.surface_observer_hook_submission_failure(error);
     }
 }
 
@@ -2406,6 +2399,85 @@ mod tests {
         let errors = hook_log_lines_eventually(&error_log, 1);
         assert_eq!(after, vec![id, second]);
         assert_eq!(errors, vec![id]);
+    }
+
+    /// #6582: hooks see a `bash` command's real exit code and status, for a
+    /// failing command as well as a passing one. `bash` reports a nonzero
+    /// exit or a timeout as a `ToolError`, and the hook used to read the code
+    /// only from a successful result, so every failing command reached
+    /// `tool_call_after` and `on_error` with no exit code.
+    #[cfg(unix)]
+    #[test]
+    fn bash_completion_hooks_get_exit_code_and_status_for_failures() {
+        use crate::hooks::{Hook, HookEvent, HookExecutor, HooksConfig};
+        use crate::tools::spec::{ToolContext, ToolSpec};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let after_log = dir.path().join("after.log");
+        let error_log = dir.path().join("error.log");
+        let script = |path: &std::path::Path| {
+            format!(
+                "printf '%s %s %s %s\\n' \"$DEEPSEEK_TOOL_CALL_ID\" \"${{DEEPSEEK_TOOL_EXIT_CODE-unset}}\" \"${{DEEPSEEK_TOOL_STATUS-unset}}\" \"$DEEPSEEK_TOOL_SUCCESS\" >> {}",
+                path.display()
+            )
+        };
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(dir.path()),
+        );
+        app.workspace = dir.path().to_path_buf();
+        app.hooks = HookExecutor::new(
+            HooksConfig {
+                enabled: true,
+                hooks: vec![
+                    Hook::new(HookEvent::ToolCallAfter, &script(&after_log)),
+                    Hook::new(HookEvent::OnError, &script(&error_log)),
+                ],
+                ..HooksConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let context = ToolContext::new(dir.path());
+        let cases = [
+            ("call-exit-0", json!({"command": "exit 0"})),
+            ("call-exit-1", json!({"command": "exit 1"})),
+            (
+                "call-exit-127",
+                json!({"command": "codewhale-no-such-command-6582"}),
+            ),
+            (
+                "call-timeout",
+                json!({"command": "sleep 5", "timeout": 0.2}),
+            ),
+        ];
+        for (id, input) in cases {
+            let result =
+                runtime.block_on(crate::tools::shell::LowercaseBashTool.execute(input, &context));
+            handle_tool_call_complete(&mut app, id, "bash", &result);
+        }
+
+        let mut after = hook_log_lines_eventually(&after_log, 4);
+        let mut errors = hook_log_lines_eventually(&error_log, 3);
+        after.sort();
+        errors.sort();
+        assert_eq!(
+            after,
+            vec![
+                "call-exit-0 0 completed true",
+                "call-exit-1 1 failed false",
+                "call-exit-127 127 failed false",
+                "call-timeout unset timed_out false",
+            ]
+        );
+        assert_eq!(
+            errors,
+            vec![
+                "call-exit-1 1 failed false",
+                "call-exit-127 127 failed false",
+                "call-timeout unset timed_out false",
+            ]
+        );
     }
 
     #[test]

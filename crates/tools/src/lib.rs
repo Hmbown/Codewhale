@@ -61,7 +61,14 @@ pub enum ToolError {
     #[error("Failed to resolve path '{}': path escapes workspace", path.display())]
     PathEscape { path: PathBuf },
     #[error("Failed to execute tool: {message}")]
-    ExecutionFailed { message: String },
+    ExecutionFailed {
+        message: String,
+        /// Structured facts about the failure, in the same shape a
+        /// `ToolResult` would carry them. A process-backed tool that reports a
+        /// nonzero exit or a timeout as an error puts its `exit_code` and
+        /// `status` here, so observers (hooks, receipts) still see them.
+        metadata: Option<Value>,
+    },
     #[error("Failed to execute tool: operation timed out after {seconds}s")]
     Timeout { seconds: u64 },
     #[error("Tool execution cancelled: {message}")]
@@ -91,6 +98,26 @@ impl ToolError {
     pub fn execution_failed(msg: impl Into<String>) -> Self {
         Self::ExecutionFailed {
             message: msg.into(),
+            metadata: None,
+        }
+    }
+
+    /// An execution failure that still carries structured result metadata,
+    /// such as a shell command's `exit_code` and `status`.
+    #[must_use]
+    pub fn execution_failed_with_metadata(msg: impl Into<String>, metadata: Value) -> Self {
+        Self::ExecutionFailed {
+            message: msg.into(),
+            metadata: Some(metadata),
+        }
+    }
+
+    /// Structured metadata the failing tool attached, if any.
+    #[must_use]
+    pub fn metadata(&self) -> Option<&Value> {
+        match self {
+            Self::ExecutionFailed { metadata, .. } => metadata.as_ref(),
+            _ => None,
         }
     }
 
@@ -889,7 +916,7 @@ mod tests {
         let err = ToolError::execution_failed("process crashed");
 
         assert!(
-            matches!(err, ToolError::ExecutionFailed { ref message } if message == "process crashed")
+            matches!(err, ToolError::ExecutionFailed { ref message, .. } if message == "process crashed")
         );
         assert_eq!(err.to_string(), "Failed to execute tool: process crashed");
     }

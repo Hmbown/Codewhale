@@ -643,28 +643,23 @@ fn fire_runtime_tool_completion_hooks(
     if !wants_after && !wants_error {
         return;
     }
-    let (text, success) = match result {
-        Ok(output) => (output.content.clone(), output.success),
-        Err(error) => (error.to_string(), false),
-    };
-    let exit_code = crate::hooks::reported_tool_exit_code(result);
-    let context = || {
-        HookContext::new()
-            .with_workspace(hooks.default_working_dir().to_path_buf())
-            .with_session_id(thread_id)
-            .with_tool_name(name)
-            .with_tool_call_id(id)
-            .with_tool_result(&text, success, exit_code)
-    };
-    if wants_after && let Err(error) = hooks.submit_observer(HookEvent::ToolCallAfter, context()) {
+    let context = HookContext::new()
+        .with_workspace(hooks.default_working_dir().to_path_buf())
+        .with_session_id(thread_id)
+        .with_tool_name(name)
+        .with_tool_call_id(id)
+        .with_tool_outcome(result);
+    let failed = context.tool_success == Some(false);
+    let error_context = (wants_error && failed).then(|| {
+        let text = context.tool_result.as_deref().unwrap_or_default();
+        let message = format!("tool `{name}` failed: {text}");
+        context.clone().with_error(&message)
+    });
+    if wants_after && let Err(error) = hooks.submit_observer(HookEvent::ToolCallAfter, context) {
         tracing::warn!(target: "hooks", %error, thread_id, "tool_call_after hook was not submitted");
     }
-    if wants_error
-        && !success
-        && let Err(error) = hooks.submit_observer(
-            HookEvent::OnError,
-            context().with_error(&format!("tool `{name}` failed: {text}")),
-        )
+    if let Some(error_context) = error_context
+        && let Err(error) = hooks.submit_observer(HookEvent::OnError, error_context)
     {
         tracing::warn!(target: "hooks", %error, thread_id, "on_error hook was not submitted");
     }

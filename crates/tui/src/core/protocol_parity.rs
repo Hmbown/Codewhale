@@ -218,7 +218,7 @@ fn tool_error_to_wire(error: &ToolError) -> wire::ToolCallError {
             field: field.clone(),
         },
         ToolError::PathEscape { path } => wire::ToolCallError::PathEscape { path: path.clone() },
-        ToolError::ExecutionFailed { message } => wire::ToolCallError::ExecutionFailed {
+        ToolError::ExecutionFailed { message, .. } => wire::ToolCallError::ExecutionFailed {
             message: message.clone(),
         },
         ToolError::Timeout { seconds } => wire::ToolCallError::Timeout { seconds: *seconds },

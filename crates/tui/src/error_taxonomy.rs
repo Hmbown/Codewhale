@@ -467,7 +467,7 @@ impl From<ToolError> for ErrorEnvelope {
                 "tool_path_escape",
                 format!("Path escapes workspace: {}", path.display()),
             ),
-            ToolError::ExecutionFailed { message } => Self::new(
+            ToolError::ExecutionFailed { message, .. } => Self::new(
                 ErrorCategory::Tool,
                 ErrorSeverity::Error,
                 true,

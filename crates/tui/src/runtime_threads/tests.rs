@@ -19357,28 +19357,31 @@ async fn runtime_tool_completion_fires_after_and_error_hooks() -> Result<()> {
     Ok(())
 }
 
-/// #6582: a Runtime API shell tool completion hands the command's exit code
-/// to `tool_call_after`, as the TUI does. The runtime path used to pass
-/// `None`, so `DEEPSEEK_TOOL_EXIT_CODE` was never set on Runtime API threads.
-/// The command exits 0 because `bash` reports a nonzero exit as a
-/// `ToolError`, which carries no metadata and so no exit code on any surface.
+/// #6582: a Runtime API `bash` completion hands the command's exit code and
+/// status to `tool_call_after` and `on_error`, as the TUI does. The runtime
+/// path used to pass `None`; and a failing command, which `bash` reports as a
+/// `ToolError`, reached hooks with no exit code on either surface.
 #[cfg(unix)]
 #[tokio::test]
-async fn runtime_shell_completion_delivers_exit_code_to_after_hook() -> Result<()> {
+async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Result<()> {
     use crate::hooks::{Hook, HookEvent, HooksConfig};
     use crate::tools::spec::ToolSpec;
     let dir = tempfile::tempdir()?;
-    let log = dir.path().join("hooks.log");
+    let after_log = dir.path().join("after.log");
+    let error_log = dir.path().join("error.log");
+    let script = |path: &std::path::Path| {
+        format!(
+            "printf '%s %s %s %s\\n' \"$CODEWHALE_TOOL_CALL_ID\" \"${{DEEPSEEK_TOOL_EXIT_CODE-unset}}\" \"${{DEEPSEEK_TOOL_STATUS-unset}}\" \"$DEEPSEEK_TOOL_SUCCESS\" >> {}",
+            path.display()
+        )
+    };
     let manager = test_manager(test_runtime_dir())?;
     let config = Config {
         hooks: Some(HooksConfig {
-            hooks: vec![Hook::new(
-                HookEvent::ToolCallAfter,
-                &format!(
-                    "printf '%s %s\\n' \"$CODEWHALE_TOOL_CALL_ID\" \"${{DEEPSEEK_TOOL_EXIT_CODE-unset}}\" >> {}",
-                    log.display()
-                ),
-            )],
+            hooks: vec![
+                Hook::new(HookEvent::ToolCallAfter, &script(&after_log)),
+                Hook::new(HookEvent::OnError, &script(&error_log)),
+            ],
             enabled: true,
             ..HooksConfig::default()
         }),
@@ -19386,18 +19389,58 @@ async fn runtime_shell_completion_delivers_exit_code_to_after_hook() -> Result<(
     };
     let hooks = manager.hook_executor_for_workspace(&config, dir.path(), None);
     let context = crate::tools::spec::ToolContext::new(dir.path());
-    let result = crate::tools::shell::LowercaseBashTool
-        .execute(json!({"command": "exit 0"}), &context)
-        .await;
-    fire_runtime_tool_completion_hooks(&hooks, "thr_1", "call-shell", "bash", &result);
+    let cases = [
+        ("call-exit-0", json!({"command": "exit 0"})),
+        ("call-exit-1", json!({"command": "exit 1"})),
+        (
+            "call-exit-127",
+            json!({"command": "codewhale-no-such-command-6582"}),
+        ),
+        (
+            "call-timeout",
+            json!({"command": "sleep 5", "timeout": 0.2}),
+        ),
+    ];
+    for (id, input) in cases {
+        let result = crate::tools::shell::LowercaseBashTool
+            .execute(input, &context)
+            .await;
+        fire_runtime_tool_completion_hooks(&hooks, "thr_1", id, "bash", &result);
+    }
+    let read_lines = |path: &std::path::Path| {
+        let mut lines = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        lines.sort();
+        lines
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
-    let text = loop {
-        let text = std::fs::read_to_string(&log).unwrap_or_default();
-        if !text.is_empty() || Instant::now() >= deadline {
-            break text;
+    let (after, errors) = loop {
+        let after = read_lines(&after_log);
+        let errors = read_lines(&error_log);
+        if (after.len() >= 4 && errors.len() >= 3) || Instant::now() >= deadline {
+            break (after, errors);
         }
         sleep(Duration::from_millis(20)).await;
     };
-    assert_eq!(text.trim_end(), "call-shell 0", "{result:?}");
+    assert_eq!(
+        after,
+        vec![
+            "call-exit-0 0 completed true",
+            "call-exit-1 1 failed false",
+            "call-exit-127 127 failed false",
+            "call-timeout unset timed_out false",
+        ]
+    );
+    assert_eq!(
+        errors,
+        vec![
+            "call-exit-1 1 failed false",
+            "call-exit-127 127 failed false",
+            "call-timeout unset timed_out false",
+        ]
+    );
     Ok(())
 }

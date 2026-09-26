@@ -4734,12 +4734,19 @@ fn finish_contract_bash_result(
         )).with_metadata(metadata));
     }
     if result.status != ShellStatus::Completed {
+        // A nonzero exit, timeout, or kill stays a failed tool call, but it
+        // keeps the same metadata a success carries: hooks read `exit_code`
+        // and `status` from it, and an error with no metadata left them blind
+        // to exactly the commands that failed.
         let status = contract_bash_error_status(&result, timeout_ms);
-        return Err(ToolError::execution_failed(if output.is_empty() {
-            status
-        } else {
-            format!("{output}\n\n{status}")
-        }));
+        return Err(ToolError::execution_failed_with_metadata(
+            if output.is_empty() {
+                status
+            } else {
+                format!("{output}\n\n{status}")
+            },
+            metadata,
+        ));
     }
 
     Ok(ToolResult::success(if output.is_empty() {
