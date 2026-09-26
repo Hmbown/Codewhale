@@ -102,6 +102,11 @@ pub struct ModelFact {
     pub pricing_withheld: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
+    /// Replacement reasoning controls in the Models.dev `reasoning_options`
+    /// shape (effort ladders, thinking modes, defaults), for a row whose
+    /// upstream controls do not match what the route accepts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_options: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

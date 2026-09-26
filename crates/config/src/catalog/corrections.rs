@@ -109,7 +109,8 @@ impl CatalogCorrections {
             let patches_more_than_price = fact.context_window.is_some()
                 || fact.max_output.is_some()
                 || fact.pricing.is_some()
-                || fact.reasoning.is_some();
+                || fact.reasoning.is_some()
+                || fact.reasoning_options.is_some();
             if !patches_more_than_price && fact.pricing_withheld.is_none() {
                 return Err(format!("{name}: changes nothing"));
             }

@@ -276,6 +276,16 @@ fn patch_fields(row: &mut CatalogOffering, patch: &ModelFact) {
     if patch.reasoning.is_some() {
         row.reasoning = patch.reasoning;
     }
+    if let Some(options) = &patch.reasoning_options {
+        // Keep this layer's own annotations; replace only the controls.
+        let markers = row
+            .reasoning_options
+            .drain(..)
+            .filter(|value| value.get("cloud_facts").is_some())
+            .collect::<Vec<_>>();
+        row.reasoning_options = options.clone();
+        row.reasoning_options.extend(markers);
+    }
     if patch.display_name.is_some() || patch.note.is_some() {
         annotate(row, patch, "upsert");
     }

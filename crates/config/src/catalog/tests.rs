@@ -1633,3 +1633,74 @@ fn pricing_withheld_round_trips_and_older_payloads_still_parse() {
     let plain = serde_json::to_string(&older).expect("serializes");
     assert!(!plain.contains("pricing_withheld"));
 }
+
+#[test]
+fn reasoning_controls_correction_holds_on_a_live_row() {
+    let catalog = ModelsDevCatalog::parse_json(
+        r#"{
+          "providers": {
+            "xai": {
+              "id": "xai",
+              "models": {
+                "grok-4.6": {
+                  "id": "grok-4.6",
+                  "reasoning": true,
+                  "reasoning_options": [
+                    { "type": "effort", "values": ["low", "medium", "high", "xhigh"] }
+                  ]
+                }
+              }
+            }
+          }
+        }"#,
+    )
+    .expect("fixture parses");
+    let rows = live_offerings_from_models_dev(&catalog, 1);
+    let grok = find(&rows, "xai", "grok-4.6");
+    assert_eq!(
+        grok.reasoning_options[0]
+            .get("default")
+            .and_then(serde_json::Value::as_str),
+        Some("high"),
+        "Codewhale's documented default survives a live refresh"
+    );
+    assert!(matches!(grok.source, CatalogSource::ModelsDevLive { .. }));
+
+    // A signed annotation already on the row is kept alongside the controls.
+    let mut row = grok.clone();
+    row.reasoning_options
+        .push(serde_json::json!({ "cloud_facts": { "op": "upsert" } }));
+    let key = row.merge_key();
+    let mut map = BTreeMap::from([(key.clone(), row)]);
+    let options = vec![serde_json::json!({ "type": "effort", "values": ["high"] })];
+    crate::cloud_facts::catalog_patch::apply_model_patches(
+        &mut map,
+        &crate::cloud_facts::ScopedFacts {
+            facts_version: 1,
+            key_id: "cwf-test-only".into(),
+            models: vec![crate::cloud_facts::ModelFact {
+                provider: key.0.clone(),
+                id: key.1.clone(),
+                reasoning_options: Some(options.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        1,
+    );
+    let patched = &map[&key].reasoning_options;
+    assert_eq!(patched[0], options[0]);
+    assert!(
+        patched
+            .iter()
+            .any(|value| value.get("cloud_facts").is_some())
+    );
+
+    assert!(
+        corrections::CatalogCorrections::parse(
+            r#"{"revision":"t","models":[{"provider":"p","id":"m","reasoning_options":[]}]}"#
+        )
+        .is_err(),
+        "a reasoning correction needs a reason"
+    );
+}
