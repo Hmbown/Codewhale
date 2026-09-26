@@ -89,7 +89,11 @@ fn session_artifact_relative_path_with_extension(
     Ok(PathBuf::from(ARTIFACTS_DIR_NAME).join(format!("{artifact_id}.{extension}")))
 }
 
-fn artifact_sessions_root() -> Option<PathBuf> {
+/// The root every session artifact is written under. Readers that serve
+/// artifacts by a recorded reference resolve through this same function, so
+/// a configured Runtime `sessions_dir` can never point a read at a different
+/// tree than the writer used.
+pub(crate) fn artifact_sessions_root() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(root) = TEST_ARTIFACT_SESSIONS_ROOT
         .lock()

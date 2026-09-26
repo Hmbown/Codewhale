@@ -440,6 +440,7 @@ mod tests {
                 "tool_input": input.to_string(),
             })),
             artifact_refs: Vec::new(),
+            artifacts: Vec::new(),
             started_at: Some(now),
             ended_at: Some(now),
         }

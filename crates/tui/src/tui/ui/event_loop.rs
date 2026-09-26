@@ -2549,6 +2549,9 @@ pub(crate) async fn run_event_loop(
                             active_translation_route = Some(route);
                         }
                     }
+                    // The TUI keeps its own undo/restore flow; only Runtime
+                    // hosts settle a turn's workspace delta.
+                    EngineEvent::TurnWorkspaceSnapshots { .. } => {}
                     EngineEvent::TurnComplete {
                         usage,
                         parent_route_usage,

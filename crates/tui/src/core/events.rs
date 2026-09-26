@@ -16,6 +16,55 @@ use crate::tools::subagent::{AgentWorkerStatus, CoordinationDetailProjection, Su
 use crate::tools::user_input::UserInputRequest;
 use codewhale_models::{Message, SystemPrompt, Tool, Usage};
 
+/// Why one side of a turn's workspace snapshot pair does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotUnavailable {
+    /// `[snapshots] enabled = false`, or an isolated chat engine.
+    Disabled,
+    /// Snapshot-eligible content exceeds `[snapshots] max_workspace_gb`.
+    WorkspaceTooLarge,
+    /// The bounded size walk hit its entry ceiling.
+    TooManyFiles,
+    /// Home, filesystem root or a top-level home folder: never snapshotted.
+    UnsafeLocation,
+    /// The snapshot was attempted and failed (git or disk error), or its task
+    /// ended without a result.
+    Failed,
+}
+
+impl SnapshotUnavailable {
+    /// Stable wire code.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "snapshots_disabled",
+            Self::WorkspaceTooLarge => "workspace_too_large",
+            Self::TooManyFiles => "too_many_files",
+            Self::UnsafeLocation => "unsafe_location",
+            Self::Failed => "snapshot_failed",
+        }
+    }
+}
+
+/// One side of a turn's workspace snapshot pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceSnapshot {
+    /// The snapshot task has not finished yet (post-turn only).
+    Pending,
+    /// The side-repo commit id.
+    Taken(String),
+    Unavailable(SnapshotUnavailable),
+}
+
+impl From<Result<String, SnapshotUnavailable>> for WorkspaceSnapshot {
+    fn from(result: Result<String, SnapshotUnavailable>) -> Self {
+        match result {
+            Ok(id) => Self::Taken(id),
+            Err(reason) => Self::Unavailable(reason),
+        }
+    }
+}
+
 /// Final status for a turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -285,6 +334,21 @@ pub enum Event {
     /// dispatch boundary, after request preparation. This is admission-time
     /// evidence, not proof of network delivery or provider invoice-time rates.
     RouteDispatched { turn_id: String, route: TurnRoute },
+
+    /// The workspace snapshot pair that brackets this turn, sent immediately
+    /// before `TurnComplete` so a host that stops reading at `TurnComplete`
+    /// still receives it. The post-turn snapshot runs off the engine loop
+    /// (TurnComplete never waits for it, #234); `post_turn` resolves when it
+    /// finishes. A host diffs the pair to learn what changed in the
+    /// workspace while the turn ran. Every turn that took (or tried to take)
+    /// a pre-turn snapshot sends this; `session_id` is the session the
+    /// snapshots are tagged with.
+    TurnWorkspaceSnapshots {
+        turn_id: String,
+        session_id: String,
+        pre_turn: WorkspaceSnapshot,
+        post_turn: tokio::sync::watch::Receiver<WorkspaceSnapshot>,
+    },
 
     /// The turn is complete (no more tool calls)
     TurnComplete {

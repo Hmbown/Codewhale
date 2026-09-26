@@ -570,6 +570,40 @@ async fn contract_edit_preserves_bom_and_crlf_without_prior_read() {
         std::fs::read(&path).expect("updated"),
         "\u{FEFF}one\r\ntwo\r\n".as_bytes()
     );
+    // The receipt describes the bytes written (BOM and CRLF included), not
+    // the edited text, so a turn artifact's revision matches the file read.
+    let on_disk = std::fs::read(&path).expect("updated");
+    assert_eq!(
+        result.metadata.as_ref().expect("metadata")["mutation"]["files"],
+        json!([{
+            "path": "doc.txt",
+            "outcome": "updated",
+            "size": on_disk.len(),
+            "sha256": crate::hashing::sha256_hex(&on_disk),
+        }])
+    );
+}
+
+#[tokio::test]
+async fn contract_write_receipt_carries_written_size_and_sha256() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let context = ToolContext::new(temporary.path());
+    let result = WriteFileTool::execute_contract_write(
+        json!({"path": "notes/out.md", "content": "# Title\n"}),
+        &context,
+    )
+    .await
+    .expect("write");
+    let on_disk = std::fs::read(temporary.path().join("notes/out.md")).expect("written");
+    assert_eq!(
+        result.metadata.as_ref().expect("metadata")["mutation"]["files"],
+        json!([{
+            "path": "notes/out.md",
+            "outcome": "created",
+            "size": on_disk.len(),
+            "sha256": crate::hashing::sha256_hex(&on_disk),
+        }])
+    );
 }
 
 /// B6: bytes that are not UTF-8 survive an edit elsewhere in the file.

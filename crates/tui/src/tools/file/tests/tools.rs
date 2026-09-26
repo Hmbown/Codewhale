@@ -682,7 +682,12 @@ async fn test_write_file_tool() {
     let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
     assert_eq!(
         mutation["files"],
-        json!([{ "path": "output.txt", "outcome": "created" }])
+        json!([{
+            "path": "output.txt",
+            "outcome": "created",
+            "size": "test content".len(),
+            "sha256": crate::hashing::sha256_hex(b"test content"),
+        }])
     );
     assert!(
         mutation["diff"]
@@ -1211,7 +1216,14 @@ async fn test_edit_file_tool() {
     let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
     assert_eq!(
         mutation["files"],
-        json!([{ "path": "edit_me.txt", "outcome": "updated" }])
+        json!([{
+            "path": "edit_me.txt",
+            "outcome": "updated",
+            "size": fs::read(tmp.path().join("edit_me.txt")).expect("edited").len(),
+            "sha256": crate::hashing::sha256_hex(
+                fs::read(tmp.path().join("edit_me.txt")).expect("edited")
+            ),
+        }])
     );
     let receipt_diff = mutation["diff"].as_str().expect("receipt diff");
     assert!(receipt_diff.contains("--- a/edit_me.txt"), "{receipt_diff}");

@@ -582,10 +582,13 @@ fn apply_spillover_inner(
     let mut artifact_path = None;
     if let Some(context) = artifact_context {
         let artifact_id = crate::artifacts::artifact_id_for_tool_call(tool_id);
-        match crate::artifacts::write_session_artifact(
+        // Publish immutably, like adaptive evidence: a turn's artifact
+        // reference names these bytes by digest, so a later call that reuses
+        // the id must fail closed (legacy footer) instead of rewriting them.
+        match crate::artifacts::write_session_artifact_immutable(
             context.session_id,
             &artifact_id,
-            &original_content,
+            original_content.as_bytes(),
         ) {
             Ok((absolute_path, relative_path)) => {
                 let record = crate::artifacts::record_tool_output_artifact(
@@ -722,6 +725,14 @@ fn apply_spillover_inner(
             "content_digest".into(),
             serde_json::Value::String(format!("sha256:{digest}")),
         );
+        if artifact_path.is_some() {
+            // Plain hex, the same form the adaptive path and the workspace
+            // read `revision` use; the turn artifact ref carries it verbatim.
+            obj.insert(
+                "artifact_digest".into(),
+                serde_json::Value::String(digest.clone()),
+            );
+        }
         obj.insert(
             "original_byte_count".into(),
             serde_json::Value::Number(serde_json::Number::from(original_content.len() as u64)),
@@ -1756,6 +1767,31 @@ mod tests {
                 "classic lane publishes no adaptive evidence metadata"
             );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+            // The classic lane names its bytes by digest, like the adaptive
+            // lane, so a turn artifact ref can carry a revision.
+            assert_eq!(
+                metadata["artifact_digest"],
+                crate::hashing::sha256_hex(raw.as_bytes())
+            );
+            let artifact = tmp
+                .path()
+                .join(".codewhale/sessions/session-classic/artifacts/art_call-classic.txt");
+            assert_eq!(std::fs::read_to_string(&artifact).unwrap(), raw);
+
+            // The published handle is immutable: a different payload under
+            // the same call id never rewrites the bytes a ref names.
+            let mut replay = ToolResult::success("other\n".repeat(20_000));
+            apply_spillover_with_artifact(
+                &mut replay,
+                "call-classic",
+                "exec_shell",
+                "session-classic",
+            )
+            .expect("replay still spills to the legacy footer");
+            assert_eq!(std::fs::read_to_string(&artifact).unwrap(), raw);
+            let replay_metadata = replay.metadata.expect("metadata stamped");
+            assert!(replay_metadata.get("artifact_id").is_none());
+            assert!(replay_metadata.get("artifact_digest").is_none());
         });
     }
 }

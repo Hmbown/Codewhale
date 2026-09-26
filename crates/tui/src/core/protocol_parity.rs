@@ -555,6 +555,25 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             turn_id: turn_id.clone(),
             route: route_to_wire(route),
         },
+        Event::TurnWorkspaceSnapshots {
+            turn_id, pre_turn, ..
+        } => {
+            let (pre_turn_snapshot_id, unavailable_reason) = match pre_turn {
+                crate::core::events::WorkspaceSnapshot::Taken(id) => (Some(id.clone()), None),
+                crate::core::events::WorkspaceSnapshot::Unavailable(reason) => {
+                    (None, Some(reason.as_str().to_string()))
+                }
+                // A pre-turn snapshot is taken before the event exists.
+                crate::core::events::WorkspaceSnapshot::Pending => (None, None),
+            };
+            wire::EventMsg::TurnWorkspaceSnapshots {
+                thread_id,
+                session_id,
+                turn_id: turn_id.clone(),
+                pre_turn_snapshot_id,
+                unavailable_reason,
+            }
+        }
         Event::TurnComplete {
             usage,
             parent_route_usage,

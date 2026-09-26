@@ -1414,14 +1414,12 @@ impl SnapshotRepo {
         Ok(())
     }
 
-    /// Return the side-repo's `.git` directory (for diagnostics).
-    #[cfg_attr(not(test), expect(dead_code))]
+    /// Return the side-repo's `.git` directory.
     pub fn git_dir(&self) -> &Path {
         &self.git_dir
     }
 
-    /// Return the work tree path (for diagnostics).
-    #[cfg_attr(not(test), expect(dead_code))]
+    /// Return the work tree path.
     pub fn work_tree(&self) -> &Path {
         &self.work_tree
     }

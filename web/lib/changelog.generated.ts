@@ -41,11 +41,12 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Added",
         "items": [
+          "Runtime API: turns now record what they produced. Items and turns carry typed artifact references (path, kind, size, revision, and a restore point when file-revert would accept one) for files a tool wrote, spilled tool output and media. Once the post-turn snapshot settles, a turn also lists what changed in the workspace while it ran, shell and sub-agent writes included, and publishes turn.artifacts. GET /v1/threads/{id}/turns/{turn_id}/artifacts lists a turn's references and…",
           "Runtime API: POST /v1/threads/{id}/fork-at-turn forks a thread at a named user turn, keeping that turn and every turn before it. The receipt matches /undo and returns the first dropped prompt so a client can put it back in the composer. Naming the turn replaces a client-computed depth, which could fork the wrong prefix. The fork leaves the workspace and any running turn untouched (#6580, thanks @gaord).",
           "Official model routing: /router (also /model router) sets up the Auto router with presets: Jev (TypeSafe's decision model, via OpenRouter or a TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes one test call before it saves, /status shows the router's choice, cost and latency, and a failing router is shown as failing (#6525).",
           "Code mode composes MCP and plugin tools and is on by default: execute_tools programs can call MCP tools, and each nested call passes the same approval gate as a direct call, pausing the program for approval when needed. Every nested call keeps its receipt, including calls that finish before a deadline, and code_mode = false turns it off. codewhale mcp list and codewhale doctor warn when a user MCP server duplicates the built-in Computer Use bundle (#6562, #6509)."
         ],
-        "itemCount": 3
+        "itemCount": 4
       },
       {
         "heading": "Fixed",

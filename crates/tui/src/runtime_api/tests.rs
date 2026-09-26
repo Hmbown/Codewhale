@@ -482,6 +482,8 @@ fn messages_from_thread_detail_batches_tool_results() {
         ],
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
     };
     let item = |id: &str,
                 kind: TurnItemKind,
@@ -498,6 +500,7 @@ fn messages_from_thread_detail_batches_tool_results() {
             detail: detail.map(str::to_string),
             metadata,
             artifact_refs: Vec::new(),
+            artifacts: Vec::new(),
             started_at: Some(now),
             ended_at: Some(now),
         }
@@ -7963,6 +7966,8 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
         item_ids: Vec::new(),
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
     };
     // Mirror `TurnRecord::persist_effective_route` (private to the runtime
     // threads module): persist the route envelope onto the turn so the
@@ -8158,6 +8163,8 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
         item_ids: Vec::new(),
         steer_count: 0,
         agent_mail_message_id: None,
+        artifacts: Vec::new(),
+        workspace: None,
     };
     turn.effective_provider = Some(ApiProvider::Openai.as_str().to_string());
     turn.effective_provider_id = Some(ApiProvider::Openai.as_str().to_string());
@@ -9278,6 +9285,7 @@ fn seed_summary_search_transcript(
                 detail: Some(text),
                 metadata: None,
                 artifact_refs: Vec::new(),
+                artifacts: Vec::new(),
                 started_at: Some(created_at),
                 ended_at: Some(created_at),
             })?;
@@ -9317,6 +9325,8 @@ fn seed_summary_search_transcript(
             item_ids,
             steer_count: 0,
             agent_mail_message_id: None,
+            artifacts: Vec::new(),
+            workspace: None,
         })?;
         latest_turn_id = Some(turn_id);
     }
@@ -17599,6 +17609,252 @@ async fn session_artifacts_list_and_bounded_read() -> Result<()> {
         .await?
         .status();
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+/// Restores the process-wide test artifact root on drop.
+struct TestArtifactRoot {
+    previous: Option<PathBuf>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for TestArtifactRoot {
+    fn drop(&mut self) {
+        crate::artifacts::set_test_artifact_sessions_root(self.previous.take());
+    }
+}
+
+fn test_artifact_root(root: &Path) -> TestArtifactRoot {
+    let guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    TestArtifactRoot {
+        previous: crate::artifacts::set_test_artifact_sessions_root(Some(root.to_path_buf())),
+        _guard: guard,
+    }
+}
+
+/// The documented file ref id: `file_` plus 32 hex of SHA-256(path).
+fn turn_file_artifact_id(path: &str) -> String {
+    format!(
+        "file_{}",
+        &crate::hashing::sha256_hex(path.as_bytes())[..32]
+    )
+}
+
+fn file_ref_json(path: &str, change: &str, revision: Option<&str>, size: Option<u64>) -> Value {
+    json!({
+        "id": turn_file_artifact_id(path),
+        "kind": "file",
+        "path": path,
+        "change": change,
+        "size": size,
+        "revision": revision,
+        "source": "workspace_changed_during_turn",
+        "recorded_at": Utc::now(),
+    })
+}
+
+/// The turn artifact routes list a turn's refs only through its own thread,
+/// and read each ref from wherever its recorded revision still lives: the
+/// workspace, the post-turn snapshot, or the session artifact directory —
+/// including a spill from an engine session that has no SavedSession index.
+#[tokio::test]
+async fn turn_artifact_routes_list_and_read_by_reference() -> Result<()> {
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("home"));
+    let artifact_root = tmp.path().join("artifact-sessions");
+    let _artifacts = test_artifact_root(&artifact_root);
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join("README.md"), "fixture\n")?;
+    let rev = |bytes: &[u8]| crate::hashing::sha256_hex(bytes);
+
+    // The turn: page.html written as v1 (then edited after the turn),
+    // current.md written and untouched since.
+    let pre = crate::core::turn::pre_turn_snapshot(&workspace, 1, 0, None, None)
+        .map_err(|reason| anyhow!("pre: {reason:?}"))?;
+    fs::write(workspace.join("page.html"), "<p>v1</p>\n")?;
+    fs::write(workspace.join("current.md"), "current\n")?;
+    let post = crate::core::turn::post_turn_snapshot(&workspace, 1, 0, None, None)
+        .map_err(|reason| anyhow!("post: {reason:?}"))?;
+    fs::write(workspace.join("page.html"), "<p>v2</p>\n")?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(workspace.join("README.md"), workspace.join("link.md"))?;
+
+    // A spill from an unbound runtime engine: bytes under the writer's
+    // artifact root, no SavedSession JSON anywhere.
+    let spill_dir = artifact_root.join("engine-random-session/artifacts");
+    fs::create_dir_all(&spill_dir)?;
+    fs::write(spill_dir.join("art_call_big.txt"), "big output\n")?;
+    // Bytes that no longer match what the turn recorded.
+    fs::write(spill_dir.join("art_call_forged.txt"), "rewritten\n")?;
+
+    let (addr, runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("turn-artifacts-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("turn artifact test requires a loopback listener")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace.clone()),
+            ..Default::default()
+        })
+        .await?;
+    let other = runtime_threads
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace.clone()),
+            ..Default::default()
+        })
+        .await?;
+
+    let spill = |id: &str, revision: &str| {
+        json!({
+            "id": id, "kind": "tool_output", "path": format!("artifacts/{id}.txt"),
+            "size": 11, "revision": revision, "session_id": "engine-random-session",
+            "source": "tool_output_spill", "recorded_at": Utc::now(),
+        })
+    };
+    let mut refs = vec![
+        file_ref_json("page.html", "created", Some(&rev(b"<p>v1</p>\n")), Some(10)),
+        file_ref_json("current.md", "created", Some(&rev(b"current\n")), Some(8)),
+        file_ref_json("gone.md", "deleted", None, None),
+        file_ref_json(
+            "huge.bin",
+            "created",
+            Some(&rev(b"x")),
+            Some(17 * 1024 * 1024),
+        ),
+        file_ref_json("lost.md", "updated", Some(&rev(b"never stored")), Some(12)),
+        spill("art_call_big", &rev(b"big output\n")),
+        spill("art_call_forged", &rev(b"other")),
+        spill("art_call_pruned", &rev(b"x")),
+    ];
+    if cfg!(unix) {
+        refs.push(file_ref_json(
+            "link.md",
+            "updated",
+            Some(&rev(b"fixture\n")),
+            Some(8),
+        ));
+    }
+    // An intermediate revision one item recorded before a later write.
+    let mut early_page =
+        file_ref_json("page.html", "created", Some(&rev(b"<p>v0</p>\n")), Some(10));
+    early_page["source"] = json!("tool_mutation");
+    let item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_page", "turn_id": "turn_artifacts_route", "kind": "tool_call",
+        "status": "completed", "summary": "write", "artifacts": [early_page],
+    }))?;
+    let store = runtime_threads.test_store();
+    store.save_item(&item)?;
+    let turn: TurnRecord = serde_json::from_value(json!({
+        "id": "turn_artifacts_route", "thread_id": thread.id, "status": "completed",
+        "input_summary": "build", "created_at": Utc::now(), "item_ids": ["item_page"],
+        "artifacts": refs,
+        "workspace": {
+            "state": "settled", "pre_turn_snapshot_id": pre, "post_turn_snapshot_id": post,
+        },
+    }))?;
+    store.save_turn(&turn)?;
+
+    let client = crate::tls::reqwest_client();
+    let base = format!(
+        "http://{addr}/v1/threads/{}/turns/turn_artifacts_route/artifacts",
+        thread.id
+    );
+    let get = |url: String| client.get(url).bearer_auth("turn-artifacts-token").send();
+    assert_eq!(
+        client.get(&base).send().await?.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let listing: Value = get(base.clone()).await?.error_for_status()?.json().await?;
+    assert_eq!(listing["turn_id"], "turn_artifacts_route");
+    assert_eq!(listing["workspace"]["state"], "settled");
+    assert_eq!(listing["artifacts"][0]["path"], "page.html");
+    assert!(listing.get("item_artifacts").is_none());
+    let foreign = format!(
+        "http://{addr}/v1/threads/{}/turns/turn_artifacts_route/artifacts",
+        other.id
+    );
+    assert_eq!(get(foreign).await?.status(), StatusCode::NOT_FOUND);
+    let missing = format!(
+        "http://{addr}/v1/threads/{}/turns/turn_nope/artifacts",
+        thread.id
+    );
+    assert_eq!(get(missing).await?.status(), StatusCode::NOT_FOUND);
+
+    let file_id = turn_file_artifact_id;
+    let read = |id: String, query: &str| get(format!("{base}/{id}{query}"));
+
+    // Still current in the workspace.
+    let body: Value = read(file_id("current.md"), "")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(body["source"], "workspace");
+    assert_eq!(body["current"], true);
+    assert_eq!(body["content"], "current\n");
+    assert_eq!(body["revision"], rev(b"current\n"));
+
+    // Edited after the turn: served from the post-turn snapshot.
+    let body: Value = read(file_id("page.html"), "?offset=3&limit=2")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(body["source"], "snapshot");
+    assert_eq!(body["current"], false);
+    assert_eq!(body["size"], 10);
+    assert_eq!(body["content"], "v1");
+    assert_eq!(body["truncated"], true);
+
+    // An item's intermediate revision is selectable, and is honestly gone.
+    let response = read(
+        file_id("page.html"),
+        &format!("?revision={}", rev(b"<p>v0</p>\n")),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let message = response.text().await?;
+    assert!(message.contains(&rev(b"<p>v2</p>\n")), "{message}");
+    let response = read(file_id("page.html"), &format!("?revision={}", rev(b"nope"))).await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let mut statuses = vec![
+        (file_id("lost.md"), StatusCode::CONFLICT),
+        (file_id("gone.md"), StatusCode::GONE),
+        (file_id("huge.bin"), StatusCode::PAYLOAD_TOO_LARGE),
+        ("art_call_forged".to_string(), StatusCode::CONFLICT),
+        ("art_call_pruned".to_string(), StatusCode::GONE),
+        ("file_unknown".to_string(), StatusCode::NOT_FOUND),
+    ];
+    if cfg!(unix) {
+        statuses.push((file_id("link.md"), StatusCode::FORBIDDEN));
+    }
+    for (id, expected) in statuses {
+        assert_eq!(read(id.clone(), "").await?.status(), expected, "{id}");
+    }
+
+    // The spill is readable through the turn although no SavedSession
+    // indexes its engine session.
+    let body: Value = read("art_call_big".to_string(), "")
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(body["source"], "session_artifact");
+    assert_eq!(body["content"], "big output\n");
+    assert_eq!(body["artifact"]["kind"], "tool_output");
+    assert!(body["current"].is_null());
 
     handle.abort();
     Ok(())
