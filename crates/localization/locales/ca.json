@@ -2016,6 +2016,8 @@
   "AgentFocusPlaceholder": "Missatge per a {agent} · Esc torna al principal",
   "AgentFocusNoTranscript": "Encara no hi ha transcripció de {agent}. Els missatges apareixen aquí a mesura que el worker els intercanvia.",
   "AgentFocusOmitted": "Els missatges anteriors ({count}) s'han omès de la transcripció en memòria.",
+  "AgentFocusResult": "Resultat",
+  "AgentFocusStopReason": "Per què s'ha aturat",
   "AgentFocusFollowUpDelivered": "A la cua per a {agent}: llegirà el missatge a la propera ronda.",
   "AgentFocusFollowUpQueued": "A la cua per a {agent}",
   "AgentFocusFollowUpContinued": "{agent} ja havia acabat; ha continuat en un fork nou ({target}). Aquesta vista ara segueix el fork.",

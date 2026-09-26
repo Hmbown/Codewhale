@@ -6091,6 +6091,203 @@ async fn undo_endpoint_404s_for_missing_thread() -> Result<()> {
 }
 
 #[tokio::test]
+async fn fork_at_turn_endpoint_cuts_at_the_named_turn() -> Result<()> {
+    // The anchor is a turn id, not a distance, and the fork keeps the turn it
+    // names: the branch point is the answer a person pointed at. Resolved one
+    // turn off, a three-turn thread still answers 201 with a plausible thread
+    // and the wrong prompt in the composer — which is what this pins.
+    let root = std::env::temp_dir().join(format!("deepseek-fork-at-turn-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let created: serde_json::Value = client
+        .post(format!("http://{addr}/v1/threads"))
+        .json(&json!({
+            "model": "deepseek-v4-pro",
+            "mode": "agent",
+            "workspace": root.join("workspace")
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = created["id"]
+        .as_str()
+        .context("missing thread id")?
+        .to_string();
+
+    let user = |text: &str| Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+    };
+    let reply = |text: &str| Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+    };
+    runtime_threads
+        .seed_thread_from_messages(
+            &thread_id,
+            &[
+                user("first"),
+                reply("one"),
+                user("second"),
+                reply("two"),
+                user("third"),
+                reply("three"),
+            ],
+        )
+        .await?;
+
+    // Name the anchor the way a client would: the turn id carrying "second".
+    let detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{thread_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let anchor = detail["items"]
+        .as_array()
+        .context("missing items")?
+        .iter()
+        .find(|item| item["kind"] == "user_message" && item["detail"] == "second")
+        .and_then(|item| item["turn_id"].as_str())
+        .context("no turn carries the second prompt")?
+        .to_string();
+
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/fork-at-turn"))
+        .json(&json!({ "turn_id": anchor }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let forked: serde_json::Value = resp.json().await?;
+    // The prompt that comes back is what was asked *next*: the branch keeps
+    // "second" and hands back "third" as the place to continue from.
+    assert_eq!(forked["original_user_text"], "third");
+    let forked_id = forked["thread"]["id"]
+        .as_str()
+        .context("missing forked thread id")?
+        .to_string();
+    assert_ne!(forked_id, thread_id, "forking must not mutate in place");
+
+    let forked_detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{forked_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let forked_turns = forked_detail["turns"]
+        .as_array()
+        .context("missing forked turns")?
+        .iter()
+        .map(|turn| {
+            turn["input_summary"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        forked_turns,
+        vec!["first".to_string(), "second".to_string()]
+    );
+
+    // Naming the last turn keeps the whole conversation: the same rule read at
+    // the end of the thread, with nothing left to hand back.
+    let last_anchor = detail["items"]
+        .as_array()
+        .context("missing items")?
+        .iter()
+        .find(|item| item["kind"] == "user_message" && item["detail"] == "third")
+        .and_then(|item| item["turn_id"].as_str())
+        .context("no turn carries the third prompt")?
+        .to_string();
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/fork-at-turn"))
+        .json(&json!({ "turn_id": last_anchor }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let whole: serde_json::Value = resp.json().await?;
+    assert!(whole["original_user_text"].is_null());
+    let whole_id = whole["thread"]["id"]
+        .as_str()
+        .context("missing whole-thread fork id")?
+        .to_string();
+    let whole_detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{whole_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        whole_detail["turns"]
+            .as_array()
+            .map_or(usize::MAX, Vec::len),
+        3
+    );
+
+    // The source keeps every turn: a fork is a sibling, not an undo.
+    let source_detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{thread_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        source_detail["turns"]
+            .as_array()
+            .map_or(usize::MAX, Vec::len),
+        3
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn fork_at_turn_endpoint_rejects_a_non_user_turn() -> Result<()> {
+    // An assistant turn is not a fork point: cutting "before" it would
+    // silently keep the user prompt it answers, which is not what the picker
+    // said. The anchor must be refused rather than rounded to a neighbour.
+    let root = std::env::temp_dir().join(format!("deepseek-fork-bad-turn-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let thread_id =
+        create_seeded_thread(&addr, &runtime_threads, &root, "Please fork this turn").await?;
+    let client = crate::tls::reqwest_client();
+
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/fork-at-turn"))
+        .json(&json!({ "turn_id": "turn_not_a_user_turn" }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<()> {
     let root =
         std::env::temp_dir().join(format!("deepseek-patch-undo-endpoint-{}", Uuid::new_v4()));

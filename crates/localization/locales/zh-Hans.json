@@ -2016,6 +2016,8 @@
   "AgentFocusPlaceholder": "给 {agent} 发消息 · Esc 返回主对话",
   "AgentFocusNoTranscript": "{agent} 尚无对话记录。工作者开始交流后会在此显示。",
   "AgentFocusOmitted": "内存中的对话记录省略了较早的 {count} 条消息。",
+  "AgentFocusResult": "结果",
+  "AgentFocusStopReason": "停止原因",
   "AgentFocusFollowUpDelivered": "已为 {agent} 排队：它会在下一轮读取该消息。",
   "AgentFocusFollowUpQueued": "已为 {agent} 排队",
   "AgentFocusFollowUpContinued": "{agent} 已完成；已在新分支（{target}）上继续。此视图现在跟随该分支。",

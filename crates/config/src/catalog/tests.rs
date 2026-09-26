@@ -861,6 +861,93 @@ fn bundled_deepseek_flash_routes_support_image_input() {
 }
 
 #[test]
+fn bundled_text_only_rows_leave_image_input_unknown_not_unsupported() {
+    // #6396: every Anthropic seed row says `input: [text]` while the provider
+    // accepts images. A cold start without a live refresh must not strip the
+    // user's images on the strength of that stale row.
+    let rows = bundled_catalog_offerings();
+    let seed = find(&rows, "anthropic", "claude-opus-5");
+    assert_eq!(seed.source, CatalogSource::Bundled);
+    assert_eq!(
+        crate::models_dev::image_input_support(seed.modalities.as_ref()),
+        crate::route::CapabilityState::Unsupported,
+        "fixture premise: the seed row is text-only"
+    );
+    assert_eq!(
+        seed.to_offering().capabilities.image_input,
+        crate::route::CapabilityState::Unknown
+    );
+
+    // The same statement from a live catalog is a real refusal.
+    let live = CatalogOffering {
+        source: CatalogSource::ModelsDevLive { fetched_at: 1 },
+        ..seed.clone()
+    };
+    assert_eq!(
+        live.to_offering().capabilities.image_input,
+        crate::route::CapabilityState::Unsupported
+    );
+
+    // A layer that re-sources the row without restating modalities keeps the
+    // seed's low trust for them.
+    let re_sourced = CatalogOffering {
+        source: CatalogSource::Live {
+            base_url_fingerprint: "fp".into(),
+            fetched_at: 1,
+        },
+        modalities_source: Some(CatalogSource::Bundled),
+        ..seed.clone()
+    };
+    assert_eq!(
+        re_sourced.to_offering().capabilities.image_input,
+        crate::route::CapabilityState::Unknown
+    );
+}
+
+#[test]
+fn offline_resolver_keeps_images_for_a_text_only_seed_row() {
+    let route = crate::route::RouteResolver::new()
+        .resolve(&crate::route::RouteRequest {
+            explicit_provider: Some(crate::ProviderKind::Anthropic),
+            model_selector: Some(crate::route::LogicalModelRef::from("claude-opus-5")),
+            saved_provider_model: None,
+            base_url_override: None,
+            limit_overrides: Vec::new(),
+        })
+        .expect("bundled Anthropic route resolves offline");
+    assert_ne!(
+        route.capabilities().image_input,
+        crate::route::CapabilityState::Unsupported
+    );
+}
+
+#[test]
+fn signed_patch_keeps_the_seed_as_the_modality_authority() {
+    let seed = find(&bundled_catalog_offerings(), "anthropic", "claude-opus-5").clone();
+    let key = seed.merge_key();
+    let mut rows = BTreeMap::from([(key.clone(), seed)]);
+    let facts = crate::cloud_facts::ScopedFacts {
+        facts_version: 1,
+        key_id: "cwf-test-only".into(),
+        models: vec![crate::cloud_facts::ModelFact {
+            provider: key.0.clone(),
+            id: key.1.clone(),
+            context_window: Some(9000),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    crate::cloud_facts::catalog_patch::apply_model_patches(&mut rows, &facts, 1);
+    let row = &rows[&key];
+    assert!(matches!(row.source, CatalogSource::CloudFacts { .. }));
+    assert_eq!(row.modalities_source(), &CatalogSource::Bundled);
+    assert_eq!(
+        row.to_offering().capabilities.image_input,
+        crate::route::CapabilityState::Unknown
+    );
+}
+
+#[test]
 fn bundled_asset_meta_describes_offline_fallback_not_competing_truth() {
     // #4188: the asset must document itself as offline/stale fallback, not a
     // competing curated source of truth alongside live Models.dev.

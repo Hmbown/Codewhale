@@ -2016,6 +2016,8 @@
   "AgentFocusPlaceholder": "Сообщение для {agent} · Esc — в основной разговор",
   "AgentFocusNoTranscript": "Для {agent} пока нет записи разговора. Сообщения появятся здесь, как только воркер начнёт ими обмениваться.",
   "AgentFocusOmitted": "Более ранние сообщения ({count}) не вошли в запись разговора в памяти.",
+  "AgentFocusResult": "Результат",
+  "AgentFocusStopReason": "Почему остановился",
   "AgentFocusFollowUpDelivered": "В очереди для {agent}: он прочитает сообщение на следующем раунде.",
   "AgentFocusFollowUpQueued": "В очереди для {agent}",
   "AgentFocusFollowUpContinued": "{agent} уже завершился; продолжен в новом форке ({target}). Этот вид теперь следует за форком.",

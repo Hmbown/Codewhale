@@ -2016,6 +2016,8 @@
   "AgentFocusPlaceholder": "Nhắn cho {agent} · Esc để về chính",
   "AgentFocusNoTranscript": "Chưa có bản ghi nào của {agent}. Tin nhắn sẽ hiện ở đây khi worker trao đổi.",
   "AgentFocusOmitted": "Các tin nhắn trước đó ({count}) đã bị lược khỏi bản ghi trong bộ nhớ.",
+  "AgentFocusResult": "Kết quả",
+  "AgentFocusStopReason": "Lý do dừng",
   "AgentFocusFollowUpDelivered": "Đã xếp hàng cho {agent}: nó sẽ đọc tin nhắn ở vòng tiếp theo.",
   "AgentFocusFollowUpQueued": "Đã xếp hàng cho {agent}",
   "AgentFocusFollowUpContinued": "{agent} đã hoàn thành; tiếp tục trên một nhánh mới ({target}). Khung nhìn này giờ theo nhánh đó.",

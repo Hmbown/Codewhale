@@ -2016,6 +2016,8 @@
   "AgentFocusPlaceholder": "Mensagem para {agent} · Esc volta ao principal",
   "AgentFocusNoTranscript": "Ainda não há transcrição de {agent}. As mensagens aparecem aqui conforme o worker as troca.",
   "AgentFocusOmitted": "Mensagens anteriores ({count}) foram omitidas da transcrição em memória.",
+  "AgentFocusResult": "Resultado",
+  "AgentFocusStopReason": "Por que parou",
   "AgentFocusFollowUpDelivered": "Na fila para {agent}: ele lê a mensagem na próxima rodada.",
   "AgentFocusFollowUpQueued": "Na fila para {agent}",
   "AgentFocusFollowUpContinued": "{agent} já havia terminado; continuou em um novo fork ({target}). Esta visão agora segue o fork.",

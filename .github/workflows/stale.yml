@@ -12,6 +12,7 @@ permissions:
 jobs:
   stale:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       # Pinned from actions/stale@v10; update deliberately when refreshing the policy.
       - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93

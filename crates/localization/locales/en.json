@@ -2016,6 +2016,8 @@
   "AgentFocusPlaceholder": "Message {agent} · Esc returns to main",
   "AgentFocusNoTranscript": "Nothing from {agent} yet — messages land here as they arrive.",
   "AgentFocusOmitted": "Earlier messages ({count}) aren't in memory.",
+  "AgentFocusResult": "Result",
+  "AgentFocusStopReason": "Why it stopped",
   "AgentFocusFollowUpDelivered": "Queued for {agent} — it reads it next round.",
   "AgentFocusFollowUpQueued": "Queued for {agent}",
   "AgentFocusFollowUpContinued": "{agent} had finished — continuing on fork ({target}). This view follows the fork.",

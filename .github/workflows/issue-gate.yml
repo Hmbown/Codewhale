@@ -11,6 +11,7 @@ permissions:
 jobs:
   gate:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       # Labels only, never comments (founder, 2026-09-22): the intake note used
       # to thank other bots, and a comment is noise a label does not make.
