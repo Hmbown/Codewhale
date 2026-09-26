@@ -2229,9 +2229,9 @@ mod tests {
     fn classifier_prompt_redacts_secret_after_tool_result_flattening() {
         let secret = "cw-router-secret-should-never-leave-process";
         let config = Config {
-            api_key: Some(secret.to_string()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(Some(secret.to_string()), None);
         let client = CodewhaleClient::new(&config).expect("classifier client");
         // `recent_auto_router_context` converts ToolResult blocks into ordinary
         // text before this boundary. Exercise that exact flattened shape.

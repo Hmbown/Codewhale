@@ -12709,10 +12709,12 @@ FINAL RECEIPT
                 let _ = axum::serve(listener, app).await;
             });
             let config = crate::config::Config {
-                api_key: Some("test-key".to_string()),
-                base_url: Some(format!("http://{address}/v1")),
                 ..crate::config::Config::default()
-            };
+            }
+            .with_legacy_root(
+                Some("test-key".to_string()),
+                Some(format!("http://{address}/v1")),
+            );
             let context = ToolContext::new(tmp.path().to_path_buf());
             let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
             let (completion_tx, mut completion_rx) = mpsc::channel(16);
@@ -13424,9 +13426,9 @@ FINAL RECEIPT
     fn stub_client() -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = crate::config::Config {
-            api_key: Some("test-key".to_string()),
             ..crate::config::Config::default()
-        };
+        }
+        .with_legacy_root(Some("test-key".to_string()), None);
         CodewhaleClient::new(&config).expect("stub client should construct")
     }
 
@@ -13520,10 +13522,12 @@ FINAL RECEIPT
         });
 
         let config = crate::config::Config {
-            api_key: Some("test-key".to_string()),
-            base_url: Some(format!("http://{addr}/v1")),
             ..crate::config::Config::default()
-        };
+        }
+        .with_legacy_root(
+            Some("test-key".to_string()),
+            Some(format!("http://{addr}/v1")),
+        );
         (
             CodewhaleClient::new(&config).expect("fake chat client"),
             calls,

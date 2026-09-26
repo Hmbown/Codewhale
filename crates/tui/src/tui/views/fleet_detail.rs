@@ -1822,9 +1822,9 @@ mod tests {
         save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap();
         let config = Config {
             provider: Some("deepseek".into()),
-            api_key: Some("test-key".into()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(Some("test-key".into()), None);
         let mut view = FleetDetailView::open_for_member(
             &app_in(ws.path().to_path_buf()),
             &config,

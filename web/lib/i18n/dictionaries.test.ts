@@ -24,6 +24,7 @@ import {
   EN_HOME,
   EN_LEGAL_PRIVACY,
   EN_LEGAL_TERMS,
+  EN_ROADMAP,
   fill,
   getChrome,
   getDocsGuide,
@@ -50,6 +51,7 @@ import {
   getHome,
   getLegalPrivacy,
   getLegalTerms,
+  getRoadmap,
   pickText,
   pickTextLocale,
   splitToken,
@@ -267,6 +269,7 @@ describe("website dictionaries", () => {
       ["legal-privacy", getLegalPrivacy, EN_LEGAL_PRIVACY],
       ["digest", getDigest, EN_DIGEST],
       ["faq", getFaq, EN_FAQ],
+      ["roadmap", getRoadmap, EN_ROADMAP],
     ] as const) {
       const enKeys = Object.keys(reference).sort();
       for (const locale of [...DICTIONARY_LOCALES, "fr", "und"]) {

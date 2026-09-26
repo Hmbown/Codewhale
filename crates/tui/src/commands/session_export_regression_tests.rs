@@ -283,8 +283,15 @@ fn adapter_reuses_turn_handoff_renderer_and_workspace_value() {
     let direct = crate::tui::ui::turn_handoff_markdown(&harness.app);
     let projection = turn_handoff_projection(&mut harness.app);
 
+    // The renderer stamps `generated <wall-clock second>` on every call, so two
+    // calls straddling a second boundary legitimately differ in that one field
+    // (seen on Windows CI: `10:35:58` vs `10:35:59`). Compare everything else
+    // byte-for-byte, and check both calls still carry the stamp.
+    assert!(direct.contains(" \u{b7} generated "));
+    assert!(projection.markdown.contains(" \u{b7} generated "));
     assert_eq!(
-        projection.markdown, direct,
+        normalize_turn_generated_at(&projection.markdown),
+        normalize_turn_generated_at(&direct),
         "renderer output must not drift"
     );
     assert!(projection.markdown.contains("# Turn handoff"));

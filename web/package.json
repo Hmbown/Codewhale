@@ -27,12 +27,12 @@
     "cf-typegen": "wrangler types"
   },
   "dependencies": {
-    "next": "^16.3.3",
+    "next": "^16.3.6",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
   "devDependencies": {
-    "@opennextjs/cloudflare": "^1.20.4",
+    "@opennextjs/cloudflare": "^1.20.6",
     "@types/node": "^26.6.1",
     "@types/react": "^19.0.7",
     "@types/react-dom": "^19.2.5",
@@ -46,7 +46,7 @@
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.3",
     "vitest": "^4.1.11",
-    "wrangler": "^4.132.0"
+    "wrangler": "^4.137.0"
   },
   "overrides": {
     "esbuild": "0.28.1",

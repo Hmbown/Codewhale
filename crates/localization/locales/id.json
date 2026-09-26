@@ -2012,6 +2012,8 @@
   "AgentFocusPlaceholder": "Pesan untuk {agent} · Esc kembali ke utama",
   "AgentFocusNoTranscript": "Belum ada transkrip untuk {agent}. Pesan muncul di sini saat worker bertukar pesan.",
   "AgentFocusOmitted": "Pesan sebelumnya ({count}) dihilangkan dari transkrip dalam memori.",
+  "AgentFocusResult": "Hasil",
+  "AgentFocusStopReason": "Mengapa berhenti",
   "AgentFocusFollowUpDelivered": "Diantrekan untuk {agent}: pesan dibaca pada putaran berikutnya.",
   "AgentFocusFollowUpQueued": "Diantrekan untuk {agent}",
   "AgentFocusFollowUpContinued": "{agent} sudah selesai; dilanjutkan pada fork baru ({target}). Tampilan ini kini mengikuti fork tersebut.",

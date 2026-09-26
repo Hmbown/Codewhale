@@ -1740,12 +1740,6 @@ mod tests {
     /// text, so the model's next patch context matches the bytes on disk.
     #[tokio::test]
     async fn patch_normalizes_rust_in_an_already_clean_file() {
-        // Warm the `rustfmt` proxy first: on a cold CI runner the first rustup
-        // shim launch alone can exceed the formatter's 5s budget, which skips
-        // normalization (by design) and fails this test for the wrong reason.
-        let _ = std::process::Command::new("rustfmt")
-            .arg("--version")
-            .output();
         let tmp = tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let file = tmp.path().join("clean.rs");

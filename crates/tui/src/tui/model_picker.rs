@@ -2372,14 +2372,6 @@ fn inactive_custom_route_identities(app: &App, config: &Config) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default();
-    // The legacy root-field `provider = "custom"` shape owns no
-    // `[providers.<name>]` table but is still a real route.
-    if config.uses_legacy_literal_custom_route() {
-        let literal = ApiProvider::Custom.as_str().to_string();
-        if !identities.contains(&literal) {
-            identities.push(literal);
-        }
-    }
     identities.sort();
     identities.retain(|identity| active != Some(identity.as_str()));
     identities

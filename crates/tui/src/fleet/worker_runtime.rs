@@ -1624,9 +1624,9 @@ mod tests {
     fn explicit_deepseek_config() -> Config {
         Config {
             provider: Some("deepseek".to_string()),
-            api_key: Some("test-key".to_string()),
             ..Config::default()
         }
+        .with_legacy_root(Some("test-key".to_string()), None)
     }
 
     #[test]

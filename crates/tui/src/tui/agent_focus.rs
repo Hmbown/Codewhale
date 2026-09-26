@@ -50,6 +50,11 @@ pub struct AgentFocus {
     pub source_message_count: usize,
     /// Messages omitted from the resident tail (durable artifact absent).
     pub omitted_messages: usize,
+    /// A settled agent's full result (or the reason it stopped), shown after
+    /// the transcript when the transcript does not already end with it, and
+    /// on its own when there is no transcript at all (#6565).
+    /// The text and whether it is a stop reason rather than a result.
+    pub result: Option<(String, bool)>,
     /// Local receipts appended after the source transcript: the user's own
     /// follow-ups echoed immediately and delivery notes.
     pub local_cells: Vec<HistoryCell>,
@@ -73,6 +78,7 @@ impl AgentFocus {
             cells: Vec::new(),
             source_message_count: 0,
             omitted_messages: 0,
+            result: None,
             local_cells: Vec::new(),
             scroll_top: None,
             last_visible: 0,
@@ -188,6 +194,113 @@ fn child_receipts<'a>(app: &'a App, agent_id: &str) -> &'a [(String, String)] {
         .map_or(&[], Vec::as_slice)
 }
 
+/// What a settled agent produced, in full, and whether it is a failure
+/// reason rather than a result. The durable worker record (the roster) holds
+/// the complete text; the manager snapshot is the fallback. `None` while the
+/// agent is live or when it left nothing. Not redacted; see [`settled_result`].
+pub(crate) fn settled_result_raw(app: &App, agent_id: &str) -> Option<(String, bool)> {
+    let from_roster = app
+        .current_agent_roster()
+        .iter()
+        .find(|row| row.worker_id == agent_id)
+        .and_then(|row| {
+            let failed = matches!(
+                row.state,
+                crate::agent_roster::RosterState::Failed
+                    | crate::agent_roster::RosterState::Cancelled
+            );
+            row.outcome.clone().map(|text| (text, failed))
+        });
+    let from_snapshot = || {
+        let agent = app
+            .subagent_cache
+            .iter()
+            .find(|agent| agent.agent_id == agent_id)?;
+        match &agent.status {
+            SubAgentStatus::Running => None,
+            SubAgentStatus::Completed => agent.result.clone().map(|text| (text, false)),
+            SubAgentStatus::Failed(reason) | SubAgentStatus::Interrupted(reason) => {
+                Some((reason.clone(), true))
+            }
+            SubAgentStatus::Cancelled | SubAgentStatus::BudgetExhausted => {
+                agent.result.clone().map(|text| (text, true))
+            }
+        }
+    };
+    from_roster
+        .or_else(from_snapshot)
+        .filter(|(text, _)| !text.trim().is_empty())
+}
+
+/// Strip terminal escapes and redact secrets before agent text is shown.
+fn visible_agent_text(text: &str) -> String {
+    let mut visible = String::with_capacity(text.len());
+    crate::tui::osc8::strip_ansi_into(text, &mut visible);
+    codewhale_config::persistence::redact_secrets(&visible)
+}
+
+/// [`settled_result_raw`], safe to render.
+pub(crate) fn settled_result(app: &App, agent_id: &str) -> Option<(String, bool)> {
+    settled_result_raw(app, agent_id)
+        .map(|(text, failed)| (visible_agent_text(&text).trim().to_string(), failed))
+        .filter(|(text, _)| !text.is_empty())
+}
+
+/// One line saying what a settled agent produced (its result headline, or
+/// why it stopped), bounded for a row with a visible `…` when cut. The full
+/// text is in the agent's focused view.
+pub(crate) fn settled_headline(app: &App, agent_id: &str) -> Option<String> {
+    let (text, _) = settled_result_raw(app, agent_id)?;
+    crate::agent_roster::result_headline(&text)
+        .map(|headline| crate::agent_roster::one_line(&visible_agent_text(&headline)))
+}
+
+/// The result block for a settled agent, unless the transcript already ends
+/// with that answer. The completion envelope is machine data and is dropped.
+fn result_block_for(app: &App, agent_id: &str, messages: &[Message]) -> Option<(String, bool)> {
+    let (text, failed) = settled_result(app, agent_id)?;
+    let text = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("<codewhale:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let answered = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .map(message_plain_text)
+        .is_some_and(|last| {
+            crate::agent_roster::result_headline(text)
+                .is_some_and(|headline| last.contains(headline.as_str()))
+        });
+    (!answered || failed).then(|| (text.to_string(), failed))
+}
+
+/// The heading and body cells for a result block.
+fn result_cells(app: &App, result: Option<&(String, bool)>) -> Vec<HistoryCell> {
+    let Some((text, failed)) = result else {
+        return Vec::new();
+    };
+    let heading = if *failed {
+        MessageId::AgentFocusStopReason
+    } else {
+        MessageId::AgentFocusResult
+    };
+    vec![
+        HistoryCell::System {
+            content: app.tr(heading).into_owned(),
+        },
+        HistoryCell::Assistant {
+            content: text.clone(),
+            streaming: false,
+        },
+    ]
+}
+
 /// Focus a child: its full transcript owns the main area and the composer
 /// addresses its fork. Re-focusing the same child is a no-op that keeps the
 /// scroll position; focusing another child replaces the focus.
@@ -208,6 +321,7 @@ pub(crate) fn focus_agent(app: &mut App, agent_id: &str) {
     focus.receipt_count = receipts.len();
     focus.source_message_count = messages.len();
     focus.omitted_messages = omitted;
+    focus.result = result_block_for(app, agent_id, &messages);
     focus.last_refresh = Instant::now();
     app.agent_focus = Some(focus);
     // The composer is now the natural owner: the next keys address the
@@ -249,10 +363,19 @@ pub(crate) fn refresh_focus(app: &mut App) {
     let agent_id = focus.agent_id.clone();
     let (messages, omitted) = resolve_agent_transcript_messages(app, &agent_id);
     let receipts = child_receipts(app, &agent_id).to_vec();
+    // The result lands when the agent settles, often with no new message.
+    let result = result_block_for(app, &agent_id, &messages);
     let Some(focus) = app.agent_focus.as_mut() else {
         return;
     };
     focus.last_refresh = Instant::now();
+    if focus.result != result {
+        focus.result = result;
+        app.needs_redraw = true;
+    }
+    let Some(focus) = app.agent_focus.as_mut() else {
+        return;
+    };
     if messages.len() == focus.source_message_count
         && omitted == focus.omitted_messages
         && receipts.len() == focus.receipt_count
@@ -558,14 +681,20 @@ pub(crate) fn render_focus(app: &mut App, area: Rect, buf: &mut Buffer) {
             Style::default().fg(theme.text_muted),
         )));
     }
-    if focus.cells.is_empty() && focus.local_cells.is_empty() {
+    let result_cells = result_cells(app, focus.result.as_ref());
+    if focus.cells.is_empty() && result_cells.is_empty() && focus.local_cells.is_empty() {
         lines.push(Line::from(Span::styled(
             app.tr(MessageId::AgentFocusNoTranscript)
                 .replace("{agent}", &focus.label),
             Style::default().fg(theme.text_muted),
         )));
     }
-    for cell in focus.cells.iter().chain(focus.local_cells.iter()) {
+    for cell in focus
+        .cells
+        .iter()
+        .chain(result_cells.iter())
+        .chain(focus.local_cells.iter())
+    {
         lines.extend(cell.transcript_lines(width));
         lines.push(Line::default());
     }
@@ -841,6 +970,155 @@ mod tests {
             .replace("{agent}", &focus_label(&app));
         let head: String = expected.chars().take(24).collect();
         assert!(screen.contains(head.trim_end()), "{screen}");
+    }
+
+    fn settled_agent(
+        agent_id: &str,
+        status: SubAgentStatus,
+        result: Option<&str>,
+    ) -> crate::tools::subagent::SubAgentResult {
+        crate::tools::subagent::SubAgentResult {
+            usage: None,
+            name: agent_id.to_string(),
+            agent_id: agent_id.to_string(),
+            context_mode: "fresh".to_string(),
+            fork_context: false,
+            workspace: None,
+            git_branch: None,
+            agent_type: crate::tools::subagent::FleetRole::Scout,
+            assignment: crate::tools::subagent::SubAgentAssignment {
+                objective: "audit the docs".to_string(),
+                role: Some("explore".to_string()),
+            },
+            model: "deepseek-v4-flash".to_string(),
+            nickname: None,
+            status,
+            worker_status: None,
+            runtime_permissions: None,
+            parent_run_id: None,
+            spawn_depth: 1,
+            child_route: None,
+            result: result.map(str::to_string),
+            steps_taken: 3,
+            checkpoint: None,
+            needs_input: None,
+            duration_ms: 1_000,
+            started_at: None,
+            from_prior_session: false,
+        }
+    }
+
+    #[test]
+    fn a_finished_agent_without_a_transcript_shows_its_full_result() {
+        // #6565: with no live capture the focused view explained the missing
+        // capture instead of showing the answer the engine had kept.
+        let tmp = tempdir().expect("tempdir");
+        let mut app = test_app(tmp.path().to_path_buf());
+        let body = (0..80)
+            .map(|n| format!("Finding {n} is documented in section {n}."))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(body.len() > 2_500);
+        let result = format!("## Summary\n\n{body}\n\nEND-OF-RESULT");
+        app.subagent_cache.push(settled_agent(
+            "agent_done",
+            SubAgentStatus::Completed,
+            Some(&result),
+        ));
+        focus_agent(&mut app, "agent_done");
+        let (text, failed) = app
+            .agent_focus
+            .as_ref()
+            .and_then(|focus| focus.result.clone())
+            .expect("the stored result is the focused view");
+        assert!(!failed);
+        assert_eq!(text, result);
+        let screen = render(&mut app, 100, 200);
+        assert!(screen.contains("Finding 0 is documented"), "{screen}");
+        assert!(screen.contains("Finding 79 is documented"), "{screen}");
+        assert!(screen.contains("END-OF-RESULT"), "{screen}");
+        let heading = app.tr(MessageId::AgentFocusResult).into_owned();
+        assert!(screen.contains(&heading), "{screen}");
+        let missing = app
+            .tr(MessageId::AgentFocusNoTranscript)
+            .replace("{agent}", &focus_label(&app));
+        let head: String = missing.chars().take(12).collect();
+        assert!(!screen.contains(head.trim_end()), "{screen}");
+    }
+
+    #[test]
+    fn a_failed_agent_shows_why_it_stopped_in_full() {
+        let tmp = tempdir().expect("tempdir");
+        let mut app = test_app(tmp.path().to_path_buf());
+        let reason = format!(
+            "provider returned 429 after 5 retries; {} last-line",
+            "context ".repeat(80)
+        );
+        app.subagent_cache.push(settled_agent(
+            "agent_failed",
+            SubAgentStatus::Failed(reason.clone()),
+            None,
+        ));
+        focus_agent(&mut app, "agent_failed");
+        assert_eq!(
+            app.agent_focus
+                .as_ref()
+                .and_then(|focus| focus.result.clone()),
+            Some((reason.trim().to_string(), true))
+        );
+        let screen = render(&mut app, 100, 60);
+        assert!(screen.contains("last-line"), "{screen}");
+        let heading = app.tr(MessageId::AgentFocusStopReason).into_owned();
+        assert!(screen.contains(&heading), "{screen}");
+    }
+
+    #[test]
+    fn a_transcript_that_already_ends_with_the_answer_gets_no_result_block() {
+        let tmp = tempdir().expect("tempdir");
+        let mut app = test_app(tmp.path().to_path_buf());
+        seed_resident_transcript(
+            &mut app,
+            "agent_told",
+            json!([
+                {"role": "user", "content": [{"type": "text", "text": "audit", "cache_control": null}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "## Summary\n\nThree links are stale. Details follow.", "cache_control": null}]}
+            ]),
+        );
+        app.subagent_cache.push(settled_agent(
+            "agent_told",
+            SubAgentStatus::Completed,
+            Some("## Summary\n\nThree links are stale. Details follow."),
+        ));
+        focus_agent(&mut app, "agent_told");
+        assert_eq!(app.agent_focus.as_ref().unwrap().result, None);
+
+        // A capture that stops before the answer gets the answer appended,
+        // and the refresh picks it up when the agent settles later.
+        seed_resident_transcript(
+            &mut app,
+            "agent_partial",
+            json!([{"role": "user", "content": [{"type": "text", "text": "audit", "cache_control": null}]}]),
+        );
+        app.subagent_cache.push(settled_agent(
+            "agent_partial",
+            SubAgentStatus::Running,
+            None,
+        ));
+        focus_agent(&mut app, "agent_partial");
+        assert_eq!(app.agent_focus.as_ref().unwrap().result, None);
+        let agent = app
+            .subagent_cache
+            .iter_mut()
+            .find(|agent| agent.agent_id == "agent_partial")
+            .unwrap();
+        agent.status = SubAgentStatus::Completed;
+        agent.result = Some("Two links are stale.".to_string());
+        app.agent_focus.as_mut().unwrap().last_refresh = Instant::now() - REFRESH_INTERVAL;
+        refresh_focus(&mut app);
+        assert_eq!(
+            app.agent_focus.as_ref().unwrap().result,
+            Some(("Two links are stale.".to_string(), false))
+        );
     }
 
     #[test]

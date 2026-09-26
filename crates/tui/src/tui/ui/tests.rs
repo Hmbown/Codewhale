@@ -10300,9 +10300,9 @@ async fn reselecting_the_same_provider_says_connected_not_switched() {
     let mut engine = mock_engine_handle();
     let mut config = Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some("test-key".to_string()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), None);
 
     switch_provider(
         &mut app,
@@ -10378,10 +10378,10 @@ async fn provider_switch_to_deepseek_canonicalizes_openrouter_default_model() {
     let mut engine = mock_engine_handle();
     let mut config = Config {
         provider: Some("openrouter".to_string()),
-        api_key: Some("test-key".to_string()),
         default_text_model: Some(DEFAULT_OPENROUTER_MODEL.to_string()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), None);
 
     switch_provider(
         &mut app,
@@ -10407,8 +10407,6 @@ async fn provider_switch_to_deepseek_drops_stale_xiaomi_root_base_url() {
     let mut engine = mock_engine_handle();
     let mut config = Config {
         provider: Some("xiaomi-mimo".to_string()),
-        api_key: Some("deepseek-key".to_string()),
-        base_url: Some("https://token-plan-sgp.xiaomimimo.com/v1".to_string()),
         default_text_model: Some("mimo-v2.5-pro".to_string()),
         providers: Some(ProvidersConfig {
             xiaomi_mimo: ProviderConfig {
@@ -10419,7 +10417,11 @@ async fn provider_switch_to_deepseek_drops_stale_xiaomi_root_base_url() {
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(
+        Some("deepseek-key".to_string()),
+        Some("https://token-plan-sgp.xiaomimimo.com/v1".to_string()),
+    );
 
     switch_provider(
         &mut app,
@@ -10434,7 +10436,7 @@ async fn provider_switch_to_deepseek_drops_stale_xiaomi_root_base_url() {
     assert!(!app.model_ids_passthrough);
     assert_eq!(app.model, DEFAULT_TEXT_MODEL);
     assert_eq!(config.provider.as_deref(), Some("deepseek"));
-    assert_eq!(config.base_url, None);
+    assert_eq!(config.deepseek_table_base_url(), None);
 }
 
 #[tokio::test]
@@ -10448,8 +10450,6 @@ async fn provider_switch_from_mimo_to_openrouter_without_key_fails_before_dispat
     let mut engine = mock_engine_handle();
     let mut config = Config {
         provider: Some("xiaomi-mimo".to_string()),
-        api_key: Some("deepseek-key".to_string()),
-        base_url: Some("https://token-plan-sgp.xiaomimimo.com/v1".to_string()),
         default_text_model: Some("mimo-v2.5-pro".to_string()),
         providers: Some(ProvidersConfig {
             xiaomi_mimo: ProviderConfig {
@@ -10460,7 +10460,11 @@ async fn provider_switch_from_mimo_to_openrouter_without_key_fails_before_dispat
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(
+        Some("deepseek-key".to_string()),
+        Some("https://token-plan-sgp.xiaomimimo.com/v1".to_string()),
+    );
 
     switch_provider(
         &mut app,
@@ -10700,7 +10704,7 @@ async fn xai_api_key_confirmation_saves_only_the_selected_xai_slot() {
     assert_eq!(xai.auth_mode.as_deref(), Some("api_key"));
     assert_eq!(xai.api_key.as_deref(), Some("violet-otter-key"));
     assert!(
-        config.api_key.is_none(),
+        config.deepseek_table_api_key().is_none(),
         "xAI key must not enter the root slot"
     );
     let saved = std::fs::read_to_string(config_env.config_path()).expect("saved config");
@@ -11028,7 +11032,6 @@ async fn provider_switch_model_override_updates_target_provider_model_slot() {
     let mut engine = mock_engine_handle();
     let mut config = Config {
         provider: Some("xiaomi-mimo".to_string()),
-        api_key: Some("deepseek-key".to_string()),
         default_text_model: Some("mimo-v2.5-pro".to_string()),
         providers: Some(ProvidersConfig {
             xiaomi_mimo: ProviderConfig {
@@ -11039,7 +11042,8 @@ async fn provider_switch_model_override_updates_target_provider_model_slot() {
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("deepseek-key".to_string()), None);
 
     switch_provider(
         &mut app,
@@ -11097,7 +11101,6 @@ async fn provider_switch_succeeds_without_writing_when_config_is_unwritable() {
     let mut engine = mock_engine_handle();
     let mut config = Config {
         provider: Some("xiaomi-mimo".to_string()),
-        api_key: Some("deepseek-key".to_string()),
         default_text_model: Some("mimo-v2.5-pro".to_string()),
         providers: Some(ProvidersConfig {
             xiaomi_mimo: ProviderConfig {
@@ -11108,7 +11111,8 @@ async fn provider_switch_succeeds_without_writing_when_config_is_unwritable() {
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("deepseek-key".to_string()), None);
 
     switch_provider(
         &mut app,
@@ -11157,7 +11161,6 @@ async fn provider_switch_without_model_uses_target_default_not_previous_provider
     let mut engine = mock_engine_handle();
     let mut config = Config {
         provider: Some("openrouter".to_string()),
-        api_key: Some("deepseek-key".to_string()),
         providers: Some(ProvidersConfig {
             openrouter: ProviderConfig {
                 api_key: Some("openrouter-key".to_string()),
@@ -11171,7 +11174,8 @@ async fn provider_switch_without_model_uses_target_default_not_previous_provider
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("deepseek-key".to_string()), None);
 
     switch_provider(
         &mut app,
@@ -11210,7 +11214,6 @@ async fn provider_switch_foreign_direct_model_rejected_before_mutation() {
     let mut engine = mock_engine_handle();
     let mut config = Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some("deepseek-key".to_string()),
         providers: Some(ProvidersConfig {
             deepseek: ProviderConfig {
                 api_key: Some("deepseek-key".to_string()),
@@ -11224,7 +11227,8 @@ async fn provider_switch_foreign_direct_model_rejected_before_mutation() {
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("deepseek-key".to_string()), None);
 
     switch_provider(
         &mut app,
@@ -11846,11 +11850,9 @@ async fn dispatch_uses_app_owned_exact_custom_identity_when_config_selector_drif
 }
 
 #[tokio::test]
-async fn dispatch_idless_custom_identity_keeps_legacy_root_over_literal_table() {
+async fn dispatch_idless_custom_identity_uses_the_literal_table() {
     let config = Config {
         provider: Some("custom".to_string()),
-        api_key: Some("legacy-root-test-key".to_string()),
-        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
         default_text_model: Some("legacy-root-model".to_string()),
         providers: Some(ProvidersConfig {
             custom: HashMap::from([(
@@ -11866,7 +11868,11 @@ async fn dispatch_idless_custom_identity_keeps_legacy_root_over_literal_table() 
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(
+        Some("legacy-root-test-key".to_string()),
+        Some("http://127.0.0.1:18180/v1".to_string()),
+    );
     let mut app = create_test_app();
     app.set_provider_identity(ApiProvider::Custom, "custom");
     app.set_model_selection("legacy-root-model".to_string());
@@ -11883,20 +11889,15 @@ async fn dispatch_idless_custom_identity_keeps_legacy_root_over_literal_table() 
 
     match engine.rx_op.recv().await.expect("send message op") {
         Op::SendMessage(TurnSpec { route, .. }) => {
+            // Beside a literal `[providers.custom]` table, the older
+            // top-level endpoint is DeepSeek's (#6394); the literal route is
+            // the table.
             assert_eq!(route.identity.provider, ApiProvider::Custom);
             assert_eq!(route.identity.key, "custom");
-            assert_eq!(route.identity.exact_id, None);
-            assert_eq!(route.model, "legacy-root-model");
+            assert_eq!(route.identity.exact_id.as_deref(), Some("custom"));
             assert_eq!(
                 route.config.active_route_base_url(),
-                "http://127.0.0.1:18180/v1"
-            );
-            assert!(
-                route
-                    .config
-                    .providers
-                    .as_ref()
-                    .is_none_or(|providers| !providers.custom.contains_key("custom"))
+                "http://127.0.0.1:18181/v1"
             );
         }
         other => panic!("expected SendMessage, got {other:?}"),
@@ -11958,7 +11959,6 @@ fn logout_memory_clear_respects_named_and_legacy_custom_scopes() {
     named_app.set_provider_identity(ApiProvider::Custom, "lm-studio");
     let mut named_config = Config {
         provider: Some("lm-studio".to_string()),
-        api_key: Some("deepseek-root-key".to_string()),
         providers: Some(ProvidersConfig {
             custom: HashMap::from([(
                 "lm-studio".to_string(),
@@ -11973,11 +11973,15 @@ fn logout_memory_clear_respects_named_and_legacy_custom_scopes() {
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("deepseek-root-key".to_string()), None);
 
     clear_active_provider_api_key_from_memory(&named_app, &mut named_config);
 
-    assert_eq!(named_config.api_key.as_deref(), Some("deepseek-root-key"));
+    assert_eq!(
+        named_config.deepseek_table_api_key(),
+        Some("deepseek-root-key")
+    );
     assert_eq!(
         named_config
             .providers
@@ -11991,16 +11995,27 @@ fn logout_memory_clear_respects_named_and_legacy_custom_scopes() {
     legacy_app.set_provider_identity(ApiProvider::Custom, "custom");
     let mut legacy_config = Config {
         provider: Some("custom".to_string()),
-        api_key: Some("legacy-key".to_string()),
-        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
         default_text_model: Some("legacy-model".to_string()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(
+        Some("legacy-key".to_string()),
+        Some("http://127.0.0.1:18180/v1".to_string()),
+    );
 
     clear_active_provider_api_key_from_memory(&legacy_app, &mut legacy_config);
 
-    assert_eq!(legacy_config.api_key, None);
-    assert!(legacy_config.providers.is_none());
+    // The literal route's key lives in `[providers.custom]` (#6394); the
+    // memory clear empties exactly that slot.
+    assert_eq!(legacy_config.deepseek_table_api_key(), None);
+    assert_eq!(
+        legacy_config
+            .providers
+            .as_ref()
+            .and_then(|providers| providers.custom.get("custom"))
+            .and_then(|provider| provider.api_key.as_deref()),
+        None
+    );
 }
 
 #[test]
@@ -12073,10 +12088,10 @@ fn configure_manual_compaction_test_route(app: &mut App) -> Config {
     app.model = DEFAULT_TEXT_MODEL.to_string();
     Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some("test-key".to_string()),
         default_text_model: Some(DEFAULT_TEXT_MODEL.to_string()),
         ..Config::default()
     }
+    .with_legacy_root(Some("test-key".to_string()), None)
 }
 
 #[test]
@@ -21435,16 +21450,16 @@ fn automatic_session_snapshot_keeps_named_custom_identity_secret_free() {
 }
 
 #[test]
-fn automatic_session_snapshot_omits_id_for_legacy_root_custom_route() {
+fn automatic_session_snapshot_records_the_literal_custom_table_id() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let manager =
         crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
     let config = Config {
         provider: Some("custom".to_string()),
-        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
         default_text_model: Some("legacy-root-model".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(None, Some("http://127.0.0.1:18180/v1".to_string()));
     let mut app = App::new(create_test_options(), &config);
     app.api_messages_mut()
         .push(text_message("user", "persist root"));
@@ -21452,9 +21467,14 @@ fn automatic_session_snapshot_omits_id_for_legacy_root_custom_route() {
     let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
     let serialized = serde_json::to_string(&snapshot).expect("serialize session");
 
+    // The literal route is the `[providers.custom]` table since #6394, so
+    // the snapshot records its exact id. Older id-less records still load.
     assert_eq!(snapshot.metadata.model_provider, "custom");
-    assert_eq!(snapshot.metadata.model_provider_id, None);
-    assert!(!serialized.contains("model_provider_id"));
+    assert_eq!(
+        snapshot.metadata.model_provider_id.as_deref(),
+        Some("custom")
+    );
+    assert!(serialized.contains("\"model_provider_id\":\"custom\""));
 }
 
 #[test]
@@ -21936,10 +21956,10 @@ fn file_load_uses_one_fresh_config_snapshot_for_custom_route_and_app_state() {
 }
 
 #[test]
-fn session_load_keeps_idless_custom_record_on_root_when_table_coexists() {
+fn session_load_resolves_an_idless_custom_record_to_the_literal_table() {
     let mut config =
         named_custom_session_config("custom", "http://127.0.0.1:18182/v1", "table-model");
-    config.base_url = Some("http://127.0.0.1:18181/v1".to_string());
+    config.set_legacy_root(None, Some("http://127.0.0.1:18181/v1".to_string()));
     config.default_text_model = Some("legacy-root-model".to_string());
     let mut app = create_test_app();
     app.api_messages_mut()
@@ -21952,29 +21972,28 @@ fn session_load_keeps_idless_custom_record_on_root_when_table_coexists() {
     session.metadata.model_provider_id = None;
     session.metadata.model = "legacy-saved-model".to_string();
 
+    // An older top-level endpoint beside a `[providers.custom]` table belongs
+    // to DeepSeek (#6394); the id-less literal record is the table's route.
     apply_loaded_session(&mut app, &mut config, &session)
-        .expect("id-less custom record must retain root provenance");
+        .expect("id-less custom record resolves to the literal table");
     assert_eq!(*app.api_messages, session.messages);
     assert_eq!(app.api_provider, ApiProvider::Custom);
     assert_eq!(app.provider_identity_for_persistence(), "custom");
-    assert_eq!(app.provider_id_for_persistence(), None);
-    assert_eq!(config.active_route_base_url(), "http://127.0.0.1:18181/v1");
-    assert!(
-        config
-            .providers
-            .as_ref()
-            .is_none_or(|providers| !providers.custom.contains_key("custom"))
+    assert_eq!(config.active_route_base_url(), "http://127.0.0.1:18182/v1");
+    assert_eq!(
+        config.deepseek_table_base_url(),
+        Some("http://127.0.0.1:18181/v1")
     );
 }
 
 #[test]
-fn session_load_rejects_exact_custom_table_record_when_only_root_remains() {
+fn session_load_resumes_an_exact_custom_record_on_the_migrated_table() {
     let mut config = Config {
         provider: Some("custom".to_string()),
-        base_url: Some("http://127.0.0.1:18181/v1".to_string()),
         default_text_model: Some("legacy-root-model".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(None, Some("http://127.0.0.1:18181/v1".to_string()));
     let mut app = create_test_app();
     app.api_messages_mut()
         .push(text_message("user", "current conversation"));
@@ -21989,19 +22008,22 @@ fn session_load_rejects_exact_custom_table_record_when_only_root_remains() {
     session.metadata.model_provider_id = Some("custom".to_string());
     session.metadata.model = "table-model".to_string();
 
-    let error = apply_loaded_session(&mut app, &mut config, &session)
-        .expect_err("exact table record must not fall back to root");
-    assert!(error.contains("[providers.custom]"), "{error}");
-    assert!(error.contains("will not fall back"), "{error}");
-    assert_eq!(app.api_messages, previous_messages);
-    assert_eq!(app.provider_identity_for_persistence(), previous_identity);
+    // A top-level-only literal route became `[providers.custom]` when the
+    // config was parsed (#6394), so an exact record resumes on it.
+    apply_loaded_session(&mut app, &mut config, &session)
+        .expect("exact table record resumes on the migrated table");
+    assert_ne!(app.api_messages, previous_messages);
+    assert_eq!(*app.api_messages, session.messages);
+    assert_ne!(app.provider_identity_for_persistence(), previous_identity);
+    assert_eq!(app.provider_identity_for_persistence(), "custom");
+    assert_eq!(config.active_route_base_url(), "http://127.0.0.1:18181/v1");
 }
 
 #[test]
 fn session_load_rejects_empty_custom_id_when_root_and_table_coexist() {
     let mut config =
         named_custom_session_config("custom", "http://127.0.0.1:18182/v1", "table-model");
-    config.base_url = Some("http://127.0.0.1:18181/v1".to_string());
+    config.set_legacy_root(None, Some("http://127.0.0.1:18181/v1".to_string()));
     config.default_text_model = Some("legacy-root-model".to_string());
     let mut app = create_test_app();
     app.api_messages_mut()
@@ -22536,9 +22558,9 @@ async fn model_picker_apply_is_session_local_until_startup_default_is_requested(
     app.reasoning_effort = ReasoningEffort::Auto;
     let mut engine = mock_engine_handle();
     let mut config = Config {
-        api_key: Some("test-key".to_string()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), None);
 
     apply_model_picker_choice(
         &mut app,
@@ -22689,9 +22711,9 @@ async fn model_picker_auto_commits_visible_implicit_fixed_model_thinking() {
     app.reasoning_effort_preference = None;
     let mut engine = mock_engine_handle();
     let mut config = Config {
-        api_key: Some("test-key".to_string()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), None);
 
     apply_model_picker_choice(
         &mut app,
@@ -22732,9 +22754,9 @@ async fn model_picker_auto_restores_raw_preference_after_fixed_normalization() {
     app.reasoning_effort_preference = Some(ReasoningEffort::Low);
     let mut engine = mock_engine_handle();
     let mut config = Config {
-        api_key: Some("test-key".to_string()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), None);
 
     apply_model_picker_choice(
         &mut app,
@@ -22806,9 +22828,9 @@ async fn reselecting_live_model_and_thinking_is_session_local() {
     app.reasoning_effort = ReasoningEffort::High;
     let mut engine = mock_engine_handle();
     let mut config = Config {
-        api_key: Some("test-key".to_string()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), None);
     assert!(
         codewhale_config::SetupState::load()
             .ok()
@@ -23058,9 +23080,9 @@ async fn model_picker_startup_default_reports_settings_write_failure() {
     app.reasoning_effort = ReasoningEffort::Auto;
     let mut engine = mock_engine_handle();
     let mut config = Config {
-        api_key: Some("test-key".to_string()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), None);
 
     apply_model_picker_choice(
         &mut app,
@@ -25203,8 +25225,6 @@ fn fallback_switch_status_shows_one_based_position_and_reason() {
 async fn failed_fallback_restores_exact_literal_custom_identity_without_root_crossover() {
     let mut config = Config {
         provider: Some("custom".to_string()),
-        api_key: Some("legacy-root-key".to_string()),
-        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
         default_text_model: Some("legacy-root-model".to_string()),
         providers: Some(ProvidersConfig {
             custom: HashMap::from([(
@@ -25220,7 +25240,11 @@ async fn failed_fallback_restores_exact_literal_custom_identity_without_root_cro
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(
+        Some("legacy-root-key".to_string()),
+        Some("http://127.0.0.1:18180/v1".to_string()),
+    );
     let previous_identity = ProviderIdentity {
         provider: ApiProvider::Custom,
         key: "custom".to_string(),
@@ -25285,7 +25309,6 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
     let mut engine = mock_engine_handle();
     let mut config = Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some("deepseek-key".to_string()),
         default_text_model: Some("deepseek-v4-pro".to_string()),
         providers: Some(ProvidersConfig {
             deepseek: ProviderConfig {
@@ -25301,7 +25324,8 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("deepseek-key".to_string()), None);
 
     switch_provider(
         &mut app,
@@ -25392,7 +25416,6 @@ async fn provider_switch_rollback_corrects_setup_receipt_when_persistence_fails(
     let mut engine = mock_engine_handle();
     let mut config = Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some("deepseek-key".to_string()),
         default_text_model: Some("deepseek-v4-pro".to_string()),
         providers: Some(ProvidersConfig {
             deepseek: ProviderConfig {
@@ -25406,7 +25429,8 @@ async fn provider_switch_rollback_corrects_setup_receipt_when_persistence_fails(
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("deepseek-key".to_string()), None);
 
     switch_provider(
         &mut app,
@@ -26250,9 +26274,9 @@ async fn keyless_engine_error_stays_visible_after_a_config_ack() {
     // before constructing the Engine or sending a turn.
     let config = Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some(String::new()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some(String::new()), None);
     let missing_key = config
         .active_route_api_key()
         .expect_err("fixture must reject credentials before provider I/O");
@@ -27514,6 +27538,23 @@ fn subagent_completion_notification_can_include_elapsed_summary() {
     assert_eq!(payload.headline(), "Agent complete (1m 05s)");
     assert_eq!(payload.detail(), Some("agent_live"));
     assert_eq!(payload.preview(), None);
+}
+
+#[test]
+fn subagent_notification_names_the_agent_and_previews_its_answer() {
+    // #6565: the notice used the raw id as detail and the report's first
+    // line (often `## Summary`) as preview.
+    let payload = crate::tui::notifications::subagent_terminal_payload(
+        codewhale_localization::Locale::En,
+        "audit docs",
+        "## Summary\n\nThree links are stale. Two are in README.md.\n<codewhale:subagent.done>{}</codewhale:subagent.done>",
+        &crate::tools::subagent::SubAgentStatus::Completed,
+        false,
+        Duration::from_secs(5),
+    );
+    assert_eq!(payload.headline(), "Agent complete");
+    assert_eq!(payload.detail(), Some("audit docs"));
+    assert_eq!(payload.preview(), Some("Three links are stale."));
 }
 
 #[test]
@@ -30872,32 +30913,21 @@ fn pending_child_approval_drives_the_phase_to_waiting_on_you() {
     assert_eq!(phase.label(app.ui_locale), "needs you");
 }
 
-/// #6565: the label a workflow gives a child is its one name. It replaces the
-/// counter placeholder the child got before the workflow event arrived, and
-/// the status line, card owner and roster all read it.
+/// #6565: the label a workflow gives a child is its one name. The engine
+/// makes it the child's explicit nickname, so the spawn event and every
+/// snapshot carry it; it replaces the counter placeholder a progress-first
+/// child got, and the status line, card owner and roster all read it.
 #[test]
 fn workflow_task_label_is_the_one_name_for_that_agent() {
-    use crate::tui::widgets::workflow_panel::WorkflowPanelEvent;
+    use crate::tools::subagent::SubAgentStatus;
 
     let mut app = create_test_app();
     // Progress arrived first and assigned the placeholder.
     assert_eq!(app.ensure_agent_label("agent_wf1"), "Agent 1");
 
-    app.apply_workflow_panel_event(
-        "run-1",
-        WorkflowPanelEvent::TaskStarted {
-            task_id: "agent_wf1".to_string(),
-            label: Some("audit docs".to_string()),
-            profile: Some("explore".to_string()),
-            model: None,
-            strength: None,
-            resolved_model: None,
-            worktree: false,
-            workspace: None,
-            route: Box::default(),
-            at_ms: 1_000,
-        },
-    );
+    let mut first = make_subagent("agent_wf1", SubAgentStatus::Running);
+    first.nickname = Some("audit docs".to_string());
+    app.subagent_cache.push(first);
 
     assert_eq!(app.ensure_agent_label("agent_wf1"), "audit docs");
     assert_eq!(app.agent_display_label("agent_wf1"), "audit docs");
@@ -30910,20 +30940,27 @@ fn workflow_task_label_is_the_one_name_for_that_agent() {
         "audit docs"
     );
 
-    // A parallel task with the same label gets a name the person can tell
-    // apart on the approval card; hearing about either task again keeps it.
-    app.note_workflow_agent_label("agent_wf2", "audit docs");
+    // A parallel task with the same label, known so far only from its spawn
+    // event, gets a name the person can tell apart on the approval card;
+    // hearing about either task again keeps it.
+    app.agent_progress_meta
+        .entry("agent_wf2".to_string())
+        .or_default()
+        .display_name = Some("audit docs".to_string());
     assert_eq!(app.ensure_agent_label("agent_wf2"), "audit docs · 2");
     assert_eq!(
         crate::tui::pending_requests::owner_for(&mut app, "agent_wf2").label,
         "audit docs · 2"
     );
-    app.note_workflow_agent_label("agent_wf2", "audit docs");
-    app.note_workflow_agent_label("agent_wf1", "audit docs");
+    let mut second = make_subagent("agent_wf2", SubAgentStatus::Running);
+    second.nickname = Some("audit docs".to_string());
+    app.subagent_cache.push(second);
+    assert_eq!(app.ensure_agent_label("agent_wf2"), "audit docs · 2");
+    assert_eq!(app.ensure_agent_label("agent_wf1"), "audit docs");
     assert_eq!(app.agent_display_label("agent_wf1"), "audit docs");
     assert_eq!(app.agent_display_label("agent_wf2"), "audit docs · 2");
     assert_eq!(
         app.agent_given_name("agent_wf2").as_deref(),
-        Some("audit docs · 2")
+        Some("audit docs")
     );
 }

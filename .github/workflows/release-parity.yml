@@ -71,14 +71,15 @@ jobs:
       - name: OHOS dependency graph
         run: ./scripts/release/check-ohos-deps.sh
       - name: Clippy
+        # Same lint set as ci.yml's "Run clippy": collapsible_if and
+        # assertions_on_constants were removed there on purpose, so allowing
+        # them here made the release gate weaker than the merge gate.
         run: |
           cargo clippy --workspace --all-targets --all-features --locked -- \
             -D warnings \
             -A clippy::uninlined_format_args \
             -A clippy::too_many_arguments \
-            -A clippy::unnecessary_map_or \
-            -A clippy::collapsible_if \
-            -A clippy::assertions_on_constants
+            -A clippy::unnecessary_map_or
       - name: Workspace tests
         # Same test binaries as `cargo test`, run by cargo-nextest: one process
         # per test. This gate used libtest, where every test shares one process,

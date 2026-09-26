@@ -1,0 +1,10 @@
+# Written by v0.10.0 `/config base_url https://proxy.example.test/v1 --save`
+# while a DeepSeek session was active, plus a later `auth set`.
+provider = "deepseek"
+reasoning_effort = "max"
+base_url = "https://proxy.example.test/v1"
+api_key = "sk-proxy-key"
+auth_mode = "api_key"
+
+[providers.openrouter]
+api_key = "sk-or-other-vendor"

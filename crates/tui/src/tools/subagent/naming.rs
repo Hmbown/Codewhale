@@ -471,3 +471,134 @@ pub(crate) fn localized_whale_display_names<'a>(
 
     names
 }
+
+/// A nickname someone chose for this agent: a workflow task label or a
+/// user-given name. A whale name generated from the agent id is presentation
+/// only and is not an explicit name.
+pub(crate) fn explicit_nickname<'a>(agent_id: &str, nickname: Option<&'a str>) -> Option<&'a str> {
+    nickname
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && *name != agent_id)
+        .filter(|name| generated_whale_name_base(agent_id, name).is_none())
+}
+
+/// The role word for an agent, most specific first: the resolved profile, the
+/// assignment role, the requested profile, the route's canonical role, then
+/// the Fleet type, in its public spelling.
+pub(crate) fn subagent_role_label(
+    child_route: Option<&super::ChildRouteReceipt>,
+    assignment_role: Option<&str>,
+    agent_type: &super::FleetRole,
+) -> String {
+    let non_empty = |value: &str| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    };
+    child_route
+        .and_then(|route| route.resolved_profile_id.as_deref())
+        .and_then(non_empty)
+        .or_else(|| assignment_role.and_then(non_empty))
+        .or_else(|| {
+            child_route
+                .and_then(|route| route.requested_profile.as_deref())
+                .and_then(non_empty)
+        })
+        .or_else(|| child_route.and_then(|route| non_empty(&route.canonical_role)))
+        .or_else(|| non_empty(agent_type.as_str()))
+        .map_or_else(
+            || "agent".to_string(),
+            |role| crate::fleet::role::public_role_label(&role),
+        )
+}
+
+/// The one name an agent goes by, on every surface and every host (#6565).
+///
+/// An explicit nickname (the workflow's task label, or a name someone gave the
+/// agent) wins as it is. A dispatch (session) name comes next, followed by the
+/// role when the name does not already say it. An agent with neither goes by
+/// its role. It is never the raw agent id.
+pub(crate) fn subagent_display_name(
+    agent_id: &str,
+    nickname: Option<&str>,
+    session_name: Option<&str>,
+    role: &str,
+) -> String {
+    if let Some(explicit) = explicit_nickname(agent_id, nickname) {
+        return explicit.to_string();
+    }
+    match session_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && *name != agent_id)
+    {
+        Some(name) if name.contains(role) => name.to_string(),
+        Some(name) => format!("{name} · {role}"),
+        None => role.to_string(),
+    }
+}
+
+/// [`subagent_display_name`] for a manager snapshot.
+pub(crate) fn subagent_result_display_name(result: &super::SubAgentResult) -> String {
+    let role = subagent_role_label(
+        result.child_route.as_ref(),
+        result.assignment.role.as_deref(),
+        &result.agent_type,
+    );
+    subagent_display_name(
+        &result.agent_id,
+        result.nickname.as_deref(),
+        Some(result.name.as_str()),
+        &role,
+    )
+}
+
+#[cfg(test)]
+mod display_name_tests {
+    use super::*;
+    use crate::tools::subagent::FleetRole;
+
+    #[test]
+    fn one_name_precedence_never_falls_to_the_agent_id() {
+        let id = "agent_1a2b3c4d";
+        // A workflow task label (an explicit nickname) wins as it is.
+        assert_eq!(
+            subagent_display_name(id, Some("audit docs"), Some("triage"), "explore"),
+            "audit docs"
+        );
+        // A generated whale name is not an explicit name.
+        let whale = whale_name_for_id_in_locale(id, "en");
+        assert_eq!(
+            subagent_display_name(id, Some(&whale), Some("triage"), "explore"),
+            "triage · explore"
+        );
+        // The dispatch name carries the role unless it already says it.
+        assert_eq!(
+            subagent_display_name(id, None, Some("explore-docs"), "explore"),
+            "explore-docs"
+        );
+        // The manager seeds the session name with the id: that is no name.
+        assert_eq!(
+            subagent_display_name(id, None, Some(id), "explore"),
+            "explore"
+        );
+        assert_eq!(
+            subagent_display_name(id, Some(" "), None, "review"),
+            "review"
+        );
+    }
+
+    #[test]
+    fn role_label_prefers_the_most_specific_token() {
+        assert_eq!(
+            subagent_role_label(None, Some("reviewer"), &FleetRole::Worker),
+            "reviewer"
+        );
+        assert_eq!(
+            subagent_role_label(None, None, &FleetRole::Builder),
+            "implement"
+        );
+        assert_eq!(
+            subagent_role_label(None, Some("  "), &FleetRole::Scout),
+            "explore"
+        );
+    }
+}

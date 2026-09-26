@@ -2012,6 +2012,8 @@
   "AgentFocusPlaceholder": "{agent} को संदेश · Esc से मुख्य पर लौटें",
   "AgentFocusNoTranscript": "{agent} का अभी कोई ट्रांसक्रिप्ट नहीं है। वर्कर के संदेश आदान-प्रदान करते ही यहाँ दिखेंगे।",
   "AgentFocusOmitted": "पहले के संदेश ({count}) इन-मेमोरी ट्रांसक्रिप्ट से छोड़ दिए गए हैं।",
+  "AgentFocusResult": "परिणाम",
+  "AgentFocusStopReason": "यह क्यों रुका",
   "AgentFocusFollowUpDelivered": "{agent} के लिए कतार में: यह अगले राउंड में संदेश पढ़ेगा।",
   "AgentFocusFollowUpQueued": "{agent} के लिए कतार में",
   "AgentFocusFollowUpContinued": "{agent} पूरा हो चुका था; नए फ़ोर्क ({target}) पर जारी रखा गया। यह दृश्य अब उस फ़ोर्क का अनुसरण करता है।",

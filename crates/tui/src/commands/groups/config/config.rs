@@ -12,9 +12,9 @@ use crate::config::{
     normalize_custom_model_id, normalize_model_name_for_provider, validate_route,
 };
 use crate::config_persistence::{
-    persist_provider_base_url_key, persist_root_bool_key, persist_root_string_key,
-    persist_subagents_bool_key, persist_subagents_integer_key, persist_table_string_key,
-    persist_tui_integer_key, persist_unset_root_key,
+    persist_root_bool_key, persist_root_string_key, persist_subagents_bool_key,
+    persist_subagents_integer_key, persist_table_string_key, persist_tui_integer_key,
+    persist_unset_root_key,
 };
 use crate::reasoning_preference::ReasoningEffort;
 use crate::settings::Settings;
@@ -2377,26 +2377,6 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             };
             return CommandResult::message(message);
         }
-        "base_url" => {
-            let value = value.trim();
-            if value.is_empty() {
-                return CommandResult::error("base_url cannot be empty");
-            }
-            if persist {
-                match persist_root_string_key(app.config_path.as_deref(), "base_url", value) {
-                    Ok(path) => {
-                        return CommandResult::message(format!(
-                            "base_url = {value} (saved to {})",
-                            path.display()
-                        ));
-                    }
-                    Err(err) => return CommandResult::error(format!("Failed to save: {err}")),
-                }
-            }
-            return CommandResult::error(
-                "base_url must be saved with --save; client base URL is loaded from config on startup. Restart and re-open your session after saving.",
-            );
-        }
         "title" | "window_title" | "tab_title" => {
             // Keep the config setter under the same terminal-control and
             // bidi/zero-width policy as `/title` and `/rename`. Persist the
@@ -2426,35 +2406,26 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                 "title = {value}{suffix} — terminal window titles now read [\"{value}\"] … until /title overrides this session"
             ));
         }
-        "provider_url" | "provider_base_url" | "endpoint" => {
+        // `base_url` is the older spelling. It used to write a top-level key
+        // that every DeepSeek-family route inherited; it now writes the
+        // active route's own `[providers.<name>]` table like `provider_url`
+        // (#6394).
+        url_key @ ("base_url" | "provider_url" | "provider_base_url" | "endpoint") => {
             let value = match resolve_provider_url_value(app.api_provider, value) {
                 Ok(value) => value,
                 Err(err) => return CommandResult::error(err),
             };
-            if matches!(
-                app.api_provider,
-                ApiProvider::Deepseek | ApiProvider::DeepseekCN
-            ) {
-                if persist {
-                    match persist_root_string_key(app.config_path.as_deref(), "base_url", &value) {
-                        Ok(path) => {
-                            return CommandResult::message(format!(
-                                "provider_url = {value} (saved to {}; restart required)",
-                                path.display()
-                            ));
-                        }
-                        Err(err) => return CommandResult::error(format!("Failed to save: {err}")),
-                    }
-                }
-            } else if persist {
-                match persist_provider_base_url_key(
+            if persist {
+                let identity = app.provider_identity_for_persistence();
+                match crate::config_persistence::persist_route_base_url(
                     app.config_path.as_deref(),
                     app.api_provider,
+                    identity,
                     &value,
                 ) {
                     Ok(path) => {
                         return CommandResult::message(format!(
-                            "provider_url = {value} for {} (saved to {}; restart required)",
+                            "{url_key} = {value} for {} (saved to {}; restart required)",
                             app.api_provider.as_str(),
                             path.display()
                         ));
@@ -2462,9 +2433,9 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                     Err(err) => return CommandResult::error(format!("Failed to save: {err}")),
                 }
             }
-            return CommandResult::error(
-                "provider_url must be saved with --save; client base URL is loaded from config on startup. Restart and re-open your session after saving.",
-            );
+            return CommandResult::error(format!(
+                "{url_key} must be saved with --save; client base URL is loaded from config on startup. Restart and re-open your session after saving."
+            ));
         }
         // The two bottom-chrome rows' size presets (`tui.posture_bar`,
         // `tui.metrics_line`, #5950). Live on the next frame; `--save`
@@ -4620,14 +4591,20 @@ mod tests {
         let saved_path = crate::config_persistence::config_toml_path(None).unwrap();
         let saved = fs::read_to_string(&saved_path).unwrap();
 
+        // The active DeepSeek route's own table, not a top-level key (#6394).
         assert_eq!(
             msg,
             format!(
-                "base_url = https://example.internal.local/v1 (saved to {})",
+                "base_url = https://example.internal.local/v1 for deepseek (saved to {}; restart required)",
                 saved_path.display()
             )
         );
-        assert!(saved.contains("base_url = \"https://example.internal.local/v1\""));
+        let table: toml::Table = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            table["providers"]["deepseek"]["base_url"].as_str(),
+            Some("https://example.internal.local/v1")
+        );
+        assert!(table.get("base_url").is_none(), "{saved}");
     }
 
     #[test]
@@ -5352,11 +5329,15 @@ context_window = 262144
         assert_eq!(
             msg,
             format!(
-                "base_url = https://example.session.local/v1 (saved to {})",
+                "base_url = https://example.session.local/v1 for deepseek (saved to {}; restart required)",
                 config_path.display()
             )
         );
-        assert!(saved.contains("base_url = \"https://example.session.local/v1\""));
+        let table: toml::Table = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            table["providers"]["deepseek"]["base_url"].as_str(),
+            Some("https://example.session.local/v1")
+        );
     }
 
     #[test]

@@ -98,10 +98,9 @@ async fn approving_the_first_of_three_queued_calls_cancels_none_of_them() {
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let route = crate::route_runtime::resolve_runtime_route(
         &api_config,
         api_config.api_provider(),

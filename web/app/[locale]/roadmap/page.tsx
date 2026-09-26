@@ -4,20 +4,19 @@ import { PageHeader, Section } from "@/components/page-header";
 import { Status, type StatusTone } from "@/components/status-badge";
 import { getCachedRoadmap, type RoadmapItem } from "@/lib/roadmap-feed";
 import { getEnv } from "@/lib/kv";
+import { fill, getRoadmap, pickTextLocale } from "@/lib/i18n/dictionaries";
 import { buildPageMetadata } from "@/lib/page-meta";
 
 export const revalidate = 1800;
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
+  const t = getRoadmap(locale);
   return buildPageMetadata({
     path: "/roadmap",
     locale,
-    title: isZh ? "路线图 · Codewhale" : "Roadmap · Codewhale",
-    description: isZh
-      ? "Codewhale 已完成、进行中、考虑中和明确不在范围内的工作。"
-      : "Current Codewhale work grouped by shipped, underway, considered, and deliberately out-of-scope directions.",
+    title: t.metaTitle,
+    description: t.metaDescription,
   });
 }
 
@@ -148,8 +147,8 @@ const roadmapText = (text: string) =>
 
 export default async function RoadmapPage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
-  const baseTracks = isZh ? tracksZh : tracksEn;
+  const t = getRoadmap(locale);
+  const baseTracks = { en: tracksEn, zh: tracksZh }[pickTextLocale(locale)];
 
   // Live feed: shipped from GitHub Releases; underway/considered/ruled-out from issue labels.
   // Per-category fallback to the static items so unlabeled categories stay populated.
@@ -180,53 +179,23 @@ export default async function RoadmapPage({ params }: { params: Promise<{ locale
     /* keep static fallback */
   }
 
-  const copy = isZh
-    ? {
-        eyebrow: "项目路线图",
-        title: "路线图",
-        introduction: "这里将已完成的仓库工作、正在推进的工作、仍在评估的方案和明确不在范围内的方向分开列出。路线图的“已完成”可包含已在源码候选版中实现的工作；安装页与首页另行标明最新已发布包。发布记录和 GitHub issues 会在可用时更新这些分类。",
-        sectionLabel: "当前状态",
-        sectionTitle: "按状态查看工作",
-        browseIssues: "浏览 open issues",
-        count: (value: number) => `${value} 项`,
-        contributeLabel: "参与贡献",
-        contributeTitle: "路线图决策公开进行。",
-        contributeBody: "Bug 和范围明确的功能请求请使用 issues；尚在形成中的想法可以先在 Discussions 讨论；已有具体实现时，欢迎发送带测试或文档的 pull request。来自不同语言、平台和提供商的验证结果都能帮助维护者判断优先级。",
-        links: [
-          { title: "Issues", detail: "报告问题，或提出范围明确的工作。", href: "https://github.com/Hmbown/CodeWhale/issues" },
-          { title: "Discussions", detail: "在开始实现前讨论尚未成熟的想法。", href: "https://github.com/Hmbown/CodeWhale/discussions/new?category=ideas" },
-          { title: "Pull requests", detail: "审查现有改动，或发送一个范围清楚的补丁。", href: "https://github.com/Hmbown/CodeWhale/pulls" },
-        ],
-      }
-    : {
-        eyebrow: "Project roadmap",
-        title: "Roadmap",
-        introduction: "This page separates completed repository work from work in progress, proposals still being evaluated, and directions intentionally kept out of scope. Roadmap Shipped can include work implemented in a source candidate; the install page and homepage separately identify the latest published package. Release records and GitHub issues refresh these categories when available.",
-        sectionLabel: "Current status",
-        sectionTitle: "Work grouped by status",
-        browseIssues: "Browse open issues",
-        count: (value: number) => `${value} ${value === 1 ? "item" : "items"}`,
-        contributeLabel: "Contribute",
-        contributeTitle: "Keep roadmap decisions in the open.",
-        contributeBody: "Use issues for bugs and well-scoped feature requests, Discussions for ideas that need shaping, and pull requests for concrete changes with tests or documentation. Verification across languages, platforms, and providers helps maintainers judge priority.",
-        links: [
-          { title: "Issues", detail: "Report a problem or propose scoped work.", href: "https://github.com/Hmbown/CodeWhale/issues" },
-          { title: "Discussions", detail: "Explore an early idea before implementation.", href: "https://github.com/Hmbown/CodeWhale/discussions/new?category=ideas" },
-          { title: "Pull requests", detail: "Review existing work or send a focused change.", href: "https://github.com/Hmbown/CodeWhale/pulls" },
-        ],
-      };
+  const links = [
+    { title: "Issues", detail: t.issuesDetail, href: "https://github.com/Hmbown/CodeWhale/issues" },
+    { title: "Discussions", detail: t.discussionsDetail, href: "https://github.com/Hmbown/CodeWhale/discussions/new?category=ideas" },
+    { title: "Pull requests", detail: t.pullsDetail, href: "https://github.com/Hmbown/CodeWhale/pulls" },
+  ];
 
   return (
     <>
-      <PageHeader kicker={copy.eyebrow} title={copy.title} lede={copy.introduction} pose="browse" />
+      <PageHeader kicker={t.eyebrow} title={t.title} lede={t.introduction} pose="browse" />
 
       <div className="page-body">
         <Section
           id="roadmap-status"
-          title={copy.sectionTitle}
+          title={t.sectionTitle}
           link={
             <Link href="https://github.com/Hmbown/CodeWhale/issues" className="section-link">
-              {copy.browseIssues}
+              {t.browseIssues}
               <Icon name="external" className="icon" />
             </Link>
           }
@@ -238,7 +207,7 @@ export default async function RoadmapPage({ params }: { params: Promise<{ locale
                   <h3 id={`track-${index}`}>
                     <Status tone={TRACK_TONES[index] ?? "idle"}>{track.title}</Status>
                   </h3>
-                  <span className="page-meta tabular">{copy.count(track.items.length)}</span>
+                  <span className="page-meta tabular">{fill(track.items.length === 1 ? t.trackCountOne : t.trackCount, { count: track.items.length })}</span>
                 </div>
                 <ul className="group-card" role="list">
                   {track.items.map((item) => (
@@ -253,9 +222,9 @@ export default async function RoadmapPage({ params }: { params: Promise<{ locale
           </div>
         </Section>
 
-        <Section id="roadmap-contribute" title={copy.contributeTitle} scope={copy.contributeBody}>
+        <Section id="roadmap-contribute" title={t.contributeTitle} scope={t.contributeBody}>
           <ul className="dir-list dir-list-card" role="list">
-            {copy.links.map((link) => (
+            {links.map((link) => (
               <li key={link.title}>
                 <Link href={link.href} className="dir-row">
                   <span className="dir-mark" aria-hidden="true">

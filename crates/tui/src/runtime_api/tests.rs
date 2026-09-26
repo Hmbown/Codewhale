@@ -81,11 +81,13 @@ fn web_launcher_failure_is_a_recoverable_manual_bootstrap_warning() {
 fn provider_default_model_cases() -> Vec<(&'static str, Config, &'static str)> {
     let deepseek = Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some("deepseek-test-key".to_string()),
-        base_url: Some("http://127.0.0.1:1/v1".to_string()),
         default_text_model: Some("deepseek-v4-flash".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("deepseek-test-key".to_string()),
+        Some("http://127.0.0.1:1/v1".to_string()),
+    );
 
     let mut zai_providers = crate::config::ProvidersConfig::default();
     zai_providers.zai.api_key = Some("zai-test-key".to_string());
@@ -1157,10 +1159,12 @@ async fn build_test_server(
         Config::load(Some(path), None)?
     } else {
         Config {
-            api_key: Some("runtime-api-test-key".to_string()),
-            base_url: Some("http://127.0.0.1:1/v1".to_string()),
             ..Config::default()
         }
+        .with_legacy_root(
+            Some("runtime-api-test-key".to_string()),
+            Some("http://127.0.0.1:1/v1".to_string()),
+        )
     };
     config.mcp_config_path = Some(root.join("mcp.json").to_string_lossy().to_string());
     let manager = TaskManager::start_with_executor(
@@ -2400,10 +2404,10 @@ fn test_fleet_route_config() -> crate::config::Config {
     providers.zai.api_key = Some("test-key".to_string());
     crate::config::Config {
         provider: Some("deepseek".to_string()),
-        api_key: Some("test-key".to_string()),
         providers: Some(providers),
         ..crate::config::Config::default()
     }
+    .with_legacy_root(Some("test-key".to_string()), None)
 }
 
 #[tokio::test]
@@ -6086,6 +6090,203 @@ async fn undo_endpoint_404s_for_missing_thread() -> Result<()> {
         .send()
         .await?;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn fork_at_turn_endpoint_cuts_at_the_named_turn() -> Result<()> {
+    // The anchor is a turn id, not a distance, and the fork keeps the turn it
+    // names: the branch point is the answer a person pointed at. Resolved one
+    // turn off, a three-turn thread still answers 201 with a plausible thread
+    // and the wrong prompt in the composer — which is what this pins.
+    let root = std::env::temp_dir().join(format!("deepseek-fork-at-turn-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let created: serde_json::Value = client
+        .post(format!("http://{addr}/v1/threads"))
+        .json(&json!({
+            "model": "deepseek-v4-pro",
+            "mode": "agent",
+            "workspace": root.join("workspace")
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = created["id"]
+        .as_str()
+        .context("missing thread id")?
+        .to_string();
+
+    let user = |text: &str| Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+    };
+    let reply = |text: &str| Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+    };
+    runtime_threads
+        .seed_thread_from_messages(
+            &thread_id,
+            &[
+                user("first"),
+                reply("one"),
+                user("second"),
+                reply("two"),
+                user("third"),
+                reply("three"),
+            ],
+        )
+        .await?;
+
+    // Name the anchor the way a client would: the turn id carrying "second".
+    let detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{thread_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let anchor = detail["items"]
+        .as_array()
+        .context("missing items")?
+        .iter()
+        .find(|item| item["kind"] == "user_message" && item["detail"] == "second")
+        .and_then(|item| item["turn_id"].as_str())
+        .context("no turn carries the second prompt")?
+        .to_string();
+
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/fork-at-turn"))
+        .json(&json!({ "turn_id": anchor }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let forked: serde_json::Value = resp.json().await?;
+    // The prompt that comes back is what was asked *next*: the branch keeps
+    // "second" and hands back "third" as the place to continue from.
+    assert_eq!(forked["original_user_text"], "third");
+    let forked_id = forked["thread"]["id"]
+        .as_str()
+        .context("missing forked thread id")?
+        .to_string();
+    assert_ne!(forked_id, thread_id, "forking must not mutate in place");
+
+    let forked_detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{forked_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let forked_turns = forked_detail["turns"]
+        .as_array()
+        .context("missing forked turns")?
+        .iter()
+        .map(|turn| {
+            turn["input_summary"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        forked_turns,
+        vec!["first".to_string(), "second".to_string()]
+    );
+
+    // Naming the last turn keeps the whole conversation: the same rule read at
+    // the end of the thread, with nothing left to hand back.
+    let last_anchor = detail["items"]
+        .as_array()
+        .context("missing items")?
+        .iter()
+        .find(|item| item["kind"] == "user_message" && item["detail"] == "third")
+        .and_then(|item| item["turn_id"].as_str())
+        .context("no turn carries the third prompt")?
+        .to_string();
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/fork-at-turn"))
+        .json(&json!({ "turn_id": last_anchor }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let whole: serde_json::Value = resp.json().await?;
+    assert!(whole["original_user_text"].is_null());
+    let whole_id = whole["thread"]["id"]
+        .as_str()
+        .context("missing whole-thread fork id")?
+        .to_string();
+    let whole_detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{whole_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        whole_detail["turns"]
+            .as_array()
+            .map_or(usize::MAX, Vec::len),
+        3
+    );
+
+    // The source keeps every turn: a fork is a sibling, not an undo.
+    let source_detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/{thread_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        source_detail["turns"]
+            .as_array()
+            .map_or(usize::MAX, Vec::len),
+        3
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn fork_at_turn_endpoint_rejects_a_non_user_turn() -> Result<()> {
+    // An assistant turn is not a fork point: cutting "before" it would
+    // silently keep the user prompt it answers, which is not what the picker
+    // said. The anchor must be refused rather than rounded to a neighbour.
+    let root = std::env::temp_dir().join(format!("deepseek-fork-bad-turn-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let thread_id =
+        create_seeded_thread(&addr, &runtime_threads, &root, "Please fork this turn").await?;
+    let client = crate::tls::reqwest_client();
+
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/fork-at-turn"))
+        .json(&json!({ "turn_id": "turn_not_a_user_turn" }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
     handle.abort();
     Ok(())
 }
@@ -16392,9 +16593,9 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
     let mut config = Config {
         provider: Some("deepseek".into()),
         default_text_model: Some("deepseek-v4-flash-vision-exp".into()),
-        api_key: Some("synthetic-image-key".into()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("synthetic-image-key".into()), None);
     config.set_provider_model_override(
         ApiProvider::Deepseek,
         Some("deepseek-v4-flash-vision-exp".into()),
@@ -16513,9 +16714,9 @@ async fn runtime_image_stream_rejection_does_not_leave_empty_threads() -> Result
     let mut config = Config {
         provider: Some("deepseek".into()),
         default_text_model: Some("deepseek-v4-flash-vision-exp".into()),
-        api_key: Some("synthetic-image-key".into()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("synthetic-image-key".into()), None);
     config.set_provider_model_override(
         ApiProvider::Deepseek,
         Some("deepseek-v4-flash-vision-exp".into()),
@@ -17743,15 +17944,26 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
     let workspace = tmp.path().join("workspace");
     fs::create_dir_all(&workspace)?;
 
-    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
-        tmp.path().join("runtime"),
-        tmp.path().join("sessions"),
-        Some("keys-token".to_string()),
-        false,
-        workspace.clone(),
-    )
-    .await?
-    .context("secrets test requires a loopback listener")?;
+    // No literal DeepSeek key in the live config: the older harness kept one
+    // at the top level, where it silently outranked the store. Since #6394
+    // that key is a `[providers.deepseek]` literal and the write refuses.
+    let (addr, _runtime_threads, handle) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            tmp.path().join("runtime"),
+            tmp.path().join("sessions"),
+            Some("keys-token".to_string()),
+            false,
+            workspace.clone(),
+            TestServerOverrides {
+                config: Some(
+                    Config::default()
+                        .with_legacy_root(None, Some("http://127.0.0.1:1/v1".to_string())),
+                ),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+        .context("secrets test requires a loopback listener")?;
     let client = crate::tls::reqwest_client();
     let base = format!("http://{addr}");
 

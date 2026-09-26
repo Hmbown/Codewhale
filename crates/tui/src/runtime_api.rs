@@ -1356,6 +1356,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/threads/{id}/resume", post(resume_thread))
         .route("/v1/threads/{id}/fork", post(fork_thread))
         .route("/v1/threads/{id}/undo", post(undo_thread_turn))
+        .route("/v1/threads/{id}/fork-at-turn", post(fork_thread_at_turn))
         .route("/v1/threads/{id}/patch-undo", post(patch_undo_thread_turn))
         .route("/v1/threads/{id}/file-revert", post(revert_thread_file))
         .route("/v1/threads/{id}/retry", post(retry_thread_turn))
@@ -5648,6 +5649,44 @@ async fn undo_thread_turn(
     ))
 }
 
+#[derive(Debug, Deserialize)]
+struct ForkAtTurnRequest {
+    /// The user turn to fork at, as `GET /v1/threads/{id}` reports it. The
+    /// fork keeps that turn and every turn before it, and drops the rest.
+    turn_id: String,
+}
+
+/// Fork a thread at one named user turn — the client-side "continue from this
+/// turn" affordance, which carries on in the new thread.
+///
+/// The fork keeps the named turn and everything before it, so the branch point
+/// is the answer a person is looking at rather than the question above it;
+/// naming the last turn keeps the whole conversation. The receipt is
+/// deliberately the undo receipt: the first dropped turn's prompt comes back
+/// with the new thread, so a client can put what was asked next into the
+/// composer and let the person edit or replace it. The source thread, its
+/// session document and the workspace are untouched — no file rollback happens
+/// here, because the branch that was left behind shares the workspace.
+async fn fork_thread_at_turn(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<ForkAtTurnRequest>,
+) -> Result<(StatusCode, Json<UndoTurnResponse>), ApiError> {
+    let (forked_thread, original_user_text, original_user_images, _) = state
+        .runtime_threads
+        .fork_at_user_turn(&id, &req.turn_id)
+        .await
+        .map_err(map_thread_err)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(UndoTurnResponse {
+            thread: forked_thread,
+            original_user_text,
+            original_user_images,
+        }),
+    ))
+}
+
 /// Result of the snapshot-based file rollback step of patch-undo, reported
 /// alongside the new forked thread.
 #[derive(Debug, Serialize)]
@@ -8541,8 +8580,9 @@ struct SwitchProviderRequest {
     /// addresses them everywhere else: the generic kind in the id (`custom`)
     /// plus this additive exact id, exactly as `ProviderEntry`
     /// `model_provider_id` and `POST /v1/threads` already carry it. Omitted
-    /// keeps the pre-existing meaning — the built-in id, or the active
-    /// legacy root-level custom route.
+    /// keeps the pre-existing meaning — the built-in id, or the literal
+    /// `[providers.custom]` route (where the older top-level custom route
+    /// lives since #6394).
     #[serde(default)]
     model_provider_id: Option<String>,
 }

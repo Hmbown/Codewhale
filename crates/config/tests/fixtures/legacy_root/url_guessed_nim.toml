@@ -1,0 +1,4 @@
+# No provider key: older releases chose NVIDIA NIM from the host.
+api_key = "nvapi-legacy-key"
+base_url = "https://integrate.api.nvidia.com/v1"
+default_text_model = "deepseek-ai/deepseek-v4-pro"

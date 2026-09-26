@@ -2258,7 +2258,7 @@ model = "model-b"
     }
 
     #[test]
-    fn legacy_literal_custom_identity_persistence_stays_root_shaped() {
+    fn legacy_literal_custom_identity_persistence_moves_into_the_custom_table() {
         let config_env = ConfigPathEnvGuard::new();
         std::fs::write(
             config_env.config_path(),
@@ -2270,10 +2270,10 @@ default_text_model = "legacy-model"
         .expect("seed legacy root route");
         let config = Config {
             provider: Some("custom".to_string()),
-            base_url: Some("http://127.0.0.1:18180/v1".to_string()),
             default_text_model: Some("legacy-model".to_string()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(None, Some("http://127.0.0.1:18180/v1".to_string()));
         let identity = config
             .resolve_provider_identity("custom")
             .expect("legacy identity");
@@ -2283,12 +2283,26 @@ default_text_model = "legacy-model"
         crate::config::save_provider_model_for_identity(&identity, &config, "legacy-model-updated")
             .expect("save legacy model");
 
+        // The literal custom route's top-level fields now live in
+        // `[providers.custom]` (#6394); the saves write there and the write
+        // moves the old top-level endpoint alongside.
         let saved = std::fs::read_to_string(config_env.config_path()).expect("saved config");
-        assert!(saved.contains("api_key = \"legacy-saved-key\""));
-        assert!(saved.contains("default_text_model = \"legacy-model-updated\""));
-        assert!(!saved.contains("[providers.custom]"));
+        let table: toml::Table = toml::from_str(&saved).expect("saved config parses");
+        assert!(
+            !codewhale_config::legacy_root::has_legacy_root_keys(&table),
+            "{saved}"
+        );
+        let custom = table["providers"]["custom"]
+            .as_table()
+            .expect("custom table");
+        assert_eq!(custom["api_key"].as_str(), Some("legacy-saved-key"));
+        assert_eq!(custom["model"].as_str(), Some("legacy-model-updated"));
+        assert_eq!(
+            custom["base_url"].as_str(),
+            Some("http://127.0.0.1:18180/v1")
+        );
         let reloaded = Config::load(Some(config_env.config_path()), None).expect("reload legacy");
-        assert!(reloaded.uses_legacy_literal_custom_route());
+        assert!(reloaded.selects_literal_custom_provider());
         assert_eq!(
             reloaded
                 .resolve_provider_identity("custom")
@@ -2321,7 +2335,7 @@ model = "model-b"
         )
         .expect("seed coexistence config");
         let config = Config::load(Some(config_env.config_path()), None).expect("load config");
-        assert!(config.uses_legacy_literal_custom_route());
+        assert!(config.selects_literal_custom_provider());
         let identity = config
             .resolve_provider_identity("custom-b")
             .expect("named custom identity");
@@ -2332,7 +2346,13 @@ model = "model-b"
             .expect("save named custom model");
 
         let saved = std::fs::read_to_string(config_env.config_path()).expect("saved config");
-        assert!(saved.contains("api_key = \"legacy-root-key\""));
+        let table: toml::Table = toml::from_str(&saved).expect("saved config parses");
+        // The literal route's key moved into its own table, untouched by the
+        // named route's save (#6394).
+        assert_eq!(
+            table["providers"]["custom"]["api_key"].as_str(),
+            Some("legacy-root-key")
+        );
         assert!(saved.contains("default_text_model = \"legacy-model\""));
         assert!(saved.contains("[providers.custom-b]"));
         assert!(saved.contains("api_key = \"saved-b-key\""));

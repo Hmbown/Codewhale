@@ -30,7 +30,7 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Contributors",
         "items": [
-          "@gaord — let undo roll back files for the turn it is undoing (#6483), stopped resume and fork from duplicating threads and sessions (#6406), and exposed user-defined provider routes to native clients (#6404).",
+          "@gaord — let a client fork a thread at a named turn (#6580), let undo roll back files for the turn it is undoing (#6483), stopped resume and fork from duplicating threads and sessions (#6406), and exposed user-defined provider routes to native clients (#6404).",
           "@Lstarsky0 — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine (#6405, #6417, #6499, #6574), tightened the Chinese-branching ceiling to 18 (#6403), and made Fleet publish without a two-link window (#6431).",
           "@aboimpinto — restored a green Linux full-workspace test gate without loosening any test (#6581).",
           "@dajiaohuang — codewhale config set checks a known setting's value against its schema type before saving it (#6568).",
@@ -41,15 +41,18 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Added",
         "items": [
+          "Runtime API: POST /v1/threads/{id}/fork-at-turn forks a thread at a named user turn, keeping that turn and every turn before it. The receipt matches /undo and returns the first dropped prompt so a client can put it back in the composer. Naming the turn replaces a client-computed depth, which could fork the wrong prefix. The fork leaves the workspace and any running turn untouched (#6580, thanks @gaord).",
           "Official model routing: /router (also /model router) sets up the Auto router with presets: Jev (TypeSafe's decision model, via OpenRouter or a TypeSafe key), your provider's fast tier, Off, or Custom. Each preset makes one test call before it saves, /status shows the router's choice, cost and latency, and a failing router is shown as failing (#6525).",
           "Code mode composes MCP and plugin tools and is on by default: execute_tools programs can call MCP tools, and each nested call passes the same approval gate as a direct call, pausing the program for approval when needed. Every nested call keeps its receipt, including calls that finish before a deadline, and code_mode = false turns it off. codewhale mcp list and codewhale doctor warn when a user MCP server duplicates the built-in Computer Use bundle (#6562, #6509)."
         ],
-        "itemCount": 2
+        "itemCount": 3
       },
       {
         "heading": "Fixed",
         "items": [
+          "A top-level base_url or api_key in config.toml now means one thing everywhere. Every reader used its own rule for which routes inherited it, which is how a DeepSeek endpoint became the Xiaomi MiMo route's and failed with DeepSeek's 401. Old files keep working: the keys are read as [providers.deepseek] (or the vendor whose official host they name), the next save moves them there with a one-time backup and a one-line note, and a value that disagrees with its table is left for…",
           "codewhale exec --auto no longer exits 141 with no output when a child it writes to, such as a stdio MCP server, closes its pipe early. Headless exec now ignores SIGPIPE while it runs, as the interactive TUI already did, and exec ... | head still ends quietly. One-shot codewhale exec no longer prints DeepSeek's raw <｜｜DSML｜｜ calls> tool-call markup as its answer: the markup is removed, and an answer that was only a tool call fails at once with the reason and a pointer to…",
+          "Resuming a session keeps its \"Resumed:\" confirmation on screen instead of replacing it with \"Make room automatically: on\" when nothing was switched.",
           "The installation page is generated from docs/INSTALL.md, so the website and the guide can no longer disagree; broken anchors and unsafe links fail the build (#6450).",
           "codewhale config set refuses a value of the wrong type for a known setting (a word for an on/off switch, text for a number, a choice outside the list) instead of saving it (#6568, thanks @dajiaohuang).",
           "A turn that stops producing output now reports itself: the turn loop records its phase and last progress, and an overdue phase surfaces instead of hanging silently until the stream idle timeout. A delegated agent's final result is never dropped when the host is busy, so a finished child no longer leaves a ghost Running row behind (#6184).",
@@ -59,10 +62,9 @@ export const CHANGELOG: ChangelogRelease[] = [
           "Continuing a conversation that is already open no longer adds a second thread, and a fork keeps its own session file, so autosave on one side no longer leaves the other unloadable (#6406, thanks @gaord).",
           "Upgrading Codewhale no longer turns off the built-in Computer Use. Each build writes the built-in bundle to its own directory, so an upgrade used to present it as never reviewed and disabled. Now the review and enablement carry to the new build when its capabilities are unchanged. Changed capabilities show capabilities-changed and wait for review, and a revoked trust never carries (#6303).",
           "\"Allow for this conversation\" records a grant for that tool and argument class instead of switching the whole thread to Full Access, so the call you just approved is no longer failed by a Permissions change. An approval also survives a Permissions change that only widens what is allowed, grants end when a thread is archived or deleted, and web.run open grants are scoped by host. Full Access covers MCP tools that declare themselves destructive in every host, including…",
-          "web.run retries a refused page once with a browser user agent, and one site's failure no longer fails the whole call or drops its search results.",
-          "Hooks treat bash, Bash and exec_shell as one tool in tool_name conditions, so the documented example fires."
+          "web.run retries a refused page once with a browser user agent, and one site's failure no longer fails the whole call or drops its search results."
         ],
-        "itemCount": 20
+        "itemCount": 22
       },
       {
         "heading": "Removed",
@@ -98,9 +100,10 @@ export const CHANGELOG: ChangelogRelease[] = [
           "A queued agent says why it is waiting, for example when launches are throttled after provider rate limits, and when its time budget ends (#6277).",
           "Stopping an agent that writes files keeps and names the work it had changed, as a budget stop already did (#5529).",
           "workflow(fleet:) runs Fleets saved from the Fleet UI, and finds workspace Fleets under .codewhale/fleets.",
-          "The runtime API can stop a delegated agent run from the desktop."
+          "The runtime API can stop a delegated agent run from the desktop.",
+          "A finished agent's answer is no longer cut off. Its row and its completion notification show the first sentence of its result instead of a ## Summary heading or its last tool, and opening the agent shows the whole result, or the full reason it stopped, even when no transcript was captured. Each agent also has one name: a workflow task's label or its dispatch name appears on the rows, the notification and the runtime API alike, never its internal id (#6565)."
         ],
-        "itemCount": 5
+        "itemCount": 6
       },
       {
         "heading": "Plugins",

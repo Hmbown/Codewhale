@@ -2221,7 +2221,7 @@ mod tests {
     #[test]
     fn configured_model_client_keeps_its_metadata_snapshot_after_reload() {
         let (mut config, _, usage) = configured_fixture_receipt();
-        config.api_key = Some("fixture-not-a-provider-credential".into());
+        config.set_legacy_root(Some("fixture-not-a-provider-credential".into()), None);
         let id = "deepseek-v4.1-flash-expires-on-0910";
         let route =
             crate::route_runtime::resolve_runtime_route(&config, ApiProvider::Deepseek, Some(id))

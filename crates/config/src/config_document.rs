@@ -22,6 +22,16 @@ pub fn mutate_config_document<T, F>(path: &Path, mutate: F) -> Result<T>
 where
     F: FnOnce(&mut toml_edit::DocumentMut) -> Result<T>,
 {
+    mutate_config_document_with_migration(path, |doc, _| mutate(doc))
+}
+
+/// [`mutate_config_document`], also handing `mutate` the receipt of the legacy
+/// top-level `base_url` / `api_key` move this same write made, so a caller can
+/// tell a value it just moved from one that was already in its table.
+pub fn mutate_config_document_with_migration<T, F>(path: &Path, mutate: F) -> Result<T>
+where
+    F: FnOnce(&mut toml_edit::DocumentMut, &crate::legacy_root::LegacyRootMigration) -> Result<T>,
+{
     with_config_write_lock(path, |path| {
         let original = read_optional_config(path)?;
         let mut document = match original.as_deref() {
@@ -36,10 +46,21 @@ where
             _ => toml_edit::DocumentMut::new(),
         };
         heal_extras_nesting(&mut document);
-        let result = mutate(&mut document)?;
+        // Move legacy top-level `base_url` / `api_key` into their provider
+        // tables as part of this write (#6394). Conflicting pairs stay put
+        // unless this very write changes the table side.
+        let moved = crate::legacy_root::apply_to_document(&mut document, None);
+        let conflicts = crate::legacy_root::conflict_snapshot(&document);
+        let result = mutate(&mut document, &moved)?;
+        crate::legacy_root::settle_conflicts_after_write(&mut document, conflicts);
         let body = document.to_string();
         if original.as_deref() == Some(body.as_str()) || (original.is_none() && body.is_empty()) {
             return Ok(result);
+        }
+        if moved.changes_file()
+            && let Some(original) = original.as_deref()
+        {
+            crate::note_legacy_root_file_migration(path, original)?;
         }
         persist_locked(path, original.as_deref(), body.as_bytes())?;
         Ok(result)
@@ -87,6 +108,52 @@ pub fn heal_extras_nesting(document: &mut toml_edit::DocumentMut) -> bool {
         }
     }
     healed
+}
+
+/// What `codewhale config migrate` would do to the file at `path`, without
+/// writing it (#6394).
+pub fn preview_legacy_root_config(
+    path: &Path,
+    prefer: Option<crate::legacy_root::LegacyRootPrefer>,
+) -> Result<crate::legacy_root::LegacyRootMigration> {
+    let Some(raw) = read_optional_config(path)? else {
+        return Ok(crate::legacy_root::LegacyRootMigration::default());
+    };
+    let document = raw.parse::<toml_edit::DocumentMut>().map_err(|_| {
+        anyhow::anyhow!(
+            "failed to parse config at {}; file contents were omitted",
+            crate::quote_os_path(path)
+        )
+    })?;
+    Ok(crate::legacy_root::preview_document(&document, prefer))
+}
+
+/// Move legacy top-level `base_url` / `api_key` into their provider tables
+/// on disk, keeping comments. A conflicting pair changes only when `prefer`
+/// says which side to keep. Before the first write a one-time,
+/// credential-free backup is kept; its path is returned when one exists.
+pub fn migrate_legacy_root_config(
+    path: &Path,
+    prefer: Option<crate::legacy_root::LegacyRootPrefer>,
+) -> Result<(crate::legacy_root::LegacyRootMigration, Option<PathBuf>)> {
+    with_config_write_lock(path, |path| {
+        let Some(original) = read_optional_config(path)? else {
+            return Ok((crate::legacy_root::LegacyRootMigration::default(), None));
+        };
+        let mut document = original.parse::<toml_edit::DocumentMut>().map_err(|_| {
+            anyhow::anyhow!(
+                "failed to parse config at {}; file contents were omitted",
+                crate::quote_os_path(path)
+            )
+        })?;
+        let receipt = crate::legacy_root::apply_to_document(&mut document, prefer);
+        if !receipt.changes_file() {
+            return Ok((receipt, None));
+        }
+        let backup = crate::write_legacy_root_backup(path, &original)?;
+        persist_locked(path, Some(&original), document.to_string().as_bytes())?;
+        Ok((receipt, Some(backup)))
+    })
 }
 
 /// Create a config file only if it is still absent when the shared lock is
@@ -364,7 +431,10 @@ fn persist_locked(path: &Path, original: Option<&str>, body: &[u8]) -> Result<()
         .with_context(|| format!("failed to write config at {}", crate::quote_os_path(path)))
 }
 
-fn remove_key_preserving_leading_decor(table: &mut dyn toml_edit::TableLike, key: &str) -> bool {
+pub(crate) fn remove_key_preserving_leading_decor(
+    table: &mut dyn toml_edit::TableLike,
+    key: &str,
+) -> bool {
     let mut found = false;
     let next_key = table.iter().find_map(|(candidate, _)| {
         if found {

@@ -165,9 +165,7 @@ impl App {
                 .active_provider_identity(provider)
                 .unwrap_or_else(|_| {
                     let key = config.provider_identity_for(provider);
-                    let exact_id = (!(provider == ApiProvider::Custom
-                        && config.uses_legacy_literal_custom_route()))
-                    .then(|| key.clone());
+                    let exact_id = Some(key.clone());
                     crate::config::ProviderIdentity {
                         provider,
                         key,
@@ -949,10 +947,8 @@ impl App {
             agent_activity_started_at: None,
             agent_counter: 0,
             agent_label_map: HashMap::new(),
-            workflow_agent_labels: HashMap::new(),
             agent_focus: None,
             agent_queued_follow_ups: HashMap::new(),
-            agent_role_counters: HashMap::new(),
             last_agent_progress_redraw: None,
             last_workflow_budget_redraw: None,
             ui_theme,

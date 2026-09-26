@@ -34,10 +34,12 @@ impl RouteFixture {
         let (target, target_calls, target_bodies) =
             tests::fake_chat_client_capturing("frozen route result").await;
         let mut config = Config {
-            api_key: Some("fixture-key".into()),
-            base_url: Some(parent.base_url().to_string()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(
+            Some("fixture-key".into()),
+            Some(parent.base_url().to_string()),
+        );
         config.set_provider_api_key_override(ApiProvider::Openrouter, Some("fixture-key".into()));
         config.set_provider_base_url_override(
             ApiProvider::Openrouter,

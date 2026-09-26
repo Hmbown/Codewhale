@@ -1319,6 +1319,25 @@ pub(crate) async fn apply_command_result(
     config: &mut Config,
     result: commands::CommandResult,
 ) -> Result<bool> {
+    let outcome =
+        apply_command_result_inner(terminal, app, engine_handle, task_manager, config, result)
+            .await;
+    // A save the command made may have moved legacy top-level `base_url` /
+    // `api_key` into their provider tables (#6394); say so once.
+    for notice in codewhale_config::legacy_root::take_notices() {
+        app.push_status_toast(notice, StatusToastLevel::Info, Some(10_000));
+    }
+    outcome
+}
+
+async fn apply_command_result_inner(
+    terminal: &mut AppTerminal,
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    task_manager: &SharedTaskManager,
+    config: &mut Config,
+    result: commands::CommandResult,
+) -> Result<bool> {
     // These two actions await participant inference inline on the UI event
     // loop. Waiting behind Runtime Chat's exclusive writer here would
     // deadlock: this same loop must drain the terminal projection/server
@@ -3997,7 +4016,7 @@ mod profile_snapshot_tests {
             "../../../../config/tests/fixtures/custom_models.toml"
         ))
         .expect("profile fixture");
-        config.api_key = Some("profile-snapshot-local-fixture".to_string());
+        config.set_legacy_root(Some("profile-snapshot-local-fixture".to_string()), None);
         config.default_text_model = Some(model.to_string());
         config.providers.as_mut().unwrap().deepseek.base_url = Some(base_url.to_string());
         let declaration = &mut config.custom_models.as_mut().unwrap()[0];

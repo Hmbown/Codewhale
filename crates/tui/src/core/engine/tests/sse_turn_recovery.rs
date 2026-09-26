@@ -222,11 +222,13 @@ async fn verify_next_user_turn_after_loss(failure: Failure) {
     let workspace = tempdir().unwrap();
     let config = Config {
         provider: Some("custom".to_string()),
-        api_key: Some("synthetic-loopback-key".to_string()),
-        base_url: Some(server.base_url.clone()),
         default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("synthetic-loopback-key".to_string()),
+        Some(server.base_url.clone()),
+    );
     let (engine, handle) = Engine::new(
         EngineConfig {
             max_steps: 1,

@@ -1109,6 +1109,7 @@ mod tests {
 
         let spawned = metadata(
             &Event::AgentSpawned {
+                display_name: None,
                 owner_session_id: "session-a".into(),
                 id: "agent-1".into(),
                 prompt: "PRIVATE CHILD PROMPT".into(),
@@ -1153,6 +1154,7 @@ mod tests {
 
         let complete = metadata(
             &Event::AgentComplete {
+                display_name: None,
                 owner_session_id: "session-a".into(),
                 id: "agent-1".into(),
                 result: "PRIVATE CHILD RESULT".into(),

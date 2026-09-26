@@ -4916,10 +4916,12 @@ async fn idle_subagent_delivery_releases_claim_when_route_fails_before_recording
 
     let workspace = tempdir().expect("tempdir");
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some("http://127.0.0.1:1/v1".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("test-key".to_string()),
+        Some("http://127.0.0.1:1/v1".to_string()),
+    );
     let (mut engine, _handle) =
         Engine::new(deterministic_engine_config(workspace.path()), &api_config);
     // Make the persisted exact identity structurally unresolvable. The
@@ -6043,9 +6045,9 @@ fn config_auth_error_does_not_blame_env() {
     let _guard = lock_test_env();
     let _env = ScopedDeepSeekApiKey::set("stale-env-key");
     let cfg = Config {
-        api_key: Some("fresh-config-key".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("fresh-config-key".to_string()), None);
     let (engine, _handle) = Engine::new(EngineConfig::default(), &cfg);
 
     let message =
@@ -9246,10 +9248,9 @@ async fn operate_conversation_reaches_provider_when_workers_are_disabled() {
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let engine_config = EngineConfig {
         workspace: workspace.path().to_path_buf(),
         snapshots_enabled: false,
@@ -11492,10 +11493,10 @@ async fn measure_production_mode_tool_catalogs() -> serde_json::Value {
     let _ocr = EnvVarGuard::set("CODEWHALE_LOCAL_OCR_UNAVAILABLE", "1");
 
     let api_config = Config {
-        api_key: Some("local-runtime-contract-fixture".to_string()),
         default_text_model: Some(DEFAULT_TEXT_MODEL.to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("local-runtime-contract-fixture".to_string()), None);
     let mut mode_metrics = serde_json::Map::new();
     for (mode_name, mode) in [
         ("plan", AppMode::Plan),
@@ -12297,10 +12298,9 @@ async fn deferred_tool_first_use_does_not_emit_a_retry_status() {
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let (engine, handle) = Engine::new(
         EngineConfig {
             model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
@@ -13060,10 +13060,9 @@ async fn operate_model_shell_uses_normal_approval_and_workspace_sandbox() {
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let (engine, handle) = Engine::new(
         EngineConfig {
             model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
@@ -13225,10 +13224,9 @@ async fn posture_change_during_approval_wait(
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let (engine, handle) = Engine::new(
         EngineConfig {
             model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
@@ -13439,10 +13437,9 @@ async fn full_access_subagent_handoff_keeps_model_shell_free_of_approval_prompts
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let (engine, handle) = Engine::new(
         EngineConfig {
             model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
@@ -13588,10 +13585,9 @@ async fn assert_full_access_model_tool_batch_is_blocked(
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let (engine, handle) = Engine::new(engine_config, &api_config);
     let run_task = tokio::spawn(engine.run());
 
@@ -13796,10 +13792,9 @@ async fn assert_full_access_model_tool_batch_runs(
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let (engine, handle) = Engine::new(engine_config, &api_config);
     let run_task = tokio::spawn(engine.run());
 
@@ -14064,10 +14059,9 @@ async fn auto_review_asks_the_user_and_returns_the_answer() {
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let (engine, handle) = Engine::new(
         EngineConfig {
             model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
@@ -14239,10 +14233,9 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let engine_config = EngineConfig {
         model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
         workspace: workspace.path().to_path_buf(),
@@ -14394,10 +14387,9 @@ async fn yolo_mode_does_not_prompt_for_background_shell() {
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let (engine, handle) = Engine::new(
         EngineConfig {
             model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
@@ -14533,10 +14525,9 @@ async fn yolo_mode_executes_publish_like_shell_without_prompt() {
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let (engine, handle) = Engine::new(
         EngineConfig {
             model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
@@ -14676,10 +14667,9 @@ async fn yolo_mode_does_not_prompt_for_mcp_action() {
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let (engine, handle) = Engine::new(
         EngineConfig {
             model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
@@ -15028,10 +15018,12 @@ fn plan_mode_registry_can_expose_agent_launcher_without_shell_tools() {
     let tmp = tempdir().expect("tempdir");
     let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
     let context = engine.build_tool_context(AppMode::Plan, false);
-    let client = CodewhaleClient::new(&Config {
-        api_key: Some("test-key".to_string()),
-        ..Config::default()
-    })
+    let client = CodewhaleClient::new(
+        &Config {
+            ..Config::default()
+        }
+        .with_legacy_root(Some("test-key".to_string()), None),
+    )
     .expect("stub client");
     let manager = crate::tools::subagent::new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
     let mut runtime = SubAgentRuntime::new(
@@ -15201,10 +15193,12 @@ fn mode_invariant_matrix_covers_context_catalog_subagents_and_prompt_metadata() 
             _ => panic!("{}: unexpected sandbox policy {sandbox:?}", case.name),
         }
 
-        let client = CodewhaleClient::new(&Config {
-            api_key: Some("test-key".to_string()),
-            ..Config::default()
-        })
+        let client = CodewhaleClient::new(
+            &Config {
+                ..Config::default()
+            }
+            .with_legacy_root(Some("test-key".to_string()), None),
+        )
         .expect("stub client");
         let manager =
             crate::tools::subagent::new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
@@ -16163,10 +16157,9 @@ async fn provider_request_bodies_never_carry_the_todo_list() {
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let todos = crate::tools::todo::new_shared_todo_list();
     let plan = crate::tools::plan::new_shared_plan_state();
     let work = crate::work_graph::new_shared_work_runtime(todos.clone(), plan.clone());
@@ -16545,9 +16538,10 @@ async fn same_turn_fork_carries_the_updated_todo() {
     );
 }
 
-/// U1: hosts resend the compaction config on every model or route sync. An
-/// unchanged config must not produce a status line, which used to overwrite
-/// a real error (the missing-key notice) in the footer.
+/// U1: hosts resend the compaction config on every model, route or session
+/// sync. A config whose switch did not move must not produce a status line,
+/// which used to overwrite a real error (the missing-key notice) and the
+/// "Resumed:" receipt in the footer.
 #[tokio::test]
 async fn unchanged_compaction_config_is_acknowledged_silently() {
     let tmp = tempdir().expect("tempdir");
@@ -16566,7 +16560,18 @@ async fn unchanged_compaction_config_is_acknowledged_silently() {
         })
         .await
         .expect("send unchanged config");
-    let mut changed = current;
+    // A session restore resyncs the model and window with the switch as it
+    // was: applied, but not news.
+    let mut resynced = current.clone();
+    resynced.model = format!("{}-resynced", current.model);
+    resynced.effective_context_window = Some(64_000);
+    handle
+        .send(Op::SetCompaction {
+            config: resynced.clone(),
+        })
+        .await
+        .expect("send resynced config");
+    let mut changed = resynced;
     changed.enabled = !changed.enabled;
     let expected = if changed.enabled {
         "Make room automatically: on"
@@ -16590,7 +16595,7 @@ async fn unchanged_compaction_config_is_acknowledged_silently() {
     };
     assert_eq!(
         first_status, expected,
-        "the unchanged config produced no status; only the real change did"
+        "unchanged and resynced configs produced no status; only the switch did"
     );
     drop(rx);
     run.abort();
@@ -17125,14 +17130,14 @@ async fn sync_session_projects_persisted_subagent_handoff_for_headless_restore()
 }
 
 #[tokio::test]
-async fn session_snapshot_omits_id_for_legacy_root_custom_route() {
+async fn session_snapshot_records_the_literal_custom_table_id() {
     let tmp = tempdir().expect("tempdir");
     let api_config = Config {
         provider: Some("custom".to_string()),
-        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
         default_text_model: Some("legacy-root-model".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(None, Some("http://127.0.0.1:18180/v1".to_string()));
     let config = EngineConfig {
         workspace: tmp.path().to_path_buf(),
         model: "legacy-root-model".to_string(),
@@ -17153,8 +17158,9 @@ async fn session_snapshot_omits_id_for_legacy_root_custom_route() {
         .expect("snapshot response")
         .expect("snapshot");
 
+    // The literal route is the `[providers.custom]` table since #6394.
     assert_eq!(snapshot.model_provider, "custom");
-    assert_eq!(snapshot.model_provider_id, None);
+    assert_eq!(snapshot.model_provider_id.as_deref(), Some("custom"));
     run.abort();
 }
 
@@ -17189,10 +17195,9 @@ async fn edit_last_turn_preserves_current_mode() {
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let config = EngineConfig {
         workspace: tmp.path().to_path_buf(),
         model: "deepseek-v4-pro".to_string(),
@@ -17307,10 +17312,9 @@ async fn edit_last_turn_cuts_at_user_prompt_before_tool_results() {
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let config = EngineConfig {
         workspace: tmp.path().to_path_buf(),
         model: "deepseek-v4-pro".to_string(),
@@ -17446,10 +17450,9 @@ async fn edit_last_turn_without_user_prompt_errors_and_sends_nothing() {
         .await;
 
     let api_config = Config {
-        api_key: Some("test-key".to_string()),
-        base_url: Some(server.uri()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let config = EngineConfig {
         workspace: tmp.path().to_path_buf(),
         model: "deepseek-v4-pro".to_string(),

@@ -17,15 +17,13 @@
 # `--provider fireworks`, `--provider siliconflow`, `--provider siliconflow-CN`,
 # `/provider arcee`, `/provider moonshot`, `/provider qianfan`, `/provider sglang`, `/provider vllm`,
 # `/provider ollama`, `/provider huggingface`, `/provider stepfun`, `/provider openmodel`,
-# `/provider opencode-go`, `/provider opencode-zen`, `/provider meta`, `/provider xai`) toggle without having to re-enter keys. Top-level
-# `api_key` / `base_url` are
-# still read as DeepSeek defaults when `[providers.deepseek]` is absent
-# (backward compatibility).
+# `/provider opencode-go`, `/provider opencode-zen`, `/provider meta`, `/provider xai`) toggle without having to re-enter keys. Keys and
+# endpoints live in each provider's `[providers.<name>]` table. An older
+# top-level `api_key` / `base_url` is still read: it belongs to
+# `[providers.deepseek]` (or to the vendor whose official host it names), and
+# `codewhale config migrate` moves it there in the file.
 provider = "deepseek" # deepseek | deepseek-cn | deepseek-anthropic | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | orcarouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | ollama-cloud | huggingface | modelscope | together | qianfan | openai-codex | anthropic | openmodel | deepinfra | sakana | longcat | opencode-go | opencode-zen | meta | xai | mistral | telecomjs | google | edenai | zenmux | csdn | concentrate | modelstudio-token-plan | modelstudio-coding-plan | codewhale
-api_key = "YOUR_DEEPSEEK_API_KEY" # must be non-empty
-base_url = "https://api.deepseek.com/beta"
 # provider = "deepseek-cn"                       # legacy alias (official host is still https://api.deepseek.com)
-# base_url = "https://api.deepseek.com"         # opt out of DeepSeek beta features
 # Optional custom model request headers for OpenAI-compatible gateways.
 # Authorization and Content-Type are managed by the client and cannot be overridden here.
 # http_headers = { "X-Model-Provider-Id" = "your-model-provider" }
@@ -576,8 +574,9 @@ max_subagents = 10 # optional (default 64, clamped to 1-128)
 
 # DeepSeek Platform (https://platform.deepseek.com)
 [providers.deepseek]
-# api_key = "YOUR_DEEPSEEK_API_KEY"
-# base_url = "https://api.deepseek.com/beta"
+api_key = "YOUR_DEEPSEEK_API_KEY" # must be non-empty; deepseek-cn reads it too
+base_url = "https://api.deepseek.com/beta"
+# base_url = "https://api.deepseek.com"         # opt out of DeepSeek beta features
 # model = "deepseek-v4-pro"
 # Custom DeepSeek-compatible example:
 # base_url = "https://your-provider.example/v1"
@@ -1342,19 +1341,24 @@ exponential_base = 2.0
 # Profile Example (for multiple environments)
 # ─────────────────────────────────────────────────────────────────────────────────
 # Select a profile with `deepseek --profile <name>` or `DEEPSEEK_PROFILE=<name>`.
-[profiles.work]
+# A profile's provider tables override the same fields of the base tables.
+[profiles.work.providers.deepseek]
 api_key = "WORK_DEEPSEEK_API_KEY"
 base_url = "https://api.deepseek.com/beta"
 
 [profiles.dev]
-api_key = "DEV_DEEPSEEK_API_KEY"
 allow_shell = true
+
+[profiles.dev.providers.deepseek]
+api_key = "DEV_DEEPSEEK_API_KEY"
 
 [profiles.nvidia-nim]
 provider = "nvidia-nim"
+default_text_model = "deepseek-ai/deepseek-v4-pro"
+
+[profiles.nvidia-nim.providers.nvidia_nim]
 api_key = "YOUR_NVIDIA_API_KEY"
 base_url = "https://integrate.api.nvidia.com/v1"
-default_text_model = "deepseek-ai/deepseek-v4-pro"
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Desktop Notifications (OSC 9 / BEL on long agent-turn completion)
