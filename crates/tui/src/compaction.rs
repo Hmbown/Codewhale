@@ -1932,7 +1932,7 @@ fn deliver_compaction_notice(sink: Option<&dyn CompactionNoticeSink>, message: S
 /// pass that changed something, and directly when the images already fit the
 /// byte budget but the body was refused anyway.
 fn replace_inline_images_for_retry(
-    messages: &mut Vec<Message>,
+    messages: &mut [Message],
     notice_sink: Option<&dyn CompactionNoticeSink>,
 ) -> Result<usize> {
     let replaced = crate::image_attach::replace_images_with_placeholders(

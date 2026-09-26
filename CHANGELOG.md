@@ -44,6 +44,12 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Fixed
 
+- Making room now recovers from a provider request-body limit (HTTP 413)
+  instead of failing the pass. A summary request that is refused for size
+  re-encodes the conversation's inline images smaller and retries, says so in
+  the status line while it does, and — if the request is still refused —
+  replaces the images with text notes for that one summary pass. Session
+  history keeps the real images either way.
 - `codewhale exec --auto` no longer exits 141 with no output when a child
   it writes to, such as a stdio MCP server, closes its pipe early. Headless
   exec now ignores SIGPIPE while it runs, as the interactive TUI already did,
