@@ -25,8 +25,8 @@ The shared catalog compiler applies these layers from lowest to highest:
 
 ```
 0 bundled Models.dev
-5 bundled Codewhale facts
 10 live Models.dev
+12 Codewhale corrections (applied to layers 0 and 10 as they load)
 15 verified cloud facts (optional, off by default)
 20 exact provider-owned live roster
 25 Codewhale account roster
@@ -34,6 +34,20 @@ The shared catalog compiler applies these layers from lowest to highest:
 40 user overrides
 policy DENY (final)
 ```
+
+Codewhale corrections live in `crates/config/assets/catalog_corrections.json`.
+They are field patches in the cloud-facts `ModelFact` shape, applied by the same
+patch code to every Models.dev row, offline seed and live refresh alike, so a
+correction holds on every install. Use one when an upstream fact is true but
+misleading for a Codewhale route: `pricing_withheld` (a reason) clears the price
+so the route reports it as unknown, for tiered rates, plan quota and billing
+surfaces the catalog cannot tell apart; `max_output` and the other fields patch
+limits. Every entry carries its reason. Corrections only fix rows that exist,
+never add or hide one, and signed cloud facts can still override them. A
+corrected row keeps its own source; a price a correction owns reports
+`CatalogSource::CodewhaleBundled` as its price source. Do not hand-edit the offline seed
+to hold a value back: a live refresh replaces the seed row, so the hold would
+work only offline.
 
 Cloud facts use the existing compiler and provider lake, as described in
 [`CLOUD_FACTS.md`](./CLOUD_FACTS.md). Capability provenance and price provenance
@@ -62,6 +76,7 @@ Key code:
 | Compile + provenance | `crates/config/src/catalog.rs` | Ordered sources, independent price provenance, policy deny, id normalization |
 | Provider lake merge | `crates/tui/src/provider_lake.rs` | Shared catalog projection with exact route-scoped provider authority |
 | Offline seed asset | `crates/config/assets/models_dev.bundled.json` | Compact offline fallback only (`_meta.role` says so) |
+| Codewhale corrections | `crates/config/assets/catalog_corrections.json` | Field patches applied to every Models.dev row (`crates/config/src/catalog/corrections.rs`) |
 | Validation script | `scripts/catalog_models_dev.py` | Secret-free fetch/validate dry-run (#4117) |
 | Script tests | `scripts/catalog_models_dev_test.py` | Offline shape/scrub checks |
 

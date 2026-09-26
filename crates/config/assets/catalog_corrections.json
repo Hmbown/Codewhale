@@ -1,0 +1,74 @@
+{
+  "_about": "Codewhale's corrections to Models.dev rows (#6396). Applied to the bundled seed and to live Models.dev rows alike, above both and below signed cloud facts and provider rosters, so a correction holds on every install, online or offline. Corrections only fix rows that exist: they never add or hide one. Each entry says why; a correction whose value now equals upstream is stale and should be deleted. See docs/CATALOG_REFRESH.md.",
+  "revision": "2026-09-26",
+  "providers": [
+    {
+      "provider": "deepseek",
+      "pricing_withheld": "DeepSeek bills by time of day (off-peak rates and a weekend rule). The time-aware table in crates/tui/src/pricing.rs prices these routes; one flat catalog rate would disagree with it."
+    },
+    {
+      "provider": "xai",
+      "pricing_withheld": "xAI doubles its rates once a prompt passes 200K tokens. A flat catalog rate would understate every long session."
+    },
+    {
+      "provider": "xiaomi-mimo",
+      "pricing_withheld": "Published PAYG rates apply only to sk- pay-as-you-go keys. Token Plan keys draw on quota, and the catalog cannot tell the two billing surfaces apart."
+    },
+    {
+      "provider": "modelstudio-token-plan",
+      "pricing_withheld": "Token Plan usage draws on plan quota, not per-token billing. Upstream lists a zero cost, which would read as free."
+    },
+    {
+      "provider": "modelstudio-token-plan-anthropic",
+      "pricing_withheld": "Token Plan usage draws on plan quota, not per-token billing. Upstream lists a zero cost, which would read as free."
+    },
+    {
+      "provider": "modelstudio-coding-plan",
+      "pricing_withheld": "Coding Plan usage draws on plan quota, not per-token billing. Upstream lists zero or pay-as-you-go costs, neither of which the plan charges."
+    },
+    {
+      "provider": "modelstudio-coding-plan-anthropic",
+      "pricing_withheld": "Coding Plan usage draws on plan quota, not per-token billing. Upstream lists zero or pay-as-you-go costs, neither of which the plan charges."
+    },
+    {
+      "provider": "stepfun",
+      "pricing_withheld": "The same model ids serve Step Plan quota and pay-as-you-go keys. Endpoint-scoped rates live in crates/tui/src/pricing.rs."
+    }
+  ],
+  "models": [
+    {
+      "provider": "deepseek",
+      "id": "deepseek-flash",
+      "max_output": 384000,
+      "reason": "DeepSeek publishes a 384K output limit; Models.dev lists 393216 (384 x 1024). Which one the API accepts is unverified, and the lower bound is accepted either way."
+    },
+    {
+      "provider": "deepseek",
+      "id": "deepseek-v4-flash",
+      "max_output": 384000,
+      "reason": "DeepSeek publishes a 384K output limit; Models.dev lists 393216 (384 x 1024). Which one the API accepts is unverified, and the lower bound is accepted either way."
+    },
+    {
+      "provider": "deepseek",
+      "id": "deepseek-v4-flash-vision-exp",
+      "max_output": 384000,
+      "reason": "DeepSeek publishes a 384K output limit; Models.dev lists 393216 (384 x 1024). Which one the API accepts is unverified, and the lower bound is accepted either way."
+    },
+    {
+      "provider": "deepseek",
+      "id": "deepseek-v4-pro",
+      "max_output": 384000,
+      "reason": "DeepSeek publishes a 384K output limit; Models.dev lists 393216 (384 x 1024). Which one the API accepts is unverified, and the lower bound is accepted either way."
+    },
+    {
+      "provider": "minimax",
+      "id": "MiniMax-M3",
+      "pricing_withheld": "MiniMax doubles M3 rates once a prompt passes 512K tokens. A flat catalog rate would understate long sessions."
+    },
+    {
+      "provider": "minimax-anthropic",
+      "id": "MiniMax-M3",
+      "pricing_withheld": "MiniMax doubles M3 rates once a prompt passes 512K tokens. A flat catalog rate would understate long sessions."
+    }
+  ]
+}
