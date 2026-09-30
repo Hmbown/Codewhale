@@ -491,10 +491,13 @@ fn base_source_entries(
     }
 
     if let Some(content) = project_context.instructions.as_deref() {
-        let source = project_context
-            .source_path
-            .as_ref()
-            .map_or_else(|| "project".to_string(), |p| p.display().to_string());
+        // Same helper as ProjectContext::as_system_block, so the report's
+        // source token derives from the same label the prompt shows. (The
+        // entry below still displays the absolute source path for operators;
+        // only the prompt label is relativized.)
+        let source = crate::project_context::project_instructions_source_label(
+            project_context.source_path.as_deref(),
+        );
         let mut block = format!(
             "<project_instructions source=\"{source}\">\n{content}\n</project_instructions>"
         );
