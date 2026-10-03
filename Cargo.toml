@@ -30,6 +30,7 @@ members = [
     "crates/workflow-js",
     "tests/portable-debug-diagnostics",
     "tests/portable-session",
+    "tests/portable-config-policy",
 ]
 default-members = ["crates/cli"]
 resolver = "2"

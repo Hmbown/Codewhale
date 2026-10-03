@@ -4424,13 +4424,6 @@ impl App {
         })
     }
 
-    pub fn format_cost_amount_precise(&self, amount: f64) -> String {
-        crate::pricing::format_cost_amount_precise(
-            amount,
-            self.cost_display_currency(self.cost_currency),
-        )
-    }
-
     pub(crate) fn cost_display_currency(&self, currency: CostCurrency) -> CostCurrency {
         if currency == CostCurrency::Cny
             && self.session.cost_cny_priced_turns == 0

@@ -11,6 +11,7 @@ description = "Config schema and precedence model for Codewhale"
 workspace = true
 
 [dependencies]
+codewhale-protocol = { path = "../protocol", version = "0.10.1" }
 anyhow.workspace = true
 base64 = "0.23.1"
 chrono.workspace = true

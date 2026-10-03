@@ -1463,7 +1463,10 @@ fn whole_debug_registry_matches_portable_inventory_and_exact_host_authority() {
                         debug_history,
                         debug_diff,
                         debug_undo,
+                        permissions,
+                        config_status,
                     } = bundle.contexts(capabilities).into_parts();
+                    assert!(permissions.is_none() && config_status.is_none());
                     for (name, present, capability) in [
                         ("session", session.is_some(), Caps::SESSION),
                         ("model", model.is_some(), Caps::MODEL),

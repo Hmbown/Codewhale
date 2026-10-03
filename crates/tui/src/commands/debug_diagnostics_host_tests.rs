@@ -1608,7 +1608,12 @@ mod cost_breakdown_tests {
         );
         // 0.07 + 0.14 accumulated in ring order equals the parent component's
         // accumulation, so the route line shows the whole parent spend.
-        let route_amount = app.format_cost_amount_precise(components.parent_turns);
+        let route_amount = crate::diagnostics_reports::format_cost_amount_precise(
+            components.parent_turns,
+            crate::commands::contract::to_command_currency(
+                app.cost_display_currency(app.cost_currency),
+            ),
+        );
         assert!(
             msg.contains(&format!("deepseek/deepseek-chat: {route_amount}")),
             "{msg}"

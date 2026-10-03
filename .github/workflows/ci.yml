@@ -864,6 +864,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+      - name: Check portable config policy boundary
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        shell: bash
+        run: |
+          python3 -B scripts/test_check_command_config_policy_proof.py
+          sh scripts/check-portable-config-policy.sh
       - uses: actions/setup-node@v7
         # The extension-host integration tests spawn the real bundle under
         # Node >= 22.19; CODEWHALE_EXT_HOST_TESTS below makes a missing Node a

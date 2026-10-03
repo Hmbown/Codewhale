@@ -6,8 +6,7 @@
 #[allow(clippy::module_inception)]
 pub mod config;
 mod import_claude;
-mod permissions;
-mod status;
+pub(in crate::commands) mod policy;
 
 use crate::commands::CommandResult;
 use crate::commands::traits::{Command, CommandGroup, CommandInfo, FunctionCommand};
@@ -21,13 +20,13 @@ impl CommandGroup for ConfigCommands {
         cached_command_list!(vec![
             Box::new(FunctionCommand::new(&CONFIG_INFO, run_config)),
             Box::new(FunctionCommand::new(&IMPORT_CLAUDE_INFO, run_import_claude)),
-            Box::new(FunctionCommand::new(&PERMISSIONS_INFO, run_permissions)),
+            crate::commands::config_policy_host::permissions_registration(),
             Box::new(FunctionCommand::new(&LOGIN_INFO, run_login)),
             Box::new(FunctionCommand::new(&AUTH_INFO, run_auth)),
             Box::new(FunctionCommand::new(&RAIL_INFO, run_rail)),
             Box::new(FunctionCommand::new(&PET_INFO, run_pet)),
             Box::new(FunctionCommand::new(&SETTINGS_INFO, run_settings)),
-            Box::new(FunctionCommand::new(&STATUS_INFO, run_status)),
+            crate::commands::config_policy_host::status_registration(),
             Box::new(FunctionCommand::new(&STATUSLINE_INFO, run_statusline)),
             Box::new(FunctionCommand::new(&MODE_INFO, run_mode)),
             Box::new(FunctionCommand::new(&FULLSCREEN_INFO, run_fullscreen)),
@@ -51,12 +50,6 @@ static IMPORT_CLAUDE_INFO: CommandInfo = CommandInfo {
     aliases: &["import_claude"],
     usage: "/import-claude [--apply]",
     description_id: MessageId::CmdImportClaudeDescription,
-};
-static PERMISSIONS_INFO: CommandInfo = CommandInfo {
-    name: "permissions",
-    aliases: &["permission-rules", "permission_rules"],
-    usage: "/permissions [list|remove <rule-number> [--confirm <token>]]",
-    description_id: MessageId::CmdPermissionsDescription,
 };
 static LOGIN_INFO: CommandInfo = CommandInfo {
     name: "login",
@@ -89,12 +82,6 @@ static SETTINGS_INFO: CommandInfo = CommandInfo {
     aliases: &[],
     usage: "/settings [text]",
     description_id: MessageId::CmdSettingsDescription,
-};
-static STATUS_INFO: CommandInfo = CommandInfo {
-    name: "status",
-    aliases: &[],
-    usage: "/status",
-    description_id: MessageId::CmdStatusDescription,
 };
 static STATUSLINE_INFO: CommandInfo = CommandInfo {
     name: "statusline",
@@ -154,9 +141,6 @@ fn run_config(app: &mut App, arg: Option<&str>) -> CommandResult {
 fn run_import_claude(app: &mut App, arg: Option<&str>) -> CommandResult {
     import_claude::import_claude_command(app, arg)
 }
-fn run_permissions(app: &mut App, arg: Option<&str>) -> CommandResult {
-    run_registered(app, "permissions", arg)
-}
 fn run_login(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "login", arg)
 }
@@ -171,9 +155,6 @@ fn run_pet(app: &mut App, arg: Option<&str>) -> CommandResult {
 }
 fn run_settings(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "settings", arg)
-}
-fn run_status(app: &mut App, arg: Option<&str>) -> CommandResult {
-    run_registered(app, "status", arg)
 }
 fn run_statusline(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "statusline", arg)
@@ -207,7 +188,7 @@ pub(in crate::commands) fn dispatch(
     let result = match command {
         "config" => config::config_command(app, arg),
         "permissions" | "permission-rules" | "permission_rules" => {
-            permissions::permissions_command(app, arg)
+            crate::commands::config_policy_host::permissions(app, arg)
         }
         "login" => config::login(app, arg),
         "auth" => match arg.map(str::trim) {
@@ -225,7 +206,7 @@ pub(in crate::commands) fn dispatch(
         "workbar" | "rail" | "sidebar" => config::sidebar(app, arg),
         "pet" => config::pet(app, arg),
         "settings" => config::settings_command(app, arg),
-        "status" => status::status(app),
+        "status" => crate::commands::config_policy_host::status(app, arg),
         "statusline" => config::status_line(app),
         "mode" => config::mode(app, arg),
         "fullscreen" => config::screen(app, crate::tui::app::ScreenMode::Fullscreen, arg),

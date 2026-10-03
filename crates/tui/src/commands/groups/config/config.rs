@@ -63,7 +63,7 @@ pub fn config_command(app: &mut App, arg: Option<&str>) -> CommandResult {
     let first_word = raw_words.next();
     if first_word.is_some_and(is_ask_rules_config_token) {
         let rest = raw_words.next().unwrap_or("").trim();
-        return super::permissions::permissions_command(app, Some(rest));
+        return crate::commands::config_policy_host::permissions(app, Some(rest));
     }
     if first_word.is_some_and(|token| {
         token.eq_ignore_ascii_case("workflow") || token.eq_ignore_ascii_case("goal")

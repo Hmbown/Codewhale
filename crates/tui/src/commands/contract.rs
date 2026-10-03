@@ -14,7 +14,7 @@
 //!
 //! ## Authoritative host-proxy design (D1)
 //!
-//! `CommandContexts` has twenty-two independently optional facet slots, all
+//! `CommandContexts` has twenty-five independently optional facet slots, all
 //! constructed here. The diagnostics adapter joins the host bundle in FEAT-029. Important behavior (mode transitions, model
 //! invalidation, cost accounting, skill refresh) is authoritative on `App`. The adapters therefore share a
 //! synchronous TUI-owned host proxy. Each trait call borrows `App` only for the
@@ -31,9 +31,14 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+pub(in crate::commands) mod config_policy;
+#[cfg(test)]
+mod config_policy_baseline;
+use config_policy::{ConfigStatusAdapter, PermissionsAdapter};
 mod debug_diagnostics;
 pub(in crate::commands) mod debug_operations;
 use debug_operations::DebugOperationsAdapter;
+mod config_policy_messages;
 mod diagnostics_messages;
 #[cfg(test)]
 pub(crate) use debug_diagnostics::CostComponents as DebugCostComponents;
@@ -2053,6 +2058,7 @@ impl CommandPresentationContext for PresentationAdapter<'_> {
             .or_else(|| key_to_plugin_message_id(key))
             .or_else(|| key_to_session_message_id(key))
             .or_else(|| diagnostics_messages::resolve(key))
+            .or_else(|| config_policy_messages::resolve(key))
         else {
             return Err("unknown translation key".to_string());
         };
@@ -4417,7 +4423,7 @@ fn default_codewhale_tools_dir() -> Option<PathBuf> {
 // Envelope construction (D1)
 // ---------------------------------------------------------------------------
 
-/// Owns twenty-three facet objects sharing one synchronous TUI host proxy.
+/// Owns twenty-five facet objects sharing one synchronous TUI host proxy.
 ///
 /// Handlers borrow only these adapters. Every method delegates to the real App
 /// authority and releases its `RefCell` borrow before returning, so facets can
@@ -4446,6 +4452,8 @@ pub(crate) struct CommandContextBundle<'a> {
     debug_diff: DebugOperationsAdapter<'a>,
     debug_undo: DebugOperationsAdapter<'a>,
     debug_diagnostics: DebugDiagnosticsAdapter<'a>,
+    permissions: PermissionsAdapter<'a>,
+    config_status: ConfigStatusAdapter<'a>,
 }
 
 impl<'a> CommandContextBundle<'a> {
@@ -4521,6 +4529,12 @@ impl<'a> CommandContextBundle<'a> {
         if capabilities.contains(CommandCapabilities::DEBUG_DIAGNOSTICS) {
             contexts = contexts.with_debug_diagnostics(&mut self.debug_diagnostics);
         }
+        if capabilities.contains(CommandCapabilities::PERMISSIONS) {
+            contexts = contexts.with_permissions(&mut self.permissions);
+        }
+        if capabilities.contains(CommandCapabilities::CONFIG_STATUS) {
+            contexts = contexts.with_config_status(&mut self.config_status);
+        }
         contexts
     }
 
@@ -4549,7 +4563,9 @@ impl<'a> CommandContextBundle<'a> {
             .union(CommandCapabilities::DEBUG_HISTORY)
             .union(CommandCapabilities::DEBUG_DIFF)
             .union(CommandCapabilities::DEBUG_UNDO)
-            .union(CommandCapabilities::DEBUG_DIAGNOSTICS);
+            .union(CommandCapabilities::DEBUG_DIAGNOSTICS)
+            .union(CommandCapabilities::PERMISSIONS)
+            .union(CommandCapabilities::CONFIG_STATUS);
         self.contexts(all_test_capabilities).into_parts()
     }
 }
@@ -4584,7 +4600,9 @@ impl App {
             debug_history: DebugOperationsAdapter { host: host.clone() },
             debug_diff: DebugOperationsAdapter { host: host.clone() },
             debug_undo: DebugOperationsAdapter { host: host.clone() },
-            debug_diagnostics: DebugDiagnosticsAdapter { host },
+            debug_diagnostics: DebugDiagnosticsAdapter { host: host.clone() },
+            permissions: PermissionsAdapter { host: host.clone() },
+            config_status: ConfigStatusAdapter { host },
         }
     }
 }

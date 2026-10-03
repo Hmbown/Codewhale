@@ -5,6 +5,8 @@
 //! `codewhale-tui` one command group at a time. Only after every group uses
 //! these shapes will groups move physically into a commands crate.
 
+pub use crate::config_policy::{CommandConfigStatusContext, CommandPermissionsContext};
+
 use std::path::{Path, PathBuf};
 
 mod session_structcopy;

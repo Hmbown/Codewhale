@@ -6,6 +6,7 @@
 //! module keeps registry construction, user-command precedence, and the
 //! fall-through behaviour.
 
+mod config_policy_host;
 mod contract;
 pub mod discovery;
 mod groups;
@@ -2103,6 +2104,9 @@ mod tests {
             "export",
             // FEAT-026 completes the session structural-copy slice.
             "structcopy",
+            // FEAT-027 config policy/status slice; remaining config stays legacy.
+            "permissions",
+            "status",
             // FEAT-029 complete debug group, including receipts and mutation.
             "tokens",
             "cost",
@@ -3101,3 +3105,10 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod config_policy_host_tests;
+#[cfg(test)]
+mod config_policy_permissions_tests;
+#[cfg(test)]
+mod config_policy_status_tests;

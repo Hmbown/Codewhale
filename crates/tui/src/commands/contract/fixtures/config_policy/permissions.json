@@ -1,0 +1,67 @@
+[
+  {
+    "message": "Permission rules\nSource: active user permissions.toml\nPath: \"<WORKSPACE>/permissions.toml\"\nFile status: missing\nRule count: 0\nNo permission rules configured.\n\nAccess now: Ask\nAsk: tool calls that change authority, cost, scope, or outcome open a prompt; proven-safe read-only calls run without one. Ask rules above always force a prompt.\nDecisions made without a prompt (Auto-Review guardian verdicts, blocks, and holds) appear as transcript notes and in the audit log at \"<TEST_AUDIT_LOG>\". Full Access is chosen deliberately with Shift+Tab or /config, never by a rule.",
+    "error": false,
+    "action": "None"
+  },
+  {
+    "message": "Permission rules\nSource: active user permissions.toml\nPath: \"<WORKSPACE>/permissions.toml\"\nFile status: empty\nRule count: 0\nNo permission rules configured.\n\nAccess now: Ask\nAsk: tool calls that change authority, cost, scope, or outcome open a prompt; proven-safe read-only calls run without one. Ask rules above always force a prompt.\nDecisions made without a prompt (Auto-Review guardian verdicts, blocks, and holds) appear as transcript notes and in the audit log at \"<TEST_AUDIT_LOG>\". Full Access is chosen deliberately with Shift+Tab or /config, never by a rule.",
+    "error": false,
+    "action": "None"
+  },
+  {
+    "message": "Permission rules\nSource: active user permissions.toml\nPath: \"<WORKSPACE>/permissions.toml\"\nFile status: present\nRule count: 2\n\n#1 | allow | exec_shell\n  Effective match: exact command `cargo test`\n  Scope: global — active in this workspace\n\n#2 | deny | edit_file\n  Effective match: exact normalized path `src/lib.rs`\n  Scope: global — active in this workspace\n\nAccess now: Ask\nAsk: tool calls that change authority, cost, scope, or outcome open a prompt; proven-safe read-only calls run without one. Ask rules above always force a prompt.\nDecisions made without a prompt (Auto-Review guardian verdicts, blocks, and holds) appear as transcript notes and in the audit log at \"<TEST_AUDIT_LOG>\". Full Access is chosen deliberately with Shift+Tab or /config, never by a rule.",
+    "error": false,
+    "action": "None"
+  },
+  {
+    "message": "Error: Usage: /permissions [list|remove <rule-number> [--confirm <token>]]",
+    "error": true,
+    "action": "None"
+  },
+  {
+    "message": "Error: Usage: /permissions [list|remove <rule-number> [--confirm <token>]]",
+    "error": true,
+    "action": "None"
+  },
+  {
+    "message": "Error: Usage: /permissions [list|remove <rule-number> [--confirm <token>]]",
+    "error": true,
+    "action": "None"
+  },
+  {
+    "message": "Error: Permission rule #0 was not found; run `/permissions list` again.",
+    "error": true,
+    "action": "None"
+  },
+  {
+    "message": "Error: Permission rule #99 was not found; run `/permissions list` again.",
+    "error": true,
+    "action": "None"
+  },
+  {
+    "message": "Error: Usage: /permissions [list|remove <rule-number> [--confirm <token>]]",
+    "error": true,
+    "action": "None"
+  },
+  {
+    "message": "Error: Usage: /permissions [list|remove <rule-number> [--confirm <token>]]",
+    "error": true,
+    "action": "None"
+  },
+  {
+    "message": "Review removal of rule #1:\n#1 | allow | exec_shell\n  Effective match: exact command `cargo test`\n  Scope: global — active in this workspace\n\nRun `/permissions remove 1 --confirm <CONFIRM_TOKEN>` to confirm. This command expires if permissions.toml changes.",
+    "error": false,
+    "action": "None"
+  },
+  {
+    "message": "Error: Could not read or change permission rules: permissions changed after they were listed; reload \"<WORKSPACE>/permissions.toml\" and retry",
+    "error": true,
+    "action": "None"
+  },
+  {
+    "message": "Removed permission rule #1: allow exec_shell.",
+    "error": false,
+    "action": "Some(PermissionRulesChanged)"
+  }
+]

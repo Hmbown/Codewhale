@@ -98,3 +98,11 @@ pub enum SessionRemoteControlAction {
 }
 
 pub type SessionCommandResult = CommandResult<SessionAction>;
+
+/// Only permission removal can request a host action in the config policy slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigPolicyAction {
+    PermissionRulesChanged,
+}
+pub type ConfigPolicyCommandResult = CommandResult<ConfigPolicyAction>;
+pub type ConfigStatusCommandResult = CommandResult<std::convert::Infallible>;

@@ -3523,6 +3523,8 @@ fn structcopy_capability_preserves_all_published_identities() {
         CommandCapabilities::DEBUG_DIFF,
         CommandCapabilities::DEBUG_UNDO,
         CommandCapabilities::SESSION_STRUCTCOPY,
+        CommandCapabilities::PERMISSIONS,
+        CommandCapabilities::CONFIG_STATUS,
     ];
     let exact = CommandCapabilities::SESSION_STRUCTCOPY | CommandCapabilities::PRESENTATION;
     for (index, capability) in capabilities.into_iter().enumerate() {
@@ -3564,6 +3566,8 @@ fn structcopy_slot_is_optional_and_does_not_grant_other_authority() {
         debug_diff,
         debug_undo,
         debug_diagnostics,
+        permissions,
+        config_status,
     } = CommandContexts::empty()
         .with_structcopy(&mut fixture)
         .with_presentation(&mut presentation)
@@ -3606,6 +3610,8 @@ fn structcopy_slot_is_optional_and_does_not_grant_other_authority() {
         debug_diff.is_some(),
         debug_undo.is_some(),
         debug_diagnostics.is_some(),
+        permissions.is_some(),
+        config_status.is_some(),
     ] {
         assert!(!present);
     }
@@ -3691,4 +3697,105 @@ fn structcopy_known_projection_fields_preserve_nulls_and_omission_rules() {
     assert_eq!(parsed.usage.as_ref().unwrap().input_tokens, Some(0));
     assert_eq!(parsed.usage.as_ref().unwrap().output_tokens, None);
     assert_eq!(serde_json::to_value(parsed).unwrap(), workflow);
+}
+
+#[test]
+fn config_policy_authorities_append_without_widening_each_other() {
+    assert_eq!(
+        CommandCapabilities::SESSION_STRUCTCOPY.bits_for_test(),
+        1 << 22
+    );
+    assert_eq!(CommandCapabilities::PERMISSIONS.bits_for_test(), 1 << 23);
+    assert_eq!(CommandCapabilities::CONFIG_STATUS.bits_for_test(), 1 << 24);
+    let permissions = CommandCapabilities::PERMISSIONS | CommandCapabilities::PRESENTATION;
+    let status = CommandCapabilities::CONFIG_STATUS | CommandCapabilities::PRESENTATION;
+    assert!(!permissions.contains(CommandCapabilities::CONFIG_STATUS));
+    assert!(!status.contains(CommandCapabilities::PERMISSIONS));
+    for caps in [permissions, status] {
+        assert!(caps.contains(CommandCapabilities::PRESENTATION));
+        assert!(!caps.contains(CommandCapabilities::MODE_POLICY));
+        assert!(!caps.contains(CommandCapabilities::SESSION));
+        assert!(!caps.contains(CommandCapabilities::WORKSPACE));
+        assert!(!caps.contains(CommandCapabilities::NONE));
+    }
+    let empty = CommandContexts::empty().into_parts();
+    assert!(empty.permissions.is_none());
+    assert!(empty.config_status.is_none());
+}
+
+#[test]
+fn permission_facet_is_object_safe_and_keeps_removal_token_with_rule() {
+    use crate::config_policy::*;
+    struct Permissions;
+    impl CommandPermissionsContext for Permissions {
+        fn snapshot(&self) -> Result<PermissionsView, String> {
+            Ok(PermissionsView {
+                path: PathBuf::from("permissions.toml"),
+                file_state: CommandPermissionsFileState::Present,
+                rules: vec![PermissionRule {
+                    action: CommandPermissionAction::Ask,
+                    tool: "exec_shell".into(),
+                    command: Some("cargo test".into()),
+                    command_exact: true,
+                    path: None,
+                    workspace: None,
+                    applies_here: true,
+                    removal_token: "opaque-token".into(),
+                }],
+                approval_mode: CommandApprovalMode::Suggest,
+                audit_path: None,
+            })
+        }
+        fn remove_rule(
+            &mut self,
+            index: usize,
+            expected_token: &str,
+        ) -> Result<RemovedPermissionRule, String> {
+            if index != 0 || expected_token != "opaque-token" {
+                return Err("stale".into());
+            }
+            Ok(RemovedPermissionRule {
+                action: CommandPermissionAction::Ask,
+                tool: "exec_shell".into(),
+            })
+        }
+    }
+    let mut fixture = Permissions;
+    let parts = CommandContexts::empty()
+        .with_permissions(&mut fixture)
+        .into_parts();
+    assert!(parts.config_status.is_none());
+    assert!(parts.mode_policy.is_none());
+    assert!(parts.session.is_none());
+    let facet = parts.permissions.unwrap();
+    let view = facet.snapshot().unwrap();
+    assert_eq!(view.rules[0].removal_token, "opaque-token");
+    assert_eq!(facet.remove_rule(0, "wrong"), Err("stale".into()));
+    assert_eq!(
+        facet
+            .remove_rule(0, &view.rules[0].removal_token)
+            .unwrap()
+            .tool,
+        "exec_shell"
+    );
+}
+
+#[test]
+fn status_facet_is_object_safe_and_construction_never_observes_or_grants_mutation() {
+    struct Status;
+    impl CommandConfigStatusContext for Status {
+        fn snapshot(&self) -> crate::config_policy::ConfigStatusView {
+            panic!("envelope construction must not observe status")
+        }
+    }
+    let mut status = Status;
+    let parts = CommandContexts::empty()
+        .with_config_status(&mut status)
+        .into_parts();
+    assert!(parts.config_status.is_some());
+    assert!(parts.permissions.is_none());
+    assert!(parts.presentation.is_none());
+    assert!(parts.mode_policy.is_none());
+    assert!(parts.session.is_none());
+    assert!(parts.workspace.is_none());
 }

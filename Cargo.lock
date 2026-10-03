@@ -887,6 +887,7 @@ dependencies = [
  "chrono",
  "codewhale-execpolicy",
  "codewhale-paths",
+ "codewhale-protocol",
  "codewhale-secrets",
  "fd-lock",
  "libc",
@@ -1034,6 +1035,15 @@ name = "codewhale-paths"
 version = "0.10.1"
 dependencies = [
  "dirs 7.0.0",
+]
+
+[[package]]
+name = "codewhale-portable-config-policy"
+version = "0.10.1"
+dependencies = [
+ "codewhale-command-contract",
+ "codewhale-protocol",
+ "serde_json",
 ]
 
 [[package]]

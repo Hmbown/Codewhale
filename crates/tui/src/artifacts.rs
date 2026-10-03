@@ -293,18 +293,7 @@ pub fn format_artifact_relative_path(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
 
-#[must_use]
-pub fn format_byte_size(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    if bytes >= MIB {
-        format!("{} MB", bytes.div_ceil(MIB))
-    } else if bytes >= KIB {
-        format!("{} KB", bytes.div_ceil(KIB))
-    } else {
-        format!("{bytes} B")
-    }
-}
+pub use codewhale_protocol::display::format_byte_size;
 
 #[cfg(test)]
 mod tests {

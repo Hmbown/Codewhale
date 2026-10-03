@@ -2778,16 +2778,6 @@ pub fn format_cost_amount(cost: f64, currency: CostCurrency) -> String {
     }
 }
 
-/// Format a cost amount for detailed reports in the chosen currency.
-#[must_use]
-pub fn format_cost_amount_precise(cost: f64, currency: CostCurrency) -> String {
-    let selected = match currency {
-        CostCurrency::Usd => codewhale_command_contract::types::CommandCurrency::Usd,
-        CostCurrency::Cny => codewhale_command_contract::types::CommandCurrency::Cny,
-    };
-    crate::diagnostics_reports::format_cost_amount_precise(cost, selected)
-}
-
 /// Format a dual-currency estimate using the selected display currency.
 #[must_use]
 pub fn format_cost_estimate(estimate: CostEstimate, currency: CostCurrency) -> String {
@@ -5192,19 +5182,31 @@ mod tests {
     #[test]
     fn format_cost_amount_precise_keeps_report_precision() {
         assert_eq!(
-            format_cost_amount_precise(0.1234, CostCurrency::Usd),
+            crate::diagnostics_reports::format_cost_amount_precise(
+                0.1234,
+                codewhale_command_contract::types::CommandCurrency::Usd
+            ),
             "$0.1234"
         );
         assert_eq!(
-            format_cost_amount_precise(0.1234, CostCurrency::Cny),
+            crate::diagnostics_reports::format_cost_amount_precise(
+                0.1234,
+                codewhale_command_contract::types::CommandCurrency::Cny
+            ),
             "¥0.1234"
         );
         assert_eq!(
-            format_cost_amount_precise(0.0, CostCurrency::Usd),
+            crate::diagnostics_reports::format_cost_amount_precise(
+                0.0,
+                codewhale_command_contract::types::CommandCurrency::Usd
+            ),
             "$0.0000"
         );
         assert_eq!(
-            format_cost_amount_precise(0.00001, CostCurrency::Usd),
+            crate::diagnostics_reports::format_cost_amount_precise(
+                0.00001,
+                codewhale_command_contract::types::CommandCurrency::Usd
+            ),
             "<$0.0001"
         );
     }

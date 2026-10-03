@@ -51,6 +51,7 @@ hooks             cargo test -p codewhale-hooks --lib --locked
 lane              cargo test -p codewhale-lane --lib --locked
 mcp               cargo test -p codewhale-mcp --lib --locked
 paths             cargo test -p codewhale-paths --lib --locked
+portable-config-policy cargo test -p codewhale-portable-config-policy --lib --locked
 protocol          cargo test -p codewhale-protocol --lib --locked
 release           cargo test -p codewhale-release --lib --locked
 runtime           cargo test -p codewhale-runtime --lib --locked
@@ -109,6 +110,9 @@ if [ -e "$area" ] || printf '%s' "$area" | grep -q /; then
   rel=${area#./}
   extra=
   case $rel in
+    tests/portable-config-policy/*|tests/portable-config-policy)
+      area=portable-config-policy
+      ;;
     crates/tui/tests/integration/*)
       area=tui-integration
       extra=$(basename "$rel" .rs)
@@ -181,6 +185,7 @@ case $area in
   lane) pkg=codewhale-lane ;;
   mcp) pkg=codewhale-mcp ;;
   paths) pkg=codewhale-paths ;;
+  portable-config-policy) pkg=codewhale-portable-config-policy ;;
   protocol) pkg=codewhale-protocol ;;
   release) pkg=codewhale-release ;;
   runtime) pkg=codewhale-runtime ;;

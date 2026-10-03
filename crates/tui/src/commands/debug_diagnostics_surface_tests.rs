@@ -251,7 +251,10 @@ fn diagnostics_registrations_expose_exact_facets_and_preview_is_pure() {
                         debug_diff,
                         debug_undo,
                         debug_diagnostics,
+                        permissions,
+                        config_status,
                     } = parts;
+                    assert!(permissions.is_none() && config_status.is_none());
                     assert!(debug_diagnostics.is_some(), "/{spelling} needs diagnostics");
                     assert_eq!(
                         presentation.is_some(),
