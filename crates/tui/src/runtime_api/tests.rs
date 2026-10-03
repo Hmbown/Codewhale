@@ -20070,6 +20070,312 @@ async fn turn_artifact_routes_list_and_read_by_reference() -> Result<()> {
     Ok(())
 }
 
+/// One tool call's changes, read from the workspace restore points the engine
+/// recorded around it: a shell command's own writes belong to that command,
+/// every path and revision comes from the span's own two trees rather than
+/// from the work tree as it is now, and a call the engine never bounded — or
+/// whose closing snapshot was lost — says so instead of handing back an empty
+/// list that would read as "this call changed nothing".
+#[tokio::test]
+async fn call_change_route_reads_one_calls_workspace_span() -> Result<()> {
+    if git_missing() {
+        return Ok(());
+    }
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("home"));
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join("kept.md"), "kept\n")?;
+    let rev = |bytes: &[u8]| crate::hashing::sha256_hex(bytes);
+    // The model endpoint's own id for the call, verbatim: the shape a gateway
+    // really hands back, `|` and all. A record-id charset check would refuse it
+    // and answer "no such call" for a call the turn plainly recorded, so this
+    // literal is the regression this test exists for.
+    const SHELL_CALL: &str =
+        "call_01_f3d82rL5aT1NDbpsh4w63727|f8912d4c-2f79-46eb-91d4-9ed4998156f9";
+    // A call whose receipts survived while the trees they name did not: the
+    // side repo keeps only its newest snapshots, so an older turn's span is
+    // regularly unreachable.
+    const PRUNED_CALL: &str = "call_00_prunedForTest";
+    // A call on a workspace whose snapshot store does not exist at all: the
+    // receipts survived, the whole store did not.
+    const STORELESS_CALL: &str = "call_00_storelessForTest";
+
+    let (addr, runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("call-changes-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("call change test requires a loopback listener")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace.clone()),
+            ..Default::default()
+        })
+        .await?;
+
+    // The call's own span: its `tool:` receipt before the command ran and its
+    // `post-tool` partner after. `out.md` is the command's own write;
+    // `script.py` is a path it modified. Afterwards the work tree moves on
+    // again — the route must report the span, not what is on disk now.
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    fs::write(workspace.join("script.py"), "print('v1')\n")?;
+    let tool = repo.take_snapshot(&format!("tool:{SHELL_CALL}"), Some(&thread.id))?;
+    fs::write(workspace.join("out.md"), "written by the command\n")?;
+    fs::write(workspace.join("script.py"), "print('v2')\n")?;
+    let post_tool = repo.take_snapshot(&format!("post-tool:{SHELL_CALL}"), Some(&thread.id))?;
+    fs::write(workspace.join("out.md"), "edited long after the call\n")?;
+    fs::write(workspace.join("after.md"), "after the span\n")?;
+
+    // A second thread on its own workspace, which never had a snapshot store.
+    let storeless_workspace = tmp.path().join("storeless-workspace");
+    fs::create_dir_all(&storeless_workspace)?;
+    let storeless_thread = runtime_threads
+        .create_thread(CreateThreadRequest {
+            workspace: Some(storeless_workspace),
+            ..Default::default()
+        })
+        .await?;
+
+    let store = runtime_threads.test_store();
+    let shell_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_shell", "turn_id": "turn_call_changes", "kind": "command_execution",
+        "status": "completed", "summary": "exec_shell started",
+        "metadata": { "tool_use_id": SHELL_CALL, "tool_name": "exec_shell" },
+    }))?;
+    store.save_item(&shell_item)?;
+    // A call the engine judged read-only: the turn has its item, and no
+    // restore point was ever taken for it.
+    let read_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_read", "turn_id": "turn_call_changes", "kind": "command_execution",
+        "status": "completed", "summary": "exec_shell started",
+        "metadata": { "tool_use_id": "call_read", "tool_name": "exec_shell" },
+    }))?;
+    store.save_item(&read_item)?;
+    let pruned_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_pruned", "turn_id": "turn_call_changes", "kind": "command_execution",
+        "status": "completed", "summary": "bash started",
+        "metadata": { "tool_use_id": PRUNED_CALL, "tool_name": "bash" },
+    }))?;
+    store.save_item(&pruned_item)?;
+    // A call whose closing snapshot was lost: the opening receipt is recorded
+    // and the span will never resolve.
+    let half_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_half", "turn_id": "turn_call_half", "kind": "command_execution",
+        "status": "completed", "summary": "exec_shell started",
+        "metadata": { "tool_use_id": "call_half", "tool_name": "exec_shell" },
+    }))?;
+    store.save_item(&half_item)?;
+    let storeless_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_storeless", "turn_id": "turn_storeless", "kind": "command_execution",
+        "status": "completed", "summary": "bash started",
+        "metadata": { "tool_use_id": STORELESS_CALL, "tool_name": "bash" },
+    }))?;
+    store.save_item(&storeless_item)?;
+
+    let turn: TurnRecord = serde_json::from_value(json!({
+        "id": "turn_call_changes", "thread_id": thread.id, "status": "completed",
+        "input_summary": "run the script", "created_at": Utc::now(),
+        "item_ids": ["item_shell", "item_read", "item_pruned"],
+        "workspace_snapshots": [
+            {
+                "kind": "tool", "snapshot_id": tool.id.as_str(), "tree_id": tool.tree.as_str(),
+                "session_id": thread.id, "tool_call_id": SHELL_CALL,
+                "write_paths": null,
+            },
+            {
+                "kind": "post_tool", "snapshot_id": post_tool.id.as_str(),
+                "tree_id": post_tool.tree.as_str(), "session_id": thread.id,
+                "tool_call_id": SHELL_CALL, "changed_paths": ["out.md", "script.py"],
+            },
+            {
+                "kind": "tool", "snapshot_id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "tree_id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "session_id": thread.id, "tool_call_id": PRUNED_CALL,
+            },
+            {
+                "kind": "post_tool", "snapshot_id": "feedfacefeedfacefeedfacefeedfacefeedface",
+                "tree_id": "feedfacefeedfacefeedfacefeedfacefeedface",
+                "session_id": thread.id, "tool_call_id": PRUNED_CALL,
+                "changed_paths": ["gone.txt"],
+            },
+        ],
+        "workspace": { "state": "settled" },
+    }))?;
+    store.save_turn(&turn)?;
+    let half_turn: TurnRecord = serde_json::from_value(json!({
+        "id": "turn_call_half", "thread_id": thread.id, "status": "completed",
+        "input_summary": "run the script", "created_at": Utc::now(),
+        "item_ids": ["item_half"],
+        "workspace_snapshots": [{
+            "kind": "tool", "snapshot_id": tool.id.as_str(), "tree_id": tool.tree.as_str(),
+            "session_id": thread.id, "tool_call_id": "call_half",
+        }],
+        "workspace": { "state": "unavailable", "reason": "snapshot_failed" },
+    }))?;
+    store.save_turn(&half_turn)?;
+    // The same pair of receipts, on a workspace whose store is gone rather
+    // than merely pruned: one answer, not an internal error.
+    let storeless_turn: TurnRecord = serde_json::from_value(json!({
+        "id": "turn_storeless", "thread_id": storeless_thread.id, "status": "completed",
+        "input_summary": "run the script", "created_at": Utc::now(),
+        "item_ids": ["item_storeless"],
+        "workspace_snapshots": [
+            {
+                "kind": "tool", "snapshot_id": "aa".repeat(20), "tree_id": "aa".repeat(20),
+                "session_id": storeless_thread.id, "tool_call_id": STORELESS_CALL,
+            },
+            {
+                "kind": "post_tool", "snapshot_id": "bb".repeat(20), "tree_id": "bb".repeat(20),
+                "session_id": storeless_thread.id, "tool_call_id": STORELESS_CALL,
+                "changed_paths": ["gone.txt"],
+            },
+        ],
+        "workspace": { "state": "settled" },
+    }))?;
+    store.save_turn(&storeless_turn)?;
+
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+    let url = |thread_id: &str, turn_id: &str, call: &str| {
+        format!("{base}/v1/threads/{thread_id}/turns/{turn_id}/calls/{call}/changes")
+    };
+    let get = |thread_id: &str,
+               turn_id: &str,
+               call: &str|
+     -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value>> + Send + '_>,
+    > {
+        let client = client.clone();
+        let url = url(thread_id, turn_id, call);
+        Box::pin(async move {
+            Ok(client
+                .get(url)
+                .bearer_auth("call-changes-token")
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?)
+        })
+    };
+
+    let body = get(&thread.id, "turn_call_changes", SHELL_CALL).await?;
+    assert_eq!(body["state"], "captured");
+    assert_eq!(body["reason"], Value::Null);
+    assert_eq!(body["tool_name"], "exec_shell");
+    assert_eq!(body["truncated"], false);
+    let files = body["files"].as_array().expect("files");
+    let paths: Vec<&str> = files
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        ["out.md", "script.py"],
+        "the span's own paths, in git's order: {files:?}"
+    );
+
+    let created = &files[0];
+    assert_eq!(created["change"], "created");
+    assert_eq!(created["added"], 1);
+    assert_eq!(created["removed"], 0);
+    // The span's end, not the work tree's newer bytes.
+    assert_eq!(created["revision"], rev(b"written by the command\n"));
+    assert_eq!(created["size"].as_u64(), Some(23));
+    assert_eq!(
+        created["restore_snapshot_id"],
+        tool.tree.as_str(),
+        "the revert point is the call's own `tool:` receipt"
+    );
+    assert!(
+        created["diff"]
+            .as_str()
+            .unwrap()
+            .contains("+written by the command"),
+        "{}",
+        created["diff"]
+    );
+    assert_eq!(created["diff_truncated"], false);
+
+    let modified = &files[1];
+    assert_eq!(modified["change"], "updated");
+    assert_eq!(modified["added"], 1);
+    assert_eq!(modified["removed"], 1);
+    let patch = modified["diff"].as_str().unwrap();
+    assert!(patch.contains("-print('v1')"), "{patch}");
+    assert!(patch.contains("+print('v2')"), "{patch}");
+    assert!(
+        !body.to_string().contains("after.md"),
+        "a write after the span is not the call's: {body}"
+    );
+
+    // A call the turn recorded but the engine never bounded: known, and not
+    // reported as "changed nothing".
+    let unbounded = get(&thread.id, "turn_call_changes", "call_read").await?;
+    assert_eq!(unbounded["state"], "unavailable");
+    assert_eq!(unbounded["reason"], "call_not_bounded");
+    assert_eq!(unbounded["files"].as_array().unwrap().len(), 0);
+
+    // A span whose trees have been pruned is a fact about the store, not a
+    // failure of the read: the receipt's own path list is what a client keeps.
+    let pruned = get(&thread.id, "turn_call_changes", PRUNED_CALL).await?;
+    assert_eq!(pruned["state"], "unavailable");
+    assert_eq!(pruned["reason"], "snapshots_pruned");
+    assert_eq!(pruned["files"].as_array().unwrap().len(), 0);
+
+    // A workspace with no snapshot store at all answers the same way: the
+    // receipts cannot be resolved, and that is not a server failure.
+    let storeless: Value = client
+        .get(url(&storeless_thread.id, "turn_storeless", STORELESS_CALL))
+        .bearer_auth("call-changes-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(storeless["state"], "unavailable");
+    assert_eq!(storeless["reason"], "snapshots_pruned");
+
+    // A span whose closing receipt is gone will never resolve, and says why.
+    let half = get(&thread.id, "turn_call_half", "call_half").await?;
+    assert_eq!(half["state"], "unavailable");
+    assert_eq!(half["reason"], "post_snapshot_missing");
+
+    // A call this turn never ran, an unknown turn, and a turn of another
+    // thread are 404s rather than empty answers.
+    for (turn_id, call) in [
+        ("turn_call_changes", "call_never"),
+        ("turn_missing", "call_shell"),
+        ("turn_call_half", "call_shell"),
+    ] {
+        let status = client
+            .get(url(&thread.id, turn_id, call))
+            .bearer_auth("call-changes-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, StatusCode::NOT_FOUND, "{turn_id}/{call}");
+    }
+    let status = client
+        .get(format!(
+            "{}?limit=0",
+            url(&thread.id, "turn_call_changes", SHELL_CALL)
+        ))
+        .bearer_auth("call-changes-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    handle.abort();
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // /v1/jobs: client-owned shell jobs on the thread's shared ShellManager.
 // ---------------------------------------------------------------------------

@@ -271,6 +271,63 @@ Routes:
   - A `tool_output` or `media` reference is read under the session artifact
     root the writer used. The same confinement, image-manifest and integrity
     checks apply as for the session route.
+- `GET /v1/threads/{id}/turns/{turn_id}/calls/{tool_call_id}/changes?limit=`
+  returns what **one** tool call changed, read from the same two restore
+  points the engine recorded around it (the call's `tool:` receipt and its
+  `post-tool:` partner on this turn):
+
+  ```json
+  {
+    "thread_id": "thr_1a2b3c4d", "turn_id": "turn_…", "tool_call_id": "call_…",
+    "tool_name": "exec_shell",
+    "state": "captured", "reason": null, "truncated": false,
+    "files": [
+      {
+        "path": "out/result.json", "change": "created",
+        "added": 12, "removed": 0, "size": 210, "revision": "<sha256 hex>",
+        "restore_snapshot_id": "<pre tree id>",
+        "diff": "@@ -0,0 +1,12 @@\n+{}\n", "diff_truncated": false
+      }
+    ]
+  }
+  ```
+
+  - This is the per-call counterpart of the turn aggregate, and the only
+    surface on which a **shell command's own writes** are attributable to that
+    command: a command produces no `metadata.mutation`, so nothing else names
+    what it wrote. The files a file tool changed are here too, read from the
+    same span.
+  - `change` is `created`, `updated` or `deleted` (git's `A`/`M`/`D`, with a
+    type change read as `updated`; the diff runs with `--no-renames`, so a move
+    is a delete plus a create). `added`/`removed` are `null` for a binary path.
+  - `size` and `revision` are the span's **end**, never the work tree as it is
+    now, so a client's `expected_hash` is the revision that change produced.
+    Both are `null` when the path was deleted here or is too large to read.
+  - `diff` is the patch between the two restore points, cut at 64 KiB on a char
+    boundary (`diff_truncated` says so). It is `null` when there is nothing to
+    render: a binary path, a change with no content delta, or no patch.
+  - `state: "unavailable"` means the span will never resolve, and `reason`
+    says why: `call_not_bounded` (the call took no receipt — the engine judged
+    it read-only, or the turn predates receipts), `post_snapshot_missing` (the
+    opening receipt exists and the closing one was lost), `pre_snapshot_missing`,
+    or `snapshots_pruned` (the receipts are still on the turn, but the side repo
+    no longer holds the trees they name — snapshots are pruned to the newest few
+    while turn records are durable, so an older turn's span is regularly
+    unrecoverable, and a workspace whose store was deleted reads the same way).
+    This is **not** the same answer as an empty `files` list, which means the
+    span changed nothing, and the receipt's own `changed_paths` remain readable
+    on the turn record either way.
+  - `limit` (default 200, max 1000) caps the list; `truncated` says it was cut,
+    and how many paths were left off is not counted.
+  - Reading the span runs `git diff` inside the side repo. Neither the work
+    tree nor the index is touched.
+
+| Status | When |
+| --- | --- |
+| 404 | Unknown thread or turn, a turn of another thread, or a `tool_call_id` this turn has no item or receipt for. |
+| 400 | `limit` outside `1..=1000`. |
+
+The artifact routes answer:
 
 | Status | When |
 | --- | --- |

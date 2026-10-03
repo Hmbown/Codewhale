@@ -1490,6 +1490,71 @@ impl SnapshotRepo {
         Ok((changes, truncated))
     }
 
+    /// Whether a tree is still in this repo.
+    ///
+    /// The side repo keeps only the newest snapshots, while the receipt that
+    /// names one is durable in the turn record: a restore point can outlive
+    /// the object it names. A caller about to diff two trees asks this first,
+    /// so "these restore points are gone" is answered with the pruning it is
+    /// rather than as a git failure over an object nobody can bring back.
+    pub fn has_tree(&self, id: &SnapshotId) -> bool {
+        let spec = format!("{}^{{tree}}", id.as_str());
+        run_git(&self.git_dir, &self.work_tree, &["cat-file", "-e", &spec])
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    /// The unified diff of one path between snapshots `from` and `to`, as
+    /// `git diff` writes it — the patch behind the [`SnapshotPathChange`]
+    /// [`Self::path_changes_between`] counts for the same two trees.
+    ///
+    /// Both trees are read from the side repo: neither the work tree nor the
+    /// index is touched. The path is taken literally, so a name holding glob
+    /// characters is one path rather than a pattern. Renames are not
+    /// detected, matching `path_changes_between`, so a moved file reads as a
+    /// deletion plus an addition.
+    ///
+    /// The text is cut at `max_bytes` on a char boundary; the flag says
+    /// whether anything was dropped. A binary path yields git's own binary
+    /// notice, and a path that does not differ yields an empty string: the
+    /// caller reports what git wrote rather than inventing a patch.
+    pub fn patch_between(
+        &self,
+        from: &SnapshotId,
+        to: &SnapshotId,
+        path: &str,
+        max_bytes: usize,
+    ) -> io::Result<(String, bool)> {
+        let output = run_git(
+            &self.git_dir,
+            &self.work_tree,
+            &[
+                "--literal-pathspecs",
+                "diff",
+                "--no-renames",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--unified=3",
+                "--end-of-options",
+                from.as_str(),
+                to.as_str(),
+                "--",
+                path,
+            ],
+        )?;
+        if !output.status.success() {
+            return Err(io_other(format!(
+                "git diff failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(truncate_at_char_boundary(
+            &String::from_utf8_lossy(&output.stdout),
+            max_bytes,
+        ))
+    }
+
     fn tree_paths(&self, treeish: &str) -> io::Result<HashSet<PathBuf>> {
         let ls = run_git(
             &self.git_dir,
@@ -2212,6 +2277,19 @@ fn git_diff_matches(output: Output) -> io::Result<bool> {
 
 fn io_other(msg: impl Into<String>) -> io::Error {
     io::Error::other(msg.into())
+}
+
+/// `text` whole, or the longest prefix that fits in `max_bytes` and ends on a
+/// char boundary; the flag says which of the two the caller got.
+fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_string(), true)
 }
 
 /// Walk `workspace` and accumulate file sizes, returning `Ok(total)`
@@ -4534,5 +4612,95 @@ mod tests {
         assert_eq!(list[0].session_id.as_deref(), Some("sess-a"));
         assert_eq!(list[1].session_id, None);
         assert_eq!(list[1].label, "pre-turn:1");
+    }
+
+    /// The patch a per-call change record shows comes from the side repo's
+    /// own two trees, names one path, and names it literally: a bracketed
+    /// filename must not drag its glob sibling into the diff.
+    #[test]
+    fn patch_between_diffs_one_literal_path_between_two_snapshots() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        std::fs::write(repo.work_tree().join("a.txt"), b"alpha\n").unwrap();
+        std::fs::write(repo.work_tree().join("b.txt"), b"keep\n").unwrap();
+        std::fs::write(repo.work_tree().join("file[12].txt"), b"literal-before\n").unwrap();
+        std::fs::write(repo.work_tree().join("file1.txt"), b"sibling-before\n").unwrap();
+        let before = repo.snapshot("tool:call-1").expect("snapshot");
+        std::fs::write(repo.work_tree().join("a.txt"), b"alpha\nbeta\n").unwrap();
+        std::fs::write(repo.work_tree().join("b.txt"), b"changed\n").unwrap();
+        std::fs::write(repo.work_tree().join("file[12].txt"), b"literal-after\n").unwrap();
+        let after = repo.snapshot("post-tool:call-1").expect("snapshot");
+
+        let (patch, truncated) = repo
+            .patch_between(&before, &after, "a.txt", 1 << 20)
+            .expect("patch");
+        assert!(!truncated);
+        assert!(patch.contains("+beta"), "{patch}");
+        assert!(
+            !patch.contains("b.txt"),
+            "only the named path belongs in this patch: {patch}"
+        );
+
+        let (literal, _) = repo
+            .patch_between(&before, &after, "file[12].txt", 1 << 20)
+            .expect("patch");
+        assert!(literal.contains("+literal-after"), "{literal}");
+        assert!(
+            !literal.contains("file1.txt"),
+            "a bracketed filename must not diff its glob sibling: {literal}"
+        );
+
+        // A path that does not differ writes nothing rather than an empty
+        // hunk the caller would have to interpret.
+        let unchanged = repo
+            .patch_between(&before, &before, "a.txt", 1 << 20)
+            .expect("patch");
+        assert!(unchanged.0.is_empty(), "{unchanged:?}");
+        assert!(!unchanged.1);
+    }
+
+    /// A tree the repo no longer holds — the receipt outlived the object —
+    /// is reported as absent rather than as a diff failure, so a caller can
+    /// tell pruning from a broken repo without reading git's stderr.
+    #[test]
+    fn has_tree_separates_a_pruned_object_from_a_present_one() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        std::fs::write(repo.work_tree().join("a.txt"), b"alpha").unwrap();
+        let taken = repo.take_snapshot("tool:call-1", None).expect("snapshot");
+
+        assert!(
+            repo.has_tree(&taken.tree),
+            "the snapshot's own tree resolves"
+        );
+        // Valid hex, never written: exactly what a pruned receipt names.
+        let pruned = SnapshotId::parse(&"deadbeef".repeat(5)).unwrap();
+        assert!(!repo.has_tree(&pruned));
+    }
+
+    /// A patch larger than the caller's bound is cut on a char boundary and
+    /// reported as cut, so a client never receives half a character.
+    #[test]
+    fn patch_between_cuts_an_over_long_patch_on_a_char_boundary() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        std::fs::write(repo.work_tree().join("d.txt"), "start\n").unwrap();
+        let before = repo.snapshot("tool:call-1").expect("snapshot");
+        let long = format!("{}\n", "汉字宽字符行".repeat(400));
+        std::fs::write(repo.work_tree().join("d.txt"), long).unwrap();
+        let after = repo.snapshot("post-tool:call-1").expect("snapshot");
+
+        let (patch, truncated) = repo
+            .patch_between(&before, &after, "d.txt", 64)
+            .expect("patch");
+        assert!(truncated, "a 64-byte bound must cut this patch");
+        assert!(patch.len() <= 64, "{} bytes kept", patch.len());
+        assert!(patch.is_char_boundary(patch.len()));
+
+        let (whole, not_truncated) = repo
+            .patch_between(&before, &after, "d.txt", 1 << 20)
+            .expect("patch");
+        assert!(!not_truncated);
+        assert!(whole.contains("汉字宽字符行"), "{whole}");
     }
 }

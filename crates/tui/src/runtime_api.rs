@@ -1506,6 +1506,13 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             "/v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}",
             get(turn_artifacts::read_turn_artifact),
         )
+        // What one tool call changed, from the workspace restore points the
+        // engine recorded around it. A shell command's writes belong to the
+        // command here, not only to the turn (see `turn_artifacts`).
+        .route(
+            "/v1/threads/{id}/turns/{turn_id}/calls/{tool_call_id}/changes",
+            get(turn_artifacts::list_call_changes),
+        )
         .route(
             "/v1/threads/{id}/turns/{turn_id}/interrupt",
             post(interrupt_thread_turn),

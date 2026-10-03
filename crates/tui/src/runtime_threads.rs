@@ -315,6 +315,25 @@ fn validated_record_id<'a>(id: &'a str, label: &str) -> Result<&'a str> {
     Ok(trimmed)
 }
 
+/// Longest tool call id this store will look up, in bytes.
+const MAX_TOOL_CALL_ID_BYTES: usize = 256;
+
+/// Whether a **provider's** tool call id can be looked up in the store.
+///
+/// This is deliberately not [`validated_record_id`]. A record id is ours and
+/// minted in a shape we chose; a tool call id is the model endpoint's, echoed
+/// back to us as an opaque string, and it is only ever *compared* — against a
+/// receipt's `tool_call_id` and an item's `tool_use_id` — never used as a
+/// path, a command, or a file name. Real endpoints hand out shapes the record
+/// charset refuses (`call_01_f3d82r…|f8912d4c-…` from one gateway, `toolu_…`
+/// from another), and rejecting those made every command's workspace span
+/// unreadable while looking exactly like "no such call". Only emptiness and
+/// control characters are refused, plus a length bound so a nonsense URL
+/// cannot make the store scan work hard.
+fn usable_provider_call_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_TOOL_CALL_ID_BYTES && !id.chars().any(char::is_control)
+}
+
 fn agent_mail_workspace_id(workspace: &Path) -> Result<String> {
     let canonical = workspace
         .canonicalize()
@@ -10011,6 +10030,96 @@ impl RuntimeThreadManager {
         .context("turn artifact read task failed")?
     }
 
+    /// The workspace span one tool call of one turn ran in, read from the
+    /// store: the `tool:<call_id>` restore point the call started from and the
+    /// `post-tool:<call_id>` receipt that closed it.
+    ///
+    /// A span exists only for a call that may write. With
+    /// `EngineConfig::record_restore_points` the engine brackets every
+    /// non-read-only call — a file tool, a shell command, a program, a
+    /// write-capable MCP tool — so a shell command's own writes are
+    /// attributable to it. A call the engine judged read-only takes neither
+    /// receipt, and a turn recorded before receipts existed carries none;
+    /// `Ok(None)` says so, and a caller must report that as "not bounded"
+    /// rather than as an empty change list.
+    pub async fn turn_call_span(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        tool_call_id: &str,
+    ) -> Result<Option<CallWorkspaceSpan>> {
+        let thread = self.get_thread(thread_id).await?;
+        if validated_record_id(turn_id, "turn id").is_err()
+            || !usable_provider_call_id(tool_call_id)
+        {
+            return Ok(None);
+        }
+        let manager = self.clone();
+        let thread_id = thread_id.to_string();
+        let turn_id = turn_id.to_string();
+        let tool_call_id = tool_call_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            if !manager.store.turn_path(&turn_id)?.exists() {
+                return Ok(None);
+            }
+            let turn = manager.store.load_turn(&turn_id)?;
+            if turn.thread_id != thread_id {
+                return Ok(None);
+            }
+            let recorded = |kind: crate::snapshot::WorkspaceSnapshotKind| {
+                turn.workspace_snapshots.iter().rfind(|receipt| {
+                    receipt.kind == kind
+                        && receipt.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+                })
+            };
+            let pre = recorded(crate::snapshot::WorkspaceSnapshotKind::Tool);
+            let post = recorded(crate::snapshot::WorkspaceSnapshotKind::PostTool);
+            let item = manager.item_for_call(&turn, &tool_call_id);
+            // A call the turn recorded no item for is a call this turn never
+            // ran: the caller asked about the wrong turn. A call with an item
+            // but no receipt is the read-only case — known, and bounded by
+            // nothing, which the route reports rather than 404s.
+            if pre.is_none() && post.is_none() && item.is_none() {
+                return Ok(None);
+            }
+            let tool_name = item
+                .as_ref()
+                .and_then(|item| item.metadata.as_ref())
+                .and_then(|metadata| metadata.get("tool_name"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Ok(Some(CallWorkspaceSpan {
+                thread_id,
+                turn_id,
+                tool_call_id,
+                tool_name,
+                pre_tool_snapshot_id: pre.map(|receipt| receipt.tree_id.clone()),
+                post_tool_snapshot_id: post.map(|receipt| receipt.tree_id.clone()),
+                thread_workspace: thread.workspace,
+            }))
+        })
+        .await
+        .context("call workspace span read task failed")?
+    }
+
+    /// The turn's item record for one call id, when any item carries it.
+    ///
+    /// `tool_use_id` is the identity the engine also labels the call's
+    /// `tool:<call_id>` restore point with, so this is how a receipt is tied
+    /// back to the tool that ran.
+    fn item_for_call(&self, turn: &TurnRecord, tool_call_id: &str) -> Option<TurnItemRecord> {
+        turn.item_ids
+            .iter()
+            .filter_map(|item_id| self.store.load_item(item_id).ok())
+            .find(|item| {
+                item.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("tool_use_id"))
+                    .and_then(Value::as_str)
+                    == Some(tool_call_id)
+            })
+    }
+
     pub async fn get_thread(&self, id: &str) -> Result<ThreadRecord> {
         self.flush_recovery_receipts_for_thread(id).await?;
         self.store
@@ -17984,6 +18093,24 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("Failed to remove {}", path.display())),
     }
+}
+
+/// One tool call's workspace span, as the call-change route serves it.
+///
+/// Both tree ids name restore points recorded on the calling turn, so the
+/// thread owns them: the `pre_tool` one is what `file-revert` accepts for
+/// every path the span changed.
+#[derive(Debug, Clone)]
+pub struct CallWorkspaceSpan {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub tool_call_id: String,
+    pub tool_name: Option<String>,
+    pub pre_tool_snapshot_id: Option<String>,
+    /// `None` when the closing snapshot failed or was gated: the span's
+    /// changes are then unknown, not empty.
+    pub post_tool_snapshot_id: Option<String>,
+    pub thread_workspace: PathBuf,
 }
 
 /// A turn's artifact references as the Runtime API serves them.
