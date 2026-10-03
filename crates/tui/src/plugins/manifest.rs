@@ -54,6 +54,8 @@ pub struct PluginManifest {
     pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
     #[serde(default)]
     pub capabilities: PluginCapabilities,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, super::providers::PluginProviderDeclaration>,
     #[serde(default)]
     pub when: Option<PluginWhen>,
 }
@@ -196,6 +198,8 @@ pub struct PluginInventory {
     pub hooks: usize,
     pub lsp: usize,
     pub native: usize,
+    #[serde(default)]
+    pub providers: usize,
     pub filesystem_roots: Vec<String>,
     pub network_hosts: Vec<String>,
     pub lifecycle_mutation: bool,
@@ -250,6 +254,9 @@ impl PluginInventory {
         }
         if self.lsp > 0 {
             capabilities.push(PluginActivationCapability::Lsp);
+        }
+        if self.providers > 0 {
+            capabilities.push(PluginActivationCapability::Providers);
         }
         if self.native > 0 {
             capabilities.push(PluginActivationCapability::Native);
@@ -330,7 +337,7 @@ impl PluginInventory {
     #[must_use]
     pub fn summary(&self) -> String {
         format!(
-            "skills={} mcp={} (stdio={} remote={}) commands={} agents={} hooks={} lsp={} native={}",
+            "skills={} mcp={} (stdio={} remote={}) commands={} agents={} hooks={} lsp={} native={} providers={}",
             self.skills,
             self.mcp_servers,
             self.stdio_mcp_servers,
@@ -339,7 +346,8 @@ impl PluginInventory {
             self.agents,
             self.hooks,
             self.lsp,
-            self.native
+            self.native,
+            self.providers
         )
     }
 }
@@ -535,6 +543,7 @@ impl PluginManifest {
 
         let components = manifest.resolve_components(&canonical_root)?;
         manifest.validate_mcp_servers(&canonical_root)?;
+        super::providers::validate_declarations(&manifest.providers)?;
         let inventory = manifest.inventory(&components)?;
         let (content_hash, file_hashes) = hash_bundle(&canonical_root, &manifest_bytes, label)?;
         let capability_hash = hash_inventory(&inventory);
@@ -931,6 +940,15 @@ impl PluginManifest {
                 }
             }
         }
+        for declaration in self.providers.values() {
+            for endpoint in declaration.endpoints() {
+                if let Ok(url) = reqwest::Url::parse(endpoint)
+                    && let Some(host) = url.host_str()
+                {
+                    network_hosts.push(host.to_ascii_lowercase());
+                }
+            }
+        }
         network_hosts.sort();
         network_hosts.dedup();
 
@@ -948,6 +966,7 @@ impl PluginManifest {
             hooks: components.hooks.len(),
             lsp: components.lsp.len(),
             native: components.native.len(),
+            providers: self.providers.len(),
             filesystem_roots,
             network_hosts,
             lifecycle_mutation: self.capabilities.lifecycle_mutation,
@@ -1687,6 +1706,7 @@ fn hash_inventory_counts(inventory: &PluginInventory) -> BTreeMap<&'static str, 
     normalized.insert("hooks", inventory.hooks.to_string());
     normalized.insert("lsp", inventory.lsp.to_string());
     normalized.insert("native", inventory.native.to_string());
+    normalized.insert("providers", inventory.providers.to_string());
     normalized.insert("filesystem", inventory.filesystem_roots.join("\n"));
     normalized.insert("network", inventory.network_hosts.join("\n"));
     normalized.insert("lifecycle", inventory.lifecycle_mutation.to_string());

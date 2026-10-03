@@ -394,6 +394,19 @@ pub(super) fn credential_writeability(
     config: &crate::config::Config,
     provider: ApiProvider,
 ) -> CredentialWriteability {
+    if provider == ApiProvider::Custom
+        && config
+            .provider_config_for(provider)
+            .is_some_and(|entry| entry.oauth.is_some())
+    {
+        return CredentialWriteability {
+            source: ProviderCredentialSource::ExternalAuth,
+            writable: false,
+            reason: Some(
+                "This provider signs in through its reviewed plugin. Use the plugin login or logout command.",
+            ),
+        };
+    }
     let auth_mode = config.auth_mode_for_provider(provider);
     if codewhale_config::auth_mode_disables_api_key(auth_mode.as_deref()) {
         return CredentialWriteability {
@@ -806,6 +819,29 @@ mod tests {
                 .as_deref(),
             Some("manual-key")
         );
+    }
+
+    #[test]
+    fn plugin_oauth_credentials_cannot_be_replaced_by_an_api_key() {
+        let mut config = Config {
+            provider: Some("plugin-test".into()),
+            ..Default::default()
+        };
+        let entry = config.provider_config_for_mut(ApiProvider::Custom);
+        entry.kind = Some("openai-compatible".into());
+        entry.oauth = Some(crate::oauth::PluginOAuthConfig {
+            issuer: "https://gateway.example".into(),
+            authorization_endpoint: "https://gateway.example/authorize".into(),
+            token_endpoint: "https://gateway.example/token".into(),
+            client_id: "plugin-test".into(),
+            scopes: vec![],
+            resource: None,
+            callback_path: "/oauth/callback".into(),
+        });
+        let writeability = credential_writeability(&config, ApiProvider::Custom);
+        assert!(!writeability.writable);
+        assert_eq!(writeability.source, ProviderCredentialSource::ExternalAuth);
+        assert!(writeability.reason.unwrap().contains("plugin"));
     }
 
     /// A route Codewhale owns is writable, and says its source is the store it

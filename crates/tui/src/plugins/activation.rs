@@ -19,14 +19,14 @@ pub const CAPABILITY_HASH_DOMAIN_V2: &[u8] = b"codewhale-plugin-capabilities-v2\
 /// receipt. Kept so discovery can prove a v1 receipt no longer matches.
 pub const CAPABILITY_HASH_DOMAIN_V1: &[u8] = b"codewhale-plugin-capabilities-v1\0";
 
-pub const ACTIVATION_POLICY_VERSION: u32 = 3;
+pub const ACTIVATION_POLICY_VERSION: u32 = 5;
 
 /// Policy version selected when `[features] extension_host` is on: `Native`
 /// (host code run by the TypeScript extension host) moves from inactive to
-/// supported. Every receipt reviewed under v3 fails closed as
-/// `CapabilitiesChanged` under v4 and the reverse, so toggling the flag in
+/// supported. Every receipt reviewed under v5 fails closed as
+/// `CapabilitiesChanged` under v6 and the reverse, so toggling the flag in
 /// either direction re-reviews every plugin. That is intended.
-pub const EXTENSION_HOST_POLICY_VERSION: u32 = 4;
+pub const EXTENSION_HOST_POLICY_VERSION: u32 = 6;
 
 /// Process-wide policy selection, set once at boot from config
 /// (`install_extension_host_policy`). A config reload never flips it
@@ -112,6 +112,7 @@ pub enum PluginActivationCapability {
     Hooks,
     Lsp,
     Native,
+    Providers,
     FilesystemRoots,
     LifecycleMutation,
 }
@@ -126,6 +127,7 @@ impl PluginActivationCapability {
         Self::Hooks,
         Self::Lsp,
         Self::Native,
+        Self::Providers,
         Self::FilesystemRoots,
         Self::LifecycleMutation,
     ];
@@ -141,6 +143,7 @@ impl PluginActivationCapability {
             Self::Hooks => "hooks",
             Self::Lsp => "lsp",
             Self::Native => "native",
+            Self::Providers => "providers",
             Self::FilesystemRoots => "filesystem-roots",
             Self::LifecycleMutation => "lifecycle-mutation",
         }
@@ -181,6 +184,7 @@ impl PluginActivationPolicy {
                 PluginActivationCapability::Commands,
                 PluginActivationCapability::Agents,
                 PluginActivationCapability::Hooks,
+                PluginActivationCapability::Providers,
                 PluginActivationCapability::Native,
             ],
             inactive: &[
@@ -191,8 +195,8 @@ impl PluginActivationPolicy {
         }
     }
 
-    /// v3: the shipping policy. Must stay byte-for-byte stable while the
-    /// extension host is experimental so existing receipts stay valid.
+    /// Shipping declarative policy (v5). The historical `v3` method name is
+    /// retained; providers intentionally invalidate older review receipts.
     #[must_use]
     pub const fn v3() -> Self {
         Self {
@@ -204,6 +208,7 @@ impl PluginActivationPolicy {
                 PluginActivationCapability::Commands,
                 PluginActivationCapability::Agents,
                 PluginActivationCapability::Hooks,
+                PluginActivationCapability::Providers,
             ],
             inactive: &[
                 PluginActivationCapability::Lsp,
@@ -264,16 +269,16 @@ mod tests {
             .collect()
     }
 
-    /// Flag off must hash exactly as the v3 policy always has, or every
-    /// user's plugin receipts (Computer Use included) would re-review.
+    /// Pin the shipping provider-aware policy independently of the optional
+    /// native extension host; changes require deliberate receipt migration.
     #[test]
-    fn flag_off_policy_hashes_exactly_as_v3() {
+    fn flag_off_policy_hashes_exactly_as_shipping_provider_policy() {
         let _guard = TestPolicyGuard::extension_host(false);
         let current = PluginActivationPolicy::current();
         assert_eq!(current, PluginActivationPolicy::v3());
         assert_eq!(
             policy_digest(current),
-            "1d8de17f08b1ef6246454881bfc38b7cd2855d56c9c6e3fdb11c54e4f756df85"
+            "f0584fdb007b7987b0934517c8723b96190137771795ed33b38499b9353aa7cf"
         );
         assert!(!current.is_supported(PluginActivationCapability::Native));
     }

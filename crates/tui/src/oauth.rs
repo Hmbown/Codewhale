@@ -282,50 +282,50 @@ pub struct OAuthEnvOverrides {
 }
 
 /// Everything about one provider's OAuth login that is not logic.
-pub struct OAuthProviderParams {
+pub struct OAuthProviderParams<'a> {
     /// Human name for prompts and errors: "xAI", "ChatGPT".
-    pub display_name: &'static str,
-    pub default_issuer: &'static str,
-    pub default_client_id: &'static str,
-    pub default_scopes: &'static str,
+    pub display_name: &'a str,
+    pub default_issuer: &'a str,
+    pub default_client_id: &'a str,
+    pub default_scopes: &'a str,
     pub env: OAuthEnvOverrides,
     /// `Some` device-authorization path under the issuer (xAI); `None`
     /// means the issuer offers no device flow and device login must fail
     /// loudly instead of guessing (ChatGPT).
-    pub device_code_path: Option<&'static str>,
+    pub device_code_path: Option<&'a str>,
     /// `Some` browser authorization path under the issuer (ChatGPT PKCE);
     /// `None` means the issuer offers no browser flow and browser login
     /// fails the same loud way (xAI is device-code only).
-    pub authorize_path: Option<&'static str>,
+    pub authorize_path: Option<&'a str>,
     /// Token path under the issuer.
-    pub token_path: &'static str,
+    pub token_path: &'a str,
     /// Whether the issuer was discovered (xAI) or pinned (ChatGPT paths).
     pub discover_endpoints: bool,
     /// Seconds the device-code poll runs past the server's `expires_in`.
     pub device_poll_floor_secs: u64,
     /// Extra authorize-endpoint parameters beyond the standard OAuth set,
     /// sent verbatim so the issuer sees exactly who is calling.
-    pub authorize_extras: &'static [(&'static str, &'static str)],
+    pub authorize_extras: &'a [(&'a str, &'a str)],
     /// Honest client identity for issuers that require one (ChatGPT's
     /// `originator`). Never impersonate another CLI.
-    pub originator: Option<&'static str>,
+    pub originator: Option<&'a str>,
     /// Remote revoke path under the issuer, pinned rather than discovered:
     /// revoke must still clear local credentials when the issuer is
     /// unreachable, so a discovery fetch would only add a failure mode to a
     /// path whose contract is to clean up regardless. `None` when
     /// revocation is purely local (xAI).
-    pub revoke_path: Option<&'static str>,
+    pub revoke_path: Option<&'a str>,
     /// Registered loopback redirect for browser flows.
-    pub callback_path: &'static str,
+    pub callback_path: &'a str,
     /// Loopback ports the public client registered, in preference order.
-    pub loopback_ports: &'static [u16],
+    pub loopback_ports: &'a [u16],
     /// The command that re-runs this provider's login, for error guidance.
-    pub relogin_hint: &'static str,
+    pub relogin_hint: &'a str,
     /// What to tell the user when every callback port is taken.
-    pub callback_conflict_hint: &'static str,
+    pub callback_conflict_hint: &'a str,
 }
 
-pub const XAI_OAUTH_PARAMS: OAuthProviderParams = OAuthProviderParams {
+pub const XAI_OAUTH_PARAMS: OAuthProviderParams<'static> = OAuthProviderParams {
     display_name: "xAI",
     // Single source: the legacy module still owns these strings until its
     // activation path unifies and they move here in 3b-iii.
@@ -352,7 +352,7 @@ pub const XAI_OAUTH_PARAMS: OAuthProviderParams = OAuthProviderParams {
     callback_conflict_hint: "",
 };
 
-pub const CHATGPT_OAUTH_PARAMS: OAuthProviderParams = OAuthProviderParams {
+pub const CHATGPT_OAUTH_PARAMS: OAuthProviderParams<'static> = OAuthProviderParams {
     display_name: "ChatGPT",
     // Single source: same arrangement as the xAI row above.
     default_issuer: CHATGPT_OAUTH_ISSUER,
@@ -381,7 +381,7 @@ pub const CHATGPT_OAUTH_PARAMS: OAuthProviderParams = OAuthProviderParams {
 /// The parameter table. A provider login looks its row up here; adding a
 /// provider means adding a row, never a module.
 #[must_use]
-pub fn oauth_provider_params(provider: OAuthProvider) -> &'static OAuthProviderParams {
+pub fn oauth_provider_params(provider: OAuthProvider) -> &'static OAuthProviderParams<'static> {
     match provider {
         OAuthProvider::Xai => &XAI_OAUTH_PARAMS,
         OAuthProvider::Chatgpt => &CHATGPT_OAUTH_PARAMS,
@@ -396,7 +396,7 @@ pub struct ResolvedOAuthInputs {
     pub open_browser: bool,
 }
 
-impl OAuthProviderParams {
+impl OAuthProviderParams<'_> {
     /// Resolve issuer/client/scopes from the environment, first var wins.
     #[must_use]
     pub fn resolve_inputs(&self) -> ResolvedOAuthInputs {
@@ -1367,6 +1367,15 @@ fn wait_for_callback(
     params: &OAuthProviderParams,
     expected_state: &str,
 ) -> Result<String> {
+    wait_for_callback_validated(listeners, params, expected_state, None)
+}
+
+fn wait_for_callback_validated(
+    listeners: &[TcpListener],
+    params: &OAuthProviderParams,
+    expected_state: &str,
+    expected_issuer: Option<&str>,
+) -> Result<String> {
     let deadline = Instant::now() + CALLBACK_TIMEOUT;
     loop {
         if Instant::now() >= deadline {
@@ -1380,7 +1389,12 @@ fn wait_for_callback(
         for listener in listeners {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    return handle_callback_stream(stream, params, expected_state);
+                    return handle_callback_stream_validated(
+                        stream,
+                        params,
+                        expected_state,
+                        expected_issuer,
+                    );
                 }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
@@ -1397,10 +1411,20 @@ fn wait_for_callback(
     }
 }
 
+#[cfg(test)]
 fn handle_callback_stream(
+    stream: TcpStream,
+    params: &OAuthProviderParams,
+    expected_state: &str,
+) -> Result<String> {
+    handle_callback_stream_validated(stream, params, expected_state, None)
+}
+
+fn handle_callback_stream_validated(
     mut stream: TcpStream,
     params: &OAuthProviderParams,
     expected_state: &str,
+    expected_issuer: Option<&str>,
 ) -> Result<String> {
     // BSD sockets (macOS) hand the accepted stream the listener's O_NONBLOCK;
     // the bounded read below needs a blocking socket with a timeout.
@@ -1436,6 +1460,9 @@ fn handle_callback_stream(
     let result = (|| {
         let target = parse_http_request_target(request_line)?;
         let query = query_from_target(params, &target)?;
+        if let Some(issuer) = expected_issuer {
+            validate_plugin_callback(query, issuer)?;
+        }
         let outcome = parse_callback_query(params, query)?;
         accept_callback(expected_state, outcome)
     })();
@@ -2721,6 +2748,417 @@ pub fn missing_auth_message(provider: OAuthProvider) -> String {
     }
 }
 
+/// Declarative public OAuth configuration for a reviewed plugin provider.
+// Plugin OAuth uses the same PKCE, callback, bounded HTTP and secure-store
+// primitives as built-in logins. This declarative boundary intentionally does
+// not execute plugin callbacks, expose refresh tokens, support confidential
+// clients, or discover endpoints: plugins name reviewed, same-issuer endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginOAuthConfig {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub client_id: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub resource: Option<String>,
+    #[serde(default = "plugin_callback_path")]
+    pub callback_path: String,
+}
+
+fn plugin_callback_path() -> String {
+    "/oauth/callback".into()
+}
+
+impl PluginOAuthConfig {
+    pub fn validate(&self) -> Result<()> {
+        let issuer = oauth_endpoint_url(&self.issuer)?;
+        for endpoint in [&self.authorization_endpoint, &self.token_endpoint] {
+            let url = oauth_endpoint_url(endpoint)?;
+            anyhow::ensure!(
+                url.origin() == issuer.origin(),
+                "Plugin OAuth endpoints must belong to the issuer origin"
+            );
+            anyhow::ensure!(
+                url.query().is_none()
+                    && url.fragment().is_none()
+                    && url.username().is_empty()
+                    && url.password().is_none(),
+                "Plugin OAuth endpoint must not contain credentials, query or fragment"
+            );
+        }
+        anyhow::ensure!(
+            issuer.query().is_none()
+                && issuer.fragment().is_none()
+                && issuer.username().is_empty()
+                && issuer.password().is_none(),
+            "Plugin OAuth issuer must not contain credentials, query or fragment"
+        );
+        anyhow::ensure!(
+            !self.client_id.trim().is_empty(),
+            "Plugin OAuth client_id must not be empty"
+        );
+        anyhow::ensure!(
+            self.callback_path.starts_with('/')
+                && !self.callback_path.starts_with("//")
+                && !self.callback_path.contains(['?', '#'])
+                && !self.callback_path.chars().any(char::is_control),
+            "Plugin OAuth callback_path must be an absolute path without query or fragment"
+        );
+        anyhow::ensure!(
+            self.scopes
+                .iter()
+                .all(|scope| !scope.is_empty() && !scope.chars().any(char::is_whitespace)),
+            "Plugin OAuth scopes must be nonempty individual scope names"
+        );
+        if let Some(resource) = &self.resource {
+            let resource = oauth_endpoint_url(resource)?;
+            anyhow::ensure!(
+                resource.fragment().is_none()
+                    && resource.username().is_empty()
+                    && resource.password().is_none(),
+                "Plugin OAuth resource must not contain credentials or a fragment"
+            );
+        }
+        Ok(())
+    }
+
+    fn callback_params(&self) -> OAuthProviderParams<'_> {
+        OAuthProviderParams {
+            display_name: "Plugin provider",
+            default_issuer: &self.issuer,
+            default_client_id: &self.client_id,
+            default_scopes: "",
+            env: OAuthEnvOverrides {
+                issuer_vars: &[],
+                client_id_vars: &[],
+                scope_vars: &[],
+                no_browser_var: "CODEWHALE_PLUGIN_OAUTH_NO_BROWSER",
+            },
+            device_code_path: None,
+            authorize_path: None,
+            token_path: "",
+            discover_endpoints: false,
+            device_poll_floor_secs: 0,
+            authorize_extras: &[],
+            originator: None,
+            revoke_path: None,
+            callback_path: &self.callback_path,
+            loopback_ports: &[],
+            relogin_hint: "codewhale auth plugin-login",
+            callback_conflict_hint: "",
+        }
+    }
+
+    fn authorize_url(
+        &self,
+        redirect_uri: &str,
+        state: &str,
+        pkce: &PkceChallenge,
+    ) -> Result<String> {
+        self.validate()?;
+        let mut url = oauth_endpoint_url(&self.authorization_endpoint)?;
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &self.client_id)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("scope", &self.scopes.join(" "))
+            .append_pair("state", state)
+            .append_pair("code_challenge", &pkce.challenge)
+            .append_pair("code_challenge_method", "S256");
+        if let Some(resource) = &self.resource {
+            url.query_pairs_mut().append_pair("resource", resource);
+        }
+        Ok(url.into())
+    }
+}
+
+fn validate_plugin_callback(query: &str, issuer: &str) -> Result<()> {
+    let url = reqwest::Url::parse(&format!("http://127.0.0.1/?{query}"))?;
+    let mut fields = BTreeMap::new();
+    for (key, value) in url.query_pairs() {
+        if matches!(
+            key.as_ref(),
+            "code" | "state" | "iss" | "error" | "error_description"
+        ) {
+            anyhow::ensure!(
+                fields
+                    .insert(key.into_owned(), value.into_owned())
+                    .is_none(),
+                "Plugin OAuth callback contains duplicate parameters"
+            );
+        }
+    }
+    anyhow::ensure!(
+        fields.get("state").is_some_and(|state| !state.is_empty()),
+        "Plugin OAuth callback missing state"
+    );
+    // RFC 9207: when an authorization server supplies `iss`, bind it exactly
+    // to the reviewed issuer. Servers not advertising that extension still
+    // have the single in-flight endpoint and PKCE/state binding.
+    if let Some(actual) = fields.get("iss") {
+        anyhow::ensure!(
+            actual == issuer,
+            "Plugin OAuth callback issuer does not match"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct PluginOAuthTokens {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: u64,
+}
+
+fn plugin_oauth_slot(
+    provider: &str,
+    base_url: &str,
+    descriptor: &PluginOAuthConfig,
+) -> Result<String> {
+    descriptor.validate()?;
+    oauth_endpoint_url(base_url)?;
+    anyhow::ensure!(!provider.trim().is_empty(), "Plugin provider name is empty");
+    let binding = serde_json::to_vec(&(provider, base_url, descriptor))?;
+    let hash: String = Sha256::digest(binding)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(format!("plugin-oauth:{hash}"))
+}
+
+#[derive(Deserialize)]
+struct PluginTokenResponse {
+    #[serde(flatten)]
+    material: OAuthTokenMaterial,
+    #[serde(default)]
+    token_type: Option<String>,
+}
+
+fn plugin_token_response(
+    descriptor: &PluginOAuthConfig,
+    form: &[(&str, &str)],
+    previous_refresh: Option<String>,
+) -> Result<PluginOAuthTokens> {
+    let response = oauth_http_client("plugin token exchange")?
+        .post(&descriptor.token_endpoint)
+        .form(form)
+        .send()?;
+    let (status, response): (_, PluginTokenResponse) =
+        parse_oauth_json(response, "Plugin OAuth token exchange")?;
+    let token = response.material;
+    anyhow::ensure!(
+        status.is_success() && token.error.is_none(),
+        "Plugin OAuth token exchange failed with HTTP {}",
+        status.as_u16()
+    );
+    anyhow::ensure!(
+        response
+            .token_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("bearer")),
+        "Plugin OAuth token response requires Bearer token_type"
+    );
+    let access_token = token
+        .access_token
+        .filter(|token| !token.trim().is_empty())
+        .context("Plugin OAuth token exchange returned no access token")?;
+    let lifetime = token
+        .expires_in
+        .filter(|seconds| *seconds > 0)
+        .context("Plugin OAuth token response requires a positive expires_in")?;
+    Ok(PluginOAuthTokens {
+        access_token,
+        refresh_token: token
+            .refresh_token
+            .filter(|token| !token.trim().is_empty())
+            .or(previous_refresh),
+        expires_at: (now_unix_secs().context("System clock before UNIX epoch")? as u64)
+            .saturating_add(lifetime),
+    })
+}
+
+/// Core-owned standard public-client PKCE login. Blocking sockets and secure
+/// storage stay on the dedicated worker; plugins never receive token material.
+pub async fn plugin_oauth_login(
+    provider: String,
+    base_url: String,
+    descriptor: PluginOAuthConfig,
+    authority: crate::plugins::types::PluginAuthority,
+) -> Result<()> {
+    let policy = crate::plugins::activation::extension_host_policy_enabled();
+    tokio::task::spawn_blocking(move || {
+        let _scope = crate::plugins::activation::PolicyScope::propagate(policy);
+        crate::plugins::providers::verify_provider_binding(
+            &authority,
+            &provider,
+            &base_url,
+            &descriptor,
+            None,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let slot = plugin_oauth_slot(&provider, &base_url, &descriptor)?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        listener.set_nonblocking(true)?;
+        let redirect_uri = format!(
+            "http://127.0.0.1:{}{}",
+            listener.local_addr()?.port(),
+            descriptor.callback_path
+        );
+        let pkce = generate_pkce();
+        let state = generate_state();
+        let authorize_url = descriptor.authorize_url(&redirect_uri, &state, &pkce)?;
+        eprintln!("{provider} sign-in (PKCE)\n  Open: {authorize_url}");
+        if std::env::var_os("CODEWHALE_PLUGIN_OAUTH_NO_BROWSER").is_none() {
+            let _ = webbrowser::open(&authorize_url);
+        }
+        let code = wait_for_callback_validated(
+            &[listener],
+            &descriptor.callback_params(),
+            &state,
+            Some(&descriptor.issuer),
+        )?;
+        crate::plugins::providers::verify_provider_binding(
+            &authority,
+            &provider,
+            &base_url,
+            &descriptor,
+            None,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut form = vec![
+            ("grant_type", "authorization_code"),
+            ("client_id", descriptor.client_id.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("code", code.as_str()),
+            ("code_verifier", pkce.verifier.as_str()),
+        ];
+        if let Some(resource) = &descriptor.resource {
+            form.push(("resource", resource));
+        }
+        let token = plugin_token_response(&descriptor, &form, None)?;
+        crate::plugins::providers::verify_provider_binding(
+            &authority,
+            &provider,
+            &base_url,
+            &descriptor,
+            None,
+        )
+        .map_err(anyhow::Error::msg)?;
+        codewhale_secrets::Secrets::auto_detect().set(&slot, &serde_json::to_string(&token)?)?;
+        Ok(())
+    })
+    .await
+    .context("Plugin OAuth login worker failed")?
+}
+
+/// Prompt-free stored-login status. Readiness reads only this exact host-owned
+/// secure slot, without refreshing, migrating or contacting the issuer.
+pub fn plugin_oauth_credentials_present(
+    provider: &str,
+    base_url: &str,
+    descriptor: &PluginOAuthConfig,
+) -> Result<bool> {
+    let slot = plugin_oauth_slot(provider, base_url, descriptor)?;
+    let secrets = codewhale_secrets::Secrets::auto_detect_read_only();
+    let Some(raw) = secrets.get(&slot)? else {
+        return Ok(false);
+    };
+    plugin_oauth_saved_token(&raw)
+}
+
+fn plugin_oauth_saved_token(raw: &str) -> Result<bool> {
+    let token: PluginOAuthTokens = serde_json::from_str(raw)
+        .map_err(|_| anyhow::anyhow!("Plugin OAuth credential store contains invalid data"))?;
+    let now = now_unix_secs().context("System clock before UNIX epoch")? as u64;
+    Ok(!token.access_token.trim().is_empty()
+        && (token.expires_at > now
+            || token
+                .refresh_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty())))
+}
+
+/// Resolve only the exact provider, endpoint and descriptor-bound credential.
+/// Async consumers must call this sync secure-store/HTTP worker off-runtime.
+pub fn plugin_oauth_access_token(
+    provider: &str,
+    base_url: &str,
+    descriptor: &PluginOAuthConfig,
+    read_only: bool,
+) -> Result<String> {
+    let slot = plugin_oauth_slot(provider, base_url, descriptor)?;
+    let secrets = if read_only {
+        codewhale_secrets::Secrets::auto_detect_read_only()
+    } else {
+        codewhale_secrets::Secrets::auto_detect()
+    };
+    plugin_oauth_access_token_with_store(&slot, descriptor, read_only, &secrets)
+}
+
+fn plugin_oauth_access_token_with_store(
+    slot: &str,
+    descriptor: &PluginOAuthConfig,
+    read_only: bool,
+    secrets: &codewhale_secrets::Secrets,
+) -> Result<String> {
+    let resolve = |raw: &mut Option<String>| -> Result<String> {
+        let stored = raw.as_ref().context(
+            "Plugin OAuth login missing; run codewhale auth plugin-login --provider <provider>",
+        )?;
+        let mut token: PluginOAuthTokens = serde_json::from_str(stored)
+            .map_err(|_| anyhow::anyhow!("Plugin OAuth credential store contains invalid data"))?;
+        let now = now_unix_secs().context("System clock before UNIX epoch")? as u64;
+        if now.saturating_add(60) >= token.expires_at {
+            anyhow::ensure!(
+                !read_only,
+                "Plugin OAuth token expired; diagnostics never refresh credentials"
+            );
+            let refresh = token
+                .refresh_token
+                .as_ref()
+                .context("Plugin OAuth token expired; sign in again")?;
+            let mut form = vec![
+                ("grant_type", "refresh_token"),
+                ("client_id", descriptor.client_id.as_str()),
+                ("refresh_token", refresh.as_str()),
+            ];
+            if let Some(resource) = &descriptor.resource {
+                form.push(("resource", resource));
+            }
+            token = plugin_token_response(descriptor, &form, Some(refresh.clone()))?;
+            *raw = Some(serde_json::to_string(&token)?);
+        }
+        Ok(token.access_token)
+    };
+    if read_only {
+        return resolve(&mut secrets.get(slot)?);
+    }
+    // Serialize rotating refresh grants with the existing backend authority:
+    // concurrent inference cannot replay an already consumed refresh token.
+    secrets
+        .with_entry_transaction(slot, |raw| {
+            resolve(raw)
+                .map_err(|error| codewhale_secrets::SecretsError::Keyring(error.to_string()))
+        })
+        .map_err(Into::into)
+}
+
+/// Local logout is authoritative; declarative plugins do not get a remote
+/// revocation hook or raw refresh token.
+pub fn plugin_oauth_logout(
+    provider: &str,
+    base_url: &str,
+    descriptor: &PluginOAuthConfig,
+) -> Result<()> {
+    let slot = plugin_oauth_slot(provider, base_url, descriptor)?;
+    codewhale_secrets::Secrets::auto_detect().delete(&slot)?;
+    Ok(())
+}
+
 /// Pending-login test constructor shared by the activation tests.
 #[cfg(test)]
 pub(crate) fn pending_login_for_test(
@@ -3730,7 +4168,7 @@ mod tests {
         format!("header.{payload}.sig")
     }
 
-    fn chatgpt() -> &'static OAuthProviderParams {
+    fn chatgpt() -> &'static OAuthProviderParams<'static> {
         oauth_provider_params(OAuthProvider::Chatgpt)
     }
 
@@ -5584,5 +6022,382 @@ consent_version = 1
         let rendered = format!("{activation:?}");
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("secret-access"));
+    }
+}
+
+#[cfg(test)]
+mod plugin_oauth_tests {
+    use super::*;
+
+    fn descriptor() -> PluginOAuthConfig {
+        PluginOAuthConfig {
+            issuer: "https://issuer.example".into(),
+            authorization_endpoint: "https://issuer.example/authorize".into(),
+            token_endpoint: "https://issuer.example/token".into(),
+            client_id: "public-client".into(),
+            scopes: vec!["models:invoke".into()],
+            resource: Some("https://api.example/oauth".into()),
+            callback_path: plugin_callback_path(),
+        }
+    }
+
+    #[test]
+    fn plugin_oauth_rejects_insecure_or_cross_origin_endpoints() {
+        let mut config = descriptor();
+        assert!(config.validate().is_ok());
+        config.token_endpoint = "https://attacker.example/token".into();
+        assert!(config.validate().is_err());
+        config.token_endpoint = "http://issuer.example/token".into();
+        assert!(config.validate().is_err());
+        config.token_endpoint = "https://issuer.example/token?secret=value".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn plugin_oauth_callback_rejects_duplicate_state_and_issuer_mixup() {
+        assert!(
+            validate_plugin_callback(
+                "code=x&state=s&iss=https%3A%2F%2Fissuer.example",
+                "https://issuer.example"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_plugin_callback("code=x&state=s&state=other", "https://issuer.example")
+                .is_err()
+        );
+        assert!(
+            validate_plugin_callback(
+                "code=x&state=s&iss=https%3A%2F%2Fattacker.example",
+                "https://issuer.example"
+            )
+            .is_err()
+        );
+        assert!(validate_plugin_callback("error=access_denied", "https://issuer.example").is_err());
+    }
+
+    #[test]
+    fn plugin_oauth_binding_is_exact_and_authorization_uses_pkce_resource() {
+        let config = descriptor();
+        let slot = plugin_oauth_slot("example", "https://api.example/v1", &config).unwrap();
+        assert_ne!(
+            slot,
+            plugin_oauth_slot("other", "https://api.example/v1", &config).unwrap()
+        );
+        assert_ne!(
+            slot,
+            plugin_oauth_slot("example", "https://other.example/v1", &config).unwrap()
+        );
+        let mut changed = config.clone();
+        changed.scopes.push("balance:read".into());
+        assert_ne!(
+            slot,
+            plugin_oauth_slot("example", "https://api.example/v1", &changed).unwrap()
+        );
+        let pkce = generate_pkce();
+        let url = reqwest::Url::parse(
+            &config
+                .authorize_url("http://127.0.0.1:1234/oauth/callback", "state", &pkce)
+                .unwrap(),
+        )
+        .unwrap();
+        let pairs: BTreeMap<_, _> = url.query_pairs().collect();
+        assert_eq!(pairs.get("code_challenge_method").unwrap(), "S256");
+        assert_eq!(pairs.get("resource").unwrap(), "https://api.example/oauth");
+        assert!(!url.as_str().contains(&pkce.verifier));
+    }
+
+    #[test]
+    fn plugin_oauth_diagnostics_do_not_refresh_or_mutate_expired_credentials() {
+        let secrets = codewhale_secrets::Secrets::new(std::sync::Arc::new(
+            codewhale_secrets::InMemoryKeyringStore::default(),
+        ));
+        let config = descriptor();
+        let raw = serde_json::to_string(&PluginOAuthTokens {
+            access_token: "expired".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at: 1,
+        })
+        .unwrap();
+        secrets.set("test-slot", &raw).unwrap();
+        assert!(plugin_oauth_saved_token(&raw).unwrap());
+        let unusable = serde_json::to_string(&PluginOAuthTokens {
+            access_token: "expired".into(),
+            refresh_token: None,
+            expires_at: 1,
+        })
+        .unwrap();
+        assert!(!plugin_oauth_saved_token(&unusable).unwrap());
+        let error =
+            plugin_oauth_access_token_with_store("test-slot", &config, true, &secrets).unwrap_err();
+        assert!(error.to_string().contains("diagnostics never refresh"));
+        assert_eq!(
+            secrets.get("test-slot").unwrap().as_deref(),
+            Some(raw.as_str())
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_oauth_refresh_rotation_serializes_concurrent_requests() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=old-refresh"))
+            .and(body_string_contains("resource=https%3A%2F%2Fapi.example%2Foauth"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"access_token":"fresh", "refresh_token":"rotated", "expires_in":3600, "token_type":"Bearer"})))
+            .expect(1).mount(&server).await;
+        let mut config = descriptor();
+        config.issuer = server.uri();
+        config.authorization_endpoint = format!("{}/authorize", server.uri());
+        config.token_endpoint = format!("{}/token", server.uri());
+        let secrets = std::sync::Arc::new(codewhale_secrets::Secrets::new(std::sync::Arc::new(
+            codewhale_secrets::InMemoryKeyringStore::default(),
+        )));
+        secrets
+            .set(
+                "rotation",
+                &serde_json::to_string(&PluginOAuthTokens {
+                    access_token: "expired".into(),
+                    refresh_token: Some("old-refresh".into()),
+                    expires_at: 1,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let config = config.clone();
+            let secrets = secrets.clone();
+            workers.push(tokio::task::spawn_blocking(move || {
+                plugin_oauth_access_token_with_store("rotation", &config, false, &secrets)
+            }));
+        }
+        for worker in workers {
+            assert_eq!(worker.await.unwrap().unwrap(), "fresh");
+        }
+        let stored: PluginOAuthTokens =
+            serde_json::from_str(&secrets.get("rotation").unwrap().unwrap()).unwrap();
+        assert_eq!(stored.refresh_token.as_deref(), Some("rotated"));
+        secrets.delete("rotation").unwrap();
+        assert!(
+            plugin_oauth_access_token_with_store("rotation", &config, false, &secrets).is_err()
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_oauth_failed_refresh_preserves_secret_without_exposing_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({"error":"invalid_grant", "error_description":"secret-response-material"})))
+            .expect(1).mount(&server).await;
+        let mut config = descriptor();
+        config.issuer = server.uri();
+        config.authorization_endpoint = format!("{}/authorize", server.uri());
+        config.token_endpoint = format!("{}/token", server.uri());
+        let secrets = codewhale_secrets::Secrets::new(std::sync::Arc::new(
+            codewhale_secrets::InMemoryKeyringStore::default(),
+        ));
+        let raw = serde_json::to_string(&PluginOAuthTokens {
+            access_token: "expired".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at: 1,
+        })
+        .unwrap();
+        secrets.set("denied", &raw).unwrap();
+        let (error, unchanged) = tokio::task::spawn_blocking(move || {
+            let error = plugin_oauth_access_token_with_store("denied", &config, false, &secrets)
+                .unwrap_err();
+            (error.to_string(), secrets.get("denied").unwrap().unwrap())
+        })
+        .await
+        .unwrap();
+        assert!(error.contains("HTTP 400"));
+        assert!(!error.contains("secret-response-material"));
+        assert_eq!(unchanged, raw);
+        server.verify().await;
+    }
+    #[test]
+    fn plugin_oauth_reviewed_provider_real_client_refresh_chat_catalog_and_revocation() {
+        use crate::client::CodewhaleClient;
+        use crate::llm_client::LlmClient;
+        use crate::plugins::discovery::{DiscoveryConfig, discover_with_config};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let _env = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().unwrap();
+        let _home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path().join("owned"));
+        let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let root = temp.path().to_owned();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path("/token"))
+                .and(body_string_contains("refresh_token=old-refresh"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"access_token":"rotated-access", "refresh_token":"rotated-refresh", "expires_in":3600, "token_type":"Bearer"})))
+                .expect(1).mount(&server).await;
+            Mock::given(method("GET")).and(path("/v1/models"))
+                .and(header("authorization", "Bearer rotated-access"))
+                .and(header("x-fixture-route", "main"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":[{"id":"fixture-model", "object":"model"}]})))
+                .expect(1).mount(&server).await;
+            Mock::given(method("POST")).and(path("/v1/chat/completions"))
+                .and(header("authorization", "Bearer rotated-access"))
+                .and(header("x-fixture-route", "main"))
+                .and(|request: &wiremock::Request| serde_json::from_slice::<serde_json::Value>(&request.body).is_ok_and(|body| body.get("stream").is_none()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":"fixture", "object":"chat.completion", "model":"fixture-model", "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}], "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}})))
+                .expect(1).mount(&server).await;
+            Mock::given(method("POST")).and(path("/v1/chat/completions"))
+                .and(header("authorization", "Bearer rotated-access"))
+                .and(header("x-fixture-route", "main"))
+                .and(body_string_contains("\"stream\":true"))
+                .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/event-stream").set_body_string("data: {\"id\":\"fixture\",\"object\":\"chat.completion.chunk\",\"model\":\"fixture-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"))
+                .expect(1).mount(&server).await;
+            let issuer = server.uri();
+            let (live, discovery, slot) = tokio::task::spawn_blocking(move || {
+                let workspace = root.join("workspace");
+                let plugin = root.join("plugins/provider-fixture");
+                std::fs::create_dir_all(&workspace).unwrap();
+                std::fs::create_dir_all(&plugin).unwrap();
+                let mut config = descriptor();
+                config.issuer = issuer.clone();
+                config.authorization_endpoint = format!("{issuer}/authorize");
+                config.token_endpoint = format!("{issuer}/token");
+                let declared_base_url = format!("{issuer}/v1/");
+                let manifest = serde_json::json!({
+                    "$schema": crate::plugins::agent_plugin::PLUGIN_SCHEMA_URL,
+                    "name":"provider-fixture", "version":"1.0.0",
+                    "extensions":{"net.codewhale":{"providers":{"fixture-gateway":{
+                        "base_url":declared_base_url, "model":"fixture-model", "models":["fixture-model"], "http_headers":{"X-Fixture-Route":"main"}, "oauth":config
+                    }}}}
+                });
+                std::fs::write(plugin.join("plugin.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+                let discovery = DiscoveryConfig { workspace:workspace.clone(), user_plugins_dir:root.join("plugins"), workspace_plugins_dir:workspace.join(".codewhale/plugins"), builtin_plugin_dirs:vec![], state_path:root.join("state/plugins.json") };
+                let mut registry = discover_with_config(&discovery);
+                registry.trust("provider-fixture").unwrap();
+                registry.enable("provider-fixture").unwrap();
+                let registry = discover_with_config(&discovery);
+                let mut live = Config { provider:Some("fixture-gateway".into()), http_headers:Some(std::collections::HashMap::from([
+                    ("Authorization".into(), "Bearer ambient-global".into()),
+                    ("X-Api-Key".into(), "ambient-global".into()),
+                    ("Cookie".into(), "secret=ambient-global".into()),
+                    ("X-Unreviewed".into(), "ambient-global".into()),
+                ])), ..Config::default() };
+                crate::plugins::providers::apply_providers(&mut live, &registry).unwrap();
+                let auth_entry = crate::plugins::providers::plugin_auth_entry(
+                    &live,
+                    "fixture-gateway",
+                )
+                .unwrap();
+                let base_url = auth_entry.base_url.unwrap();
+                assert_eq!(base_url, format!("{issuer}/v1"));
+                assert_eq!(base_url, live.base_url_for_route_identity(crate::config::ApiProvider::Custom, "fixture-gateway"));
+                let slot = plugin_oauth_slot("fixture-gateway", &base_url, &config).unwrap();
+                let secrets = codewhale_secrets::Secrets::auto_detect();
+                let expired = PluginOAuthTokens { access_token:"private-expired-token".into(), refresh_token:Some("old-refresh".into()), expires_at:1 };
+                secrets.set(&slot, &serde_json::to_string(&expired).unwrap()).unwrap();
+                assert!(crate::config::has_api_key(&live));
+                assert!(crate::config::has_api_key_for(&live, crate::config::ApiProvider::Custom));
+                (live, discovery, slot)
+            }).await.unwrap();
+            // Exercise the real async constructor with an already-expired
+            // stored credential: only the actual request worker may refresh.
+            let (generic_key, source) = live.active_route_api_key_with_source().unwrap();
+            assert!(generic_key.is_empty());
+            assert_eq!(source, "host-managed plugin OAuth");
+            assert!(live.active_route_api_key_read_only().unwrap().is_empty());
+            let diagnostic = live.with_read_only_api_key_for_diagnostic().unwrap();
+            assert!(diagnostic.plugin_oauth_read_only);
+            assert!(!live.plugin_oauth_read_only);
+            let diagnostic_client = CodewhaleClient::new(&diagnostic).unwrap();
+            assert!(diagnostic_client.list_models().await.is_err());
+            assert!(server.received_requests().await.unwrap().is_empty());
+            // Even a valid stored credential for an in-memory endpoint edit
+            // cannot reuse the receipt for the originally reviewed declaration.
+            let mut altered = live.clone();
+            let altered_base = format!("{}/other", server.uri());
+            let altered_entry = altered.providers.as_mut().unwrap().custom.get_mut("fixture-gateway").unwrap();
+            altered_entry.base_url = Some(altered_base.clone());
+            let altered_descriptor = altered_entry.oauth.clone().unwrap();
+            tokio::task::spawn_blocking(move || {
+                let altered_slot = plugin_oauth_slot("fixture-gateway", &altered_base, &altered_descriptor).unwrap();
+                let credential = PluginOAuthTokens { access_token:"review-bypass-token".into(), refresh_token:None, expires_at:(now_unix_secs().unwrap() as u64).saturating_add(3600) };
+                codewhale_secrets::Secrets::auto_detect().set(&altered_slot, &serde_json::to_string(&credential).unwrap()).unwrap();
+            }).await.unwrap();
+            let altered_client = CodewhaleClient::new(&altered).unwrap();
+            assert!(altered_client.list_models().await.is_err());
+            assert!(server.received_requests().await.unwrap().is_empty());
+            let client = CodewhaleClient::new(&live).unwrap();
+            assert!(server.received_requests().await.unwrap().is_empty());
+            let models = client.list_models().await.unwrap();
+            assert!(models.iter().any(|model| model.id == "fixture-model"));
+            let input = codewhale_models::MessageRequest {
+                model:"fixture-model".into(), messages:vec![codewhale_models::Message { role:codewhale_models::Role::User, content:vec![codewhale_models::ContentBlock::Text { text:"hello".into(), cache_control:None }] }], max_tokens:8,
+                system:None, tools:None, tool_choice:None, metadata:None, thinking:None, reasoning_effort:None, stream:Some(false), temperature:None, top_p:None,
+            };
+            client.create_message(input.clone()).await.unwrap();
+            let mut stream_input = input.clone();
+            stream_input.stream = Some(true);
+            let mut stream = client.create_message_stream(stream_input).await.unwrap();
+            let mut count = 0;
+            while let Some(event) = stream.next().await { event.unwrap(); count += 1; }
+            assert!(count > 0);
+            let refresh_started = std::sync::Arc::new(tokio::sync::Notify::new());
+            let notify_refresh = std::sync::Arc::clone(&refresh_started);
+            Mock::given(method("POST")).and(path("/token"))
+                .and(body_string_contains("refresh_token=rotated-refresh"))
+                .respond_with(move |_request: &wiremock::Request| {
+                    notify_refresh.notify_one();
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(2))
+                        .set_body_json(serde_json::json!({"access_token":"revoked-during-refresh", "refresh_token":"new-refresh", "expires_in":3600, "token_type":"Bearer"}))
+                })
+                .expect(1).mount(&server).await;
+            let seed_slot = slot.clone();
+            tokio::task::spawn_blocking(move || {
+                let expired = PluginOAuthTokens { access_token:"rotated-access".into(), refresh_token:Some("rotated-refresh".into()), expires_at:1 };
+                codewhale_secrets::Secrets::auto_detect().set(&seed_slot, &serde_json::to_string(&expired).unwrap()).unwrap();
+            }).await.unwrap();
+            let before_refresh = server.received_requests().await.unwrap().len();
+            let revoked_config = live.clone();
+            let revoke = async move {
+                refresh_started.notified().await;
+                tokio::task::spawn_blocking(move || {
+                let mut registry = discover_with_config(&discovery);
+                registry.disable("provider-fixture").unwrap();
+                assert!(!crate::config::has_api_key_for(&revoked_config, crate::config::ApiProvider::Custom));
+                // Private material can remain in secure storage; receipt revocation
+                // must still prevent reuse by an already constructed client.
+                assert!(codewhale_secrets::Secrets::auto_detect().get(&slot).unwrap().is_some());
+                }).await.unwrap();
+            };
+            let (during_refresh, ()) = tokio::join!(client.list_models(), revoke);
+            assert!(during_refresh.is_err());
+            // The already-authorized refresh may complete; the model request
+            // must not leave the host after receipt revocation during that wait.
+            assert_eq!(server.received_requests().await.unwrap().len(), before_refresh + 1);
+            let before = server.received_requests().await.unwrap().len();
+            assert!(client.list_models().await.is_err());
+            // Two failures trigger the actual /models recovery probe. It must
+            // obey the same review check and make no extra network request.
+            for _ in 0..2 { assert!(client.create_message(input.clone()).await.is_err()); }
+            assert_eq!(server.received_requests().await.unwrap().len(), before);
+            for request in server.received_requests().await.unwrap() {
+                for header in ["x-api-key", "cookie", "x-unreviewed"] {
+                    assert!(!request.headers.contains_key(header));
+                }
+                assert!(request.headers.get("authorization").is_none_or(|value| value != "Bearer ambient-global"));
+            }
+            server.verify().await;
+        });
     }
 }

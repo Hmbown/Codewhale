@@ -13,6 +13,7 @@ pub mod marketplace;
 pub mod matcher;
 pub mod mutation;
 mod path_identity;
+pub mod providers;
 pub mod recommend;
 pub mod registry;
 pub mod runtime;

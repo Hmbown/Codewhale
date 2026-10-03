@@ -2988,6 +2988,9 @@ pub(crate) struct AccountModelAccess {
 /// Resolved CLI configuration, including defaults and environment overrides.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
+    /// Diagnostic clones must never refresh or mutate plugin OAuth credentials.
+    #[serde(skip)]
+    pub(crate) plugin_oauth_read_only: bool,
     /// Never deserialized from disk or exposed as provider configuration.
     #[serde(skip)]
     pub(crate) account_model_access:
@@ -3916,6 +3919,9 @@ pub struct ProviderConfig {
     pub wire: Option<String>,
     #[serde(alias = "authMode")]
     pub auth_mode: Option<String>,
+    /// Core-owned public-client OAuth descriptor for a named plugin provider.
+    #[serde(default)]
+    pub oauth: Option<crate::oauth::PluginOAuthConfig>,
     /// Validated basename of the active Codewhale-owned xAI OAuth generation.
     /// The file always lives below Codewhale's private credentials directory.
     #[serde(default, alias = "oauthCredentialGeneration")]
@@ -3951,6 +3957,9 @@ pub struct ProviderConfig {
     /// than silently routing as OpenAI. Built-in providers leave this unset.
     #[serde(default)]
     pub kind: Option<String>,
+    /// Runtime-only receipt; a config file cannot manufacture plugin authority.
+    #[serde(skip)]
+    pub plugin_authority: Option<crate::plugins::types::PluginAuthority>,
     /// Name of the environment variable holding this custom provider's API key
     /// (#1519), e.g. `api_key_env = "EXAMPLE_API_KEY"`. The key value itself is
     /// never stored in config; only the env var name is.
@@ -5121,6 +5130,7 @@ impl Config {
         apply_env_overrides(&mut config, environment_policy);
         apply_managed_overrides(&mut config)?;
         apply_requirements(&mut config)?;
+        crate::plugins::providers::apply_startup_providers(&mut config)?;
         normalize_model_config(&mut config);
         config.exec_policy_engine = load_sibling_exec_policy_engine(path.as_deref())?;
         config.loaded_config_path = path.as_deref().map(std::path::absolute).transpose()?;
@@ -7170,8 +7180,16 @@ impl Config {
     /// persisted.
     pub(crate) fn with_read_only_api_key_for_diagnostic(&self) -> Result<Self> {
         let provider = self.api_provider();
-        let api_key = self.active_route_api_key_read_only()?;
         let mut diagnostic = self.clone();
+        if provider == ApiProvider::Custom
+            && self
+                .provider_config_for(provider)
+                .is_some_and(|entry| entry.oauth.is_some())
+        {
+            diagnostic.plugin_oauth_read_only = true;
+            return Ok(diagnostic);
+        }
+        let api_key = self.active_route_api_key_read_only()?;
         diagnostic.set_provider_api_key_override(provider, Some(api_key));
         Ok(diagnostic)
     }
@@ -7186,6 +7204,29 @@ impl Config {
             anyhow::bail!(codewhale_config::LEGACY_ANTIGRAVITY_TOMBSTONE_MESSAGE);
         }
         let auth_mode = self.auth_mode_for_provider(provider);
+        if provider == ApiProvider::Custom
+            && let Some(entry) = self.provider_config_for(provider)
+            && let Some(oauth) = entry.oauth.as_ref()
+        {
+            entry
+                .plugin_authority
+                .as_ref()
+                .context("Plugin OAuth route lacks an approved plugin authority")?;
+            anyhow::ensure!(
+                auth_mode.as_deref() == Some("oauth"),
+                "Plugin OAuth route requires auth_mode = oauth"
+            );
+            self.provider
+                .as_deref()
+                .context("Plugin OAuth route has no provider name")?;
+            oauth.validate()?;
+            // Generic config/client construction must never read secure storage,
+            // hash plugin files or refresh OAuth on an async caller's thread.
+            // The request worker verifies the receipt, resolves the bound token
+            // and checks revocation again immediately before each actual send.
+            return Ok((String::new(), "host-managed plugin OAuth".to_string()));
+        }
+
         if auth_mode_disables_api_key(auth_mode.as_deref()) {
             return Ok(keyless());
         }
@@ -11389,7 +11430,7 @@ fn model_for_provider(provider: ApiProvider, normalized: String) -> String {
     }
 }
 
-fn normalize_base_url(base: &str) -> String {
+pub(crate) fn normalize_base_url(base: &str) -> String {
     let trimmed = base.trim_end_matches('/');
     let deepseek_domains = ["api.deepseek.com", "api.deepseeki.com"];
     if deepseek_domains
@@ -11662,6 +11703,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         },
         legacy_root: base.legacy_root,
         account_model_access: base.account_model_access,
+        plugin_oauth_read_only: base.plugin_oauth_read_only || override_cfg.plugin_oauth_read_only,
         runtime_chat_isolated: override_cfg.runtime_chat_isolated || base.runtime_chat_isolated,
         runtime_thread_inference_unrelated: override_cfg.runtime_thread_inference_unrelated
             || base.runtime_thread_inference_unrelated,
@@ -11735,6 +11777,8 @@ fn merge_provider_config(base: ProviderConfig, override_cfg: ProviderConfig) -> 
         mode: override_cfg.mode.or(base.mode),
         wire: override_cfg.wire.or(base.wire),
         auth_mode: override_cfg.auth_mode.or(base.auth_mode),
+        oauth: override_cfg.oauth.or(base.oauth),
+        plugin_authority: base.plugin_authority,
         oauth_credential_generation: override_cfg
             .oauth_credential_generation
             .or(base.oauth_credential_generation),
@@ -12827,6 +12871,14 @@ fn user_global_config_api_key(provider: ApiProvider) -> Option<String> {
 /// prompt for a key inline.
 #[must_use]
 pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
+    if provider == ApiProvider::Custom
+        && config
+            .provider_config_for(provider)
+            .is_some_and(|entry| entry.oauth.is_some())
+    {
+        return crate::provider_readiness::credential_state_for_provider(config, provider)
+            == crate::provider_readiness::CredentialState::Saved;
+    }
     credential_resolve::resolve_credential_source(config, provider).is_present()
 }
 

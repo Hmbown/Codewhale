@@ -104,6 +104,13 @@ pub(crate) fn auth_class_for_provider(
     config: &crate::config::Config,
     provider: ApiProvider,
 ) -> ProviderAuthClass {
+    if provider == ApiProvider::Custom
+        && config
+            .provider_config_for(provider)
+            .is_some_and(|entry| entry.oauth.is_some())
+    {
+        return ProviderAuthClass::OAuth;
+    }
     let auth_mode = config.auth_mode_for_provider(provider);
     if crate::config::auth_mode_disables_api_key(auth_mode.as_deref()) {
         return ProviderAuthClass::NoAuth;
@@ -141,6 +148,39 @@ pub(crate) fn credential_state_for_provider(
     config: &crate::config::Config,
     provider: ApiProvider,
 ) -> CredentialState {
+    // Plugin OAuth takes precedence over local/keyless and legacy custom
+    // classifications. Diagnostics only read the bound credential; they never
+    // refresh, migrate storage or turn a missing login into API-key fallback.
+    if provider == ApiProvider::Custom
+        && config
+            .provider_config_for(provider)
+            .is_some_and(|entry| entry.oauth.is_some())
+    {
+        let stored = config.provider_config_for(provider).is_some_and(|entry| {
+            let Some(authority) = entry.plugin_authority.as_ref() else {
+                return false;
+            };
+            if crate::plugins::registry::verify_plugin_component_authority(
+                authority,
+                crate::plugins::activation::PluginActivationCapability::Providers,
+            )
+            .is_err()
+            {
+                return false;
+            }
+            crate::oauth::plugin_oauth_credentials_present(
+                &config.provider_identity_for(provider),
+                &config.base_url_for_route(provider),
+                entry.oauth.as_ref().unwrap(),
+            )
+            .unwrap_or(false)
+        });
+        return if config.auth_mode_for_provider(provider).as_deref() == Some("oauth") && stored {
+            CredentialState::Saved
+        } else {
+            CredentialState::MissingLogin
+        };
+    }
     let auth_mode = config.auth_mode_for_provider(provider);
     if crate::config::auth_mode_disables_api_key(auth_mode.as_deref()) {
         return CredentialState::NoAuth;
@@ -692,6 +732,42 @@ fn sanitize_message(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_oauth_readiness_requires_login_even_on_a_local_custom_route() {
+        let mut config = crate::config::Config {
+            provider: Some("plugin-test".into()),
+            ..Default::default()
+        };
+        let entry = config.provider_config_for_mut(ApiProvider::Custom);
+        entry.kind = Some("openai-compatible".into());
+        entry.base_url = Some("http://127.0.0.1:12345/api".into());
+        entry.auth_mode = Some("oauth".into());
+        entry.oauth = Some(crate::oauth::PluginOAuthConfig {
+            issuer: "http://127.0.0.1:12345".into(),
+            authorization_endpoint: "http://127.0.0.1:12345/authorize".into(),
+            token_endpoint: "http://127.0.0.1:12345/token".into(),
+            client_id: "plugin-test".into(),
+            scopes: vec!["models:invoke".into()],
+            resource: None,
+            callback_path: "/oauth/callback".into(),
+        });
+        // An absent receipt is rejected before any credential file is read.
+        assert_eq!(
+            auth_class_for_provider(&config, ApiProvider::Custom),
+            ProviderAuthClass::OAuth
+        );
+        assert_eq!(
+            credential_state_for_provider(&config, ApiProvider::Custom),
+            CredentialState::MissingLogin
+        );
+        config.auth_mode = Some("none".into());
+        assert_eq!(
+            credential_state_for_provider(&config, ApiProvider::Custom),
+            CredentialState::MissingLogin
+        );
+    }
+
     use crate::error_taxonomy::ErrorSeverity;
 
     fn resolve_test_route(

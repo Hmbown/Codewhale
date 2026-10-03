@@ -279,6 +279,10 @@ pub struct CodewhaleClient {
     /// Where `api_key` came from (secret store slot, config file, env var
     /// name, CLI, OAuth, …), named in authentication errors (#6528).
     api_key_source: String,
+    /// Reviewed runtime authority and OAuth descriptor travel with the frozen route.
+    plugin_provider: Option<crate::config::ProviderConfig>,
+    /// Read-only diagnostic probes must never migrate or refresh the grant.
+    plugin_oauth_read_only: bool,
     /// Exact configured credential values removed from model-bound tool
     /// results. Structural redaction handles config/JSON assignments, while
     /// this list closes the gap for bare provider tokens with no recognizable
@@ -617,6 +621,8 @@ impl Clone for CodewhaleClient {
             http1_client: self.http1_client.clone(),
             api_key: self.api_key.clone(),
             api_key_source: self.api_key_source.clone(),
+            plugin_provider: self.plugin_provider.clone(),
+            plugin_oauth_read_only: self.plugin_oauth_read_only,
             model_bound_secret_values: Arc::clone(&self.model_bound_secret_values),
             catalog_error_secret_values: Arc::clone(&self.catalog_error_secret_values),
             model_bound_masking: self.model_bound_masking,
@@ -1579,6 +1585,27 @@ impl CodewhaleClient {
     ) -> Result<Self> {
         let api_provider = config.api_provider();
         let provider_identity = config.provider_identity_for(api_provider);
+        let plugin_provider = config
+            .provider_config_for(api_provider)
+            .filter(|entry| entry.plugin_authority.is_some())
+            .cloned();
+        if let Some(entry) = &plugin_provider {
+            anyhow::ensure!(
+                entry.oauth.is_some()
+                    && config.auth_mode_for_provider(api_provider).as_deref() == Some("oauth"),
+                "plugin provider requires host-managed OAuth"
+            );
+        }
+        let base_url = if plugin_provider.is_some() {
+            let reviewed = config.base_url_for_route_identity(api_provider, &provider_identity);
+            anyhow::ensure!(
+                reqwest::Url::parse(&base_url)? == reqwest::Url::parse(&reviewed)?,
+                "plugin candidate changed its reviewed provider endpoint"
+            );
+            reviewed
+        } else {
+            base_url
+        };
         let openrouter_vendor = config.openrouter_vendor()?;
         let billing_surface = crate::route_billing::billing_surface_for_dispatch(
             Some(config),
@@ -1634,7 +1661,12 @@ impl CodewhaleClient {
                 "HTTP/1.1 pinned (stream configuration or environment) — HTTP/2 disabled",
             );
         }
-        let http_headers = config.http_headers();
+        // A newly reviewed plugin destination must not inherit credentials or
+        // routing headers from unrelated, global provider configuration.
+        let http_headers = plugin_provider.as_ref().map_or_else(
+            || config.http_headers(),
+            |entry| entry.http_headers.clone().unwrap_or_default(),
+        );
         let auth_disabled =
             auth_mode_disables_api_key(config.auth_mode_for_provider(api_provider).as_deref());
         let insecure_skip_tls_verify = config.insecure_skip_tls_verify();
@@ -1690,7 +1722,12 @@ impl CodewhaleClient {
             auth_disabled,
             force_http1,
             config,
-        )?
+        )?;
+        let http_client = if plugin_provider.is_some() {
+            http_client.redirect(reqwest::redirect::Policy::none())
+        } else {
+            http_client
+        }
         .build()?;
         let models_http_client = Self::http_client_builder_with_auth_mode(
             &api_key,
@@ -1716,7 +1753,12 @@ impl CodewhaleClient {
             auth_disabled,
             true,
             config,
-        )?
+        )?;
+        let http1_client = if plugin_provider.is_some() {
+            http1_client.redirect(reqwest::redirect::Policy::none())
+        } else {
+            http1_client
+        }
         .build()?;
 
         let catalog_error_secret_values = Arc::new(catalog_error_secret_values(
@@ -1730,6 +1772,8 @@ impl CodewhaleClient {
             http1_client,
             api_key,
             api_key_source,
+            plugin_provider,
+            plugin_oauth_read_only: config.plugin_oauth_read_only,
             model_bound_secret_values,
             catalog_error_secret_values,
             model_bound_masking,
@@ -1761,6 +1805,62 @@ impl CodewhaleClient {
             stream_open_timeout,
             force_http1,
         })
+    }
+
+    /// Revalidate revocation and refresh host-owned OAuth before each actual send.
+    /// Plugin code receives neither the access token nor the refresh token.
+    pub(super) async fn authorize_plugin_request(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder> {
+        let Some(provider) = self.plugin_provider.clone() else {
+            return Ok(request);
+        };
+        let authority = provider
+            .plugin_authority
+            .clone()
+            .context("plugin provider has no authority")?;
+        let name = self.provider_identity.clone();
+        let base_url = self.base_url.clone();
+        let destination = request
+            .try_clone()
+            .context("plugin request cannot be inspected")?
+            .build()?;
+        let base = reqwest::Url::parse(&base_url)?;
+        anyhow::ensure!(
+            destination.url().origin() == base.origin(),
+            "plugin request escaped its reviewed provider origin"
+        );
+        let policy = crate::plugins::activation::extension_host_policy_enabled();
+        let read_only = self.plugin_oauth_read_only;
+        let token = tokio::task::spawn_blocking(move || -> Result<String> {
+            let _scope = crate::plugins::activation::PolicyScope::propagate(policy);
+            let descriptor = provider
+                .oauth
+                .as_ref()
+                .context("plugin provider requires host-managed OAuth")?;
+            let empty_headers = std::collections::HashMap::new();
+            crate::plugins::providers::verify_provider_binding(
+                &authority,
+                &name,
+                &base_url,
+                descriptor,
+                Some(provider.http_headers.as_ref().unwrap_or(&empty_headers)),
+            )
+            .map_err(anyhow::Error::msg)?;
+            let token =
+                crate::oauth::plugin_oauth_access_token(&name, &base_url, descriptor, read_only)?;
+            // Refresh may wait on the issuer. Do not send a model request if
+            // the review was revoked while that HTTP request was in flight.
+            crate::plugins::registry::verify_plugin_component_authority(
+                &authority,
+                crate::plugins::activation::PluginActivationCapability::Providers,
+            )
+            .map_err(anyhow::Error::msg)?;
+            Ok(token)
+        })
+        .await??;
+        Ok(request.bearer_auth(token))
     }
 
     /// Map a failed HTTP response, naming the route, host and key source on
@@ -3189,7 +3289,10 @@ impl CodewhaleClient {
                             .await
                             .map_err(ModelsFetchError::Interactive)?
                     }
-                    ModelsRequestMode::Refresh => build()
+                    ModelsRequestMode::Refresh => self
+                        .authorize_plugin_request(build())
+                        .await
+                        .map_err(|_| CatalogRefreshError::Unauthorized)?
                         .send()
                         .await
                         .map_err(|_| CatalogRefreshError::Network)?,
@@ -3678,12 +3781,19 @@ impl CodewhaleClient {
             return;
         }
         let health_url = api_url(&self.base_url, "models");
-        let probe = self
+        let request = self
             .models_http_client
             .get(health_url)
-            .timeout(NON_STREAMING_HTTP_TIMEOUT)
-            .send()
-            .await;
+            .timeout(NON_STREAMING_HTTP_TIMEOUT);
+        let request = match self.authorize_plugin_request(request).await {
+            Ok(request) => request,
+            Err(error) => {
+                self.mark_request_failure(&format!("probe authorization failed: {error}"))
+                    .await;
+                return;
+            }
+        };
+        let probe = request.send().await;
         match probe {
             Ok(resp) if resp.status().is_success() => {
                 // Consume the response body so the connection can be returned to the pool.
@@ -3721,6 +3831,11 @@ impl CodewhaleClient {
         status: u16,
         raw: &str,
     ) -> String {
+        // Rotated opaque bearer values are not part of this client's frozen
+        // redaction list. Do not disclose an untrusted plugin endpoint's body.
+        if self.plugin_provider.is_some() {
+            return "plugin provider request failed".into();
+        }
         let provider = Some(self.api_provider.display_name());
         let ErrorBodyDisclosure::Guarded { request_secrets } = disclosure else {
             return sanitize_http_error_body(provider, status, raw);
@@ -3783,6 +3898,10 @@ impl CodewhaleClient {
                         tokio::time::sleep(delay.min(RATE_LIMIT_PAUSE_RECHECK_INTERVAL)).await;
                     }
                     self.wait_for_rate_limit().await;
+                    let request = self
+                        .authorize_plugin_request(request)
+                        .await
+                        .map_err(|error| LlmError::Other(error.to_string()))?;
                     let response = request
                         .send()
                         .await
@@ -3876,6 +3995,10 @@ impl CodewhaleClient {
                 let request = build();
                 async move {
                     self.wait_for_rate_limit().await;
+                    let request = self
+                        .authorize_plugin_request(request)
+                        .await
+                        .map_err(|error| LlmError::Other(error.to_string()))?;
                     let response = request
                         .send()
                         .await
@@ -4050,9 +4173,12 @@ impl LlmClient for CodewhaleClient {
         let health_url = api_url(&self.base_url, "models");
         self.wait_for_rate_limit().await;
         let response = self
-            .models_http_client
-            .get(health_url)
-            .timeout(NON_STREAMING_HTTP_TIMEOUT)
+            .authorize_plugin_request(
+                self.models_http_client
+                    .get(health_url)
+                    .timeout(NON_STREAMING_HTTP_TIMEOUT),
+            )
+            .await?
             .send()
             .await;
         match response {

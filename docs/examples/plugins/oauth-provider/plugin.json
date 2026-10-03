@@ -1,0 +1,28 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "oauth-provider-example",
+  "version": "0.1.0",
+  "description": "A reviewed OpenAI-compatible provider using host-owned OAuth PKCE.",
+  "license": "MIT",
+  "extensions": {
+    "net.codewhale": {
+      "providers": {
+        "example-oauth": {
+          "base_url": "https://api.example.com/v1",
+          "model": "example-chat",
+          "models": ["example-chat"],
+          "http_headers": {"X-Project": "example"},
+          "oauth": {
+            "issuer": "https://identity.example.com",
+            "authorization_endpoint": "https://identity.example.com/oauth/authorize",
+            "token_endpoint": "https://identity.example.com/oauth/token",
+            "client_id": "codewhale-public-client",
+            "scopes": ["models:read", "models:invoke"],
+            "resource": "https://api.example.com/v1",
+            "callback_path": "/oauth/example/callback"
+          }
+        }
+      }
+    }
+  }
+}

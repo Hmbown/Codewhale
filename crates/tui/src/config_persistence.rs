@@ -63,6 +63,7 @@ pub(crate) fn migrate_legacy_route_preferences(
             "Could not parse configuration for route preference migration; contents omitted"
         )
     })?;
+    crate::plugins::providers::apply_startup_providers(&mut config)?;
     let previous_config = config.clone();
     let settings =
         crate::settings::Settings::load_legacy_route_preferences_read_only().map_err(|_| {
@@ -176,9 +177,10 @@ pub(crate) fn set_provider_model_document(
         !model.trim().is_empty() && !model.chars().any(char::is_control),
         "model must be nonempty and contain no control characters"
     );
-    let config = crate::config::parse_config_base(&doc.to_string()).map_err(|_| {
+    let mut config = crate::config::parse_config_base(&doc.to_string()).map_err(|_| {
         anyhow::anyhow!("Could not parse destination route identity; contents omitted")
     })?;
+    crate::plugins::providers::apply_startup_providers(&mut config)?;
     let identity = config
         .resolve_provider_pin_identity(provider_identity)
         .map_err(anyhow::Error::msg)?;
@@ -219,8 +221,9 @@ pub(crate) fn persist_provider_selection(
     let path = config_toml_path(config_path)?;
     let ((), undo) = codewhale_config::mutate_config_document_undoable(&path, |doc| {
         migrate_legacy_route_preferences(&path, doc)?;
-        let config = crate::config::parse_config_base(&doc.to_string())
+        let mut config = crate::config::parse_config_base(&doc.to_string())
             .map_err(|_| anyhow::anyhow!("Could not parse destination route; contents omitted"))?;
+        crate::plugins::providers::apply_startup_providers(&mut config)?;
         let identity = config
             .resolve_provider_pin_identity(provider_identity)
             .map_err(anyhow::Error::msg)?;
@@ -309,8 +312,9 @@ pub(crate) fn reconcile_root_model_aliases(
     else {
         return Ok(());
     };
-    let switched = crate::config::parse_config_base(&doc.to_string())
+    let mut switched = crate::config::parse_config_base(&doc.to_string())
         .map_err(|_| anyhow::anyhow!("Could not parse switched route; contents omitted"))?;
+    crate::plugins::providers::apply_startup_providers(&mut switched)?;
     // `Config::validate` is the single authority on what the incoming route can
     // serve, so a writer cannot disagree with the loader. Act only when this
     // alias is what the loader rejects: a document already broken for an

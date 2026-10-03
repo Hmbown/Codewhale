@@ -7,6 +7,9 @@ The [hello-codewhale example](examples/plugins/hello-codewhale/plugin.json)
 contains two files, declares no server or hook, and asks for no tool use.
 This walkthrough takes it from source files to a reviewed, enabled skill.
 
+For a custom AI provider with host-owned OAuth, see [Plugin providers](PLUGIN_PROVIDERS.md)
+and the [provider example](examples/plugins/oauth-provider/plugin.json).
+
 ## 1. Create the bundle
 
 Use the checked-in example, or create this directory outside an installed

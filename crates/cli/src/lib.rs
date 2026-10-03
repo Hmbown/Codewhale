@@ -1642,6 +1642,19 @@ struct AuthArgs {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
+    /// Sign in to a reviewed plugin-defined OAuth provider (PKCE loopback).
+    #[command(name = "plugin-login")]
+    PluginLogin {
+        #[arg(long)]
+        provider: String,
+    },
+    /// Remove host-owned credentials for a plugin-defined provider.
+    #[command(name = "plugin-logout")]
+    PluginLogout {
+        #[arg(long)]
+        provider: String,
+    },
+
     /// Sign in to xAI/Grok with an SSH-friendly device code.
     #[command(name = "xai-device")]
     XaiDevice,
@@ -2394,6 +2407,32 @@ fn run() -> Result<()> {
             run_logout_command(&mut store, cli.profile.as_deref())
         }
         Some(Commands::Auth(args)) => match args.command {
+            AuthCommand::PluginLogin { provider } => {
+                let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+                run_tui_in_process(
+                    &cli,
+                    &resolved_runtime,
+                    vec![
+                        "auth".to_string(),
+                        "plugin-login".to_string(),
+                        "--provider".to_string(),
+                        provider,
+                    ],
+                )
+            }
+            AuthCommand::PluginLogout { provider } => {
+                let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+                run_tui_in_process(
+                    &cli,
+                    &resolved_runtime,
+                    vec![
+                        "auth".to_string(),
+                        "plugin-logout".to_string(),
+                        "--provider".to_string(),
+                        provider,
+                    ],
+                )
+            }
             AuthCommand::XaiDevice => {
                 let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
                 run_tui_in_process(
@@ -4311,6 +4350,9 @@ fn run_auth_command_with_secrets_and_runtime(
     runtime_overrides: &CliRuntimeOverrides,
 ) -> Result<()> {
     match command {
+        AuthCommand::PluginLogin { .. } | AuthCommand::PluginLogout { .. } => {
+            bail!("plugin OAuth commands must run through the runtime dispatch")
+        }
         AuthCommand::XaiDevice => {
             let argv = vec![
                 "codewhale".to_string(),
