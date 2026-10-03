@@ -332,6 +332,14 @@ impl QuotaExhaustionError {
     pub(crate) fn into_message(self) -> String {
         self.message
     }
+
+    /// Append route guidance (which account hit the limit, how to switch)
+    /// to already-classified evidence. Cannot manufacture the class.
+    #[must_use]
+    pub(crate) fn with_guidance(mut self, guidance: &str) -> Self {
+        self.message = format!("{}\n{guidance}", self.message);
+        self
+    }
 }
 
 /// Classified LLM errors with retryability information.
@@ -788,6 +796,13 @@ fn is_explicit_quota_code(code: &str) -> bool {
             | "billinghardlimitreached"
             | "billinglimitreached"
             | "creditbalanceexhausted"
+            // ChatGPT/Codex subscription window (HTTP 429, `error.type`),
+            // as openai/codex `api_bridge.rs` maps it. It resets on the
+            // plan's schedule, not after a short backoff.
+            | "usagelimitreached"
+            // Same backend, same branch: the signed-in plan does not include
+            // Codex. Retrying cannot help; switching accounts can.
+            | "usagenotincluded"
     )
 }
 

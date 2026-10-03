@@ -2438,5 +2438,11 @@
   "ModelPickerPinReorderFailed": "Tidak dapat mengubah urutan sematan: {error}",
   "ModelPickerReadinessRefreshed": "Kesiapan model diperbarui · baris katalog dibangun ulang",
   "ModelPickerOpenToRefresh": "Buka /model untuk memperbarui kesiapan dan katalog",
-  "ModelPickerPinnedChip": "disematkan"
+  "ModelPickerPinnedChip": "disematkan",
+  "AuthSignedInAs": "Masuk ke {provider} sebagai {account}.",
+  "AuthSignedInWithoutEmail": "Masuk ke {provider} (penerbit tidak mengirim email akun).",
+  "AuthReplacedPreviousSignInAs": "Menggantikan login Codewhale {provider} sebelumnya ({account}).",
+  "AuthReplacedPreviousSignIn": "Menggantikan login Codewhale {provider} sebelumnya.",
+  "AuthSameAccountAsBefore": "Ini akun yang sama seperti sebelumnya; untuk memakai akun {provider} lain, keluar dari akun ini di browser (atau gunakan jendela pribadi) lalu masuk lagi.",
+  "AuthEnvTokenOutranksSignIn": "OPENAI_CODEX_ACCESS_TOKEN atau CODEX_ACCESS_TOKEN diatur di lingkungan ini dan lebih diutamakan daripada login ini; permintaan tetap memakai akun token tersebut sampai Anda menghapusnya."
 }

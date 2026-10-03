@@ -7139,6 +7139,42 @@ impl Config {
         self.active_route_api_key_with_secret_store_mode(false)
     }
 
+    /// [`Self::active_route_api_key_with_source`], plus — only when the
+    /// resolver's xAI OAuth step produced the key — the account label of
+    /// that same credential (`Some(None)`: its ID token names no email).
+    /// Plan-limit guidance must name the account that sends the request, and
+    /// this reads it without opening the credential a second time.
+    pub(crate) fn active_route_api_key_with_xai_sign_in(
+        &self,
+    ) -> Result<(ResolvedApiKey, Option<XaiSignInLabel>)> {
+        if let Some(credentials) = self.xai_oauth_route_credentials() {
+            let credentials = credentials?;
+            return Ok((
+                (
+                    codewhale_secrets::normalize_api_key(&credentials.access_token),
+                    XAI_OAUTH_KEY_SOURCE.to_string(),
+                ),
+                Some(credentials.account_label),
+            ));
+        }
+        Ok((self.active_route_api_key_with_source()?, None))
+    }
+
+    /// The resolver's xAI OAuth step: `Some` when the active route is xAI on
+    /// the official endpoint with `auth_mode = "oauth"` and a usable sign-in
+    /// exists (configured owned generation, legacy owned file, or consented
+    /// Grok CLI import), holding that sign-in's credentials.
+    fn xai_oauth_route_credentials(&self) -> Option<Result<crate::oauth::OwnedOAuthCredentials>> {
+        let provider = self.api_provider();
+        let selected = provider == ApiProvider::Xai
+            && !self.provider_uses_custom_endpoint(provider)
+            && self
+                .provider_config_for(provider)
+                .is_some_and(provider_config_uses_xai_oauth)
+            && crate::oauth::credentials_present(crate::oauth::OAuthProvider::Xai, self);
+        selected.then(|| crate::oauth::get_xai_credentials(self))
+    }
+
     /// Resolve an API key for a diagnostic without migrating a legacy secret
     /// store or opening a write-capable secret backend.
     ///
@@ -7231,16 +7267,12 @@ impl Config {
 
         // xAI OAuth prefers Codewhale-owned device-login storage. An existing
         // Grok CLI file is considered only with provider/path-scoped read-only
-        // consent. Activated by [providers.xai] auth_mode = "oauth".
-        if provider == ApiProvider::Xai
-            && !custom_endpoint
-            && self
-                .provider_config_for(provider)
-                .is_some_and(provider_config_uses_xai_oauth)
-            && crate::oauth::credentials_present(crate::oauth::OAuthProvider::Xai, self)
-        {
-            return crate::oauth::get_xai_access_token(self)
-                .map(|key| (key, "xAI OAuth login".to_string()));
+        // consent. Activated by [providers.xai] auth_mode = "oauth". No
+        // earlier step applies to xAI, which
+        // `active_route_api_key_with_xai_sign_in` relies on.
+        if let Some(credentials) = self.xai_oauth_route_credentials() {
+            return credentials
+                .map(|credentials| (credentials.access_token, XAI_OAUTH_KEY_SOURCE.to_string()));
         }
 
         // OpenAI Codex (ChatGPT) can read an existing Codex CLI OAuth login
@@ -12830,6 +12862,17 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
     credential_resolve::resolve_credential_source(config, provider).is_present()
 }
 
+/// `(key, source label)` as the active-route resolver returns it.
+pub(crate) type ResolvedApiKey = (String, String);
+
+/// Account label of the xAI sign-in that minted a key; `None` when its ID
+/// token names no email.
+pub(crate) type XaiSignInLabel = Option<String>;
+
+/// Key-source label the resolver gives a key minted by xAI OAuth (owned
+/// sign-in or consented Grok CLI import), named in authentication errors.
+pub(crate) const XAI_OAUTH_KEY_SOURCE: &str = "xAI OAuth login";
+
 impl Config {
     /// Resolve one coherent Codex OAuth snapshot. The bearer and account id
     /// must come from the same secure file handle; opening the external JSON a
@@ -12850,6 +12893,7 @@ impl Config {
             return Ok(crate::oauth::CodexCredentials {
                 access_token: owned.access_token,
                 account_id: owned.account_id,
+                account_label: owned.account_label,
             });
         }
         let path = crate::oauth::auth_file_path();

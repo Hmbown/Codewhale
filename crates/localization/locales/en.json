@@ -2438,5 +2438,11 @@
   "ModelPickerPinReorderFailed": "Could not reorder pin: {error}",
   "ModelPickerReadinessRefreshed": "Model readiness refreshed · catalog rows rebuilt",
   "ModelPickerOpenToRefresh": "Open /model to refresh readiness and catalog",
-  "ModelPickerPinnedChip": "pinned"
+  "ModelPickerPinnedChip": "pinned",
+  "AuthSignedInAs": "Signed in to {provider} as {account}.",
+  "AuthSignedInWithoutEmail": "Signed in to {provider} (the issuer sent no account email).",
+  "AuthReplacedPreviousSignInAs": "Replaced the previous Codewhale {provider} sign-in ({account}).",
+  "AuthReplacedPreviousSignIn": "Replaced the previous Codewhale {provider} sign-in.",
+  "AuthSameAccountAsBefore": "This is the same account as before; to use another {provider} account, sign out of it in the browser (or use a private window) and sign in again.",
+  "AuthEnvTokenOutranksSignIn": "OPENAI_CODEX_ACCESS_TOKEN or CODEX_ACCESS_TOKEN is set in this environment and outranks this sign-in; requests keep using that token's account until you unset it."
 }

@@ -2438,5 +2438,11 @@
   "ModelPickerPinReorderFailed": "No se pudo reordenar la fijación: {error}",
   "ModelPickerReadinessRefreshed": "Disponibilidad de modelos actualizada · filas del catálogo reconstruidas",
   "ModelPickerOpenToRefresh": "Abre /model para actualizar la disponibilidad y el catálogo",
-  "ModelPickerPinnedChip": "fijado"
+  "ModelPickerPinnedChip": "fijado",
+  "AuthSignedInAs": "Sesión iniciada en {provider} como {account}.",
+  "AuthSignedInWithoutEmail": "Sesión iniciada en {provider} (el emisor no envió el correo de la cuenta).",
+  "AuthReplacedPreviousSignInAs": "Se reemplazó el inicio de sesión anterior de Codewhale en {provider} ({account}).",
+  "AuthReplacedPreviousSignIn": "Se reemplazó el inicio de sesión anterior de Codewhale en {provider}.",
+  "AuthSameAccountAsBefore": "Es la misma cuenta que antes; para usar otra cuenta de {provider}, cierra sesión en el navegador (o usa una ventana privada) y vuelve a iniciar sesión.",
+  "AuthEnvTokenOutranksSignIn": "OPENAI_CODEX_ACCESS_TOKEN o CODEX_ACCESS_TOKEN está definido en este entorno y tiene prioridad sobre este inicio de sesión; las solicitudes seguirán usando la cuenta de ese token hasta que lo quites."
 }

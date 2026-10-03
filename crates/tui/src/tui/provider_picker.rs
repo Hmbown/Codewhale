@@ -594,6 +594,17 @@ impl ProviderDashboardRow {
             crate::credentials::CredentialSource::ExternalGrant { cli, .. } => {
                 format!("{cli} credentials (read-only)")
             }
+            // Name the signed-in subscription account (label only) so two
+            // accounts on one machine are told apart before a limit is hit.
+            // The resolver read it with the sign-in it just proved usable;
+            // the picker opens no credential file of its own. Known limit:
+            // that structural read (`usable_sign_in`, formerly
+            // `credentials_present`) still runs synchronously when a row is
+            // built, as it did before #6715; naming the account adds no read.
+            crate::credentials::CredentialSource::OAuth {
+                account: Some(account),
+                ..
+            } => format!("{} · {account}", credential_resolution.source.label()),
             other => other.label().into_owned(),
         };
         let credential_state = credential_state_for_provider(config, provider);

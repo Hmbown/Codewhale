@@ -244,6 +244,38 @@ fn explicit_400_402_and_429_quota_responses_are_typed_and_non_retryable() {
 }
 
 #[test]
+fn chatgpt_usage_limit_is_quota_and_carries_account_guidance() {
+    // Shape of the ChatGPT Codex backend's subscription-window 429, as
+    // openai/codex `codex-api/src/api_bridge.rs` parses it.
+    let raw = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_at":1790000000}}"#;
+    let safe = sanitize_http_error_body(Some("OpenAI Codex"), 429, raw);
+    let error = LlmError::from_http_response(429, &safe);
+    assert!(!error.is_retryable());
+    let LlmError::QuotaExhausted(evidence) = error else {
+        panic!("usage_limit_reached must be typed quota, got {error:?}");
+    };
+    let rendered = LlmError::QuotaExhausted(evidence.with_guidance(
+        "This limit belongs to the ChatGPT account a@example.com (plus). Run `codewhale auth chatgpt`.",
+    ))
+    .to_string();
+    assert!(
+        rendered.contains("The usage limit has been reached"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("a@example.com (plus)"), "{rendered}");
+    assert!(rendered.contains("`codewhale auth chatgpt`"), "{rendered}");
+
+    // Same backend branch: the signed-in plan does not include Codex.
+    // Retrying cannot help, so it must not be a retryable rate limit.
+    let raw =
+        r#"{"error":{"type":"usage_not_included","message":"Your plan does not include Codex"}}"#;
+    let safe = sanitize_http_error_body(Some("OpenAI Codex"), 429, raw);
+    let error = LlmError::from_http_response(429, &safe);
+    assert!(!error.is_retryable());
+    assert!(matches!(error, LlmError::QuotaExhausted(_)), "{error:?}");
+}
+
+#[test]
 fn generic_429_stays_rate_limited_and_retryable() {
     for body in [
         "Too Many Requests",

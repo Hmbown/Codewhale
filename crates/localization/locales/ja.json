@@ -2438,5 +2438,11 @@
   "ModelPickerPinReorderFailed": "ピン留めの順序を変更できませんでした: {error}",
   "ModelPickerReadinessRefreshed": "モデルの準備状況を更新しました · カタログ行を再構築しました",
   "ModelPickerOpenToRefresh": "準備状況とカタログを更新するには /model を開いてください",
-  "ModelPickerPinnedChip": "ピン留め"
+  "ModelPickerPinnedChip": "ピン留め",
+  "AuthSignedInAs": "{provider} に {account} としてサインインしました。",
+  "AuthSignedInWithoutEmail": "{provider} にサインインしました（発行元からアカウントのメールアドレスが送られませんでした）。",
+  "AuthReplacedPreviousSignInAs": "以前の Codewhale の {provider} サインイン（{account}）を置き換えました。",
+  "AuthReplacedPreviousSignIn": "以前の Codewhale の {provider} サインインを置き換えました。",
+  "AuthSameAccountAsBefore": "以前と同じアカウントです。別の {provider} アカウントを使うには、ブラウザーでこのアカウントからサインアウトして（またはプライベートウィンドウを使って）、もう一度サインインしてください。",
+  "AuthEnvTokenOutranksSignIn": "この環境には OPENAI_CODEX_ACCESS_TOKEN または CODEX_ACCESS_TOKEN が設定されており、このサインインより優先されます。設定を解除するまで、リクエストはそのトークンのアカウントを使い続けます。"
 }

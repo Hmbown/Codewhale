@@ -3960,6 +3960,32 @@ mod tests {
         config
     }
 
+    /// Wait until every idle worker of `managers` has stopped polling.
+    ///
+    /// A worker that saw a fresh queue stamp (another manager starting writes
+    /// one) re-reads it once, `STORE_IDLE_POLL_INTERVAL` later and on a
+    /// `STORE_REFRESH_INTERVAL` tick boundary, to confirm the stamp has settled.
+    /// A fixed `interval + 300ms` sleep leaves under one tick of margin, so a
+    /// slow runner (Windows CI) could land that confirming read inside the
+    /// caller's "no reloads" window. A window longer than the interval in which
+    /// no worker reloaded proves every worker has settled; a worker that polls
+    /// forever never produces one, so the caller's assertion still catches it.
+    async fn settle_idle_store_polling(managers: &[&TaskManager]) {
+        for _ in 0..5 {
+            for manager in managers {
+                manager.store_loads.store(0, Ordering::Relaxed);
+            }
+            sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
+            let loads: usize = managers
+                .iter()
+                .map(|manager| manager.store_loads.load(Ordering::Relaxed))
+                .sum();
+            if loads == 0 {
+                return;
+            }
+        }
+    }
+
     /// #6573: idle managers sharing one data dir must not reload the store
     /// (and take its cross-process lock) every 200ms per worker.
     #[tokio::test]
@@ -3975,7 +4001,7 @@ mod tests {
         let second =
             TaskManager::start_with_executor_in_scope(config(), Arc::new(MockExecutor), "second")
                 .await?;
-        sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
+        settle_idle_store_polling(&[&first, &second]).await;
         for manager in [&first, &second] {
             manager.store_loads.store(0, Ordering::Relaxed);
         }
@@ -4110,7 +4136,7 @@ mod tests {
             "idle",
         )
         .await?;
-        sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
+        settle_idle_store_polling(&[&idle]).await;
         idle.store_loads.store(0, Ordering::Relaxed);
         let record = root.path().join("tasks").join(format!("{}.json", task.id));
         let flushed_before = fs::metadata(&record)?.modified()?;

@@ -2438,5 +2438,11 @@
   "ModelPickerPinReorderFailed": "Không thể sắp xếp lại ghim: {error}",
   "ModelPickerReadinessRefreshed": "Đã làm mới trạng thái sẵn sàng của mô hình · đã dựng lại các dòng danh mục",
   "ModelPickerOpenToRefresh": "Mở /model để làm mới trạng thái sẵn sàng và danh mục",
-  "ModelPickerPinnedChip": "đã ghim"
+  "ModelPickerPinnedChip": "đã ghim",
+  "AuthSignedInAs": "Đã đăng nhập {provider} với tài khoản {account}.",
+  "AuthSignedInWithoutEmail": "Đã đăng nhập {provider} (bên cấp không gửi email tài khoản).",
+  "AuthReplacedPreviousSignInAs": "Đã thay thế lần đăng nhập {provider} trước đó của Codewhale ({account}).",
+  "AuthReplacedPreviousSignIn": "Đã thay thế lần đăng nhập {provider} trước đó của Codewhale.",
+  "AuthSameAccountAsBefore": "Đây vẫn là tài khoản cũ; để dùng tài khoản {provider} khác, hãy đăng xuất tài khoản này trong trình duyệt (hoặc dùng cửa sổ riêng tư) rồi đăng nhập lại.",
+  "AuthEnvTokenOutranksSignIn": "Môi trường này đã đặt OPENAI_CODEX_ACCESS_TOKEN hoặc CODEX_ACCESS_TOKEN, và biến đó được ưu tiên hơn lần đăng nhập này; các yêu cầu vẫn dùng tài khoản của token đó cho đến khi bạn bỏ đặt nó."
 }

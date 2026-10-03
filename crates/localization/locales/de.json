@@ -2438,5 +2438,11 @@
   "ModelPickerPinReorderFailed": "Anheftung konnte nicht verschoben werden: {error}",
   "ModelPickerReadinessRefreshed": "Modellbereitschaft aktualisiert · Katalogzeilen neu aufgebaut",
   "ModelPickerOpenToRefresh": "Öffne /model, um Bereitschaft und Katalog zu aktualisieren",
-  "ModelPickerPinnedChip": "angeheftet"
+  "ModelPickerPinnedChip": "angeheftet",
+  "AuthSignedInAs": "Bei {provider} als {account} angemeldet.",
+  "AuthSignedInWithoutEmail": "Bei {provider} angemeldet (der Aussteller hat keine Konto-E-Mail gesendet).",
+  "AuthReplacedPreviousSignInAs": "Die vorherige Codewhale-Anmeldung bei {provider} ({account}) wurde ersetzt.",
+  "AuthReplacedPreviousSignIn": "Die vorherige Codewhale-Anmeldung bei {provider} wurde ersetzt.",
+  "AuthSameAccountAsBefore": "Das ist dasselbe Konto wie zuvor. Um ein anderes {provider}-Konto zu verwenden, melde dich im Browser davon ab (oder nutze ein privates Fenster) und melde dich erneut an.",
+  "AuthEnvTokenOutranksSignIn": "OPENAI_CODEX_ACCESS_TOKEN oder CODEX_ACCESS_TOKEN ist in dieser Umgebung gesetzt und hat Vorrang vor dieser Anmeldung; Anfragen nutzen weiter das Konto dieses Tokens, bis du die Variable entfernst."
 }

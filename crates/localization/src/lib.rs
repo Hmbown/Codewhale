@@ -2673,6 +2673,12 @@ pub enum MessageId {
     ModelPickerReadinessRefreshed,
     ModelPickerOpenToRefresh,
     ModelPickerPinnedChip,
+    AuthSignedInAs,
+    AuthSignedInWithoutEmail,
+    AuthReplacedPreviousSignInAs,
+    AuthReplacedPreviousSignIn,
+    AuthSameAccountAsBefore,
+    AuthEnvTokenOutranksSignIn,
 }
 
 #[allow(dead_code)]
@@ -5118,6 +5124,12 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ModelPickerReadinessRefreshed,
     MessageId::ModelPickerOpenToRefresh,
     MessageId::ModelPickerPinnedChip,
+    MessageId::AuthSignedInAs,
+    MessageId::AuthSignedInWithoutEmail,
+    MessageId::AuthReplacedPreviousSignInAs,
+    MessageId::AuthReplacedPreviousSignIn,
+    MessageId::AuthSameAccountAsBefore,
+    MessageId::AuthEnvTokenOutranksSignIn,
 ];
 
 pub fn tr(locale: Locale, id: MessageId) -> Cow<'static, str> {
@@ -5916,6 +5928,51 @@ mod tests {
                 "{} defines key(s) en.json lacks: {extra:?}",
                 locale.tag()
             );
+        }
+    }
+
+    /// #6715 review: the sign-in account summary is filled by `{provider}` and
+    /// `{account}` substitution, so a pack that drops a placeholder or ships the
+    /// English sentence would silently name no account or stay untranslated.
+    #[test]
+    fn auth_sign_in_copy_is_translated_and_keeps_its_placeholders() {
+        let english = raw_locale_messages(Locale::En);
+        let auth_keys = [
+            "AuthSignedInAs",
+            "AuthSignedInWithoutEmail",
+            "AuthReplacedPreviousSignInAs",
+            "AuthReplacedPreviousSignIn",
+            "AuthSameAccountAsBefore",
+            "AuthEnvTokenOutranksSignIn",
+        ];
+
+        for locale in Locale::shipped_complete() {
+            if *locale == Locale::En {
+                continue;
+            }
+            let pack = raw_locale_messages(*locale);
+            for key in auth_keys {
+                let english_value = english
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("English {key} must be a string"));
+                let translated = pack
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("{} is missing raw key {key}", locale.tag()));
+                assert_eq!(
+                    message_placeholders(translated),
+                    message_placeholders(english_value),
+                    "{} changed placeholders for {key}",
+                    locale.tag()
+                );
+                assert_ne!(
+                    translated,
+                    english_value,
+                    "{} ships English for {key}",
+                    locale.tag()
+                );
+            }
         }
     }
 

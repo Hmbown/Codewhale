@@ -2438,5 +2438,11 @@
   "ModelPickerPinReorderFailed": "Impossible de réordonner l’épingle : {error}",
   "ModelPickerReadinessRefreshed": "Disponibilité des modèles actualisée · lignes du catalogue reconstruites",
   "ModelPickerOpenToRefresh": "Ouvrez /model pour actualiser la disponibilité et le catalogue",
-  "ModelPickerPinnedChip": "épinglé"
+  "ModelPickerPinnedChip": "épinglé",
+  "AuthSignedInAs": "Connecté à {provider} en tant que {account}.",
+  "AuthSignedInWithoutEmail": "Connecté à {provider} (l'émetteur n'a envoyé aucune adresse e-mail de compte).",
+  "AuthReplacedPreviousSignInAs": "La connexion Codewhale précédente à {provider} ({account}) a été remplacée.",
+  "AuthReplacedPreviousSignIn": "La connexion Codewhale précédente à {provider} a été remplacée.",
+  "AuthSameAccountAsBefore": "C'est le même compte qu'avant ; pour utiliser un autre compte {provider}, déconnectez-vous-en dans le navigateur (ou utilisez une fenêtre privée), puis reconnectez-vous.",
+  "AuthEnvTokenOutranksSignIn": "OPENAI_CODEX_ACCESS_TOKEN ou CODEX_ACCESS_TOKEN est défini dans cet environnement et prime sur cette connexion ; les requêtes continuent d'utiliser le compte de ce jeton tant que vous ne l'avez pas supprimé."
 }

@@ -2438,5 +2438,11 @@
   "ModelPickerPinReorderFailed": "No s'ha pogut reordenar la fixació: {error}",
   "ModelPickerReadinessRefreshed": "S'ha actualitzat la disponibilitat dels models · files del catàleg reconstruïdes",
   "ModelPickerOpenToRefresh": "Obre /model per actualitzar la disponibilitat i el catàleg",
-  "ModelPickerPinnedChip": "fixat"
+  "ModelPickerPinnedChip": "fixat",
+  "AuthSignedInAs": "S'ha iniciat la sessió a {provider} com a {account}.",
+  "AuthSignedInWithoutEmail": "S'ha iniciat la sessió a {provider} (l'emissor no ha enviat el correu del compte).",
+  "AuthReplacedPreviousSignInAs": "S'ha substituït l'inici de sessió anterior de Codewhale a {provider} ({account}).",
+  "AuthReplacedPreviousSignIn": "S'ha substituït l'inici de sessió anterior de Codewhale a {provider}.",
+  "AuthSameAccountAsBefore": "És el mateix compte que abans; per fer servir un altre compte de {provider}, tanca'n la sessió al navegador (o fes servir una finestra privada) i torna a iniciar la sessió.",
+  "AuthEnvTokenOutranksSignIn": "OPENAI_CODEX_ACCESS_TOKEN o CODEX_ACCESS_TOKEN està definit en aquest entorn i té prioritat sobre aquest inici de sessió; les sol·licituds continuaran fent servir el compte d'aquest testimoni fins que el suprimeixis."
 }

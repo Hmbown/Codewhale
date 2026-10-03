@@ -58,8 +58,14 @@ pub(crate) enum CredentialSource {
     SecretStore { slot: String },
     /// A read-only, explicitly consented credential file owned by another CLI.
     ExternalGrant { cli: String, path: String },
-    /// CodeWhale-owned OAuth device-login storage (xAI today).
-    OAuth { flow: String },
+    /// A subscription OAuth sign-in: Codewhale-owned storage, or (xAI) a
+    /// consented Grok CLI import. `account` is the display label (email,
+    /// plan) of the account it signs in as, taken from the same read that
+    /// proved the sign-in usable; never token material.
+    OAuth {
+        flow: String,
+        account: Option<String>,
+    },
     /// The user-global `~/.codewhale/config.toml`, consulted last so a key
     /// saved there survives loading a workspace config.
     UserGlobalConfig,
@@ -91,7 +97,7 @@ impl CredentialSource {
             Self::ExternalGrant { cli, path } => {
                 Cow::Owned(format!("{cli} credentials (read-only) {path}"))
             }
-            Self::OAuth { flow } => Cow::Owned(format!("{flow} OAuth")),
+            Self::OAuth { flow, .. } => Cow::Owned(format!("{flow} OAuth")),
             Self::AccountSession => Cow::Borrowed("Codewhale account"),
             Self::UserGlobalConfig => Cow::Borrowed("~/.codewhale/config.toml api_key"),
             Self::Missing { .. } => Cow::Borrowed("not found"),
