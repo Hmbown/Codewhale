@@ -409,6 +409,7 @@ fn run(
         )
     });
     let mut renderer = graphics::Renderer::default();
+    let mut whale = crate::tui::whale_v2::Whale::default();
     let id = uuid::Uuid::new_v4().to_string();
     let mut client = Client::connect()?;
 
@@ -606,13 +607,26 @@ fn run(
                 1.0
             };
             renderer.set_appearance(&s.appearance);
-            let (cells, image) = renderer.render(
+            let (_, image) = renderer.render(
                 &pose,
                 previous.as_ref().filter(|_| view.motion),
                 fraction,
                 &view,
                 if view.motion { s.time_ms / 1000.0 } else { 0.0 },
             )?;
+            // The Braille cells are the v2 character; the particle world
+            // still feeds the pixel image and the label.
+            whale.observe(
+                &s.source,
+                s.activity.as_ref(),
+                s.producer_connected,
+                !view.motion,
+            );
+            whale.advance(Instant::now());
+            let cells = whale.cells(
+                usize::from(view.width.clamp(1, 512)),
+                usize::from(view.height.clamp(1, 256)),
+            );
             let bytes = image.as_ref().map_or(0, Vec::len);
             if let Ok(mut slot) = output.lock() {
                 *slot = Some(Presentation {
