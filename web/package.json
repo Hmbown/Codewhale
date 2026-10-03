@@ -33,7 +33,7 @@
   },
   "devDependencies": {
     "@opennextjs/cloudflare": "^1.20.6",
-    "@types/node": "^26.6.1",
+    "@types/node": "^26.6.3",
     "@types/react": "^19.0.7",
     "@types/react-dom": "^19.2.5",
     "autoprefixer": "^10.6.1",
