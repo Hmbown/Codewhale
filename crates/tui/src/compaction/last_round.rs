@@ -271,6 +271,17 @@ pub(super) fn replacement_messages(
         retained.retain(|message| !crate::runtime_handoff::is_operate_contract_message(message));
         retained.insert(0, contract.clone());
     }
+    // Contributions are captured once per turn. Preserve the complete latest
+    // snapshot, including a withdrawal, rather than summarizing or truncating
+    // instructions that still apply to this tool loop.
+    if let Some(snapshot) = messages.iter().rev().find(|message| {
+        crate::runtime_handoff::extension_prompt_contributions_display(message).is_some()
+    }) {
+        retained.retain(|message| {
+            crate::runtime_handoff::extension_prompt_contributions_display(message).is_none()
+        });
+        retained.insert(0, snapshot.clone());
+    }
     retained
 }
 
@@ -691,6 +702,54 @@ mod tests {
         compaction_checkpoint_message(&SystemPrompt::Text(format!(
             "{COMPACTION_SUMMARY_MARKER}: {summary}"
         )))
+    }
+
+    #[test]
+    fn replacement_keeps_only_latest_complete_prompt_snapshot_and_withdrawal() {
+        use crate::runtime_handoff::{
+            extension_prompt_contributions_display, extension_prompt_contributions_runtime_message,
+        };
+        let old = extension_prompt_contributions_runtime_message(Some("old instructions"));
+        let current_text = "current instructions ".repeat(400);
+        for current in [
+            extension_prompt_contributions_runtime_message(Some(&current_text)),
+            extension_prompt_contributions_runtime_message(None),
+        ] {
+            let quoted = msg(
+                "user",
+                &user_text_of(&current).expect("runtime snapshot has text"),
+            );
+            let original = vec![
+                old.clone(),
+                quoted.clone(),
+                current.clone(),
+                msg("user", "Continue this task."),
+                tool_use("first", "Read", json!({"path": "first"})),
+                tool_result("first", "first output"),
+                tool_use("second", "Read", json!({"path": "second"})),
+                tool_result("second", "second output"),
+                tool_use("third", "Read", json!({"path": "third"})),
+                tool_result("third", "third output"),
+            ];
+            let kept = replacement_messages(&original, 20_000);
+            let snapshots: Vec<_> = kept
+                .iter()
+                .filter(|message| extension_prompt_contributions_display(message).is_some())
+                .collect();
+            assert_eq!(snapshots, [&current]);
+            assert!(
+                kept.contains(&quoted),
+                "a person's quote is ordinary user text"
+            );
+            assert_eq!(
+                replacement_messages(&kept, 20_000)
+                    .iter()
+                    .filter(|message| extension_prompt_contributions_display(message).is_some())
+                    .count(),
+                1,
+                "repeated compaction must not accumulate snapshots"
+            );
+        }
     }
 
     /// The handoff header tells the next turn what survived. It must match

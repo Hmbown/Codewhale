@@ -1,4 +1,4 @@
-//! Unix-domain-socket daemon transport (Desktop Phase 0, socket half).
+//! Authenticated local daemon transport: Unix socket and Windows named pipe.
 //!
 //! The desktop shell attaches to a long-lived `codewhale app-server --socket`
 //! daemon over a local socket instead of a TCP port: local multi-client,
@@ -20,9 +20,9 @@
 //! 4. macOS: `~/Library/Application Support/codewhale/daemon.sock`;
 //! 5. `~/.codewhale/run/daemon.sock`.
 //!
-//! Windows is reserved as the named pipe [`WINDOWS_NAMED_PIPE`]; binding
-//! there returns [`DaemonSocketError::UnsupportedPlatform`] rather than
-//! silently falling back to TCP.
+//! Windows derives a local named-pipe endpoint from the selected home and
+//! current principal. It shares the same dispatcher and ownership handshake;
+//! no supported platform falls back to TCP. Windows runtime proof is separate.
 //!
 //! # Ownership
 //!
@@ -35,13 +35,14 @@
 
 use std::path::{Path, PathBuf};
 
+use codewhale_protocol::RuntimeOwnerReceipt;
 use serde::{Deserialize, Serialize};
 
 /// Basename of the daemon socket inside the Codewhale runtime directory.
 pub const DAEMON_SOCKET_FILE_NAME: &str = "daemon.sock";
 
-/// Reserved Windows endpoint. Not implemented yet; binding on Windows fails
-/// with [`DaemonSocketError::UnsupportedPlatform`] naming this pipe.
+/// Historical reserved endpoint used in unsupported-platform diagnostics.
+/// Actual Windows owner endpoints are scoped to the selected home/principal.
 pub const WINDOWS_NAMED_PIPE: &str = r"\\.\pipe\codewhale-daemon";
 
 /// JSON-RPC method a client must send first on a daemon-socket connection.
@@ -198,7 +199,7 @@ pub fn default_socket_path() -> Result<PathBuf, DaemonSocketError> {
 }
 
 /// The socket path this host would use with no explicit override.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn default_socket_path() -> Result<PathBuf, DaemonSocketError> {
     Err(unsupported_platform())
 }
@@ -234,8 +235,25 @@ pub enum AttachRole {
 }
 
 /// `daemon/attach` params.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachFrontend {
+    #[default]
+    Control,
+    Acp,
+    Listener,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AttachParams {
+    #[serde(default)]
+    pub frontend: AttachFrontend,
+    #[serde(default)]
+    pub listener: Option<crate::RuntimeListenerSelection>,
+    #[serde(default)]
+    pub scope: Option<crate::RuntimeFrontendScope>,
+    #[serde(default)]
+    pub acp_model: Option<String>,
     pub client: ClientIdentity,
     #[serde(default)]
     pub mode: AttachMode,
@@ -243,11 +261,13 @@ pub struct AttachParams {
     /// own version string matches exactly.
     #[serde(default)]
     pub expect_daemon_version: Option<String>,
+    #[serde(default)]
+    pub expect_owner: Option<RuntimeOwnerReceipt>,
 }
 
 /// The typed refusal every non-unix entry point returns. Unused in the unix
 /// library build by construction; the tests pin its wording on every host.
-#[cfg_attr(unix, allow(dead_code))]
+#[cfg(any(test, not(any(unix, windows))))]
 fn unsupported_platform() -> DaemonSocketError {
     DaemonSocketError::UnsupportedPlatform {
         platform: std::env::consts::OS,
@@ -255,127 +275,581 @@ fn unsupported_platform() -> DaemonSocketError {
     }
 }
 
+/// One bounded blocking boundary for held filesystem/process identity work.
+/// The worker retains its permit and captured handles if the waiter cancels.
+#[cfg(any(unix, windows))]
+pub async fn owner_work<T, F>(work: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let permit = SLOTS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)))
+        .clone()
+        .acquire_owned()
+        .await?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(anyhow::Error::from)?
+}
+
+use crate::{
+    AppState, AppTransport, JsonRpcError, ParsedStdioLine, ShutdownAuthority, StdioLoopExit,
+    StdioLoopPolicy, dispatch_stdio_request_with_writer, jsonrpc_error, jsonrpc_result,
+    params_or_object, parse_params, parse_stdio_line, run_stdio_loop, write_stdio_line,
+};
+use anyhow::Result;
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
+
+/// Facts about this daemon, reported in every attach reply.
+#[derive(Debug)]
+struct DaemonInfo {
+    pid: u32,
+    version: &'static str,
+    /// Independent effective principal captured from this process.
+    #[cfg(unix)]
+    uid: u32,
+    socket_path: PathBuf,
+    started_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionRegistry {
+    next_id: u64,
+    connections: HashMap<u64, ClientIdentity>,
+    owner: Option<u64>,
+}
+
+impl ConnectionRegistry {
+    fn register(&mut self, client: ClientIdentity) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.connections.insert(id, client);
+        id
+    }
+
+    /// Take the owner slot, or report who holds it.
+    fn claim(&mut self, id: u64) -> Result<(), ClientIdentity> {
+        if let Some(owner_id) = self.owner
+            && owner_id != id
+            && let Some(owner) = self.connections.get(&owner_id)
+        {
+            return Err(owner.clone());
+        }
+        self.owner = Some(id);
+        Ok(())
+    }
+
+    fn owner(&self) -> Option<ClientIdentity> {
+        self.owner.and_then(|id| self.connections.get(&id)).cloned()
+    }
+
+    fn remove(&mut self, id: u64) {
+        self.connections.remove(&id);
+        if self.owner == Some(id) {
+            self.owner = None;
+        }
+    }
+}
+
+/// Releases the registry slot (and the owner claim) on drop, whichever
+/// way the connection ends.
+struct ConnectionGuard {
+    frontend: AttachFrontend,
+    listener: Option<crate::RuntimeListenerSelection>,
+    scope: Option<crate::RuntimeFrontendScope>,
+    acp_model: Option<String>,
+    registry: Arc<Mutex<ConnectionRegistry>>,
+    id: u64,
+    role: AttachRole,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = self.registry.lock() {
+            registry.remove(self.id);
+        }
+    }
+}
+
+/// Asks a running [`DaemonSocket::serve`] to stop.
+#[derive(Debug, Clone)]
+pub struct DaemonShutdownHandle(pub(crate) Arc<watch::Sender<bool>>);
+
+impl DaemonShutdownHandle {
+    /// Idempotent; safe to call from any task or signal handler.
+    pub fn trigger(&self) {
+        self.0.send_replace(true);
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ConnectionContext {
+    state: AppState,
+    registry: Arc<Mutex<ConnectionRegistry>>,
+    info: Arc<DaemonInfo>,
+    shutdown: DaemonShutdownHandle,
+    owner: Option<RuntimeOwnerReceipt>,
+}
+
+/// The daemon's connection tasks. A `JoinSet` keeps every finished task
+/// until it is joined, so a long-lived daemon used to retain one task per
+/// past client (health polls, re-attaches) for its whole lifetime.
+/// [`Self::spawn`] is the only way in and reaps finished tasks first, so
+/// the set is bounded by the live connections plus those that ended since
+/// the last accept. A panicked connection is logged, not fatal.
+#[derive(Default)]
+pub(crate) struct ConnectionTasks(JoinSet<()>);
+
+impl ConnectionTasks {
+    pub(crate) async fn shutdown(&mut self) {
+        self.0.shutdown().await;
+    }
+    pub(crate) fn at_capacity(&mut self) -> bool {
+        while let Some(joined) = self.0.try_join_next() {
+            if let Err(err) = joined
+                && err.is_panic()
+            {
+                tracing::warn!(error = %err, "daemon connection task panicked");
+            }
+        }
+        self.0.len() >= 64
+    }
+    pub(crate) fn spawn(&mut self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        if !self.at_capacity() {
+            self.0.spawn(task);
+        } else {
+            tracing::debug!("local control connection ceiling reached; refusing before admission");
+        }
+    }
+}
+
+/// Serve `healthz` and wait for `daemon/attach`; everything else is
+/// refused with `attach_required` until the client attaches.
+async fn handshake<R, W>(
+    context: &ConnectionContext,
+    lines: &mut crate::BoundedLines<R>,
+    writer: &mut W,
+) -> Result<Option<ConnectionGuard>>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        let Some(line) = lines.next_line().await? else {
+            return Ok(None);
+        };
+        let request = match parse_stdio_line(&line) {
+            ParsedStdioLine::Blank => continue,
+            ParsedStdioLine::Rejected(response) => {
+                write_stdio_line(writer, &response).await?;
+                continue;
+            }
+            ParsedStdioLine::Request(request) => request,
+        };
+        let id = request.id.clone();
+        match request.method.as_str() {
+            "healthz" | "app/healthz" => {
+                let response = match dispatch_stdio_request_with_writer(
+                    &context.state,
+                    writer,
+                    &request.method,
+                    request.params,
+                    AppTransport::Socket,
+                )
+                .await
+                {
+                    Ok(dispatch) => jsonrpc_result(id, dispatch.result),
+                    Err(err) => jsonrpc_error(id, err),
+                };
+                write_stdio_line(writer, &response).await?;
+            }
+            ATTACH_METHOD => match attach(context, request.params).await {
+                Ok((result, guard)) => {
+                    write_stdio_line(writer, &jsonrpc_result(id, result)).await?;
+                    return Ok(Some(guard));
+                }
+                Err(err) => write_stdio_line(writer, &jsonrpc_error(id, err)).await?,
+            },
+            other => {
+                write_stdio_line(
+                    writer,
+                    &jsonrpc_error(id, JsonRpcError::attach_required(other)),
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+async fn attach(
+    context: &ConnectionContext,
+    params: Value,
+) -> Result<(Value, ConnectionGuard), JsonRpcError> {
+    let params: AttachParams = parse_params(params_or_object(params))?;
+    if params.frontend == AttachFrontend::Acp
+        && (context.state.owner_frontend.is_none()
+            || !context
+                .state
+                .captured_routing
+                .as_ref()
+                .is_some_and(|routing| routing.acp))
+    {
+        return Err(JsonRpcError::invalid_params(
+            "held owner has no narrowed ACP projection; cross-profile attachment refused",
+        ));
+    }
+    if (params.frontend == AttachFrontend::Listener) != params.listener.is_some() {
+        return Err(JsonRpcError::invalid_params(
+            "listener selection does not match frontend",
+        ));
+    }
+    if let Some(listener) = params.listener.as_ref() {
+        listener.validate_bounds().map_err(|_| {
+            JsonRpcError::invalid_params("selected frontend input exceeds its bounds")
+        })?;
+        if context.state.owner_frontend.is_none() {
+            return Err(JsonRpcError::invalid_params(
+                "held owner has no selected listener projection",
+            ));
+        }
+    }
+    if params.scope.is_some()
+        && (params.frontend == AttachFrontend::Listener || context.state.owner_frontend.is_none())
+        || params.acp_model.is_some() && params.frontend != AttachFrontend::Acp
+    {
+        return Err(JsonRpcError::invalid_params(
+            "selected scope does not match captured frontend",
+        ));
+    }
+    if let Some(scope) = params.scope.as_ref() {
+        scope.validate_bounds().map_err(|_| {
+            JsonRpcError::invalid_params("selected frontend scope exceeds its bounds")
+        })?;
+    }
+    if params
+        .acp_model
+        .as_ref()
+        .is_some_and(|model| model.trim().is_empty() || model.len() > 1024)
+    {
+        return Err(JsonRpcError::invalid_params("invalid selected ACP model"));
+    }
+    if let Some(owner) = context.owner.as_ref() {
+        if params.expect_owner.as_ref() != Some(owner) {
+            return Err(JsonRpcError::invalid_params(
+                "captured owner generation or store does not match",
+            ));
+        }
+        if params.mode == AttachMode::Claim {
+            return Err(JsonRpcError::not_daemon_owner());
+        }
+    }
+    if params.client.name.trim().is_empty() {
+        return Err(JsonRpcError::invalid_params(
+            "client.name must not be empty",
+        ));
+    }
+    if let Some(expected) = params.expect_daemon_version.as_deref()
+        && expected != context.info.version
+    {
+        return Err(JsonRpcError::daemon_version_skew(
+            expected,
+            context.info.version,
+        ));
+    }
+
+    if let Some(frontend) = context.state.owner_frontend.as_ref() {
+        let selection = match params.frontend {
+            AttachFrontend::Listener => Some(crate::RuntimeOwnerFrontendSelection::Listener(
+                params.listener.clone().expect("validated listener"),
+            )),
+            AttachFrontend::Acp => Some(crate::RuntimeOwnerFrontendSelection::Acp {
+                scope: params.scope.clone(),
+                model: params.acp_model.clone(),
+            }),
+            AttachFrontend::Control => params
+                .scope
+                .clone()
+                .map(crate::RuntimeOwnerFrontendSelection::Control),
+        };
+        if let Some(selection) = selection {
+            frontend
+                .validate_selection(&selection)
+                .await
+                .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
+        }
+    }
+    let mut registry = context
+        .registry
+        .lock()
+        .map_err(|_| JsonRpcError::internal("daemon connection registry poisoned"))?;
+    let id = registry.register(params.client.clone());
+    let role = match params.mode {
+        AttachMode::Attach => AttachRole::Attached,
+        AttachMode::Claim => match registry.claim(id) {
+            Ok(()) => AttachRole::Owner,
+            Err(owner) => {
+                registry.remove(id);
+                let owner = serde_json::to_value(owner)
+                    .map_err(|err| JsonRpcError::internal(err.to_string()))?;
+                return Err(JsonRpcError::daemon_already_claimed(&owner));
+            }
+        },
+    };
+    let owner = registry.owner();
+    let connections = registry.connections.len();
+    drop(registry);
+
+    let info = &context.info;
+    let result = json!({
+        "attached": true,
+        "connection_id": id,
+        "role": role,
+        "transport": AppTransport::Socket.label(),
+        "daemon": {
+            "service": crate::legacy_deepseek_compat::SERVICE_NAME,
+            "pid": info.pid,
+            "version": info.version,
+            "socket_path": info.socket_path.display().to_string(),
+            "uptime_ms": u64::try_from(info.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        },
+        "owner": owner,
+        "connections": connections,
+        "owner_receipt": context.owner,
+        "runtime_routing": context.state.captured_routing,
+    });
+    Ok((
+        result,
+        ConnectionGuard {
+            frontend: params.frontend,
+            listener: params.listener,
+            scope: params.scope,
+            acp_model: params.acp_model,
+            registry: Arc::clone(&context.registry),
+            id,
+            role,
+        },
+    ))
+}
+
+pub(crate) struct AuthorizedPeer {
+    pub(crate) pid: u32,
+    pub(crate) start: String,
+    #[cfg(windows)]
+    pub(crate) process: codewhale_config::windows_identity::WindowsPeerProcess,
+}
+
+impl AuthorizedPeer {
+    pub(crate) fn check(&self) -> Result<()> {
+        #[cfg(unix)]
+        anyhow::ensure!(
+            codewhale_config::private_directory::unix_process_start(self.pid)? == self.start,
+            "local control peer generation changed"
+        );
+        #[cfg(windows)]
+        {
+            self.process.check_current_user()?;
+            anyhow::ensure!(
+                self.process.pid() == self.pid,
+                "Windows kernel peer PID changed"
+            );
+            anyhow::ensure!(
+                self.process.start() == self.start,
+                "local control peer generation changed"
+            );
+        }
+        Ok(())
+    }
+}
+
+pub(crate) async fn connection_context(
+    state: AppState,
+    path: PathBuf,
+    shutdown: DaemonShutdownHandle,
+    owner: Option<RuntimeOwnerReceipt>,
+) -> Result<ConnectionContext> {
+    Ok(ConnectionContext {
+        state,
+        registry: Arc::new(Mutex::new(ConnectionRegistry::default())),
+        info: Arc::new(DaemonInfo {
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION"),
+            #[cfg(unix)]
+            uid: codewhale_config::private_directory::PrivateDirectory::current_user_id(),
+            socket_path: path,
+            started_at: Instant::now(),
+        }),
+        shutdown,
+        owner,
+    })
+}
+
+pub(crate) async fn run_authorized_connection<R, W>(
+    context: ConnectionContext,
+    read: R,
+    mut writer: W,
+    peer: AuthorizedPeer,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let peer = Arc::new(peer);
+    let check = peer.clone();
+    if owner_work(move || check.check()).await.is_err() {
+        return;
+    }
+    let mut lines = crate::BoundedLines::new(BufReader::new(read));
+    let guard = match tokio::time::timeout(
+        Duration::from_secs(5),
+        handshake(&context, &mut lines, &mut writer),
+    )
+    .await
+    {
+        Err(_) => return,
+        Ok(result) => match result {
+            Ok(Some(guard)) => guard,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::debug!(%error,"local control handshake ended");
+                return;
+            }
+        },
+    };
+    let check = peer.clone();
+    if owner_work(move || check.check()).await.is_err() {
+        return;
+    }
+    if guard.frontend != AttachFrontend::Control || guard.scope.is_some() {
+        let Some(frontend) = context.state.owner_frontend.as_ref() else {
+            return;
+        };
+        let selection = match guard.frontend {
+            AttachFrontend::Listener => crate::RuntimeOwnerFrontendSelection::Listener(
+                guard.listener.clone().expect("admitted listener"),
+            ),
+            AttachFrontend::Acp => crate::RuntimeOwnerFrontendSelection::Acp {
+                scope: guard.scope.clone(),
+                model: guard.acp_model.clone(),
+            },
+            AttachFrontend::Control => crate::RuntimeOwnerFrontendSelection::Control(
+                guard.scope.clone().expect("admitted scope"),
+            ),
+        };
+        let _claim = (guard, peer);
+        if let Err(error) = frontend
+            .serve(
+                selection,
+                context.state.clone(),
+                Box::new(lines.into_inner()),
+                Box::new(writer),
+            )
+            .await
+        {
+            tracing::debug!(%error,"captured frontend connection ended");
+        }
+        return;
+    }
+    let policy = StdioLoopPolicy {
+        transport: AppTransport::Socket,
+        shutdown: match guard.role {
+            AttachRole::Owner => ShutdownAuthority::Granted,
+            AttachRole::Attached => ShutdownAuthority::Denied,
+        },
+    };
+    match run_stdio_loop(&context.state, lines, writer, policy, Some((guard, peer))).await {
+        Ok(StdioLoopExit::Shutdown) => context.shutdown.trigger(),
+        Ok(StdioLoopExit::InputClosed) => {}
+        Err(error) => tracing::debug!(%error,"local control connection ended"),
+    }
+}
+
 #[cfg(unix)]
 mod platform {
-    use std::collections::HashMap;
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    use std::fs::File;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use anyhow::Result;
-    use serde_json::{Value, json};
-    use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, BufReader, Lines};
+    use codewhale_config::private_directory::{PrivateDirectory, PrivateSocketIdentity};
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::watch;
-    use tokio::task::JoinSet;
 
+    #[cfg(test)]
+    use super::{ClientIdentity, ConnectionRegistry};
     use super::{
-        ATTACH_METHOD, AttachMode, AttachParams, AttachRole, ClientIdentity, DaemonSocketError,
+        ConnectionContext, ConnectionTasks, DaemonShutdownHandle, DaemonSocketError,
         DaemonSocketOptions, SocketPathInputs, resolve_socket_path,
     };
-    use crate::{
-        AppState, AppTransport, JsonRpcError, ParsedStdioLine, ShutdownAuthority, StdioLoopExit,
-        StdioLoopPolicy, build_state_off_runtime, dispatch_stdio_request_with_writer,
-        jsonrpc_error, jsonrpc_result, legacy_deepseek_compat, params_or_object, parse_params,
-        parse_stdio_line, run_stdio_loop, write_stdio_line,
-    };
+    use crate::{AppState, AppTransport, build_state_off_runtime};
 
     /// How long the stale-socket probe waits for a connect to resolve.
     const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-    /// Facts about this daemon, reported in every attach reply.
-    #[derive(Debug)]
-    struct DaemonInfo {
-        pid: u32,
-        version: &'static str,
-        /// Owner uid of the socket file, i.e. the daemon's effective uid.
-        uid: u32,
-        socket_path: PathBuf,
-        started_at: Instant,
+    /// Removes the socket file when the server stops, however it stops.
+    struct SocketFileGuard {
+        parent: Arc<PrivateDirectory>,
+        name: String,
+        identity: PrivateSocketIdentity,
+        receipt: Option<(String, File)>,
+        retired: bool,
     }
 
-    #[derive(Debug, Default)]
-    struct ConnectionRegistry {
-        next_id: u64,
-        connections: HashMap<u64, ClientIdentity>,
-        owner: Option<u64>,
-    }
-
-    impl ConnectionRegistry {
-        fn register(&mut self, client: ClientIdentity) -> u64 {
-            self.next_id += 1;
-            let id = self.next_id;
-            self.connections.insert(id, client);
-            id
+    impl SocketFileGuard {
+        fn retirement(&mut self) -> Option<impl FnOnce() -> Result<()> + Send + 'static> {
+            if self.retired {
+                return None;
+            }
+            self.retired = true;
+            let parent = self.parent.clone();
+            let name = self.name.clone();
+            let identity = self.identity;
+            let receipt = self.receipt.take();
+            Some(move || {
+                if let Some((name, file)) = receipt {
+                    parent.retire_private_receipt(&name, &file)?;
+                }
+                parent.retire_socket(&name, identity)?;
+                Ok(())
+            })
         }
 
-        /// Take the owner slot, or report who holds it.
-        fn claim(&mut self, id: u64) -> Result<(), ClientIdentity> {
-            if let Some(owner_id) = self.owner
-                && owner_id != id
-                && let Some(owner) = self.connections.get(&owner_id)
-            {
-                return Err(owner.clone());
+        async fn retire(&mut self) -> Result<()> {
+            if let Some(retire) = self.retirement() {
+                tokio::spawn(async move { super::owner_work(retire).await })
+                    .await
+                    .map_err(anyhow::Error::from)??;
             }
-            self.owner = Some(id);
             Ok(())
         }
-
-        fn owner(&self) -> Option<ClientIdentity> {
-            self.owner.and_then(|id| self.connections.get(&id)).cloned()
-        }
-
-        fn remove(&mut self, id: u64) {
-            self.connections.remove(&id);
-            if self.owner == Some(id) {
-                self.owner = None;
-            }
-        }
     }
-
-    /// Releases the registry slot (and the owner claim) on drop, whichever
-    /// way the connection ends.
-    struct ConnectionGuard {
-        registry: Arc<Mutex<ConnectionRegistry>>,
-        id: u64,
-        role: AttachRole,
-    }
-
-    impl Drop for ConnectionGuard {
-        fn drop(&mut self) {
-            if let Ok(mut registry) = self.registry.lock() {
-                registry.remove(self.id);
-            }
-        }
-    }
-
-    /// Removes the socket file when the server stops, however it stops.
-    struct SocketFileGuard(PathBuf);
 
     impl Drop for SocketFileGuard {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            let Some(retire) = self.retirement() else {
+                return;
+            };
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    if let Err(error) = super::owner_work(retire).await {
+                        tracing::warn!(%error, "private endpoint retirement is uncertain; retaining it");
+                    }
+                });
+            } else if let Err(error) = retire() {
+                tracing::warn!(%error, "private endpoint retirement is uncertain; retaining it");
+            }
         }
-    }
-
-    /// Asks a running [`DaemonSocket::serve`] to stop.
-    #[derive(Debug, Clone)]
-    pub struct DaemonShutdownHandle(Arc<watch::Sender<bool>>);
-
-    impl DaemonShutdownHandle {
-        /// Idempotent; safe to call from any task or signal handler.
-        pub fn trigger(&self) {
-            self.0.send_replace(true);
-        }
-    }
-
-    #[derive(Clone)]
-    struct ConnectionContext {
-        state: AppState,
-        registry: Arc<Mutex<ConnectionRegistry>>,
-        info: Arc<DaemonInfo>,
-        shutdown: DaemonShutdownHandle,
     }
 
     /// A bound, not yet serving, daemon socket.
@@ -384,6 +858,8 @@ mod platform {
         path: PathBuf,
         state: AppState,
         shutdown: Arc<watch::Sender<bool>>,
+        socket_file: SocketFileGuard,
+        owner: Option<super::RuntimeOwnerReceipt>,
     }
 
     impl DaemonSocket {
@@ -407,28 +883,18 @@ mod platform {
                 path,
                 state,
                 shutdown,
+                socket_file,
+                owner,
             } = self;
-            let _socket_file = SocketFileGuard(path.clone());
-            let uid = tokio::fs::metadata(&path)
-                .await
-                .map_err(|source| DaemonSocketError::Io {
-                    context: "failed to stat the daemon socket",
-                    path: path.clone(),
-                    source,
-                })?
-                .uid();
-            let context = ConnectionContext {
+            let mut socket_file = socket_file;
+            let context = super::connection_context(
                 state,
-                registry: Arc::new(Mutex::new(ConnectionRegistry::default())),
-                info: Arc::new(DaemonInfo {
-                    pid: std::process::id(),
-                    version: env!("CARGO_PKG_VERSION"),
-                    uid,
-                    socket_path: path.clone(),
-                    started_at: Instant::now(),
-                }),
-                shutdown: DaemonShutdownHandle(Arc::clone(&shutdown)),
-            };
+                path.clone(),
+                DaemonShutdownHandle(Arc::clone(&shutdown)),
+                owner,
+            )
+            .await
+            .map_err(DaemonSocketError::State)?;
             let mut shutdown_rx = shutdown.subscribe();
             let mut connections = ConnectionTasks::default();
 
@@ -457,30 +923,13 @@ mod platform {
             // The owner's `shutdown` reply was flushed before its loop
             // returned, so aborting what is left loses nothing a client
             // still needs.
-            connections.0.shutdown().await;
+            connections.shutdown().await;
+            drop(listener);
+            socket_file
+                .retire()
+                .await
+                .map_err(DaemonSocketError::State)?;
             Ok(())
-        }
-    }
-
-    /// The daemon's connection tasks. A `JoinSet` keeps every finished task
-    /// until it is joined, so a long-lived daemon used to retain one task per
-    /// past client (health polls, re-attaches) for its whole lifetime.
-    /// [`Self::spawn`] is the only way in and reaps finished tasks first, so
-    /// the set is bounded by the live connections plus those that ended since
-    /// the last accept. A panicked connection is logged, not fatal.
-    #[derive(Default)]
-    struct ConnectionTasks(JoinSet<()>);
-
-    impl ConnectionTasks {
-        fn spawn(&mut self, task: impl std::future::Future<Output = ()> + Send + 'static) {
-            while let Some(joined) = self.0.try_join_next() {
-                if let Err(err) = joined
-                    && err.is_panic()
-                {
-                    tracing::warn!(error = %err, "daemon connection task panicked");
-                }
-            }
-            self.0.spawn(task);
         }
     }
 
@@ -490,267 +939,230 @@ mod platform {
     pub async fn bind_daemon_socket(
         options: DaemonSocketOptions,
     ) -> Result<DaemonSocket, DaemonSocketError> {
+        bind_with_owner(options, None).await
+    }
+
+    pub(crate) async fn bind_captured_owner(
+        state: AppState,
+        owner: super::RuntimeOwnerReceipt,
+    ) -> Result<DaemonSocket, DaemonSocketError> {
+        let options = DaemonSocketOptions {
+            socket_path: Some(owner.socket_path.clone()),
+            config_path: None,
+        };
+        bind_with_owner(options, Some((state, owner))).await
+    }
+
+    async fn bind_with_owner(
+        options: DaemonSocketOptions,
+        captured: Option<(AppState, super::RuntimeOwnerReceipt)>,
+    ) -> Result<DaemonSocket, DaemonSocketError> {
         let path = resolve_socket_path(&SocketPathInputs::from_environment(options.socket_path)?)?;
-        ensure_private_parent_dir(&path).await?;
-        clear_stale_socket(&path).await?;
+        let parent_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or(DaemonSocketError::RuntimeDirUnavailable)?
+            .to_path_buf();
+        let parent = Arc::new(
+            super::owner_work(move || PrivateDirectory::admit(&parent_path))
+                .await
+                .map_err(DaemonSocketError::State)?,
+        );
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(DaemonSocketError::RuntimeDirUnavailable)?
+            .to_string();
+        clear_stale_socket(&path, &parent, &name).await?;
+        let check_parent = parent.clone();
+        if !super::owner_work(move || check_parent.is_at_selected_path())
+            .await
+            .map_err(DaemonSocketError::State)?
+        {
+            return Err(DaemonSocketError::State(anyhow::anyhow!(
+                "private endpoint parent changed"
+            )));
+        }
 
         let listener = UnixListener::bind(&path).map_err(|source| DaemonSocketError::Io {
             context: "failed to bind the daemon socket",
             path: path.clone(),
             source,
         })?;
-        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        let inspect_parent = parent.clone();
+        let inspect_name = name.clone();
+        let identity = super::owner_work(move || inspect_parent.socket_identity(&inspect_name))
             .await
-            .map_err(|source| DaemonSocketError::Io {
-                context: "failed to restrict daemon socket permissions to 0600",
-                path: path.clone(),
-                source,
+            .map_err(DaemonSocketError::State)?
+            .ok_or_else(|| {
+                DaemonSocketError::State(anyhow::anyhow!("bound socket identity is unavailable"))
             })?;
+        let socket_file = SocketFileGuard {
+            parent: parent.clone(),
+            name,
+            identity,
+            receipt: None,
+            retired: false,
+        };
+        let protect_parent = parent.clone();
+        let protect_name = socket_file.name.clone();
+        super::owner_work(move || {
+            anyhow::ensure!(
+                protect_parent.is_at_selected_path()?,
+                "private endpoint parent changed during bind"
+            );
+            protect_parent.protect_socket(&protect_name, identity)
+        })
+        .await
+        .map_err(DaemonSocketError::State)?;
 
-        let state = build_state_off_runtime(options.config_path, None, AppTransport::Socket)
+        let (state, owner) = match captured {
+            Some((state, owner)) => (state, Some(owner)),
+            None => (
+                build_state_off_runtime(options.config_path, None, AppTransport::Socket)
+                    .await
+                    .map_err(DaemonSocketError::State)?,
+                None,
+            ),
+        };
+        let mut socket_file = socket_file;
+        if let Some(owner) = owner.as_ref() {
+            let receipt_name = format!("{}.owner.json", socket_file.name);
+            let bytes = serde_json::to_vec(owner)
+                .map_err(|error| DaemonSocketError::State(error.into()))?;
+            if bytes.len() > 16384 {
+                return Err(DaemonSocketError::State(anyhow::anyhow!(
+                    "owner receipt exceeds private publication limit"
+                )));
+            }
+            let parent = parent.clone();
+            let name = receipt_name.clone();
+            let expected = owner.clone();
+            let guard = socket_file;
+            socket_file = super::owner_work(move || {
+                let mut guard = guard;
+                anyhow::ensure!(
+                    parent.is_at_selected_path()?,
+                    "private owner parent changed before publication"
+                );
+                if let Some((bytes, old)) = parent.read_private_receipt(&name, 16384)? {
+                    let previous: super::RuntimeOwnerReceipt = serde_json::from_slice(&bytes)?;
+                    anyhow::ensure!(
+                        previous.version == expected.version
+                            && previous.data_dir == expected.data_dir
+                            && previous.execution_scope == expected.execution_scope
+                            && previous.socket_path == expected.socket_path,
+                        "stale owner receipt belongs to a different selected store"
+                    );
+                    anyhow::ensure!(
+                        parent.retire_private_receipt(&name, &old)?,
+                        "stale owner receipt changed"
+                    );
+                }
+                parent.write_owned_file(&name, &bytes, false)?;
+                let (_, file) = parent
+                    .read_private_receipt(&name, 16384)?
+                    .ok_or_else(|| anyhow::anyhow!("published owner receipt unavailable"))?;
+                guard.receipt = Some((name, file));
+                anyhow::ensure!(
+                    parent.is_at_selected_path()?,
+                    "private owner parent changed during publication; retaining uncertain receipt"
+                );
+                Ok(guard)
+            })
             .await
             .map_err(DaemonSocketError::State)?;
+        }
         let (shutdown, _) = watch::channel(false);
         Ok(DaemonSocket {
             listener,
             path,
             state,
             shutdown: Arc::new(shutdown),
+            socket_file,
+            owner,
         })
     }
 
-    /// Create the socket's directory as `0700` when it does not exist. An
-    /// existing directory is left as the operator made it. Async because the
-    /// caller runs on the Tokio runtime (blocking-call convention, #6149).
-    async fn ensure_private_parent_dir(path: &Path) -> Result<(), DaemonSocketError> {
-        let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
+    /// Only a definite refusal permits exact captured endpoint retirement.
+    async fn clear_stale_socket(
+        path: &Path,
+        parent: &Arc<PrivateDirectory>,
+        name: &str,
+    ) -> Result<(), DaemonSocketError> {
+        let inspect_parent = parent.clone();
+        let inspect_name = name.to_string();
+        let Some(identity) =
+            super::owner_work(move || inspect_parent.socket_identity(&inspect_name))
+                .await
+                .map_err(|error| {
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidInput)
+                    {
+                        DaemonSocketError::NotASocket {
+                            path: path.to_path_buf(),
+                        }
+                    } else {
+                        DaemonSocketError::State(error)
+                    }
+                })?
         else {
             return Ok(());
         };
-        if tokio::fs::metadata(parent)
-            .await
-            .is_ok_and(|metadata| metadata.is_dir())
-        {
-            return Ok(());
-        }
-        tokio::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)
-            .await
-            .map_err(|source| DaemonSocketError::Io {
-                context: "failed to create the daemon runtime directory",
-                path: parent.to_path_buf(),
-                source,
-            })
-    }
-
-    /// Remove a socket file nobody answers on; refuse to touch anything else.
-    async fn clear_stale_socket(path: &Path) -> Result<(), DaemonSocketError> {
-        let metadata = match tokio::fs::symlink_metadata(path).await {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => {
-                return Err(DaemonSocketError::Io {
-                    context: "failed to inspect the daemon socket path",
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-        };
-        if !metadata.file_type().is_socket() {
-            return Err(DaemonSocketError::NotASocket {
-                path: path.to_path_buf(),
-            });
-        }
         match tokio::time::timeout(PROBE_TIMEOUT, UnixStream::connect(path)).await {
             Ok(Ok(_live)) => Err(DaemonSocketError::AlreadyRunning {
                 path: path.to_path_buf(),
             }),
-            Ok(Err(_refused)) => {
-                tokio::fs::remove_file(path)
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                let retire_parent = parent.clone();
+                let retire_name = name.to_string();
+                if super::owner_work(move || retire_parent.retire_socket(&retire_name, identity))
                     .await
-                    .map_err(|source| DaemonSocketError::Io {
-                        context: "failed to remove a stale daemon socket",
-                        path: path.to_path_buf(),
-                        source,
-                    })
+                    .map_err(DaemonSocketError::State)?
+                {
+                    Ok(())
+                } else {
+                    Err(DaemonSocketError::State(anyhow::anyhow!(
+                        "stale endpoint changed; refusing replacement"
+                    )))
+                }
             }
-            Err(_elapsed) => Err(DaemonSocketError::ProbeTimedOut {
+            Ok(Err(source)) => Err(DaemonSocketError::Io {
+                context: "uncertain daemon endpoint probe; refusing replacement",
+                path: path.to_path_buf(),
+                source,
+            }),
+            Err(_) => Err(DaemonSocketError::ProbeTimedOut {
                 path: path.to_path_buf(),
             }),
         }
     }
 
     async fn handle_connection(context: ConnectionContext, stream: UnixStream) {
-        match stream.peer_cred() {
-            Ok(cred) if cred.uid() == context.info.uid => {}
-            Ok(cred) => {
-                tracing::warn!(
-                    peer_uid = cred.uid(),
-                    daemon_uid = context.info.uid,
-                    "rejected daemon socket peer: uid mismatch"
-                );
-                return;
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "rejected daemon socket peer: no peer credentials");
-                return;
-            }
-        }
-
-        let (rx, mut writer) = stream.into_split();
-        let mut lines = BufReader::new(rx).lines();
-        let guard = match handshake(&context, &mut lines, &mut writer).await {
-            Ok(Some(guard)) => guard,
-            Ok(None) => return,
-            Err(err) => {
-                tracing::debug!(error = %err, "daemon socket handshake aborted");
-                return;
-            }
+        let credential = match stream.peer_cred() {
+            Ok(peer) if peer.uid() == context.info.uid => peer,
+            _ => return,
         };
-
-        let policy = StdioLoopPolicy {
-            transport: AppTransport::Socket,
-            shutdown: match guard.role {
-                AttachRole::Owner => ShutdownAuthority::Granted,
-                AttachRole::Attached => ShutdownAuthority::Denied,
-            },
+        let Some(pid) = credential.pid().and_then(|pid| u32::try_from(pid).ok()) else {
+            return;
         };
-        // The guard moves into the loop so the claim is released when the
-        // socket closes, not when a long-running turn finally returns.
-        let exit = run_stdio_loop(&context.state, lines, writer, policy, Some(guard)).await;
-        match exit {
-            Ok(StdioLoopExit::Shutdown) => context.shutdown.trigger(),
-            Ok(StdioLoopExit::InputClosed) => {}
-            Err(err) => tracing::debug!(error = %err, "daemon socket connection ended with error"),
-        }
-    }
-
-    /// Serve `healthz` and wait for `daemon/attach`; everything else is
-    /// refused with `attach_required` until the client attaches.
-    async fn handshake<R, W>(
-        context: &ConnectionContext,
-        lines: &mut Lines<R>,
-        writer: &mut W,
-    ) -> Result<Option<ConnectionGuard>>
-    where
-        R: AsyncBufRead + Unpin,
-        W: AsyncWrite + Unpin,
-    {
-        loop {
-            let Some(line) = lines.next_line().await? else {
-                return Ok(None);
-            };
-            let request = match parse_stdio_line(&line) {
-                ParsedStdioLine::Blank => continue,
-                ParsedStdioLine::Rejected(response) => {
-                    write_stdio_line(writer, &response).await?;
-                    continue;
-                }
-                ParsedStdioLine::Request(request) => request,
-            };
-            let id = request.id.clone();
-            match request.method.as_str() {
-                "healthz" | "app/healthz" => {
-                    let response = match dispatch_stdio_request_with_writer(
-                        &context.state,
-                        writer,
-                        &request.method,
-                        request.params,
-                        AppTransport::Socket,
-                    )
-                    .await
-                    {
-                        Ok(dispatch) => jsonrpc_result(id, dispatch.result),
-                        Err(err) => jsonrpc_error(id, err),
-                    };
-                    write_stdio_line(writer, &response).await?;
-                }
-                ATTACH_METHOD => match attach(context, request.params) {
-                    Ok((result, guard)) => {
-                        write_stdio_line(writer, &jsonrpc_result(id, result)).await?;
-                        return Ok(Some(guard));
-                    }
-                    Err(err) => write_stdio_line(writer, &jsonrpc_error(id, err)).await?,
-                },
-                other => {
-                    write_stdio_line(
-                        writer,
-                        &jsonrpc_error(id, JsonRpcError::attach_required(other)),
-                    )
-                    .await?;
-                }
-            }
-        }
-    }
-
-    fn attach(
-        context: &ConnectionContext,
-        params: Value,
-    ) -> Result<(Value, ConnectionGuard), JsonRpcError> {
-        let params: AttachParams = parse_params(params_or_object(params))?;
-        if params.client.name.trim().is_empty() {
-            return Err(JsonRpcError::invalid_params(
-                "client.name must not be empty",
-            ));
-        }
-        if let Some(expected) = params.expect_daemon_version.as_deref()
-            && expected != context.info.version
+        let start = match super::owner_work(move || {
+            codewhale_config::private_directory::unix_process_start(pid)
+        })
+        .await
         {
-            return Err(JsonRpcError::daemon_version_skew(
-                expected,
-                context.info.version,
-            ));
-        }
-
-        let mut registry = context
-            .registry
-            .lock()
-            .map_err(|_| JsonRpcError::internal("daemon connection registry poisoned"))?;
-        let id = registry.register(params.client.clone());
-        let role = match params.mode {
-            AttachMode::Attach => AttachRole::Attached,
-            AttachMode::Claim => match registry.claim(id) {
-                Ok(()) => AttachRole::Owner,
-                Err(owner) => {
-                    registry.remove(id);
-                    let owner = serde_json::to_value(owner)
-                        .map_err(|err| JsonRpcError::internal(err.to_string()))?;
-                    return Err(JsonRpcError::daemon_already_claimed(&owner));
-                }
-            },
+            Ok(start) => start,
+            Err(_) => return,
         };
-        let owner = registry.owner();
-        let connections = registry.connections.len();
-        drop(registry);
-
-        let info = &context.info;
-        let result = json!({
-            "attached": true,
-            "connection_id": id,
-            "role": role,
-            "transport": AppTransport::Socket.label(),
-            "daemon": {
-                "service": legacy_deepseek_compat::SERVICE_NAME,
-                "pid": info.pid,
-                "version": info.version,
-                "socket_path": info.socket_path.display().to_string(),
-                "uptime_ms": u64::try_from(info.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-            },
-            "owner": owner,
-            "connections": connections,
-        });
-        Ok((
-            result,
-            ConnectionGuard {
-                registry: Arc::clone(&context.registry),
-                id,
-                role,
-            },
-        ))
+        let (read, write) = stream.into_split();
+        super::run_authorized_connection(
+            context,
+            read,
+            write,
+            super::AuthorizedPeer { pid, start },
+        )
+        .await;
     }
 
     #[cfg(test)]
@@ -792,6 +1204,53 @@ mod platform {
             connections.0.abort_all();
         }
 
+        #[tokio::test]
+        async fn cancelled_owner_waiter_retains_worker_capacity_until_real_completion() {
+            let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
+            let mut releases = Vec::new();
+            let mut waiters = Vec::new();
+            for _ in 0..4 {
+                let (release, released) = std::sync::mpsc::channel();
+                releases.push(release);
+                let started = started.clone();
+                waiters.push(tokio::spawn(super::super::owner_work(move || {
+                    started.send(()).unwrap();
+                    let _ = released.recv();
+                    Ok(())
+                })));
+            }
+            for _ in 0..4 {
+                tokio::time::timeout(Duration::from_secs(5), observed.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            waiters[0].abort();
+            let _ = (&mut waiters[0]).await;
+            let (next_started, mut next_observed) = tokio::sync::mpsc::unbounded_channel();
+            let next = tokio::spawn(super::super::owner_work(move || {
+                next_started.send(()).unwrap();
+                Ok(())
+            }));
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                next_observed.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            releases.remove(0).send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), next_observed.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            for release in releases {
+                release.send(()).unwrap();
+            }
+            for waiter in waiters.into_iter().skip(1) {
+                waiter.await.unwrap().unwrap();
+            }
+            next.await.unwrap().unwrap();
+        }
+
         #[test]
         fn registry_claim_is_exclusive_until_the_owner_leaves() {
             let mut registry = ConnectionRegistry::default();
@@ -824,23 +1283,17 @@ mod platform {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 mod platform {
     use std::path::Path;
 
-    use super::{DaemonSocketError, DaemonSocketOptions, unsupported_platform};
+    use super::{
+        DaemonShutdownHandle, DaemonSocketError, DaemonSocketOptions, unsupported_platform,
+    };
 
     /// Placeholder until the Windows named pipe lands; cannot be constructed.
     pub struct DaemonSocket {
         never: std::convert::Infallible,
-    }
-
-    /// Placeholder handle for the unsupported platform.
-    #[derive(Debug, Clone)]
-    pub struct DaemonShutdownHandle(());
-
-    impl DaemonShutdownHandle {
-        pub fn trigger(&self) {}
     }
 
     impl DaemonSocket {
@@ -867,7 +1320,9 @@ mod platform {
     }
 }
 
-pub use platform::{DaemonShutdownHandle, DaemonSocket, bind_daemon_socket};
+#[cfg(windows)]
+use crate::daemon_windows as platform;
+pub use platform::{DaemonSocket, bind_daemon_socket};
 
 /// `codewhale app-server --socket`: bind, announce, serve until the owner's
 /// `shutdown` or a termination signal.
@@ -884,6 +1339,31 @@ pub async fn run_daemon_socket(options: DaemonSocketOptions) -> anyhow::Result<(
     });
     daemon.serve().await?;
     Ok(())
+}
+
+#[cfg(any(unix, windows))]
+pub(crate) use platform::bind_captured_owner;
+
+#[cfg(unix)]
+pub async fn capture_process_start(pid: u32) -> anyhow::Result<String> {
+    owner_work(move || codewhale_config::private_directory::unix_process_start(pid)).await
+}
+
+#[cfg(windows)]
+pub fn default_socket_path() -> Result<PathBuf, DaemonSocketError> {
+    crate::daemon_windows::selected_pipe_path(None).map_err(DaemonSocketError::State)
+}
+
+#[cfg(windows)]
+pub async fn capture_process_start(pid: u32) -> anyhow::Result<String> {
+    owner_work(move || {
+        Ok(
+            codewhale_config::windows_identity::WindowsPeerProcess::open_current_user(pid)?
+                .start()
+                .to_string(),
+        )
+    })
+    .await
 }
 
 #[cfg(test)]

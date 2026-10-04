@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 
-use crate::config::ApiProvider;
+use crate::config::{ProviderIdentity, ProviderKind};
 use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope};
 use codewhale_config::route::{LogicalModelRef, RouteRequest, RouteResolver};
 
@@ -43,76 +43,45 @@ pub(crate) enum ProviderAuthClass {
 /// one private endpoint or model entitlement is not evidence for another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderRouteIdentity {
-    provider: ApiProvider,
-    provider_id: String,
+    identity: ProviderIdentity,
     endpoint: String,
     model: String,
     auth_class: ProviderAuthClass,
+    credential_generation: Option<crate::route_receipt::CredentialGeneration>,
 }
 
 pub(crate) fn route_identity_for_model(
     config: &crate::config::Config,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
     model: &str,
 ) -> ProviderRouteIdentity {
-    let configured = config.provider_config_for(provider);
-    let provider_id = if provider == ApiProvider::Custom {
-        config
-            .provider
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(provider.as_str())
-    } else {
-        provider.as_str()
-    };
-    let endpoint = if provider == config.api_provider() {
-        config.active_route_base_url()
-    } else {
-        configured
-            .and_then(|entry| entry.base_url.as_deref())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| {
-                if provider == ApiProvider::Moonshot
-                    && configured.is_some_and(|entry| {
-                        entry
-                            .auth_mode
-                            .as_deref()
-                            .is_some_and(crate::config::auth_mode_uses_kimi_imported_token)
-                    })
-                {
-                    crate::config::DEFAULT_KIMI_CODE_BASE_URL
-                } else {
-                    provider.default_base_url()
-                }
-            })
-            .to_string()
-    }
-    .trim_end_matches('/')
-    .to_string();
+    let endpoint = crate::route_receipt::endpoint_identity(&config.base_url_for_route(identity));
     ProviderRouteIdentity {
-        provider,
-        provider_id: provider_id.to_string(),
+        identity: identity.clone(),
         endpoint,
         model: model.trim().to_string(),
-        auth_class: auth_class_for_provider(config, provider),
+        auth_class: auth_class_for_provider(config, identity),
+        credential_generation: config.readonly_health_credential_generation(identity),
     }
 }
 
 pub(crate) fn auth_class_for_provider(
     config: &crate::config::Config,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
 ) -> ProviderAuthClass {
-    let auth_mode = config.auth_mode_for_provider(provider);
+    let provider = identity.provider;
+    if config.verify_provider_identity(identity).is_err() {
+        return ProviderAuthClass::Legacy;
+    }
+    let auth_mode = config.auth_mode_for_provider(identity);
     if crate::config::auth_mode_disables_api_key(auth_mode.as_deref()) {
         return ProviderAuthClass::NoAuth;
     }
-    let official_endpoint = !config.provider_uses_custom_endpoint(provider);
-    if provider == ApiProvider::OpenaiCodex && official_endpoint {
+    let official_endpoint = !config.provider_uses_custom_endpoint(identity);
+    if provider == ProviderKind::OpenaiCodex && official_endpoint {
         return ProviderAuthClass::OAuth;
     }
-    if provider == ApiProvider::Moonshot
+    if provider == ProviderKind::Moonshot
         && official_endpoint
         && auth_mode
             .as_deref()
@@ -120,7 +89,7 @@ pub(crate) fn auth_class_for_provider(
     {
         return ProviderAuthClass::ImportedToken;
     }
-    if provider == ApiProvider::Xai
+    if provider == ProviderKind::Xai
         && official_endpoint
         && auth_mode
             .as_deref()
@@ -128,7 +97,7 @@ pub(crate) fn auth_class_for_provider(
     {
         return ProviderAuthClass::OAuth;
     }
-    match credential_state_for_provider(config, provider) {
+    match credential_state_for_provider(config, identity) {
         CredentialState::NoAuth => ProviderAuthClass::NoAuth,
         CredentialState::Local => ProviderAuthClass::Local,
         CredentialState::Legacy => ProviderAuthClass::Legacy,
@@ -139,14 +108,21 @@ pub(crate) fn auth_class_for_provider(
 
 pub(crate) fn credential_state_for_provider(
     config: &crate::config::Config,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
 ) -> CredentialState {
-    let auth_mode = config.auth_mode_for_provider(provider);
+    let provider = identity.provider;
+    if provider == ProviderKind::Antigravity {
+        return CredentialState::Legacy;
+    }
+    if config.verify_provider_identity(identity).is_err() {
+        return CredentialState::MissingKey;
+    }
+    let auth_mode = config.auth_mode_for_provider(identity);
     if crate::config::auth_mode_disables_api_key(auth_mode.as_deref()) {
         return CredentialState::NoAuth;
     }
     let api_key_required = crate::config::auth_mode_requires_api_key(auth_mode.as_deref());
-    let official_endpoint = !config.provider_uses_custom_endpoint(provider);
+    let official_endpoint = !config.provider_uses_custom_endpoint(identity);
 
     // A built-in provider can intentionally target a local OpenAI-compatible
     // runtime. That route is keyless unless the operator explicitly declares
@@ -154,12 +130,14 @@ pub(crate) fn credential_state_for_provider(
     // branches (including the DeepSeek-CN compatibility alias) so readiness
     // and cache identity describe the effective endpoint, not just the
     // provider enum.
-    if provider == config.api_provider()
+    if config
+        .active_provider_identity()
+        .is_ok_and(|active| active == *identity)
         && !official_endpoint
         && crate::config::base_url_uses_local_host(&config.active_route_base_url())
     {
         return if api_key_required {
-            if crate::config::has_api_key_for(config, provider) {
+            if crate::config::has_api_key_for(config, identity) {
                 CredentialState::Saved
             } else {
                 CredentialState::MissingKey
@@ -169,26 +147,11 @@ pub(crate) fn credential_state_for_provider(
         };
     }
 
-    // DeepSeek CN is a TUI compatibility alias without a shared
-    // `ProviderKind`, but it is still a live route handled by the runtime.
-    // Treating it as `Legacy` makes setup claim it cannot run at all.
-    if provider == ApiProvider::DeepseekCN {
-        return if crate::config::has_api_key_for(config, provider) {
-            CredentialState::Saved
-        } else {
-            CredentialState::MissingKey
-        };
-    }
-    // The retired Antigravity identity keeps a `ProviderKind` only so legacy
-    // `[providers.antigravity]` tables deserialize and can be cleared. A
-    // leftover `api_key` in that table must never read as `Saved`: the route
-    // is a non-runnable tombstone, so `/model`, setup, and readiness treat it
-    // as legacy regardless of what the table contains.
-    if provider == ApiProvider::Antigravity || provider.kind().is_none() {
+    if provider == ProviderKind::Antigravity {
         return CredentialState::Legacy;
     }
-    if provider == ApiProvider::Custom {
-        let Some(configured) = config.provider_config_for(provider) else {
+    if provider == ProviderKind::Custom {
+        let Some(configured) = config.provider_config_for(identity) else {
             return CredentialState::MissingKey;
         };
         let auth_optional = configured
@@ -201,10 +164,12 @@ pub(crate) fn credential_state_for_provider(
         }
         // The literal `custom` route (older top-level shape, now
         // `[providers.custom]`) also owns the generic `custom` secret slot.
-        let has_auth = (provider == config.api_provider()
+        let has_auth = (config
+            .active_provider_identity()
+            .is_ok_and(|active| active == *identity)
             && crate::config::explicit_cli_api_key_override().is_some())
             || (config.selects_literal_custom_provider()
-                && crate::config::has_api_key_for(config, provider))
+                && crate::config::has_api_key_for(config, identity))
             || configured.api_key.as_deref().is_some_and(|value| {
                 crate::config::classify_config_api_key_value(value)
                     == crate::config::ConfigApiKeyValueKind::Literal
@@ -225,10 +190,10 @@ pub(crate) fn credential_state_for_provider(
     }
     if crate::config::provider_route_is_keyless_self_hosted(
         provider,
-        &config.base_url_for_route(provider),
+        &config.base_url_for_route(identity),
     ) {
         return if api_key_required {
-            if crate::config::has_api_key_for(config, provider) {
+            if crate::config::has_api_key_for(config, identity) {
                 CredentialState::Saved
             } else {
                 CredentialState::MissingKey
@@ -238,7 +203,7 @@ pub(crate) fn credential_state_for_provider(
         };
     }
 
-    let uses_kimi_imported_token = provider == ApiProvider::Moonshot
+    let uses_kimi_imported_token = provider == ProviderKind::Moonshot
         && official_endpoint
         && auth_mode
             .as_deref()
@@ -248,12 +213,14 @@ pub(crate) fn credential_state_for_provider(
         // OAuth client identity. Never inspect Kimi CLI storage here.
         return CredentialState::MissingKey;
     }
-    if provider == ApiProvider::OpenaiCodex && official_endpoint {
-        return if crate::config::has_api_key_for(config, provider) {
+    if provider == ProviderKind::OpenaiCodex && official_endpoint {
+        return if crate::config::has_api_key_for(config, identity) {
             CredentialState::Saved
-        } else if provider != config.api_provider()
+        } else if config
+            .active_provider_identity()
+            .is_ok_and(|active| active != *identity)
             && config.external_credential_read_consent_configured(
-                provider,
+                identity,
                 codewhale_config::ExternalCredentialSource::CodexCli,
             )
         {
@@ -262,7 +229,7 @@ pub(crate) fn credential_state_for_provider(
             CredentialState::MissingLogin
         };
     }
-    let xai_oauth_selected = provider == ApiProvider::Xai
+    let xai_oauth_selected = provider == ProviderKind::Xai
         && official_endpoint
         && auth_mode
             .as_deref()
@@ -272,12 +239,14 @@ pub(crate) fn credential_state_for_provider(
         // consent record whose file is gone or expired resolves below as
         // `ExternalConsent` (dormant) or `MissingLogin`, never as `Saved`.
         return if crate::oauth::credentials_valid(crate::oauth::OAuthProvider::Xai, config)
-            || explicit_provider_credential_present(config, provider)
+            || explicit_provider_credential_present(config, identity)
         {
             CredentialState::Saved
-        } else if provider != config.api_provider()
+        } else if config
+            .active_provider_identity()
+            .is_ok_and(|active| active != *identity)
             && config.external_credential_read_consent_configured(
-                provider,
+                identity,
                 codewhale_config::ExternalCredentialSource::GrokCli,
             )
         {
@@ -286,22 +255,24 @@ pub(crate) fn credential_state_for_provider(
             CredentialState::MissingLogin
         };
     }
-    if provider == ApiProvider::Xai && explicit_provider_credential_present(config, provider) {
+    if provider == ProviderKind::Xai && explicit_provider_credential_present(config, identity) {
         return CredentialState::Saved;
     }
-    if provider == ApiProvider::Xai {
+    if provider == ProviderKind::Xai {
         return CredentialState::MissingKey;
     }
 
-    if crate::config::has_api_key_for(config, provider) {
+    if crate::config::has_api_key_for(config, identity) {
         CredentialState::Saved
     } else if matches!(
         provider,
-        ApiProvider::Deepseek | ApiProvider::DeepseekAnthropic
+        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
     ) && official_endpoint
-        && provider != config.api_provider()
+        && config
+            .active_provider_identity()
+            .is_ok_and(|active| active != *identity)
         && config.external_credential_read_consent_configured(
-            provider,
+            identity,
             codewhale_config::ExternalCredentialSource::DshCli,
         )
     {
@@ -313,16 +284,24 @@ pub(crate) fn credential_state_for_provider(
 
 fn explicit_provider_credential_present(
     config: &crate::config::Config,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
 ) -> bool {
-    (provider == config.api_provider() && crate::config::explicit_cli_api_key_override().is_some())
-        || (!config.provider_uses_custom_endpoint(provider)
+    let provider = identity.provider;
+    if config.verify_provider_identity(identity).is_err() {
+        return false;
+    }
+    (config
+        .active_provider_identity()
+        .is_ok_and(|active| active == *identity)
+        && crate::config::explicit_cli_api_key_override().is_some())
+        || (!config.provider_uses_custom_endpoint(identity)
             && provider
+                .provider()
                 .env_vars()
                 .iter()
                 .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty())))
-        || (config.config_credentials_are_bound_to_provider_endpoint(provider)
-            && config.provider_config_for(provider).is_some_and(|entry| {
+        || (config.config_credentials_are_bound_to_provider_endpoint(identity)
+            && config.provider_config_for(identity).is_some_and(|entry| {
                 entry.api_key.as_deref().is_some_and(|value| {
                     crate::config::classify_config_api_key_value(value)
                         == crate::config::ConfigApiKeyValueKind::Literal
@@ -342,15 +321,15 @@ fn explicit_provider_credential_present(
 /// none of them can mark a route selectable when `/provider` would reject it.
 pub(crate) fn route_is_valid_for_model(
     config: &crate::config::Config,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
     model: Option<&str>,
 ) -> bool {
-    let compatibility_kind =
-        (provider == ApiProvider::DeepseekCN).then_some(codewhale_config::ProviderKind::Deepseek);
-    let Some(kind) = provider.kind().or(compatibility_kind) else {
-        return true;
-    };
-    let configured = config.provider_config_for(provider);
+    let provider = identity.provider;
+    if config.verify_provider_identity(identity).is_err() || provider == ProviderKind::Antigravity {
+        return false;
+    }
+    let kind = provider;
+    let configured = config.provider_config_for(identity);
     let configured_model = model
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -362,22 +341,16 @@ pub(crate) fn route_is_valid_for_model(
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
         });
-    let active_model = (provider == config.api_provider())
-        .then(|| config.default_model())
-        .filter(|model| !model.trim().is_empty() && !model.eq_ignore_ascii_case("auto"));
+    let active_model = (config
+        .active_provider_identity()
+        .is_ok_and(|active| active == *identity))
+    .then(|| config.default_model())
+    .filter(|model| !model.trim().is_empty() && !model.eq_ignore_ascii_case("auto"));
     let request = RouteRequest {
         explicit_provider: Some(kind),
         model_selector: configured_model.or(active_model).map(LogicalModelRef::from),
         saved_provider_model: None,
-        base_url_override: if provider == config.api_provider() {
-            Some(config.active_route_base_url())
-        } else {
-            configured
-                .and_then(|entry| entry.base_url.as_deref())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        },
+        base_url_override: Some(config.base_url_for_route(identity)),
         limit_overrides: Vec::new(),
     };
     RouteResolver::new()
@@ -493,6 +466,7 @@ pub(crate) struct ProviderReadinessSnapshot {
 
 impl ProviderReadinessSnapshot {
     fn last(&self, identity: &ProviderRouteIdentity) -> Option<&LastProviderCheck> {
+        identity.credential_generation.as_ref()?;
         if let Some(check) = self
             .checks
             .iter()
@@ -510,10 +484,10 @@ impl ProviderReadinessSnapshot {
             return None;
         }
         self.checks.iter().rev().find_map(|(candidate, check)| {
-            (candidate.provider == identity.provider
-                && candidate.provider_id == identity.provider_id
+            (candidate.identity == identity.identity
                 && candidate.endpoint == identity.endpoint
-                && candidate.auth_class == identity.auth_class)
+                && candidate.auth_class == identity.auth_class
+                && candidate.credential_generation == identity.credential_generation)
                 .then_some(check)
         })
     }
@@ -521,13 +495,14 @@ impl ProviderReadinessSnapshot {
     pub(crate) fn record_success(
         &mut self,
         config: &crate::config::Config,
-        provider: ApiProvider,
+        receipt: &crate::route_receipt::TurnRouteReceipt,
         model: &str,
     ) {
-        self.replace(
-            route_identity_for_model(config, provider, model),
-            LastProviderCheck::Passed,
-        );
+        let identity = receipt.admitted_identity();
+        let mut route = route_identity_for_model(config, identity, model);
+        route.endpoint = receipt.endpoint_identity().to_string();
+        route.credential_generation = Some(receipt.credential_generation().clone());
+        self.replace(route, LastProviderCheck::Passed);
     }
 
     /// Records a failed `/models` probe. Unlike [`Self::record_failure`],
@@ -536,13 +511,16 @@ impl ProviderReadinessSnapshot {
     pub(crate) fn record_models_probe_failure(
         &mut self,
         config: &crate::config::Config,
-        provider: ApiProvider,
+        identity: &ProviderIdentity,
         model: &str,
+        generation: crate::route_receipt::CredentialGeneration,
         category: ErrorCategory,
         message: &str,
     ) {
+        let mut route = route_identity_for_model(config, identity, model);
+        route.credential_generation = Some(generation);
         self.replace(
-            route_identity_for_model(config, provider, model),
+            route,
             LastProviderCheck::Failed {
                 category,
                 message: sanitize_message(message),
@@ -554,27 +532,31 @@ impl ProviderReadinessSnapshot {
     pub(crate) fn record_models_probe_success(
         &mut self,
         config: &crate::config::Config,
-        provider: ApiProvider,
+        identity: &ProviderIdentity,
         model: &str,
+        generation: crate::route_receipt::CredentialGeneration,
     ) {
-        self.replace(
-            route_identity_for_model(config, provider, model),
-            LastProviderCheck::ModelsEndpointPassed,
-        );
+        let mut route = route_identity_for_model(config, identity, model);
+        route.credential_generation = Some(generation);
+        self.replace(route, LastProviderCheck::ModelsEndpointPassed);
     }
 
     pub(crate) fn record_failure(
         &mut self,
         config: &crate::config::Config,
-        provider: ApiProvider,
+        receipt: &crate::route_receipt::TurnRouteReceipt,
         model: &str,
         envelope: &ErrorEnvelope,
     ) {
+        let identity = receipt.admitted_identity();
+        let mut route = route_identity_for_model(config, identity, model);
+        route.endpoint = receipt.endpoint_identity().to_string();
+        route.credential_generation = Some(receipt.credential_generation().clone());
         if !provider_owned_failure(envelope) {
             return;
         }
         self.replace(
-            route_identity_for_model(config, provider, model),
+            route,
             LastProviderCheck::Failed {
                 category: envelope.category,
                 message: sanitize_message(&envelope.message),
@@ -586,13 +568,13 @@ impl ProviderReadinessSnapshot {
     pub(crate) fn record_failure_message(
         &mut self,
         config: &crate::config::Config,
-        provider: ApiProvider,
+        identity: &ProviderIdentity,
         model: &str,
         category: ErrorCategory,
         message: &str,
     ) {
         self.replace(
-            route_identity_for_model(config, provider, model),
+            route_identity_for_model(config, identity, model),
             LastProviderCheck::Failed {
                 category,
                 message: sanitize_message(message),
@@ -662,14 +644,14 @@ pub(crate) fn resolve_with_identity(
 
 pub(crate) fn resolve_for_model(
     config: &crate::config::Config,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
     model: &str,
     checks: &ProviderReadinessSnapshot,
 ) -> ResolvedProviderReadiness {
     resolve_with_identity(
-        &route_identity_for_model(config, provider, model),
-        credential_state_for_provider(config, provider),
-        route_is_valid_for_model(config, provider, Some(model)),
+        &route_identity_for_model(config, identity, model),
+        credential_state_for_provider(config, identity),
+        route_is_valid_for_model(config, identity, Some(model)),
         checks,
     )
 }
@@ -694,16 +676,27 @@ mod tests {
     use super::*;
     use crate::error_taxonomy::ErrorSeverity;
 
+    fn literal_health_config(kind: ProviderKind) -> crate::config::Config {
+        let mut config = crate::config::Config {
+            provider: Some(kind.as_str().into()),
+            ..Default::default()
+        };
+        let identity = config.builtin_provider_identity(kind).unwrap();
+        config.provider_config_for_mut(&identity).unwrap().api_key =
+            Some("health-fixture-key".into());
+        config
+    }
+
     fn resolve_test_route(
         config: &crate::config::Config,
-        provider: ApiProvider,
+        provider: ProviderKind,
         model: &str,
         credentials: CredentialState,
         route_ok: bool,
         checks: &ProviderReadinessSnapshot,
     ) -> ResolvedProviderReadiness {
         resolve_with_identity(
-            &route_identity_for_model(config, provider, model),
+            &route_identity_for_model(config, &(config).test_identity_for_kind(provider), model),
             credentials,
             route_ok,
             checks,
@@ -717,7 +710,7 @@ mod tests {
         assert_eq!(
             resolve_test_route(
                 &config,
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek-v4-pro",
                 CredentialState::Saved,
                 true,
@@ -736,7 +729,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            credential_state_for_provider(&missing, ApiProvider::DeepseekCN),
+            credential_state_for_provider(
+                &missing,
+                &(missing)
+                    .resolve_provider_selection_identity("deepseek-cn")
+                    .unwrap()
+            ),
             CredentialState::MissingKey
         );
 
@@ -752,7 +750,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            credential_state_for_provider(&configured, ApiProvider::DeepseekCN),
+            credential_state_for_provider(
+                &configured,
+                &(configured)
+                    .resolve_provider_selection_identity("deepseek-cn")
+                    .unwrap()
+            ),
             CredentialState::Saved
         );
     }
@@ -797,69 +800,90 @@ mod tests {
             }),
             ..Default::default()
         };
-        let upper_identity = route_identity_for_model(&upper, ApiProvider::Custom, "Vendor/ModelA");
-        let lower_identity = route_identity_for_model(&lower, ApiProvider::Custom, "vendor/modela");
+        let upper_identity = route_identity_for_model(
+            &upper,
+            &(upper).test_identity_for_kind(ProviderKind::Custom),
+            "Vendor/ModelA",
+        );
+        let lower_identity = route_identity_for_model(
+            &lower,
+            &(lower).test_identity_for_kind(ProviderKind::Custom),
+            "vendor/modela",
+        );
 
         assert_ne!(upper_identity, lower_identity);
-        assert_eq!(upper_identity.provider_id, "CUSTOM");
+        assert_eq!(upper_identity.identity.key.as_str(), "CUSTOM");
         assert_eq!(upper_identity.endpoint, "https://example.test/TenantA/v1");
         assert_eq!(upper_identity.model, "Vendor/ModelA");
 
         let mut checks = ProviderReadinessSnapshot::default();
-        checks.record_success(&upper, ApiProvider::Custom, "Vendor/ModelA");
+        checks.record_success(
+            &upper,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &upper,
+                ProviderKind::Custom,
+                "Vendor/ModelA",
+            ),
+            "Vendor/ModelA",
+        );
         assert_eq!(
-            resolve_for_model(&lower, ApiProvider::Custom, "vendor/modela", &checks),
+            resolve_for_model(
+                &lower,
+                &(lower).test_identity_for_kind(ProviderKind::Custom),
+                "vendor/modela",
+                &checks
+            ),
             ResolvedProviderReadiness::SavedUnchecked
         );
     }
 
     #[test]
-    fn external_consent_with_passed_check_becomes_ready() {
+    fn external_consent_cached_turn_cannot_prove_current_opaque_generation() {
         let config = crate::config::Config::default();
         let mut checks = ProviderReadinessSnapshot::default();
         checks.record_success(
             &config,
-            ApiProvider::OpenaiCodex,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &config,
+                ProviderKind::OpenaiCodex,
+                crate::config::DEFAULT_OPENAI_CODEX_MODEL,
+            ),
             crate::config::DEFAULT_OPENAI_CODEX_MODEL,
         );
         assert_eq!(
             resolve_test_route(
                 &config,
-                ApiProvider::OpenaiCodex,
+                ProviderKind::OpenaiCodex,
                 crate::config::DEFAULT_OPENAI_CODEX_MODEL,
                 CredentialState::ExternalConsent,
                 true,
                 &checks,
             ),
-            ResolvedProviderReadiness::Ready
+            ResolvedProviderReadiness::ExternalConsentPendingSelection
         );
     }
 
     #[test]
-    fn external_consent_with_failed_check_surfaces_reason() {
+    fn external_consent_cached_failure_cannot_prove_current_opaque_generation() {
         let config = crate::config::Config::default();
         let mut checks = ProviderReadinessSnapshot::default();
         checks.record_failure_message(
             &config,
-            ApiProvider::Xai,
+            &(config).test_identity_for_kind(ProviderKind::Xai),
             "grok-4.5",
             ErrorCategory::Authentication,
             "consent revoked",
         );
-        assert!(
-            matches!(
-                resolve_test_route(
-                    &config,
-                    ApiProvider::Xai,
-                    "grok-4.5",
-                    CredentialState::ExternalConsent,
-                    true,
-                    &checks,
-                ),
-                ResolvedProviderReadiness::SavedLastCheckFailed { category, .. }
-                    if category == ErrorCategory::Authentication
+        assert_eq!(
+            resolve_test_route(
+                &config,
+                ProviderKind::Xai,
+                "grok-4.5",
+                CredentialState::ExternalConsent,
+                true,
+                &checks
             ),
-            "failed activation should surface the sanitized reason"
+            ResolvedProviderReadiness::ExternalConsentPendingSelection
         );
     }
 
@@ -870,7 +894,7 @@ mod tests {
         assert_eq!(
             resolve_test_route(
                 &config,
-                ApiProvider::OpenaiCodex,
+                ProviderKind::OpenaiCodex,
                 crate::config::DEFAULT_OPENAI_CODEX_MODEL,
                 CredentialState::ExternalConsent,
                 true,
@@ -882,13 +906,27 @@ mod tests {
 
     #[test]
     fn models_probe_success_marks_connection_checked_not_ready() {
-        let config = crate::config::Config::default();
+        let _lock = crate::test_support::lock_test_env();
+        let _cli = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+        let _source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let config = literal_health_config(ProviderKind::Deepseek);
         let mut checks = ProviderReadinessSnapshot::default();
-        checks.record_models_probe_success(&config, ApiProvider::Deepseek, "deepseek-v4-pro");
+        checks.record_models_probe_success(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Deepseek),
+            "deepseek-v4-pro",
+            crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &config,
+                ProviderKind::Deepseek,
+                "deepseek-v4-pro",
+            )
+            .credential_generation()
+            .clone(),
+        );
         assert_eq!(
             resolve_test_route(
                 &config,
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek-v4-pro",
                 CredentialState::Saved,
                 true,
@@ -905,13 +943,24 @@ mod tests {
 
     #[test]
     fn success_and_provider_failure_replace_session_evidence() {
-        let config = crate::config::Config::default();
+        let _lock = crate::test_support::lock_test_env();
+        let _cli = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+        let _source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let config = literal_health_config(ProviderKind::Zai);
         let mut checks = ProviderReadinessSnapshot::default();
-        checks.record_success(&config, ApiProvider::Zai, "glm-5.2");
+        checks.record_success(
+            &config,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &config,
+                ProviderKind::Zai,
+                "glm-5.2",
+            ),
+            "glm-5.2",
+        );
         assert_eq!(
             resolve_test_route(
                 &config,
-                ApiProvider::Zai,
+                ProviderKind::Zai,
                 "glm-5.2",
                 CredentialState::Saved,
                 true,
@@ -922,7 +971,11 @@ mod tests {
 
         checks.record_failure(
             &config,
-            ApiProvider::Zai,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &config,
+                ProviderKind::Zai,
+                "glm-5.2",
+            ),
             "glm-5.2",
             &ErrorEnvelope::new(
                 ErrorCategory::Authentication,
@@ -934,7 +987,7 @@ mod tests {
         );
         let resolved = resolve_test_route(
             &config,
-            ApiProvider::Zai,
+            ProviderKind::Zai,
             "glm-5.2",
             CredentialState::Saved,
             true,
@@ -952,12 +1005,27 @@ mod tests {
 
     #[test]
     fn tool_failures_do_not_poison_provider_health() {
-        let config = crate::config::Config::default();
+        let _lock = crate::test_support::lock_test_env();
+        let _cli = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+        let _source = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+        let config = literal_health_config(ProviderKind::Deepseek);
         let mut checks = ProviderReadinessSnapshot::default();
-        checks.record_success(&config, ApiProvider::Deepseek, "deepseek-v4-pro");
+        checks.record_success(
+            &config,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &config,
+                ProviderKind::Deepseek,
+                "deepseek-v4-pro",
+            ),
+            "deepseek-v4-pro",
+        );
         checks.record_failure(
             &config,
-            ApiProvider::Deepseek,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &config,
+                ProviderKind::Deepseek,
+                "deepseek-v4-pro",
+            ),
             "deepseek-v4-pro",
             &ErrorEnvelope::new(
                 ErrorCategory::Tool,
@@ -970,7 +1038,7 @@ mod tests {
         assert!(matches!(
             resolve_test_route(
                 &config,
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek-v4-pro",
                 CredentialState::Saved,
                 true,
@@ -987,11 +1055,19 @@ mod tests {
             ..Default::default()
         };
         let mut checks = ProviderReadinessSnapshot::default();
-        checks.record_success(&config, ApiProvider::OpenaiCodex, "gpt-5.5");
+        checks.record_success(
+            &config,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &config,
+                ProviderKind::OpenaiCodex,
+                "gpt-5.5",
+            ),
+            "gpt-5.5",
+        );
         assert_eq!(
             resolve_test_route(
                 &config,
-                ApiProvider::OpenaiCodex,
+                ProviderKind::OpenaiCodex,
                 "gpt-5.5",
                 CredentialState::MissingLogin,
                 true,
@@ -1002,7 +1078,7 @@ mod tests {
         assert_eq!(
             resolve_test_route(
                 &config,
-                ApiProvider::OpenaiCodex,
+                ProviderKind::OpenaiCodex,
                 "gpt-5.5",
                 CredentialState::Saved,
                 false,
@@ -1046,7 +1122,15 @@ mod tests {
         };
         let mut checks = ProviderReadinessSnapshot::default();
         let api_key_model = api_key_config.default_model();
-        checks.record_success(&api_key_config, ApiProvider::Xai, &api_key_model);
+        checks.record_success(
+            &api_key_config,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &api_key_config,
+                ProviderKind::Xai,
+                &api_key_model,
+            ),
+            &api_key_model,
+        );
 
         let mut oauth_config = api_key_config;
         oauth_config
@@ -1056,13 +1140,21 @@ mod tests {
             .xai
             .auth_mode = Some("oauth".to_string());
         assert_eq!(
-            credential_state_for_provider(&oauth_config, ApiProvider::Xai),
+            credential_state_for_provider(
+                &oauth_config,
+                &(oauth_config).test_identity_for_kind(ProviderKind::Xai)
+            ),
             CredentialState::Saved,
             "fixture must have structurally valid OAuth material"
         );
         let model = oauth_config.default_model();
         assert_eq!(
-            resolve_for_model(&oauth_config, ApiProvider::Xai, &model, &checks),
+            resolve_for_model(
+                &oauth_config,
+                &(oauth_config).test_identity_for_kind(ProviderKind::Xai),
+                &model,
+                &checks
+            ),
             ResolvedProviderReadiness::SavedUnchecked,
             "API-key evidence must not cross the auth-class boundary"
         );
@@ -1075,11 +1167,19 @@ mod tests {
         }
         .with_legacy_root(Some("deepseek-test-key".to_string()), None);
         let mut checks = ProviderReadinessSnapshot::default();
-        checks.record_success(&deepseek, ApiProvider::Deepseek, "deepseek-v4-pro");
+        checks.record_success(
+            &deepseek,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &deepseek,
+                ProviderKind::Deepseek,
+                "deepseek-v4-pro",
+            ),
+            "deepseek-v4-pro",
+        );
         assert_eq!(
             resolve_for_model(
                 &deepseek,
-                ApiProvider::Deepseek,
+                &(deepseek).test_identity_for_kind(ProviderKind::Deepseek),
                 "deepseek-v4-flash",
                 &checks,
             ),
@@ -1105,18 +1205,36 @@ mod tests {
             ..Default::default()
         };
         let alpha = custom_config("alpha", "https://alpha.example/v1");
-        checks.record_success(&alpha, ApiProvider::Custom, "private-coder");
+        checks.record_success(
+            &alpha,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &alpha,
+                ProviderKind::Custom,
+                "private-coder",
+            ),
+            "private-coder",
+        );
 
         let beta = custom_config("beta", "https://alpha.example/v1");
         assert_eq!(
-            resolve_for_model(&beta, ApiProvider::Custom, "private-coder", &checks),
+            resolve_for_model(
+                &beta,
+                &(beta).test_identity_for_kind(ProviderKind::Custom),
+                "private-coder",
+                &checks
+            ),
             ResolvedProviderReadiness::SavedUnchecked,
             "named custom providers must not share observed health"
         );
 
         let alpha_moved = custom_config("alpha", "https://other.example/v1");
         assert_eq!(
-            resolve_for_model(&alpha_moved, ApiProvider::Custom, "private-coder", &checks,),
+            resolve_for_model(
+                &alpha_moved,
+                &(alpha_moved).test_identity_for_kind(ProviderKind::Custom),
+                "private-coder",
+                &checks,
+            ),
             ResolvedProviderReadiness::SavedUnchecked,
             "changing endpoints must invalidate observed health"
         );
@@ -1132,16 +1250,34 @@ mod tests {
 
         // Before any observed turn, auto honestly reports unchecked.
         assert_eq!(
-            resolve_for_model(&config, ApiProvider::Deepseek, "auto", &checks),
+            resolve_for_model(
+                &config,
+                &(config).test_identity_for_kind(ProviderKind::Deepseek),
+                "auto",
+                &checks
+            ),
             ResolvedProviderReadiness::SavedUnchecked,
             "auto with no observed history must stay unchecked"
         );
 
         // A successful concrete-model turn on the route verifies auto too —
         // the router picks the model, so per-model scoping cannot apply.
-        checks.record_success(&config, ApiProvider::Deepseek, "deepseek-v4-flash");
+        checks.record_success(
+            &config,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &config,
+                ProviderKind::Deepseek,
+                "deepseek-v4-flash",
+            ),
+            "deepseek-v4-flash",
+        );
         assert_eq!(
-            resolve_for_model(&config, ApiProvider::Deepseek, "auto", &checks),
+            resolve_for_model(
+                &config,
+                &(config).test_identity_for_kind(ProviderKind::Deepseek),
+                "auto",
+                &checks
+            ),
             ResolvedProviderReadiness::Ready,
             "a passed turn on the route must clear auto's not-checked badge"
         );
@@ -1149,14 +1285,19 @@ mod tests {
         // A later failure on the same route must surface for auto as well.
         checks.record_failure_message(
             &config,
-            ApiProvider::Deepseek,
+            &(config).test_identity_for_kind(ProviderKind::Deepseek),
             "deepseek-v4-pro",
             crate::error_taxonomy::ErrorCategory::Authentication,
             "401 unauthorized",
         );
         assert!(
             matches!(
-                resolve_for_model(&config, ApiProvider::Deepseek, "auto", &checks),
+                resolve_for_model(
+                    &config,
+                    &(config).test_identity_for_kind(ProviderKind::Deepseek),
+                    "auto",
+                    &checks
+                ),
                 ResolvedProviderReadiness::SavedLastCheckFailed { .. }
             ),
             "the most recent route check must win for auto, including failures"
@@ -1184,12 +1325,25 @@ mod tests {
         };
         let mut checks = ProviderReadinessSnapshot::default();
         let alpha = custom_config("alpha", "https://alpha.example/v1");
-        checks.record_success(&alpha, ApiProvider::Custom, "private-coder");
+        checks.record_success(
+            &alpha,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &alpha,
+                ProviderKind::Custom,
+                "private-coder",
+            ),
+            "private-coder",
+        );
 
         // Same endpoint, different named provider: no leak.
         let beta = custom_config("beta", "https://alpha.example/v1");
         assert_eq!(
-            resolve_for_model(&beta, ApiProvider::Custom, "auto", &checks),
+            resolve_for_model(
+                &beta,
+                &(beta).test_identity_for_kind(ProviderKind::Custom),
+                "auto",
+                &checks
+            ),
             ResolvedProviderReadiness::SavedUnchecked,
             "auto fallback is scoped to the route, not the workspace"
         );
@@ -1197,7 +1351,12 @@ mod tests {
         // Same named provider, different endpoint: no leak.
         let alpha_moved = custom_config("alpha", "https://other.example/v1");
         assert_eq!(
-            resolve_for_model(&alpha_moved, ApiProvider::Custom, "auto", &checks),
+            resolve_for_model(
+                &alpha_moved,
+                &(alpha_moved).test_identity_for_kind(ProviderKind::Custom),
+                "auto",
+                &checks
+            ),
             ResolvedProviderReadiness::SavedUnchecked,
             "changing endpoints must invalidate the auto fallback too"
         );
@@ -1240,12 +1399,18 @@ mod tests {
 
         crate::external_credentials::reset_side_effect_trap();
         assert_eq!(
-            credential_state_for_provider(&config, ApiProvider::Moonshot),
+            credential_state_for_provider(
+                &config,
+                &(config).test_identity_for_kind(ProviderKind::Moonshot)
+            ),
             CredentialState::MissingKey,
             "an unusable Kimi import must recover through the supported API-key route"
         );
         assert_eq!(
-            credential_state_for_provider(&config, ApiProvider::Xai),
+            credential_state_for_provider(
+                &config,
+                &(config).test_identity_for_kind(ProviderKind::Xai)
+            ),
             CredentialState::MissingLogin
         );
         assert_eq!(
@@ -1274,12 +1439,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            credential_state_for_provider(&api_key_config, ApiProvider::Xai),
+            credential_state_for_provider(
+                &api_key_config,
+                &(api_key_config).test_identity_for_kind(ProviderKind::Xai)
+            ),
             CredentialState::Saved,
             "an unrelated stale Grok OAuth file must not shadow an explicit xAI API key"
         );
         assert_eq!(
-            credential_state_for_provider(&crate::config::Config::default(), ApiProvider::Xai),
+            credential_state_for_provider(
+                &crate::config::Config::default(),
+                &(crate::config::Config::default()).test_identity_for_kind(ProviderKind::Xai)
+            ),
             CredentialState::MissingKey,
             "a Grok file is not active until xAI OAuth is selected in config"
         );
@@ -1289,7 +1460,10 @@ mod tests {
         }
         .with_legacy_root(Some("legacy-deepseek-root-key".to_string()), None);
         assert_eq!(
-            credential_state_for_provider(&stale_root_config, ApiProvider::Xai),
+            credential_state_for_provider(
+                &stale_root_config,
+                &(stale_root_config).test_identity_for_kind(ProviderKind::Xai)
+            ),
             CredentialState::MissingKey,
             "the legacy root DeepSeek key is not an xAI credential"
         );
@@ -1302,7 +1476,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            credential_state_for_provider(&cli_config, ApiProvider::Xai),
+            credential_state_for_provider(
+                &cli_config,
+                &(cli_config).test_identity_for_kind(ProviderKind::Xai)
+            ),
             CredentialState::Saved,
             "the source-marked CLI override is valid for the active xAI provider"
         );
@@ -1330,7 +1507,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            credential_state_for_provider(&remote, ApiProvider::Custom),
+            credential_state_for_provider(
+                &remote,
+                &(remote).test_identity_for_kind(ProviderKind::Custom)
+            ),
             CredentialState::Saved
         );
 
@@ -1352,13 +1532,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            credential_state_for_provider(&local, ApiProvider::Custom),
+            credential_state_for_provider(
+                &local,
+                &(local).test_identity_for_kind(ProviderKind::Custom)
+            ),
             CredentialState::NoAuth
         );
         assert_eq!(
             resolve_for_model(
                 &local,
-                ApiProvider::Custom,
+                &(local).test_identity_for_kind(ProviderKind::Custom),
                 "local-model",
                 &ProviderReadinessSnapshot::default(),
             ),
@@ -1389,26 +1572,48 @@ mod tests {
             .auth_mode = Some("no-auth".to_string());
 
         assert_eq!(
-            credential_state_for_provider(&local, ApiProvider::Vllm),
+            credential_state_for_provider(
+                &local,
+                &(local).test_identity_for_kind(ProviderKind::Vllm)
+            ),
             CredentialState::Local
         );
         assert_eq!(
-            credential_state_for_provider(&no_auth, ApiProvider::Vllm),
+            credential_state_for_provider(
+                &no_auth,
+                &(no_auth).test_identity_for_kind(ProviderKind::Vllm)
+            ),
             CredentialState::NoAuth
         );
         assert_eq!(
-            auth_class_for_provider(&local, ApiProvider::Vllm),
+            auth_class_for_provider(&local, &(local).test_identity_for_kind(ProviderKind::Vllm)),
             ProviderAuthClass::Local
         );
         assert_eq!(
-            auth_class_for_provider(&no_auth, ApiProvider::Vllm),
+            auth_class_for_provider(
+                &no_auth,
+                &(no_auth).test_identity_for_kind(ProviderKind::Vllm)
+            ),
             ProviderAuthClass::NoAuth
         );
 
         let mut checks = ProviderReadinessSnapshot::default();
-        checks.record_success(&local, ApiProvider::Vllm, "local-model");
+        checks.record_success(
+            &local,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &local,
+                ProviderKind::Vllm,
+                "local-model",
+            ),
+            "local-model",
+        );
         assert_eq!(
-            resolve_for_model(&no_auth, ApiProvider::Vllm, "local-model", &checks),
+            resolve_for_model(
+                &no_auth,
+                &(no_auth).test_identity_for_kind(ProviderKind::Vllm),
+                "local-model",
+                &checks
+            ),
             ResolvedProviderReadiness::NoAuthUnchecked,
             "implicit-local success must not verify an explicitly no-auth route"
         );
@@ -1435,11 +1640,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            credential_state_for_provider(&local, ApiProvider::Ollama),
+            credential_state_for_provider(
+                &local,
+                &(local).test_identity_for_kind(ProviderKind::Ollama)
+            ),
             CredentialState::Local
         );
         assert_eq!(
-            auth_class_for_provider(&local, ApiProvider::Ollama),
+            auth_class_for_provider(
+                &local,
+                &(local).test_identity_for_kind(ProviderKind::Ollama)
+            ),
             ProviderAuthClass::Local
         );
 
@@ -1454,20 +1665,32 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(cloud.api_provider(), ApiProvider::OllamaCloud);
         assert_eq!(
-            credential_state_for_provider(&cloud, ApiProvider::OllamaCloud),
+            cloud.active_provider_identity().unwrap().provider,
+            ProviderKind::OllamaCloud
+        );
+        assert_eq!(
+            credential_state_for_provider(
+                &cloud,
+                &(cloud).test_identity_for_kind(ProviderKind::OllamaCloud)
+            ),
             CredentialState::MissingKey
         );
         assert_eq!(
-            auth_class_for_provider(&cloud, ApiProvider::OllamaCloud),
+            auth_class_for_provider(
+                &cloud,
+                &(cloud).test_identity_for_kind(ProviderKind::OllamaCloud)
+            ),
             ProviderAuthClass::ApiKey
         );
 
         cloud.providers.as_mut().expect("providers").ollama.api_key =
             Some("ollama-cloud-key".to_string());
         assert_eq!(
-            credential_state_for_provider(&cloud, ApiProvider::OllamaCloud),
+            credential_state_for_provider(
+                &cloud,
+                &(cloud).test_identity_for_kind(ProviderKind::OllamaCloud)
+            ),
             CredentialState::Saved
         );
     }
@@ -1496,7 +1719,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            credential_state_for_provider(&missing, ApiProvider::Vllm),
+            credential_state_for_provider(
+                &missing,
+                &(missing).test_identity_for_kind(ProviderKind::Vllm)
+            ),
             CredentialState::MissingKey
         );
         assert!(missing.active_route_api_key().is_err());
@@ -1509,7 +1735,10 @@ mod tests {
             .vllm
             .api_key = Some("protected-local-key".to_string());
         assert_eq!(
-            credential_state_for_provider(&configured, ApiProvider::Vllm),
+            credential_state_for_provider(
+                &configured,
+                &(configured).test_identity_for_kind(ProviderKind::Vllm)
+            ),
             CredentialState::Saved
         );
         assert_eq!(
@@ -1535,7 +1764,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            credential_state_for_provider(&named_custom, ApiProvider::Custom),
+            credential_state_for_provider(
+                &named_custom,
+                &(named_custom).test_identity_for_kind(ProviderKind::Custom)
+            ),
             CredentialState::MissingKey
         );
         assert!(named_custom.active_route_api_key().is_err());
@@ -1569,7 +1801,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            credential_state_for_provider(&command, ApiProvider::Openai),
+            credential_state_for_provider(
+                &command,
+                &(command).test_identity_for_kind(ProviderKind::Openai)
+            ),
             CredentialState::MissingKey
         );
 
@@ -1590,7 +1825,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            credential_state_for_provider(&secret, ApiProvider::Xai),
+            credential_state_for_provider(
+                &secret,
+                &(secret).test_identity_for_kind(ProviderKind::Xai)
+            ),
             CredentialState::MissingKey
         );
     }
@@ -1619,11 +1857,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            auth_class_for_provider(&custom_xai, ApiProvider::Xai),
+            auth_class_for_provider(
+                &custom_xai,
+                &(custom_xai).test_identity_for_kind(ProviderKind::Xai)
+            ),
             ProviderAuthClass::ApiKey
         );
         assert_eq!(
-            credential_state_for_provider(&custom_xai, ApiProvider::Xai),
+            credential_state_for_provider(
+                &custom_xai,
+                &(custom_xai).test_identity_for_kind(ProviderKind::Xai)
+            ),
             CredentialState::MissingKey
         );
 
@@ -1639,11 +1883,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            auth_class_for_provider(&official_xai, ApiProvider::Xai),
+            auth_class_for_provider(
+                &official_xai,
+                &(official_xai).test_identity_for_kind(ProviderKind::Xai)
+            ),
             ProviderAuthClass::OAuth
         );
         assert_eq!(
-            credential_state_for_provider(&official_xai, ApiProvider::Xai),
+            credential_state_for_provider(
+                &official_xai,
+                &(official_xai).test_identity_for_kind(ProviderKind::Xai)
+            ),
             CredentialState::MissingLogin
         );
 
@@ -1659,11 +1909,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            auth_class_for_provider(&custom_codex, ApiProvider::OpenaiCodex),
+            auth_class_for_provider(
+                &custom_codex,
+                &(custom_codex).test_identity_for_kind(ProviderKind::OpenaiCodex)
+            ),
             ProviderAuthClass::ApiKey
         );
         assert_eq!(
-            credential_state_for_provider(&custom_codex, ApiProvider::OpenaiCodex),
+            credential_state_for_provider(
+                &custom_codex,
+                &(custom_codex).test_identity_for_kind(ProviderKind::OpenaiCodex)
+            ),
             CredentialState::MissingKey
         );
     }
@@ -1687,9 +1943,15 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!crate::config::has_api_key_for(&config, ApiProvider::Xai));
+        assert!(!crate::config::has_api_key_for(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Xai)
+        ));
         assert_eq!(
-            credential_state_for_provider(&config, ApiProvider::Xai),
+            credential_state_for_provider(
+                &config,
+                &(config).test_identity_for_kind(ProviderKind::Xai)
+            ),
             CredentialState::MissingKey
         );
     }
@@ -1699,7 +1961,7 @@ mod tests {
         let official = crate::config::Config::default();
         assert!(!route_is_valid_for_model(
             &official,
-            ApiProvider::Deepseek,
+            &(official).test_identity_for_kind(ProviderKind::Deepseek),
             Some("anthropic/private-model")
         ));
 
@@ -1713,14 +1975,11 @@ mod tests {
                 None,
                 Some("https://tenant-gateway.example.test/v1".to_string()),
             );
-            let provider = config.api_provider();
-            assert!(matches!(
-                provider,
-                ApiProvider::Deepseek | ApiProvider::DeepseekCN
-            ));
+            let provider = config.active_provider_identity().unwrap().provider;
+            assert!(matches!(provider, ProviderKind::Deepseek));
             assert!(route_is_valid_for_model(
                 &config,
-                provider,
+                &(config).test_identity_for_kind(provider),
                 Some("anthropic/private-model")
             ));
         }
@@ -1761,7 +2020,7 @@ default_text_model = "deepseek-chat"
         );
         assert!(route_is_valid_for_model(
             &config,
-            ApiProvider::Deepseek,
+            &(config).test_identity_for_kind(ProviderKind::Deepseek),
             Some("anthropic/private-model")
         ));
     }
@@ -1790,30 +2049,63 @@ default_text_model = "deepseek-chat"
         protected_route.api_key = Some("protected-local-key".to_string());
 
         assert_eq!(
-            credential_state_for_provider(&local, ApiProvider::Openai),
+            credential_state_for_provider(
+                &local,
+                &(local).test_identity_for_kind(ProviderKind::Openai)
+            ),
             CredentialState::Local
         );
         assert_eq!(
-            auth_class_for_provider(&local, ApiProvider::Openai),
+            auth_class_for_provider(
+                &local,
+                &(local).test_identity_for_kind(ProviderKind::Openai)
+            ),
             ProviderAuthClass::Local
         );
         assert_eq!(
-            credential_state_for_provider(&protected, ApiProvider::Openai),
+            credential_state_for_provider(
+                &protected,
+                &(protected).test_identity_for_kind(ProviderKind::Openai)
+            ),
             CredentialState::Saved
         );
         assert_eq!(
-            auth_class_for_provider(&protected, ApiProvider::Openai),
+            auth_class_for_provider(
+                &protected,
+                &(protected).test_identity_for_kind(ProviderKind::Openai)
+            ),
             ProviderAuthClass::ApiKey
         );
         assert_ne!(
-            route_identity_for_model(&local, ApiProvider::Openai, "local-model"),
-            route_identity_for_model(&protected, ApiProvider::Openai, "local-model")
+            route_identity_for_model(
+                &local,
+                &(local).test_identity_for_kind(ProviderKind::Openai),
+                "local-model"
+            ),
+            route_identity_for_model(
+                &protected,
+                &(protected).test_identity_for_kind(ProviderKind::Openai),
+                "local-model"
+            )
         );
 
         let mut checks = ProviderReadinessSnapshot::default();
-        checks.record_success(&local, ApiProvider::Openai, "local-model");
+        checks.record_success(
+            &local,
+            &crate::route_receipt::TurnRouteReceipt::for_test_fixture(
+                &local,
+                ProviderKind::Openai,
+                "local-model",
+            ),
+            "local-model",
+        );
         assert_eq!(
-            resolve_for_model(&protected, ApiProvider::Openai, "local-model", &checks),
+            resolve_for_model(
+                &protected,
+                &(protected).test_identity_for_kind(ProviderKind::Openai),
+                "local-model",
+                &checks
+            ),
             ResolvedProviderReadiness::SavedUnchecked
         );
 
@@ -1824,8 +2116,161 @@ default_text_model = "deepseek-chat"
         }
         .with_legacy_root(None, Some("http://127.0.0.1:9090/v1".to_string()));
         assert_eq!(
-            credential_state_for_provider(&deepseek_cn_local, ApiProvider::DeepseekCN),
+            credential_state_for_provider(
+                &deepseek_cn_local,
+                &(deepseek_cn_local)
+                    .resolve_provider_selection_identity("deepseek-cn")
+                    .unwrap()
+            ),
             CredentialState::Local
+        );
+    }
+    #[test]
+    fn captured_key_rotation_cannot_reuse_ready_or_failure_evidence() {
+        let _env = crate::test_support::lock_test_env();
+        let _cli = crate::test_support::EnvVarGuard::remove(codewhale_config::CLI_API_KEY_ENV);
+        let mut config = crate::config::Config::from_saved_document(
+            r#"provider = "openai"
+            [providers.openai]
+            api_key = "captured-key"
+            model = "gpt-5.5"
+        "#,
+            None,
+        )
+        .unwrap();
+        let identity = config.active_provider_identity().unwrap();
+        let endpoint = config.base_url_for_route(&identity);
+        let receipt = crate::route_receipt::TurnRouteReceipt::from_admitted(
+            &identity,
+            "gpt-5.5",
+            &endpoint,
+            "captured-key",
+        );
+        let mut checks = ProviderReadinessSnapshot::default();
+        checks.record_success(&config, &receipt, "gpt-5.5");
+        let route = route_identity_for_model(&config, &identity, "gpt-5.5");
+        assert!(matches!(
+            checks.last(&route),
+            Some(LastProviderCheck::Passed)
+        ));
+        config
+            .set_provider_api_key_override(&identity, Some("replacement-key".into()))
+            .unwrap();
+        let replaced = route_identity_for_model(&config, &identity, "gpt-5.5");
+        assert_ne!(route.credential_generation, replaced.credential_generation);
+        assert!(checks.last(&replaced).is_none());
+        checks.record_failure(
+            &config,
+            &receipt,
+            "gpt-5.5",
+            &ErrorEnvelope::new(
+                ErrorCategory::Authentication,
+                ErrorSeverity::Error,
+                false,
+                "auth_failed",
+                "captured route failed",
+            ),
+        );
+        assert!(
+            checks.last(&replaced).is_none(),
+            "a late failure uses its dispatched key generation"
+        );
+        assert!(matches!(
+            checks.last(&route),
+            Some(LastProviderCheck::Failed { .. })
+        ));
+    }
+
+    #[test]
+    fn opaque_command_credentials_do_not_execute_or_inherit_cached_readiness() {
+        let _env = crate::test_support::lock_test_env();
+        let _cli = crate::test_support::EnvVarGuard::remove(codewhale_config::CLI_API_KEY_ENV);
+        let mut config = crate::config::Config::from_saved_document(
+            r#"provider = "openai"
+            [providers.openai]
+            api_key = "captured-key"
+            model = "gpt-5.5"
+        "#,
+            None,
+        )
+        .unwrap();
+        let identity = config.active_provider_identity().unwrap();
+        let endpoint = config.base_url_for_route(&identity);
+        let receipt = crate::route_receipt::TurnRouteReceipt::from_admitted(
+            &identity,
+            "gpt-5.5",
+            &endpoint,
+            "captured-key",
+        );
+        let mut checks = ProviderReadinessSnapshot::default();
+        checks.record_success(&config, &receipt, "gpt-5.5");
+        config.provider_config_for_mut(&identity).unwrap().auth =
+            Some(codewhale_config::ProviderAuthSourceToml {
+                source: codewhale_config::AuthSourceKind::Command,
+                command: vec!["this-command-must-never-run".into()],
+                timeout_ms: None,
+                secret_id: None,
+            });
+        assert!(
+            config
+                .readonly_health_credential_generation(&identity)
+                .is_none()
+        );
+        let opaque = route_identity_for_model(&config, &identity, "gpt-5.5");
+        assert!(checks.last(&opaque).is_none());
+        assert!(!format!("{opaque:?}").contains("captured-key"));
+        assert!(!format!("{receipt:?}").contains("captured-key"));
+    }
+
+    #[test]
+    fn bound_environment_rotation_and_keyless_endpoint_scope_are_exact() {
+        let _env = crate::test_support::lock_test_env();
+        let _cli = crate::test_support::EnvVarGuard::remove(codewhale_config::CLI_API_KEY_ENV);
+        let config = crate::config::Config::from_saved_document(
+            r#"provider = "CustomA"
+            [providers.CustomA]
+            kind = "openai-compatible"
+            base_url = "http://127.0.0.1:18180/v1"
+            model = "private-model"
+            api_key_env = "CODEWHALE_HEALTH_FIXTURE_KEY"
+        "#,
+            None,
+        )
+        .unwrap();
+        let identity = config.active_provider_identity().unwrap();
+        let first =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HEALTH_FIXTURE_KEY", "first-key");
+        let generation = config
+            .readonly_health_credential_generation(&identity)
+            .unwrap();
+        drop(first);
+        let _second =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HEALTH_FIXTURE_KEY", "second-key");
+        assert_ne!(
+            config
+                .readonly_health_credential_generation(&identity)
+                .unwrap(),
+            generation
+        );
+        let local = crate::config::Config::from_saved_document(
+            r#"provider = "CustomA"
+            [providers.CustomA]
+            kind = "openai-compatible"
+            base_url = "http://127.0.0.1:18180/v1"
+            auth_mode = "none"
+        "#,
+            None,
+        )
+        .unwrap();
+        let id = local.active_provider_identity().unwrap();
+        assert!(local.readonly_health_credential_generation(&id).is_some());
+        let mut changed = local.clone();
+        changed
+            .set_provider_base_url_override(&id, Some("http://127.0.0.1:19191/v1".into()))
+            .unwrap();
+        assert_ne!(
+            local.readonly_health_credential_generation(&id),
+            changed.readonly_health_credential_generation(&id)
         );
     }
 }

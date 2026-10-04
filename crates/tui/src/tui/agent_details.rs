@@ -574,6 +574,7 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Builder,
             assignment: SubAgentAssignment {
+                native_preset: None,
                 objective: "Implement the bounded details route".to_string(),
                 role: Some("worker".to_string()),
             },

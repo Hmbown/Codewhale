@@ -16,7 +16,7 @@ fn work_bar_opens_from_launch_with_legacy_and_enhanced_keys() {
         let trust = workspace.workspace().join(".deepseek");
         std::fs::create_dir_all(&trust).unwrap();
         std::fs::write(trust.join("trusted"), "").unwrap();
-        let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+        let mut tui = Harness::builder(Harness::codewhale_binary())
             .cwd(workspace.workspace())
             .clear_env()
             .seal_home(workspace.home())

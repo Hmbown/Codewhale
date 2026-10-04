@@ -29,7 +29,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, Clear, Padding, Widget},
 };
 
 use crate::tui::app::App;
@@ -723,14 +723,15 @@ impl ModalView for LiveTranscriptOverlay {
             line_links[scroll..end].to_vec()
         };
 
-        let paragraph = Paragraph::new(visible_lines).wrap(Wrap { trim: false });
-        paragraph.render(content, buf);
+        let mut viewport = codewhale_ratatui::TranscriptViewport::new(&visible_lines);
+        viewport.wrap = true;
+        let plan = viewport.render(content, buf);
 
         // Targets stay beside the visible lines, so the popup never writes an
         // escape payload into the buffer. Replace the opaque popup's portion
         // of the frame map so links in the obscured transcript cannot leak
         // through unrelated modal text.
-        let regions = crate::tui::osc8::link_regions_for_lines(content, &visible_line_links);
+        let regions = crate::tui::osc8::link_regions_for_plan(&plan, &visible_line_links);
         crate::tui::osc8::overlay_frame_links(popup_area, regions);
     }
 }
@@ -1215,5 +1216,108 @@ mod tests {
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
         v.render(area, &mut buf);
+    }
+}
+
+#[cfg(test)]
+#[path = "live_transcript/transcript_legacy.rs"]
+mod transcript_legacy;
+
+#[cfg(test)]
+mod mounted_transcript_acceptance {
+    use super::*;
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    fn fixture() -> App {
+        let mut app = App::new(
+            crate::test_support::test_tui_options(PathBuf::from(".")),
+            &Config::default(),
+        );
+        app.launch.visible = false;
+        app.low_motion = true;
+        app.push_history_cell(HistoryCell::User {
+            content: "Review the source".into(),
+        });
+        app.push_history_cell(HistoryCell::Assistant {
+            content: String::new(),
+            streaming: true,
+        });
+        app
+    }
+    #[test]
+    fn mounted_transcript_live_overlay_stream_resize_preview_and_links_match_frozen_painter() {
+        let (mut app, mut old_app) = (fixture(), fixture());
+        let mut current = LiveTranscriptOverlay::new();
+        let mut old = transcript_legacy::LiveTranscriptOverlay::new();
+        for (chunk, width, height) in [
+            ("First source", 80, 20),
+            (
+                "First source with [guide](https://example.test/source) and 鲸鱼",
+                40,
+                12,
+            ),
+            (
+                "First source with [guide](https://example.test/source)\n```rust\nlet x",
+                20,
+                9,
+            ),
+            (
+                "Final source with [guide](https://example.test/source)\n```rust\nlet x = 1;\n```",
+                80,
+                20,
+            ),
+        ] {
+            for app in [&mut app, &mut old_app] {
+                app.history[1] = HistoryCell::Assistant {
+                    content: chunk.into(),
+                    streaming: !chunk.starts_with("Final"),
+                };
+                app.bump_history_cell(1);
+            }
+            current.refresh_from_app(&mut app);
+            old.refresh_from_app(&mut old_app);
+            assert_eq!(current.snapshot_count(), old.frozen_snapshot_count());
+            for preview in [false, true] {
+                if preview {
+                    current.set_backtrack_preview(0);
+                    old.set_backtrack_preview(0);
+                } else {
+                    current.set_tail_mode();
+                    old.set_tail_mode();
+                }
+                assert_eq!(
+                    matches!(current.mode(), Mode::Tail),
+                    matches!(old.mode(), transcript_legacy::Mode::Tail)
+                );
+                let area = Rect::new(0, 0, width, height);
+                let mut actual = Buffer::empty(area);
+                let mut expected = actual.clone();
+                crate::tui::osc8::set_frame_links(Vec::new());
+                old.render(area, &mut expected);
+                assert_eq!(old.scroll_offset(), old.frozen_metrics().0);
+                assert_eq!(old.is_sticky(), old.frozen_metrics().3);
+                let links = crate::tui::osc8::FRAME_LINKS.with(|links| links.borrow().clone());
+                crate::tui::osc8::set_frame_links(Vec::new());
+                current.render(area, &mut actual);
+                assert_eq!(
+                    actual, expected,
+                    "chunk={chunk:?} area={area:?} preview={preview}"
+                );
+                assert_eq!(
+                    crate::tui::osc8::FRAME_LINKS.with(|links| links.borrow().clone()),
+                    links
+                );
+                assert_eq!(
+                    (
+                        current.scroll.get(),
+                        current.last_visible_height.get(),
+                        current.last_total_lines.get(),
+                        current.sticky_to_bottom.get()
+                    ),
+                    old.frozen_metrics()
+                );
+            }
+        }
     }
 }

@@ -8,7 +8,7 @@ use std::{path::PathBuf, sync::Arc};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::error_taxonomy::ErrorEnvelope;
 use crate::tools::goal::GoalSnapshot;
 use crate::tools::spec::{ToolError, ToolResult};
@@ -41,9 +41,9 @@ pub enum TurnOutcomeStatus {
 /// turns such as composer `!` shell commands use no route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnRoute {
-    pub provider: ApiProvider,
+    pub provider: ProviderKind,
     /// Exact non-secret configured route key. Named custom providers all map
-    /// to [`ApiProvider::Custom`], so the enum alone is not provenance.
+    /// to [`ProviderKind::Custom`], so the enum alone is not provenance.
     pub provider_identity: String,
     pub model: String,
     pub auto_model: bool,
@@ -184,12 +184,6 @@ impl AgentProgressEventMeta {
     }
 
     #[must_use]
-    pub const fn routine_wait(mut self) -> Self {
-        self.routine_wait = true;
-        self
-    }
-
-    #[must_use]
     pub fn with_tool(mut self, tool_name: impl Into<String>) -> Self {
         self.tool_name = Some(tool_name.into());
         self
@@ -254,6 +248,14 @@ pub enum Event {
     /// transcript. It only prevents the TUI from declaring a healthy,
     /// deliberately long-running tool turn stale.
     ToolCallHeartbeat,
+
+    /// Optional actual dispatch observation for a narrowed protocol host.
+    ToolExecutionStarted { id: String },
+    /// Canonical rich result after existing output/media preservation.
+    ToolResultContent {
+        id: String,
+        blocks: Vec<codewhale_tools::ToolResultContentBlock>,
+    },
 
     /// Tool call completed
     ToolCallComplete {
@@ -628,6 +630,10 @@ pub enum Event {
         approval_force_prompt: bool,
     },
 
+    /// The engine no longer waits for this approval. Every decision surface
+    /// must retire the request by identity without sending a user decision.
+    ApprovalWithdrawn { id: String },
+
     /// Request user input for a tool call
     UserInputRequired {
         id: String,
@@ -873,11 +879,23 @@ impl StatusVisibility {
     }
 }
 
-/// Classify an engine status line for durable clients.
-///
-/// Matches the engine's own fixed status wording (turn scheduler, step
-/// continuation, deferred-tool hydration). Unknown lines stay user-visible,
-/// so a new status is never silently hidden.
+/// Engine-owned retry status wording. Retain these observations in the TUI
+/// transcript without turning unrelated scheduler/footer updates into rows.
+#[must_use]
+pub fn is_retry_status_receipt(message: &str) -> bool {
+    [
+        "Retry attempt: ",
+        "Retry recovery: ",
+        "Retry exhaustion: ",
+        "Retry interrupted: ",
+        "Retry stopped: ",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
+}
+
+/// Classify an engine status line for durable clients. Unknown lines stay
+/// user-visible; internal scheduler and model-only notices retain their scope.
 #[must_use]
 pub fn status_visibility(message: &str) -> StatusVisibility {
     let message = message.trim();
@@ -1074,6 +1092,28 @@ mod status_visibility_tests {
             assert_eq!(status_visibility(user), StatusVisibility::User, "{user}");
         }
         assert_eq!(StatusVisibility::Internal.as_str(), "internal");
+    }
+
+    #[test]
+    fn retry_status_receipts_classify_every_closing_kind_without_footer_noise() {
+        for message in [
+            "Retry attempt: transport 1/2; upstream 503; waiting 0.00s",
+            "Retry recovery: stream recovered after 1 retries",
+            "Retry exhaustion: stream stopped after 2 retries",
+            "Retry interrupted: request cancelled",
+            "Retry stopped: transparent stream completion was not observed",
+        ] {
+            assert!(super::is_retry_status_receipt(message), "{message}");
+            assert_eq!(status_visibility(message), StatusVisibility::User);
+        }
+        for message in [
+            "Executing tools sequentially",
+            "Loaded deferred tool 'load_skill'. Retry the call with its visible schema.",
+            "Goal set; starting goal work.",
+            "Retry stopped",
+        ] {
+            assert!(!super::is_retry_status_receipt(message), "{message}");
+        }
     }
 
     #[test]

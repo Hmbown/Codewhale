@@ -63,11 +63,16 @@ assert.match(
   "the non-PR CNB fallback must be named explicitly",
 );
 
+assert.match(
+  namedStep(ciTestJob, "Build canonical executable for acceptance tests"),
+  /cargo build -p codewhale-cli --bin codewhale --all-features --locked/,
+  "Engine acceptance must build the canonical executable first",
+);
 const npmSmokeJob = ci.match(/^  npm-wrapper-smoke:\n([\s\S]*?)(?=^  \S)/m)?.[1];
 assert.ok(npmSmokeJob, "CI must retain the required npm-wrapper job");
 assert.match(
   namedStep(npmSmokeJob, "Build wrapper binaries"),
-  /run: cargo build --release --locked -p codewhale-cli -p codewhale-tui/,
+  /run: cargo build --release --locked -p codewhale-cli --bin codewhale/,
 );
 assert.match(
   namedStep(npmSmokeJob, "Smoke wrapper install and delegated entrypoints"),
@@ -154,7 +159,7 @@ function classify(paths) {
 }
 const rustSources = execFileSync("git", ["ls-files", "-z", "--", "*.rs"], { cwd: repoRoot, encoding: "utf8" })
   .split("\0")
-  .filter(Boolean);
+  .filter((file) => file && fs.existsSync(path.join(repoRoot, file)));
 const includeTargets = new Set();
 const includePattern =
   /include_(?:str|bytes)!\s*\(\s*(?:concat!\s*\(\s*(?:env!\s*\(\s*"(\w+)"\s*\)\s*,\s*)?)?"([^"]+)"/g;

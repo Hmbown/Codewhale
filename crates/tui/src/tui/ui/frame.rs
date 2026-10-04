@@ -37,14 +37,9 @@ pub(crate) fn session_cost_label(app: &App) -> String {
 /// for flat-priced routes, for other vendors, and while auto routing has not
 /// pinned a concrete model.
 pub(crate) fn billing_tier_label(app: &App, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
-    use crate::config::ApiProvider;
+    use crate::config::ProviderKind;
     use codewhale_localization::{MessageId, tr};
-    if app.auto_model
-        || !matches!(
-            app.api_provider.catalog_identity(),
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN
-        )
-    {
+    if app.auto_model || !matches!(app.api_provider, ProviderKind::Deepseek) {
         return None;
     }
     let peak = crate::pricing::deepseek_time_tier(&app.model, now)?;
@@ -881,7 +876,10 @@ pub(crate) async fn build_preview_request_inputs(
         content.push_str(note);
     }
 
-    let (app_route_identity, route_config) = app_scoped_runtime_config(app, config);
+    let (app_route_identity, route_config) = match app_scoped_runtime_config(app, config) {
+        Ok(route) => route,
+        Err(error) => return posture(None, PreviewUnresolved::PlanFailed(error)),
+    };
     let planned = plan_turn_route(TurnRoutePlanRequest {
         route_config: &route_config,
         app_route_identity: &app_route_identity,
@@ -936,7 +934,10 @@ pub(crate) async fn build_preview_request_inputs(
 }
 
 pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
-    let provider = app.api_provider;
+    let identity = app
+        .provider_identity
+        .as_ref()
+        .filter(|identity| config.verify_provider_identity(identity).is_ok());
     let max_subagents = app.max_subagents.clamp(1, crate::config::MAX_SUBAGENTS);
     EngineConfig {
         model: app.model.clone(),
@@ -963,13 +964,20 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         // Only an explicit `[tui].max_model_steps` installs a step ceiling.
         max_steps: config.max_model_steps(),
         max_subagents,
-        max_admitted_subagents: config
-            .max_admitted_subagents_for_provider(provider)
+        max_admitted_subagents: identity
+            .map_or_else(
+                || config.max_admitted_subagents(),
+                |identity| config.max_admitted_subagents_for_provider(identity),
+            )
             .max(max_subagents),
-        launch_concurrency: config
-            .launch_concurrency_for_provider(provider)
+        launch_concurrency: identity
+            .map_or_else(
+                || config.launch_concurrency(),
+                |identity| config.launch_concurrency_for_provider(identity),
+            )
             .max(app.mode.mode_delegation_launch_floor()),
-        subagents_enabled: config.subagents_enabled_for_provider(provider),
+        subagents_enabled: identity
+            .is_some_and(|identity| config.subagents_enabled_for_provider(identity)),
         features: config.features(),
         auto_review_policy: config.auto_review_policy(),
         compaction: app.compaction_config(),
@@ -987,7 +995,10 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
                 crate::tools::goal::new_shared_goal_state_from_snapshot(&goal.to_runtime_snapshot())
             },
         ),
-        max_spawn_depth: config.subagent_max_spawn_depth_for_provider(provider),
+        max_spawn_depth: identity.map_or_else(
+            || config.subagent_max_spawn_depth(),
+            |identity| config.subagent_max_spawn_depth_for_provider(identity),
+        ),
         allowed_tools: app.active_allowed_tools.clone(),
         disallowed_tools: None,
         max_tool_calls: None,
@@ -1012,20 +1023,22 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         fleet_roster: std::sync::Arc::new(crate::fleet::identity::load_effective_roster(
             &config.fleet_config(),
             &app.workspace,
-            Some(app.plugin_registry.as_ref()),
+            Some(app.extension_plugin_view().as_ref()),
         )),
-        subagent_api_timeout: Duration::from_secs(
-            config.subagent_api_timeout_secs_for_provider(provider),
-        ),
+        subagent_api_timeout: Duration::from_secs(identity.map_or_else(
+            || config.subagent_api_timeout_secs(),
+            |identity| config.subagent_api_timeout_secs_for_provider(identity),
+        )),
         stream_chunk_timeout: Duration::from_secs(app.stream_chunk_timeout_secs),
         turn_wall_clock: config.turn_wall_clock(),
         stream_max_content_bytes: config.stream_max_content_bytes(),
         stream_max_duration: config.stream_max_duration(),
         stream_retry_limits: config.stream_retry_limits(),
         stream_open_timeout: config.stream_open_timeout(),
-        subagent_heartbeat_timeout: Duration::from_secs(
-            config.subagent_heartbeat_timeout_secs_for_provider(provider),
-        ),
+        subagent_heartbeat_timeout: Duration::from_secs(identity.map_or_else(
+            || config.subagent_heartbeat_timeout_secs(),
+            |identity| config.subagent_heartbeat_timeout_secs_for_provider(identity),
+        )),
         prefer_bwrap: config.prefer_bwrap.unwrap_or(false),
         bwrap_extensions: crate::sandbox::BwrapMountExtensions {
             read_only_roots: config.bwrap_ro_roots.clone(),
@@ -1115,7 +1128,7 @@ pub(crate) fn build_app_system_prompt_with_goal(
             verbosity: app.verbosity.as_deref(),
             recovery_hint: recovery_hint.as_deref(),
             skills_discovery_mode: app.skills_discovery_mode,
-            plugin_registry: Some(app.plugin_registry.as_ref()),
+            plugin_registry: Some(app.extension_plugin_view().as_ref()),
             mode: app.mode,
         },
     )
@@ -1420,6 +1433,7 @@ pub(crate) fn build_pending_input_preview(app: &App) -> PendingInputPreview {
 }
 
 pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(u16, u16)> {
+    app.viewport.ocean_semantic_surfaces.clear();
     let size = f.area();
     // Hover targets belong to the whole composed frame. Resetting inside the
     // transcript erased targets registered later by the composer and modals.
@@ -1745,6 +1759,9 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
                 shell_ocean = chat_widget.ocean_column();
             }
             app.viewport.pending_scroll_delta = parked_scroll_delta;
+            // The constructor above sampled an invisible main transcript;
+            // only the actual focused painter may publish semantic regions.
+            app.viewport.ocean_semantic_surfaces.clear();
             // The sampling constructor above records the pinned prompt header's
             // hit box from the main session's transcript, but the focus pane
             // never paints that header — its first row is the agent banner.
@@ -1799,71 +1816,21 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         app.viewport.last_plugin_cta_dismiss_area = None;
     }
 
-    // Render composer
-    let cursor_pos = {
+    // Render once and retain that exact plan for caret and pointer projection.
+    let composer_plan = {
         let composer_widget = ComposerWidget::new(
             app,
             composer_max_height,
             &slash_menu_entries,
             &mention_menu_entries,
         );
-        let buf = f.buffer_mut();
-        composer_widget.render(body_chunks[composer_slot], buf);
-        composer_widget.cursor_pos(body_chunks[composer_slot])
+        composer_widget.render_plan(body_chunks[composer_slot], f.buffer_mut())
     };
+    let cursor_pos = composer_plan.cursor.map(|pos| (pos.x, pos.y));
     app.viewport.last_composer_area = Some(body_chunks[composer_slot]);
-    {
-        let area = body_chunks[composer_slot];
-        let composer_widget = ComposerWidget::new(
-            app,
-            composer_max_height,
-            &slash_menu_entries,
-            &mention_menu_entries,
-        );
-        let input_plane = composer_widget.inner_area(area);
-        app.viewport.last_composer_content = Some(input_plane);
-
-        // Compute scroll offset and top padding for mouse coordinate mapping.
-        let input_text = app.composer_display_input();
-        let input_cursor = app.composer_display_cursor();
-        let content_geometry = crate::tui::widgets::composer_content_geometry(
-            input_plane,
-            app.is_history_search_active(),
-        );
-        let content_width = content_geometry.text_width();
-        let menu_lines = ComposerWidget::new(
-            app,
-            composer_max_height,
-            &slash_menu_entries,
-            &mention_menu_entries,
-        )
-        .active_menu_reserved_rows();
-        let budget =
-            crate::tui::widgets::composer_input_rows_budget(input_plane.height, menu_lines);
-        let (_, _, _, scroll_offset) = crate::tui::widgets::layout_input_with_scroll(
-            input_text,
-            input_cursor,
-            content_width,
-            budget,
-        );
-        let visual_rows = if input_text.is_empty() {
-            let hint: Option<std::borrow::Cow<'_, str>> = if let Some(ref suggestion) =
-                app.prompt_suggestion
-                && !app.is_history_search_active()
-            {
-                Some(std::borrow::Cow::Borrowed(suggestion.as_str()))
-            } else {
-                Some(crate::tui::widgets::composer_empty_hint_text(app))
-            };
-            crate::tui::widgets::empty_composer_visual_rows(hint.as_deref(), content_width, budget)
-        } else {
-            // Count wrapped lines (approximation matching the render path).
-            crate::tui::widgets::wrap_input_lines_for_mouse(input_text, content_width).len()
-        };
-        let top_padding = budget.saturating_sub(visual_rows.clamp(1, budget));
-        app.viewport.last_composer_scroll_offset = scroll_offset;
-        app.viewport.last_composer_top_padding = top_padding;
-    }
+    app.viewport.last_composer_content = Some(composer_plan.geometry.inner);
+    app.viewport.last_composer_scroll_offset = composer_plan.scroll_offset;
+    app.viewport.last_composer_top_padding = composer_plan.top_padding;
     // The posture bar is the first row under the composer: permission chip
     // (never sheds), mode, live counts, the one hint that applies now, with
     // the remote-control state or a live notice pinned right.
@@ -1902,58 +1869,97 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     }
     register_info_interaction_targets(app, info_interactions);
 
+    // The native plan keeps its selected source rows private. If a custom
+    // theme aliases selection and base grounds, preserve the whole mounted
+    // composer while selecting rather than infer selected cells from RGB.
+    if app.selection_range().is_some() && app.ui_theme.selection_bg == app.ui_theme.composer_bg {
+        app.viewport
+            .ocean_semantic_surfaces
+            .push(body_chunks[composer_slot]);
+    }
+
     // The underwater shell is one water column, not a stack of independently
     // shaded panels. Continue the transcript's absolute-row ramp through each
     // ordinary shell surface after its foreground has rendered. Semantic
-    // backgrounds such as selection, hover, errors, and code blocks do not
-    // match these base colors and therefore remain intact.
+    // backgrounds remain exact through different-ground guards and the
+    // frame-derived explicit styled-surface mask, including aliased colors.
     if let Some(column) = shell_ocean {
         // The working canvas may keep a small responsive gutter, but the water
         // does not stop at that content edge. Paint the cleared terminal floor
         // first so wide layouts read as one ocean rather than a blue card
         // floating between black banks. `paint_matching` leaves every semantic
         // widget background untouched.
-        column.paint_matching(size, f.buffer_mut(), app.ui_theme.surface_bg);
+        column.paint_matching_native(
+            size,
+            f.buffer_mut(),
+            app.ui_theme.surface_bg,
+            &app.ui_theme,
+            &app.viewport.ocean_semantic_surfaces,
+        );
         if top_work_strip_height > 0 {
-            column.paint_matching(
+            column.paint_matching_native(
                 body_chunks[strip_slot],
                 f.buffer_mut(),
                 app.ui_theme.surface_bg,
+                &app.ui_theme,
+                &app.viewport.ocean_semantic_surfaces,
             );
         }
         if let Some(side_area) = side_work_area {
-            column.paint_matching(side_area, f.buffer_mut(), app.ui_theme.surface_bg);
+            column.paint_matching_native(
+                side_area,
+                f.buffer_mut(),
+                app.ui_theme.surface_bg,
+                &app.ui_theme,
+                &app.viewport.ocean_semantic_surfaces,
+            );
         }
-        column.paint_matching(work_chat_area, f.buffer_mut(), app.ui_theme.surface_bg);
-        column.paint_matching(
+        column.paint_matching_native(
+            work_chat_area,
+            f.buffer_mut(),
+            app.ui_theme.surface_bg,
+            &app.ui_theme,
+            &app.viewport.ocean_semantic_surfaces,
+        );
+        column.paint_matching_native(
             body_chunks[preview_slot],
             f.buffer_mut(),
             app.ui_theme.surface_bg,
+            &app.ui_theme,
+            &app.viewport.ocean_semantic_surfaces,
         );
         if plugin_cta_height > 0 {
-            column.paint_matching(
+            column.paint_matching_native(
                 body_chunks[plugin_cta_slot],
                 f.buffer_mut(),
                 app.ui_theme.composer_bg,
+                &app.ui_theme,
+                &app.viewport.ocean_semantic_surfaces,
             );
         }
-        column.paint_matching(
+        column.paint_matching_native(
             body_chunks[composer_slot],
             f.buffer_mut(),
             app.ui_theme.composer_bg,
+            &app.ui_theme,
+            &app.viewport.ocean_semantic_surfaces,
         );
         if footer_height > 0 {
-            column.paint_matching(
+            column.paint_matching_native(
                 body_chunks[footer_slot],
                 f.buffer_mut(),
                 app.ui_theme.footer_bg,
+                &app.ui_theme,
+                &app.viewport.ocean_semantic_surfaces,
             );
         }
         if workbar_height > 0 {
-            column.paint_matching(
+            column.paint_matching_native(
                 body_chunks[workbar_slot],
                 f.buffer_mut(),
                 app.ui_theme.footer_bg,
+                &app.ui_theme,
+                &app.viewport.ocean_semantic_surfaces,
             );
         }
     }
@@ -2032,6 +2038,7 @@ pub(crate) fn draw_app_frame_inner(
 ) -> Result<()> {
     terminal.backend_mut().set_palette_mode(app.ui_theme.mode);
     terminal.backend_mut().set_theme(app.theme_id, app.ui_theme);
+    app.viewport.ocean_caps = Some(terminal.backend().native_ocean_caps());
     // DEC 2026 wrapping is on by default but can be turned off for
     // terminals that mishandle it (Ptyxis 50.x + VTE 0.84.x flashes the
     // whole viewport on every wrapped frame instead of deferring as the
@@ -2579,7 +2586,7 @@ mod tests {
         use crate::reasoning_preference::ReasoningEffort;
 
         let mut app = app_with_context_percent(1);
-        app.api_provider = crate::config::ApiProvider::Openai;
+        app.api_provider = crate::config::ProviderKind::Openai;
         app.active_route_base_url = "https://api.openai.com/v1".to_string();
         app.model = "gpt-5.6".to_string();
         app.auto_model = false;
@@ -2712,7 +2719,7 @@ mod tests {
         use crate::tui::underwater::ShellTier;
 
         let mut app = app_with_context_percent(10);
-        app.set_provider_identity(crate::config::ApiProvider::Custom, "my-gateway");
+        app.set_provider_identity(crate::config::ProviderKind::Custom, "my-gateway");
         app.auto_model = false;
         app.active_route_base_url = "https://gateway.example/v1".to_string();
         app.model = "vendor-model-x".to_string();
@@ -2758,11 +2765,11 @@ mod tests {
     /// beside the cost; flat routes and other vendors show nothing.
     #[test]
     fn deepseek_tiered_routes_paint_the_billing_tier_beside_the_cost() {
-        use crate::config::ApiProvider;
+        use crate::config::ProviderKind;
         use chrono::TimeZone as _;
         let mut app = app_with_context_percent(10);
         app.auto_model = false;
-        app.api_provider = ApiProvider::Deepseek;
+        app.api_provider = ProviderKind::Deepseek;
         app.model = "deepseek-v4-flash".to_string();
         // Wednesday 2026-09-16: 02:00Z is inside the 01:00-04:00 peak
         // window, 12:00Z outside every window.
@@ -2795,11 +2802,11 @@ mod tests {
 
         // Another vendor serving a DeepSeek id is priced on its own terms.
         app.model = "deepseek-v4-flash".to_string();
-        app.api_provider = ApiProvider::Openai;
+        app.api_provider = ProviderKind::Openai;
         assert_eq!(super::billing_tier_label(&app, peak), None);
 
         // Auto routing has not pinned a model, so there is nothing to claim.
-        app.api_provider = ApiProvider::Deepseek;
+        app.api_provider = ProviderKind::Deepseek;
         app.auto_model = true;
         assert_eq!(super::billing_tier_label(&app, peak), None);
     }

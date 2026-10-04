@@ -177,10 +177,12 @@ default model, Node engines) are never hand-written into pages:
 revision, version, provider count, tool count, selection reason, and latest
 published release. It contains no environment values, tokens, or KV contents.
 
-When a new `ApiProvider` variant lands in `crates/tui/src/config.rs`, it must
-be added to the `labelMap` in **both** `scripts/derive-facts.mjs` and
-`lib/facts-drift.ts` (or to the `EXCLUDED` set if deliberately hidden). Both
-fail loudly on unmapped variants, so the build / cron will tell you.
+Public provider facts derive the complete roster and optional presentation
+labels from `crates/config/assets/provider_descriptors.json`, alongside the
+catalog from the same selected source revision. Both local generation and the
+remote drift check validate that descriptor document and refuse missing or
+malformed data. Add metadata there; there is no separate website label map or
+TUI enum roster to update.
 
 ## Visual direction
 

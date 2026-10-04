@@ -494,7 +494,7 @@ fn parse_exec_terminal_route(value: &serde_json::Value) -> ParsedTerminalRoute {
         if provider.is_empty() || model.is_empty() {
             return None;
         }
-        let provider_kind = crate::config::ApiProvider::parse(provider)?;
+        let provider_kind = crate::config::ProviderKind::parse(provider)?;
         let provider_exact_id = match meta.get("provider_id") {
             None => None,
             Some(value) => {
@@ -505,7 +505,7 @@ fn parse_exec_terminal_route(value: &serde_json::Value) -> ParsedTerminalRoute {
                 Some(id.to_string())
             }
         };
-        if provider_exact_id.is_some() && provider_kind != crate::config::ApiProvider::Custom {
+        if provider_exact_id.is_some() && provider_kind != crate::config::ProviderKind::Custom {
             return None;
         }
         Some(FleetWorkerReportedRoute {
@@ -1083,6 +1083,7 @@ mod tests {
 
     fn agent_profile(id: &str, role: &str, instructions: &str) -> AgentProfile {
         AgentProfile {
+            native_preset: None,
             id: id.to_string(),
             display_name: Some(format!("{role} profile")),
             description: Some(format!("{role} description")),

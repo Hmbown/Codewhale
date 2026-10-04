@@ -14,39 +14,68 @@ var ErrorCode = {
   Internal: -32603,
   ExecutionFailed: -32e3,
   NotAvailable: -32001,
+  Refused: -32002,
+  Denied: -32003,
   Cancelled: -32800
 };
 var METHODS = [
-  { name: "host/initialize", direction: "core_to_host", request: true, params: "InitializeParams" },
-  { name: "host/ping", direction: "core_to_host", request: true, params: "EmptyParams" },
-  { name: "host/shutdown", direction: "core_to_host", request: true, params: "EmptyParams" },
-  { name: "ext/activate", direction: "core_to_host", request: true, params: "ActivateParams" },
-  { name: "ext/deactivate", direction: "core_to_host", request: true, params: "DeactivateParams" },
-  { name: "tool/call", direction: "core_to_host", request: true, params: "ToolCallParams" },
-  { name: "$/cancel", direction: "core_to_host", request: false, params: "CancelParams" },
-  { name: "host/hello", direction: "host_to_core", request: false, params: "HelloParams" },
-  { name: "host/ready", direction: "host_to_core", request: false, params: "EmptyParams" },
-  { name: "registry/register", direction: "host_to_core", request: true, params: "RegisterParams" },
-  { name: "registry/unregister", direction: "host_to_core", request: true, params: "UnregisterParams" },
-  { name: "ext/faulted", direction: "host_to_core", request: false, params: "FaultedParams" },
-  { name: "log", direction: "host_to_core", request: false, params: "LogParams" },
-  { name: "$/cancel", direction: "host_to_core", request: false, params: "CancelParams" }
+  { name: "host/initialize", direction: "core_to_host", request: true, params: "InitializeParams", tiers: ["plugin", "builtin"] },
+  { name: "host/ping", direction: "core_to_host", request: true, params: "EmptyParams", tiers: ["plugin", "builtin"] },
+  { name: "host/shutdown", direction: "core_to_host", request: true, params: "EmptyParams", tiers: ["plugin", "builtin"] },
+  { name: "ext/activate", direction: "core_to_host", request: true, params: "ActivateParams", tiers: ["plugin", "builtin"] },
+  { name: "ext/deactivate", direction: "core_to_host", request: true, params: "DeactivateParams", tiers: ["plugin", "builtin"] },
+  { name: "tool/call", direction: "core_to_host", request: true, params: "ToolCallParams", tiers: ["plugin", "builtin"] },
+  { name: "command/run", direction: "core_to_host", request: true, params: "CommandRunParams", tiers: ["plugin", "builtin"] },
+  { name: "hook/evaluate", direction: "core_to_host", request: true, params: "HookEvaluateParams", tiers: ["plugin", "builtin"] },
+  { name: "mcp/open", direction: "core_to_host", request: true, params: "McpOpenParams", tiers: ["builtin"] },
+  { name: "mcp/request", direction: "core_to_host", request: true, params: "McpRequestParams", tiers: ["builtin"] },
+  { name: "mcp/close", direction: "core_to_host", request: true, params: "McpCloseParams", tiers: ["builtin"] },
+  { name: "harness/run", direction: "core_to_host", request: true, params: "HarnessRunParams", tiers: ["builtin"] },
+  { name: "$/cancel", direction: "core_to_host", request: false, params: "CancelParams", tiers: ["plugin", "builtin"] },
+  { name: "host/hello", direction: "host_to_core", request: false, params: "HelloParams", tiers: ["plugin", "builtin"] },
+  { name: "host/ready", direction: "host_to_core", request: false, params: "EmptyParams", tiers: ["plugin", "builtin"] },
+  { name: "registry/register", direction: "host_to_core", request: true, params: "RegisterParams", tiers: ["plugin", "builtin"] },
+  { name: "registry/unregister", direction: "host_to_core", request: true, params: "UnregisterParams", tiers: ["plugin", "builtin"] },
+  { name: "core/call", direction: "host_to_core", request: true, params: "CoreCallParams", tiers: ["plugin", "builtin"] },
+  { name: "proc/launch", direction: "host_to_core", request: true, params: "ProcLaunchParams", tiers: ["builtin"] },
+  { name: "proc/read", direction: "host_to_core", request: true, params: "ProcSessionParams", tiers: ["builtin"] },
+  { name: "proc/write", direction: "host_to_core", request: true, params: "ProcWriteParams", tiers: ["builtin"] },
+  { name: "proc/close", direction: "host_to_core", request: true, params: "ProcSessionParams", tiers: ["builtin"] },
+  { name: "net/start", direction: "host_to_core", request: true, params: "ProcLaunchParams", tiers: ["builtin"] },
+  { name: "net/fetch", direction: "host_to_core", request: true, params: "NetFetchParams", tiers: ["builtin"] },
+  { name: "net/read", direction: "host_to_core", request: true, params: "NetReadParams", tiers: ["builtin"] },
+  { name: "net/release", direction: "host_to_core", request: true, params: "NetReadParams", tiers: ["builtin"] },
+  { name: "net/close", direction: "host_to_core", request: true, params: "ProcSessionParams", tiers: ["builtin"] },
+  { name: "exec/redeem", direction: "host_to_core", request: true, params: "ExecutionRedeemParams", tiers: ["builtin"] },
+  { name: "ext/faulted", direction: "host_to_core", request: false, params: "FaultedParams", tiers: ["plugin", "builtin"] },
+  { name: "log", direction: "host_to_core", request: false, params: "LogParams", tiers: ["plugin", "builtin"] },
+  { name: "$/cancel", direction: "host_to_core", request: false, params: "CancelParams", tiers: ["plugin", "builtin"] }
 ];
 var SHAPES = {
   ActivateParams: {
     strict: false,
     required: { owner: { ref: "OwnerRef" }, plugin_name: "string", entry: { ref: "EntryRef" } },
-    optional: { config: "json" }
+    optional: { scope: { ref: "EntryRef" }, config: "json", data_dir: "string" }
   },
   CancelParams: {
     strict: true,
     required: { id: "uint" },
     optional: {}
   },
+  CommandRunParams: {
+    strict: false,
+    required: { handle: "uint", command_id: "string", raw_input: "string", deadline_ms: "uint" },
+    optional: { workspace: "string", session_id: "string", agent_id: "string", origin_turn_id: "string" }
+  },
+  CoreCallParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, ticket: "string", name: "string", input: "json" },
+    optional: {}
+  },
   DeactivateParams: {
     strict: false,
     required: { owner: { ref: "OwnerRef" } },
-    optional: {}
+    optional: { entry: { ref: "EntryRef" } }
   },
   EmptyParams: {
     strict: true,
@@ -58,19 +87,44 @@ var SHAPES = {
     required: { path: "string", sha256: "string" },
     optional: {}
   },
+  ExecutionRedeemParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, execution_id: "string", ticket: "string" },
+    optional: {}
+  },
   FaultedParams: {
     strict: true,
     required: { owner: { ref: "OwnerRef" }, error: "string" },
     optional: {}
   },
+  HarnessRunParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, execution_id: "string", ticket: "string", deadline_ms: "uint" },
+    optional: { hook: { ref: "HookDispatchWire" } }
+  },
   HelloParams: {
     strict: true,
-    required: { protocol: { ref: "ProtocolRange" }, host_version: "string", bundle_sha256: "string", runtime: { ref: "HelloRuntime" } },
+    required: { protocol: { ref: "ProtocolRange" }, host_version: "string", bundle_sha256: "string", runtime: { ref: "HelloRuntime" }, tier: { enum: ["builtin", "plugin"] }, builtin_modules: { items: { ref: "ModuleDigestWire" } } },
     optional: { memory_limit_mib: "uint" }
   },
   HelloRuntime: {
     strict: true,
     required: { name: "string", version: "string" },
+    optional: {}
+  },
+  HookCallPayload: {
+    strict: true,
+    required: { name: "string", call_id: "string", input: "json", mode: "string", workspace: "string", model: "string" },
+    optional: {}
+  },
+  HookDispatchWire: {
+    strict: true,
+    required: { event: "string", dialect: "string", point: "string", query: "string" },
+    optional: { matcher: "string" }
+  },
+  HookEvaluateParams: {
+    strict: true,
+    required: { handle: "uint", event: "string", payload: { ref: "HookCallPayload" }, deadline_ms: "uint" },
     optional: {}
   },
   HostLimits: {
@@ -88,10 +142,65 @@ var SHAPES = {
     required: { level: "string", msg: "string" },
     optional: { plugin_id: "string" }
   },
+  McpCloseParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, session_id: "string", deadline_ms: "uint" },
+    optional: {}
+  },
+  McpHttpHeaders: {
+    strict: true,
+    required: {},
+    optional: { accept: "string", content_type: "string", mcp_session_id: "string", mcp_protocol_version: "string" }
+  },
+  McpOpenParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, session_id: "string", launch_ticket: "string", transport: "string", initialize_grant: { ref: "McpOperationGrant" }, initialized_grant: { ref: "McpOperationGrant" }, client_version: "string", deadline_ms: "uint" },
+    optional: {}
+  },
+  McpOperationGrant: {
+    strict: true,
+    required: { ticket: "string", operation_id: "string", method: "string", params: "json" },
+    optional: { wire_id: "string" }
+  },
+  McpRequestParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, session_id: "string", grant: { ref: "McpOperationGrant" }, deadline_ms: "uint" },
+    optional: {}
+  },
+  ModuleDigestWire: {
+    strict: true,
+    required: { id: "string", sha256: "string" },
+    optional: {}
+  },
+  NetFetchParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, session_id: "string", url: "string", method: "string", headers: { ref: "McpHttpHeaders" } },
+    optional: { frame: "json", ticket: "string", operation_id: "string" }
+  },
+  NetReadParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, session_id: "string", response_id: "string" },
+    optional: {}
+  },
   OwnerRef: {
     strict: true,
     required: { plugin_id: "string", generation: "uint", owner_token: "string" },
     optional: {}
+  },
+  ProcLaunchParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, session_id: "string", ticket: "string" },
+    optional: {}
+  },
+  ProcSessionParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, session_id: "string" },
+    optional: {}
+  },
+  ProcWriteParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, session_id: "string", frame: "json" },
+    optional: { ticket: "string", operation_id: "string" }
   },
   ProtocolRange: {
     strict: true,
@@ -100,8 +209,13 @@ var SHAPES = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool"] }, spec: { ref: "ToolSpecWire" } },
-    optional: {}
+    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook", "prompt_section", "prompt_template", "skill_root", "shell_hook", "mcp_server"] }, spec: { ref: "RegisterSpecWire" } },
+    optional: { scope: { ref: "EntryRef" } }
+  },
+  RegisterSpecWire: {
+    strict: true,
+    required: { name: "string", description: "string" },
+    optional: { input_schema: "object", argument_hint: "string" }
   },
   RpcErrorWire: {
     strict: true,
@@ -111,12 +225,7 @@ var SHAPES = {
   ToolCallParams: {
     strict: false,
     required: { handle: "uint", call_id: "string", input: "json", deadline_ms: "uint" },
-    optional: {}
-  },
-  ToolSpecWire: {
-    strict: true,
-    required: { name: "string", description: "string", input_schema: "object" },
-    optional: {}
+    optional: { workspace: "string", ticket: "string", session_id: "string", agent_id: "string", origin_turn_id: "string" }
   },
   UnregisterParams: {
     strict: true,
@@ -229,7 +338,7 @@ function checkKind(where, value, kind) {
       return;
   }
 }
-function validateMessage(value, direction) {
+function validateMessage(value, direction, tier, methods = METHODS) {
   const strict = direction === "host_to_core";
   if (!isObject(value)) throw new ProtocolError("message: expected an object");
   if (value.jsonrpc !== "2.0") throw new ProtocolError('message: jsonrpc must be "2.0"');
@@ -238,8 +347,9 @@ function validateMessage(value, direction) {
   if ("method" in value) {
     checkShape("message", value, { strict, required: { jsonrpc: "string", method: "string" }, optional: { id: "uint", params: "json" } });
     const method = value.method;
-    const spec = METHODS.find((entry) => entry.name === method && entry.direction === direction);
+    const spec = methods.find((entry) => entry.name === method && entry.direction === direction);
     if (!spec) throw new ProtocolError(`unknown ${direction} method \`${method}\``);
+    if (!spec.tiers.includes(tier)) throw new ProtocolError(`\`${method}\` is not allowed on the ${tier} tier`);
     if (spec.request !== hasId) {
       throw new ProtocolError(`\`${method}\` must be ${spec.request ? "a request (with id)" : "a notification (no id)"}`);
     }
@@ -247,6 +357,11 @@ function validateMessage(value, direction) {
     checkShape(method, params, SHAPES[spec.params]);
     if (method === "host/hello" && params.runtime.name !== "bun" && params.runtime.name !== "node") {
       throw new ProtocolError(`host/hello.runtime.name: unknown runtime \`${params.runtime.name}\``);
+    }
+    if (method === "registry/register") {
+      const { kind, spec: spec2 } = params;
+      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : (kind === "hook" || kind === "prompt_section" || kind === "prompt_template" || kind === "skill_root" || kind === "shell_hook" || kind === "mcp_server") && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook, prompt or skill root registration has no input schema or argument hint" : void 0;
+      if (reason !== void 0) throw new ProtocolError(`${method}: ${reason}`);
     }
     return value;
   }

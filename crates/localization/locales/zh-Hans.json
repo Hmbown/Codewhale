@@ -1,5 +1,7 @@
 {
+  "ExtensionPromptUnavailable": "扩展指令不可用；请通过 /plugin show 查看。",
   "ComposerOversizedSubmitHeld": "未发送：消息超过 {limit} 个字符，无法保存为粘贴文本文件（{error}）。完整文本仍保留在输入框中：请缩短内容，或允许写入 .codewhale/pastes，然后再次按 Enter。",
+  "ComposerOversizedSubmitHeldShort": "未发送：超过 {limit} 个字符；粘贴文件未保存。",
   "CmdPluginOwnerReport": "扩展宿主：\n  状态：{state}\n  活动工具（{count}）：{tools}",
   "CmdPluginOwnerActivating": "正在激活",
   "CmdPluginOwnerActive": "已激活",
@@ -2439,5 +2441,11 @@
   "ModelPickerReadinessRefreshed": "已刷新模型就绪状态 · 已重建目录行",
   "ModelPickerOpenToRefresh": "打开 /model 以刷新就绪状态和目录",
   "ModelPickerPinnedChip": "已固定",
+  "AuthSignedInAs": "已以 {account} 身份登录 {provider}。",
+  "AuthSignedInWithoutEmail": "已登录 {provider}（签发方未提供账户邮箱）。",
+  "AuthReplacedPreviousSignInAs": "已替换之前的 Codewhale {provider} 登录（{account}）。",
+  "AuthReplacedPreviousSignIn": "已替换之前的 Codewhale {provider} 登录。",
+  "AuthSameAccountAsBefore": "这与之前是同一个账户；如需使用其他 {provider} 账户，请先在浏览器中退出该账户（或使用无痕窗口），然后重新登录。",
+  "AuthEnvTokenOutranksSignIn": "此环境中设置了 OPENAI_CODEX_ACCESS_TOKEN 或 CODEX_ACCESS_TOKEN，其优先级高于本次登录；在取消设置之前，请求将继续使用该令牌对应的账户。",
   "PinnedPromptJumpToMessage": "跳转到这条消息"
 }

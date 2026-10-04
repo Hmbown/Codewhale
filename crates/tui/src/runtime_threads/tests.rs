@@ -244,11 +244,11 @@ mod recovery {
         let _env = crate::test_support::lock_test_env();
         let dir = tempfile::tempdir()?;
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
-        let manager = RuntimeThreadManager::open(
-            config(),
-            dir.path().to_path_buf(),
-            test_manager_config(dir.path().join("runtime")),
-        )?;
+        let sessions_dir = dir.path().join("owner-sessions");
+        let mut manager_config = test_manager_config(dir.path().join("runtime"));
+        manager_config.sessions_dir = Some(sessions_dir.clone());
+        let manager =
+            RuntimeThreadManager::open(config(), dir.path().to_path_buf(), manager_config)?;
         let thread = manager
             .create_thread(CreateThreadRequest::default())
             .await?;
@@ -274,14 +274,26 @@ mod recovery {
             None,
             Some("agent"),
         );
-        let sessions = crate::session_manager::SessionManager::new(
-            crate::session_manager::default_sessions_dir()?,
-        )?;
+        let sessions = crate::session_manager::SessionManager::new(sessions_dir.clone())?;
+        assert_eq!(manager.sessions_dir(), sessions.sessions_dir());
         let _admission = manager.session_checkpoint_guard().await;
         sessions.save_session(&saved)?;
         manager
             .set_thread_session_checkpoint(&thread.id, &saved)
             .await?;
+        drop(_admission);
+        let _relocated_home = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_HOME",
+            dir.path().join("another-home"),
+        );
+        let foreign_sessions = dir.path().join("foreign-sessions");
+        assert!(
+            manager
+                .fork_thread_in_sessions_dir(&thread.id, &foreign_sessions)
+                .await
+                .is_err()
+        );
+        assert!(!foreign_sessions.exists());
         let thread = manager.get_thread(&thread.id).await?;
         let fork = manager.fork_thread(&thread.id).await?;
         assert_eq!(manager.restore_thread_messages(&fork)?, messages);
@@ -887,10 +899,7 @@ mod recovery {
         }
 
         let prepared = manager.prepare_fork_at_user_message(&thread.id, 0).await?;
-        let (_, prefix, _) = prepared
-            .own_session
-            .as_ref()
-            .context("a prepared backtrack carries the prefix it keeps")?;
+        let (_, prefix, _) = &prepared.own_session;
         assert_eq!(
             prefix.as_slice(),
             &transcript[..6],
@@ -902,11 +911,9 @@ mod recovery {
         // Undoing the second turn back (`depth` 1) keeps nothing: the first
         // turn's own prompt is the anchor, so the boundary is the first message.
         let first_turn = manager.prepare_fork_at_user_message(&thread.id, 1).await?;
-        let (_, prefix, _) = first_turn
-            .own_session
-            .as_ref()
-            .context("a prepared backtrack carries the prefix it keeps")?;
+        let (_, prefix, _) = &first_turn.own_session;
         assert!(prefix.is_empty(), "undoing the first turn keeps no history");
+        drop(first_turn); // An abandoned preparation releases its captured source lease.
 
         // A transcript that no longer lines up with the turn records must refuse
         // rather than cut where it cannot account for the history: the undone
@@ -2378,6 +2385,7 @@ impl Drop for RuntimeEventChildGuard {
 fn test_manager_config(data_dir: PathBuf) -> RuntimeThreadManagerConfig {
     RuntimeThreadManagerConfig {
         task_data_dir: data_dir.clone(),
+        sessions_dir: None,
         data_dir,
         max_active_threads: 4,
     }
@@ -2643,7 +2651,7 @@ async fn agent_mail_queue_is_durable_idempotent_redacted_and_workspace_scoped() 
 
 fn set_test_turn_route(
     turn: &mut TurnRecord,
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: &str,
     model: &str,
     billing_surface: Option<&str>,
@@ -2671,7 +2679,7 @@ fn runtime_compaction_uses_provider_route_context() {
     };
     let config = runtime_compaction_config(
         &Config::default(),
-        ApiProvider::OpenaiCodex,
+        ProviderKind::OpenaiCodex,
         "gpt-5.5",
         Some(limits),
         false,
@@ -2787,8 +2795,8 @@ async fn named_custom_thread_identity_round_trips_and_fails_closed_when_removed(
     assert!(!serialized.contains("127.0.0.1:1234"));
 
     let route = manager.resolved_route_for_thread(&config, &persisted)?;
-    assert_eq!(route.identity.provider, ApiProvider::Custom);
-    assert_eq!(route.identity.key, "lm-studio");
+    assert_eq!(route.identity.provider, ProviderKind::Custom);
+    assert_eq!(route.identity.key.as_str(), "lm-studio");
     assert_eq!(route.model, "local-code-model");
     assert_eq!(
         route.config.active_route_base_url(),
@@ -2835,8 +2843,8 @@ fn legacy_literal_custom_thread_resumes_on_the_migrated_table() -> Result<()> {
     let restored: ThreadRecord = serde_json::from_str(&serde_json::to_string(&persisted)?)?;
 
     let route = manager.resolved_route_for_thread(&config, &restored)?;
-    assert_eq!(route.identity.provider, ApiProvider::Custom);
-    assert_eq!(route.identity.key, "custom");
+    assert_eq!(route.identity.provider, ProviderKind::Custom);
+    assert_eq!(route.identity.key.as_str(), "custom");
     assert_eq!(route.model, "legacy-saved-model");
     assert_eq!(
         route.config.active_route_base_url(),
@@ -2849,14 +2857,15 @@ fn legacy_literal_custom_thread_resumes_on_the_migrated_table() -> Result<()> {
             .resolve_provider_identity("custom")
             .map_err(anyhow::Error::msg)?,
         crate::config::ProviderIdentity {
-            provider: ApiProvider::Custom,
-            key: "custom".to_string(),
-            exact_id: Some("custom".to_string()),
+            provider: ProviderKind::Custom,
+            key: "custom".into(),
+            exact_id: Some("custom".into()),
             migrated_legacy_ollama_cloud_route: false,
+            legacy_root_custom_generation: None,
         }
     );
     let repeated = manager.resolved_route_for_thread(&route.config, &restored)?;
-    assert_eq!(repeated.identity.key, "custom");
+    assert_eq!(repeated.identity.key.as_str(), "custom");
     assert_eq!(repeated.model, "legacy-saved-model");
     assert_eq!(
         repeated.config.active_route_base_url(),
@@ -2887,14 +2896,14 @@ fn legacy_literal_custom_thread_resumes_on_the_migrated_table() -> Result<()> {
         .resolved_route_for_thread(&named_config, &restored)
         .expect_err("id-less root record must not migrate to a named table")
         .to_string();
-    assert!(error.contains("[providers.custom]"), "{error}");
+    assert!(error.contains("root-scope migrated `base_url`"), "{error}");
     assert!(error.contains("will not guess or fall back"), "{error}");
 
     Ok(())
 }
 
 #[tokio::test]
-async fn literal_custom_thread_and_turn_writers_record_the_table_id() -> Result<()> {
+async fn captured_legacy_root_thread_and_turn_keep_absent_id_provenance() -> Result<()> {
     let config = Config {
         provider: Some("custom".to_string()),
         default_text_model: Some("legacy-root-model".to_string()),
@@ -2912,9 +2921,9 @@ async fn literal_custom_thread_and_turn_writers_record_the_table_id() -> Result<
             ..CreateThreadRequest::default()
         })
         .await?;
-    // The literal route is the `[providers.custom]` table since #6394.
+    // The leaf is canonicalized, while the captured released record keeps no additive ID.
     assert_eq!(thread.model_provider.as_deref(), Some("custom"));
-    assert_eq!(thread.model_provider_id.as_deref(), Some("custom"));
+    assert_eq!(thread.model_provider_id.as_deref(), None);
 
     let mut harness = install_mock_engine(&manager, &thread.id).await;
     let turn = manager
@@ -2927,11 +2936,11 @@ async fn literal_custom_thread_and_turn_writers_record_the_table_id() -> Result<
         )
         .await?;
     assert_eq!(turn.effective_provider.as_deref(), Some("custom"));
-    assert_eq!(turn.effective_provider_id.as_deref(), Some("custom"));
+    assert_eq!(turn.effective_provider_id.as_deref(), None);
     match harness.rx_op.recv().await {
         Some(Op::SendMessage(TurnSpec { route, .. })) => {
-            assert_eq!(route.identity.key, "custom");
-            assert_eq!(route.identity.exact_id.as_deref(), Some("custom"));
+            assert_eq!(route.identity.key.as_str(), "custom");
+            assert_eq!(route.identity.persisted_id(), None);
             assert_eq!(
                 route.config.active_route_base_url(),
                 "http://127.0.0.1:18180/v1"
@@ -4402,7 +4411,7 @@ async fn concurrent_turn_starts_leave_one_claim_and_one_consistent_durable_turn(
 }
 
 #[test]
-fn legacy_custom_thread_resumes_on_the_literal_table_when_both_exist() -> Result<()> {
+fn idless_custom_thread_refuses_conflicting_root_and_exact_table() -> Result<()> {
     let mut custom = std::collections::HashMap::new();
     custom.insert(
         "custom".to_string(),
@@ -4433,22 +4442,16 @@ fn legacy_custom_thread_resumes_on_the_literal_table_when_both_exist() -> Result
     legacy.model_provider = Some("custom".to_string());
     legacy.model_provider_id = None;
 
-    // Beside the literal table, the older top-level endpoint is DeepSeek's
-    // (#6394): an id-less record resumes on the table like an exact one.
-    let root = manager.resolved_route_for_thread(&config, &legacy)?;
-    assert_eq!(root.identity.provider, ApiProvider::Custom);
-    assert_eq!(root.identity.key, "custom");
-    assert_eq!(root.identity.exact_id.as_deref(), Some("custom"));
-    assert_eq!(
-        root.config.active_route_base_url(),
-        "http://127.0.0.1:18182/v1"
-    );
+    let error = manager
+        .resolved_route_for_thread(&config, &legacy)
+        .expect_err("conflicting root cannot bless exact table");
+    assert!(error.to_string().contains("will not guess or fall back"));
 
     legacy.model_provider_id = Some("custom".to_string());
     let exact = manager.resolved_route_for_thread(&config, &legacy)?;
-    assert_eq!(exact.identity.provider, ApiProvider::Custom);
-    assert_eq!(exact.identity.key, "custom");
-    assert_eq!(exact.identity.exact_id.as_deref(), Some("custom"));
+    assert_eq!(exact.identity.provider, ProviderKind::Custom);
+    assert_eq!(exact.identity.key.as_str(), "custom");
+    assert_eq!(exact.identity.persisted_id(), Some("custom"));
     assert_eq!(
         exact.config.active_route_base_url(),
         "http://127.0.0.1:18182/v1"
@@ -4567,8 +4570,8 @@ async fn thread_records_and_create_requests_preserve_provider_kind_id_pairing() 
     exact_custom.model_provider = Some("custom".to_string());
     exact_custom.model_provider_id = Some("openai".to_string());
     let route = manager.resolved_route_for_thread(&config, &exact_custom)?;
-    assert_eq!(route.identity.provider, ApiProvider::Custom);
-    assert_eq!(route.identity.key, "openai");
+    assert_eq!(route.identity.provider, ProviderKind::Custom);
+    assert_eq!(route.identity.key.as_str(), "openai");
     assert_eq!(
         route.config.active_route_base_url(),
         "http://127.0.0.1:18183/v1"
@@ -4590,8 +4593,8 @@ async fn thread_records_and_create_requests_preserve_provider_kind_id_pairing() 
     // A restored built-in pick is not the thread's saved provider, so it is
     // ignored rather than captured: the thread keeps its exact custom route.
     let ignored = manager.resolved_route_for_thread(&config, &auto_thread)?;
-    assert_eq!(ignored.identity.provider, ApiProvider::Custom);
-    assert_eq!(ignored.identity.key, "openai");
+    assert_eq!(ignored.identity.provider, ProviderKind::Custom);
+    assert_eq!(ignored.identity.key.as_str(), "openai");
     assert_eq!(
         ignored.config.active_route_base_url(),
         "http://127.0.0.1:18183/v1"
@@ -4601,8 +4604,8 @@ async fn thread_records_and_create_requests_preserve_provider_kind_id_pairing() 
     restored_turn.effective_provider_id = Some("openai".to_string());
     manager.store.save_turn(&restored_turn)?;
     let restored_custom = manager.resolved_route_for_thread(&config, &auto_thread)?;
-    assert_eq!(restored_custom.identity.provider, ApiProvider::Custom);
-    assert_eq!(restored_custom.identity.key, "openai");
+    assert_eq!(restored_custom.identity.provider, ProviderKind::Custom);
+    assert_eq!(restored_custom.identity.key.as_str(), "openai");
     assert_eq!(restored_custom.model, "custom-openai-model");
 
     let request_error = manager
@@ -4678,7 +4681,7 @@ async fn config_reload_updates_next_turn_route_without_mutating_engine_route() -
     manager.reload_config(reloaded).await?;
 
     let refreshed = manager.resolved_route_for_thread(&manager.read_config(), &thread)?;
-    assert_eq!(refreshed.identity.key, "lm-studio");
+    assert_eq!(refreshed.identity.key.as_str(), "lm-studio");
     assert_eq!(
         refreshed.config.active_route_base_url(),
         "http://127.0.0.1:18182/v1"
@@ -4713,7 +4716,7 @@ async fn config_reload_updates_next_turn_route_without_mutating_engine_route() -
         Some(Op::CompactContext {
             route, compaction, ..
         }) => {
-            assert_eq!(route.identity.key, "lm-studio");
+            assert_eq!(route.identity.key.as_str(), "lm-studio");
             assert_eq!(
                 route.config.active_route_base_url(),
                 "http://127.0.0.1:18182/v1"
@@ -4722,7 +4725,7 @@ async fn config_reload_updates_next_turn_route_without_mutating_engine_route() -
             assert_eq!(
                 compaction.effective_context_window,
                 Some(crate::route_budget::route_context_window_tokens(
-                    ApiProvider::Custom,
+                    ProviderKind::Custom,
                     "local-model",
                     crate::route_budget::known_route_limits(route.candidate.limits()),
                 ))
@@ -5012,7 +5015,7 @@ async fn create_thread_uses_requested_named_custom_provider_default_model() -> R
     assert_eq!(thread.model_provider_id.as_deref(), Some("custom-a"));
     assert_eq!(thread.model, "model-a");
     let route = manager.resolved_route_for_thread(&config, &thread)?;
-    assert_eq!(route.identity.key, "custom-a");
+    assert_eq!(route.identity.key.as_str(), "custom-a");
     assert_eq!(
         route.config.active_route_base_url(),
         "http://127.0.0.1:18181/v1"
@@ -5101,7 +5104,7 @@ async fn update_thread_switches_provider_and_keeps_the_loaded_engine() -> Result
     assert_eq!(switched.model_provider_id.as_deref(), Some("custom-b"));
     assert_eq!(switched.model, "model-b");
     let route = manager.resolved_route_for_thread(&config, &switched)?;
-    assert_eq!(route.identity.key, "custom-b");
+    assert_eq!(route.identity.key.as_str(), "custom-b");
 
     // The same engine (and so the same conversation) serves the next turn,
     // now on the new route.
@@ -5118,7 +5121,7 @@ async fn update_thread_switches_provider_and_keeps_the_loaded_engine() -> Result
     assert_eq!(turn.effective_model.as_deref(), Some("model-b"));
     match harness.rx_op.recv().await {
         Some(Op::SendMessage(TurnSpec { route, .. })) => {
-            assert_eq!(route.identity.key, "custom-b");
+            assert_eq!(route.identity.key.as_str(), "custom-b");
             assert_eq!(route.model, "model-b");
         }
         other => panic!("expected send on the switched route, got {other:?}"),
@@ -5161,7 +5164,7 @@ async fn start_turn_provider_override_routes_one_turn_only() -> Result<()> {
     assert_eq!(turn.effective_model.as_deref(), Some("model-b"));
     match harness.rx_op.recv().await {
         Some(Op::SendMessage(TurnSpec { route, .. })) => {
-            assert_eq!(route.identity.key, "custom-b");
+            assert_eq!(route.identity.key.as_str(), "custom-b");
         }
         other => panic!("expected send on the override route, got {other:?}"),
     }
@@ -5218,7 +5221,7 @@ async fn auto_thread_follows_a_provider_switch_even_after_the_old_provider_is_re
     earlier.effective_model = Some("model-a".to_string());
     manager.store.save_turn(&earlier)?;
     let before = manager.resolved_route_for_thread(&config, &thread)?;
-    assert_eq!(before.identity.key, "custom-a");
+    assert_eq!(before.identity.key.as_str(), "custom-a");
     assert_eq!(before.model, "model-a");
 
     let switched = manager
@@ -5232,13 +5235,13 @@ async fn auto_thread_follows_a_provider_switch_even_after_the_old_provider_is_re
         .await?;
     assert_eq!(switched.model, "auto");
     let route = manager.resolved_route_for_thread(&config, &switched)?;
-    assert_eq!(route.identity.key, "custom-b");
+    assert_eq!(route.identity.key.as_str(), "custom-b");
     assert_eq!(route.model, "model-b");
 
     // The earlier pick names a provider that is gone; the thread still routes
     // through its saved provider instead of failing on history.
     let route = manager.resolved_route_for_thread(&only_custom_b_config(), &switched)?;
-    assert_eq!(route.identity.key, "custom-b");
+    assert_eq!(route.identity.key.as_str(), "custom-b");
     assert_eq!(route.model, "model-b");
     Ok(())
 }
@@ -5271,7 +5274,7 @@ async fn config_reload_accepts_removing_the_provider_an_idle_thread_switched_awa
     manager.reload_config(only_custom_b_config()).await?;
     let saved = manager.get_thread(&thread.id).await?;
     let route = manager.resolved_route_for_thread(&manager.read_config(), &saved)?;
-    assert_eq!(route.identity.key, "custom-b");
+    assert_eq!(route.identity.key.as_str(), "custom-b");
     Ok(())
 }
 
@@ -5396,16 +5399,16 @@ async fn simultaneous_named_custom_auto_threads_keep_exact_routes() -> Result<()
     assert_eq!(turn_b.effective_model.as_deref(), Some("model-b"));
     match harness_a.rx_op.recv().await {
         Some(Op::SendMessage(TurnSpec { route, .. })) => {
-            assert_eq!(route.identity.provider, ApiProvider::Custom);
-            assert_eq!(route.identity.key, "custom-a");
+            assert_eq!(route.identity.provider, ProviderKind::Custom);
+            assert_eq!(route.identity.key.as_str(), "custom-a");
             assert_eq!(route.model, "model-a");
         }
         other => panic!("expected custom A send, got {other:?}"),
     }
     match harness_b.rx_op.recv().await {
         Some(Op::SendMessage(TurnSpec { route, .. })) => {
-            assert_eq!(route.identity.provider, ApiProvider::Custom);
-            assert_eq!(route.identity.key, "custom-b");
+            assert_eq!(route.identity.provider, ProviderKind::Custom);
+            assert_eq!(route.identity.key.as_str(), "custom-b");
             assert_eq!(route.model, "model-b");
         }
         other => panic!("expected custom B send, got {other:?}"),
@@ -5417,13 +5420,13 @@ async fn simultaneous_named_custom_auto_threads_keep_exact_routes() -> Result<()
 fn turn_record_preserves_openrouter_vendor_pin_after_reload() {
     let mut turn = sample_turn("thr_vendor", "turn_vendor", RuntimeTurnStatus::Completed);
     let route = crate::cost_status::EffectiveRouteEnvelope {
-        provider: ApiProvider::Openrouter,
+        provider: ProviderKind::Openrouter,
         provider_identity: "openrouter".to_string(),
         model: "qwen/qwen3.7-plus".to_string(),
         openrouter_vendor: Some("cerebras".to_string()),
         billing_surface: crate::pricing::billing_surface_for_route(
-            ApiProvider::Openrouter,
-            Some(ApiProvider::Openrouter.default_base_url()),
+            ProviderKind::Openrouter,
+            Some(ProviderKind::Openrouter.provider().default_base_url()),
         )
         .map(str::to_string),
         endpoint_fingerprint: None,
@@ -5465,7 +5468,7 @@ fn turn_record_persists_billing_surface_without_raw_endpoint() {
     let fingerprint = "a".repeat(64);
     turn.persist_effective_route(&crate::cost_status::EffectiveRouteEnvelope {
         openrouter_vendor: None,
-        provider: ApiProvider::Stepfun,
+        provider: ProviderKind::Stepfun,
         provider_identity: "stepfun-primary".to_string(),
         model: "step-3.7-flash".to_string(),
         billing_surface: Some(crate::pricing::STEPFUN_PAYG_BILLING_SURFACE.to_string()),
@@ -5531,7 +5534,7 @@ fn turn_record_round_trips_frozen_provider_live_pricing_and_drops_hostile_quotes
     crate::provider_catalog_live::record_success(priced_delta(1.25, 5.0));
     let route = crate::cost_status::EffectiveRouteEnvelope::capture(
         None,
-        ApiProvider::Custom,
+        ProviderKind::Custom,
         codewhale_config::catalog::BASETEN_PROVIDER_ID,
         model,
         Some(codewhale_config::catalog::BASETEN_BASE_URL),
@@ -5712,8 +5715,8 @@ async fn aggregate_usage_keeps_codex_tokens_without_api_dollar_pricing() -> Resu
     deepseek.usage = Some(usage.clone());
     set_test_turn_route(
         &mut deepseek,
-        ApiProvider::Deepseek,
-        ApiProvider::Deepseek.as_str(),
+        ProviderKind::Deepseek,
+        ProviderKind::Deepseek.as_str(),
         "deepseek-v4-flash",
         // A real dispatch persists the classified surface. Leaving it absent
         // here would price the row at official DeepSeek rates on nothing but
@@ -5727,8 +5730,8 @@ async fn aggregate_usage_keeps_codex_tokens_without_api_dollar_pricing() -> Resu
     codex.usage = Some(usage);
     set_test_turn_route(
         &mut codex,
-        ApiProvider::OpenaiCodex,
-        ApiProvider::OpenaiCodex.as_str(),
+        ProviderKind::OpenaiCodex,
+        ProviderKind::OpenaiCodex.as_str(),
         "gpt-5.5",
         Some(crate::pricing::OAUTH_SUBSCRIPTION_BILLING_SURFACE),
         crate::cost_status::RouteBillingMode::Subscription,
@@ -5745,12 +5748,12 @@ async fn aggregate_usage_keeps_codex_tokens_without_api_dollar_pricing() -> Resu
     let deepseek_bucket = report
         .buckets
         .iter()
-        .find(|bucket| bucket.key == ApiProvider::Deepseek.as_str())
+        .find(|bucket| bucket.key == ProviderKind::Deepseek.as_str())
         .expect("DeepSeek bucket");
     let codex_bucket = report
         .buckets
         .iter()
-        .find(|bucket| bucket.key == ApiProvider::OpenaiCodex.as_str())
+        .find(|bucket| bucket.key == ProviderKind::OpenaiCodex.as_str())
         .expect("Codex bucket");
     assert!(deepseek_bucket.cost_usd > 0.0);
     assert_eq!(codex_bucket.cost_usd, 0.0);
@@ -5791,8 +5794,8 @@ async fn aggregate_usage_for_thread_scopes_both_currencies_to_one_thread() -> Re
     });
     set_test_turn_route(
         &mut turn,
-        ApiProvider::Deepseek,
-        ApiProvider::Deepseek.as_str(),
+        ProviderKind::Deepseek,
+        ProviderKind::Deepseek.as_str(),
         "deepseek-v4-flash",
         Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE),
         crate::cost_status::RouteBillingMode::Metered,
@@ -5800,8 +5803,8 @@ async fn aggregate_usage_for_thread_scopes_both_currencies_to_one_thread() -> Re
     turn.routed_usage = vec![crate::cost_status::EffectiveRouteUsage {
         route: crate::cost_status::EffectiveRouteEnvelope {
             openrouter_vendor: None,
-            provider: ApiProvider::Deepseek,
-            provider_identity: ApiProvider::Deepseek.as_str().to_string(),
+            provider: ProviderKind::Deepseek,
+            provider_identity: ProviderKind::Deepseek.as_str().to_string(),
             model: "deepseek-v4-flash".to_string(),
             billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string()),
             endpoint_fingerprint: None,
@@ -5829,8 +5832,8 @@ async fn aggregate_usage_for_thread_scopes_both_currencies_to_one_thread() -> Re
     });
     set_test_turn_route(
         &mut other_turn,
-        ApiProvider::Deepseek,
-        ApiProvider::Deepseek.as_str(),
+        ProviderKind::Deepseek,
+        ProviderKind::Deepseek.as_str(),
         "deepseek-v4-flash",
         Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE),
         crate::cost_status::RouteBillingMode::Metered,
@@ -5932,8 +5935,8 @@ async fn aggregate_usage_reports_an_all_unknown_run_as_unavailable_not_zero() ->
         turn.usage = Some(usage.clone());
         set_test_turn_route(
             &mut turn,
-            ApiProvider::Openai,
-            ApiProvider::Openai.as_str(),
+            ProviderKind::Openai,
+            ProviderKind::Openai.as_str(),
             "gpt-5.5",
             surface,
             crate::cost_status::RouteBillingMode::Metered,
@@ -5995,8 +5998,8 @@ async fn aggregate_usage_marks_unknown_cost_as_subtotal_and_keeps_cache_writes()
     priced.usage = Some(usage.clone());
     set_test_turn_route(
         &mut priced,
-        ApiProvider::Deepseek,
-        ApiProvider::Deepseek.as_str(),
+        ProviderKind::Deepseek,
+        ProviderKind::Deepseek.as_str(),
         "deepseek-v4-flash",
         Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE),
         crate::cost_status::RouteBillingMode::Metered,
@@ -6007,8 +6010,8 @@ async fn aggregate_usage_marks_unknown_cost_as_subtotal_and_keeps_cache_writes()
     unknown.usage = Some(usage);
     set_test_turn_route(
         &mut unknown,
-        ApiProvider::Openai,
-        ApiProvider::Openai.as_str(),
+        ProviderKind::Openai,
+        ProviderKind::Openai.as_str(),
         "gpt-5.5",
         Some(crate::pricing::UNCLASSIFIED_BILLING_SURFACE),
         crate::cost_status::RouteBillingMode::Unknown,
@@ -6070,8 +6073,8 @@ async fn aggregate_usage_prices_slow_predispatch_turn_at_dispatch_boundary() -> 
         turn.usage = Some(usage.clone());
         set_test_turn_route(
             &mut turn,
-            ApiProvider::Deepseek,
-            ApiProvider::Deepseek.as_str(),
+            ProviderKind::Deepseek,
+            ProviderKind::Deepseek.as_str(),
             "deepseek-v4-flash",
             Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE),
             crate::cost_status::RouteBillingMode::Metered,
@@ -6123,8 +6126,8 @@ async fn aggregate_usage_prices_only_stepfun_payg_surface() -> Result<()> {
         turn.usage = Some(usage.clone());
         set_test_turn_route(
             &mut turn,
-            ApiProvider::Stepfun,
-            ApiProvider::Stepfun.as_str(),
+            ProviderKind::Stepfun,
+            ProviderKind::Stepfun.as_str(),
             "step-3.7-flash",
             Some(surface),
             if surface == crate::pricing::STEPFUN_PLAN_BILLING_SURFACE {
@@ -6162,8 +6165,8 @@ async fn aggregate_usage_includes_exclusive_child_calls_and_zero_usage_receipts(
     });
     set_test_turn_route(
         &mut turn,
-        ApiProvider::Deepseek,
-        "deepseek-parent",
+        ProviderKind::Deepseek,
+        "deepseek",
         "deepseek-v4-flash",
         Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE),
         crate::cost_status::RouteBillingMode::Metered,
@@ -6172,9 +6175,11 @@ async fn aggregate_usage_includes_exclusive_child_calls_and_zero_usage_receipts(
         .push(crate::cost_status::EffectiveRouteUsage {
             route: crate::cost_status::EffectiveRouteEnvelope {
                 openrouter_vendor: None,
-                provider: ApiProvider::Deepseek,
-                provider_identity: "deepseek-child".to_string(),
-                model: "deepseek-v4-flash".to_string(),
+                provider: ProviderKind::Deepseek,
+                // A distinct actual model keeps the child's route receipt
+                // separate without treating its role as a provider identity.
+                provider_identity: "deepseek".to_string(),
+                model: "deepseek-v4-pro".to_string(),
                 // A child call carries the surface its own dispatch classified;
                 // the route audit will not price a metered route without one.
                 billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string()),
@@ -6196,8 +6201,8 @@ async fn aggregate_usage_includes_exclusive_child_calls_and_zero_usage_receipts(
         .push(crate::cost_status::EffectiveRouteUsage {
             route: crate::cost_status::EffectiveRouteEnvelope {
                 openrouter_vendor: None,
-                provider: ApiProvider::OpenaiCodex,
-                provider_identity: "codex-oauth".to_string(),
+                provider: ProviderKind::OpenaiCodex,
+                provider_identity: "openai-codex".to_string(),
                 model: "gpt-5.5".to_string(),
                 billing_surface: Some(
                     crate::pricing::OAUTH_SUBSCRIPTION_BILLING_SURFACE.to_string(),
@@ -6246,8 +6251,8 @@ async fn aggregate_usage_filters_each_call_by_its_dispatch_timestamp() -> Result
     });
     set_test_turn_route(
         &mut turn,
-        ApiProvider::Deepseek,
-        "deepseek-parent",
+        ProviderKind::Deepseek,
+        "deepseek",
         "deepseek-v4-flash",
         Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE),
         crate::cost_status::RouteBillingMode::Metered,
@@ -6256,8 +6261,8 @@ async fn aggregate_usage_filters_each_call_by_its_dispatch_timestamp() -> Result
         .push(crate::cost_status::EffectiveRouteUsage {
             route: crate::cost_status::EffectiveRouteEnvelope {
                 openrouter_vendor: None,
-                provider: ApiProvider::Deepseek,
-                provider_identity: "deepseek-child".to_string(),
+                provider: ProviderKind::Deepseek,
+                provider_identity: "deepseek".to_string(),
                 model: "deepseek-v4-flash".to_string(),
                 billing_surface: None,
                 endpoint_fingerprint: None,
@@ -6349,10 +6354,10 @@ fn runtime_usage_sink_survives_parent_terminal_and_restart_exactly_once() -> Res
 
     let route = crate::cost_status::EffectiveRouteEnvelope::capture(
         None,
-        ApiProvider::Deepseek,
-        "deepseek-compaction",
+        ProviderKind::Deepseek,
+        "deepseek",
         "deepseek-v4-flash",
-        Some(ApiProvider::Deepseek.default_base_url()),
+        Some(ProviderKind::Deepseek.provider().default_base_url()),
         Utc::now(),
     );
     crate::cost_status::report_effective_route_for_runtime(
@@ -6421,10 +6426,10 @@ fn routed_usage_append_is_bounded_and_idempotent_for_every_delivery_path() {
     );
     let route = crate::cost_status::EffectiveRouteEnvelope::capture(
         None,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek-primary",
         "deepseek-v4-flash",
-        Some(ApiProvider::Deepseek.default_base_url()),
+        Some(ProviderKind::Deepseek.provider().default_base_url()),
         Utc::now(),
     );
     for index in 0..90 {
@@ -6489,10 +6494,10 @@ async fn raw_metadata_missing_usage_deduplicates_direct_drop_and_legacy_totals()
         let mut turn = sample_turn(&thread.id, "turn_raw_missing", RuntimeTurnStatus::Completed);
         let mut route = EffectiveRouteEnvelope::capture(
             None,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek",
             "deepseek-v4-flash",
-            Some(ApiProvider::Deepseek.default_base_url()),
+            Some(ProviderKind::Deepseek.provider().default_base_url()),
             Utc::now(),
         );
         route.billing_mode = mode;
@@ -6571,10 +6576,10 @@ fn routed_usage_rejects_new_records_when_legacy_source_ledger_already_exceeds_bo
         .collect();
     let route = crate::cost_status::EffectiveRouteEnvelope::capture(
         None,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek",
         "deepseek-v4-flash",
-        Some(ApiProvider::Deepseek.default_base_url()),
+        Some(ProviderKind::Deepseek.provider().default_base_url()),
         Utc::now(),
     );
     let record = EffectiveRouteUsage {
@@ -6594,6 +6599,7 @@ fn routed_usage_rejects_new_records_when_legacy_source_ledger_already_exceeds_bo
     assert!(!append_routed_usage_drop_record(
         &mut turn,
         RuntimeUsageDropRecord {
+            reason: crate::cost_status::RuntimeUsageMissingReason::default(),
             source_id: "another-new-response".to_string(),
             route,
         }
@@ -6617,7 +6623,7 @@ async fn aggregate_usage_fails_closed_for_legacy_reconstructed_route() -> Result
     });
     // These mutable-era fields are intentionally insufficient: no exact
     // identity, billing mode, or dispatch timestamp was persisted.
-    turn.effective_provider = Some(ApiProvider::Deepseek.as_str().to_string());
+    turn.effective_provider = Some(ProviderKind::Deepseek.as_str().to_string());
     turn.effective_model = Some("deepseek-v4-flash".to_string());
     manager.store.save_turn(&turn)?;
 
@@ -8046,6 +8052,7 @@ fn enforce_lru_capacity_does_not_loop_when_all_threads_are_active() {
         ActiveThreadState {
             engine: harness_a.handle,
             active_turn: Some(ActiveTurnState {
+                narrowing: crate::core::engine::TurnNarrowing::Inherit,
                 goal_progress: None,
                 goal_id: None,
                 turn_id: "turn_a".to_string(),
@@ -8053,10 +8060,11 @@ fn enforce_lru_capacity_does_not_loop_when_all_threads_are_active() {
                 compaction_id: None,
             }),
             route_identity: crate::config::ProviderIdentity {
-                provider: ApiProvider::Deepseek,
-                key: "deepseek".to_string(),
-                exact_id: Some("deepseek".to_string()),
+                provider: ProviderKind::Deepseek,
+                key: "deepseek".into(),
+                exact_id: Some("deepseek".into()),
                 migrated_legacy_ollama_cloud_route: false,
+                legacy_root_custom_generation: None,
             },
             route_model: DEFAULT_TEXT_MODEL.to_string(),
             hook_executor: None,
@@ -8068,6 +8076,7 @@ fn enforce_lru_capacity_does_not_loop_when_all_threads_are_active() {
         ActiveThreadState {
             engine: harness_b.handle,
             active_turn: Some(ActiveTurnState {
+                narrowing: crate::core::engine::TurnNarrowing::Inherit,
                 goal_progress: None,
                 goal_id: None,
                 turn_id: "turn_b".to_string(),
@@ -8075,10 +8084,11 @@ fn enforce_lru_capacity_does_not_loop_when_all_threads_are_active() {
                 compaction_id: None,
             }),
             route_identity: crate::config::ProviderIdentity {
-                provider: ApiProvider::Deepseek,
-                key: "deepseek".to_string(),
-                exact_id: Some("deepseek".to_string()),
+                provider: ProviderKind::Deepseek,
+                key: "deepseek".into(),
+                exact_id: Some("deepseek".into()),
                 migrated_legacy_ollama_cloud_route: false,
+                legacy_root_custom_generation: None,
             },
             route_model: DEFAULT_TEXT_MODEL.to_string(),
             hook_executor: None,
@@ -8459,10 +8469,10 @@ async fn initial_classifier_usage_is_persisted_before_terminal_and_merged_exactl
     };
     let classifier_route = crate::cost_status::EffectiveRouteEnvelope::capture(
         None,
-        ApiProvider::Openai,
+        ProviderKind::Openai,
         "openai",
         "classifier-model",
-        Some(ApiProvider::Openai.default_base_url()),
+        Some(ProviderKind::Openai.provider().default_base_url()),
         Utc::now(),
     );
     let classifier_batch = crate::cost_status::RuntimeUsageBatch {
@@ -8475,6 +8485,7 @@ async fn initial_classifier_usage_is_persisted_before_terminal_and_merged_exactl
             },
         }],
         drop_records: vec![crate::cost_status::RuntimeUsageDropRecord {
+            reason: crate::cost_status::RuntimeUsageMissingReason::default(),
             source_id: "auto-router:runtime-missing-usage".to_string(),
             route: classifier_route,
         }],
@@ -8596,10 +8607,10 @@ fn classifier_settlement_batch(
 ) -> crate::cost_status::RuntimeUsageBatch {
     let mut route = crate::cost_status::EffectiveRouteEnvelope::capture(
         None,
-        ApiProvider::Openrouter,
+        ProviderKind::Custom,
         identity,
         model,
-        Some(ApiProvider::Openrouter.default_base_url()),
+        Some(ProviderKind::Openrouter.provider().default_base_url()),
         Utc::now(),
     );
     route.billing_mode = crate::cost_status::RouteBillingMode::Subscription;
@@ -8617,6 +8628,7 @@ fn classifier_settlement_batch(
             },
         }],
         drop_records: vec![crate::cost_status::RuntimeUsageDropRecord {
+            reason: crate::cost_status::RuntimeUsageMissingReason::default(),
             source_id: format!("auto-router:{source_prefix}-drop"),
             route,
         }],
@@ -9003,10 +9015,10 @@ async fn terminal_settlement_preserves_late_sink_receipts_during_pending_request
     .context("terminal cleanup did not reach its blocked append")?;
     let route = crate::cost_status::EffectiveRouteEnvelope::capture(
         None,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek",
         "deepseek-v4-flash",
-        Some(ApiProvider::Deepseek.default_base_url()),
+        Some(ProviderKind::Deepseek.provider().default_base_url()),
         Utc::now(),
     );
     crate::cost_status::report_effective_route_for_runtime(
@@ -9093,6 +9105,7 @@ async fn monitor_deduplicates_sink_and_metadata_and_persists_metadata_only_missi
     batch
         .drop_records
         .push(crate::cost_status::RuntimeUsageDropRecord {
+            reason: crate::cost_status::RuntimeUsageMissingReason::default(),
             source_id: "metadata-only-missing-response".to_string(),
             route: batch.records[0].usage.route.clone(),
         });
@@ -9197,8 +9210,8 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
         .send(EngineEvent::RouteDispatched {
             turn_id: "engine_route_receipt".to_string(),
             route: crate::core::events::TurnRoute {
-                provider: ApiProvider::Stepfun,
-                provider_identity: "stepfun-payg-primary".to_string(),
+                provider: ProviderKind::Stepfun,
+                provider_identity: "stepfun".to_string(),
                 model: "step-3.7-flash".to_string(),
                 auto_model: false,
                 receipt: None,
@@ -9210,7 +9223,10 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
                     billing_mode: crate::cost_status::RouteBillingMode::Metered,
                     dispatched_at,
                 }),
-                base_url: ApiProvider::Stepfun.default_base_url().to_string(),
+                base_url: ProviderKind::Stepfun
+                    .provider()
+                    .default_base_url()
+                    .to_string(),
                 billing_product: crate::route_billing::RouteProduct::Unproven,
             },
         })
@@ -9226,8 +9242,8 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
                 source_id: "response-child".to_string(),
                 route: Box::new(crate::cost_status::EffectiveRouteEnvelope {
                     openrouter_vendor: None,
-                    provider: ApiProvider::OpenaiCodex,
-                    provider_identity: "codex-child".to_string(),
+                    provider: ProviderKind::OpenaiCodex,
+                    provider_identity: "openai-codex".to_string(),
                     model: "gpt-5.5".to_string(),
                     billing_surface: Some(
                         crate::pricing::OAUTH_SUBSCRIPTION_BILLING_SURFACE.to_string(),
@@ -9310,10 +9326,7 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
 
     let completed = wait_for_terminal_turn(&manager, &turn.id).await?;
     assert_eq!(completed.effective_provider.as_deref(), Some("stepfun"));
-    assert_eq!(
-        completed.effective_provider_id.as_deref(),
-        Some("stepfun-payg-primary")
-    );
+    assert_eq!(completed.effective_provider_id.as_deref(), Some("stepfun"));
     assert_eq!(
         completed.effective_billing_surface.as_deref(),
         Some(crate::pricing::STEPFUN_PAYG_BILLING_SURFACE)
@@ -9378,8 +9391,8 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
                 source_id: "response-child-second".to_string(),
                 route: Box::new(crate::cost_status::EffectiveRouteEnvelope {
                     openrouter_vendor: None,
-                    provider: ApiProvider::OpenaiCodex,
-                    provider_identity: "codex-child".to_string(),
+                    provider: ProviderKind::OpenaiCodex,
+                    provider_identity: "openai-codex".to_string(),
                     model: "gpt-5.5".to_string(),
                     billing_surface: Some(
                         crate::pricing::OAUTH_SUBSCRIPTION_BILLING_SURFACE.to_string(),
@@ -9496,8 +9509,11 @@ async fn monitor_persists_request_snapshots_and_matching_terminal_diagnostics() 
         );
     terminal_request.terminal = Some(crate::tool_inspection::TurnStopDiagnostics {
         model_requests_started: 2,
+        transport_retries: 3,
         transparent_stream_retries: 1,
         stream_resumes: 1,
+        reasoning_only_reprompts: 2,
+        empty_stop_retries: 1,
         ..Default::default()
     });
     harness
@@ -9523,9 +9539,13 @@ async fn monitor_persists_request_snapshots_and_matching_terminal_diagnostics() 
     assert_eq!(
         completed.model_request_diagnostics,
         Some(RuntimeTurnRequestDiagnostics {
+            stop_reason: None,
             model_requests_started: 2,
+            transport_retries: 3,
             transparent_stream_retries: 1,
             stream_resumes: 1,
+            reasoning_only_reprompts: 2,
+            empty_stop_retries: 1,
         }),
         "terminal model-client facts must be kept distinct from status items"
     );
@@ -10222,6 +10242,7 @@ async fn workspace_restore_guard_rejects_overlapping_active_turns() -> Result<()
         let mut active = manager.active.lock().await;
         let state = active.engines.get_mut(&thread.id).expect("mock engine");
         state.active_turn = Some(ActiveTurnState {
+            narrowing: crate::core::engine::TurnNarrowing::Inherit,
             goal_progress: None,
             goal_id: None,
             turn_id: "turn_live".to_string(),
@@ -10292,6 +10313,7 @@ async fn update_thread_workspace_rejects_active_turn() -> Result<()> {
         let mut active = manager.active.lock().await;
         let state = active.engines.get_mut(&thread.id).expect("mock engine");
         state.active_turn = Some(ActiveTurnState {
+            narrowing: crate::core::engine::TurnNarrowing::Inherit,
             goal_progress: None,
             goal_id: None,
             turn_id: "turn_live".to_string(),
@@ -15003,6 +15025,117 @@ async fn terminal_turn_cancels_pending_dynamic_tool_exactly_once() -> Result<()>
 /// decision. It must never be sequenced after `approval.decided`, where it
 /// reads as a live claim that the (already answered) call is still waiting.
 #[tokio::test]
+async fn engine_withdrawal_retires_approval_and_unblocks_queued_events() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "run extension".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
+    harness
+        .tx_event
+        .send(EngineEvent::TurnStarted {
+            turn_id: "engine_withdrawal".to_string(),
+            created_at: Utc::now(),
+            route: None,
+            submission_id: None,
+        })
+        .await?;
+    let request = |id: &str| EngineEvent::ApprovalRequired {
+        id: id.to_string(),
+        tool_name: "exec_shell".to_string(),
+        description: "extension call".to_string(),
+        input: json!({"command": "echo example"}),
+        approval_key: format!("extension-key:{id}"),
+        approval_grouping_key: "extension-group".to_string(),
+        intent_summary: None,
+        approval_force_prompt: true,
+    };
+    harness.tx_event.send(request("ext-1.1")).await?;
+    let withdrawn_id = await_approval_identity(&manager, &thread.id, "ext-1.1").await?;
+
+    // An unrelated event ahead of withdrawal must not park the event pump.
+    harness
+        .tx_event
+        .send(EngineEvent::MessageStarted { index: 0 })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::MessageDelta {
+            index: 0,
+            content: "continued".into(),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::ApprovalWithdrawn {
+            id: "ext-1.1".into(),
+        })
+        .await?;
+    harness.tx_event.send(request("ext-1.2")).await?;
+    let next_id = await_approval_identity(&manager, &thread.id, "ext-1.2").await?;
+    assert_ne!(withdrawn_id, next_id);
+    assert!(
+        !manager.deliver_external_approval(
+            &withdrawn_id,
+            ExternalApprovalDecision::Allow { remember: true },
+        ),
+        "withdrawal removes the capability before any late allow can create a grant"
+    );
+    let detail = manager.get_thread_detail(&thread.id).await?;
+    assert_eq!(detail.pending_approvals.len(), 1);
+    assert_eq!(detail.pending_approvals[0].id, next_id);
+    assert!(detail.approval_grants.is_empty());
+    assert!(
+        manager.deliver_external_approval(
+            &next_id,
+            ExternalApprovalDecision::Deny { remember: false }
+        )
+    );
+    assert_eq!(
+        harness.recv_approval_event().await,
+        Some(MockApprovalEvent::Denied {
+            id: "ext-1.2".into()
+        }),
+        "withdrawal itself never dispatches a fabricated user decision"
+    );
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    wait_for_terminal_turn(&manager, &turn.id).await?;
+    assert!(manager.events_since(&thread.id, None)?.iter().any(|event| {
+        event.event == "approval.decided"
+            && event.payload["approval_id"] == withdrawn_id
+            && event.payload["tool_call_id"] == "ext-1.1"
+            && event.payload["cancelled"] == true
+            && event.payload["remember"] == false
+    }));
+    assert_eq!(manager.pending_approvals_count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn approval_wait_heartbeat_is_never_sequenced_after_the_decision() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
     let thread = manager
@@ -18732,10 +18865,12 @@ mod runtime_image_inputs {
             ..Config::default()
         }
         .with_legacy_root(Some("synthetic-image-fixture-key".into()), None);
-        config.set_provider_model_override(
-            ApiProvider::Deepseek,
-            Some("deepseek-v4-flash-vision-exp".into()),
-        );
+        config
+            .set_provider_model_override(
+                &config.test_identity_for_kind(ProviderKind::Deepseek),
+                Some("deepseek-v4-flash-vision-exp".into()),
+            )
+            .unwrap();
         config.set_feature("mcp", false).unwrap();
         config.set_feature("subagents", false).unwrap();
         config
@@ -19517,6 +19652,7 @@ async fn shell_opt_in_is_idle_only_and_preserves_ask() -> Result<()> {
         .get_mut(&thread.id)
         .unwrap()
         .active_turn = Some(ActiveTurnState {
+        narrowing: crate::core::engine::TurnNarrowing::Inherit,
         goal_progress: None,
         goal_id: None,
         turn_id: "turn_shell_guard".into(),
@@ -19581,6 +19717,7 @@ async fn shell_opt_in_is_idle_only_and_preserves_ask() -> Result<()> {
         .get_mut(&thread.id)
         .unwrap()
         .active_turn = Some(ActiveTurnState {
+        narrowing: crate::core::engine::TurnNarrowing::Inherit,
         goal_progress: None,
         goal_id: None,
         turn_id: "turn_revoke".into(),
@@ -21253,15 +21390,19 @@ async fn runtime_tool_completion_fires_after_and_error_hooks() -> Result<()> {
     fire_runtime_tool_completion_hooks(
         &hooks,
         "thr_1",
+        "turn-1",
         "call-ok",
         "exec_command",
+        None,
         &Ok(crate::tools::spec::ToolResult::success("fine")),
     );
     fire_runtime_tool_completion_hooks(
         &hooks,
         "thr_1",
+        "turn-1",
         "call-bad",
         "exec_command",
+        None,
         &Ok(crate::tools::spec::ToolResult::error("exit 1")),
     );
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -21955,9 +22096,17 @@ async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Re
     ];
     for (id, input) in cases {
         let result = crate::tools::shell::LowercaseBashTool
-            .execute(input, &context)
+            .execute(input.clone(), &context)
             .await;
-        fire_runtime_tool_completion_hooks(&hooks, "thr_1", id, "bash", &result);
+        fire_runtime_tool_completion_hooks(
+            &hooks,
+            "thr_1",
+            "turn-1",
+            id,
+            "bash",
+            Some(&input),
+            &result,
+        );
     }
     let read_lines = |path: &std::path::Path| {
         let mut lines = std::fs::read_to_string(path)
@@ -22434,4 +22583,174 @@ async fn decision_receipt_lease_persists_terminal_turn_and_replays_exactly_once(
     );
     assert!(!serde_json::to_string(&reloaded)?.contains("raw-runtime-decision-id"));
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn control_owner_capture_uses_held_lease_and_new_generation_after_restart() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("runtime");
+    let manager = test_manager(path.clone())?;
+    let (binding, generation) = manager.capture_control_owner()?;
+    assert_eq!(binding, manager.session_store_binding());
+    assert!(!generation.is_empty());
+    assert_eq!(manager.capture_control_owner()?.1, generation);
+    let lock = binding.data_dir.join(RUNTIME_PROCESS_OWNER_LOCK_FILE);
+    let retained = binding.data_dir.join("retained-owner.lock");
+    fs::rename(&lock, &retained)?;
+    fs::write(&lock, b"replacement")?;
+    assert!(manager.capture_control_owner().is_err());
+    fs::remove_file(&lock)?;
+    fs::rename(&retained, &lock)?;
+    drop(manager);
+    let restarted = test_manager(path)?;
+    assert_ne!(restarted.capture_control_owner()?.1, generation);
+    assert_eq!(restarted.capture_control_owner()?.0, binding);
+    Ok(())
+}
+
+#[test]
+fn ordinary_terminal_request_facts_omit_private_acp_stop_projection() {
+    let facts = RuntimeTurnRequestDiagnostics {
+        stop_reason: None,
+        model_requests_started: 2,
+        transport_retries: 0,
+        transparent_stream_retries: 1,
+        stream_resumes: 0,
+        reasoning_only_reprompts: 0,
+        empty_stop_retries: 0,
+    };
+    let json = serde_json::to_value(facts).unwrap();
+    assert!(json.get("stopReason").is_none());
+    assert_eq!(
+        serde_json::from_value::<RuntimeTurnRequestDiagnostics>(json).unwrap(),
+        facts
+    );
+}
+#[test]
+fn acp_typed_stop_projection_preserves_every_core_reason() {
+    use crate::tool_inspection::{TurnStopDiagnostics, TurnStopReason};
+    for (reason, expected) in [
+        (
+            TurnStopReason::ProviderNoToolCall,
+            RuntimeTurnStopReason::ProviderNoToolCall,
+        ),
+        (
+            TurnStopReason::ProviderToolCallMissing,
+            RuntimeTurnStopReason::ProviderToolCallMissing,
+        ),
+        (
+            TurnStopReason::StepBudgetExhausted,
+            RuntimeTurnStopReason::StepBudgetExhausted,
+        ),
+        (
+            TurnStopReason::NoProgress,
+            RuntimeTurnStopReason::NoProgress,
+        ),
+        (
+            TurnStopReason::Interrupted,
+            RuntimeTurnStopReason::Interrupted,
+        ),
+        (TurnStopReason::Failed, RuntimeTurnStopReason::Failed),
+    ] {
+        let facts = RuntimeTurnRequestDiagnostics::from(&TurnStopDiagnostics {
+            reason: Some(reason),
+            ..Default::default()
+        });
+        assert_eq!(facts.stop_reason, Some(expected));
+    }
+}
+
+#[test]
+fn durable_turn_unknown_drop_promotes_exact_source_once_without_erasing_other_gap() {
+    let mut turn = sample_turn("thread", "turn", RuntimeTurnStatus::Completed);
+    let route = EffectiveRouteEnvelope::capture(
+        None,
+        ProviderKind::Deepseek,
+        "deepseek",
+        "deepseek-v4-flash",
+        Some("https://api.deepseek.com/v1"),
+        Utc::now(),
+    );
+    for source in ["late-response", "still-unknown"] {
+        assert!(append_routed_usage_drop_record(
+            &mut turn,
+            RuntimeUsageDropRecord {
+                reason: crate::cost_status::RuntimeUsageMissingReason::RequestOutcomeUnknown,
+                source_id: source.into(),
+                route: route.clone(),
+            }
+        ));
+    }
+    let mut restored: TurnRecord =
+        serde_json::from_slice(&serde_json::to_vec(&turn).unwrap()).unwrap();
+    assert!(
+        restored
+            .routed_usage_drop_records
+            .iter()
+            .all(|record| record.reason
+                == crate::cost_status::RuntimeUsageMissingReason::RequestOutcomeUnknown)
+    );
+    let usage = Usage {
+        input_tokens: 17,
+        output_tokens: 3,
+        ..Default::default()
+    };
+    let mut changed = route.clone();
+    changed.model = "different-model".into();
+    assert!(!append_routed_usage_record(
+        &mut restored,
+        "late-response",
+        EffectiveRouteUsage {
+            route: changed,
+            usage: usage.clone()
+        }
+    ));
+    assert!(append_routed_usage_record(
+        &mut restored,
+        "late-response",
+        EffectiveRouteUsage {
+            route: route.clone(),
+            usage: usage.clone()
+        }
+    ));
+    assert!(!append_routed_usage_record(
+        &mut restored,
+        "late-response",
+        EffectiveRouteUsage { route, usage }
+    ));
+    assert_eq!(restored.routed_usage.len(), 1);
+    assert_eq!(restored.routed_usage_drop_records.len(), 1);
+    assert_eq!(restored.routed_usage_source_ids.len(), 2);
+    assert_eq!(
+        restored.routed_usage_drop_records[0].source_id,
+        routed_usage_source_fingerprint("still-unknown")
+    );
+}
+
+#[test]
+fn runtime_transport_retry_counts_default_old_bytes_and_preserve_new_receipts() {
+    let old = serde_json::json!({"modelRequestsStarted":2,"transparentStreamRetries":1,"streamResumes":0});
+    let facts: RuntimeTurnRequestDiagnostics = serde_json::from_value(old).unwrap();
+    assert_eq!(facts.transport_retries, 0);
+    assert_eq!(facts.reasoning_only_reprompts, 0);
+    assert_eq!(facts.empty_stop_retries, 0);
+    let facts = RuntimeTurnRequestDiagnostics::from(&crate::tool_inspection::TurnStopDiagnostics {
+        model_requests_started: 2,
+        transport_retries: 3,
+        reasoning_only_reprompts: 2,
+        empty_stop_retries: 1,
+        ..Default::default()
+    });
+    assert_eq!(facts.transport_retries, 3);
+    assert_eq!(facts.reasoning_only_reprompts, 2);
+    assert_eq!(facts.empty_stop_retries, 1);
+    let encoded = serde_json::to_value(facts).unwrap();
+    assert_eq!(encoded["transportRetries"], 3);
+    assert_eq!(encoded["reasoningOnlyReprompts"], 2);
+    assert_eq!(encoded["emptyStopRetries"], 1);
+    assert_eq!(
+        serde_json::from_value::<RuntimeTurnRequestDiagnostics>(encoded).unwrap(),
+        facts
+    );
 }

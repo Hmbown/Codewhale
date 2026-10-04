@@ -415,7 +415,43 @@ fn show_bundle(
     if let Some(report) = crate::extension_host::owner_report(&detail.id) {
         append_host_owner_report(presentation, &mut output, &report);
     }
+    // What the user configured for the plugin is data its code will read, so
+    // it is part of what `/plugin show` puts in front of them (keys only: a
+    // value can be anything, including something they would rather not echo).
+    if let Some(summary) = crate::extension_host::plugin_config_summary(&detail.name) {
+        append_plugin_config_summary(&mut output, &detail.name, &summary);
+    }
     CommandResult::message(output)
+}
+
+/// The `[plugins."<name>".config]` line of `/plugin show`: the configured
+/// keys, never the values, or why the config is refused. Every part is escaped.
+fn append_plugin_config_summary(
+    output: &mut String,
+    plugin_name: &str,
+    summary: &Result<Vec<String>, String>,
+) {
+    let name = escape_review_text(plugin_name);
+    match summary {
+        Ok(keys) => {
+            let keys = keys
+                .iter()
+                .map(|key| escape_review_text(key))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(
+                output,
+                "\n  config from [plugins.\"{name}\".config] in your config.toml (values not shown): {keys}"
+            );
+        }
+        Err(reason) => {
+            let _ = write!(
+                output,
+                "\n  config from [plugins.\"{name}\".config] is refused: {}",
+                escape_review_text(reason)
+            );
+        }
+    }
 }
 
 fn append_host_owner_report(

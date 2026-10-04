@@ -4,7 +4,7 @@
 //! tools can resolve and normalize reasoning effort without depending on
 //! presentation types.
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::work_graph::ReasoningEffortTier;
 
 /// Reasoning-effort tier, mirrored across DeepSeek and Codex effort pickers.
@@ -146,7 +146,7 @@ impl ReasoningEffort {
     }
 
     #[must_use]
-    pub fn from_setting_for_provider(value: &str, provider: ApiProvider) -> Self {
+    pub fn from_setting_for_provider(value: &str, provider: ProviderKind) -> Self {
         Self::from_setting(value).normalize_for_provider(provider)
     }
 
@@ -184,20 +184,20 @@ impl ReasoningEffort {
 
     /// Provider-facing label for user-visible surfaces.
     #[must_use]
-    pub fn display_label_for_provider(self, provider: ApiProvider) -> &'static str {
+    pub fn display_label_for_provider(self, provider: ProviderKind) -> &'static str {
         match (provider, self.normalize_for_provider(provider)) {
-            (ApiProvider::OpenaiCodex, Self::Minimal) => "low",
-            (ApiProvider::OpenaiCodex, Self::Low) => "low",
-            (ApiProvider::OpenaiCodex, Self::Medium) => "medium",
-            (ApiProvider::OpenaiCodex, Self::High) => "high",
+            (ProviderKind::OpenaiCodex, Self::Minimal) => "low",
+            (ProviderKind::OpenaiCodex, Self::Low) => "low",
+            (ProviderKind::OpenaiCodex, Self::Medium) => "medium",
+            (ProviderKind::OpenaiCodex, Self::High) => "high",
             // `xhigh`, `max` and `ultra` are three distinct rungs the Codex
             // roster publishes per model; collapsing them onto "xhigh" dates
             // from when xhigh was the ceiling and made the top tiers
             // unreachable and indistinguishable.
-            (ApiProvider::OpenaiCodex, Self::XHigh) => "xhigh",
-            (ApiProvider::OpenaiCodex, Self::Ultra) => "ultra",
-            (ApiProvider::OpenaiCodex, Self::Max) => "max",
-            (ApiProvider::Xai, Self::XHigh) => "xhigh",
+            (ProviderKind::OpenaiCodex, Self::XHigh) => "xhigh",
+            (ProviderKind::OpenaiCodex, Self::Ultra) => "ultra",
+            (ProviderKind::OpenaiCodex, Self::Max) => "max",
+            (ProviderKind::Xai, Self::XHigh) => "xhigh",
             (_, effort) => effort.short_label(),
         }
     }
@@ -211,8 +211,8 @@ impl ReasoningEffort {
     }
 
     #[must_use]
-    pub fn normalize_for_provider(self, provider: ApiProvider) -> Self {
-        if provider != ApiProvider::OpenaiCodex {
+    pub fn normalize_for_provider(self, provider: ProviderKind) -> Self {
+        if provider != ProviderKind::OpenaiCodex {
             return self;
         }
         match self {
@@ -237,7 +237,7 @@ impl ReasoningEffort {
     #[must_use]
     pub fn normalize_for_route(
         self,
-        provider: ApiProvider,
+        provider: ProviderKind,
         base_url: &str,
         wire_model: &str,
     ) -> Self {
@@ -255,7 +255,7 @@ impl ReasoningEffort {
                 other => other,
             };
         }
-        if provider == ApiProvider::OpenaiCodex {
+        if provider == ProviderKind::OpenaiCodex {
             return normalized;
         }
         // First-party DeepSeek routes document `reasoning_effort` low/high/max
@@ -264,7 +264,7 @@ impl ReasoningEffort {
         // dialect has no such value (#52). `minimal`, `xhigh`, and `ultra`
         // collapse exactly as `client::deepseek_effort` sends them, so the
         // effective tier names what the wire receives (#6650).
-        if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+        if matches!(provider, ProviderKind::Deepseek) {
             return match normalized {
                 Self::Minimal => Self::Low,
                 Self::Medium | Self::XHigh => Self::High,
@@ -276,7 +276,7 @@ impl ReasoningEffort {
         // documents the complete none/low/medium/high/max ladder. Keep every
         // real tier distinct for normal turns; only Codewhale-only synonyms
         // are folded onto the nearest documented spelling.
-        if provider == ApiProvider::OllamaCloud {
+        if provider == ProviderKind::OllamaCloud {
             return match normalized {
                 Self::Minimal => Self::Low,
                 Self::XHigh | Self::Ultra => Self::Max,
@@ -292,7 +292,7 @@ impl ReasoningEffort {
         }
     }
 
-    pub fn catalog_default(provider: ApiProvider, wire_model: &str) -> Option<Self> {
+    pub fn catalog_default(provider: ProviderKind, wire_model: &str) -> Option<Self> {
         let offering = crate::provider_lake::catalog_offering_for_model(provider, wire_model)?;
         offering.reasoning_options.iter().find_map(|option| {
             option
@@ -306,7 +306,7 @@ impl ReasoningEffort {
         })
     }
 
-    pub fn catalog_effort_values(provider: ApiProvider, wire_model: &str) -> Option<Vec<Self>> {
+    pub fn catalog_effort_values(provider: ProviderKind, wire_model: &str) -> Option<Vec<Self>> {
         let offering = crate::provider_lake::catalog_offering_for_model(provider, wire_model)?;
         let mut efforts = Vec::new();
         let mut has_toggle = false;
@@ -355,7 +355,7 @@ impl ReasoningEffort {
 
     fn clamp_to_catalog_efforts(
         normalized: Self,
-        provider: ApiProvider,
+        provider: ProviderKind,
         wire_model: &str,
         values: &[Self],
     ) -> Self {
@@ -376,8 +376,8 @@ impl ReasoningEffort {
     }
 
     #[must_use]
-    pub fn api_value_for_provider(self, provider: ApiProvider) -> Option<&'static str> {
-        if provider != ApiProvider::OpenaiCodex {
+    pub fn api_value_for_provider(self, provider: ProviderKind) -> Option<&'static str> {
+        if provider != ProviderKind::OpenaiCodex {
             return self.api_value();
         }
         Some(match self.normalize_for_provider(provider) {
@@ -397,7 +397,7 @@ impl ReasoningEffort {
     #[must_use]
     pub fn api_value_for_route(
         self,
-        provider: ApiProvider,
+        provider: ProviderKind,
         base_url: &str,
         wire_model: &str,
     ) -> Option<&'static str> {
@@ -406,7 +406,7 @@ impl ReasoningEffort {
     }
 
     #[must_use]
-    pub fn as_setting_for_provider(self, provider: ApiProvider) -> &'static str {
+    pub fn as_setting_for_provider(self, provider: ProviderKind) -> &'static str {
         self.api_value_for_provider(provider)
             .unwrap_or_else(|| self.as_setting())
     }
@@ -415,7 +415,7 @@ impl ReasoningEffort {
     #[must_use]
     pub fn as_setting_for_route(
         self,
-        provider: ApiProvider,
+        provider: ProviderKind,
         base_url: &str,
         wire_model: &str,
     ) -> &'static str {

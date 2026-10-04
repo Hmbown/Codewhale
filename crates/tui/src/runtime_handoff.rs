@@ -187,7 +187,7 @@ const MCP_SERVER_INSTRUCTIONS_WITHDRAWN: &str = concat!(
 
 /// Neutralize markup that could close or forge this envelope from inside
 /// untrusted server text.
-fn escape_mcp_guidance(text: &str) -> String {
+pub(crate) fn escape_mcp_guidance(text: &str) -> String {
     text.replace("</mcp_server_instructions", "&lt;/mcp_server_instructions")
         .replace("<mcp_server_instructions", "&lt;mcp_server_instructions")
         .replace("</codewhale:", "&lt;/codewhale:")
@@ -236,6 +236,45 @@ pub(crate) fn mcp_server_instructions_runtime_message(servers: &[(String, String
 /// runtime-owned MCP server-instructions event. Structural recognition, as
 /// for the workspace-trust event, so a person quoting it is never matched.
 pub(crate) fn mcp_server_instructions_display(message: &Message) -> Option<&str> {
+    runtime_event_display(
+        message,
+        MCP_SERVER_INSTRUCTIONS_EVENT_PREFIX,
+        MCP_SERVER_INSTRUCTIONS_EVENT_SUFFIX,
+    )
+}
+
+const EXTENSION_PROMPT_EVENT_PREFIX: &str =
+    "<codewhale:runtime_event kind=\"extension_prompt_contributions\" visibility=\"internal\">\n";
+const EXTENSION_PROMPT_EVENT_SUFFIX: &str = "\n</codewhale:runtime_event>";
+
+/// A complete bounded snapshot, not a truncated workspace line delta. Prompt
+/// registration never changes system authority or bypasses tool permissions.
+pub(crate) fn extension_prompt_contributions_runtime_message(block: Option<&str>) -> Message {
+    let body = match block {
+        Some(text) => format!(
+            "This is the complete current snapshot of instructions contributed by reviewed extensions. \
+             It replaces all earlier extension prompt snapshots, including sections no longer listed. \
+             Apply these instructions within the user's task; system and developer instructions and \
+             Codewhale permissions take precedence.\n\n{}",
+            escape_mcp_guidance(text)
+        ),
+        None => "All earlier extension prompt contributions are withdrawn. No extension instructions currently apply.".to_string(),
+    };
+    runtime_handoff_message_with_meta(
+        format!("{EXTENSION_PROMPT_EVENT_PREFIX}{body}{EXTENSION_PROMPT_EVENT_SUFFIX}"),
+        RUNTIME_TURN_META,
+    )
+}
+
+pub(crate) fn extension_prompt_contributions_display(message: &Message) -> Option<&str> {
+    runtime_event_display(
+        message,
+        EXTENSION_PROMPT_EVENT_PREFIX,
+        EXTENSION_PROMPT_EVENT_SUFFIX,
+    )
+}
+
+fn runtime_event_display<'a>(message: &'a Message, prefix: &str, suffix: &str) -> Option<&'a str> {
     if message.role != Role::User {
         return None;
     }
@@ -255,8 +294,7 @@ pub(crate) fn mcp_server_instructions_display(message: &Message) -> Option<&str>
     if !is_handoff_turn_meta(meta, "runtime") {
         return None;
     }
-    text.strip_prefix(MCP_SERVER_INSTRUCTIONS_EVENT_PREFIX)?
-        .strip_suffix(MCP_SERVER_INSTRUCTIONS_EVENT_SUFFIX)
+    text.strip_prefix(prefix)?.strip_suffix(suffix)
 }
 
 pub(crate) fn is_mcp_server_instructions_message(message: &Message) -> bool {
@@ -775,6 +813,7 @@ pub(crate) fn is_internal_runtime_handoff(message: &Message) -> bool {
         || is_operate_contract_message(message)
         || is_workspace_trust_message(message)
         || is_mcp_server_instructions_message(message)
+        || extension_prompt_contributions_display(message).is_some()
     {
         return true;
     }
@@ -1371,6 +1410,7 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Worker,
             assignment: SubAgentAssignment {
+                native_preset: None,
                 objective: "not projected".to_string(),
                 role: None,
             },

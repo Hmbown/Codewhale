@@ -16,6 +16,8 @@ use uuid::Uuid;
 
 mod command_catalog;
 mod headless_catalog;
+#[cfg(any(unix, windows))]
+mod runtime_store_convergence;
 mod workspace_instructions;
 
 /// Scale a wait budget for shared CI runners.
@@ -161,6 +163,7 @@ async fn http_and_web_server_thread_manager_installs_configured_workshop_byte_bu
         RuntimeThreadManagerConfig {
             data_dir: temp.path().join("runtime"),
             task_data_dir: temp.path().join("tasks"),
+            sessions_dir: None,
             max_active_threads: 2,
         },
         Arc::new(crate::plugins::PluginRegistry::empty(&workspace)),
@@ -980,6 +983,10 @@ async fn spawn_test_server_with_root_token_mobile_workspace(
 
 #[derive(Default)]
 struct TestServerOverrides {
+    /// Publish the exact manager using the production owner/frontend factory.
+    owner_socket: Option<PathBuf>,
+    /// Capture the actual owner's service table for cache/lifetime assertions.
+    workspace_scopes_handle: Option<oneshot::Sender<Arc<RuntimeWorkspaceScopes>>>,
     sub_agent_manager: Option<SharedSubAgentManager>,
     fleet_codewhale_binary: Option<String>,
     config: Option<Config>,
@@ -1141,7 +1148,7 @@ fn spawn_product_stack_server(
                 )
                 .await
                 {
-                    Ok(Some((listener, app, addr, runtime_threads))) => {
+                    Ok(Some((listener, app, addr, runtime_threads, owner_frontend))) => {
                         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
                         if setup_tx
                             .send(Ok(Some((addr, runtime_threads, shutdown_tx))))
@@ -1155,9 +1162,30 @@ fn spawn_product_stack_server(
                             .expect("nonblocking test listener");
                         let listener =
                             TcpListener::from_std(listener).expect("register test listener");
+                        // Stop the owner the way the product does: trigger its
+                        // shutdown and await it while this runtime is alive, so
+                        // the owner receipt is retired before the thread exits.
+                        let owner_handle =
+                            owner_frontend.as_ref().map(|owner| owner.shutdown_handle());
+                        let mut owner_task =
+                            owner_frontend.map(|owner| tokio::spawn(owner.serve()));
                         tokio::select! {
                             _ = serve_runtime_api(listener, app, shutdown) => {}
                             _ = shutdown_rx => {}
+                            _ = async {
+                                match owner_task.as_mut() {
+                                    Some(task) => { let _ = task.await; }
+                                    None => std::future::pending::<()>().await,
+                                }
+                            } => {
+                                owner_task = None;
+                            }
+                        }
+                        if let Some(handle) = owner_handle {
+                            handle.trigger();
+                        }
+                        if let Some(task) = owner_task {
+                            let _ = task.await;
                         }
                     }
                     Ok(None) => {
@@ -1188,6 +1216,7 @@ async fn build_test_server(
         axum::Router,
         SocketAddr,
         SharedRuntimeThreadManager,
+        Option<codewhale_app_server::daemon_socket::DaemonSocket>,
     )>,
 > {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1230,9 +1259,11 @@ async fn build_test_server(
         RuntimeThreadManagerConfig {
             data_dir: root.join("runtime/runtime"),
             task_data_dir: root.join("runtime"),
+            sessions_dir: Some(sessions_dir.clone()),
             max_active_threads: overrides.max_active_threads.unwrap_or(8),
         },
     )?);
+    let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
     runtime_threads.attach_task_manager(manager.clone());
     let automations = Arc::new(Mutex::new(AutomationManager::open_for_test(
         root.join("automations"),
@@ -1266,6 +1297,15 @@ async fn build_test_server(
     } else {
         Arc::new(parking_lot::RwLock::new(config))
     };
+    let workspace_scopes =
+        RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
+    let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
+    if let Some(sender) = overrides.workspace_scopes_handle {
+        let _ = sender.send(workspace_scopes.clone());
+    }
+    if let Some(manager) = overrides.lsp_manager {
+        let _ = workspace_scope.lsp.set(manager);
+    }
     let state = RuntimeApiState {
         config,
         workspace,
@@ -1278,7 +1318,8 @@ async fn build_test_server(
         sessions_dir,
         config_path: overrides.config_path.clone(),
         config_profile: overrides.config_profile,
-        mcp_pool: Arc::new(Mutex::new(None)),
+        workspace_scopes,
+        workspace_scope,
         automations,
         sub_agent_manager,
         runtime_token,
@@ -1294,21 +1335,31 @@ async fn build_test_server(
         fleet_codewhale_binary: overrides
             .fleet_codewhale_binary
             .unwrap_or_else(configured_codewhale_binary),
-        lsp_manager: {
-            let cell = std::sync::OnceLock::new();
-            if let Some(manager) = overrides.lsp_manager {
-                let _ = cell.set(manager);
-            }
-            Arc::new(cell)
-        },
         computer: super::computer_display::ComputerState::from_env(),
         shutdown: overrides.shutdown.clone().unwrap_or_default(),
         git_writes: Arc::new(tokio::sync::Mutex::new(())),
         provider_switches: Arc::new(tokio::sync::Mutex::new(())),
         compat_stream_test_hook: overrides.compat_stream_test_hook,
     };
-    let app = build_router(state);
-    Ok(Some((listener, app, addr, runtime_threads)))
+    let (owner_frontend, compatibility) = if let Some(socket) = overrides.owner_socket {
+        let model = runtime_request_model(&state.config.read(), None)
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        let (owner, compatibility) =
+            bind_captured_runtime_frontends(&state, Some(socket), model, 1, false).await?;
+        (Some(owner), Some(compatibility))
+    } else {
+        (None, None)
+    };
+    let mut app = build_router(state.clone());
+    if let Some(compatibility) = compatibility {
+        app = app.merge(codewhale_app_server::runtime_compatibility_router(
+            compatibility,
+            &state.cors_origins,
+            state.runtime_token.clone(),
+            Some(state.workspace.clone()),
+        ));
+    }
+    Ok(Some((listener, app, addr, runtime_threads, owner_frontend)))
 }
 
 async fn spawn_test_server() -> Result<
@@ -2872,6 +2923,9 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
             note: "not reported".to_string(),
         },
         usage_source_fingerprints: Default::default(),
+        missing_usage_sources: Default::default(),
+        missing_usage_overflowed: false,
+        legacy_unreported_usage: false,
         has_unreported_usage: false,
         delivery_evidence: Default::default(),
         verification: AgentRunVerificationSummary {
@@ -9471,8 +9525,8 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
         routed_usage: vec![crate::cost_status::EffectiveRouteUsage {
             route: crate::cost_status::EffectiveRouteEnvelope {
                 openrouter_vendor: None,
-                provider: ApiProvider::Deepseek,
-                provider_identity: ApiProvider::Deepseek.as_str().to_string(),
+                provider: ProviderKind::Deepseek,
+                provider_identity: ProviderKind::Deepseek.as_str().to_string(),
                 model: "deepseek-v4-flash".to_string(),
                 billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string()),
                 endpoint_fingerprint: None,
@@ -9500,8 +9554,8 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
     // Mirror `TurnRecord::persist_effective_route` (private to the runtime
     // threads module): persist the route envelope onto the turn so the
     // recorded-time pricer sees a complete dispatch record.
-    turn.effective_provider = Some(ApiProvider::Deepseek.as_str().to_string());
-    turn.effective_provider_id = Some(ApiProvider::Deepseek.as_str().to_string());
+    turn.effective_provider = Some(ProviderKind::Deepseek.as_str().to_string());
+    turn.effective_provider_id = Some(ProviderKind::Deepseek.as_str().to_string());
     turn.effective_billing_surface =
         Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string());
     turn.effective_endpoint_fingerprint = None;
@@ -9670,8 +9724,8 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
         routed_usage: vec![crate::cost_status::EffectiveRouteUsage {
             route: crate::cost_status::EffectiveRouteEnvelope {
                 openrouter_vendor: None,
-                provider: ApiProvider::Deepseek,
-                provider_identity: ApiProvider::Deepseek.as_str().to_string(),
+                provider: ProviderKind::Deepseek,
+                provider_identity: ProviderKind::Deepseek.as_str().to_string(),
                 model: "deepseek-v4-flash".to_string(),
                 billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string()),
                 endpoint_fingerprint: None,
@@ -9696,8 +9750,8 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
         workspace: None,
         workspace_snapshots: Vec::new(),
     };
-    turn.effective_provider = Some(ApiProvider::Openai.as_str().to_string());
-    turn.effective_provider_id = Some(ApiProvider::Openai.as_str().to_string());
+    turn.effective_provider = Some(ProviderKind::Openai.as_str().to_string());
+    turn.effective_provider_id = Some(ProviderKind::Openai.as_str().to_string());
     turn.effective_billing_surface = Some(crate::pricing::UNCLASSIFIED_BILLING_SURFACE.to_string());
     turn.effective_endpoint_fingerprint = None;
     turn.effective_billing_mode = Some(crate::cost_status::RouteBillingMode::Metered);
@@ -11660,9 +11714,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
 #[test]
 fn resolve_skills_dir_rejects_symlink_escaping_workspace() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _env_lock = crate::test_support::lock_test_env();
-    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
-    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+    let _home = crate::test_support::SealedHome::at(tmp.path());
     let workspace_root = tmp.path().join("workspace");
     let escape_target = tmp.path().join("escape_target");
     fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -11693,9 +11745,7 @@ fn resolve_skills_dir_rejects_symlink_escaping_workspace() {
 #[test]
 fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _env_lock = crate::test_support::lock_test_env();
-    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
-    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+    let _home = crate::test_support::SealedHome::at(tmp.path());
     let codewhale_only = Config {
         skills: Some(crate::config::SkillsConfig {
             scan_codewhale_only: Some(true),
@@ -11742,9 +11792,7 @@ fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
 #[test]
 fn resolve_skills_dir_rejects_codewhale_only_symlink_escaping_workspace() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _env_lock = crate::test_support::lock_test_env();
-    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
-    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+    let _home = crate::test_support::SealedHome::at(tmp.path());
     let workspace_root = tmp.path().join("workspace");
     let escape_target = tmp.path().join("escape_target");
     fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -12708,7 +12756,9 @@ async fn provider_catalog_and_switch_preserve_each_listed_route_identity() -> Re
             );
         }
     }
-    for invalid in ["deepseek-cn", "antigravity", "not-a-provider"] {
+    let legacy_alias = get_provider_models(&client, &addr, "deepseek-cn").await;
+    assert_eq!(legacy_alias["provider"], "deepseek-cn");
+    for invalid in ["deepseek-cn-unknown", "antigravity", "not-a-provider"] {
         let response = client
             .get(format!("http://{addr}/v1/providers/{invalid}/models"))
             .send()
@@ -12933,30 +12983,71 @@ async fn provider_models_expose_exact_image_input_facts_and_thread_selection_sta
 fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries() {
     let _lock = crate::test_support::lock_test_env();
     let root = tempfile::tempdir().unwrap();
-    let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", root.path());
-    let config = Config {
+    let canonical_home = root
+        .path()
+        .canonicalize()
+        .expect("canonical private fixture home");
+    let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", &canonical_home);
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &canonical_home);
+    let mut config = Config {
         provider: Some("openai-codex".to_string()),
         ..Config::default()
     };
-    let cache_path = root.path().join("models_cache.json");
-    let cache = json!({
-        "fetched_at": chrono::Utc::now(),
-        "models": [
-            {"slug": "gpt-6-astra", "supported_reasoning_levels": [
-                {"effort": "low"}, {"effort": "medium"}, {"effort": "high"},
-                {"effort": "xhigh"}, {"effort": "max"}, {"effort": "ultra"},
-                {"effort": "unexpected-private-value"}
-            ]},
-            {"slug": "gpt-5.5", "supported_reasoning_levels": [{"effort": "high"}, {"effort": "xhigh"}]},
-            {"slug": "no-reasoning", "supported_reasoning_levels": []},
-            {"slug": "optional-reasoning", "supported_reasoning_levels": [{"effort": "none"}, {"effort": "minimal"}, {"effort": "low"}]},
-            {"slug": "no-effort-metadata"},
-            {"slug": "unrecognized-efforts", "supported_reasoning_levels": [{"effort": "future-value"}]}
+    let access_token = crate::oauth::install_test_chatgpt_registration(&mut config).unwrap();
+    crate::codex_model_cache::install_test_chatgpt_roster_with_metadata(
+        &config,
+        [
+            (
+                "gpt-6-astra",
+                None,
+                vec![
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra",
+                    "unexpected-private-value",
+                ],
+            ),
+            ("gpt-5.5", None, vec!["high", "xhigh"]),
+            ("no-reasoning", Some(false), vec![]),
+            ("optional-reasoning", None, vec!["none", "minimal", "low"]),
+            ("no-effort-metadata", None, vec![]),
+            ("unrecognized-efforts", None, vec!["future-value"]),
         ]
-    });
-    fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
-    let astra =
-        provider_model_entry_for_api(&config, ApiProvider::OpenaiCodex, "gpt-6-astra".to_string());
+        .into_iter()
+        .map(
+            |(id, reasoning, efforts)| crate::codex_model_cache::CodexModelMetadata {
+                id: id.into(),
+                display_name: None,
+                context_window: None,
+                reasoning,
+                efforts: efforts.into_iter().map(str::to_string).collect(),
+            },
+        )
+        .collect(),
+    )
+    .unwrap();
+    // Locate the one snapshot actually created by the account-scoped helper;
+    // an external CODEX_HOME cache is not an account roster authority.
+    let catalog_path = crate::models_dev_live::cache_path().unwrap();
+    let snapshots: Vec<_> = fs::read_dir(catalog_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("chatgpt-plan-"))
+        })
+        .collect();
+    assert_eq!(snapshots.len(), 1);
+    let cache_path = &snapshots[0];
+    let astra = provider_model_entry_for_api(
+        &config,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+        "gpt-6-astra".to_string(),
+    );
     assert_eq!(
         astra.reasoning_effort,
         codewhale_config::route::CapabilityState::Supported
@@ -12965,7 +13056,7 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
         astra.reasoning_effort_levels,
         ["low", "medium", "high", "xhigh", "max", "ultra"]
     );
-    assert_eq!(astra.reasoning_effort_source, Some("codex_cli_cache"));
+    assert_eq!(astra.reasoning_effort_source, Some("chatgpt_plan_api"));
     // The relay preserves the same model facts without elevating them into
     // a tool-execution or account-entitlement receipt.
     let _token = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
@@ -12982,15 +13073,19 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
         relayed_astra["reasoningEffortLevels"],
         json!(astra.reasoning_effort_levels)
     );
-    assert_eq!(relayed_astra["reasoningEffortSource"], "codex_cli_cache");
+    assert_eq!(relayed_astra["reasoningEffortSource"], "chatgpt_plan_api");
     assert_eq!(relay["runtime"]["capabilities"]["tool_execution"], false);
     assert!(!relay.to_string().contains("test-token"));
-    let older =
-        provider_model_entry_for_api(&config, ApiProvider::OpenaiCodex, "gpt-5.5".to_string());
+    assert!(!relay.to_string().contains(&access_token));
+    let older = provider_model_entry_for_api(
+        &config,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+        "gpt-5.5".to_string(),
+    );
     assert_eq!(older.reasoning_effort_levels, ["high", "xhigh"]);
     let unsupported = provider_model_entry_for_api(
         &config,
-        ApiProvider::OpenaiCodex,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
         "no-reasoning".to_string(),
     );
     assert_eq!(
@@ -13000,7 +13095,7 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
     assert!(unsupported.reasoning_effort_levels.is_empty());
     let optional = provider_model_entry_for_api(
         &config,
-        ApiProvider::OpenaiCodex,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
         "optional-reasoning".to_string(),
     );
     assert_eq!(optional.reasoning_effort_levels, ["low"]);
@@ -13009,8 +13104,11 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
         codewhale_config::route::CapabilityState::Supported
     );
     for id in ["no-effort-metadata", "unrecognized-efforts"] {
-        let unknown =
-            provider_model_entry_for_api(&config, ApiProvider::OpenaiCodex, id.to_string());
+        let unknown = provider_model_entry_for_api(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+            id.to_string(),
+        );
         assert_eq!(
             unknown.reasoning_effort,
             codewhale_config::route::CapabilityState::Unknown
@@ -13019,7 +13117,7 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
     }
     let missing = provider_model_entry_for_api(
         &config,
-        ApiProvider::OpenaiCodex,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
         "unknown-model".to_string(),
     );
     assert_eq!(
@@ -13029,20 +13127,27 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
     assert!(missing.reasoning_effort_levels.is_empty());
     let mut custom = config.clone();
     custom
-        .provider_config_for_mut(ApiProvider::OpenaiCodex)
+        .provider_config_for_mut(&custom.test_identity_for_kind(ProviderKind::OpenaiCodex))
+        .unwrap()
         .base_url = Some("https://proxy.example.test/v1".to_string());
-    let proxy =
-        provider_model_entry_for_api(&custom, ApiProvider::OpenaiCodex, "gpt-6-astra".to_string());
+    let proxy = provider_model_entry_for_api(
+        &custom,
+        &(custom).test_identity_for_kind(ProviderKind::OpenaiCodex),
+        "gpt-6-astra".to_string(),
+    );
     assert_eq!(
         proxy.reasoning_effort,
         codewhale_config::route::CapabilityState::Unknown
     );
     assert!(proxy.reasoning_effort_levels.is_empty());
-    let mut stale = cache;
+    let mut stale: Value = serde_json::from_slice(&fs::read(cache_path).unwrap()).unwrap();
     stale["fetched_at"] = json!(chrono::Utc::now() - chrono::Duration::hours(48));
-    fs::write(&cache_path, serde_json::to_vec(&stale).unwrap()).unwrap();
-    let stale =
-        provider_model_entry_for_api(&config, ApiProvider::OpenaiCodex, "gpt-6-astra".to_string());
+    fs::write(cache_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+    let stale = provider_model_entry_for_api(
+        &config,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+        "gpt-6-astra".to_string(),
+    );
     assert_eq!(
         stale.reasoning_effort,
         codewhale_config::route::CapabilityState::Unknown
@@ -13117,15 +13222,22 @@ fn provider_catalog_keeps_official_deepseek_facts_but_not_custom_proxy_claims() 
             default_text_model: Some("deepseek-v4-pro".to_string()),
             ..Config::default()
         };
-        let provider_config = config.provider_config_for_mut(ApiProvider::Deepseek);
+        let provider_config = config
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Deepseek))
+            .unwrap();
         provider_config.base_url = Some(official_base_url.to_string());
         provider_config.model = Some("deepseek-v4-pro".to_string());
 
         assert!(
-            !config.provider_uses_custom_endpoint(ApiProvider::Deepseek),
+            !config.provider_uses_custom_endpoint(
+                &config.test_identity_for_kind(ProviderKind::Deepseek)
+            ),
             "official DeepSeek endpoint must retain the shared model catalog: {official_base_url}"
         );
-        let models = provider_models_for_api(&config, ApiProvider::Deepseek, ApiProvider::Deepseek);
+        let models = provider_models_for_api(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Deepseek),
+        );
         assert!(
             models
                 .iter()
@@ -13139,29 +13251,42 @@ fn provider_catalog_keeps_official_deepseek_facts_but_not_custom_proxy_claims() 
         default_text_model: Some("private-deepseek-deployment".to_string()),
         ..Config::default()
     };
-    let provider_config = custom.provider_config_for_mut(ApiProvider::Deepseek);
+    let provider_config = custom
+        .provider_config_for_mut(&custom.test_identity_for_kind(ProviderKind::Deepseek))
+        .unwrap();
     provider_config.base_url = Some("https://deepseek-proxy.example.test/v1".to_string());
     provider_config.model = Some("private-deepseek-deployment".to_string());
 
-    assert!(custom.provider_uses_custom_endpoint(ApiProvider::Deepseek));
+    assert!(
+        custom
+            .provider_uses_custom_endpoint(&custom.test_identity_for_kind(ProviderKind::Deepseek))
+    );
     assert_eq!(
-        provider_models_for_api(&custom, ApiProvider::Deepseek, ApiProvider::Deepseek),
+        provider_models_for_api(
+            &custom,
+            &(custom).test_identity_for_kind(ProviderKind::Deepseek)
+        ),
         vec!["private-deepseek-deployment".to_string()],
         "a real custom endpoint must expose only its explicitly configured model namespace"
     );
 
     custom.default_text_model = Some("deepseek-v4-flash-vision-exp".to_string());
-    custom.provider_config_for_mut(ApiProvider::Deepseek).model =
-        Some("deepseek-v4-flash-vision-exp".to_string());
+    custom
+        .provider_config_for_mut(&custom.test_identity_for_kind(ProviderKind::Deepseek))
+        .unwrap()
+        .model = Some("deepseek-v4-flash-vision-exp".to_string());
     assert_eq!(
-        provider_models_for_api(&custom, ApiProvider::Deepseek, ApiProvider::Deepseek),
+        provider_models_for_api(
+            &custom,
+            &(custom).test_identity_for_kind(ProviderKind::Deepseek)
+        ),
         vec!["deepseek-v4-flash-vision-exp".to_string()],
         "a custom proxy may legitimately reuse a first-party model id"
     );
     assert_eq!(
         provider_model_image_input_for_api(
             &custom,
-            ApiProvider::Deepseek,
+            &(custom).test_identity_for_kind(ProviderKind::Deepseek),
             "deepseek-v4-flash-vision-exp",
         ),
         codewhale_config::route::CapabilityState::Unknown,
@@ -13611,23 +13736,35 @@ base_url = "http://127.0.0.1:18191/v1"
         route["has_model_catalog"], true,
         "the flag must describe what this route's own model endpoint returns"
     );
-    assert!(
-        catalog
-            .iter()
-            .all(|entry| entry["model_provider_id"] != "not-a-routable-route"),
-        "a table without the openai-compatible kind is not a routable route: {providers}"
+    let unavailable: Vec<_> = catalog
+        .iter()
+        .filter(|entry| entry["model_provider_id"] == "not-a-routable-route")
+        .collect();
+    assert_eq!(unavailable.len(), 1);
+    assert_eq!(
+        unavailable[0]["display_name"],
+        "not-a-routable-route (unavailable)"
     );
-    // Only the selected route carries an exact id. An inactive entry that
-    // borrowed the active route's id would be read by a client as the route
-    // that is selected — which is worse than carrying none.
+    assert_eq!(unavailable[0]["has_model_catalog"], false);
+    assert_eq!(unavailable[0]["credentialState"], "legacy");
+    assert_eq!(unavailable[0]["credentialWritable"], false);
+    // Every admitted built-in carries its own exact id, including inactive
+    // entries. None may borrow the selected route's id.
     for entry in catalog {
         if entry["id"] != "deepseek" && entry["id"] != "custom" {
-            assert!(
-                entry["model_provider_id"].is_null(),
-                "an inactive provider must not carry an exact id: {entry}"
+            assert_eq!(
+                entry["model_provider_id"], entry["id"],
+                "an inactive provider must carry its own exact id: {entry}"
             );
         }
     }
+    let unavailable_models = client
+        .get(format!(
+            "http://{addr}/v1/providers/custom/models?model_provider_id=not-a-routable-route"
+        ))
+        .send()
+        .await?;
+    assert_eq!(unavailable_models.status(), StatusCode::BAD_REQUEST);
 
     // The route's model catalog is reachable with the identity the catalog
     // just published — no other spelling is needed by a client.
@@ -13877,9 +14014,8 @@ async fn set_config_base_url_moves_the_root_route_endpoint() -> Result<()> {
 
 #[tokio::test]
 async fn set_config_base_url_refuses_a_named_route_with_guidance() -> Result<()> {
-    // A user-defined `[providers.<name>]` route keeps its endpoint in the table
-    // it is named by. This path cannot write it, and saying so beats writing a
-    // key that changes nothing while reporting success.
+    // Keep the existing selector while adopting the canonical named-table
+    // writer: the endpoint moves only in that exact table, after reload.
     let root = std::env::temp_dir().join(format!(
         "codewhale-config-base-url-custom-{}",
         Uuid::new_v4()
@@ -13913,17 +14049,40 @@ model = "glm-5.3"
         true,
     )
     .await;
-    assert_ne!(status, StatusCode::OK, "body: {body}");
-    let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("providers.<name>") || message.contains("named"),
-        "the refusal must say where the endpoint lives, got: {message}"
+    assert_eq!(status, StatusCode::OK, "named-table write should succeed");
+    assert_eq!(body["persisted"], true);
+    assert_eq!(body["requires_reload"], true);
+    let before_reload = get_config(&client, &addr).await;
+    assert_eq!(
+        before_reload["base_url"],
+        "https://open.bigmodel.cn/api/paas/v4"
     );
     let persisted = fs::read_to_string(&config_file)?;
-    assert!(
-        !persisted.contains("active_route_base_url") && !persisted.contains("moved.example.test"),
-        "a refused write changes nothing:\n{persisted}"
+    let saved: toml::Value = toml::from_str(&persisted)?;
+    assert_eq!(
+        saved["providers"]["bigmodel-cn"]["base_url"].as_str(),
+        Some("https://moved.example.test/v1")
     );
+    assert_eq!(
+        saved["providers"]["bigmodel-cn"]["model"].as_str(),
+        Some("glm-5.3")
+    );
+    assert!(saved.get("base_url").is_none());
+    assert!(
+        !persisted.contains("active_route_base_url"),
+        "no dead endpoint key may be written"
+    );
+    let (status, _) = post_set_config(&client, &addr, "provider", "missing-route", true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(fs::read_to_string(&config_file)?, persisted);
+    let reload = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(reload.status(), StatusCode::OK);
+    let after_reload = get_config(&client, &addr).await;
+    assert_eq!(after_reload["provider"], "bigmodel-cn");
+    assert_eq!(after_reload["base_url"], "https://moved.example.test/v1");
 
     handle.abort();
     Ok(())
@@ -14373,8 +14532,8 @@ model = "glm-2"
     // Validating the root alias instead of the selection returned 500 here.
     let reloaded = Config::load(Some(config_file.clone()), None)?;
     assert_eq!(
-        reloaded.api_provider(),
-        crate::config::ApiProvider::Deepseek
+        reloaded.active_provider_identity().unwrap().provider,
+        crate::config::ProviderKind::Deepseek
     );
     assert_eq!(reloaded.default_model(), "deepseek-v4-pro");
 
@@ -15049,7 +15208,7 @@ async fn set_config_model_follows_persisted_provider_before_reload() -> Result<(
     // The persisted value is the normalized wire id (lowercase), not the
     // display spelling of DEFAULT_VOLCENGINE_FLASH_MODEL.
     let expected_wire = crate::config::normalize_model_name_for_provider(
-        crate::config::ApiProvider::Volcengine,
+        crate::config::ProviderKind::Volcengine,
         target_model,
     )
     .expect("volcengine flash model should normalize");
@@ -15057,10 +15216,13 @@ async fn set_config_model_follows_persisted_provider_before_reload() -> Result<(
         config_body.contains(&format!("model = \"{expected_wire}\"")),
         "volcengine model should be written to the provider table as its wire id"
     );
-    assert!(
-        config_body.contains("default_text_model = \"deepseek-v4-pro\""),
-        "switching provider model must not overwrite DeepSeek's root default_text_model"
+    let saved: toml::Value = toml::from_str(&config_body)?;
+    assert_eq!(
+        saved["providers"]["deepseek"]["model"].as_str(),
+        Some("deepseek-v4-pro"),
+        "switching provider model must preserve DeepSeek's migrated model table"
     );
+    assert!(saved.get("default_text_model").is_none());
 
     let reload_resp = client
         .post(format!("http://{addr}/v1/config/reload"))
@@ -17660,14 +17822,27 @@ async fn dsh_package_preview_then_exact_install_over_http() -> Result<()> {
     };
     let client = crate::tls::reqwest_client();
 
-    let preview: serde_json::Value = client
+    let mut preview_response = client
         .post(format!("http://{addr}/v1/apps/plugins/import/dsh/preview"))
         .json(&serde_json::json!({"path": package.display().to_string()}))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
+    if !preview_response.status().is_success() {
+        let status = preview_response.status();
+        let mut diagnostic = Vec::new();
+        while let Some(chunk) = preview_response.chunk().await? {
+            let remaining = 1024 - diagnostic.len();
+            diagnostic.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            if diagnostic.len() == 1024 {
+                break;
+            }
+        }
+        anyhow::bail!(
+            "DSH fixture preview {status}: {}",
+            String::from_utf8_lossy(&diagnostic)
+        );
+    }
+    let preview: serde_json::Value = preview_response.json().await?;
     assert_eq!(preview["conversion"]["plugin_name"], "docs-dsh");
     assert_eq!(
         preview["conversion"]["network_hosts"],
@@ -18053,7 +18228,9 @@ vendor = "{vendor}"
         )?;
         let old_config = manager.read_config().clone();
         let old_vendor = old_config.openrouter_vendor()?;
-        let old_client = if old_config.api_provider() == crate::config::ApiProvider::Openrouter {
+        let old_client = if old_config.active_provider_identity().unwrap().provider
+            == crate::config::ProviderKind::Openrouter
+        {
             Some(crate::client::CodewhaleClient::new(&old_config)?)
         } else {
             None
@@ -18090,14 +18267,21 @@ fn oauth_pass_through_provider_lists_catalog_models_without_a_live_listing() {
     };
     // Before the OAuth opt-in, a pass-through provider with no live listing
     // offers only its configured model.
-    assert!(provider_models_for_api(&config, ApiProvider::Deepseek, ApiProvider::Xai).is_empty());
+    assert!(
+        provider_models_for_api(&config, &(config).test_identity_for_kind(ProviderKind::Xai))
+            .is_empty()
+    );
 
-    config.provider_config_for_mut(ApiProvider::Xai).auth_mode = Some("oauth".into());
+    config
+        .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Xai))
+        .unwrap()
+        .auth_mode = Some("oauth".into());
     assert!(crate::provider_lake::live_catalog_unavailable(
         &config,
-        ApiProvider::Xai
+        &(config).test_identity_for_kind(ProviderKind::Xai)
     ));
-    let models = provider_models_for_api(&config, ApiProvider::Deepseek, ApiProvider::Xai);
+    let models =
+        provider_models_for_api(&config, &(config).test_identity_for_kind(ProviderKind::Xai));
     assert!(
         models.iter().any(|model| model == "grok-4.7"),
         "OAuth xAI must fall back to the bundled catalog: {models:?}"
@@ -18117,18 +18301,24 @@ fn api_provider_default_and_model_list_follow_exact_local_catalog() {
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
     crate::provider_catalog_live::reset_cache_for_test();
     crate::provider_lake::clear_live_snapshot();
-    let provider = ApiProvider::Ollama;
+    let provider = ProviderKind::Ollama;
     let endpoint = "http://localhost:11455/v1";
     let mut config = Config {
         provider: Some("ollama".into()),
         ..Default::default()
     };
-    config.provider_config_for_mut(provider).base_url = Some(endpoint.into());
+    config
+        .provider_config_for_mut(&config.test_identity_for_kind(provider))
+        .unwrap()
+        .base_url = Some(endpoint.into());
     assert_eq!(
-        provider_default_model_for_api(&config, provider, provider),
+        provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider)),
         ""
     );
-    assert!(!provider_models_for_api(&config, provider, provider).contains(&"unknown".to_string()));
+    assert!(
+        !provider_models_for_api(&config, &(config).test_identity_for_kind(provider))
+            .contains(&"unknown".to_string())
+    );
     assert!(runtime_request_model(&config, None).is_err());
     assert_eq!(
         runtime_request_model(&config, Some("auto")).unwrap(),
@@ -18161,11 +18351,11 @@ fn api_provider_default_and_model_list_follow_exact_local_catalog() {
         },
     );
     assert_eq!(
-        provider_default_model_for_api(&config, provider, provider),
+        provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider)),
         "local-default:tag"
     );
     assert_eq!(
-        provider_models_for_api(&config, provider, provider),
+        provider_models_for_api(&config, &(config).test_identity_for_kind(provider)),
         vec!["local-default:tag"]
     );
     assert_eq!(
@@ -18173,12 +18363,15 @@ fn api_provider_default_and_model_list_follow_exact_local_catalog() {
         "local-default:tag"
     );
     let mut other = config.clone();
-    other.provider_config_for_mut(provider).base_url = Some("http://localhost:11456/v1".into());
+    other
+        .provider_config_for_mut(&other.test_identity_for_kind(provider))
+        .unwrap()
+        .base_url = Some("http://localhost:11456/v1".into());
     assert_eq!(
-        provider_default_model_for_api(&other, provider, provider),
+        provider_default_model_for_api(&other, &(other).test_identity_for_kind(provider)),
         ""
     );
-    assert!(provider_models_for_api(&other, provider, provider).is_empty());
+    assert!(provider_models_for_api(&other, &(other).test_identity_for_kind(provider)).is_empty());
     crate::provider_catalog_live::record_failure_if_current(
         &ticket,
         "ollama",
@@ -18186,13 +18379,18 @@ fn api_provider_default_and_model_list_follow_exact_local_catalog() {
         CatalogRefreshError::Network,
     );
     assert_eq!(
-        provider_default_model_for_api(&config, provider, provider),
+        provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider)),
         ""
     );
     assert!(runtime_request_model(&config, None).is_err());
-    config.set_provider_model_override(provider, Some("chosen:tag".into()));
+    config
+        .set_provider_model_override(
+            &config.test_identity_for_kind(provider),
+            Some("chosen:tag".into()),
+        )
+        .unwrap();
     assert_eq!(
-        provider_default_model_for_api(&config, provider, provider),
+        provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider)),
         "chosen:tag"
     );
     crate::provider_catalog_live::reset_cache_for_test();
@@ -18248,7 +18446,7 @@ async fn api_config_reports_local_default_availability_without_blocking_config_r
     let fetched_at = now_unix();
     let fingerprint = base_url_fingerprint(endpoint);
     let ticket = crate::provider_catalog_live::begin_refresh_for_identity(
-        ApiProvider::Ollama,
+        ProviderKind::Ollama,
         "ollama",
         endpoint,
     );
@@ -18755,10 +18953,12 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
         ..Default::default()
     }
     .with_legacy_root(Some("synthetic-image-key".into()), None);
-    config.set_provider_model_override(
-        ApiProvider::Deepseek,
-        Some("deepseek-v4-flash-vision-exp".into()),
-    );
+    config
+        .set_provider_model_override(
+            &config.test_identity_for_kind(ProviderKind::Deepseek),
+            Some("deepseek-v4-flash-vision-exp".into()),
+        )
+        .unwrap();
     let (addr, manager, server) = spawn_test_server_with_root_token_mobile_workspace_and_overrides(
         dir.path().to_path_buf(),
         dir.path().join("sessions"),
@@ -18877,10 +19077,12 @@ async fn runtime_image_stream_rejection_does_not_leave_empty_threads() -> Result
         ..Default::default()
     }
     .with_legacy_root(Some("synthetic-image-key".into()), None);
-    config.set_provider_model_override(
-        ApiProvider::Deepseek,
-        Some("deepseek-v4-flash-vision-exp".into()),
-    );
+    config
+        .set_provider_model_override(
+            &config.test_identity_for_kind(ProviderKind::Deepseek),
+            Some("deepseek-v4-flash-vision-exp".into()),
+        )
+        .unwrap();
     let (addr, manager, server) = spawn_test_server_with_root_token_mobile_workspace_and_overrides(
         dir.path().to_path_buf(),
         dir.path().join("sessions"),
@@ -19007,14 +19209,15 @@ async fn runtime_image_named_catalog_resolves_and_echoes_exact_configured_identi
             StatusCode::BAD_REQUEST
         );
     }
-    let legacy: Value = client
+    let legacy = client
         .get(format!("http://{addr}/v1/providers/custom/models"))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
-    assert!(legacy.get("model_provider_id").is_none());
+    assert_eq!(legacy.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        get_config(&client, &addr).await["provider"],
+        "vision-personal"
+    );
     server.abort();
     Ok(())
 }
@@ -19154,13 +19357,17 @@ fn output_cap_catalog_reports_exact_transport_support() {
     let _env = crate::test_support::lock_test_env();
     let config = Config::default();
     assert_eq!(
-        provider_model_output_token_limit_for_api(&config, ApiProvider::OpenaiCodex, "gpt-5.5"),
+        provider_model_output_token_limit_for_api(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+            "gpt-5.5"
+        ),
         CapabilityState::Unsupported
     );
     assert_eq!(
         provider_model_output_token_limit_for_api(
             &config,
-            ApiProvider::Deepseek,
+            &(config).test_identity_for_kind(ProviderKind::Deepseek),
             "deepseek-v4-pro"
         ),
         CapabilityState::Supported
@@ -20407,7 +20614,8 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
     let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
     let _cli_key = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
-    let _provider_keys: Vec<_> = ApiProvider::Deepseek
+    let _provider_keys: Vec<_> = ProviderKind::Deepseek
+        .provider()
         .env_vars()
         .iter()
         .copied()
@@ -20502,7 +20710,7 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
         let live = live_config.read();
         assert_eq!(live.auth_mode, None);
         assert_eq!(
-            live.provider_config_for(ApiProvider::OpenaiCodex)
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::OpenaiCodex))
                 .and_then(|entry| entry.auth_mode.as_deref()),
             None
         );
@@ -20558,12 +20766,12 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
         let live = live_config.read();
         assert_eq!(live.auth_mode, None);
         assert_eq!(
-            live.provider_config_for(ApiProvider::Deepseek)
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::Deepseek))
                 .and_then(|entry| entry.auth_mode.as_deref()),
             None
         );
         assert_eq!(
-            live.provider_config_for(ApiProvider::Openai)
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::Openai))
                 .and_then(|entry| entry.auth_mode.as_deref()),
             Some("api_key")
         );
@@ -20597,7 +20805,7 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
         let live = live_config.read();
         assert_eq!(live.auth_mode.as_deref(), Some("api_key"));
         assert_eq!(
-            live.provider_config_for(ApiProvider::Deepseek)
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::Deepseek))
                 .and_then(|entry| entry.auth_mode.as_deref()),
             Some("api_key")
         );
@@ -20629,7 +20837,7 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
         let live = live_config.read();
         assert_eq!(live.auth_mode.as_deref(), Some("api_key"));
         assert_eq!(
-            live.provider_config_for(ApiProvider::Openrouter)
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::Openrouter))
                 .and_then(|entry| entry.auth_mode.as_deref()),
             None
         );
@@ -22312,7 +22520,7 @@ api_key = "refresh-fixture-key"
         "custom/models/refresh?model_provider_id=",
         "custom/models/refresh?model_provider_id=missing",
         "openai/models/refresh?model_provider_id=second",
-        "deepseek-cn/models/refresh",
+        "deepseek-cn-unknown/models/refresh",
         "custom/models/refresh?base_url=https://untrusted.invalid",
     ] {
         assert_eq!(
@@ -22813,12 +23021,21 @@ async fn mcp_server_management_blocks_credential_retargeting() -> Result<()> {
     Ok(())
 }
 
+/// Like `error_for_status`, but keeps the server's `ApiError` body so a hosted
+/// failure names the refusing handler instead of only its status.
+async fn mcp_test_success(response: reqwest::Response) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let url = response.url().clone();
+    let body = response.text().await.unwrap_or_default();
+    bail!("{status} for {url}: {body}")
+}
+
 async fn mcp_test_revision(client: &reqwest::Client, base: &str) -> Result<String> {
-    let listing: Value = client
-        .get(base)
-        .send()
+    let listing: Value = mcp_test_success(client.get(base).send().await?)
         .await?
-        .error_for_status()?
         .json()
         .await?;
     Ok(format!(

@@ -6,6 +6,8 @@
 
 #![allow(dead_code)]
 
+pub use crate::core::authority::RunOrigin;
+
 use crate::tui::approval::{RiskLevel, ToolCategory, classify_risk, get_tool_category_for_call};
 use codewhale_execpolicy::ApprovalMode;
 use serde_json::{Value, json};
@@ -382,20 +384,23 @@ fn tool_name_words(name: &str) -> Vec<String> {
     words
 }
 
+/// Process-name termination can include every npm launcher, including other
+/// Codewhale sessions. This is a captured platform fact, not a model verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunOrigin {
-    Interactive,
-    Headless,
-    Background,
+enum SessionRuntimeRisk {
+    WindowsNodeImageKill,
+    UnclassifiedWindowsInvocation,
 }
 
-impl RunOrigin {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
+impl SessionRuntimeRisk {
+    fn reason(self) -> &'static str {
         match self {
-            Self::Interactive => "interactive",
-            Self::Headless => "headless",
-            Self::Background => "background",
+            Self::WindowsNodeImageKill => {
+                "unbounded process termination can kill this or another Codewhale npm session's Node launcher; stop the owned server by PID or port instead"
+            }
+            Self::UnclassifiedWindowsInvocation => {
+                "Windows command input cannot be classified safely enough to exclude termination of Codewhale npm launchers; use a direct PID- or port-specific command"
+            }
         }
     }
 }
@@ -407,6 +412,7 @@ pub struct AutoReviewContext<'a> {
     pub risk: RiskLevel,
     pub action_kind: ToolActionKind,
     pub shell_is_auto_review_routine: bool,
+    session_runtime_risk: Option<SessionRuntimeRisk>,
     pub run_origin: RunOrigin,
     pub approval_mode: ApprovalMode,
     pub workspace_trusted: bool,
@@ -504,6 +510,11 @@ impl<'a> AutoReviewContext<'a> {
             action_kind,
             shell_is_auto_review_routine: matches!(category, ToolCategory::Shell)
                 && shell_params_are_auto_review_routine(params),
+            session_runtime_risk: if cfg!(windows) {
+                windows_tool_runtime_risk(name, params)
+            } else {
+                None
+            },
             run_origin,
             approval_mode,
             workspace_trusted,
@@ -633,6 +644,13 @@ fn deterministic_fallback(
     ctx: &AutoReviewContext<'_>,
     allow_rule: Option<&AutoReviewRule>,
 ) -> AutoReviewDecision {
+    // A native session can also kill a neighboring npm launcher's Node process.
+    // Therefore this hold applies to all Windows callers, ahead of allow rules
+    // and Full Access, rather than trusting an npm marker or a model warning.
+    if let Some(risk) = ctx.session_runtime_risk {
+        return AutoReviewDecision::safety_gate(risk.reason());
+    }
+
     // Gate on the action, not the broad modal-styling risk bucket.
     match (ctx.action_kind, ctx.run_origin) {
         // Full Access skips publish holds; catastrophic detached work still
@@ -1061,6 +1079,242 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+/// Supplied execution text only, from the existing canonical tool contracts.
+/// Do not guess what default verifier scripts, packages or stored code will do.
+fn windows_tool_runtime_risk(tool_name: &str, params: &Value) -> Option<SessionRuntimeRisk> {
+    let canonical = crate::tools::canonical_action::canonical_action_alias(tool_name, params);
+    match canonical {
+        "exec_shell" | "task_shell_start" | "task_gate_run" => {
+            let command = params
+                .get("command")
+                .or_else(|| params.get("cmd"))
+                .and_then(Value::as_str)
+                .and_then(windows_session_runtime_risk);
+            command.or_else(|| {
+                if canonical == "task_gate_run" {
+                    None
+                } else {
+                    windows_shell_stdin_risk(params)
+                }
+            })
+        }
+        "exec_shell_interact" | "exec_interact" => windows_shell_stdin_risk(params),
+        "run_verifiers" => params
+            .get("commands")
+            .and_then(Value::as_array)?
+            .iter()
+            .find_map(|row| {
+                let program = row.get("program").and_then(Value::as_str)?;
+                let args = row.get("args").and_then(Value::as_array);
+                let words = std::iter::once(program)
+                    .chain(args.into_iter().flatten().filter_map(Value::as_str));
+                match shlex::try_join(words) {
+                    Ok(command) => windows_session_runtime_risk(&command),
+                    Err(_) => Some(SessionRuntimeRisk::UnclassifiedWindowsInvocation),
+                }
+            }),
+        _ => None,
+    }
+}
+
+fn windows_shell_stdin_risk(params: &Value) -> Option<SessionRuntimeRisk> {
+    // Match Bash's first non-null alias exactly. Wrong types remain refused by
+    // the existing tool schema; this projection never admits an execution.
+    ["stdin", "input", "data"]
+        .into_iter()
+        .find_map(|name| params.get(name).filter(|value| !value.is_null()))
+        .and_then(Value::as_str)
+        .and_then(windows_session_runtime_risk)
+}
+
+/// Reuse the existing bounded invocation walk, including nested shell payloads.
+/// It is deliberately over-inclusive: filters on a named group do not prove
+/// another Codewhale launcher is excluded. This is not a PowerShell evaluator
+/// or a sandbox for arbitrary scripts. Literal PID/port cleanup stays available.
+fn windows_session_runtime_risk(command: &str) -> Option<SessionRuntimeRisk> {
+    use codewhale_execpolicy::command_safety::command_invocations;
+    let Some(mut invocations) = command_invocations(command) else {
+        return Some(SessionRuntimeRisk::UnclassifiedWindowsInvocation);
+    };
+    if command.contains(['\\', '`']) {
+        // The shared POSIX splitter can consume Windows path/module separators
+        // or preserve PowerShell escapes. Add their Windows spelling through
+        // the same bounded walk; retain the original so no invocation loses a hold.
+        let windows_spelling = command
+            .replace('\\', "/")
+            .replace("`\r\n", "")
+            .replace("`\n", "")
+            .replace('`', "");
+        let Some(windows_paths) = command_invocations(&windows_spelling) else {
+            return Some(SessionRuntimeRisk::UnclassifiedWindowsInvocation);
+        };
+        invocations.extend(windows_paths);
+    }
+    fn word(argv: &[String]) -> &str {
+        let word = argv
+            .first()
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim_start_matches(['(', '$']);
+        let word = word.split(')').next().unwrap_or(word);
+        word.strip_suffix(".exe").unwrap_or(word)
+    }
+    // PowerShell accepts an unambiguous parameter prefix and colon syntax.
+    // Reuse the invocation's words; do not interpret a PowerShell program.
+    let parameter = |arg: &str, name: &str| {
+        let flag = arg.split(':').next().unwrap_or(arg).to_ascii_lowercase();
+        flag.starts_with('-') && flag.len() > 1 && name.starts_with(&flag)
+    };
+    let literal_pids = |value: &str| {
+        value
+            .split(',')
+            .all(|pid| pid.parse::<u32>().is_ok_and(|pid| pid != 0))
+    };
+    let bounded_pid_selector = |args: &[String]| {
+        let Some(first) = args.first() else {
+            return false;
+        };
+        literal_pids(first)
+            || (word(args).eq_ignore_ascii_case("get-nettcpconnection")
+                && args
+                    .iter()
+                    .any(|arg| arg.to_ascii_lowercase().contains(").owningprocess"))
+                && args.windows(2).any(|pair| {
+                    parameter(&pair[0], "-localport")
+                        && pair[1]
+                            .split(')')
+                            .next()
+                            .unwrap_or(&pair[1])
+                            .parse::<u16>()
+                            .is_ok_and(|port| port != 0)
+                }))
+    };
+    let named_targets = |args: &[String], flag: &str| {
+        args.iter()
+            .position(|arg| parameter(arg, flag))
+            .map(|index| {
+                let inline = args[index].split_once(':').map(|(_, name)| name);
+                let names: Vec<_> = inline
+                    .into_iter()
+                    .chain(
+                        args[index + 1..]
+                            .iter()
+                            .take_while(|arg| !arg.starts_with('-'))
+                            .map(String::as_str),
+                    )
+                    .collect();
+                names.is_empty() || names.iter().any(|name| windows_name_can_include_node(name))
+            })
+    };
+    // -Id is not bounded when it is fed IDs from a whole named image group.
+    // Conservatively retain this getter fact across the supplied statement;
+    // do not evaluate PowerShell variables, pipelines or branch conditions.
+    let getter_can_include_node = invocations.iter().any(|argv| {
+        if !matches!(word(argv), "get-process" | "gps" | "ps") {
+            return false;
+        }
+        let args = &argv[1..];
+        named_targets(args, "-name").unwrap_or_else(|| {
+            if args.iter().any(|arg| parameter(arg, "-id")) {
+                return false;
+            }
+            let names: Vec<_> = args.iter().filter(|arg| !arg.starts_with('-')).collect();
+            names.is_empty() || names.iter().any(|name| windows_name_can_include_node(name))
+        })
+    });
+    let kills = invocations.iter().any(|argv| {
+        let args = &argv[1..];
+        if getter_can_include_node
+            && matches!(
+                word(argv),
+                "taskkill" | "stop-process" | "spps" | "kill" | "killall" | "pkill"
+            )
+        {
+            return true;
+        }
+        match word(argv) {
+            "taskkill" => {
+                let images: Vec<_> = args
+                    .windows(2)
+                    .filter(|pair| pair[0].eq_ignore_ascii_case("/im"))
+                    .map(|pair| &pair[1])
+                    .collect();
+                if images
+                    .iter()
+                    .any(|name| windows_name_can_include_node(name))
+                {
+                    return true;
+                }
+                if !images.is_empty() {
+                    return false;
+                }
+                let image_filter_excludes_node = args.windows(2).any(|pair| {
+                    pair[0].eq_ignore_ascii_case("/fi") && {
+                        let filter: Vec<_> = pair[1].split_whitespace().collect();
+                        filter.len() == 3
+                            && filter[0].eq_ignore_ascii_case("imagename")
+                            && filter[1].eq_ignore_ascii_case("eq")
+                            && !windows_name_can_include_node(filter[2])
+                    }
+                });
+                // Filter-only taskkill can target a whole set. An owned PID
+                // or a fixed non-Node image is the bounded cleanup remedy.
+                let pids: Vec<_> = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, arg)| arg.eq_ignore_ascii_case("/pid"))
+                    .collect();
+                !image_filter_excludes_node
+                    && (pids.is_empty()
+                        || pids
+                            .iter()
+                            .any(|(index, _)| !bounded_pid_selector(&args[*index + 1..])))
+            }
+            "stop-process" | "spps" | "kill" => {
+                named_targets(args, "-name").unwrap_or_else(|| {
+                    // A bare pipeline/variable input is not proof of an owned
+                    // PID. Keep explicit -Id (including a port's owner) usable.
+                    args.iter()
+                        .position(|arg| parameter(arg, "-id"))
+                        .is_none_or(|index| match args[index].split_once(':') {
+                            Some((_, value)) => !literal_pids(value),
+                            None => !bounded_pid_selector(&args[index + 1..]),
+                        })
+                })
+            }
+            // pkill's pattern grammar is not a literal image-name proof.
+            "pkill" => true,
+            "killall" => args
+                .iter()
+                .filter(|arg| !arg.starts_with('-'))
+                .any(|name| windows_name_can_include_node(name)),
+            _ => false,
+        }
+    });
+    kills.then_some(SessionRuntimeRisk::WindowsNodeImageKill)
+}
+
+fn windows_name_can_include_node(name: &str) -> bool {
+    name.split(',').any(|name| {
+        // Computed name lists cannot prove they omit a runtime image. Fixed
+        // names/globs use the already installed matcher, not a new parser.
+        if name.contains(['$', '@', '`']) {
+            return true;
+        }
+        let name = name.trim_matches(['\'', '"']);
+        // A getter argument can end the subexpression before .Id is projected.
+        let name = name.split(')').next().unwrap_or(name);
+        globset::GlobBuilder::new(name)
+            .case_insensitive(true)
+            .build()
+            .map(|glob| {
+                let matcher = glob.compile_matcher();
+                matcher.is_match("node") || matcher.is_match("node.exe")
+            })
+            .unwrap_or(true)
+    })
+}
+
 fn shell_params_are_publish_like(params: &Value) -> bool {
     let Some(command) = params
         .get("command")
@@ -1450,6 +1704,225 @@ mod tests {
     fn assert_safety_gate(decision: &AutoReviewDecision) {
         assert_eq!(decision.action, AutoReviewAction::AskUser);
         assert!(decision.built_in_safety_gate);
+    }
+
+    #[test]
+    fn windows_node_image_kills_and_powershell_aliases_are_held() {
+        for command in [
+            "taskkill /F /IM node.exe",
+            "TASKKILL.EXE /F /IM NODE.EXE",
+            r#"'C:\Windows\System32\taskkill.exe' /F /IM node.exe"#,
+            r"C:\Windows\System32\taskkill.exe /F /IM node.exe",
+            "taskkill /F /FI 'PID ge 1000' /IM *",
+            "taskkill /F /IM n*.exe",
+            "taskkill /F /FI 'IMAGENAME eq node.exe'",
+            "taskkill /F /FI 'IMAGENAME ne chrome.exe'",
+            "Stop-Process -Name node -Force",
+            r"Microsoft.PowerShell.Management\Stop-Process -Name node -Force",
+            "Sto`p-Process -Na`me no`de -Force",
+            "Sto`\np-Process -Name node -Force",
+            "Stop-Process -Na:node -Force",
+            "Stop-Process -Name chrome,node -Force",
+            "Stop-Process -Name $names -Force",
+            "Stop-Process -Name node -Id 123 -Force",
+            "Stop-Process -Id (Get-Process node).Id -Force",
+            "Stop-Process -Id (Get-Process).Id -Force",
+            "Get-Process node | ForEach-Object { taskkill /PID $_.Id /F }",
+            "Stop-Process -Id $ids -Force",
+            "taskkill /PID $ids /F",
+            "Get-Process node | Stop-Process -Force",
+            "Get-Process node | Where-Object { $_.StartTime -gt $start } | Stop-Process -Force",
+            "gps node | spps -Force",
+            "ps node | kill -Force",
+            "$processes | Stop-Process -Force",
+            "powershell -NoProfile -Command 'Get-Process node | Stop-Process -Force'",
+            "pwsh -Command 'Stop-Process -Name node -Force'",
+            "cmd /c taskkill /F /IM node.exe",
+            "pkill '^node$'",
+            "killall node.exe",
+        ] {
+            assert_eq!(
+                windows_session_runtime_risk(command),
+                Some(SessionRuntimeRisk::WindowsNodeImageKill),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_owned_pid_cleanup_and_process_reads_do_not_gain_a_runtime_hold() {
+        for command in [
+            "node --version",
+            "Get-Process node",
+            "tasklist /FI 'IMAGENAME eq node.exe'",
+            "taskkill /PID 123 /F",
+            "taskkill /PID 123 /T /F",
+            "taskkill /F /IM chrome.exe",
+            "taskkill /F /FI 'IMAGENAME eq chrome.exe'",
+            "Stop-Process -Id 123 -Force",
+            "Stop-Process -Id:123 -Force",
+            "Stop-Process -Name chrome -Force",
+            "Stop-Process -Name nodemon -Force",
+            "Stop-Process -Id (Get-NetTCPConnection -LocalPort 3000).OwningProcess -Force",
+        ] {
+            assert_eq!(windows_session_runtime_risk(command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn windows_runtime_risk_uses_the_existing_bounded_scanner_and_platform() {
+        let nested = (0..10).fold("node --version".to_string(), |inner, _| {
+            format!("sh -c {}", shlex::try_quote(&inner).unwrap())
+        });
+        assert_eq!(
+            windows_session_runtime_risk(&nested),
+            Some(SessionRuntimeRisk::UnclassifiedWindowsInvocation)
+        );
+        let ctx = ctx_for(
+            "bash",
+            json!({"command": "taskkill /F /IM node.exe"}),
+            RunOrigin::Interactive,
+            ApprovalMode::Bypass,
+        );
+        assert_eq!(ctx.session_runtime_risk.is_some(), cfg!(windows));
+        let read = ctx_for(
+            "read_file",
+            json!({"command": "taskkill /F /IM node.exe"}),
+            RunOrigin::Interactive,
+            ApprovalMode::Bypass,
+        );
+        assert_eq!(read.session_runtime_risk, None);
+        for (name, input) in [
+            (
+                "Bash",
+                json!({"action":"run", "command":"powershell", "stdin":"Stop-Process -Name node -Force\n"}),
+            ),
+            (
+                "Bash",
+                json!({"action":"interact", "task_id":"owned", "stdin":null, "input":"taskkill /IM node.exe\n"}),
+            ),
+            (
+                "exec_interact",
+                json!({"task_id":"owned", "data":"taskkill /IM node.exe\n"}),
+            ),
+            (
+                "task_shell_start",
+                json!({"command":"taskkill /IM node.exe"}),
+            ),
+            (
+                "tasks",
+                json!({"action":"gate_run", "gate":"cleanup", "command":"taskkill /IM node.exe"}),
+            ),
+            (
+                "Run",
+                json!({"action":"verifiers", "commands":[{"name":"cleanup", "program":"taskkill.exe", "args":["/F","/IM","node.exe"]}]}),
+            ),
+            (
+                "run_verifiers",
+                json!({"commands":[{"name":"cleanup", "program":"powershell", "args":["-Command","gps node | spps -Force"]}]}),
+            ),
+        ] {
+            assert_eq!(
+                windows_tool_runtime_risk(name, &input),
+                Some(SessionRuntimeRisk::WindowsNodeImageKill),
+                "{name}: {input}"
+            );
+        }
+        for (name, input) in [
+            (
+                "Bash",
+                json!({"action":"interact", "task_id":"owned", "input":"Stop-Process -Id 123 -Force\n"}),
+            ),
+            (
+                "Bash",
+                json!({"action":"cancel", "task_id":"owned", "command":"taskkill /IM node.exe"}),
+            ),
+            ("Run", json!({"action":"verifiers", "profile":"auto"})),
+            (
+                "Run",
+                json!({"action":"verifiers", "commands":[{"name":"cleanup", "program":"taskkill", "args":["/PID","123","/F"]}]}),
+            ),
+            (
+                "File",
+                json!({"action":"read", "command":"taskkill /IM node.exe"}),
+            ),
+        ] {
+            assert_eq!(
+                windows_tool_runtime_risk(name, &input),
+                None,
+                "{name}: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_runtime_floor_precedes_allow_and_full_access_but_retains_denials() {
+        use crate::core::engine::{AutoReviewPlanDecision, auto_review_plan_decision_for_context};
+
+        let policy = AutoReviewPolicy {
+            allow_rules: vec![AutoReviewRule::allow(
+                "allow-execution",
+                "operator execution allow",
+            )],
+            ..Default::default()
+        };
+        for origin in [
+            RunOrigin::Interactive,
+            RunOrigin::Headless,
+            RunOrigin::Background,
+        ] {
+            for mode in [
+                ApprovalMode::Suggest,
+                ApprovalMode::Auto,
+                ApprovalMode::Never,
+                ApprovalMode::Bypass,
+            ] {
+                for (name, input) in [
+                    ("bash", json!({"command":"taskkill /F /IM node.exe"})),
+                    (
+                        "Bash",
+                        json!({"action":"interact", "task_id":"owned", "stdin":"gps node | spps -Force\n"}),
+                    ),
+                    (
+                        "tasks",
+                        json!({"action":"gate_run", "gate":"cleanup", "command":"taskkill /IM node.exe"}),
+                    ),
+                    (
+                        "Run",
+                        json!({"action":"verifiers", "commands":[{"name":"cleanup", "program":"taskkill", "args":["/IM","node.exe"]}]}),
+                    ),
+                ] {
+                    let captured = windows_tool_runtime_risk(name, &input);
+                    assert_eq!(captured, Some(SessionRuntimeRisk::WindowsNodeImageKill));
+                    let mut ctx = ctx_for(name, input, origin, mode);
+                    // Exercise the platform fact through the same resolver on
+                    // every test host; production captures it only on Windows.
+                    ctx.session_runtime_risk = captured;
+                    let decision = policy.evaluate(&ctx);
+                    assert_safety_gate(&decision);
+                    assert_eq!(decision.rule_id, None);
+                    let (plan, audit) = auto_review_plan_decision_for_context(&policy, &ctx);
+                    assert_eq!(audit["decision"], "hold_for_review");
+                    assert!(audit["reason"].as_str().unwrap().contains("Node launcher"));
+                    assert!(match mode {
+                        ApprovalMode::Suggest =>
+                            matches!(plan, AutoReviewPlanDecision::ForcePrompt(_)),
+                        _ => matches!(plan, AutoReviewPlanDecision::Block(_)),
+                    });
+                    let denied = AutoReviewPolicy {
+                        block_rules: vec![AutoReviewRule::block(
+                            "deny-execution",
+                            "operator denial",
+                        )],
+                        ..policy.clone()
+                    }
+                    .evaluate(&ctx);
+                    assert_eq!(denied.action, AutoReviewAction::Block);
+                    assert_eq!(denied.rule_id.as_deref(), Some("deny-execution"));
+                    assert!(!denied.built_in_safety_gate);
+                }
+            }
+        }
     }
 
     #[test]

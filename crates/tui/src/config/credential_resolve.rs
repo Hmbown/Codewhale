@@ -68,9 +68,9 @@ use crate::credentials::{
 /// process environment.
 pub(crate) fn resolve_credential_source(
     config: &Config,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
 ) -> CredentialResolution {
-    resolve_credential_source_with(config, provider, &ProcessAuthContext)
+    resolve_credential_source_with(config, identity, &ProcessAuthContext)
 }
 
 /// Resolve with an injected [`AuthContext`].
@@ -82,25 +82,52 @@ pub(crate) fn resolve_credential_source(
 /// this lane.
 pub(crate) fn resolve_credential_source_with(
     config: &Config,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
     ctx: &dyn AuthContext,
 ) -> CredentialResolution {
+    if let Err(error) = config.verify_provider_identity(identity) {
+        return CredentialResolution::missing(vec![CredentialProbe::with_fix(
+            error,
+            "repair the exact provider kind/id pair",
+        )]);
+    }
+    let provider = identity.provider;
     let mut probed: Vec<CredentialProbe> = Vec::new();
 
-    let auth_mode = config.auth_mode_for_provider(provider);
+    let auth_mode = config.auth_mode_for_provider(identity);
     if auth_mode_disables_api_key(auth_mode.as_deref()) {
         return CredentialResolution::found(CredentialSource::AuthModeNone);
     }
 
-    if provider == config.api_provider()
-        && !provider_uses_oauth_credentials(config, provider)
+    // The public ChatGPT API accepts only Codewhale's own issued registration.
+    // Environment tokens and consented Codex files belong to different clients.
+    if provider == ProviderKind::OpenaiCodex && !config.provider_uses_custom_endpoint(identity) {
+        if let Some(sign_in) =
+            crate::oauth::usable_sign_in(crate::oauth::OAuthProvider::Chatgpt, config)
+        {
+            return CredentialResolution::found(CredentialSource::OAuth {
+                flow: "ChatGPT".to_string(),
+                account: sign_in.account_label,
+            });
+        }
+        probed.push(CredentialProbe::with_fix(
+            "Codewhale-owned ChatGPT sign-in",
+            "codewhale auth chatgpt",
+        ));
+        return CredentialResolution::missing(probed);
+    }
+
+    if config
+        .active_provider_identity()
+        .is_ok_and(|active| active == *identity)
+        && !provider_uses_oauth_credentials(config, identity)
         && explicit_cli_api_key_override().is_some()
     {
         return CredentialResolution::found(CredentialSource::CliOverride);
     }
 
-    if let Some(var) = bound_provider_api_key_env_name(config, provider) {
-        if provider_config_env_api_key(config, provider).is_some() {
+    if let Some(var) = bound_provider_api_key_env_name(config, identity) {
+        if provider_config_env_api_key(config, identity).is_some() {
             return CredentialResolution::found(CredentialSource::ProviderConfigEnv { var });
         }
         probed.push(CredentialProbe::with_fix(
@@ -109,9 +136,10 @@ pub(crate) fn resolve_credential_source_with(
         ));
     }
 
-    let skip_secret_store = config.should_skip_secret_store_for_provider(provider);
+    let skip_secret_store = config.should_skip_secret_store_for_provider(identity);
     if !skip_secret_store {
         if let Some(var) = provider
+            .provider()
             .env_vars()
             .iter()
             .find(|var| ctx.env(var).is_some())
@@ -120,15 +148,15 @@ pub(crate) fn resolve_credential_source_with(
                 var: (*var).to_string(),
             });
         }
-        if let Some(var) = provider.env_vars().first() {
+        if let Some(var) = provider.provider().env_vars().first() {
             probed.push(CredentialProbe::with_fix(
-                format!("env {}", provider.env_vars_label()),
+                format!("env {}", provider.provider().env_vars().join(" / ")),
                 format!("export {var}=<key>"),
             ));
         }
     }
 
-    if provider == ApiProvider::Moonshot && provider_uses_oauth_credentials(config, provider) {
+    if provider == ProviderKind::Moonshot && provider_uses_oauth_credentials(config, identity) {
         // Kimi CLI credentials are never imported; the route needs its own key.
         probed.push(CredentialProbe::with_fix(
             "Kimi CLI credentials (never imported)",
@@ -136,52 +164,28 @@ pub(crate) fn resolve_credential_source_with(
         ));
         return CredentialResolution::missing(probed);
     }
-    if provider == ApiProvider::OpenaiCodex && !config.provider_uses_custom_endpoint(provider) {
-        if crate::oauth::credentials_present(crate::oauth::OAuthProvider::Chatgpt, config) {
-            return CredentialResolution::found(CredentialSource::OAuth {
-                flow: "ChatGPT".to_string(),
-            });
-        }
-        probed.push(CredentialProbe::with_fix(
-            "Codewhale-owned ChatGPT sign-in",
-            "codewhale auth chatgpt",
-        ));
-        // Token env overrides are checked above. An external Codex login is
-        // considered only after exact read-only consent has been validated.
-        match resolve_external_grant(
-            config,
-            provider,
-            codewhale_config::ExternalCredentialSource::CodexCli,
-            "Codex CLI",
-            "codewhale auth external-consent --provider openai-codex --mode read-only",
-            crate::oauth::stored_credentials_present,
-        ) {
-            Ok(source) => return CredentialResolution::found(source),
-            Err(probe) => {
-                probed.push(probe);
-                return CredentialResolution::missing(probed);
-            }
-        }
-    }
-    if provider == ApiProvider::Xai
-        && !config.provider_uses_custom_endpoint(provider)
-        && crate::oauth::credentials_present(crate::oauth::OAuthProvider::Xai, config)
+    if provider == ProviderKind::Xai
+        && !config.provider_uses_custom_endpoint(identity)
+        && let Some(sign_in) =
+            crate::oauth::usable_sign_in(crate::oauth::OAuthProvider::Xai, config)
     {
         // xAI supports both API keys and OAuth. A Grok-compatible token file is
         // sufficient, but its absence must fall through to the ordinary API-key
         // checks below instead of masking a configured key.
         return CredentialResolution::found(CredentialSource::OAuth {
             flow: "xAI".to_string(),
+            account: sign_in.account_label,
         });
     }
     if matches!(
         provider,
-        ApiProvider::Deepseek | ApiProvider::DeepseekAnthropic
-    ) && !config.provider_uses_custom_endpoint(provider)
+        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
+    ) && identity.key.as_str() != codewhale_config::descriptors::LEGACY_DEEPSEEK_CN.id
+        && !config.provider_uses_custom_endpoint(identity)
     {
         match resolve_external_grant(
             config,
-            provider,
+            identity,
             codewhale_config::ExternalCredentialSource::DshCli,
             "DeepSeek Harness",
             "codewhale auth external-consent --provider deepseek --mode read-only",
@@ -198,28 +202,30 @@ pub(crate) fn resolve_credential_source_with(
     }
 
     if !auth_mode_requires_api_key(auth_mode.as_deref())
-        && (provider_route_is_keyless_self_hosted(provider, &config.base_url_for_route(provider))
-            || (provider == config.api_provider()
+        && (provider_route_is_keyless_self_hosted(provider, &config.base_url_for_route(identity))
+            || (config
+                .active_provider_identity()
+                .is_ok_and(|active| active == *identity)
                 && base_url_uses_local_host(&config.active_route_base_url())))
     {
         return CredentialResolution::found(CredentialSource::KeylessRoute {
-            base_url: config.base_url_for_route(provider),
+            base_url: config.base_url_for_route(identity),
         });
     }
 
-    if config.config_credentials_are_bound_to_provider_endpoint(provider) {
+    if config.config_credentials_are_bound_to_provider_endpoint(identity) {
         if config
-            .provider_route_string_with_deepseek_fallback(provider, |entry| entry.api_key.clone())
+            .provider_route_string_with_deepseek_fallback(identity, |entry| entry.api_key.clone())
             .is_some_and(|key| {
                 classify_config_api_key_value(&key) == ConfigApiKeyValueKind::Literal
             })
         {
             return CredentialResolution::found(CredentialSource::ProviderConfigApiKey {
-                table: provider_config_table_name(provider)
-                    .unwrap_or_else(|_| format!("providers.{}", provider.as_str())),
+                table: provider_config_table_name(identity)
+                    .unwrap_or_else(|_| format!("providers.{}", identity.key.as_str())),
             });
         }
-        if let Ok(table) = provider_config_table_name(provider) {
+        if let Ok(table) = provider_config_table_name(identity) {
             probed.push(CredentialProbe::with_fix(
                 format!("[{table}] api_key"),
                 format!("add api_key to [{table}] in ~/.codewhale/config.toml"),
@@ -240,16 +246,19 @@ pub(crate) fn resolve_credential_source_with(
     // opens a write-capable backend.
     if !skip_secret_store {
         let slot = provider_secret_store_slot(provider).to_string();
-        if provider == config.api_provider() {
-            if provider_secret_store_api_key(config, provider).is_some() {
+        if config
+            .active_provider_identity()
+            .is_ok_and(|active| active == *identity)
+        {
+            if provider_secret_store_api_key(config, identity).is_some() {
                 return CredentialResolution::found(CredentialSource::SecretStore { slot });
             }
-            probed.push(secret_store_probe(&slot, provider));
-        } else if secret_slot_save_marker_on_shared_slot(config, provider) {
-            if provider_secret_store_api_key_with_mode(config, provider, true).is_some() {
+            probed.push(secret_store_probe(&slot, identity));
+        } else if secret_slot_save_marker_on_shared_slot(config, identity) {
+            if provider_secret_store_api_key_with_mode(config, identity, true).is_some() {
                 return CredentialResolution::found(CredentialSource::SecretStore { slot });
             }
-            probed.push(secret_store_probe(&slot, provider));
+            probed.push(secret_store_probe(&slot, identity));
         } else {
             // #5033's marker gate: without a `[providers.<name>]` api-key
             // auth-mode marker the store is not read at all for an inactive
@@ -262,7 +271,7 @@ pub(crate) fn resolve_credential_source_with(
                 ),
                 format!(
                     "codewhale auth set --provider {} writes the marker that makes this slot readable while inactive",
-                    provider.as_str()
+                    identity.key.as_str()
                 ),
             ));
         }
@@ -270,25 +279,25 @@ pub(crate) fn resolve_credential_source_with(
 
     // Last resort: the user-global config file. A key saved there must not
     // disappear just because this process loaded a workspace config.
-    if user_global_config_api_key(provider).is_some() {
+    if user_global_config_api_key(identity).is_some() {
         return CredentialResolution::found(CredentialSource::UserGlobalConfig);
     }
     probed.push(CredentialProbe::with_fix(
         "~/.codewhale/config.toml",
-        format!("codewhale auth set --provider {}", provider.as_str()),
+        format!("codewhale auth set --provider {}", identity.key.as_str()),
     ));
 
-    if config.account_model_api_key(provider).is_some() {
+    if config.account_model_api_key(identity).is_some() {
         return CredentialResolution::found(CredentialSource::AccountSession);
     }
 
     CredentialResolution::missing(probed)
 }
 
-fn secret_store_probe(slot: &str, provider: ApiProvider) -> CredentialProbe {
+fn secret_store_probe(slot: &str, identity: &ProviderIdentity) -> CredentialProbe {
     CredentialProbe::with_fix(
         format!("secret store \"{slot}\""),
-        format!("codewhale auth set --provider {}", provider.as_str()),
+        format!("codewhale auth set --provider {}", identity.key.as_str()),
     )
 }
 
@@ -309,14 +318,14 @@ fn secret_store_probe(slot: &str, provider: ApiProvider) -> CredentialProbe {
 ///    usable credential. Structural consent alone never resolves as found.
 fn resolve_external_grant(
     config: &Config,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
     source: codewhale_config::ExternalCredentialSource,
     cli: &str,
     consent_command: &str,
     validate: impl FnOnce(&codewhale_config::ExternalCredentialReadGrant) -> bool,
 ) -> Result<CredentialSource, CredentialProbe> {
     let Some(consent) = config
-        .provider_config_for(provider)
+        .provider_config_for(identity)
         .and_then(|entry| entry.external_credentials.as_ref())
     else {
         return Err(CredentialProbe::with_fix(
@@ -326,10 +335,10 @@ fn resolve_external_grant(
     };
     // The pinned path comes from the consent record the user confirmed, never
     // from an ambient candidate, so no resolver runs here either.
-    let Ok(grant) = config.external_credential_read_grant(provider, source, &consent.path) else {
+    let Ok(grant) = config.external_credential_read_grant(identity, source, &consent.path) else {
         return Err(CredentialProbe::with_fix(
             format!("{cli} credentials (consent dormant until this provider is selected)"),
-            format!("codewhale config set provider {}", provider.as_str()),
+            format!("codewhale config set provider {}", identity.key.as_str()),
         ));
     };
     if validate(&grant) {
@@ -345,7 +354,7 @@ fn resolve_external_grant(
         format!("{cli} credentials (consented, but no usable credential in that file)"),
         format!(
             "log in again with {cli}, or run codewhale auth set --provider {}",
-            provider.as_str()
+            identity.key.as_str()
         ),
     ))
 }
@@ -376,7 +385,10 @@ mod tests {
             ),
             ..Config::default()
         };
-        let resolution = resolve_credential_source(&config, ApiProvider::Openrouter);
+        let resolution = resolve_credential_source(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Openrouter),
+        );
         assert_eq!(
             resolution.source,
             CredentialSource::ProviderConfigEnv {
@@ -394,7 +406,11 @@ mod tests {
         let _lock = lock_test_env();
         let ctx = MapAuthContext::new().with_env("OPENROUTER_API_KEY", "value");
         let config = Config::default();
-        let resolution = resolve_credential_source_with(&config, ApiProvider::Openrouter, &ctx);
+        let resolution = resolve_credential_source_with(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Openrouter),
+            &ctx,
+        );
         assert_eq!(
             resolution.source,
             CredentialSource::AmbientEnv {
@@ -412,7 +428,11 @@ mod tests {
         let _lock = lock_test_env();
         let ctx = MapAuthContext::new();
         let config = Config::default();
-        let resolution = resolve_credential_source_with(&config, ApiProvider::Openrouter, &ctx);
+        let resolution = resolve_credential_source_with(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Openrouter),
+            &ctx,
+        );
         assert!(!resolution.is_present());
 
         let checked = resolution.checked_places();
@@ -446,7 +466,11 @@ mod tests {
         let _lock = lock_test_env();
         let ctx = MapAuthContext::new();
         let config = deepseek_config();
-        let resolution = resolve_credential_source_with(&config, ApiProvider::Openrouter, &ctx);
+        let resolution = resolve_credential_source_with(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Openrouter),
+            &ctx,
+        );
 
         let checked = resolution.checked_places();
         assert!(
@@ -465,7 +489,10 @@ mod tests {
             ),
             ..Config::default()
         };
-        let resolution = resolve_credential_source(&config, ApiProvider::Openrouter);
+        let resolution = resolve_credential_source(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Openrouter),
+        );
         assert_eq!(resolution.source, CredentialSource::AuthModeNone);
         assert!(resolution.is_present());
         assert!(resolution.checked_places().is_empty());
@@ -476,11 +503,25 @@ mod tests {
     #[test]
     fn has_api_key_for_agrees_with_the_resolver_for_every_provider() {
         let _lock = lock_test_env();
-        let config = Config::default();
-        for provider in ApiProvider::all() {
-            let resolution = resolve_credential_source(&config, *provider);
+        let mut config = Config::default();
+        config
+            .providers
+            .get_or_insert_with(Default::default)
+            .custom
+            .insert(
+                "custom".into(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".into()),
+                    base_url: Some("http://localhost:1234/v1".into()),
+                    model: Some("fixture-model".into()),
+                    ..Default::default()
+                },
+            );
+        for provider in ProviderKind::all() {
+            let identity = config.test_identity_for_kind(*provider);
+            let resolution = resolve_credential_source(&config, &identity);
             assert_eq!(
-                has_api_key_for(&config, *provider),
+                has_api_key_for(&config, &identity),
                 resolution.is_present(),
                 "{provider:?} disagreed: {:?}",
                 resolution.source
@@ -511,13 +552,19 @@ mod tests {
         };
 
         crate::external_credentials::reset_side_effect_trap();
-        let resolution = resolve_credential_source(&config, ApiProvider::OpenaiCodex);
+        let resolution = resolve_credential_source(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+        );
         assert!(!resolution.is_present());
-        assert!(!has_api_key_for(&config, ApiProvider::OpenaiCodex));
+        assert!(!has_api_key_for(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::OpenaiCodex)
+        ));
         let checked = resolution.checked_places();
         assert!(
-            checked.contains("no read-only consent recorded"),
-            "the probe explains the missing consent without an existence claim: {checked}"
+            checked.contains("Codewhale-owned ChatGPT sign-in"),
+            "the probe names the owned connection without accessing external state: {checked}"
         );
         assert!(
             !checked.contains("(absent)") && !checked.contains("present, not consented"),
@@ -536,7 +583,7 @@ mod tests {
     /// and resolves as *missing* rather than masquerading as a stored
     /// credential. No write, refresh, or network side effect is permitted.
     #[test]
-    fn consented_external_resolution_validates_the_exact_consented_file() {
+    fn chatgpt_resolution_does_not_import_even_consented_external_files() {
         let _lock = lock_test_env();
         let temp = tempfile::tempdir().expect("external fixture");
         let codex_path = temp
@@ -568,7 +615,10 @@ mod tests {
         };
 
         crate::external_credentials::reset_side_effect_trap();
-        let resolution = resolve_credential_source(&config, ApiProvider::OpenaiCodex);
+        let resolution = resolve_credential_source(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+        );
         assert!(
             !resolution.is_present(),
             "a consent record whose file is gone must resolve as missing: {:?}",
@@ -577,20 +627,23 @@ mod tests {
         assert!(
             resolution
                 .checked_places()
-                .contains("consented, but no usable credential in that file"),
-            "the probe names the consented-read outcome: {}",
+                .contains("Codewhale-owned ChatGPT sign-in"),
+            "the probe requires Codewhale sign-in despite external consent: {}",
             resolution.checked_places()
         );
         assert_eq!(
             crate::external_credentials::complete_side_effect_trap_counts(),
-            (1, 0, 0, 0, 0),
-            "one secure open attempt of the exact consented path; NotFound stops before the read"
+            (0, 0, 0, 0, 0),
+            "external consent cannot authorize the public ChatGPT API"
         );
-        assert!(!has_api_key_for(&config, ApiProvider::OpenaiCodex));
+        assert!(!has_api_key_for(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::OpenaiCodex)
+        ));
         assert_eq!(
             crate::external_credentials::complete_side_effect_trap_counts(),
-            (2, 0, 0, 0, 0),
-            "has_api_key_for re-resolves through the same consented read; still no write/refresh/network"
+            (0, 0, 0, 0, 0),
+            "has_api_key_for never reads another client credential"
         );
     }
 }

@@ -107,6 +107,14 @@ MCP tools are dynamic. Successfully connected servers register names such as
 must not be presented as available. MCP and plugin tools are deferred unless a
 user explicitly names them in `[tools].always_load`.
 
+For an unstarted configured server, an MCP-focused `tool_search` first
+performs bounded discovery under the current turn's server/tool ceiling.
+It searches real server-provided schemas after connection, rather than
+inventing `mcp_*` definitions. A search inside `execute_tools` describes
+those schemas without activating them; a direct search uses the existing
+bounded activation cache. Ordinary unrelated searches leave optional servers
+unstarted. The CLI's standalone MCP inspection commands own a separate pool.
+
 ### Code mode (`execute_tools`)
 
 `execute_tools` is engine-injected, alongside the synthetic interpreter tools.

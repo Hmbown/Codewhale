@@ -5,7 +5,7 @@
  * core aborts it. The core resolves a cancelled call on its own side after a
  * 500 ms grace, so a late answer here is harmless (the core drops it).
  */
-import { ErrorCode, MAX_INFLIGHT, validateMessage, type Message, type RpcErrorWire } from './protocol.ts'
+import { ErrorCode, MAX_INFLIGHT, validateMessage, type HostTier, type Message, type RpcErrorWire } from './protocol.ts'
 
 export class RpcError extends Error {
   constructor(
@@ -40,7 +40,11 @@ export class RpcPeer {
   private readonly notificationHandlers = new Map<string, NotificationHandler>()
   private closed = false
 
-  constructor(private readonly send: (message: Message) => void) {}
+  constructor(
+    private readonly send: (message: Message) => void,
+    /** The trust tier this host serves: methods reserved for the other tier are neither sent nor accepted. */
+    private readonly tier: HostTier,
+  ) {}
 
   onRequest(method: string, handler: RequestHandler) {
     this.requestHandlers.set(method, handler)
@@ -50,18 +54,39 @@ export class RpcPeer {
     this.notificationHandlers.set(method, handler)
   }
 
-  /** Send a host→core request. Outbound messages are validated strictly first. */
-  request<T = any>(method: string, params: unknown): Promise<T> {
+  /**
+   * Send a host→core request. Outbound messages are validated strictly first.
+   * When `signal` aborts before the answer, the core is sent `$/cancel` for it
+   * and the promise rejects as cancelled at once; an answer that still arrives
+   * is dropped (the core drops its own after a cancel as well).
+   */
+  request<T = any>(method: string, params: unknown, signal?: AbortSignal): Promise<T> {
     if (this.closed) return Promise.reject(new RpcError(ErrorCode.NotAvailable, 'channel closed'))
+    if (signal?.aborted) return Promise.reject(new RpcError(ErrorCode.Cancelled, 'cancelled'))
     // The core's per-direction limit.
     if (this.pending.size >= MAX_INFLIGHT) {
       return Promise.reject(new RpcError(ErrorCode.Internal, `more than ${MAX_INFLIGHT} requests in flight`))
     }
     const id = this.nextId++
     const message = { jsonrpc: '2.0' as const, id, method, params }
-    validateMessage(message, 'host_to_core')
+    validateMessage(message, 'host_to_core', this.tier)
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
+      const onAbort = () => {
+        if (!this.pending.delete(id)) return
+        this.notify('$/cancel', { id })
+        reject(new RpcError(ErrorCode.Cancelled, 'cancelled'))
+      }
+      this.pending.set(id, {
+        resolve: (value) => {
+          signal?.removeEventListener('abort', onAbort)
+          resolve(value)
+        },
+        reject: (error) => {
+          signal?.removeEventListener('abort', onAbort)
+          reject(error)
+        },
+      })
+      signal?.addEventListener('abort', onAbort, { once: true })
       this.send(message)
     })
   }
@@ -69,13 +94,13 @@ export class RpcPeer {
   notify(method: string, params: unknown) {
     if (this.closed) return
     const message = { jsonrpc: '2.0' as const, method, params }
-    validateMessage(message, 'host_to_core')
+    validateMessage(message, 'host_to_core', this.tier)
     this.send(message)
   }
 
   /** Dispatch one decoded core→host message. Throws `ProtocolError` for malformed input. */
   handle(raw: unknown) {
-    const message = validateMessage(raw, 'core_to_host') as any
+    const message = validateMessage(raw, 'core_to_host', this.tier) as any
     if ('method' in message) {
       if (message.method === '$/cancel') {
         this.inbound.get(message.params.id)?.abort()

@@ -103,7 +103,7 @@ async fn approving_the_first_of_three_queued_calls_cancels_none_of_them() {
     .with_legacy_root(Some("test-key".to_string()), Some(server.uri()));
     let route = crate::route_runtime::resolve_runtime_route(
         &api_config,
-        api_config.api_provider(),
+        api_config.active_provider_identity().unwrap().provider,
         Some(crate::config::DEFAULT_TEXT_MODEL),
     )
     .expect("resolve test route");

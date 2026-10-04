@@ -1,5 +1,7 @@
 {
+  "ExtensionPromptUnavailable": "As instruções das extensões não estão disponíveis; confira /plugin show.",
   "ComposerOversizedSubmitHeld": "Não enviado: esta mensagem excede {limit} caracteres e não pôde ser salva em um arquivo de texto colado ({error}). O texto completo continua no campo de entrada: reduza-o ou permita a gravação em .codewhale/pastes e pressione Enter novamente.",
+  "ComposerOversizedSubmitHeldShort": "Não enviado: acima de {limit} caracteres; arquivo colado não salvo.",
   "CmdPluginOwnerReport": "Host de extensões:\n  Estado: {state}\n  Ferramentas ativas ({count}): {tools}",
   "CmdPluginOwnerActivating": "Ativando",
   "CmdPluginOwnerActive": "Ativo",
@@ -2439,5 +2441,11 @@
   "ModelPickerReadinessRefreshed": "Prontidão dos modelos atualizada · linhas do catálogo reconstruídas",
   "ModelPickerOpenToRefresh": "Abra /model para atualizar a prontidão e o catálogo",
   "ModelPickerPinnedChip": "fixado",
+  "AuthSignedInAs": "Conectado ao {provider} como {account}.",
+  "AuthSignedInWithoutEmail": "Conectado ao {provider} (o emissor não enviou o e-mail da conta).",
+  "AuthReplacedPreviousSignInAs": "Substituiu o login anterior do Codewhale no {provider} ({account}).",
+  "AuthReplacedPreviousSignIn": "Substituiu o login anterior do Codewhale no {provider}.",
+  "AuthSameAccountAsBefore": "Esta é a mesma conta de antes; para usar outra conta do {provider}, saia dela no navegador (ou use uma janela privada) e entre novamente.",
+  "AuthEnvTokenOutranksSignIn": "OPENAI_CODEX_ACCESS_TOKEN ou CODEX_ACCESS_TOKEN está definido neste ambiente e tem prioridade sobre este login; as solicitações continuam usando a conta desse token até você removê-lo.",
   "PinnedPromptJumpToMessage": "Ir para esta mensagem"
 }

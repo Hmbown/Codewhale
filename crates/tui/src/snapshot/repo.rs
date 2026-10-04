@@ -2956,7 +2956,9 @@ mod tests {
         let held = peer.write().expect("peer holds the write lock");
 
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let env_ticket = crate::test_support::env_scope_ticket();
         let opener = std::thread::spawn(move || {
+            let _membership = crate::test_support::join_env_scope(env_ticket);
             let opened = SnapshotRepo::open_or_init(&workspace);
             let _ = done_tx.send(());
             opened

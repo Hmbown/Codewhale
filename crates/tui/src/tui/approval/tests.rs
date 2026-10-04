@@ -2996,3 +2996,284 @@ fn delegated_work_cards_show_requested_authority_fields() {
             .any(|detail| detail.label == "Trust mode")
     );
 }
+
+fn native_band_expected_decisions(request: &ApprovalRequest) -> Vec<ReviewDecision> {
+    let mut decisions = vec![ReviewDecision::Approved, ReviewDecision::ApprovedForSession];
+    if request.tool_name == "workflow" {
+        return vec![
+            ReviewDecision::Approved,
+            ReviewDecision::Denied,
+            ReviewDecision::Abort,
+        ];
+    }
+    if request.owner.is_none() && request.can_save_allow_rule() {
+        decisions.push(ReviewDecision::Approved);
+    }
+    decisions.push(ReviewDecision::Denied);
+    if request.owner.is_none() {
+        decisions.push(ReviewDecision::Abort);
+    }
+    decisions
+}
+
+#[test]
+fn kit_decision_band_matches_exact_legacy_paint_region_and_option_geometry() {
+    use crate::tui::widgets::{Renderable, legacy_approval_band};
+    use ratatui::{
+        buffer::Buffer,
+        layout::Rect,
+        style::{Color, Style},
+    };
+    let mut child = shell_request();
+    child.owner = Some(ApprovalOwner {
+        agent_id: "child-1".into(),
+        label: "Builder 你好".into(),
+        role: Some("implementer".into()),
+    });
+    let workflow = ApprovalRequest::new(
+        "workflow",
+        "workflow",
+        "Launch workflow",
+        &json!({"action":"start","plan":{"goal":"ship the fix","children":[{"prompt":"go"}]}}),
+        "tool:workflow",
+    );
+    let law = ApprovalRequest::new(
+        "law",
+        "edit_file",
+        "Repo law holds this write: protected path",
+        &json!({"path":"Cargo.toml","old":"a","new":"b"}),
+        "tool:edit_file",
+    );
+    let cases = [
+        benign_request(),
+        shell_request(),
+        critical_request(),
+        destructive_request(),
+        child,
+        workflow,
+        law,
+    ];
+    for &locale in Locale::shipped() {
+        for request in &cases {
+            for collapsed in [false, true] {
+                for width in [40, 60, 80, 120] {
+                    for height in [9, 12, 20, 40] {
+                        let mut actual_view = ApprovalView::new_for_locale(request.clone(), locale);
+                        actual_view.collapsed = collapsed;
+                        let mut legacy_view = actual_view.clone();
+                        let area = Rect::new(7, 5, width, height);
+                        let canvas = Rect::new(2, 3, width + 12, height + 8);
+                        let mut actual = Buffer::empty(canvas);
+                        actual.set_style(
+                            canvas,
+                            Style::default()
+                                .bg(Color::Rgb(11, 23, 37))
+                                .add_modifier(ratatui::style::Modifier::UNDERLINED),
+                        );
+                        for cell in &mut actual.content {
+                            cell.set_symbol("~");
+                        }
+                        let mut expected = actual.clone();
+                        let guard = actual[(canvas.x, canvas.y)].clone();
+                        let legacy =
+                            legacy_approval_band::ApprovalWidget::new(request, &legacy_view);
+                        assert_eq!(
+                            actual_view.occupied_region(area),
+                            legacy.inline_region(area)
+                        );
+                        actual_view.render(area, &mut actual);
+                        legacy.render(area, &mut expected);
+                        // The frozen painter's unbounded truncation hint can
+                        // spill beyond the requested region. Preserve exact
+                        // in-region paint while requiring the kit's bounds guard.
+                        for y in canvas.y..canvas.bottom() {
+                            for x in canvas.x..canvas.right() {
+                                if x < area.x
+                                    || x >= area.right()
+                                    || y < area.y
+                                    || y >= area.bottom()
+                                {
+                                    expected[(x, y)] = guard.clone();
+                                }
+                            }
+                        }
+                        assert_eq!(
+                            actual, expected,
+                            "locale={locale:?} tool={} collapsed={collapsed} area={area:?}",
+                            request.tool_name
+                        );
+                        let mut expected_boxes = legacy_view.row_hitboxes.borrow().clone();
+                        // Hidden/collapsed actions keep canonical empty slots.
+                        expected_boxes.resize(
+                            native_band_expected_decisions(request).len(),
+                            Rect::default(),
+                        );
+                        assert_eq!(*actual_view.row_hitboxes.borrow(), expected_boxes);
+                        for code in [KeyCode::Char('p'), KeyCode::Char('s')] {
+                            assert_eq!(
+                                matches!(
+                                    actual_view.handle_key(create_key_event(code)),
+                                    ViewAction::EmitAndClose(_)
+                                ),
+                                matches!(
+                                    legacy_view.handle_key(create_key_event(code)),
+                                    ViewAction::EmitAndClose(_)
+                                )
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn kit_decision_band_resize_to_zero_withdraws_persistent_keys_and_stale_hitboxes() {
+    use ratatui::{buffer::Buffer, layout::Rect};
+    let view = ApprovalView::new(shell_request());
+    render_lines(&view, 120, 40);
+    assert!(
+        view.row_hitboxes
+            .borrow()
+            .iter()
+            .any(|rect| !rect.is_empty())
+    );
+    let mut view = view;
+    for area in [Rect::new(7, 5, 0, 40), Rect::new(7, 5, 120, 0)] {
+        let mut buf = Buffer::empty(Rect::new(7, 5, 120, 40));
+        view.render(area, &mut buf);
+        assert!(
+            view.row_hitboxes
+                .borrow()
+                .iter()
+                .all(|rect| rect.is_empty())
+        );
+        for code in ['p', 's'] {
+            assert!(matches!(
+                view.handle_key(create_key_event(KeyCode::Char(code))),
+                ViewAction::None
+            ));
+        }
+    }
+}
+
+#[test]
+fn kit_decision_band_last_wrapped_action_row_keeps_its_canonical_decision() {
+    for &locale in Locale::shipped() {
+        let request = destructive_request();
+        let view = ApprovalView::new_for_locale(request.clone(), locale);
+        render_lines(&view, 40, 12);
+        let boxes = view.row_hitboxes.borrow().clone();
+        for (index, rect) in boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, rect)| !rect.is_empty())
+        {
+            let mut view = view.clone();
+            let action = view.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.bottom() - 1,
+                modifiers: KeyModifiers::NONE,
+            });
+            let ViewAction::EmitAndClose(ViewEvent::ApprovalDecision { decision, .. }) = action
+            else {
+                panic!("wrapped row did not decide {locale:?} {index}");
+            };
+            assert_eq!(decision, native_band_expected_decisions(&request)[index]);
+        }
+    }
+}
+
+#[test]
+fn kit_decision_band_keeps_parent_child_and_default_deny_authority() {
+    let mut parent = ApprovalView::new(shell_request());
+    render_lines(&parent, 120, 40);
+    assert!(matches!(
+        parent.handle_key(create_key_event(KeyCode::Enter)),
+        ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+            decision: ReviewDecision::Denied,
+            ..
+        })
+    ));
+    assert!(matches!(
+        parent.handle_key(create_key_event(KeyCode::Esc)),
+        ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+            decision: ReviewDecision::Abort,
+            ..
+        })
+    ));
+    let mut child = shell_request();
+    child.owner = Some(ApprovalOwner {
+        agent_id: "child-1".into(),
+        label: "Builder".into(),
+        role: None,
+    });
+    let mut child = ApprovalView::new(child);
+    render_lines(&child, 40, 12);
+    assert!(matches!(
+        child.handle_key(create_key_event(KeyCode::Esc)),
+        ViewAction::Close
+    ));
+    assert!(
+        matches!(child.handle_key(create_key_event(KeyCode::Char('g'))), ViewAction::Emit(ViewEvent::OpenAgentTranscript { agent_id }) if agent_id == "child-1")
+    );
+    for kind in [
+        crossterm::event::KeyEventKind::Release,
+        crossterm::event::KeyEventKind::Repeat,
+    ] {
+        let mut key = create_key_event(KeyCode::Char('y'));
+        key.kind = kind;
+        assert!(matches!(child.handle_key(key), ViewAction::None));
+    }
+    assert!(matches!(
+        child.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+        ViewAction::None
+    ));
+    child.timeout = Some(std::time::Duration::from_secs(1));
+    child.requested_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+    assert!(matches!(
+        child.tick(),
+        ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+            decision: ReviewDecision::Denied,
+            timed_out: true,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn kit_decision_band_clips_the_legacy_truncation_hint_spill() {
+    use crate::tui::widgets::{Renderable, legacy_approval_band};
+    use ratatui::{
+        buffer::Buffer,
+        layout::Rect,
+        style::{Color, Style},
+    };
+    let request = critical_request();
+    let actual_view = ApprovalView::new_for_locale(request.clone(), Locale::En);
+    let legacy_view = actual_view.clone();
+    let area = Rect::new(7, 5, 40, 20);
+    let canvas = Rect::new(2, 3, 52, 28);
+    let mut actual = Buffer::empty(canvas);
+    actual.set_style(canvas, Style::default().bg(Color::Rgb(11, 23, 37)));
+    for cell in &mut actual.content {
+        cell.set_symbol("~");
+    }
+    let guard = actual[(canvas.x, canvas.y)].clone();
+    let mut legacy = actual.clone();
+    actual_view.render(area, &mut actual);
+    legacy_approval_band::ApprovalWidget::new(&request, &legacy_view).render(area, &mut legacy);
+    assert!(
+        (area.y..area.bottom()).any(|y| legacy[(area.right(), y)] != guard),
+        "the frozen counterpart demonstrates the old right-edge spill"
+    );
+    for y in canvas.y..canvas.bottom() {
+        for x in canvas.x..canvas.right() {
+            if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
+                assert_eq!(actual[(x, y)], guard, "guard at {x},{y}");
+            }
+        }
+    }
+}

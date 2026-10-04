@@ -1,72 +1,12 @@
-//! RLM turn loop — paper Algorithm 1 driven over a long-lived Python
-//! subprocess + stdin/stdout RPC bridge (no HTTP sidecar).
-//!
-//! # What this loop is, and is not (#6511)
-//!
-//! This is the recursive sub-RLM behind `rlm_query` from the Python REPL
-//! (`bridge.rs::dispatch_rlm`). It is a second model/code-round loop beside
-//! `Engine::run_turn`, listed as a named interim exception in
-//! `crates/core/tests/single_turn_loop.rs` until it converges.
-//!
-//! - **Logged.** Every status line and code round is retained in the shared
-//!   RLM receipt batch before live forwarding. The enclosing RLM tool includes
-//!   those receipts in its result, using the same session/artifact persistence
-//!   as any other tool. A terminal receipt records how the loop ended.
-//! - **History is kept whole.** The root model sees every prior round. The
-//!   history is bounded by `MAX_RLM_ITERATIONS` (two small metadata messages
-//!   per round), not by silently dropping the middle.
-//! - **Never an empty answer without a reason.** On exhaustion the last root
-//!   response is returned with the error, and the REPL's `rlm_query` hands
-//!   that text to the caller marked `[rlm_query incomplete: …]`. Any other
-//!   empty answer, except a deliberate `FINAL("")`, carries an error naming
-//!   the termination.
-//! - **Wall-clock bounded.** One deadline covers setup, model/code rounds
-//!   (including recursive RPCs), and shutdown. Timeout keeps the last root
-//!   response and reports an incomplete result, just like iteration exhaustion.
-//!
-//! The parent deadline is inherited through every bridge; the existing default
-//! child wall-time remains an additional upper bound. Async cancellation cannot
-//! preempt synchronous context-file I/O or CPU work, stop remote provider work
-//! already dispatched, or kill Python's descendants. Receipts become durable
-//! with the enclosing tool result; killing the host or externally dropping the
-//! whole tool future before hand-back can still lose its in-flight receipts.
+//! Pure RLM result and feedback facts. The canonical Engine owns every model
+//! request, code round, cancellation, session message and permission settlement.
+use codewhale_models::{ContentBlock, Message, Role, Usage};
+use std::time::Duration;
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use tokio::sync::mpsc;
-use uuid::Uuid;
-
-use crate::core::events::Event;
-use crate::repl::PythonRuntime;
-use codewhale_models::{
-    ContentBlock, Message, MessageRequest, SystemPrompt, Usage, is_incomplete_stop_reason,
-    stop_reason_detail,
-};
-
-use super::bridge::{RlmBridge, RlmLlmClient, RlmUsageAccumulator};
-use super::prompt::rlm_system_prompt;
-use codewhale_models::Role;
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Maximum number of RLM iterations before the loop gives up.
-const MAX_RLM_ITERATIONS: u32 = 25;
-/// Max consecutive rounds where the model returns no `repl` fence before we
-/// hard-fail. The paper requires `code → REPL → Final`; anything else is
-/// not the RLM contract.
-const MAX_CONSECUTIVE_NO_CODE: u32 = 3;
-/// Max chars of stdout shown as metadata to the root LLM in next iteration.
-const STDOUT_METADATA_PREVIEW_LEN: usize = 800;
-/// Max chars of `context` shown as a preview in the metadata.
+pub(crate) const MAX_RLM_ITERATIONS: u32 = 25;
+pub(crate) const MAX_CONSECUTIVE_NO_CODE: u32 = 3;
+pub(crate) const STDOUT_METADATA_PREVIEW_LEN: usize = 800;
 const PROMPT_PREVIEW_LEN: usize = 500;
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// How an RLM turn ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,768 +61,45 @@ pub struct RlmTurnResult {
     pub total_rpcs: u32,
 }
 
-/// Inner entry point — also used by the bridge when it recurses. Returns
-/// a boxed future to break the recursive opaque-future-type cycle:
-/// `run_rlm_turn_inner` → `RlmBridge::dispatch` → `run_rlm_turn_inner`.
-#[cfg(test)]
-pub(crate) fn run_rlm_turn_inner(
-    client: Arc<dyn RlmLlmClient>,
-    model: String,
-    prompt: String,
-    root_prompt: Option<String>,
-    child_model: String,
-    tx_event: mpsc::Sender<Event>,
-    max_depth: u32,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = RlmTurnResult> + Send>> {
-    run_rlm_turn_inner_with_usage(
-        client,
-        model,
-        prompt,
-        root_prompt,
-        child_model,
-        tx_event,
-        max_depth,
-        RlmUsageAccumulator::new(),
-        tokio::time::Instant::now() + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME,
-        Some(crate::tools::codemode::NestedCallGate::admitting_for_test()),
-    )
-}
-
-/// Recursive entry point that keeps one pre-dispatch receipt bound across the
-/// entire nested/batched RLM tree.
-pub(crate) fn run_rlm_turn_inner_with_usage(
-    client: Arc<dyn RlmLlmClient>,
-    model: String,
-    prompt: String,
-    root_prompt: Option<String>,
-    child_model: String,
-    tx_event: mpsc::Sender<Event>,
-    max_depth: u32,
-    usage: RlmUsageAccumulator,
-    deadline: tokio::time::Instant,
-    gate: Option<crate::tools::codemode::NestedCallGate>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = RlmTurnResult> + Send>> {
-    Box::pin(async move {
-        let mut result = run_rlm_turn_impl(
-            client,
-            model,
-            prompt,
-            root_prompt,
-            child_model,
-            tx_event,
-            max_depth,
-            usage.clone(),
-            deadline,
-            gate,
-        )
-        .await;
-        let snapshot = usage.snapshot().await;
-        result.usage = snapshot.usage;
-        result.routed_usage = snapshot.records;
-        result.routed_usage_drop_records = snapshot.drop_records;
-        result.routed_usage_dropped_records = snapshot.dropped_records;
-        result
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Implementation
-// ---------------------------------------------------------------------------
-
-/// Why one round of model-written Python may not run, or `None` when the
-/// serving turn admitted exactly `code`.
-///
-/// Known limitation: time spent waiting on an approval counts against the
-/// RLM turn's absolute deadline.
-async fn round_refusal(
-    gate: Option<&crate::tools::codemode::NestedCallGate>,
-    code: &str,
-) -> Option<String> {
-    use crate::tools::codemode::NestedCallVerdict;
-    let tool_name = crate::core::engine::tool_catalog::CODE_EXECUTION_TOOL_NAME;
-    let Some(gate) = gate else {
-        return Some("no permission gate is serving this RLM turn".to_string());
-    };
-    match gate
-        .ask(tool_name.to_string(), serde_json::json!({ "code": code }))
-        .await
-    {
-        NestedCallVerdict::Run { name, input, .. }
-            if name == tool_name
-                && input.get("code").and_then(serde_json::Value::as_str) == Some(code) =>
+impl RlmTurnResult {
+    pub(crate) fn failed(error: String, duration: Duration) -> Self {
+        Self {
+            answer: String::new(),
+            iterations: 0,
+            duration,
+            error: Some(error),
+            usage: Usage::default(),
+            routed_usage: Vec::new(),
+            routed_usage_drop_records: Vec::new(),
+            routed_usage_dropped_records: 0,
+            termination: RlmTermination::Error,
+            trace: Vec::new(),
+            total_rpcs: 0,
+        }
+    }
+    pub(crate) fn require_answer_or_error(mut self) -> Self {
+        if self.termination != RlmTermination::Final
+            && self.answer.trim().is_empty()
+            && self.error.is_none()
         {
-            None
+            self.error = Some(format!(
+                "RLM ended ({:?}) after {} iteration(s) with an empty answer",
+                self.termination, self.iterations
+            ));
         }
-        NestedCallVerdict::Run { .. } | NestedCallVerdict::Answered { .. } => {
-            Some("the admitted call was not this code".to_string())
-        }
-        NestedCallVerdict::Refused { error, .. } => Some(error.to_string()),
+        self
     }
 }
 
-/// Record at the producing loop, before forwarding. Recording at each bridge
-/// would duplicate deeper events as they pass through their ancestors.
-struct RlmEventSender {
-    sender: mpsc::Sender<Event>,
-    usage: RlmUsageAccumulator,
-    run_id: String,
-    depth_remaining: u32,
+pub(crate) fn metadata_text(
+    prompt: &str,
+    iteration: u32,
+    code: Option<&str>,
+    stdout: Option<&str>,
+) -> String {
+    extract_text_blocks(&build_metadata_message(prompt, None, iteration, code, stdout).content)
 }
 
-impl RlmEventSender {
-    async fn record(&self, event: &Event) {
-        let (kind, content) = match event {
-            Event::Status { message } => ("status", message.as_str()),
-            Event::MessageDelta { content, .. } => ("code", content.as_str()),
-            _ => return,
-        };
-        self.usage
-            .record_nested_event(serde_json::json!({
-                "run_id": self.run_id,
-                "depth_remaining": self.depth_remaining,
-                "kind": kind,
-                "content": content,
-            }))
-            .await;
-    }
-
-    async fn send(&self, event: Event) {
-        self.record(&event).await;
-        let _ = self.sender.send(event).await;
-    }
-}
-
-async fn run_rlm_turn_impl(
-    client: Arc<dyn RlmLlmClient>,
-    model: String,
-    prompt: String,
-    root_prompt: Option<String>,
-    child_model: String,
-    tx_event: mpsc::Sender<Event>,
-    max_depth: u32,
-    routed_usage: RlmUsageAccumulator,
-    deadline: tokio::time::Instant,
-    gate: Option<crate::tools::codemode::NestedCallGate>,
-) -> RlmTurnResult {
-    let start = Instant::now();
-    let tx_event = RlmEventSender {
-        sender: tx_event,
-        usage: routed_usage.clone(),
-        run_id: Uuid::new_v4().to_string(),
-        depth_remaining: max_depth,
-    };
-    let mut total_usage = Usage::default();
-    let mut trace: Vec<RlmRoundTrace> = Vec::new();
-    let mut total_rpcs: u32 = 0;
-    let mut iterations = 0;
-    let mut last_response_text = String::new();
-
-    // Cancelling this future drops the owned PythonRuntime: kill_on_drop stops
-    // the interpreter and its Drop implementation removes the context file.
-    let result = tokio::time::timeout_at(deadline, async {
-        // 1. Stage `context` to a temp file. The REPL reads it on bootstrap so
-        //    the big string never enters the process command line and doesn't
-        //    show up in `ps`.
-        let ctx_path = match write_context_file(&prompt) {
-            Ok(p) => p,
-            Err(e) => {
-                return RlmTurnResult {
-                    answer: String::new(),
-                    iterations: 0,
-                    duration: start.elapsed(),
-                    error: Some(format!("rlm: failed to stage context: {e}")),
-                    usage: total_usage.clone(),
-                    routed_usage: Vec::new(),
-                    routed_usage_drop_records: Vec::new(),
-                    routed_usage_dropped_records: 0,
-                    termination: RlmTermination::Error,
-                    trace: trace.clone(),
-                    total_rpcs,
-                };
-            }
-        };
-
-        // 2. Spawn the long-lived REPL.
-        let mut repl = match PythonRuntime::spawn_with_context(&ctx_path).await {
-            Ok(rt) => rt,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&ctx_path).await;
-                return RlmTurnResult {
-                    answer: String::new(),
-                    iterations: 0,
-                    duration: start.elapsed(),
-                    error: Some(format!("rlm: failed to spawn REPL: {e}")),
-                    usage: total_usage.clone(),
-                    routed_usage: Vec::new(),
-                    routed_usage_drop_records: Vec::new(),
-                    routed_usage_dropped_records: 0,
-                    termination: RlmTermination::Error,
-                    trace: trace.clone(),
-                    total_rpcs,
-                };
-            }
-        };
-
-        // 3. Build the bridge that services llm_query / rlm_query RPCs.
-        let bridge = RlmBridge::with_usage_accumulator(
-            Arc::clone(&client),
-            child_model.clone(),
-            max_depth,
-            routed_usage.clone(),
-        )
-        .with_events(tx_event.sender.clone())
-        .with_deadline(Some(deadline))
-        .with_gate(gate.clone());
-
-        tx_event
-            .send(Event::status(format!(
-                "RLM: spawned Python REPL (root={model}, child={child_model}, max_depth={max_depth}, ctx={} chars)",
-                prompt.chars().count()
-            )))
-            .await;
-
-        // 4. Build initial metadata-only history.
-        let system = rlm_system_prompt();
-        let mut messages: Vec<Message> = vec![build_metadata_message(
-            &prompt,
-            root_prompt.as_deref(),
-            0,
-            None,
-            None,
-        )];
-
-        let mut consecutive_no_code: u32 = 0;
-        let mut consecutive_empty_rounds: u32 = 0;
-
-        let result = 'turn: {
-            for iteration in 0..MAX_RLM_ITERATIONS {
-                iterations = iteration + 1;
-
-                tx_event
-                    .send(Event::status(format!(
-                        "RLM iteration {}/{}",
-                        iteration + 1,
-                        MAX_RLM_ITERATIONS
-                    )))
-                    .await;
-
-                // 4a. Root LLM generates code from metadata-only context.
-                let request_route = client.effective_route_envelope(&model, chrono::Utc::now());
-                let reservation = match routed_usage.reserve(request_route.clone()).await {
-                    Ok(reservation) => reservation,
-                    Err(error) => {
-                        break 'turn RlmTurnResult {
-                            answer: String::new(),
-                            iterations: iteration,
-                            duration: start.elapsed(),
-                            error: Some(error),
-                            usage: total_usage.clone(),
-                            routed_usage: Vec::new(),
-                            routed_usage_drop_records: Vec::new(),
-                            routed_usage_dropped_records: 0,
-                            termination: RlmTermination::Error,
-                            trace: trace.clone(),
-                            total_rpcs,
-                        };
-                    }
-                };
-                let request = build_root_request(
-                    &model,
-                    &messages,
-                    &system,
-                    client.effective_max_output_tokens(&request_route.model),
-                );
-
-                let response = match client.create_message_boxed(request).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        routed_usage.cancel(reservation, false).await;
-                        break 'turn RlmTurnResult {
-                            answer: String::new(),
-                            iterations: iteration + 1,
-                            duration: start.elapsed(),
-                            error: Some(format!("Root LLM call failed: {e}")),
-                            usage: total_usage.clone(),
-                            routed_usage: Vec::new(),
-                            routed_usage_drop_records: Vec::new(),
-                            routed_usage_dropped_records: 0,
-                            termination: RlmTermination::Error,
-                            trace: trace.clone(),
-                            total_rpcs,
-                        };
-                    }
-                };
-
-                // Preserve billed usage even when the response is incomplete and
-                // its partial FINAL/REPL output is rejected below.
-                routed_usage
-                    .settle_provider_success(reservation, &response.usage)
-                    .await;
-                super::add_usage_with_prompt_cache(&mut total_usage, &response.usage);
-
-                if is_incomplete_stop_reason(response.stop_reason.as_deref()) {
-                    let reason = stop_reason_detail(response.stop_reason.as_deref());
-                    break 'turn RlmTurnResult {
-                        answer: String::new(),
-                        iterations: iteration + 1,
-                        duration: start.elapsed(),
-                        error: Some(format!(
-                            "RLM root model response incomplete: provider stop reason `{reason}`; partial FINAL/REPL output was not accepted."
-                        )),
-                        usage: total_usage.clone(),
-                        routed_usage: Vec::new(),
-                        routed_usage_drop_records: Vec::new(),
-                        routed_usage_dropped_records: 0,
-                        termination: RlmTermination::Error,
-                        trace: trace.clone(),
-                        total_rpcs,
-                    };
-                }
-
-                let response_text = extract_text_blocks(&response.content);
-                last_response_text = response_text.clone();
-
-                // 4b. Top-level FINAL(...) lets the model close out without
-                //     touching the REPL — but only if it has done some work
-                //     (non-zero rpc_count) on a prior round. Otherwise it's a
-                //     shortcut and we reject it.
-                if let Some(final_val) = parse_text_final(&response_text) {
-                    if total_rpcs == 0 {
-                        // Discard the top-level FINAL — the model is bypassing
-                        // the loop. Force it to use the REPL by appending a
-                        // strict reminder.
-                        consecutive_no_code = consecutive_no_code.saturating_add(1);
-                        if consecutive_no_code >= MAX_CONSECUTIVE_NO_CODE {
-                            break 'turn RlmTurnResult {
-                                answer: final_val,
-                                iterations: iteration + 1,
-                                duration: start.elapsed(),
-                                error: None,
-                                usage: total_usage.clone(),
-                                routed_usage: Vec::new(),
-                                routed_usage_drop_records: Vec::new(),
-                                routed_usage_dropped_records: 0,
-                                termination: RlmTermination::NoCode,
-                                trace: trace.clone(),
-                                total_rpcs,
-                            };
-                        }
-                        messages.push(Message {
-                            role: Role::Assistant,
-                            content: vec![ContentBlock::Text {
-                                text: response_text.clone(),
-                                cache_control: None,
-                            }],
-                        });
-                        messages.push(Message {
-                            role: Role::User,
-                            content: vec![ContentBlock::Text {
-                                text: "You called FINAL(...) without ever running a ```repl block. \
-                                       That defeats the recursive language model — you're guessing \
-                                       from the preview alone. Emit a ```repl block now that uses \
-                                       `llm_query`, `sub_query_sequence`, or an explicitly independent \
-                                       `llm_query_batched(..., dependency_mode=\"independent\")` against \
-                                       `context` to actually compute the answer."
-                                    .to_string(),
-                                cache_control: None,
-                            }],
-                        });
-                        continue;
-                    }
-                    tx_event
-                        .send(Event::status(
-                            "RLM: FINAL detected in response text".to_string(),
-                        ))
-                        .await;
-                    break 'turn RlmTurnResult {
-                        answer: final_val,
-                        iterations: iteration + 1,
-                        duration: start.elapsed(),
-                        error: None,
-                        usage: total_usage.clone(),
-                        routed_usage: Vec::new(),
-                        routed_usage_drop_records: Vec::new(),
-                        routed_usage_dropped_records: 0,
-                        termination: RlmTermination::Final,
-                        trace: trace.clone(),
-                        total_rpcs,
-                    };
-                }
-
-                // 4c. Extract a ```repl block.
-                let code = extract_repl_code(&response_text);
-                let code_to_run = match code {
-                    Some(c) => {
-                        consecutive_no_code = 0;
-                        c
-                    }
-                    None => {
-                        consecutive_no_code = consecutive_no_code.saturating_add(1);
-                        if consecutive_no_code >= MAX_CONSECUTIVE_NO_CODE {
-                            break 'turn RlmTurnResult {
-                                answer: response_text,
-                                iterations: iteration + 1,
-                                duration: start.elapsed(),
-                                error: Some(format!(
-                                    "RLM: model failed to emit ```repl after {MAX_CONSECUTIVE_NO_CODE} consecutive rounds"
-                                )),
-                                usage: total_usage.clone(),
-                                routed_usage: Vec::new(),
-                                routed_usage_drop_records: Vec::new(),
-                                routed_usage_dropped_records: 0,
-                                termination: RlmTermination::NoCode,
-                                trace: trace.clone(),
-                                total_rpcs,
-                            };
-                        }
-                        messages.push(Message {
-                            role: Role::Assistant,
-                            content: vec![ContentBlock::Text {
-                                text: response_text.clone(),
-                                cache_control: None,
-                            }],
-                        });
-                        messages.push(Message {
-                            role: Role::User,
-                            content: vec![ContentBlock::Text {
-                                text: "Reminder: emit Python inside a ```repl … ``` fence. \
-                                       Use `llm_query`, `sub_query_sequence`, or \
-                                       `llm_query_batched(..., dependency_mode=\"independent\")` to \
-                                       process `context` and call `FINAL(value)` when done."
-                                    .to_string(),
-                                cache_control: None,
-                            }],
-                        });
-                        continue;
-                    }
-                };
-
-                tx_event
-                    .send(Event::MessageDelta {
-                        index: iteration as usize,
-                        content: format!(
-                            "\n[RLM round {} — code]\n```repl\n{code_to_run}\n```\n",
-                            iteration + 1
-                        ),
-                    })
-                    .await;
-
-                // 4d. Model-written Python runs only after the serving turn
-                //     admits this exact code, like a `code_execution` call
-                //     carrying it. No gate, a refusal, or an answer for any
-                //     other input ends the turn with nothing run.
-                if let Some(reason) = round_refusal(gate.as_ref(), &code_to_run).await {
-                    tx_event
-                        .send(Event::status(format!(
-                            "RLM round {} not run: {reason}",
-                            iteration + 1
-                        )))
-                        .await;
-                    break 'turn RlmTurnResult {
-                        answer: String::new(),
-                        iterations: iteration + 1,
-                        duration: start.elapsed(),
-                        error: Some(format!("RLM code was not run: {reason}")),
-                        usage: total_usage.clone(),
-                        routed_usage: Vec::new(),
-                        routed_usage_drop_records: Vec::new(),
-                        routed_usage_dropped_records: 0,
-                        termination: RlmTermination::Error,
-                        trace: trace.clone(),
-                        total_rpcs,
-                    };
-                }
-
-                // 4e. Execute the code in the REPL with the bridge servicing
-                //     llm_query / rlm_query callbacks.
-                let round = match repl.run(&code_to_run, Some(&bridge)).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        break 'turn RlmTurnResult {
-                            answer: String::new(),
-                            iterations: iteration + 1,
-                            duration: start.elapsed(),
-                            error: Some(format!("REPL execution failed: {e}")),
-                            usage: total_usage.clone(),
-                            routed_usage: Vec::new(),
-                            routed_usage_drop_records: Vec::new(),
-                            routed_usage_dropped_records: 0,
-                            termination: RlmTermination::Error,
-                            trace: trace.clone(),
-                            total_rpcs,
-                        };
-                    }
-                };
-
-                total_rpcs = total_rpcs.saturating_add(round.rpc_count);
-
-                // Trace this round.
-                let stdout_preview = truncate_text(round.stdout.trim(), STDOUT_METADATA_PREVIEW_LEN);
-                trace.push(RlmRoundTrace {
-                    round: iteration + 1,
-                    code_summary: summarize_code(&code_to_run),
-                    stdout_preview: stdout_preview.clone(),
-                    had_error: round.has_error,
-                    rpc_count: round.rpc_count,
-                    elapsed_ms: round.elapsed.as_millis() as u64,
-                });
-
-                tx_event
-                    .send(Event::status(format!(
-                        "RLM round {}: {} bytes stdout, {} sub-LLM call(s){}",
-                        iteration + 1,
-                        round.full_stdout.len(),
-                        round.rpc_count,
-                        if round.has_error { " (error)" } else { "" },
-                    )))
-                    .await;
-
-                // 4e. FINAL detection.
-                if let Some(final_val) = round.final_value.clone() {
-                    tx_event
-                        .send(Event::status(
-                            "RLM: FINAL detected in REPL, ending loop".to_string(),
-                        ))
-                        .await;
-                    break 'turn RlmTurnResult {
-                        answer: final_val,
-                        iterations: iteration + 1,
-                        duration: start.elapsed(),
-                        error: None,
-                        usage: total_usage.clone(),
-                        routed_usage: Vec::new(),
-                        routed_usage_drop_records: Vec::new(),
-                        routed_usage_dropped_records: 0,
-                        termination: RlmTermination::Final,
-                        trace: trace.clone(),
-                        total_rpcs,
-                    };
-                }
-
-                // 4e+. Empty/no-op guard — same contract as the normal Agent REPL path.
-                // If the block produced no stdout, no RPC, and no finalize(), tell the
-                // model plainly and count consecutive empties to avoid an infinite loop.
-                let is_empty_round = !round.has_error
-                    && round.stdout.trim().is_empty()
-                    && round.stderr.trim().is_empty()
-                    && round.rpc_count == 0
-                    && round.final_value.is_none();
-                if is_empty_round {
-                    consecutive_empty_rounds = consecutive_empty_rounds.saturating_add(1);
-                    let empty_feedback = if consecutive_empty_rounds >= MAX_CONSECUTIVE_NO_CODE {
-                        format!(
-                            "Your emitted ```repl block (round {}) result: no observable output — print something, call a helper, or stop emitting REPL blocks and answer. No output for {consecutive_empty_rounds} consecutive rounds; stopping empty loop.",
-                            iteration + 1
-                        )
-                    } else {
-                        format!(
-                            "Your emitted ```repl block (round {}) result: no observable output — print something, call a helper, or stop emitting REPL blocks and answer",
-                            iteration + 1
-                        )
-                    };
-                    messages.push(Message {
-                        role: Role::Assistant,
-                        content: vec![ContentBlock::Text {
-                            text: format!("```repl\n{code_to_run}\n```"),
-                            cache_control: None,
-                        }],
-                    });
-                    messages.push(build_metadata_message(
-                        &prompt,
-                        root_prompt.as_deref(),
-                        iteration + 1,
-                        Some(&code_to_run),
-                        Some(&empty_feedback),
-                    ));
-                    if consecutive_empty_rounds >= MAX_CONSECUTIVE_NO_CODE {
-                        break 'turn RlmTurnResult {
-                            answer: last_response_text.clone(),
-                            iterations: iteration + 1,
-                            duration: start.elapsed(),
-                            error: Some(format!(
-                                "RLM: {MAX_CONSECUTIVE_NO_CODE} consecutive empty REPL rounds"
-                            )),
-                            usage: total_usage.clone(),
-                            routed_usage: Vec::new(),
-                            routed_usage_drop_records: Vec::new(),
-                            routed_usage_dropped_records: 0,
-                            termination: RlmTermination::NoCode,
-                            trace: trace.clone(),
-                            total_rpcs,
-                        };
-                    }
-                    continue;
-                } else {
-                    consecutive_empty_rounds = 0;
-                }
-
-                // Provenance: make round feedback unambiguous — it is always the
-                // assistant's own emitted block, never the user's.
-                let provenance_prefix = format!(
-                    "Your emitted ```repl block (round {}) result:",
-                    iteration + 1
-                );
-                let stdout_for_feedback = if round.has_error {
-                    format!(
-                        "{provenance_prefix} error\nstdout:\n{}\nstderr:\n{}",
-                        round.stdout, round.stderr
-                    )
-                } else if round.stdout.trim().is_empty() && round.rpc_count == 0 {
-                    format!(
-                        "{provenance_prefix} no output — block produced no observable output — print something, call a helper, or stop emitting REPL blocks and answer\nstdout:\n{}\n[{} child query RPC(s)]",
-                        round.stdout, round.rpc_count
-                    )
-                } else {
-                    format!(
-                        "{provenance_prefix}\n[{} child query RPC(s)]\n{}",
-                        round.rpc_count, round.stdout
-                    )
-                };
-                let stdout_preview_for_next =
-                    truncate_text(stdout_for_feedback.trim(), STDOUT_METADATA_PREVIEW_LEN);
-
-                // 4f. Build metadata for next iteration.
-                messages.push(Message {
-                    role: Role::Assistant,
-                    content: vec![ContentBlock::Text {
-                        text: format!("```repl\n{code_to_run}\n```"),
-                        cache_control: None,
-                    }],
-                });
-                messages.push(build_metadata_message(
-                    &prompt,
-                    root_prompt.as_deref(),
-                    iteration + 1,
-                    Some(&code_to_run),
-                    Some(&stdout_preview_for_next),
-                ));
-            }
-
-            // Exhausted: surface the last root response rather than discarding
-            // it; the error below says the loop never reached FINAL.
-            RlmTurnResult {
-                answer: last_response_text.clone(),
-                iterations: MAX_RLM_ITERATIONS,
-                duration: start.elapsed(),
-                error: Some(format!(
-                    "RLM loop exhausted after {MAX_RLM_ITERATIONS} iterations without FINAL"
-                )),
-                usage: total_usage.clone(),
-                routed_usage: Vec::new(),
-                routed_usage_drop_records: Vec::new(),
-                routed_usage_dropped_records: 0,
-                termination: RlmTermination::Exhausted,
-                trace: trace.clone(),
-                total_rpcs,
-            }
-        };
-
-        repl.shutdown().await;
-        result
-    })
-    .await;
-    let result = result.unwrap_or_else(|_| RlmTurnResult {
-        answer: last_response_text,
-        iterations,
-        duration: start.elapsed(),
-        error: Some("RLM turn timed out at its wall-clock deadline".to_string()),
-        usage: total_usage,
-        routed_usage: Vec::new(),
-        routed_usage_drop_records: Vec::new(),
-        routed_usage_dropped_records: 0,
-        termination: RlmTermination::Error,
-        trace,
-        total_rpcs,
-    });
-    let result = require_answer_or_error(result);
-    let status = termination_status(&result);
-    let terminal_event = Event::status(status.clone());
-    tx_event.record(&terminal_event).await;
-    // A full event stream must not turn deadline hand-back into another wait.
-    if !matches!(
-        tokio::time::timeout_at(deadline, tx_event.sender.send(terminal_event)).await,
-        Ok(Ok(()))
-    ) {
-        tracing::info!(target: "rlm", "{status}");
-    }
-    result
-}
-
-/// An empty answer is never returned silently: without an error of its own,
-/// it gets one naming how the loop ended. A deliberate `FINAL("")` is the
-/// model's answer, not a failure, and stays an empty answer with no error.
-fn require_answer_or_error(mut result: RlmTurnResult) -> RlmTurnResult {
-    if result.termination != RlmTermination::Final
-        && result.answer.trim().is_empty()
-        && result.error.is_none()
-    {
-        result.error = Some(format!(
-            "RLM ended ({:?}) after {} iteration(s) with an empty answer",
-            result.termination, result.iterations
-        ));
-    }
-    result
-}
-
-/// The terminal log line for one RLM loop.
-fn termination_status(result: &RlmTurnResult) -> String {
-    let mut line = format!(
-        "RLM finished: {:?} after {} iteration(s), {} sub-LLM call(s), answer {} chars",
-        result.termination,
-        result.iterations,
-        result.total_rpcs,
-        result.answer.chars().count()
-    );
-    if let Some(error) = result.error.as_deref() {
-        line.push_str(" — ");
-        line.push_str(error);
-    }
-    line
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn write_context_file(prompt: &str) -> std::io::Result<PathBuf> {
-    let dir = std::env::temp_dir().join("deepseek_rlm_ctx");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!(
-        "ctx_{}_{}.txt",
-        std::process::id(),
-        Uuid::new_v4().simple()
-    ));
-    std::fs::write(&path, prompt)?;
-    Ok(path)
-}
-
-fn build_root_request(
-    model: &str,
-    messages: &[Message],
-    system: &SystemPrompt,
-    max_tokens: u32,
-) -> MessageRequest {
-    MessageRequest {
-        model: model.to_string(),
-        messages: messages.to_vec(),
-        max_tokens,
-        system: Some(system.clone()),
-        tools: None,
-        tool_choice: None,
-        metadata: None,
-        thinking: None,
-        reasoning_effort: None,
-        stream: Some(false),
-        temperature: None,
-        top_p: None,
-    }
-}
-
-/// Build `Metadata(state)` from the paper. Surfaces:
-/// - the small `root_prompt` (if any) — repeated each iteration
-/// - `context` length + preview
-/// - the REPL helpers
-/// - the previous round's code summary + stdout preview
 fn build_metadata_message(
     prompt: &str,
     root_prompt: Option<&str>,
@@ -903,24 +120,28 @@ fn build_metadata_message(
         parts.push(format!("> {}", truncate_text(rp.trim(), 600)));
         parts.push(String::new());
     }
-    parts.push("**`context`** — the long input lives in the REPL only".to_string());
+    parts.push("**`_context`** — the long input lives in the REPL only".to_string());
     parts.push(format!("- Length: {prompt_len} chars"));
     parts.push(format!("- Preview: \"{prompt_preview}\""));
     parts.push(String::new());
 
     parts.push("**REPL helpers** (use inside ```repl blocks)".to_string());
-    parts.push("- `context` / `ctx`                       — the full input string".to_string());
-    parts.push("- `len(context)` / `context[a:b]` / `context.splitlines()` — slice it".to_string());
     parts.push(
-        "- `chunk_context(max_chars=20000, overlap=0)` — full-coverage chunks with index/start/end/text"
+        "- `_context` / `_ctx` / `content`                       — the full input string"
             .to_string(),
     );
     parts.push(
-        "- `chunk_coverage(chunks)`              — coverage report for chunk_context output"
+        "- `len(_context)` / `_context[a:b]` / `_context.splitlines()` — slice it".to_string(),
+    );
+    parts.push(
+        "- `chunk(max_chars=20000, overlap=0)` — full-coverage chunks with index/start/end/text"
             .to_string(),
     );
     parts.push(
-        "- `llm_query(prompt, model=None)`        — one-shot child LLM; `model` is ignored and child calls stay pinned to Flash"
+        "- `chunk_coverage(chunks)`              — coverage report for chunk output".to_string(),
+    );
+    parts.push(
+        "- `llm_query(prompt, model=None)`        — one-shot child LLM; `model` is ignored and child calls keep the captured Core route"
             .to_string(),
     );
     parts.push(
@@ -980,7 +201,7 @@ fn build_metadata_message(
     }
 }
 
-fn summarize_code(code: &str) -> String {
+pub(crate) fn summarize_code(code: &str) -> String {
     let lines: Vec<&str> = code.lines().collect();
     if lines.len() <= 8 {
         return code.to_string();
@@ -1008,7 +229,7 @@ fn extract_text_blocks(blocks: &[ContentBlock]) -> String {
 /// The opening fence must start its own line (up to three spaces of indent,
 /// as in Markdown) with no other info string, so prose that mentions a fence
 /// mid-line is never code to run.
-fn extract_repl_code(text: &str) -> Option<String> {
+pub(crate) fn extract_repl_code(text: &str) -> Option<String> {
     let mut lines = text.split_inclusive('\n');
     let mut offset = 0;
     let code_start = loop {
@@ -1040,7 +261,7 @@ fn extract_repl_code(text: &str) -> Option<String> {
 /// Parse a top-level `FINAL(...)` directive from the model's raw text.
 /// Mirrors the reference RLM's `find_final_answer`: directive must appear
 /// at the start of a line, *outside* any code fence.
-fn parse_text_final(text: &str) -> Option<String> {
+pub(crate) fn parse_text_final(text: &str) -> Option<String> {
     let outside_fence = strip_code_fences(text);
 
     for line in outside_fence.lines() {
@@ -1089,7 +310,7 @@ fn strip_quotes(s: &str) -> String {
     s.to_string()
 }
 
-fn truncate_text(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_text(text: &str, max_chars: usize) -> String {
     let count = text.chars().count();
     if count <= max_chars {
         return text.to_string();
@@ -1100,15 +321,17 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     result
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::engine::tests::rlm_host::{Replies, run_admitted_fixture, run_fixture};
+    use crate::core::events::Event;
     use crate::llm_client::mock::MockLlmClient;
-    use codewhale_models::MessageResponse;
+    use crate::rlm::bridge::RlmUsageAccumulator;
+    use codewhale_models::{MessageRequest, MessageResponse};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     /// One model round whose code writes a marker file, run under `gate`.
     async fn marker_round(
@@ -1134,9 +357,9 @@ mod tests {
             container: None,
             usage: Usage::default(),
         });
-        let client: Arc<dyn RlmLlmClient> = mock;
+        let client: Arc<dyn Replies> = mock;
         let (tx, _rx) = mpsc::channel(8);
-        let result = run_rlm_turn_inner_with_usage(
+        let result = run_admitted_fixture(
             client,
             "root-model".to_string(),
             "long context".to_string(),
@@ -1222,10 +445,10 @@ mod tests {
             container: None,
             usage: usage.clone(),
         });
-        let client: Arc<dyn RlmLlmClient> = mock.clone();
+        let client: Arc<dyn Replies> = mock.clone();
         let (tx, _rx) = mpsc::channel(8);
 
-        let result = run_rlm_turn_inner(
+        let result = run_fixture(
             client,
             "root-model".to_string(),
             "long context".to_string(),
@@ -1272,10 +495,10 @@ mod tests {
             container: None,
             usage: Usage::default(),
         });
-        let client: Arc<dyn RlmLlmClient> = mock;
+        let client: Arc<dyn Replies> = mock;
         let (tx, _rx) = mpsc::channel(8);
 
-        let result = run_rlm_turn_inner(
+        let result = run_fixture(
             client,
             "root-model".to_string(),
             "long context".to_string(),
@@ -1328,10 +551,10 @@ mod tests {
                 "```repl\nprint('round {round}')\n```"
             )));
         }
-        let client: Arc<dyn RlmLlmClient> = mock.clone();
+        let client: Arc<dyn Replies> = mock.clone();
         let (tx, mut rx) = mpsc::channel(1024);
 
-        let result = run_rlm_turn_inner(
+        let result = run_fixture(
             client,
             "root-model".to_string(),
             "long context".to_string(),
@@ -1378,14 +601,14 @@ mod tests {
         assert!(
             statuses
                 .iter()
-                .any(|line| line.starts_with("RLM finished: Exhausted")),
+                .any(|line| line.contains("RLM finished: Exhausted")),
             "the loop must log how it ended: {statuses:#?}"
         );
     }
 
-    struct PendingAfterFirstResponse(MockLlmClient);
+    struct PendingAfterResponses(MockLlmClient, usize);
 
-    impl RlmLlmClient for PendingAfterFirstResponse {
+    impl Replies for PendingAfterResponses {
         fn effective_route_envelope(
             &self,
             model: &str,
@@ -1404,7 +627,7 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = anyhow::Result<MessageResponse>> + Send + '_>,
         > {
-            if self.0.call_count() == 0 {
+            if self.0.call_count() < self.1 {
                 self.0.create_message_boxed(request)
             } else {
                 Box::pin(std::future::pending())
@@ -1424,13 +647,13 @@ mod tests {
             };
             let mock = MockLlmClient::new(Vec::new());
             mock.push_message_response(text_response(partial));
-            let client = Arc::new(PendingAfterFirstResponse(mock));
+            let client = Arc::new(PendingAfterResponses(mock, 1));
             let (tx, mut rx) = mpsc::channel(32);
             let usage = RlmUsageAccumulator::new();
 
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
-                run_rlm_turn_impl(
+                run_admitted_fixture(
                     client.clone(),
                     "root-model".to_string(),
                     "long context".to_string(),
@@ -1474,21 +697,38 @@ mod tests {
             let mut saw_timeout = false;
             while let Ok(event) = rx.try_recv() {
                 if let Event::Status { message } = event {
-                    saw_timeout |= message.starts_with("RLM finished: Error")
+                    saw_timeout |= message.contains("RLM finished: Error")
                         && message.contains("wall-clock deadline");
                 }
             }
             assert!(saw_timeout, "timeout must record how the turn ended");
+            let terminal_receipts: Vec<_> = snapshot
+                .nested_events
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "status"
+                        && event["content"].as_str().is_some_and(|content| {
+                            content.contains("RLM finished: Error")
+                                && content.contains("wall-clock deadline")
+                        })
+                })
+                .collect();
+            assert_eq!(terminal_receipts.len(), 1, "one canonical terminal receipt");
         }
     }
 
     #[tokio::test]
     async fn wall_clock_deadline_returns_when_event_stream_is_full() {
-        let client = Arc::new(MockLlmClient::new(Vec::new()));
+        // An empty response queue fails immediately and cannot test the deadline.
+        // Keep the admitted provider future pending while the host channel is full.
+        let client = Arc::new(PendingAfterResponses(MockLlmClient::new(Vec::new()), 0));
+        let usage = RlmUsageAccumulator::new();
         let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(Event::status("fixture occupies the caller event channel"))
+            .unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            run_rlm_turn_impl(
+            run_admitted_fixture(
                 client.clone(),
                 "root-model".to_string(),
                 "long context".to_string(),
@@ -1496,7 +736,7 @@ mod tests {
                 "child-model".to_string(),
                 tx,
                 0,
-                RlmUsageAccumulator::new(),
+                usage.clone(),
                 tokio::time::Instant::now() + Duration::from_secs(1),
                 Some(crate::tools::codemode::NestedCallGate::admitting_for_test()),
             ),
@@ -1512,7 +752,24 @@ mod tests {
                 .unwrap()
                 .contains("wall-clock deadline")
         );
-        assert_eq!(client.call_count(), 0);
+        assert_eq!(client.0.call_count(), 0, "no scripted response completed");
+        let snapshot = usage.snapshot().await;
+        assert_eq!(snapshot.dropped_records, 1, "one pending admitted request");
+        assert_eq!(
+            snapshot
+                .nested_events
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "status"
+                        && event["content"].as_str().is_some_and(|content| {
+                            content.contains("RLM finished: Error")
+                                && content.contains("wall-clock deadline")
+                        })
+                })
+                .count(),
+            1,
+            "full host channel must retain one canonical terminal receipt"
+        );
     }
 
     #[test]
@@ -1530,14 +787,15 @@ mod tests {
             trace: Vec::new(),
             total_rpcs: 0,
         };
-        let error = require_answer_or_error(empty(RlmTermination::NoCode))
+        let error = empty(RlmTermination::NoCode)
+            .require_answer_or_error()
             .error
             .expect("empty answer needs a reason");
         assert!(error.contains("empty answer"), "{error}");
         assert!(error.contains("NoCode"), "{error}");
 
         // `FINAL("")` is an answer the model chose; callers keep getting "".
-        let deliberate = require_answer_or_error(empty(RlmTermination::Final));
+        let deliberate = empty(RlmTermination::Final).require_answer_or_error();
         assert!(deliberate.error.is_none(), "{:?}", deliberate.error);
     }
 
@@ -1640,29 +898,55 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_root_request_keeps_context_tail_out_of_root_payload() {
+    #[tokio::test]
+    async fn build_root_request_keeps_context_tail_out_of_root_payload() {
         let secret_tail = "DO_NOT_LEAK_ROOT_REQUEST";
         let prompt = format!("{}{}", "a".repeat(PROMPT_PREVIEW_LEN + 100), secret_tail);
-        let messages = vec![build_metadata_message(
-            &prompt,
-            Some("answer from the long context"),
+        let mock = Arc::new(MockLlmClient::new(Vec::new()));
+        mock.push_message_response(MessageResponse {
+            id: "context-metadata".into(),
+            r#type: "message".into(),
+            role: "assistant".into(),
+            content: vec![ContentBlock::Text {
+                text: "```repl\nFINAL('metadata only')\n```".into(),
+                cache_control: None,
+            }],
+            model: "root-model".into(),
+            stop_reason: Some("end_turn".into()),
+            stop_sequence: None,
+            container: None,
+            usage: Usage::default(),
+        });
+        let (tx, _rx) = mpsc::channel(64);
+        let result = run_fixture(
+            mock.clone(),
+            "root-model".into(),
+            prompt.clone(),
+            Some("answer from the long context".into()),
+            "child-model".into(),
+            tx,
             0,
-            None,
-            None,
-        )];
-
-        let request = build_root_request("root-model", &messages, &rlm_system_prompt(), 8192);
-        let payload = serde_json::to_string(&request).expect("request should serialize");
-
-        assert_eq!(request.max_tokens, 8192);
+        )
+        .await;
+        assert_eq!(
+            result.termination,
+            RlmTermination::Final,
+            "{:?}",
+            result.error
+        );
+        let requests = mock.captured_requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        let payload = serde_json::to_string(request).expect("actual Core request serializes");
         assert_eq!(request.temperature, None);
         assert_eq!(request.top_p, None);
         assert!(payload.contains(&format!("- Length: {} chars", prompt.chars().count())));
         assert!(
             !payload.contains(secret_tail),
-            "root LLM request leaked the non-preview tail of context"
+            "Core request leaked the non-preview context tail"
         );
+        assert!(payload.contains("Captured operator Core policy"));
+        assert!(payload.contains("answer from the long context"));
     }
 
     #[test]

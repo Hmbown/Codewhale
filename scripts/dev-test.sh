@@ -238,6 +238,12 @@ printf '+ cargo %s\n' "$*"
 # topology once, retaining Cargo's build-dir template and any caller overrides.
 CODEWHALE_CACHE_ROOT=$(codewhale_dev_cache_root)
 export CODEWHALE_CACHE_ROOT
+# Engine acceptance launches the canonical CLI, which is not a binary target
+# of the Engine library package. Build it with the same cache/lock topology.
+if [ "$target" = "--test" ]; then
+  "$repo_root/scripts/with-hermetic-test-home.sh" "$repo_root/scripts/dev-cargo.sh" \
+    build -p codewhale-cli --bin codewhale --locked
+fi
 # libtest exits 0 when a filter matches nothing, which has been mistaken for
 # a pass. With an explicit filter, refuse that green. (nextest already fails
 # loud on an empty selection, so the guard only wraps libtest.)

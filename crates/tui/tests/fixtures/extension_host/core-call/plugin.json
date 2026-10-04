@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "core-call",
+  "version": "0.1.0",
+  "description": "Test fixture: tools that ask the core to run core tools (`exec.core.call`) and report what they got.",
+  "license": "MIT",
+  "extensions": {
+    "net.codewhale": {
+      "native": {
+        "path": "index.mjs"
+      }
+    }
+  }
+}

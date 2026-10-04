@@ -48,6 +48,24 @@ pub enum Feature {
     /// host (experimental). Toggling it changes the plugin activation policy,
     /// so every plugin is re-reviewed after a restart, in either direction.
     ExtensionHost,
+    /// Use the pinned TypeScript finance normalization adapter; no runtime fallback.
+    FinanceHost,
+    /// Use the pinned TypeScript data validation presenter; no runtime fallback.
+    DataHost,
+    /// Use pinned speech preparation for the CLI and tool; no runtime fallback.
+    SpeechHost,
+    /// Pinned PDF outcome orchestration; Core retains process and document bytes.
+    PdfHost,
+    /// Pinned Native/Tesseract selection; Core retains image/process authority.
+    OcrHost,
+    /// Pinned web query/provider adapters; Core retains all HTTP and policy.
+    WebSearchHost,
+    /// Pinned HTML region selection; complete document bytes stay in Core.
+    WebExtractHost,
+    /// Pinned GitHub and local report presentation; Core retains effects and disclosure.
+    GithubHost,
+    /// Captured review presentation; Core retains provider, evidence and publication.
+    ReviewHost,
 }
 
 impl fmt::Display for Stage {
@@ -241,6 +259,60 @@ pub const FEATURES: &[FeatureSpec] = &[
         // `[features] code_mode = false` is the escape hatch: execute_tools
         // goes back to deferred (reachable through tool_search).
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::FinanceHost,
+        key: "finance_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::DataHost,
+        key: "data_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::SpeechHost,
+        key: "speech_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::PdfHost,
+        key: "pdf_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::OcrHost,
+        key: "ocr_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::GithubHost,
+        key: "github_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::WebSearchHost,
+        key: "web_search_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::WebExtractHost,
+        key: "web_extract_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ReviewHost,
+        key: "review_host",
+        stage: Stage::Experimental,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::ExtensionHost,

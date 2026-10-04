@@ -32,6 +32,11 @@ pub const MODELS_DEV_CATALOG_URL: &str = "https://models.dev/catalog.json";
 /// Combined Models.dev catalog payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ModelsDevCatalog {
+    /// Generated bundled presentation/transport facts; external documents cannot affect the compiled owner.
+    #[serde(default, rename = "_reviewed")]
+    pub reviewed: crate::catalog::reviewed::ReviewedCatalog,
+    #[serde(default, rename = "_meta")]
+    pub meta: BTreeMap<String, serde_json::Value>,
     /// Provider-agnostic model facts, keyed by canonical model id.
     #[serde(default)]
     pub models: BTreeMap<String, ModelsDevModel>,
@@ -71,30 +76,13 @@ impl ModelsDevCatalog {
         self.provider(provider_id)?.models.get(wire_model_id.trim())
     }
 
-    /// Resolve the sourced `reasoning` fact for a model id, wherever the
-    /// catalog carries the row: the provider-agnostic `models` map, or any
-    /// provider's scoped rows (OpenRouter-style rows are keyed by the full
-    /// `vendor/model` id, so compound ids match verbatim). The id must match
-    /// exactly — no provider aliasing, no prefix inference (#6032).
-    ///
-    /// Returns `None` when no row for the id states the fact, or when rows
-    /// disagree across providers — a conflict stays unknown rather than
-    /// guessed.
+    /// Resolve an intrinsic reasoning fact from canonical data or a
+    /// conflict-free explicit `base_model` join. A provider wire spelling
+    /// without that join never becomes an unscoped capability (#6032).
+    /// Missing and conflicting facts remain unknown.
     #[must_use]
     pub fn reasoning_support(&self, model_id: &str) -> Option<bool> {
-        let key = model_id.trim();
-        let mut sourced = self.models.get(key).and_then(|model| model.reasoning);
-        for provider in self.providers.values() {
-            let Some(reasoning) = provider.models.get(key).and_then(|row| row.reasoning) else {
-                continue;
-            };
-            match sourced {
-                None => sourced = Some(reasoning),
-                Some(known) if known == reasoning => {}
-                Some(_) => return None,
-            }
-        }
-        sourced
+        crate::catalog::reviewed::intrinsic_model_in(self, model_id).and_then(|row| row.reasoning)
     }
 
     /// Build a route offering from a provider-scoped Models.dev row.
@@ -672,11 +660,11 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_support_reads_top_level_and_provider_rows_exactly() {
+    fn reasoning_support_requires_canonical_rows_or_explicit_joins() {
         let catalog = ModelsDevCatalog::parse_json(GLM_FIXTURE).expect("fixture parses");
-        // Compound canonical id (top-level map) and bare provider ids.
+        // The canonical row is intrinsic; the bare wire row has no proven join.
         assert_eq!(catalog.reasoning_support("zhipuai/glm-5.2"), Some(true));
-        assert_eq!(catalog.reasoning_support("glm-5.2"), Some(true));
+        assert_eq!(catalog.reasoning_support("glm-5.2"), None);
         // Unknown id stays unknown; no prefix or alias inference.
         assert_eq!(catalog.reasoning_support("glm-5.1"), None);
         assert_eq!(catalog.reasoning_support("zai/glm-5.2"), None);

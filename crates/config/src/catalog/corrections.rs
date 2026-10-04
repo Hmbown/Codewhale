@@ -37,6 +37,9 @@ pub struct CatalogCorrections {
     pub about: String,
     /// Stamped as [`CatalogSource::CodewhaleBundled`] on prices it owns.
     pub revision: String,
+    /// Pure reviewed model/transport data copied into the deterministic bundled seed.
+    #[serde(default)]
+    pub reviewed: super::reviewed::ReviewedCatalog,
     /// Rules for every row a provider serves.
     #[serde(default)]
     pub providers: Vec<ProviderCorrection>,
@@ -81,6 +84,7 @@ impl CatalogCorrections {
         if self.revision.trim().is_empty() {
             return Err("revision must be set".into());
         }
+        self.reviewed.validate()?;
         for rule in &self.providers {
             if rule.provider.trim().is_empty() || rule.pricing_withheld.trim().is_empty() {
                 return Err("provider rules need a provider and a reason".into());

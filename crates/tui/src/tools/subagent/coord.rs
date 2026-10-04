@@ -612,6 +612,7 @@ impl ToolSpec for AgentsInterruptTool {
                 .map_err(|err| ToolError::invalid_input(err.to_string()))?
         };
 
+        let snapshot = super::settle_requested_child(&self.manager, snapshot).await;
         let worker_record = {
             let manager = self.manager.read().await;
             manager.get_worker_record_for_session(&context.state_namespace, &snapshot.agent_id)
@@ -1131,87 +1132,24 @@ impl AgentsCoordinateTool {
     pub fn new(manager: SharedSubAgentManager, caller: Option<String>) -> Self {
         Self { manager, caller }
     }
-}
-
-#[async_trait]
-impl ToolSpec for AgentsCoordinateTool {
-    fn model_visible(&self) -> bool {
-        // #5462: `agent` is the sole model-facing sub-agent surface. These
-        // narrow tools stay registered and executable by name so a persisted
-        // transcript replays byte-for-byte, but they are never advertised in
-        // the catalog and can never be returned by `tool_search` — the same
-        // shape `rlm` and `exec_shell` already use.
-        false
-    }
-
-    fn name(&self) -> &'static str {
-        "agents/coordinate"
-    }
-
-    fn description(&self) -> &'static str {
-        "Record or inspect bounded coordination state: propose/accept/supersede decisions, expand the caller's write claim before mutation, reconcile multiple decision records into one neutral fan-in receipt, or release stale write-claims whose owner is no longer running."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": { "type": "string", "enum": ["inspect", "propose", "accept", "supersede", "claim", "reconcile", "release"] },
-                "decision_id": { "type": "string" },
-                "subject": { "type": "string" },
-                "expected_version": { "type": "integer", "minimum": 1 },
-                "scope": { "type": "array", "items": { "type": "string" } },
-                "constraints": { "type": "array", "items": { "type": "string" } },
-                "evidence_handles": { "type": "array", "items": { "type": "string" } },
-                "roots": { "type": "array", "items": { "type": "string" } },
-                "exact_files": { "type": "array", "items": { "type": "string" } },
-                "contracts": { "type": "array", "items": { "type": "string" } },
-                "owner": { "type": "string" },
-                "input_decisions": { "type": "array", "items": { "type": "string" } },
-                "outcome": { "type": "string" },
-                "candidate_handles": { "type": "array", "items": { "type": "string" } },
-                "retry_count": { "type": "integer", "minimum": 0, "maximum": 3 },
-                "retry_limit": { "type": "integer", "minimum": 1, "maximum": 3 },
-                "reviewer_evidence_handles": { "type": "array", "items": { "type": "string" } },
-                "verifier_evidence_handles": { "type": "array", "items": { "type": "string" } },
-                "verification_outcome": { "type": "string" },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 24 }
-            },
-            "required": ["action"]
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        // #5123-class: this tool mutates the coordination ledger and expands
-        // the caller's write claim (actions propose/accept/supersede/claim/
-        // reconcile) — declaring ReadOnly was a lie that let policy layers
-        // treat a mutating call as a safe read. Only `inspect` is read-only,
-        // which is what is_read_only_for reports.
-        vec![ToolCapability::WritesFiles]
-    }
-    fn approval_requirement(&self) -> ApprovalRequirement {
-        // Stays Auto: coordination records are session-scoped in-memory
-        // state, and gating them would deadlock autonomous sub-agent fan-in.
-        ApprovalRequirement::Auto
-    }
-    fn is_read_only_for(&self, input: &Value) -> bool {
-        input.get("action").and_then(Value::as_str) == Some("inspect")
-    }
-
-    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+    fn mutate_coordination(
+        caller: Option<&str>,
+        session: &str,
+        workspace: &std::path::Path,
+        manager: &mut super::SubAgentManager,
+        input: Value,
+    ) -> Result<ToolResult, ToolError> {
         let action = input
             .get("action")
             .and_then(Value::as_str)
             .unwrap_or("inspect");
+        let owner = caller.map(str::to_string).unwrap_or_else(|| "root".into());
         let bounded_text = |key: &str| {
             input
                 .get(key)
                 .and_then(Value::as_str)
                 .map(|value| value.chars().take(512).collect::<String>())
         };
-        // Tool authority is the runtime caller identity. Root cannot supply an
-        // arbitrary child owner and mutate that child's decisions/claim.
-        let owner = self.caller.clone().unwrap_or_else(|| "root".to_string());
         let strings = |key: &str| {
             input
                 .get(key)
@@ -1226,41 +1164,16 @@ impl ToolSpec for AgentsCoordinateTool {
                 })
                 .unwrap_or_default()
         };
-        if action == "inspect" {
-            let manager = self.manager.read().await;
-            let value = manager.inspect_coordination_for_session(
-                &context.state_namespace,
-                bounded_text("subject").as_deref(),
-                input
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(COORDINATION_INSPECT_LIMIT as u64) as usize,
-            );
-            return ToolResult::json(&value)
-                .map_err(|e| ToolError::execution_failed(e.to_string()));
-        }
-        if !matches!(
-            action,
-            "propose" | "accept" | "supersede" | "claim" | "reconcile" | "release"
-        ) {
-            return Err(ToolError::invalid_input(format!(
-                "unknown coordination action '{action}'"
-            )));
-        }
-
-        let mut manager = self.manager.write().await;
-        if let Some(caller) = self.caller.as_deref() {
+        if let Some(caller) = caller {
             manager
-                .get_result_by_ref_for_session(&context.state_namespace, caller)
+                .get_result_by_ref_for_session(session, caller)
                 .map_err(|_| {
                     ToolError::invalid_input("Agent not found in the active session".to_string())
                 })?;
         }
         if matches!(action, "accept" | "supersede") {
             let decision_id = bounded_text("decision_id").unwrap_or_default();
-            if !manager
-                .coordination_decision_is_owned_by_session(&context.state_namespace, &decision_id)
-            {
+            if !manager.coordination_decision_is_owned_by_session(session, &decision_id) {
                 return Err(ToolError::invalid_input(
                     "Coordination decision not found in the active session".to_string(),
                 ));
@@ -1268,10 +1181,7 @@ impl ToolSpec for AgentsCoordinateTool {
         }
         if action == "reconcile"
             && strings("input_decisions").iter().any(|decision_id| {
-                !manager.coordination_decision_is_owned_by_session(
-                    &context.state_namespace,
-                    decision_id,
-                )
+                !manager.coordination_decision_is_owned_by_session(session, decision_id)
             })
         {
             return Err(ToolError::invalid_input(
@@ -1282,17 +1192,20 @@ impl ToolSpec for AgentsCoordinateTool {
         let coordination_before = manager.coordination.clone();
         let mutation = match action {
             "propose" => manager
-                .record_coordination_decision(DecisionRecord {
-                    decision_id: bounded_text("decision_id").unwrap_or_default(),
-                    subject: bounded_text("subject").unwrap_or_default(),
-                    status: DecisionStatus::Proposed,
-                    owner,
-                    scope: strings("scope"),
-                    constraints: strings("constraints"),
-                    evidence_handles: strings("evidence_handles"),
-                    version: 1,
-                    sequence: 0,
-                })
+                .record_coordination_decision_in_workspace(
+                    DecisionRecord {
+                        decision_id: bounded_text("decision_id").unwrap_or_default(),
+                        subject: bounded_text("subject").unwrap_or_default(),
+                        status: DecisionStatus::Proposed,
+                        owner,
+                        scope: strings("scope"),
+                        constraints: strings("constraints"),
+                        evidence_handles: strings("evidence_handles"),
+                        version: 1,
+                        sequence: 0,
+                    },
+                    workspace,
+                )
                 .map_err(ToolError::invalid_input)
                 .and_then(|record| {
                     serde_json::to_value(record)
@@ -1392,8 +1305,8 @@ impl ToolSpec for AgentsCoordinateTool {
                 let first_new_sequence = coordination_before.sequence.saturating_add(1);
                 let last_new_sequence = manager.coordination.sequence;
                 for sequence in first_new_sequence..=last_new_sequence {
-                    if let Err(stamp_error) = manager
-                        .stamp_coordination_sequence_for_session(sequence, &context.state_namespace)
+                    if let Err(stamp_error) =
+                        manager.stamp_coordination_sequence_for_session(sequence, session)
                     {
                         manager.coordination = coordination_before;
                         return Err(ToolError::execution_failed(format!(
@@ -1418,9 +1331,7 @@ impl ToolSpec for AgentsCoordinateTool {
                 "coordination action '{action}' produced no durable sequence"
             )));
         };
-        if let Err(error) =
-            manager.stamp_coordination_sequence_for_session(sequence, &context.state_namespace)
-        {
+        if let Err(error) = manager.stamp_coordination_sequence_for_session(sequence, session) {
             manager.coordination = coordination_before;
             return Err(ToolError::execution_failed(error));
         }
@@ -1431,6 +1342,131 @@ impl ToolSpec for AgentsCoordinateTool {
             )));
         }
         ToolResult::json(&value).map_err(|e| ToolError::execution_failed(e.to_string()))
+    }
+}
+
+#[async_trait]
+impl ToolSpec for AgentsCoordinateTool {
+    fn model_visible(&self) -> bool {
+        // #5462: `agent` is the sole model-facing sub-agent surface. These
+        // narrow tools stay registered and executable by name so a persisted
+        // transcript replays byte-for-byte, but they are never advertised in
+        // the catalog and can never be returned by `tool_search` — the same
+        // shape `rlm` and `exec_shell` already use.
+        false
+    }
+
+    fn name(&self) -> &'static str {
+        "agents/coordinate"
+    }
+
+    fn description(&self) -> &'static str {
+        "Record or inspect bounded coordination state: propose/accept/supersede decisions, expand the caller's write claim before mutation, reconcile multiple decision records into one neutral fan-in receipt, or release stale write-claims whose owner is no longer running."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["inspect", "propose", "accept", "supersede", "claim", "reconcile", "release"] },
+                "decision_id": { "type": "string" },
+                "subject": { "type": "string" },
+                "expected_version": { "type": "integer", "minimum": 1 },
+                "scope": { "type": "array", "items": { "type": "string" } },
+                "constraints": { "type": "array", "items": { "type": "string" } },
+                "evidence_handles": { "type": "array", "items": { "type": "string" } },
+                "roots": { "type": "array", "items": { "type": "string" } },
+                "exact_files": { "type": "array", "items": { "type": "string" } },
+                "contracts": { "type": "array", "items": { "type": "string" } },
+                "owner": { "type": "string" },
+                "input_decisions": { "type": "array", "items": { "type": "string" } },
+                "outcome": { "type": "string" },
+                "candidate_handles": { "type": "array", "items": { "type": "string" } },
+                "retry_count": { "type": "integer", "minimum": 0, "maximum": 3 },
+                "retry_limit": { "type": "integer", "minimum": 1, "maximum": 3 },
+                "reviewer_evidence_handles": { "type": "array", "items": { "type": "string" } },
+                "verifier_evidence_handles": { "type": "array", "items": { "type": "string" } },
+                "verification_outcome": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 24 }
+            },
+            "required": ["action"]
+        })
+    }
+
+    fn capabilities(&self) -> Vec<ToolCapability> {
+        // #5123-class: this tool mutates the coordination ledger and expands
+        // the caller's write claim (actions propose/accept/supersede/claim/
+        // reconcile) — declaring ReadOnly was a lie that let policy layers
+        // treat a mutating call as a safe read. Only `inspect` is read-only,
+        // which is what is_read_only_for reports.
+        vec![ToolCapability::WritesFiles]
+    }
+    fn approval_requirement(&self) -> ApprovalRequirement {
+        // Stays Auto: coordination records are session-scoped in-memory
+        // state, and gating them would deadlock autonomous sub-agent fan-in.
+        ApprovalRequirement::Auto
+    }
+    fn is_read_only_for(&self, input: &Value) -> bool {
+        input.get("action").and_then(Value::as_str) == Some("inspect")
+    }
+
+    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("inspect");
+        let bounded_text = |key: &str| {
+            input
+                .get(key)
+                .and_then(Value::as_str)
+                .map(|value| value.chars().take(512).collect::<String>())
+        };
+        if action == "inspect" {
+            let manager = self.manager.read().await;
+            let value = manager.inspect_coordination_for_session(
+                &context.state_namespace,
+                bounded_text("subject").as_deref(),
+                input
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(COORDINATION_INSPECT_LIMIT as u64) as usize,
+            );
+            return ToolResult::json(&value)
+                .map_err(|e| ToolError::execution_failed(e.to_string()));
+        }
+        if !matches!(
+            action,
+            "propose" | "accept" | "supersede" | "claim" | "reconcile" | "release"
+        ) {
+            return Err(ToolError::invalid_input(format!(
+                "unknown coordination action '{action}'"
+            )));
+        }
+
+        let mut manager = self.manager.clone().write_owned().await;
+        if matches!(action, "claim" | "propose") {
+            let caller = self.caller.clone();
+            let session = context.state_namespace.clone();
+            let workspace = context.workspace.clone();
+            return codewhale_app_server::daemon_socket::owner_work(move || {
+                Ok(Self::mutate_coordination(
+                    caller.as_deref(),
+                    &session,
+                    &workspace,
+                    &mut manager,
+                    input,
+                ))
+            })
+            .await
+            .map_err(|error| ToolError::execution_failed(error.to_string()))?;
+        }
+        Self::mutate_coordination(
+            self.caller.as_deref(),
+            &context.state_namespace,
+            &context.workspace,
+            &mut manager,
+            input,
+        )
     }
 }
 
@@ -2403,7 +2439,7 @@ mod tests {
         ));
         let (agent_id, _handle) = {
             let mut guard = manager.write().await;
-            guard.insert_test_interrupted_continuable_agent(
+            let interrupted = guard.insert_test_interrupted_continuable_agent(
                 "paused_child",
                 tmp.path(),
                 vec![codewhale_models::Message {
@@ -2413,10 +2449,16 @@ mod tests {
                         cache_control: None,
                     }],
                 }],
-            )
+            );
+            // This fixture is resumed by root, rather than a fabricated parent_session agent.
+            let record = guard.worker_records.get_mut(&interrupted.0).unwrap();
+            record.parent_run_id = None;
+            record.spec.parent_run_id = None;
+            interrupted
         };
         let mut runtime = super::super::tests::stub_runtime();
         runtime.manager = Arc::clone(&manager);
+        runtime.context = ToolContext::new(tmp.path());
         let tool = AgentsFollowupTool::new(Arc::clone(&manager)).with_runtime(runtime);
         let result = tool
             .execute(

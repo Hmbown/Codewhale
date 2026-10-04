@@ -208,7 +208,7 @@ impl ToolSpec for FetchUrlTool {
                         &fetched.bytes,
                         is_success,
                         body_text.as_deref(),
-                        PdfTextCommand::system(context.cancel_token.as_ref()),
+                        PdfTextCommand::system(Some(context)),
                     )
                     .await?;
                     Ok((extracted, fields))
@@ -292,7 +292,7 @@ async fn extract_fetched_document(
     is_success: bool,
     decoded_body: Option<&str>,
     pdf_command: PdfTextCommand<'_>,
-) -> Result<ExtractedDocument, ToolError> {
+) -> super::web::adapter::AdapterResult<ExtractedDocument> {
     let extraction = if format == Format::Raw
         && super::web::extract::validate_pdf_response(url, Some(content_type), bytes)?
     {
@@ -316,8 +316,10 @@ async fn extract_fetched_document(
     };
     match extraction {
         Ok(document) => Ok(document),
-        Err(_error)
-            if (format == Format::Raw || !is_success) && is_declared_textual(content_type) =>
+        Err(error)
+            if error.content()
+                && (format == Format::Raw || !is_success)
+                && is_declared_textual(content_type) =>
         {
             let body_text = match decoded_body {
                 Some(body_text) => body_text.to_string(),
@@ -550,6 +552,52 @@ mod tests {
 
     fn ctx() -> ToolContext {
         ToolContext::new(PathBuf::from("."))
+    }
+
+    /// `fetch_url` can disclose local data through a URL or query, so it always
+    /// asks: the tool declares `Required`, and the default-ask policy resolves
+    /// that to a prompt rather than running it.
+    #[test]
+    fn fetch_url_always_requires_approval() {
+        use crate::tools::spec::{ApprovalRequirement, ToolSpec};
+        assert_eq!(
+            FetchUrlTool.approval_requirement(),
+            ApprovalRequirement::Required
+        );
+        assert!(
+            FetchUrlTool
+                .capabilities()
+                .contains(&ToolCapability::Network)
+        );
+
+        // Under the default Ask posture that requirement resolves to a prompt,
+        // and only full access (or an explicit bypass) lets it through.
+        use crate::core::authority::{ToolPermission, TurnAuthority, resolve_tool_permission};
+        use codewhale_config::AppMode;
+        use codewhale_execpolicy::ApprovalMode;
+        let requirement = FetchUrlTool.approval_requirement();
+        let ask = TurnAuthority::from_effective_fields(
+            AppMode::Agent,
+            true,
+            false,
+            false,
+            ApprovalMode::Suggest,
+        );
+        assert_eq!(
+            resolve_tool_permission(&ask, requirement, false),
+            ToolPermission::Prompt
+        );
+        let never = TurnAuthority::from_effective_fields(
+            AppMode::Agent,
+            true,
+            false,
+            false,
+            ApprovalMode::Never,
+        );
+        assert_eq!(
+            resolve_tool_permission(&never, requirement, false),
+            ToolPermission::Deny
+        );
     }
 
     #[test]

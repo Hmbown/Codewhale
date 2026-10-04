@@ -121,10 +121,9 @@ pub trait LlmClient: Send + Sync {
         requested_model: &str,
         dispatched_at: chrono::DateTime<chrono::Utc>,
     ) -> crate::cost_status::EffectiveRouteEnvelope {
-        let provider = crate::config::ApiProvider::parse(self.provider_name())
-            .unwrap_or(crate::config::ApiProvider::Custom);
-        crate::cost_status::EffectiveRouteEnvelope::capture(
-            None,
+        let provider = crate::config::ProviderKind::parse(self.provider_name())
+            .unwrap_or(crate::config::ProviderKind::Custom);
+        crate::cost_status::EffectiveRouteEnvelope::capture_observed(
             provider,
             self.provider_name(),
             requested_model,
@@ -316,7 +315,7 @@ fn redact_api_key_from_message(message: &str, api_key: Option<&str>) -> String {
 
 // === LlmError - Classified Error Types ===
 
-/// Evidence captured when an HTTP response explicitly identifies plan quota
+/// Evidence captured when a provider response explicitly identifies plan quota
 /// exhaustion. The private field prevents callers outside this parser module
 /// from manufacturing the durable classification from arbitrary text.
 #[derive(Debug)]
@@ -331,6 +330,14 @@ impl QuotaExhaustionError {
 
     pub(crate) fn into_message(self) -> String {
         self.message
+    }
+
+    /// Append route guidance (which account hit the limit, how to switch)
+    /// to already-classified evidence. Cannot manufacture the class.
+    #[must_use]
+    pub(crate) fn with_guidance(mut self, guidance: &str) -> Self {
+        self.message = format!("{}\n{guidance}", self.message);
+        self
     }
 }
 
@@ -352,7 +359,7 @@ pub enum LlmError {
     ///
     /// Unlike an ordinary 429 rate limit, retrying the same request after a short
     /// backoff cannot resolve this condition. This variant is constructed only at
-    /// the provider HTTP response boundary from explicit quota evidence.
+    /// a provider HTTP or structured stream-event boundary from explicit quota evidence.
     QuotaExhausted(QuotaExhaustionError),
 
     /// Server error (HTTP 5xx)
@@ -461,6 +468,13 @@ impl LlmError {
     /// - Status code (429 = rate limit, 401/403 = auth, 499/5xx = transient upstream error)
     /// - Response body keywords (`context_length`, `content_policy`, safety, etc.)
     pub fn from_http_response(status: u16, body: &str) -> Self {
+        if let Some(error) = explicit_quota_code(body)
+            .or_else(|| explicit_quota_code_marker(body))
+            .as_deref()
+            .and_then(Self::from_subscription_sharing_error_code)
+        {
+            return error;
+        }
         if matches!(status, 400 | 402 | 429) && has_explicit_quota_evidence(body) {
             return LlmError::QuotaExhausted(QuotaExhaustionError::from_http_message(
                 body.to_string(),
@@ -537,6 +551,24 @@ impl LlmError {
         }
     }
 
+    /// Official structured ChatGPT plan errors are terminal account states.
+    /// Plain text containing quota words is never enough to mint this type.
+    #[must_use]
+    pub(crate) fn from_subscription_sharing_error_code(code: &str) -> Option<Self> {
+        let message = match code {
+            "subscription_sharing_usage_limit_exceeded" => {
+                "ChatGPT plan usage limit reached. Check ChatGPT Settings > Usage for your remaining allowance and reset time."
+            }
+            "subscription_sharing_usage_unavailable" => {
+                "ChatGPT plan usage is unavailable. Check ChatGPT Settings > Usage and reconnect if needed."
+            }
+            _ => return None,
+        };
+        Some(Self::QuotaExhausted(
+            QuotaExhaustionError::from_http_message(message.to_string()),
+        ))
+    }
+
     #[must_use]
     pub fn authentication_error(message: impl Into<String>) -> Self {
         LlmError::AuthenticationError(AuthenticationErrorDetail::new(message))
@@ -581,6 +613,10 @@ impl LlmError {
         body: &str,
         auth_context: Option<AuthenticationErrorContext>,
     ) -> Self {
+        let classified = Self::from_http_response(status, body);
+        if matches!(classified, Self::QuotaExhausted(_)) {
+            return classified;
+        }
         match status {
             401 => Self::authentication_error_with_context(body, auth_context),
             403 => {
@@ -590,7 +626,7 @@ impl LlmError {
                     LlmError::AuthorizationError(body.to_string())
                 }
             }
-            _ => Self::from_http_response(status, body),
+            _ => classified,
         }
     }
 
@@ -754,7 +790,7 @@ pub(crate) fn is_context_length_message(lower: &str) -> bool {
 /// callers holding a stringified error must never promote it to this type.
 fn has_explicit_quota_evidence(body: &str) -> bool {
     explicit_quota_code(body).is_some()
-        || has_explicit_quota_code_marker(body)
+        || explicit_quota_code_marker(body).is_some()
         || has_explicit_quota_phrase(body)
 }
 
@@ -788,20 +824,27 @@ fn is_explicit_quota_code(code: &str) -> bool {
             | "billinghardlimitreached"
             | "billinglimitreached"
             | "creditbalanceexhausted"
+            // ChatGPT/Codex subscription window (HTTP 429, `error.type`),
+            // as openai/codex `api_bridge.rs` maps it. It resets on the
+            // plan's schedule, not after a short backoff.
+            | "usagelimitreached"
+            // Same backend, same branch: the signed-in plan does not include
+            // Codex. Retrying cannot help; switching accounts can.
+            | "usagenotincluded"
+            | "subscriptionsharingusagelimitexceeded"
+            | "subscriptionsharingusageunavailable"
     )
 }
 
-fn has_explicit_quota_code_marker(body: &str) -> bool {
+fn explicit_quota_code_marker(body: &str) -> Option<String> {
     let lower = body.to_ascii_lowercase();
-    let Some((_, suffix)) = lower.split_once("provider error code:") else {
-        return false;
-    };
+    let (_, suffix) = lower.split_once("provider error code:")?;
     let code = suffix
         .trim_start()
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
         .next()
         .unwrap_or_default();
-    is_explicit_quota_code(code)
+    is_explicit_quota_code(code).then(|| code.to_string())
 }
 
 fn has_explicit_quota_phrase(body: &str) -> bool {
@@ -1204,6 +1247,86 @@ pub type RetryResult<T> = Result<T, RetryError>;
 /// - The delay before the next attempt
 pub type RetryCallback = Box<dyn Fn(&LlmError, u32, Duration) + Send + Sync>;
 
+/// An observation of the existing request, never another retry driver. Its
+/// lexical scope captures the producing Engine queue, not an ambient session.
+pub(crate) type RetryStatusEmitter =
+    std::sync::Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+#[derive(Clone)]
+pub(crate) struct RequestRetryObservation {
+    pub(crate) retries: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    pub(crate) emit: RetryStatusEmitter,
+}
+
+tokio::task_local! {
+    static REQUEST_RETRY_OBSERVATION: Option<RequestRetryObservation>;
+}
+
+pub(crate) async fn observe_request_retries<F: Future>(
+    observation: Option<RequestRetryObservation>,
+    future: F,
+) -> F::Output {
+    REQUEST_RETRY_OBSERVATION.scope(observation, future).await
+}
+
+async fn observe_transport_status(message: String) {
+    let observation = REQUEST_RETRY_OBSERVATION
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    if let Some(observation) = observation {
+        (observation.emit)(message).await;
+    }
+}
+
+fn observe_transport_attempt() {
+    let _ = REQUEST_RETRY_OBSERVATION.try_with(|observation| {
+        if let Some(observation) = observation {
+            let mut count = observation
+                .retries
+                .load(std::sync::atomic::Ordering::Relaxed);
+            loop {
+                match observation.retries.compare_exchange_weak(
+                    count,
+                    count.saturating_add(1),
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => count = current,
+                }
+            }
+        }
+    });
+}
+
+/// A public receipt must never include the provider-controlled error payload.
+/// Raw errors remain intact in the original result and diagnostic/log paths.
+pub(crate) fn retry_reason_summary(error: &LlmError) -> String {
+    match error {
+        LlmError::RateLimited { .. } => "rate limited".into(),
+        LlmError::ServerError { status, .. } => format!("upstream {status}"),
+        LlmError::NetworkError(_) => "network error".into(),
+        LlmError::Timeout(_) => "timeout".into(),
+        _ => "non-retryable provider failure".into(),
+    }
+}
+
+async fn observe_transport_stopped(retries: u32, error: &LlmError, exhausted: bool) {
+    if retries > 0 {
+        let disposition = if exhausted {
+            "Retry exhaustion"
+        } else {
+            "Retry stopped"
+        };
+        observe_transport_status(format!(
+            "{disposition}: transport request stopped after {retries} retries; {}",
+            retry_reason_summary(error),
+        ))
+        .await;
+    }
+}
+
 // === with_retry - Generic Retry Wrapper ===
 
 /// Executes an async operation with configurable retry logic.
@@ -1281,18 +1404,32 @@ where
         if let Some(timeout) = total_timeout
             && start_time.elapsed() >= timeout
         {
+            let error = last_error.unwrap_or(LlmError::Timeout(timeout));
+            observe_transport_stopped(attempt.saturating_sub(1), &error, true).await;
             return Err(RetryError {
-                last_error: last_error.unwrap_or(LlmError::Timeout(timeout)),
+                last_error: error,
                 attempts: attempt,
                 total_time: start_time.elapsed(),
             });
         }
 
+        if attempt > 0 {
+            observe_transport_attempt();
+        }
         match operation().await {
-            Ok(result) => return Ok(result),
+            Ok(result) => {
+                if attempt > 0 {
+                    observe_transport_status(format!(
+                        "Retry recovery: transport request recovered after {attempt} retries"
+                    ))
+                    .await;
+                }
+                return Ok(result);
+            }
             Err(err) => {
                 // Non-retryable errors fail immediately
                 if !err.is_retryable() {
+                    observe_transport_stopped(attempt, &err, false).await;
                     return Err(RetryError {
                         last_error: err,
                         attempts: attempt + 1,
@@ -1302,6 +1439,7 @@ where
 
                 // Last attempt - no more retries
                 if attempt >= config.max_retries {
+                    observe_transport_stopped(attempt, &err, true).await;
                     return Err(RetryError {
                         last_error: err,
                         attempts: attempt + 1,
@@ -1323,6 +1461,14 @@ where
                     cb(&err, attempt, delay);
                 }
 
+                observe_transport_status(format!(
+                    "Retry attempt: transport {}/{}; {}; waiting {:.2}s",
+                    attempt + 1,
+                    config.max_retries,
+                    retry_reason_summary(&err),
+                    delay.as_secs_f64(),
+                ))
+                .await;
                 last_error = Some(err);
 
                 // Wait before retrying
@@ -1398,6 +1544,41 @@ mod quota_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn official_chatgpt_usage_codes_are_terminal_across_http_boundaries() {
+        for code in [
+            "subscription_sharing_usage_limit_exceeded",
+            "subscription_sharing_usage_unavailable",
+        ] {
+            let body = serde_json::json!({"error":{"code":code,"message":"opaque"}}).to_string();
+            for status in [400, 403, 429] {
+                for safe_body in [body.clone(), sanitize_http_error_body(None, status, &body)] {
+                    let error =
+                        LlmError::from_http_response_with_auth_context(status, &safe_body, None);
+                    assert!(matches!(error, LlmError::QuotaExhausted(_)), "{error:?}");
+                    assert!(!error.is_retryable());
+                    assert!(error.to_string().contains("ChatGPT Settings > Usage"));
+                    let envelope = crate::error_taxonomy::envelope_for_llm_error(
+                        error.into(),
+                        "allowance unavailable".into(),
+                    );
+                    assert!(!envelope.recoverable);
+                    assert_eq!(envelope.code, "llm_quota_exhausted");
+                }
+            }
+        }
+        for body in [
+            "usage limit reached",
+            r#"{"error":{"code":"subscription_sharing_usage_limit_exceeded_later"}}"#,
+        ] {
+            assert!(matches!(
+                LlmError::from_http_response(429, body),
+                LlmError::RateLimited { .. }
+            ));
+            assert!(LlmError::from_http_response(429, body).is_retryable());
+        }
+    }
 
     fn assert_f64_eq(actual: f64, expected: f64) {
         assert!(

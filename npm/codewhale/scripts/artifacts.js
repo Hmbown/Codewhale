@@ -1,5 +1,6 @@
 const path = require("path");
 const os = require("os");
+const compiledHosts = require("./compiled-hosts");
 
 const CHECKSUM_MANIFEST = "codewhale-artifacts-sha256.txt";
 const BUNDLE_CHECKSUM_MANIFEST = "codewhale-bundles-sha256.txt";
@@ -101,7 +102,7 @@ function unsupportedBuildHint() {
     "No prebuilt binary is available for this platform/architecture combo.",
     "You can still run codewhale by building from source with Cargo (single binary):",
     "",
-    "  # Requires Rust 1.88+ (https://rustup.rs)",
+    "  # Requires Rust 1.89+ (https://rustup.rs)",
     "  cargo install codewhale-cli --locked   # provides `codewhale`",
     "",
     "Or build from a checkout:",
@@ -257,7 +258,7 @@ function allAssetNames() {
   return Array.from(new Set(names));
 }
 
-function allReleaseAssetNames() {
+function allReleaseAssetNames(catalog) {
   return [
     ...allAssetNames(),
     ...LEGACY_TUI_BRIDGE_ASSET_NAMES,
@@ -265,11 +266,12 @@ function allReleaseAssetNames() {
     WINDOWS_INSTALLER_ASSET,
     BUNDLE_CHECKSUM_MANIFEST,
     CHECKSUM_MANIFEST,
+    ...compiledHosts.assets(catalog),
   ];
 }
 
-function checksummedReleaseAssetNames() {
-  return allReleaseAssetNames().filter((name) => name !== CHECKSUM_MANIFEST);
+function checksummedReleaseAssetNames(catalog) {
+  return allReleaseAssetNames(catalog).filter((name) => name !== CHECKSUM_MANIFEST);
 }
 
 module.exports = {

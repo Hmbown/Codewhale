@@ -34,6 +34,7 @@
     cargo fmt --all -- --check
     cargo check --workspace --all-targets --locked
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+    cargo build -p codewhale-cli --bin codewhale --all-features --locked
     # Use the shared test HOME boundary while retaining the real toolchain.
     RUST_MIN_STACK=16777216 sh scripts/with-hermetic-test-home.sh cargo test --workspace --all-features --locked
     # Parity gates as first-class steps so drift surfaces as a named failure,

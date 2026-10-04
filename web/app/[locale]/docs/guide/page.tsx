@@ -1,10 +1,12 @@
 import Link from "next/link";
 import { GettingStartedSteps } from "@/components/getting-started-steps";
 import { SessionMedia } from "@/components/session-media";
+import { NativeTerminalGallery } from "@/components/native-terminal-gallery";
 import { GUIDE_NEXT_LINKS } from "@/lib/content/getting-started";
-import { getDocsGuide, pickText } from "@/lib/i18n/dictionaries";
-import { getMediaAsset } from "@/lib/media-manifest";
+import { fill, getDocsGuide, getHome, pickText } from "@/lib/i18n/dictionaries";
+import { getMediaAsset, TERMINAL_SCREENSHOT } from "@/lib/media-manifest";
 import { buildPageMetadata } from "@/lib/page-meta";
+import { getNativeTerminalCopy } from "@/lib/content/native-terminal";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
@@ -21,6 +23,8 @@ export default async function GuidePage({ params }: { params: Promise<{ locale: 
   const { locale } = await params;
   const t = getDocsGuide(locale);
   const session = getMediaAsset("first-fleet-session");
+  const terminal = getNativeTerminalCopy(locale);
+  const home = getHome(locale);
 
   return (
     <section className="space-y-10">
@@ -31,6 +35,19 @@ export default async function GuidePage({ params }: { params: Promise<{ locale: 
 
       <section id="path" className="scroll-mt-32">
         <GettingStartedSteps locale={locale} headingLevel={2} />
+      </section>
+
+      <section id="terminal-views" className="scroll-mt-32">
+        <h2 className="font-display text-2xl mb-1">{terminal.title}</h2>
+        <p className={`${t.bodyClassName} mt-3 mb-4`}>{terminal.description}</p>
+        <div className="figure-frame">
+          <NativeTerminalGallery
+            locale={locale}
+            defaultFrame="home"
+            regionLabel={home.shotPreview}
+            label={fill(home.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
+          />
+        </div>
       </section>
 
       {session?.status === "published" && (

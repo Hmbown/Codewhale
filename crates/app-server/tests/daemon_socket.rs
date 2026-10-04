@@ -32,7 +32,10 @@ fn short_socket_root(label: &str) -> PathBuf {
         % 1_000_000;
     let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    let root = PathBuf::from("/tmp").join(format!("cw-ds-{label}-{pid}-{nonce}-{millis}"));
+    let root = PathBuf::from("/tmp")
+        .canonicalize()
+        .expect("selected temporary parent")
+        .join(format!("cw-ds-{label}-{pid}-{nonce}-{millis}"));
     assert!(
         root.as_os_str().len() < 60,
         "socket root too long for a unix socket test: {}",
@@ -361,6 +364,11 @@ async fn version_skew_is_refused_at_attach() {
 async fn stale_socket_is_cleaned_up_and_foreign_files_are_refused() {
     let harness = Harness::new("stale");
     std::fs::create_dir_all(harness.socket_path.parent().expect("parent")).expect("mkdir");
+    std::fs::set_permissions(
+        harness.socket_path.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("private stale fixture parent");
 
     // A socket file whose listener is gone: bind must reclaim it.
     {
@@ -398,4 +406,474 @@ async fn stale_socket_is_cleaned_up_and_foreign_files_are_refused() {
         std::fs::read(&harness.socket_path).expect("file intact"),
         b"not a socket"
     );
+}
+
+#[tokio::test]
+async fn binding_refuses_public_parent_and_drop_before_serve_retires_exact_socket() {
+    let harness = Harness::new("private");
+    let parent = harness.socket_path.parent().unwrap();
+    std::fs::create_dir_all(parent).unwrap();
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(bind_daemon_socket(harness.options()).await.is_err());
+    assert_eq!(
+        std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert!(!harness.socket_path.exists());
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let daemon = bind_daemon_socket(harness.options()).await.unwrap();
+    assert!(harness.socket_path.exists());
+    drop(daemon);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while harness.socket_path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled binder retirement finishes off-runtime");
+    assert!(!harness.socket_path.exists());
+}
+
+#[tokio::test]
+async fn dropping_bound_daemon_preserves_a_replacement_at_the_selected_path() {
+    let harness = Harness::new("replaced");
+    let daemon = bind_daemon_socket(harness.options()).await.unwrap();
+    let captured = harness.socket_path.with_extension("captured");
+    std::fs::rename(&harness.socket_path, &captured).unwrap();
+    std::fs::write(&harness.socket_path, b"operator replacement").unwrap();
+    drop(daemon);
+    assert_eq!(
+        std::fs::read(&harness.socket_path).unwrap(),
+        b"operator replacement"
+    );
+    assert!(captured.exists());
+}
+
+#[tokio::test]
+async fn captured_owner_frontend_authenticates_generation_without_publishing_bearer() {
+    let harness = Harness::new("owner");
+    let owner = codewhale_protocol::RuntimeOwnerReceipt {
+        version: 1,
+        data_dir: harness.root.join("runtime"),
+        execution_scope: "captured-test-store".into(),
+        lease_generation: "captured-test-generation".into(),
+        pid: std::process::id(),
+        process_start: codewhale_app_server::daemon_socket::capture_process_start(
+            std::process::id(),
+        )
+        .await
+        .unwrap(),
+        principal: codewhale_config::private_directory::PrivateDirectory::current_user_id()
+            .to_string(),
+        socket_path: harness.socket_path.clone(),
+        config_path: harness.options().config_path,
+    };
+    // Transport acceptance: the captured owner is a fixture, not an Engine/store proof.
+    let daemon = codewhale_app_server::bind_runtime_owner(
+        owner.config_path.clone(),
+        "127.0.0.1:1".parse().unwrap(),
+        Some("private-fixture-bearer".into()),
+        owner.clone(),
+    )
+    .await
+    .unwrap();
+    let receipt_path = harness.socket_path.with_file_name("daemon.sock.owner.json");
+    let bytes = std::fs::read(&receipt_path).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<codewhale_protocol::RuntimeOwnerReceipt>(&bytes).unwrap(),
+        owner
+    );
+    assert!(
+        !String::from_utf8(bytes)
+            .unwrap()
+            .contains("private-fixture-bearer")
+    );
+    assert_eq!(
+        std::fs::metadata(&receipt_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let handle = daemon.shutdown_handle();
+    let server = tokio::spawn(daemon.serve());
+    let mut guest = Client::connect(&harness.socket_path).await;
+    let missing = guest.attach(1, "guest", "attach").await;
+    assert!(missing["error"].is_object());
+    let mut stale = owner.clone();
+    stale.lease_generation = "other-generation".into();
+    let rejected = guest
+        .call(
+            2,
+            "daemon/attach",
+            json!({"client":{"name":"guest"},"mode":"attach","expect_owner":stale}),
+        )
+        .await;
+    assert!(rejected["error"].is_object());
+    let claim = guest
+        .call(
+            3,
+            "daemon/attach",
+            json!({"client":{"name":"guest"},"mode":"claim","expect_owner":owner}),
+        )
+        .await;
+    assert!(claim["error"].is_object());
+    let attached = guest
+        .call(
+            4,
+            "daemon/attach",
+            json!({"client":{"name":"guest","pid":1},"mode":"attach","expect_owner":owner}),
+        )
+        .await;
+    assert_eq!(attached["result"]["role"], "attached");
+    assert_eq!(attached["result"]["owner_receipt"], json!(owner));
+    // The display PID is deliberately false: authorization uses kernel peer credentials.
+    let denied = guest.call(5, "shutdown", json!({})).await;
+    assert!(denied["error"].is_object());
+    assert!(guest.call(6, "healthz", json!({})).await["result"].is_object());
+    handle.trigger();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!harness.socket_path.exists());
+    assert!(
+        !receipt_path.exists(),
+        "normal shutdown awaits exact receipt retirement"
+    );
+}
+
+/// Native IPC/HTTP transport proof with a fake owned Runtime; no Engine or
+/// provider acceptance is inferred from this source fixture.
+#[tokio::test]
+async fn canonical_cli_control_uses_authenticated_owner_and_same_dispatcher() {
+    use axum::{Json, Router, routing::get};
+    let harness = Harness::new("thread-control");
+    let workspace = harness._config_dir.path().to_path_buf();
+    let thread = serde_json::json!({"id":"canonical-transport","created_at":"2026-10-02T00:00:00Z",
+        "updated_at":"2026-10-02T00:00:00Z","model":"fixture-model","model_provider":"custom",
+        "model_provider_id":"fixture-owner","workspace":workspace,"archived":false});
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route(
+            "/v1/threads",
+            get(move || {
+                let thread = thread.clone();
+                async move { Json(serde_json::json!([thread])) }
+            }),
+        )
+        .route(
+            "/v1/threads/running",
+            get(|| async { Json(serde_json::json!([])) }),
+        );
+    let fake_http = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let owner = codewhale_protocol::RuntimeOwnerReceipt {
+        version: 1,
+        data_dir: harness.root.join("runtime"),
+        execution_scope: "control-fixture".into(),
+        lease_generation: "control-generation".into(),
+        pid: std::process::id(),
+        process_start: codewhale_app_server::daemon_socket::capture_process_start(
+            std::process::id(),
+        )
+        .await
+        .unwrap(),
+        principal: codewhale_config::private_directory::PrivateDirectory::current_user_id()
+            .to_string(),
+        socket_path: harness.socket_path.clone(),
+        config_path: harness.options().config_path,
+    };
+    let daemon = codewhale_app_server::bind_runtime_owner(
+        owner.config_path.clone(),
+        endpoint,
+        Some("private-fixture-control".into()),
+        owner.clone(),
+    )
+    .await
+    .unwrap();
+    let shutdown = daemon.shutdown_handle();
+    let socket = tokio::spawn(daemon.serve());
+    let result = codewhale_app_server::request_thread_control(
+        owner.config_path.clone(),
+        Some(harness.socket_path.clone()),
+        None,
+        codewhale_protocol::ThreadRequest::List(codewhale_protocol::ThreadListParams {
+            include_archived: false,
+            limit: None,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.threads.len(), 1);
+    assert_eq!(result.threads[0].id, "canonical-transport");
+    assert_eq!(result.threads[0].model_provider, "fixture-owner");
+    assert!(
+        !serde_json::to_string(&result)
+            .unwrap()
+            .contains("private-fixture-control")
+    );
+    let error = codewhale_app_server::request_thread_control(
+        owner.config_path.clone(),
+        Some(harness.socket_path.clone()),
+        Some(codewhale_app_server::ThreadControlSelection {
+            workspace: Some(workspace),
+            config_profile: None,
+            config_source: None,
+        }),
+        codewhale_protocol::ThreadRequest::List(codewhale_protocol::ThreadListParams {
+            include_archived: false,
+            limit: None,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("no captured worker setting"));
+    shutdown.trigger();
+    tokio::time::timeout(Duration::from_secs(5), socket)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    fake_http.abort();
+}
+
+/// This only validates the adapter's captured scope transport. Actual Runtime
+/// policy/Config admission is covered by the owning Runtime acceptance suite.
+struct ScopedControlFixture {
+    workers: usize,
+    config: PathBuf,
+    scopes: std::sync::Arc<tokio::sync::Mutex<Vec<codewhale_app_server::RuntimeFrontendScope>>>,
+}
+impl codewhale_app_server::RuntimeOwnerFrontend for ScopedControlFixture {
+    fn validate_selection<'a>(
+        &'a self,
+        selection: &'a codewhale_app_server::RuntimeOwnerFrontendSelection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let codewhale_app_server::RuntimeOwnerFrontendSelection::Control(scope) = selection
+            else {
+                anyhow::bail!("fixture expects the existing control frontend");
+            };
+            anyhow::ensure!(
+                scope.workers == self.workers,
+                "captured scheduler setting changed"
+            );
+            anyhow::ensure!(
+                scope.workspace.is_absolute() && scope.workspace.is_dir(),
+                "fixture scope is not selected"
+            );
+            anyhow::ensure!(
+                scope
+                    .config_profile
+                    .as_deref()
+                    .is_none_or(|profile| profile == "reviewed"),
+                "profile is not admitted by held owner"
+            );
+            anyhow::ensure!(
+                scope
+                    .config_source
+                    .as_ref()
+                    .is_none_or(|source| source == &self.config),
+                "config is not admitted by held owner"
+            );
+            self.scopes.lock().await.push(scope.clone());
+            Ok(())
+        })
+    }
+    fn serve(
+        &self,
+        selection: codewhale_app_server::RuntimeOwnerFrontendSelection,
+        compatibility: codewhale_app_server::AppState,
+        input: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
+        output: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            let codewhale_app_server::RuntimeOwnerFrontendSelection::Control(scope) = selection
+            else {
+                anyhow::bail!("fixture expects control");
+            };
+            codewhale_app_server::run_guest_control(compatibility, scope.workspace, input, output)
+                .await
+        })
+    }
+}
+
+#[tokio::test]
+async fn canonical_cli_scoped_resume_fork_keep_exact_owner_workers_and_refuse_wrong_selection() {
+    use axum::{Json, Router, response::IntoResponse as _};
+    use std::sync::Arc;
+    let harness = Harness::new("scoped-control");
+    let workspace = harness._config_dir.path().to_path_buf();
+    let selected = workspace.join("explicit-target");
+    std::fs::create_dir(&selected).unwrap();
+    let owner = codewhale_protocol::RuntimeOwnerReceipt {
+        version: 1,
+        data_dir: harness.root.join("runtime"),
+        execution_scope: "scoped-control-store".into(),
+        lease_generation: "scoped-control-generation".into(),
+        pid: std::process::id(),
+        process_start: codewhale_app_server::daemon_socket::capture_process_start(
+            std::process::id(),
+        )
+        .await
+        .unwrap(),
+        principal: codewhale_config::private_directory::PrivateDirectory::current_user_id()
+            .to_string(),
+        socket_path: harness.socket_path.clone(),
+        config_path: harness.options().config_path,
+    };
+    let calls = Arc::new(tokio::sync::Mutex::new(Vec::<(String, Value)>::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let captured = owner.clone();
+    let http_calls = calls.clone();
+    let target = selected.clone();
+    let app = Router::new().fallback(move |request: axum::extract::Request| {
+        let owner = captured.clone(); let calls = http_calls.clone(); let target = target.clone();
+        async move {
+            let path = request.uri().path().to_string();
+            let bytes = axum::body::to_bytes(request.into_body(), 8 * 1024 * 1024).await.unwrap();
+            let body = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
+            calls.lock().await.push((path.clone(), body.clone()));
+            let record = |id: &str, root: &Path| json!({"id":id,"created_at":"2026-10-02T00:00:00Z",
+                "updated_at":"2026-10-02T00:00:00Z","model":"fixture-model","model_provider":"custom",
+                "model_provider_id":"fixture-owner","workspace":root,"archived":false});
+            let value = if path.ends_with("/operations/lookup") { json!({"state":"absent"}) }
+                else if path.ends_with("/mutate") {
+                    assert_eq!(body["expected_data_dir"], json!(owner.data_dir));
+                    assert_eq!(body["expected_execution_scope"], owner.execution_scope);
+                    assert_eq!(body["workspace"], json!(target));
+                    assert_eq!(body["mutation"]["options"]["overrides"], json!({"model":"explicit-model", "model_provider":"fixture-owner", "approval_policy":"on-request", "sandbox":"workspace-write"}));
+                    let fork = body["mutation"]["action"] == "fork";
+                    json!({"version":1,"data_dir":owner.data_dir,"execution_scope":owner.execution_scope,
+                        "operation_key":body["operation_key"],"request_digest":"1".repeat(64),"history_digest":"2".repeat(64),
+                        "runtime_thread_id":if fork {"canonical-scoped-fork"} else {"canonical-source"},
+                        "session_id":if fork {"session-scoped-fork"} else {"session-source"}})
+                } else if path.ends_with("/history") {
+                    json!({"version":1,"data_dir":owner.data_dir,"execution_scope":owner.execution_scope,
+                        "runtime_thread_id":"canonical-source","saved_session_id":"session-source",
+                        "saved_document_digest":"a".repeat(64),"session_goal_digest":"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+                        "document_digest":"b".repeat(64),"session":{"metadata":{"id":"session-source"},"messages":[],"journal":{"entries":[]}}})
+                } else if path == "/v1/threads/running" { json!([]) }
+                else if path == "/v1/threads" { json!([record("canonical-source", &target), record("other-workspace", Path::new("/recorded-other-workspace"))]) }
+                else if path == "/v1/threads/canonical-scoped-fork" { record("canonical-scoped-fork", &target) }
+                else if path == "/v1/threads/canonical-source" { record("canonical-source", &target) }
+                else { return (axum::http::StatusCode::NOT_FOUND, Json(json!({"error":"fixture route missing"}))).into_response(); };
+            Json(value).into_response()
+        }
+    });
+    let fake_http = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let scopes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let frontend = Arc::new(ScopedControlFixture {
+        workers: 7,
+        config: owner.config_path.clone().unwrap(),
+        scopes: scopes.clone(),
+    });
+    let (daemon, _) = codewhale_app_server::bind_runtime_frontends(
+        owner.config_path.clone(),
+        Some("fixture-private-scope-token".into()),
+        owner.clone(),
+        codewhale_app_server::RuntimeOwnerRouting {
+            endpoint,
+            workspace: Some(workspace),
+            workers: Some(7),
+            mobile: false,
+            web: false,
+            acp: true,
+            acp_only: false,
+        },
+        Some(frontend),
+    )
+    .await
+    .unwrap();
+    let shutdown = daemon.shutdown_handle();
+    let socket = tokio::spawn(daemon.serve());
+    let selection = codewhale_app_server::ThreadControlSelection {
+        workspace: Some(selected.clone()),
+        config_profile: Some("reviewed".into()),
+        config_source: owner.config_path.clone(),
+    };
+    for (kind, operation, expected_id) in [
+        ("resume", "scoped-resume", "canonical-source"),
+        ("fork", "scoped-fork", "canonical-scoped-fork"),
+    ] {
+        let request = serde_json::from_value(
+            json!({"kind":kind,"thread_id":"canonical-source","operation_key":operation,
+                "model":"explicit-model", "model_provider":"fixture-owner", "approval_policy":"on-request", "sandbox":"workspace-write"}),
+        )
+        .unwrap();
+        let response = codewhale_app_server::request_thread_control(
+            owner.config_path.clone(),
+            Some(harness.socket_path.clone()),
+            Some(selection.clone()),
+            request,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.data["receipt"]["operation_key"], operation);
+        assert_eq!(response.data["receipt"]["runtime_thread_id"], expected_id);
+        assert_eq!(response.thread.unwrap().id, expected_id);
+    }
+    let list = codewhale_app_server::request_thread_control(
+        owner.config_path.clone(),
+        Some(harness.socket_path.clone()),
+        Some(selection.clone()),
+        codewhale_protocol::ThreadRequest::List(codewhale_protocol::ThreadListParams {
+            include_archived: false,
+            limit: None,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        list.threads
+            .iter()
+            .any(|thread| thread.id == "other-workspace"),
+        "scoped execution does not filter owner-store-wide read-only list"
+    );
+    assert!(scopes.lock().await.iter().all(|scope| scope.workers == 7
+        && scope.workspace == selected
+        && scope.config_profile.as_deref() == Some("reviewed")));
+    let before = calls.lock().await.len();
+    for wrong in [
+        codewhale_app_server::ThreadControlSelection {
+            config_profile: Some("wrong".into()),
+            ..selection.clone()
+        },
+        codewhale_app_server::ThreadControlSelection {
+            config_source: Some(selected.join("other.toml")),
+            ..selection.clone()
+        },
+    ] {
+        let request = serde_json::from_value(json!({"kind":"resume","thread_id":"canonical-source","operation_key":"never-dispatched"})).unwrap();
+        assert!(
+            codewhale_app_server::request_thread_control(
+                owner.config_path.clone(),
+                Some(harness.socket_path.clone()),
+                Some(wrong),
+                request
+            )
+            .await
+            .is_err()
+        );
+    }
+    assert_eq!(
+        calls.lock().await.len(),
+        before,
+        "selection refusal happens before HTTP effect dispatch"
+    );
+    shutdown.trigger();
+    tokio::time::timeout(Duration::from_secs(5), socket)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    fake_http.abort();
 }

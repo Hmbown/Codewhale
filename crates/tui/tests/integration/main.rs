@@ -5,6 +5,9 @@
 //! same test names (`integration::adaptive_evidence_acceptance::...`) so
 //! `cargo test -p codewhale-tui adaptive_evidence_acceptance` still filters.
 
+#[path = "../support/binary.rs"]
+mod binary;
+
 // Production modules that are `#[path]`-included by the test files below and
 // that themselves use `crate::`. They must exist at the harness crate root so
 // `crate::config`, `crate::shell_dispatcher`, etc. resolve when the same

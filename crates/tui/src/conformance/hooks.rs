@@ -153,6 +153,7 @@ fn run_case(name: &str, case: &Value, failures: &mut Failures) {
             let verdict =
                 runtime.block_on(crate::core::engine::turn_loop::run_tool_call_before_hooks(
                     Some(&executor),
+                    None, // This surface has no TypeScript host attachment.
                     tool_name,
                     call_id,
                     &tool["input"],

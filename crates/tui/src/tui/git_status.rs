@@ -29,6 +29,7 @@
 
 use crate::dependencies::{ExternalTool, Git};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -390,6 +391,63 @@ pub struct WorktreeEntry {
 
 const CACHE_TTL: Duration = Duration::from_secs(2);
 
+/// Probe cadence while the session is in use. One probe is about a dozen
+/// `git` processes, none of them counted in the TUI's own CPU time.
+pub(crate) const ACTIVE_PROBE_INTERVAL: Duration = CACHE_TTL;
+
+/// How long a session must see no input and no engine event before the probe
+/// backs off to [`QUIET_PROBE_INTERVAL`] (#6728).
+pub(crate) const QUIET_PROBE_AFTER: Duration = Duration::from_secs(30);
+
+/// Probe cadence of a session nobody is touching. Input or any engine event
+/// (a tool finishing, a turn ending) ends the quiet and the next tick probes.
+pub(crate) const QUIET_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Cache lifetime while backed off. Just under [`QUIET_PROBE_INTERVAL`], so
+/// the 15 s workspace-context refresh finds the loop's probe fresh instead of
+/// adding a second one of its own.
+const QUIET_CACHE_TTL: Duration = Duration::from_secs(14);
+
+static PROBE_BACKED_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Whether a session quiet for `quiet_for` is on the slow probe schedule.
+#[must_use]
+pub(crate) fn probe_is_backed_off(quiet_for: Duration) -> bool {
+    quiet_for >= QUIET_PROBE_AFTER
+}
+
+/// The gap between probes for a session quiet for `quiet_for`.
+#[must_use]
+pub(crate) fn probe_interval(quiet_for: Duration) -> Duration {
+    if probe_is_backed_off(quiet_for) {
+        QUIET_PROBE_INTERVAL
+    } else {
+        ACTIVE_PROBE_INTERVAL
+    }
+}
+
+/// Whether a probe is due, `last_probe_age` after the previous one (`None`:
+/// never probed). Fresh input shortens the interval, so a probe that is
+/// older than the fast cadence fires on the very next tick.
+#[must_use]
+pub(crate) fn probe_due(last_probe_age: Option<Duration>, quiet_for: Duration) -> bool {
+    last_probe_age.is_none_or(|age| age >= probe_interval(quiet_for))
+}
+
+/// Tell the cache which schedule the loop is on, so [`refresh_if_stale`]
+/// callers agree with it about what "fresh" means.
+pub(crate) fn set_probe_backoff(backed_off: bool) {
+    PROBE_BACKED_OFF.store(backed_off, Ordering::Relaxed);
+}
+
+fn cache_ttl() -> Duration {
+    if PROBE_BACKED_OFF.load(Ordering::Relaxed) {
+        QUIET_CACHE_TTL
+    } else {
+        CACHE_TTL
+    }
+}
+
 static CACHE: OnceLock<Mutex<GitStatusSnapshot>> = OnceLock::new();
 
 fn cache() -> &'static Mutex<GitStatusSnapshot> {
@@ -414,19 +472,26 @@ pub fn cached_status() -> GitStatusSnapshot {
 /// the two-second chrome tick into an unconditional six-command probe —
 /// including the `git status` that contends for `.git/index.lock` (#5617).
 fn snapshot_is_stale(snap: &GitStatusSnapshot, workspace: &Path) -> bool {
-    snap.fetched_at.is_none_or(|t| t.elapsed() > CACHE_TTL)
+    snap.fetched_at.is_none_or(|t| t.elapsed() > cache_ttl())
         || snap.probed_workspace.as_deref() != Some(workspace)
 }
 
 /// Returns the snapshot for `workspace`: the cached one while fresh, else a
 /// new probe (which also becomes the cache).
 pub fn refresh_if_stale(workspace: &Path) -> GitStatusSnapshot {
-    let cached = cache()
-        .lock()
-        .ok()
-        .filter(|g| !snapshot_is_stale(g, workspace))
-        .map(|g| g.clone());
-    if let Some(snap) = cached {
+    let cached = cache().lock().ok().map(|g| g.clone());
+    if let Some(snap) = cached.as_ref().filter(|g| !snapshot_is_stale(g, workspace)) {
+        return snap.clone();
+    }
+    // Backed off, with a healthy snapshot of this workspace in hand: re-read
+    // the status only (#6728).
+    if PROBE_BACKED_OFF.load(Ordering::Relaxed)
+        && let Some(prev) = cached.filter(|prev| can_probe_status_only(prev, workspace))
+    {
+        let snap = probe_status_only(&prev);
+        if let Ok(mut guard) = cache().lock() {
+            *guard = snap.clone();
+        }
         return snap;
     }
     force_refresh(workspace)
@@ -478,20 +543,7 @@ pub(crate) fn probe_status(workspace: &Path) -> GitStatusSnapshot {
 
     // Branch, upstream, ahead/behind and every changed path: one call.
     match probe_workspace_status(&root) {
-        Ok(status) => {
-            snap.detached = status.head.is_none();
-            snap.branch = status
-                .head
-                .clone()
-                .or_else(|| status.oid.as_deref().map(|oid| short_oid(oid).to_string()));
-            snap.has_upstream = status.upstream.is_some();
-            snap.ahead = status.ahead;
-            snap.behind = status.behind;
-            snap.dirty = !status.changes.is_clean();
-            snap.changes = status.changes;
-            snap.changed_paths = status.changed_paths;
-            snap.changed_path_count = status.changed_path_count;
-        }
+        Ok(status) => apply_porcelain(&mut snap, status),
         Err(error) => {
             snap.error = Some(format!("git status failed: {}", error.trim()));
             return snap;
@@ -512,6 +564,57 @@ pub(crate) fn probe_status(workspace: &Path) -> GitStatusSnapshot {
         snap.worktrees = parse_worktree_list(&list);
     }
 
+    snap
+}
+
+/// Fold one `git status` reading into `snap`: branch, upstream, ahead/behind
+/// and every changed path.
+fn apply_porcelain(snap: &mut GitStatusSnapshot, status: PorcelainStatus) {
+    snap.detached = status.head.is_none();
+    snap.branch = status
+        .head
+        .clone()
+        .or_else(|| status.oid.as_deref().map(|oid| short_oid(oid).to_string()));
+    snap.has_upstream = status.upstream.is_some();
+    snap.ahead = status.ahead;
+    snap.behind = status.behind;
+    snap.dirty = !status.changes.is_clean();
+    snap.changes = status.changes;
+    snap.changed_paths = status.changed_paths;
+    snap.changed_path_count = status.changed_path_count;
+}
+
+/// Whether a backed-off refresh may re-read only `git status` on top of
+/// `prev`. It needs a healthy earlier probe of the same workspace: the rest
+/// (repository identity, forge slug, recent commits, worktrees) only changes
+/// through something the person or the agent does, and that is activity,
+/// which ends the back-off and brings the full probe back.
+fn can_probe_status_only(prev: &GitStatusSnapshot, workspace: &Path) -> bool {
+    prev.probed_workspace.as_deref() == Some(workspace)
+        && prev.error.is_none()
+        && prev.root.is_some()
+}
+
+/// The back-off probe: one `git status` (two processes) instead of the dozen
+/// the full probe starts, spliced into `prev`. Branch, dirty state and
+/// ahead/behind still follow whatever happens in another terminal; the
+/// commit list and worktree list wait for the next full probe (#6728).
+///
+/// Known limits: while backed off, a commit or worktree change made in another
+/// terminal shows in the branch and dirty state within [`QUIET_PROBE_INTERVAL`]
+/// but not in the recent-commit and worktree lists, and the relative ages in
+/// those lists stand still, until the next input or engine event brings the
+/// full probe back.
+fn probe_status_only(prev: &GitStatusSnapshot) -> GitStatusSnapshot {
+    let mut snap = prev.clone();
+    snap.fetched_at = Some(Instant::now());
+    let Some(root) = prev.root.as_deref() else {
+        return snap;
+    };
+    match probe_workspace_status(root) {
+        Ok(status) => apply_porcelain(&mut snap, status),
+        Err(error) => snap.error = Some(format!("git status failed: {}", error.trim())),
+    }
     snap
 }
 
@@ -701,6 +804,106 @@ mod tests {
             !snapshot_is_stale(&snap, &workspace),
             "a fresh probe from a subdirectory must satisfy the TTL"
         );
+    }
+
+    /// The probe schedule of #6728: two seconds while the session is in use,
+    /// fifteen once nothing has touched it for thirty, and the fast cadence
+    /// back on the very next tick after any activity.
+    #[test]
+    fn the_probe_backs_off_only_after_thirty_quiet_seconds() {
+        let secs = Duration::from_secs;
+        assert_eq!(probe_interval(secs(0)), secs(2));
+        assert_eq!(probe_interval(secs(29)), secs(2));
+        assert!(!probe_is_backed_off(secs(29)));
+        assert_eq!(probe_interval(secs(30)), secs(15));
+        assert!(probe_is_backed_off(secs(30)));
+        assert_eq!(probe_interval(secs(3_600)), secs(15));
+    }
+
+    #[test]
+    fn a_probe_is_due_on_its_interval_and_at_once_after_activity() {
+        let secs = Duration::from_secs;
+        // Never probed: always due.
+        assert!(probe_due(None, secs(0)));
+        assert!(probe_due(None, secs(600)));
+        // In use: the 2 s cadence.
+        assert!(!probe_due(Some(secs(1)), secs(5)));
+        assert!(probe_due(Some(secs(2)), secs(5)));
+        // Quiet: nothing until 15 s.
+        assert!(!probe_due(Some(secs(2)), secs(60)));
+        assert!(!probe_due(Some(secs(14)), secs(60)));
+        assert!(probe_due(Some(secs(15)), secs(60)));
+        // The next input resets the quiet clock; a probe 9 s old is now due.
+        assert!(!probe_due(Some(secs(9)), secs(60)));
+        assert!(probe_due(Some(secs(9)), secs(0)));
+    }
+
+    #[test]
+    fn a_status_only_refresh_needs_a_healthy_snapshot_of_the_same_workspace() {
+        let workspace = PathBuf::from("/repo/crates/tui");
+        let healthy = probed(&workspace, Path::new("/repo"));
+        assert!(can_probe_status_only(&healthy, &workspace));
+        assert!(
+            !can_probe_status_only(&healthy, Path::new("/other")),
+            "another workspace gets the full probe"
+        );
+        let mut errored = healthy.clone();
+        errored.error = Some("git status failed: boom".into());
+        assert!(!can_probe_status_only(&errored, &workspace));
+        let mut rootless = healthy;
+        rootless.root = None;
+        assert!(!can_probe_status_only(&rootless, &workspace));
+        assert!(!can_probe_status_only(
+            &GitStatusSnapshot::default(),
+            &workspace
+        ));
+    }
+
+    /// The back-off probe runs one `git status` and leaves everything else
+    /// the full probe learned in place.
+    #[test]
+    fn a_status_only_refresh_keeps_identity_commits_and_worktrees() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("a.txt"), "a\n").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "first"]);
+
+        let full = probe_status(dir.path());
+        assert!(full.error.is_none(), "{:?}", full.error);
+        assert!(!full.dirty);
+        assert_eq!(full.recent_commits.len(), 1);
+        assert!(can_probe_status_only(&full, dir.path()));
+
+        std::fs::write(dir.path().join("b.txt"), "b\n").expect("write");
+        let light = probe_status_only(&full);
+        assert!(light.error.is_none(), "{:?}", light.error);
+        assert!(light.dirty, "the new untracked file shows up");
+        assert_eq!(light.changes.untracked, 1);
+        assert_eq!(light.branch.as_deref(), Some("main"));
+        assert_eq!(light.recent_commits, full.recent_commits);
+        assert_eq!(light.worktrees, full.worktrees);
+        assert_eq!(light.repository_name, full.repository_name);
+        assert_eq!(light.root, full.root);
+        assert_eq!(light.probed_workspace, full.probed_workspace);
+        assert!(light.fetched_at >= full.fetched_at);
+    }
+
+    #[test]
+    fn the_quiet_cache_lifetime_stays_below_the_quiet_probe_interval() {
+        // Otherwise the loop's own probe would find its previous result
+        // fresh and skip, and the cadence would silently double.
+        assert!(QUIET_CACHE_TTL < QUIET_PROBE_INTERVAL);
+        assert!(QUIET_CACHE_TTL > CACHE_TTL);
     }
 
     #[test]

@@ -1,0 +1,15 @@
+{
+  "server_received": [],
+  "steps": [
+    {
+      "op": "boot",
+      "outcome": {
+        "err": "conformance: MCP server 'conformance' discovery failed: tools/list repeated pagination cursor; aborting"
+      }
+    },
+    {
+      "op": "catalog",
+      "tools": []
+    }
+  ]
+}

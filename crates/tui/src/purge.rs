@@ -10,7 +10,7 @@ use regex::Regex;
 use std::fmt::Write;
 use tokio::sync::mpsc::Sender;
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::core::events::Event;
 use crate::fast_hash::{FastHashMap, FastHashSet};
 use crate::llm_client::LlmClient;
@@ -663,7 +663,7 @@ pub fn build_purge_tool() -> Tool {
 /// and for replacing the session message list with `PurgeResult.messages`.
 pub async fn run_purge(
     client: &impl LlmClient,
-    _provider: ApiProvider,
+    _provider: ProviderKind,
     session_id: &str,
     messages: &[Message],
     model: &str,
@@ -862,7 +862,7 @@ mod tests {
         let result = runtime
             .block_on(run_purge(
                 &mock,
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 session_id,
                 &messages,
                 "mock",
@@ -1203,7 +1203,7 @@ mod tests {
 
         let result = run_purge(
             &mock,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "purge-test",
             &messages,
             "mock",
@@ -1249,7 +1249,7 @@ mod tests {
 
         let result = run_purge(
             &mock,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "purge-test",
             &messages,
             "mock",
@@ -1283,7 +1283,7 @@ mod tests {
         let messages = vec![msg_text("user", "hi")];
         let err = run_purge(
             &mock,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "purge-test",
             &messages,
             "mock",
@@ -1306,7 +1306,7 @@ mod tests {
         let messages = vec![msg_text("user", "hi")];
         let err = run_purge(
             &mock,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "purge-test",
             &messages,
             "mock",

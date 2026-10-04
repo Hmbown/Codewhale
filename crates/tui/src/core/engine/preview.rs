@@ -476,7 +476,9 @@ impl Engine {
         });
 
         let prepared = match route.client.prepare_outbound_request(request, true) {
-            Ok(prepared) => prepared.with_route_id(route.identity.exact_id.clone()),
+            Ok(prepared) => {
+                prepared.with_route_id(route.identity.persisted_id().map(str::to_string))
+            }
             Err(error) => {
                 let detail = super::turn_loop::preview_request_error_user_message(
                     &self.config.locale_tag,
@@ -547,7 +549,7 @@ impl Engine {
             context_limit_source: route.context_window.source,
             route_input_limit_tokens: limits.and_then(|limits| limits.input_tokens),
             route_output_limit_tokens: limits.and_then(|limits| limits.output_tokens),
-            billing: preview_billing_facts(&route.config, provider, &base_url),
+            billing: preview_billing_facts(&route.config, &route.identity, &base_url),
             routing_source: routing_source.label().to_string(),
             auto_route_source: auto_route_source.as_deref().map(SafeLabel::phrase),
         };
@@ -713,13 +715,15 @@ impl Engine {
 /// and sidebar read. Every label is a compile-time constant.
 fn preview_billing_facts(
     config: &crate::config::Config,
-    provider: crate::config::ApiProvider,
+    identity: &crate::config::ProviderIdentity,
     base_url: &str,
 ) -> BillingFacts {
-    if let Some(surface) = crate::pricing::billing_surface_for_route(provider, Some(base_url)) {
+    if let Some(surface) =
+        crate::pricing::billing_surface_for_route(identity.provider, Some(base_url))
+    {
         return BillingFacts::Surface { surface };
     }
-    match crate::route_billing::for_route(config, provider) {
+    match crate::route_billing::for_route(config, identity) {
         crate::route_billing::BillingPresentation::Metered => BillingFacts::Metered,
         crate::route_billing::BillingPresentation::Subscription(plan) => {
             BillingFacts::Subscription { plan }

@@ -3227,6 +3227,7 @@ mod tests {
             git_branch: None,
             agent_type: crate::tools::subagent::FleetRole::Worker,
             assignment: crate::tools::subagent::SubAgentAssignment {
+                native_preset: None,
                 objective: "sweep the lane".to_string(),
                 role: Some("builder".to_string()),
             },

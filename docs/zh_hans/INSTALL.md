@@ -288,10 +288,10 @@ sudo apt-get install -y build-essential pkg-config libdbus-1-dev git
 # Rust via rustup (the distro's cargo is too old for this edition-2024 workspace)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
-rustc --version            # the workspace declares rust-version = 1.88
+rustc --version            # the workspace declares rust-version = 1.89
 ```
 
-（注释含义：发行版自带的 cargo 太旧，无法构建这个 edition-2024 的 workspace；workspace 声明的 rust-version 为 1.88。）
+（注释含义：发行版自带的 cargo 太旧，无法构建这个 edition-2024 的 workspace；workspace 声明的 rust-version 为 1.89。）
 
 `libdbus-1-dev` **是必需的**。没有它，构建会在大约一分钟后失败：
 
@@ -315,7 +315,7 @@ codewhale --version
 * `codewhale --version` 打印 `codewhale 0.10.0`，不带 commit 哈希。
 * 无头模式和 TUI 冒烟测试通过。
 
-> **文档里说"Rust 1.88+"，这对 v0.10.0 是错的。** 用 1.88.0 时，安装会在几秒内失败：
+> **v0.10.0 声明的"Rust 1.88+"是错的，工作区现在声明 1.89（CI 的 MSRV 任务所构建的版本）。** 用 1.88.0 时，安装会在几秒内失败：
 > `rustc 1.88.0 is not supported by the following package: serde-saphyr@1.3.0 requires rustc 1.89`。
 > 请使用当前 stable（`rustup update stable`）。
 
@@ -1032,7 +1032,7 @@ cargo build --release --target aarch64-unknown-linux-gnu -p codewhale-cli   # si
 **前置条件（Windows）**
 
 1. 安装 Visual Studio 2022 Build Tools——选择 **"使用 C++ 的桌面开发（Desktop development with C++）"** 工作负载。
-2. 安装 [Rust](https://rustup.rs) 1.88+（如果从中国大陆下载，参见上文[中国大陆/镜像友好安装](#中国大陆镜像友好安装)）。
+2. 安装 [Rust](https://rustup.rs) 1.89+（如果从中国大陆下载，参见上文[中国大陆/镜像友好安装](#中国大陆镜像友好安装)）。
 3. 安装 [Git for Windows](https://git-scm.com/download/win)（提供 `git` 和 `git-bash` 终端）。
 
 **推荐的终端**：Windows Terminal、`git-bash` 或 PowerShell。`cmd.exe` 可用，但缓冲区较小，PATH 行为也有限。

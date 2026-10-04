@@ -1,0 +1,55 @@
+[package]
+name = "codewhale-ratatui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Reusable Ratatui components from Codewhale: native workbar, composer, views, themes, ocean and motion."
+repository = "https://github.com/Hmbown/codewhale-ratatui"
+keywords = ["ratatui", "tui", "terminal", "components", "codewhale"]
+categories = ["command-line-interface"]
+# Ship the library and runnable sources, not repository previews or local sessions.
+include = [
+    "/src/**",
+    "/vendor/codewhale-design/tokens.rs",
+    "/assets/whale-v2.scenes",
+    "/assets/whale-motion/**",
+    "/assets/tui-palettes.json",
+    "/assets/tui-source.json",
+    "/tests/fixtures/whale-motion/**",
+    "/examples/**",
+    "/benches/**",
+    "/README.md",
+    "/COMPONENTS.md",
+    "/VIEWS.md",
+    "/DESIGN.md",
+    "/CONTRIBUTING-COMPONENTS.md",
+    "/QUALITY.md",
+    "/WEBSITE.md",
+    "/BENCHMARKS.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
+
+[dependencies]
+ratatui = { version = "0.30.2", default-features = false, features = ["std", "layout-cache", "unstable-rendered-line-info"] }
+# Enable style data directly without resolving optional facade backend packages.
+ratatui-core = { version = "0.1.2", default-features = false, features = ["underline-color"] }
+crossterm = "0.29"
+unicode-width = "0.2"
+unicode-segmentation = "1.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# The host chooses its backend. Our interactive examples use Crossterm.
+ratatui = { version = "0.30.2", default-features = false, features = ["std", "layout-cache", "crossterm_0_29"] }
+insta = "1.48.0"
+sha2 = "0.10"
+
+[[bench]]
+name = "render"
+harness = false
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"

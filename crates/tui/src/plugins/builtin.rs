@@ -169,8 +169,24 @@ pub fn materialized_dirs() -> Vec<PathBuf> {
 /// into an existing home only keeps that promise, and costs nothing in
 /// practice — the home exists from the moment Codewhale is configured or run.
 fn materialize() -> io::Result<Option<PathBuf>> {
-    let home = codewhale_config::codewhale_home().map_err(io::Error::other)?;
+    let home = materialization_home()?;
     materialize_at_home(&home)
+}
+
+/// Startup materializes into any existing home, so an unsealed test would
+/// write the developer's real `~/.codewhale/builtin-plugins`; it gets a
+/// private home instead.
+#[cfg(test)]
+fn materialization_home() -> io::Result<PathBuf> {
+    match crate::test_support::unsealed_state_dir(".") {
+        Some(home) => Ok(home),
+        None => codewhale_config::codewhale_home().map_err(io::Error::other),
+    }
+}
+
+#[cfg(not(test))]
+fn materialization_home() -> io::Result<PathBuf> {
+    codewhale_config::codewhale_home().map_err(io::Error::other)
 }
 
 fn materialize_at_home(home: &Path) -> io::Result<Option<PathBuf>> {

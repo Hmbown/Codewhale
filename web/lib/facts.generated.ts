@@ -37,7 +37,7 @@ export interface RepoFacts {
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-09-30T12:04:09.233Z",
+  "generatedAt": "2026-10-02T18:06:32.682Z",
   "sourceRevision": null,
   "sourceCommittedAt": null,
   "version": "0.10.1",
@@ -331,9 +331,9 @@ export const FACTS: RepoFacts = {
     {
       "id": "grok-4.7",
       "provider": "xAI",
-      "contextWindow": null,
+      "contextWindow": 500000,
       "maxOutput": null,
-      "reasoning": false,
+      "reasoning": true,
       "addedAt": "2026-09-23"
     },
     {
@@ -379,8 +379,8 @@ export const FACTS: RepoFacts = {
     {
       "id": "qwen3.8-flash",
       "provider": "Qwen",
-      "contextWindow": null,
-      "maxOutput": null,
+      "contextWindow": 1000000,
+      "maxOutput": 131072,
       "reasoning": true,
       "addedAt": "2026-08-27"
     },
@@ -403,87 +403,87 @@ export const FACTS: RepoFacts = {
     {
       "id": "gemini-3.7-flash",
       "provider": "Google",
-      "contextWindow": null,
-      "maxOutput": null,
+      "contextWindow": 1048576,
+      "maxOutput": 65536,
       "reasoning": false,
       "addedAt": "2026-08-17"
     },
     {
       "id": "kimi-k2.7-code-highspeed",
       "provider": "Moonshot/Kimi",
-      "contextWindow": null,
-      "maxOutput": null,
-      "reasoning": false,
+      "contextWindow": 262144,
+      "maxOutput": 32768,
+      "reasoning": true,
       "addedAt": "2026-08-17"
     },
     {
       "id": "gemini-2.5-flash",
       "provider": "Google",
-      "contextWindow": null,
-      "maxOutput": null,
+      "contextWindow": 1048576,
+      "maxOutput": 65536,
       "reasoning": false,
       "addedAt": "2026-08-14"
     },
     {
       "id": "gemini-2.5-pro",
       "provider": "Google",
-      "contextWindow": null,
-      "maxOutput": null,
+      "contextWindow": 1048576,
+      "maxOutput": 65536,
       "reasoning": false,
       "addedAt": "2026-08-14"
     },
     {
       "id": "gemini-3-pro-preview",
       "provider": "Google",
-      "contextWindow": null,
-      "maxOutput": null,
+      "contextWindow": 1048576,
+      "maxOutput": 65536,
       "reasoning": false,
       "addedAt": "2026-08-14"
     },
     {
       "id": "gemini-3.1-pro-preview",
       "provider": "Google",
-      "contextWindow": null,
-      "maxOutput": null,
+      "contextWindow": 1048576,
+      "maxOutput": 65536,
       "reasoning": false,
       "addedAt": "2026-08-14"
     },
     {
       "id": "gemini-3.5-flash",
       "provider": "Google",
-      "contextWindow": null,
-      "maxOutput": null,
+      "contextWindow": 1048576,
+      "maxOutput": 65536,
       "reasoning": false,
       "addedAt": "2026-08-14"
     },
     {
       "id": "gemini-3.5-flash-lite",
       "provider": "Google",
-      "contextWindow": null,
-      "maxOutput": null,
+      "contextWindow": 1048576,
+      "maxOutput": 65536,
       "reasoning": false,
       "addedAt": "2026-08-14"
     },
     {
       "id": "gemini-3.6-flash",
       "provider": "Google",
-      "contextWindow": null,
-      "maxOutput": null,
+      "contextWindow": 1048576,
+      "maxOutput": 65536,
       "reasoning": false,
       "addedAt": "2026-08-14"
     },
     {
       "id": "grok-4.6",
       "provider": "xAI",
-      "contextWindow": null,
+      "contextWindow": 500000,
       "maxOutput": null,
-      "reasoning": false,
+      "reasoning": true,
       "addedAt": "2026-08-12"
     },
     {
       "id": "mistral-code-latest",
       "provider": "Mistral",
-      "contextWindow": null,
+      "contextWindow": 256000,
       "maxOutput": null,
       "reasoning": false,
       "addedAt": "2026-08-09"
@@ -491,7 +491,7 @@ export const FACTS: RepoFacts = {
     {
       "id": "mistral-large-latest",
       "provider": "Mistral",
-      "contextWindow": null,
+      "contextWindow": 262144,
       "maxOutput": null,
       "reasoning": false,
       "addedAt": "2026-08-09"
@@ -499,17 +499,17 @@ export const FACTS: RepoFacts = {
     {
       "id": "mistral-medium-latest",
       "provider": "Mistral",
-      "contextWindow": null,
+      "contextWindow": 262144,
       "maxOutput": null,
-      "reasoning": false,
+      "reasoning": true,
       "addedAt": "2026-08-08"
     },
     {
       "id": "mistral-small-latest",
       "provider": "Mistral",
-      "contextWindow": null,
+      "contextWindow": 262144,
       "maxOutput": null,
-      "reasoning": false,
+      "reasoning": true,
       "addedAt": "2026-08-08"
     },
     {
@@ -547,23 +547,23 @@ export const FACTS: RepoFacts = {
     {
       "id": "qwen3.8-max",
       "provider": "Qwen",
-      "contextWindow": null,
-      "maxOutput": null,
+      "contextWindow": 1000000,
+      "maxOutput": 131072,
       "reasoning": true,
       "addedAt": "2026-08-02"
     },
     {
       "id": "qwen3.8-max-preview",
       "provider": "Qwen",
-      "contextWindow": null,
-      "maxOutput": null,
+      "contextWindow": 1000000,
+      "maxOutput": 131072,
       "reasoning": true,
       "addedAt": "2026-08-02"
     },
     {
       "id": "kimi-for-coding-highspeed",
       "provider": "Moonshot/Kimi",
-      "contextWindow": null,
+      "contextWindow": 262144,
       "maxOutput": null,
       "reasoning": true,
       "addedAt": "2026-07-27"
@@ -589,7 +589,7 @@ export const FACTS: RepoFacts = {
       "provider": "Together",
       "contextWindow": null,
       "maxOutput": null,
-      "reasoning": false,
+      "reasoning": true,
       "addedAt": "2026-07-15"
     },
     {
@@ -651,15 +651,15 @@ export const FACTS: RepoFacts = {
     {
       "id": "qwen3.7-plus",
       "provider": "Qwen",
-      "contextWindow": null,
-      "maxOutput": null,
+      "contextWindow": 1000000,
+      "maxOutput": 65536,
       "reasoning": true,
       "addedAt": "2026-07-09"
     },
     {
       "id": "grok-4.20-0309-non-reasoning",
       "provider": "xAI",
-      "contextWindow": null,
+      "contextWindow": 2000000,
       "maxOutput": null,
       "reasoning": false,
       "addedAt": "2026-07-08"
@@ -667,39 +667,39 @@ export const FACTS: RepoFacts = {
     {
       "id": "grok-4.20-0309-reasoning",
       "provider": "xAI",
-      "contextWindow": null,
+      "contextWindow": 2000000,
       "maxOutput": null,
-      "reasoning": false,
+      "reasoning": true,
       "addedAt": "2026-07-08"
     },
     {
       "id": "grok-4.3",
       "provider": "xAI",
-      "contextWindow": null,
+      "contextWindow": 1000000,
       "maxOutput": null,
-      "reasoning": false,
+      "reasoning": true,
       "addedAt": "2026-07-08"
     },
     {
       "id": "grok-4.5",
       "provider": "xAI",
-      "contextWindow": null,
+      "contextWindow": 500000,
       "maxOutput": null,
-      "reasoning": false,
+      "reasoning": true,
       "addedAt": "2026-07-08"
     },
     {
       "id": "grok-build",
       "provider": "xAI",
-      "contextWindow": null,
+      "contextWindow": 512000,
       "maxOutput": null,
-      "reasoning": false,
+      "reasoning": true,
       "addedAt": "2026-07-08"
     },
     {
       "id": "grok-composer-2.5-fast",
       "provider": "xAI",
-      "contextWindow": null,
+      "contextWindow": 200000,
       "maxOutput": null,
       "reasoning": false,
       "addedAt": "2026-07-08"
@@ -771,9 +771,9 @@ export const FACTS: RepoFacts = {
     {
       "id": "gpt-5.5-pro",
       "provider": "OpenAI",
-      "contextWindow": null,
-      "maxOutput": null,
-      "reasoning": false,
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": true,
       "addedAt": "2026-06-14"
     },
     {
@@ -827,9 +827,9 @@ export const FACTS: RepoFacts = {
     {
       "id": "gpt-5.5",
       "provider": "OpenAI",
-      "contextWindow": null,
-      "maxOutput": null,
-      "reasoning": false,
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": true,
       "addedAt": "2026-06-08"
     },
     {
@@ -859,9 +859,9 @@ export const FACTS: RepoFacts = {
     {
       "id": "glm-5.1",
       "provider": "Z.ai",
-      "contextWindow": null,
-      "maxOutput": null,
-      "reasoning": false,
+      "contextWindow": 202752,
+      "maxOutput": 131072,
+      "reasoning": true,
       "addedAt": "2026-05-31"
     },
     {
@@ -875,8 +875,8 @@ export const FACTS: RepoFacts = {
     {
       "id": "qwen3.7-max",
       "provider": "Qwen",
-      "contextWindow": null,
-      "maxOutput": null,
+      "contextWindow": 1000000,
+      "maxOutput": 65536,
       "reasoning": true,
       "addedAt": "2026-05-31"
     },
@@ -907,7 +907,7 @@ export const FACTS: RepoFacts = {
     {
       "id": "kimi-for-coding",
       "provider": "Moonshot/Kimi",
-      "contextWindow": null,
+      "contextWindow": 262144,
       "maxOutput": null,
       "reasoning": true,
       "addedAt": "2026-05-25"
@@ -915,8 +915,8 @@ export const FACTS: RepoFacts = {
     {
       "id": "kimi-k2.6",
       "provider": "Moonshot/Kimi",
-      "contextWindow": null,
-      "maxOutput": null,
+      "contextWindow": 262144,
+      "maxOutput": 32768,
       "reasoning": true,
       "addedAt": "2026-05-25"
     },

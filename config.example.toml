@@ -1253,16 +1253,27 @@ code_mode = true # execute_tools composes MCP/plugin/native calls; false defers 
                         # Set false to remove it from the model's tool catalog.
 # extension_host = false # EXPERIMENTAL. Run reviewed plugins' `native` host code
                         # (TypeScript/JavaScript, Cordis/DSH plugin model) in a
-                        # Node.js sidecar. Tools only in this phase. Every
+                        # separate Node.js (or, opt-in, Bun) process. Tools and
+                        # slash commands in this phase. Every
                         # extension tool is always Required and never
                         # read-only; like any Required tool it runs without
                         # a prompt under Full Access, under Bypass, or with a
                         # matching session grant, which is bound to the
-                        # plugin's reviewed build (an update asks again). On macOS
-                        # the host runs under Seatbelt (no network, no reads of
-                        # ~/.codewhale secrets/credentials/config/sessions,
-                        # writes only to its data dir and temp dirs); on Linux
-                        # and Windows it runs with your user permissions.
+                        # plugin's reviewed build (an update asks again).
+                        # Sandbox: on macOS the host runs under Seatbelt, and
+                        # on Linux under bubblewrap (/usr/bin/bwrap) when a
+                        # launch-time probe shows it works. Either way: no
+                        # direct network, no reads of ~/.codewhale secrets/
+                        # credentials/config/sessions, and writes only to its
+                        # data dir and temp dirs (plus, on macOS, the Darwin
+                        # user cache, ~/.cargo/registry, ~/.cargo/git and the
+                        # npm cache, which every Seatbelt-sandboxed command
+                        # gets). If bwrap is missing or cannot start (for
+                        # example blocked unprivileged user namespaces), the
+                        # host runs UNSANDBOXED with your user permissions and
+                        # /plugin, `codewhale doctor` and the start diagnostic
+                        # say so with bwrap's own error. On Windows it always
+                        # runs with your user permissions.
                         # Toggling this changes the plugin activation policy,
                         # so every plugin must be re-reviewed afterwards.
 
@@ -1279,6 +1290,17 @@ code_mode = true # execute_tools composes MCP/plugin/native calls; false defers 
 #                               # tried. Unset, every `node` on PATH is tried in
 #                               # order, skipping any inside node_modules or the
 #                               # working directory.
+
+# Per-plugin settings for the extension host, keyed by the plugin's manifest
+# name. The table is delivered to the plugin's `apply(ctx, config)` and checked
+# against the plugin's own `Config` schema, if it declares one. User config
+# only: a project's .codewhale/config.toml cannot set it. Read at start and at
+# `/plugin reload`, which re-activates a plugin whose table changed. At most
+# 16 KiB of plain TOML values; `/plugin show <name>` lists the keys, not the
+# values. Do not store secrets here: the plugin's code reads every value.
+#
+# [plugins."hello-extension".config]
+# greeting = "Howdy"
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Vision Model Configuration (optional)

@@ -1041,7 +1041,7 @@ mod tests {
         // Pin the route identity: App::new consults the developer's real
         // saved settings, so on a machine with customized provider/model
         // the context-window assertions computed against a different route.
-        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.api_provider = crate::config::ProviderKind::Deepseek;
         app.auto_model = false;
         app.last_effective_model = None;
         app.active_route_limits = None;

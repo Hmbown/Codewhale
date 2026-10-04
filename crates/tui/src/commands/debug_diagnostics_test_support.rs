@@ -18,8 +18,15 @@ use std::sync::OnceLock;
 use regex::Regex;
 use tempfile::TempDir;
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::tui::app::{App, TuiOptions};
+
+/// The shared home seal, re-exported so the diagnostics suites keep one import
+/// path. Take it first in any test whose output depends on the user's state
+/// (global instructions, installed skills, persisted settings), before building
+/// a [`DiagnosticsHarness`]: it holds the process-wide environment lock, which
+/// the harness's settings loader re-enters.
+pub(crate) use crate::test_support::SealedHome;
 
 /// Host-isolated fixture for the diagnostics command surface.
 ///
@@ -54,7 +61,7 @@ impl DiagnosticsHarness {
             ..crate::test_support::test_tui_options(temp.path())
         };
         let mut app = crate::test_support::test_app_with_options(options);
-        app.api_provider = ApiProvider::Deepseek;
+        app.api_provider = ProviderKind::Deepseek;
 
         Self {
             app,

@@ -19,6 +19,7 @@ use crate::tools::spec::{
 
 mod actions;
 mod cli;
+pub(crate) mod host;
 pub(crate) mod report;
 mod schema;
 mod shape;
@@ -198,7 +199,17 @@ impl ToolSpec for GithubTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        match self.resolve_action(&input)? {
+        let action = self.resolve_action(&input)?;
+        if context
+            .features
+            .enabled(crate::features::Feature::GithubHost)
+        {
+            let request = host::Request::capture(action, &input, context)?;
+            return crate::extension_host::manager()
+                .execute_github(request, context)
+                .await;
+        }
+        match action {
             "report_draft" => report::draft(input, context),
             "report_read" => report::read(input, context),
             "issue_context" => self.execute_issue_context(&input, context).await,

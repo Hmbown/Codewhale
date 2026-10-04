@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{ApiProvider, Config, ProviderConfig, ProvidersConfig};
+use crate::config::{Config, ProviderConfig, ProviderKind, ProvidersConfig};
 use crate::settings::Settings;
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
@@ -367,38 +367,38 @@ fn test_trust_mode_follows_yolo_on_startup() {
 #[test]
 fn reasoning_effort_display_label_keeps_codex_top_tiers_distinct() {
     assert_eq!(
-        ReasoningEffort::Off.display_label_for_provider(ApiProvider::OpenaiCodex),
+        ReasoningEffort::Off.display_label_for_provider(ProviderKind::OpenaiCodex),
         "low"
     );
     assert_eq!(
-        ReasoningEffort::Medium.display_label_for_provider(ApiProvider::OpenaiCodex),
+        ReasoningEffort::Medium.display_label_for_provider(ProviderKind::OpenaiCodex),
         "medium"
     );
     // The roster publishes xhigh, max and ultra as separate rungs, so the
     // label must not collapse them onto the old ceiling.
     assert_eq!(
-        ReasoningEffort::XHigh.display_label_for_provider(ApiProvider::OpenaiCodex),
+        ReasoningEffort::XHigh.display_label_for_provider(ProviderKind::OpenaiCodex),
         "xhigh"
     );
     assert_eq!(
-        ReasoningEffort::Max.display_label_for_provider(ApiProvider::OpenaiCodex),
+        ReasoningEffort::Max.display_label_for_provider(ProviderKind::OpenaiCodex),
         "max"
     );
     assert_eq!(
-        ReasoningEffort::Ultra.display_label_for_provider(ApiProvider::OpenaiCodex),
+        ReasoningEffort::Ultra.display_label_for_provider(ProviderKind::OpenaiCodex),
         "ultra"
     );
     assert_eq!(
-        ReasoningEffort::Max.display_label_for_provider(ApiProvider::Deepseek),
+        ReasoningEffort::Max.display_label_for_provider(ProviderKind::Deepseek),
         "max"
     );
     assert_eq!(
-        ReasoningEffort::High.display_label_for_provider(ApiProvider::OpenaiCodex),
+        ReasoningEffort::High.display_label_for_provider(ProviderKind::OpenaiCodex),
         "high"
     );
 
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::OpenaiCodex;
+    app.api_provider = ProviderKind::OpenaiCodex;
     app.reasoning_effort = ReasoningEffort::Max;
     app.auto_model = false;
     assert_eq!(app.reasoning_effort_display_label(), "max");
@@ -412,7 +412,7 @@ fn reasoning_effort_display_label_keeps_codex_top_tiers_distinct() {
 #[test]
 fn fixed_auto_reasoning_label_preserves_untiered_effective_receipt() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Zai;
+    app.api_provider = ProviderKind::Zai;
     app.auto_model = false;
     app.model = crate::config::ZAI_GLM_5_TURBO_MODEL.to_string();
     app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
@@ -429,7 +429,7 @@ fn fixed_auto_reasoning_label_preserves_untiered_effective_receipt() {
 #[test]
 fn cache_replay_keeps_untiered_reasoning_enabled() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Zai;
+    app.api_provider = ProviderKind::Zai;
     app.auto_model = false;
     app.model = crate::config::ZAI_GLM_5_TURBO_MODEL.to_string();
     app.reasoning_effort = ReasoningEffort::Auto;
@@ -438,18 +438,18 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
 
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
-            ApiProvider::Zai,
+            ProviderKind::Zai,
             crate::config::DEFAULT_ZAI_BASE_URL,
             crate::config::ZAI_GLM_5_TURBO_MODEL,
         ),
         Some("high")
     );
 
-    app.api_provider = ApiProvider::Minimax;
+    app.api_provider = ProviderKind::Minimax;
     app.model = crate::config::DEFAULT_MINIMAX_MODEL.to_string();
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
-            ApiProvider::Minimax,
+            ProviderKind::Minimax,
             crate::config::DEFAULT_MINIMAX_BASE_URL,
             crate::config::DEFAULT_MINIMAX_MODEL,
         ),
@@ -459,7 +459,7 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
     app.last_effective_reasoning_effort = Some(EffectiveReasoningEffort::Unavailable);
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
-            ApiProvider::Zai,
+            ProviderKind::Zai,
             crate::config::DEFAULT_ZAI_BASE_URL,
             crate::config::ZAI_GLM_5_TURBO_MODEL,
         ),
@@ -470,14 +470,14 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
 #[test]
 fn cache_replay_normalizes_reasoning_against_the_concrete_auto_route() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = "auto".to_string();
     app.auto_model = true;
 
     app.reasoning_effort = ReasoningEffort::Off;
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
-            ApiProvider::OpenaiCodex,
+            ProviderKind::OpenaiCodex,
             crate::config::DEFAULT_OPENAI_CODEX_BASE_URL,
             crate::config::DEFAULT_OPENAI_CODEX_MODEL,
         ),
@@ -488,7 +488,7 @@ fn cache_replay_normalizes_reasoning_against_the_concrete_auto_route() {
     app.reasoning_effort = ReasoningEffort::Medium;
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             crate::config::DEFAULT_KIMI_CODE_BASE_URL,
             crate::config::KIMI_CODE_K3_MODEL,
         ),
@@ -502,13 +502,13 @@ fn cache_replay_target_uses_the_last_completed_auto_route() {
     let mut app = App::new(test_options(false), &Config::default());
     app.model = "auto".to_string();
     app.auto_model = true;
-    app.last_effective_provider = Some(ApiProvider::OpenaiCodex);
-    app.last_effective_provider_identity = Some(ApiProvider::OpenaiCodex.as_str().to_string());
+    app.last_effective_provider = Some(ProviderKind::OpenaiCodex);
+    app.last_effective_provider_identity = Some(ProviderKind::OpenaiCodex.as_str().to_string());
     app.last_effective_model = Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string());
     app.session.last_base_url = Some(crate::config::DEFAULT_OPENAI_CODEX_BASE_URL.to_string());
     app.push_turn_cache_record(TurnCacheRecord {
-        provider: Some(ApiProvider::OpenaiCodex),
-        provider_identity: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
+        provider: Some(ProviderKind::OpenaiCodex),
+        provider_identity: Some(ProviderKind::OpenaiCodex.as_str().to_string()),
         model: Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string()),
         auto_model: true,
         input_tokens: 1,
@@ -526,11 +526,11 @@ fn cache_replay_target_uses_the_last_completed_auto_route() {
         .cache_replay_target()
         .expect("completed Auto route must be replayable");
 
-    assert_eq!(target.provider, ApiProvider::OpenaiCodex);
-    assert_eq!(target.provider_identity, ApiProvider::OpenaiCodex.as_str());
+    assert_eq!(target.provider, ProviderKind::OpenaiCodex);
+    assert_eq!(target.provider_identity, ProviderKind::OpenaiCodex.as_str());
     assert_eq!(
         target.provider_id.as_deref(),
-        Some(ApiProvider::OpenaiCodex.as_str())
+        Some(ProviderKind::OpenaiCodex.as_str())
     );
     assert_eq!(target.model, crate::config::DEFAULT_OPENAI_CODEX_MODEL);
     assert_eq!(
@@ -544,7 +544,7 @@ fn cache_replay_target_uses_the_last_completed_auto_route() {
     app.session.turn_cache_history.clear();
     app.session.last_base_url = None;
     app.session.last_warmup_key = Some(CacheWarmupKey {
-        provider: ApiProvider::OpenaiCodex.as_str().to_string(),
+        provider: ProviderKind::OpenaiCodex.as_str().to_string(),
         model: crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
         base_url: crate::config::DEFAULT_OPENAI_CODEX_BASE_URL.to_string(),
         static_prefix_hash: "static".to_string(),
@@ -563,13 +563,13 @@ fn cache_replay_target_uses_the_last_completed_auto_route() {
 #[test]
 fn auto_reasoning_change_invalidates_the_previous_route_and_receipt() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = "auto".to_string();
     app.auto_model = true;
     app.reasoning_effort = ReasoningEffort::Low;
     app.reasoning_effort_preference = Some(ReasoningEffort::Low);
-    app.last_effective_provider = Some(ApiProvider::OpenaiCodex);
-    app.last_effective_provider_identity = Some(ApiProvider::OpenaiCodex.as_str().to_string());
+    app.last_effective_provider = Some(ProviderKind::OpenaiCodex);
+    app.last_effective_provider_identity = Some(ProviderKind::OpenaiCodex.as_str().to_string());
     app.last_effective_model = Some(crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string());
     app.last_auto_route_receipt = Some(crate::model_routing::AutoRouteReceipt {
         tier: crate::model_routing::AutoRouteTier::Strong,
@@ -669,7 +669,7 @@ fn cycle_effort_updates_effort_status_and_compaction() {
     // effort must surface a status message and refresh the compaction budget,
     // not just silently flip the setting.
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Off;
     // Sentinel so the test can observe update_model_compaction_budget().
@@ -707,7 +707,7 @@ fn cycle_effort_updates_effort_status_and_compaction() {
         } => {
             assert_eq!(*requested, crate::work_graph::ReasoningEffortTier::Low);
             assert_eq!(*effective, crate::work_graph::ReasoningEffortTier::Low);
-            assert_eq!(*provider_kind, Some(ApiProvider::Deepseek));
+            assert_eq!(*provider_kind, Some(ProviderKind::Deepseek));
             assert_eq!(provider, "deepseek");
             assert!(operation.is_none());
         }
@@ -723,7 +723,11 @@ fn cycle_effort_updates_effort_status_and_compaction() {
 #[test]
 fn glm_5_turbo_records_enabled_with_granularity_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Zai;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Zai.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
     app.model = crate::config::ZAI_GLM_5_TURBO_MODEL.to_string();
@@ -772,7 +776,11 @@ fn glm_5_turbo_records_enabled_with_granularity_unavailable() {
 #[test]
 fn glm_5_1_records_enabled_with_granularity_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Zai;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Zai.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
     app.model = crate::config::ZAI_GLM_5_1_MODEL.to_string();
@@ -804,7 +812,11 @@ fn glm_5_1_records_enabled_with_granularity_unavailable() {
 #[test]
 fn unknown_model_on_exact_zai_endpoint_records_effective_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Zai;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Zai.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
     app.model = "glm-future-unknown".to_string();
@@ -836,7 +848,11 @@ fn unknown_model_on_exact_zai_endpoint_records_effective_unavailable() {
 #[test]
 fn compatible_zai_gateway_records_effective_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Zai;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Zai.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = "https://gateway.example/v1".to_string();
     app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
@@ -889,7 +905,11 @@ fn minimax_m3_high_and_max_receipts_do_not_claim_tier_granularity() {
         (ReasoningEffort::Auto, ReasoningEffort::Off, "off"),
     ] {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ApiProvider::Minimax;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Minimax.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_MINIMAX_BASE_URL.to_string();
         app.model = crate::config::DEFAULT_MINIMAX_MODEL.to_string();
@@ -939,7 +959,11 @@ fn minimax_anthropic_m3_high_and_max_receipts_match_adaptive_wire_truth() {
         (ReasoningEffort::Auto, ReasoningEffort::Off, "off"),
     ] {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ApiProvider::MinimaxAnthropic;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::MinimaxAnthropic.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_MINIMAX_ANTHROPIC_BASE_URL.to_string();
         app.model = crate::config::DEFAULT_MINIMAX_MODEL.to_string();
@@ -976,7 +1000,7 @@ fn minimax_anthropic_m3_high_and_max_receipts_match_adaptive_wire_truth() {
                 crate::work_graph::ReasoningEffortTier::Off
             }
         );
-        assert_eq!(provider_kind, Some(ApiProvider::MinimaxAnthropic));
+        assert_eq!(provider_kind, Some(ProviderKind::MinimaxAnthropic));
         assert_eq!(provider, "minimax-anthropic");
         assert_eq!(
             endpoint_identity.as_deref(),
@@ -989,7 +1013,7 @@ fn minimax_anthropic_m3_high_and_max_receipts_match_adaptive_wire_truth() {
 #[test]
 fn named_custom_route_displays_and_persists_effective_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.set_provider_identity(ApiProvider::Custom, "my-gateway");
+    app.set_provider_identity(ProviderKind::Custom, "my-gateway");
     app.auto_model = false;
     app.active_route_base_url = "https://gateway.example/v1?api_key=must-not-persist".to_string();
     app.model = "vendor-model-x".to_string();
@@ -1025,7 +1049,7 @@ fn named_custom_route_displays_and_persists_effective_unavailable() {
         effective,
         crate::work_graph::ReasoningEffortTier::Unavailable
     );
-    assert_eq!(provider_kind, Some(ApiProvider::Custom));
+    assert_eq!(provider_kind, Some(ProviderKind::Custom));
     assert_eq!(provider, "my-gateway");
     let endpoint = endpoint_identity.expect("redacted endpoint provenance");
     assert!(endpoint.contains("gateway.example"), "{endpoint}");
@@ -1037,7 +1061,7 @@ fn named_custom_route_displays_and_persists_effective_unavailable() {
 fn custom_routes_named_with_builtin_slugs_retain_custom_kind_and_fail_closed() {
     for identity in ["openai", "zai"] {
         let mut app = App::new(test_options(false), &Config::default());
-        app.set_provider_identity(ApiProvider::Custom, identity);
+        app.set_provider_identity(ProviderKind::Custom, identity);
         app.auto_model = false;
         app.active_route_base_url = "https://gateway.example/v1".to_string();
         app.model = "vendor-model-x".to_string();
@@ -1070,7 +1094,7 @@ fn custom_routes_named_with_builtin_slugs_retain_custom_kind_and_fail_closed() {
             effective,
             crate::work_graph::ReasoningEffortTier::Unavailable
         );
-        assert_eq!(provider_kind, Some(ApiProvider::Custom));
+        assert_eq!(provider_kind, Some(ProviderKind::Custom));
         assert_eq!(provider, identity);
     }
 }
@@ -1082,7 +1106,11 @@ fn zai_gateway_off_and_high_receipts_remain_unavailable() {
         (ReasoningEffort::Max, ReasoningEffort::Auto, "auto"),
     ] {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ApiProvider::Zai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Zai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = "https://gateway.example/v1".to_string();
         app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
@@ -1105,7 +1133,11 @@ fn kimi_code_high_and_max_work_receipts_preserve_exact_tiers() {
         (ReasoningEffort::High, ReasoningEffort::Max),
     ] {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ApiProvider::Moonshot;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Moonshot.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string();
         app.model = crate::config::KIMI_CODE_K3_MODEL.to_string();
@@ -1142,7 +1174,7 @@ fn kimi_code_high_and_max_work_receipts_preserve_exact_tiers() {
 #[test]
 fn active_turn_zai_receipt_overrides_all_mutable_parallel_route_metadata() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.active_route_base_url = crate::config::DEFAULT_DEEPSEEK_BASE_URL.to_string();
     app.model = "deepseek-chat".to_string();
     app.reasoning_effort = ReasoningEffort::High;
@@ -1150,12 +1182,12 @@ fn active_turn_zai_receipt_overrides_all_mutable_parallel_route_metadata() {
         turn_id: "turn-zai-receipt".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Zai,
+            provider: ProviderKind::Zai,
             provider_identity: "openai".to_string(),
             model: "mutable-wrong-model".to_string(),
             auto_model: false,
             receipt: Some(crate::route_receipt::TurnRouteReceipt::new(
-                ApiProvider::Zai,
+                ProviderKind::Zai,
                 "zai",
                 crate::config::ZAI_GLM_5_TURBO_MODEL,
                 crate::config::DEFAULT_ZAI_BASE_URL,
@@ -1200,7 +1232,7 @@ fn active_turn_zai_receipt_overrides_all_mutable_parallel_route_metadata() {
         model,
         ..
     } = activity;
-    assert_eq!(provider_kind, Some(ApiProvider::Zai));
+    assert_eq!(provider_kind, Some(ProviderKind::Zai));
     assert_eq!(provider, "zai");
     assert_eq!(
         endpoint_identity.as_deref(),
@@ -1212,11 +1244,11 @@ fn active_turn_zai_receipt_overrides_all_mutable_parallel_route_metadata() {
 #[test]
 fn pending_zai_route_without_endpoint_receipt_is_effective_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Max;
     app.pending_turn_route = Some((
-        ApiProvider::Zai,
+        ProviderKind::Zai,
         crate::config::ZAI_GLM_5_2_MODEL.to_string(),
         true,
     ));
@@ -1233,7 +1265,7 @@ fn reasoning_effort_scenario() {
     // from reasoning_effort_display_receipts_route_normalization
     {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ApiProvider::Moonshot;
+        app.api_provider = ProviderKind::Moonshot;
         app.auto_model = false;
         app.reasoning_effort = ReasoningEffort::Low;
         app.active_route_base_url = crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string();
@@ -1251,33 +1283,33 @@ fn reasoning_effort_scenario() {
     // from reasoning_effort_api_values_are_provider_aware_for_codex
     {
         assert_eq!(
-            ReasoningEffort::Off.normalize_for_provider(ApiProvider::OpenaiCodex),
+            ReasoningEffort::Off.normalize_for_provider(ProviderKind::OpenaiCodex),
             ReasoningEffort::Low
         );
         assert_eq!(
-            ReasoningEffort::Auto.normalize_for_provider(ApiProvider::OpenaiCodex),
+            ReasoningEffort::Auto.normalize_for_provider(ProviderKind::OpenaiCodex),
             ReasoningEffort::Medium
         );
         // Codex sends the rung the operator picked: the roster offers xhigh,
         // max and ultra as separate efforts per model.
         assert_eq!(
-            ReasoningEffort::XHigh.api_value_for_provider(ApiProvider::OpenaiCodex),
+            ReasoningEffort::XHigh.api_value_for_provider(ProviderKind::OpenaiCodex),
             Some("xhigh")
         );
         assert_eq!(
-            ReasoningEffort::Max.api_value_for_provider(ApiProvider::OpenaiCodex),
+            ReasoningEffort::Max.api_value_for_provider(ProviderKind::OpenaiCodex),
             Some("max")
         );
         assert_eq!(
-            ReasoningEffort::Ultra.api_value_for_provider(ApiProvider::OpenaiCodex),
+            ReasoningEffort::Ultra.api_value_for_provider(ProviderKind::OpenaiCodex),
             Some("ultra")
         );
         assert_eq!(
-            ReasoningEffort::Off.api_value_for_provider(ApiProvider::OpenaiCodex),
+            ReasoningEffort::Off.api_value_for_provider(ProviderKind::OpenaiCodex),
             Some("low")
         );
         assert_eq!(
-            ReasoningEffort::Max.api_value_for_provider(ApiProvider::Deepseek),
+            ReasoningEffort::Max.api_value_for_provider(ProviderKind::Deepseek),
             Some("max")
         );
         assert_eq!(
@@ -1299,17 +1331,17 @@ fn ollama_cloud_normal_turns_preserve_the_documented_reasoning_ladder() {
         ReasoningEffort::Max,
     ] {
         assert_eq!(
-            effort.normalize_for_route(ApiProvider::OllamaCloud, base_url, model),
+            effort.normalize_for_route(ProviderKind::OllamaCloud, base_url, model),
             effort,
             "{effort:?} must remain distinct on Ollama's documented Cloud ladder"
         );
     }
     assert_eq!(
-        ReasoningEffort::Minimal.normalize_for_route(ApiProvider::OllamaCloud, base_url, model,),
+        ReasoningEffort::Minimal.normalize_for_route(ProviderKind::OllamaCloud, base_url, model,),
         ReasoningEffort::Low
     );
     assert_eq!(
-        ReasoningEffort::XHigh.normalize_for_route(ApiProvider::OllamaCloud, base_url, model),
+        ReasoningEffort::XHigh.normalize_for_route(ProviderKind::OllamaCloud, base_url, model),
         ReasoningEffort::Max
     );
 }
@@ -1359,30 +1391,30 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
     let kimi_base = crate::config::DEFAULT_KIMI_CODE_BASE_URL;
     let moonshot_base = crate::config::DEFAULT_MOONSHOT_BASE_URL;
     assert_eq!(
-        ReasoningEffort::Off.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
+        ReasoningEffort::Off.normalize_for_route(ProviderKind::Moonshot, kimi_base, "k3"),
         ReasoningEffort::Low,
         "membership K3 stays on K3 by mapping off to its lowest thinking tier"
     );
     assert_eq!(
-        ReasoningEffort::Auto.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
+        ReasoningEffort::Auto.normalize_for_route(ProviderKind::Moonshot, kimi_base, "k3"),
         ReasoningEffort::Auto,
         "route normalization preserves the Auto sentinel until dispatch selects a concrete tier"
     );
     assert_eq!(
-        ReasoningEffort::Low.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
+        ReasoningEffort::Low.normalize_for_route(ProviderKind::Moonshot, kimi_base, "k3"),
         ReasoningEffort::Low
     );
     assert_eq!(
-        ReasoningEffort::Medium.normalize_for_route(ApiProvider::Moonshot, kimi_base, "k3"),
+        ReasoningEffort::Medium.normalize_for_route(ProviderKind::Moonshot, kimi_base, "k3"),
         ReasoningEffort::Medium
     );
     assert_eq!(
-        ReasoningEffort::Low.normalize_for_route(ApiProvider::Moonshot, moonshot_base, "k3"),
+        ReasoningEffort::Low.normalize_for_route(ProviderKind::Moonshot, moonshot_base, "k3"),
         ReasoningEffort::High
     );
     assert_eq!(
         ReasoningEffort::Medium.normalize_for_route(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             kimi_base,
             "kimi-for-coding",
         ),
@@ -1391,7 +1423,7 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
 
     assert_eq!(
         ReasoningEffort::Off.normalize_for_route(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             moonshot_base,
             crate::config::MOONSHOT_KIMI_K3_MODEL,
         ),
@@ -1400,7 +1432,7 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
     );
     assert_eq!(
         ReasoningEffort::Low.normalize_for_route(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             moonshot_base,
             crate::config::MOONSHOT_KIMI_K3_MODEL,
         ),
@@ -1408,7 +1440,7 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
     );
     assert_eq!(
         ReasoningEffort::Medium.normalize_for_route(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             moonshot_base,
             crate::config::MOONSHOT_KIMI_K3_MODEL,
         ),
@@ -1416,7 +1448,7 @@ fn reasoning_effort_normalizes_each_exact_k3_route_without_neighbor_leakage() {
     );
     assert_eq!(
         ReasoningEffort::Off.normalize_for_route(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             "https://proxy.example/v1",
             crate::config::MOONSHOT_KIMI_K3_MODEL,
         ),
@@ -1431,8 +1463,8 @@ fn picker_uses_scenario() {
     // from picker_uses_catalog_reasoning_efforts_for_grok_46
     {
         let labels: Vec<&str> = crate::tui::model_picker::picker_efforts_for_route(
-            ApiProvider::Xai,
-            ApiProvider::Xai.default_base_url(),
+            ProviderKind::Xai,
+            ProviderKind::Xai.provider().default_base_url(),
             crate::config::XAI_GROK_4_6_MODEL,
             false,
         )
@@ -1444,8 +1476,8 @@ fn picker_uses_scenario() {
     // from picker_uses_catalog_reasoning_efforts_for_grok_45
     {
         let labels: Vec<&str> = crate::tui::model_picker::picker_efforts_for_route(
-            ApiProvider::Xai,
-            ApiProvider::Xai.default_base_url(),
+            ProviderKind::Xai,
+            ProviderKind::Xai.provider().default_base_url(),
             crate::config::XAI_GROK_4_5_MODEL,
             false,
         )
@@ -1471,14 +1503,14 @@ fn reasoning_effort_preserves_grok_46_ladder_only_on_exact_xai_route() {
         (ReasoningEffort::Auto, ReasoningEffort::Auto),
     ] {
         assert_eq!(
-            requested.normalize_for_route(ApiProvider::Xai, xai, model),
+            requested.normalize_for_route(ProviderKind::Xai, xai, model),
             expected,
             "{requested:?}"
         );
     }
     assert_eq!(
         ReasoningEffort::Medium.normalize_for_route(
-            ApiProvider::Xai,
+            ProviderKind::Xai,
             "https://gateway.example/v1",
             model,
         ),
@@ -1521,7 +1553,7 @@ fn app_new_scenario() {
         let config = xai_grok_46_startup_config();
         let app = xai_grok_46_startup_app(&config);
 
-        assert_eq!(app.api_provider, ApiProvider::Xai);
+        assert_eq!(app.api_provider, ProviderKind::Xai);
         assert_eq!(app.model, crate::config::XAI_GROK_4_6_MODEL);
         assert_eq!(
             app.active_route_base_url,
@@ -1655,7 +1687,11 @@ fn cycle_effort_scenario() {
     // from cycle_effort_walks_grok_46_official_ladder
     {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ApiProvider::Xai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Xai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_XAI_BASE_URL.to_string();
         app.model = crate::config::XAI_GROK_4_6_MODEL.to_string();
@@ -1676,7 +1712,11 @@ fn cycle_effort_scenario() {
     // from cycle_effort_walks_grok_45_official_ladder_without_xhigh
     {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ApiProvider::Xai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Xai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_XAI_BASE_URL.to_string();
         app.model = crate::config::XAI_GROK_4_5_MODEL.to_string();
@@ -1696,7 +1736,7 @@ fn cycle_effort_scenario() {
 #[test]
 fn set_model_selection_normalizes_codex_fixed_model_effort() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::OpenaiCodex;
+    app.api_provider = ProviderKind::OpenaiCodex;
     app.reasoning_effort = ReasoningEffort::Off;
     app.reasoning_effort_preference = Some(ReasoningEffort::Off);
 
@@ -1722,12 +1762,12 @@ fn auto_model_selection_preserves_only_explicit_reasoning_effort() {
 
     for (provider, requested, normalized) in [
         (
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             ReasoningEffort::Low,
             ReasoningEffort::High,
         ),
         (
-            ApiProvider::OpenaiCodex,
+            ProviderKind::OpenaiCodex,
             ReasoningEffort::Off,
             ReasoningEffort::Low,
         ),
@@ -1783,7 +1823,7 @@ fn app_new_normalizes_saved_codex_reasoning_effort() {
 
         let app = App::new(test_options(false), &config);
 
-        assert_eq!(app.api_provider, ApiProvider::OpenaiCodex);
+        assert_eq!(app.api_provider, ProviderKind::OpenaiCodex);
         assert_eq!(app.reasoning_effort, expected, "raw setting {raw}");
         assert_eq!(
             app.reasoning_effort_preference,
@@ -1823,7 +1863,7 @@ fn app_new_exposes_direct_moonshot_k3_off_as_effective_low() {
     options.model = crate::config::MOONSHOT_KIMI_K3_MODEL.to_string();
     let app = App::new(options, &config);
 
-    assert_eq!(app.api_provider, ApiProvider::Moonshot);
+    assert_eq!(app.api_provider, ProviderKind::Moonshot);
     assert_eq!(app.model, crate::config::MOONSHOT_KIMI_K3_MODEL);
     assert_eq!(
         app.active_route_base_url,
@@ -1837,27 +1877,14 @@ fn app_new_exposes_direct_moonshot_k3_off_as_effective_low() {
 fn codex_startup_threads_fresh_roster_context_into_active_route_limits() {
     let _lock = lock_test_env();
     let tmp = tempfile::tempdir().expect("tempdir");
+    let canonical_home = tmp
+        .path()
+        .canonicalize()
+        .expect("canonical private fixture home");
     let config_path = tmp.path().join("config.toml");
-    let codex_home = tmp.path().join("codex-home");
-    std::fs::create_dir_all(&codex_home).expect("Codex home");
-    std::fs::write(
-        codex_home.join("models_cache.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "fetched_at": chrono::Utc::now(),
-            "models": [{
-                "slug": crate::config::DEFAULT_OPENAI_CODEX_MODEL,
-                "priority": 1,
-                "context_window": 128000,
-                "supported_reasoning_levels": [{"effort": "high"}]
-            }]
-        }))
-        .expect("serialize cache"),
-    )
-    .expect("write cache");
     let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
-    let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
-    let _token = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-codex-startup-token");
-    let config = Config {
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", &canonical_home);
+    let mut config = Config {
         provider: Some("openai-codex".to_string()),
         providers: Some(ProvidersConfig {
             openai_codex: ProviderConfig {
@@ -1869,11 +1896,25 @@ fn codex_startup_threads_fresh_roster_context_into_active_route_limits() {
         ..Config::default()
     };
 
+    crate::oauth::install_test_chatgpt_registration(&mut config)
+        .expect("owned ChatGPT registration");
+    crate::codex_model_cache::install_test_chatgpt_roster_with_metadata(
+        &config,
+        vec![crate::codex_model_cache::CodexModelMetadata {
+            id: crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
+            display_name: None,
+            context_window: Some(128_000),
+            reasoning: Some(true),
+            efforts: vec!["high".to_string()],
+        }],
+    )
+    .expect("account-scoped roster");
+
     let mut options = test_options(false);
     options.model = crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string();
     let app = App::new(options, &config);
 
-    assert_eq!(app.api_provider, ApiProvider::OpenaiCodex);
+    assert_eq!(app.api_provider, ProviderKind::OpenaiCodex);
     assert_eq!(
         app.active_route_limits
             .and_then(|limits| limits.context_tokens),
@@ -1916,7 +1957,7 @@ fn settings_default_provider_auth_check_uses_provider_scoped_key() {
 
     let app = App::new(test_options(false), &config);
 
-    assert_eq!(app.api_provider, ApiProvider::Openai);
+    assert_eq!(app.api_provider, ProviderKind::Openai);
     assert!(
         !app.onboarding_needs_api_key,
         "OpenAI provider config key should satisfy startup auth without a DeepSeek key"
@@ -1958,7 +1999,7 @@ fn saved_startup_provider_overrides_config_file_provider() {
     options.model = "mimo-v2.5-pro".to_string();
     let app = App::new(options, &config);
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, "deepseek-v4-pro");
     assert!(
         !app.onboarding_needs_api_key,
@@ -2009,7 +2050,7 @@ openrouter = "openai/gpt-5"
     options.model = "deepseek-v4-flash-vision-exp".to_string();
     let app = App::new(options, &config);
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, "deepseek-v4-flash-vision-exp");
     assert_eq!(app.reasoning_effort, ReasoningEffort::High);
     assert_eq!(app.reasoning_effort_preference, Some(ReasoningEffort::High));
@@ -2050,7 +2091,7 @@ fn explicit_launch_provider_overrides_saved_startup_provider() {
     options.model = "mimo-v2.5-pro".to_string();
     let app = App::new(options, &config);
 
-    assert_eq!(app.api_provider, ApiProvider::XiaomiMimo);
+    assert_eq!(app.api_provider, ProviderKind::XiaomiMimo);
     assert_eq!(app.model, "mimo-v2.5-pro");
 }
 
@@ -2224,7 +2265,7 @@ fn provider_switch_keeps_audited_cumulative_spend_visible() {
         ..Default::default()
     };
     let priced = crate::pricing::audit_turn_cost_for_provider_at(
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek-v4-flash",
         &usage,
         chrono::Utc::now(),
@@ -2232,7 +2273,7 @@ fn provider_switch_keeps_audited_cumulative_spend_visible() {
     app.record_turn_cost_audit(&priced);
     app.accrue_session_cost_estimate(priced.estimate.expect("priced"));
 
-    app.api_provider = ApiProvider::OpenaiCodex;
+    app.api_provider = ProviderKind::OpenaiCodex;
     app.model = "gpt-5.5".to_string();
     app.billing_presentation =
         crate::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
@@ -2246,7 +2287,7 @@ fn provider_switch_keeps_audited_cumulative_spend_visible() {
     );
 
     let unknown = crate::pricing::audit_turn_cost_for_route_at(
-        ApiProvider::Openai,
+        ProviderKind::Openai,
         "gpt-5.5",
         Some(crate::pricing::UNCLASSIFIED_BILLING_SURFACE),
         &usage,
@@ -3337,11 +3378,24 @@ fn submit_input_holds_oversized_input_when_paste_file_cannot_be_written() {
         app.input, full_content,
         "the full text stays in the composer"
     );
+    // The toast is short enough to survive the footer's clause-shedding...
     assert!(
         app.status_toasts
             .iter()
-            .any(|toast| toast.text.starts_with("Not sent") && toast.text.contains("shorten it")),
-        "expected an actionable not-sent toast"
+            .any(|toast| toast.text.starts_with("Not sent")
+                && toast.text.contains("paste file not saved")),
+        "expected a short not-sent toast"
+    );
+    // ...and the actionable reason, with the write error, is in the transcript.
+    assert!(
+        app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::System { content }
+                if content.starts_with("Not sent")
+                    && content.contains("shorten it")
+                    && !content.contains("{error}")
+        )),
+        "expected the full reason in the transcript"
     );
 }
 
@@ -3643,18 +3697,18 @@ fn test_cycle_scenario() {
 fn effective_route_display_tracks_inflight_and_last_auto_provider() {
     let mut app = App::new(test_options(false), &Config::default());
     app.auto_model = true;
-    app.pending_turn_route = Some((ApiProvider::Zai, "glm-5.2".to_string(), true));
+    app.pending_turn_route = Some((ProviderKind::Zai, "glm-5.2".to_string(), true));
     assert_eq!(
         app.effective_route_display(),
-        (ApiProvider::Zai, "glm-5.2".to_string())
+        (ProviderKind::Zai, "glm-5.2".to_string())
     );
 
     app.pending_turn_route = None;
-    app.last_effective_provider = Some(ApiProvider::Xai);
+    app.last_effective_provider = Some(ProviderKind::Xai);
     app.last_effective_model = Some("grok-4.5".to_string());
     assert_eq!(
         app.effective_route_display(),
-        (ApiProvider::Xai, "grok-4.5".to_string())
+        (ProviderKind::Xai, "grok-4.5".to_string())
     );
 }
 
@@ -4737,7 +4791,7 @@ fn test_update_model_compaction_budget() {
     // depend on the developer's local `auto_compact_threshold_percent`
     // setting (App::new loads real settings) or on auto-model resolution.
     app.auto_model = false;
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.active_route_limits = None;
     app.active_context_window_override = None;
     app.auto_compact_threshold_percent = 80.0;
@@ -6233,9 +6287,9 @@ fn word_selection_extends_by_word_and_replaces_on_type() {
 /// settings home is isolated too: an intentional saved default from a previous
 /// test or a developer's real profile must not replace the chain primary.
 fn app_with_fallback_chain(
-    active: ApiProvider,
+    active: ProviderKind,
     fallbacks: &[codewhale_config::ProviderKind],
-    keyed: &[ApiProvider],
+    keyed: &[ProviderKind],
 ) -> App {
     let settings_home = tempfile::tempdir().expect("isolated fallback settings home");
     let _home = EnvVarGuard::set("HOME", settings_home.path());
@@ -6251,11 +6305,11 @@ fn app_with_fallback_chain(
             ..Default::default()
         };
         match provider {
-            ApiProvider::Deepseek => providers.deepseek = entry,
-            ApiProvider::Openai => providers.openai = entry,
-            ApiProvider::Openrouter => providers.openrouter = entry,
-            ApiProvider::Together => providers.together = entry,
-            ApiProvider::Fireworks => providers.fireworks = entry,
+            ProviderKind::Deepseek => providers.deepseek = entry,
+            ProviderKind::Openai => providers.openai = entry,
+            ProviderKind::Openrouter => providers.openrouter = entry,
+            ProviderKind::Together => providers.together = entry,
+            ProviderKind::Fireworks => providers.fireworks = entry,
             other => panic!("unhandled keyed provider in test helper: {other:?}"),
         }
     }
@@ -6282,19 +6336,19 @@ fn advance_fallback_skips_unauthed_middle_provider_and_lands_on_next_ready() {
 
     // Chain: Openai (active, keyed) -> Openrouter (no key) -> Together (keyed).
     let mut app = app_with_fallback_chain(
-        ApiProvider::Openai,
+        ProviderKind::Openai,
         &[
             codewhale_config::ProviderKind::Openrouter,
             codewhale_config::ProviderKind::Together,
         ],
-        &[ApiProvider::Openai, ApiProvider::Together],
+        &[ProviderKind::Openai, ProviderKind::Together],
     );
     assert_eq!(app.fallback_chain_position(), Some(0));
 
     // Openrouter is skipped (needs auth); we land on Together.
     let next = app.advance_fallback("network error");
-    assert_eq!(next, Some(ApiProvider::Together));
-    assert_eq!(app.api_provider, ApiProvider::Together);
+    assert_eq!(next, Some(ProviderKind::Together));
+    assert_eq!(app.api_provider, ProviderKind::Together);
     assert_eq!(app.fallback_chain_position(), Some(2));
 
     let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
@@ -6318,18 +6372,18 @@ fn advance_fallback_scenario() {
 
         // Chain: Openai (active, keyed) -> Ollama (local, no key needed).
         let mut app = app_with_fallback_chain(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             &[codewhale_config::ProviderKind::Ollama],
-            &[ApiProvider::Openai],
+            &[ProviderKind::Openai],
         );
 
         let next = app.advance_fallback("timeout");
         assert_eq!(
             next,
-            Some(ApiProvider::Ollama),
+            Some(ProviderKind::Ollama),
             "self-hosted providers are ready without a key"
         );
-        assert_eq!(app.api_provider, ApiProvider::Ollama);
+        assert_eq!(app.api_provider, ProviderKind::Ollama);
         let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
         assert!(reason.contains("Fell back to ollama"), "{reason}");
         assert!(
@@ -6344,7 +6398,7 @@ fn advance_fallback_scenario() {
         // Local primary (Ollama) -> local sibling (vLLM). Both are self-hosted, so
         // the local/private posture is preserved and the fallback is allowed.
         let mut app = app_with_fallback_chain(
-            ApiProvider::Ollama,
+            ProviderKind::Ollama,
             &[codewhale_config::ProviderKind::Vllm],
             &[],
         );
@@ -6352,10 +6406,10 @@ fn advance_fallback_scenario() {
         let next = app.advance_fallback("local runtime unavailable");
         assert_eq!(
             next,
-            Some(ApiProvider::Vllm),
+            Some(ProviderKind::Vllm),
             "local->local fallback stays within the private posture"
         );
-        assert_eq!(app.api_provider, ApiProvider::Vllm);
+        assert_eq!(app.api_provider, ProviderKind::Vllm);
         let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
         assert!(reason.contains("Fell back to vllm"), "{reason}");
     }
@@ -6371,18 +6425,18 @@ fn advance_fallback_all_unready_exhausts_with_clear_reason() {
     // Chain: Openai (active, keyed) -> Openrouter (no key) -> Together (no key).
     // Every fallback entry is unready, so the chain exhausts.
     let mut app = app_with_fallback_chain(
-        ApiProvider::Openai,
+        ProviderKind::Openai,
         &[
             codewhale_config::ProviderKind::Openrouter,
             codewhale_config::ProviderKind::Together,
         ],
-        &[ApiProvider::Openai],
+        &[ProviderKind::Openai],
     );
 
     let next = app.advance_fallback("rate limited");
     assert_eq!(next, None, "no ready fallback remains");
     // Active provider is unchanged on exhaustion.
-    assert_eq!(app.api_provider, ApiProvider::Openai);
+    assert_eq!(app.api_provider, ProviderKind::Openai);
 
     let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
     assert!(
@@ -6416,7 +6470,7 @@ fn startup_and_fallback_skip_inactive_external_only_routes_without_io() {
     let _cli_source = EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
 
     let config = Config {
-        provider: Some(ApiProvider::Deepseek.as_str().to_string()),
+        provider: Some(ProviderKind::Deepseek.as_str().to_string()),
         fallback_providers: vec![
             codewhale_config::ProviderKind::OpenaiCodex,
             codewhale_config::ProviderKind::Xai,
@@ -6491,14 +6545,14 @@ fn advance_fallback_local_primary_does_not_fall_back_to_cloud() {
     // cloud entry is policy-blocked even though it is otherwise ready, so the
     // chain exhausts rather than leaking a local/private route out to cloud.
     let mut app = app_with_fallback_chain(
-        ApiProvider::Ollama,
+        ProviderKind::Ollama,
         &[codewhale_config::ProviderKind::Deepseek],
-        &[ApiProvider::Deepseek],
+        &[ProviderKind::Deepseek],
     );
 
     let next = app.advance_fallback("local runtime unavailable");
     assert_eq!(next, None, "local->cloud fallback must be blocked");
-    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert_eq!(app.api_provider, ProviderKind::Ollama);
 
     let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
     assert!(
@@ -6522,21 +6576,21 @@ fn advance_fallback_cloud_primary_can_hop_cloud_to_local_to_cloud() {
     // is otherwise ready; only local/private primaries are blocked from leaking
     // out to cloud.
     let mut app = app_with_fallback_chain(
-        ApiProvider::Openai,
+        ProviderKind::Openai,
         &[
             codewhale_config::ProviderKind::Ollama,
             codewhale_config::ProviderKind::Deepseek,
         ],
-        &[ApiProvider::Openai, ApiProvider::Deepseek],
+        &[ProviderKind::Openai, ProviderKind::Deepseek],
     );
 
     let local = app.advance_fallback("cloud provider timed out");
-    assert_eq!(local, Some(ApiProvider::Ollama));
-    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert_eq!(local, Some(ProviderKind::Ollama));
+    assert_eq!(app.api_provider, ProviderKind::Ollama);
 
     let cloud = app.advance_fallback("local runtime unavailable");
-    assert_eq!(cloud, Some(ApiProvider::Deepseek));
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(cloud, Some(ProviderKind::Deepseek));
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
 
     let reason = app.last_fallback_reason.as_deref().unwrap_or_default();
     assert!(reason.contains("Fell back to deepseek"), "{reason}");
@@ -6770,7 +6824,7 @@ fn reasoning_cycle_persists_through_the_same_owner_as_the_picker() {
     let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
 
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Off;
 
@@ -6885,7 +6939,7 @@ async fn rapid_thinking_selections_persist_the_last_one() {
     let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
 
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Off;
 
@@ -6917,7 +6971,11 @@ async fn fixed_route_thinking_cycle_persists_raw_preference() {
     let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
 
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Moonshot;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Moonshot.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string();
     app.model = crate::config::MOONSHOT_KIMI_K3_MODEL.to_string();
@@ -6950,7 +7008,7 @@ async fn queued_mode_and_thinking_writes_finish_before_a_synchronous_selection()
     let _env = sealed_settings_home(tmp.path());
     let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Off;
     assert_eq!(app.select_mode(AppMode::Plan), SettingSelection::Changed);
@@ -7075,7 +7133,7 @@ async fn thinking_and_an_unrelated_direct_setting_write_do_not_clobber_each_othe
     let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
 
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Off;
 
@@ -7124,7 +7182,7 @@ async fn rapid_mixed_writes_settle_on_the_last_value_for_every_field() {
     options.start_in_agent_mode = true;
     options.config_path = Some(config_path);
     let mut app = App::new(options, &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Off;
     app.approval_mode = ApprovalMode::Suggest;
@@ -7228,7 +7286,7 @@ fn slash_config_and_set_refuse_every_live_route_key_while_a_turn_runs() {
     let before = Settings::load_persisted().expect("read the seeded settings");
 
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.set_model_selection("deepseek-chat".to_string());
     app.reasoning_effort = ReasoningEffort::Off;
@@ -7753,12 +7811,16 @@ fn owned_restore_moves_the_journal_and_matches_the_borrowing_restore() {
 /// press changes the effective tier — the value `/status`, the effort status
 /// line, and Work receipts report — not merely the requested label.
 fn assert_every_ctrl_t_press_changes_the_effective_tier(
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     model: &str,
 ) -> Vec<ReasoningEffort> {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = provider;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(provider.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = base_url.to_string();
     app.model = model.to_string();
@@ -7794,22 +7856,22 @@ fn every_ctrl_t_press_changes_the_effective_thinking_tier() {
     crate::provider_lake::clear_live_snapshot();
     for (provider, base_url, model) in [
         (
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             crate::config::DEFAULT_DEEPSEEK_BASE_URL,
             "deepseek-v4.1-flash",
         ),
         (
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             crate::config::DEFAULT_DEEPSEEK_BASE_URL,
             "deepseek-v4.1",
         ),
         (
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             crate::config::DEFAULT_KIMI_CODE_BASE_URL,
             crate::config::KIMI_CODE_K3_MODEL,
         ),
         (
-            ApiProvider::Xai,
+            ProviderKind::Xai,
             crate::config::DEFAULT_XAI_BASE_URL,
             crate::config::XAI_GROK_4_6_MODEL,
         ),
@@ -7827,7 +7889,7 @@ fn ctrl_t_skips_catalog_rungs_that_resolve_to_an_offered_tier() {
     let _catalog = crate::provider_lake::lock_live_snapshot();
     crate::provider_lake::clear_live_snapshot();
     let fetched_at = u64::try_from(chrono::Utc::now().timestamp()).expect("timestamp");
-    let offering = |provider: ApiProvider, model: &str, values: &[&str]| {
+    let offering = |provider: ProviderKind, model: &str, values: &[&str]| {
         codewhale_config::catalog::CatalogOffering {
             provider: provider.as_str().to_string(),
             wire_model_id: model.to_string(),
@@ -7844,12 +7906,12 @@ fn ctrl_t_skips_catalog_rungs_that_resolve_to_an_offered_tier() {
         codewhale_config::catalog::CatalogSnapshot {
             offerings: vec![
                 offering(
-                    ApiProvider::Deepseek,
+                    ProviderKind::Deepseek,
                     "deepseek-v4.1-flash",
                     &["low", "medium", "high", "xhigh", "max"],
                 ),
                 offering(
-                    ApiProvider::Zai,
+                    ProviderKind::Zai,
                     crate::config::ZAI_GLM_5_2_MODEL,
                     &["off", "low", "medium", "high", "max"],
                 ),
@@ -7859,12 +7921,12 @@ fn ctrl_t_skips_catalog_rungs_that_resolve_to_an_offered_tier() {
     );
 
     let deepseek = assert_every_ctrl_t_press_changes_the_effective_tier(
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         crate::config::DEFAULT_DEEPSEEK_BASE_URL,
         "deepseek-v4.1-flash",
     );
     let zai = assert_every_ctrl_t_press_changes_the_effective_tier(
-        ApiProvider::Zai,
+        ProviderKind::Zai,
         crate::config::DEFAULT_ZAI_BASE_URL,
         crate::config::ZAI_GLM_5_2_MODEL,
     );
@@ -7880,7 +7942,7 @@ fn ctrl_t_moves_past_a_persisted_alias_the_ladder_dropped() {
     // reach `max` rather than re-select `high`.
     let _catalog = crate::provider_lake::lock_live_snapshot();
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = false;
     app.active_route_base_url = crate::config::DEFAULT_DEEPSEEK_BASE_URL.to_string();
     app.model = "deepseek-v4.1-flash".to_string();

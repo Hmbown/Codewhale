@@ -1,6 +1,6 @@
 //! Cucumber acceptance test for directory listing.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use cucumber::{World as _, gherkin::Step, given, then, when, writer::Stats as _};
@@ -33,12 +33,12 @@ fn user_asks(world: &mut DirectoryListingWorld, prompt: String) {
         .record_dir
         .as_ref()
         .expect("offline evaluation workspace should be initialized");
-    let output = Command::new(codewhale_tui_binary())
+    let output = Command::new(crate::binary::codewhale())
         .args(["eval", "--json", "--shell-command", "echo eval-harness"])
         .arg("--record")
         .arg(record_dir.path())
         .output()
-        .expect("run codewhale-tui eval");
+        .expect("run codewhale eval");
 
     assert!(
         output.status.success(),
@@ -177,21 +177,4 @@ fn read_jsonl_records(path: &Path) -> Vec<serde_json::Value> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("fixture line should parse"))
         .collect()
-}
-
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
 }

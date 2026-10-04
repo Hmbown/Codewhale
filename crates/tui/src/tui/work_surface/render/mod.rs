@@ -36,6 +36,15 @@ use super::model::{
 mod layout;
 mod rows;
 
+#[cfg(test)]
+mod body_legacy;
+#[cfg(test)]
+mod body_tests;
+#[cfg(test)]
+mod dock_tabs_legacy;
+#[cfg(test)]
+mod dock_tabs_tests;
+
 pub(crate) use layout::collapse_strip;
 pub use layout::{height, split_chat};
 
@@ -108,46 +117,26 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         .flatten();
     // Pin goal title, then progress receipt, above the scrollable rows.
     // A compact strip keeps its last usable row for content, ahead of headers.
-    let goal_height = u16::from(goal_title.is_some() && body_area.height >= 2);
-    let fold_progress = progress_shares_goal_row(body_area.width, goal_height > 0);
-    let progress_height = u16::from(
-        todo_progress.is_some()
-            && !fold_progress
-            && body_area.height.saturating_sub(goal_height) >= 2,
+    // Body geometry has one shared owner; Engine still supplies viewport,
+    // caller rows, goal/progress truth and the remembered scroll offset.
+    let body_layout = codewhale_ratatui::WorkbarLayout::for_body(
+        body_area,
+        rows.len(),
+        app.work_surface.scroll_offset,
+        goal_title.is_some(),
+        todo_progress.is_some(),
     );
-    let header_height = goal_height.saturating_add(progress_height);
-    let list_height = body_area.height.saturating_sub(header_height);
-    let body_height = usize::from(list_height);
-    let overflow = rows.len() > body_height;
-    // A capped list owes the reader the size of what it is hiding, so the
-    // last painted row becomes `↓ N more`. The scrollbar shows position; only
-    // this shows how much work is off-screen.
-    let more_row = overflow && body_height >= 2;
-    let list_rows = if more_row {
-        body_height.saturating_sub(1)
-    } else {
-        body_height
-    };
-    let inset = u16::from(body_area.width >= 16);
-    let rail_width = u16::from(overflow);
-    let content_area = Rect {
-        x: body_area.x.saturating_add(inset),
-        y: body_area.y.saturating_add(header_height),
-        width: body_area
-            .width
-            .saturating_sub(inset.saturating_mul(2))
-            .saturating_sub(rail_width),
-        height: list_height,
-    };
-
+    let goal_height = body_layout.goal_height;
+    let fold_progress = progress_shares_goal_row(body_area.width, goal_height > 0);
+    let progress_height = body_layout.progress_height;
+    let content_area = body_layout.content;
+    let overflow = body_layout.overflow;
+    let more_row = body_layout.more_row;
+    let list_rows = body_layout.visible_rows;
     app.work_surface.visible_rows = list_rows;
     app.work_surface.total_rows = rows.len();
-    // A redraw may clamp an obsolete offset, but it must not reveal the
-    // remembered keyboard selection: doing so undoes mouse-wheel scrolling
-    // whenever that selection is above the viewport (#4594).
+    // A redraw clamps the viewport, never reveals the remembered selection.
     app.work_surface.clamp_viewport(&rows);
-    let max_offset = rows.len().saturating_sub(list_rows.max(1));
-    app.work_surface.scroll_offset = app.work_surface.scroll_offset.min(max_offset);
 
     Block::default()
         .style(Style::default().bg(app.ui_theme.panel_bg))
@@ -511,18 +500,9 @@ fn todo_ordinals(rows: &[WorkRow]) -> HashMap<String, usize> {
         .collect()
 }
 
-/// Below this width the goal title and the receipt cannot both stay readable
-/// on one row, so the receipt keeps its own row.
-const PROGRESS_FOLD_MIN_WIDTH: u16 = 72;
-
-/// Whether the to-do receipt rides on the goal-title row instead of claiming
-/// a row of its own.
-///
-/// [`height`] and [`render`] must agree on this or the strip paints into a row
-/// it did not reserve, so the rule is a pure function of the strip width and
-/// whether there is a goal title to share with.
+/// Shared goal/receipt folding rule used by both height and body painting.
 pub(super) fn progress_shares_goal_row(width: u16, has_goal_title: bool) -> bool {
-    has_goal_title && width >= PROGRESS_FOLD_MIN_WIDTH
+    codewhale_ratatui::WorkbarLayout::progress_shares_goal_row(width, has_goal_title)
 }
 
 pub(super) fn top_todo_progress(app: &App, rows: &[WorkRow]) -> Option<String> {
@@ -592,49 +572,59 @@ fn render_divider(frame: &mut Frame, area: Rect, placement: WorkSurfacePlacement
     }
 }
 
-#[derive(Debug, Clone)]
-struct DockTab {
-    target: DockTabTarget,
-    label: std::borrow::Cow<'static, str>,
-    count: usize,
+// Engine supplies the caller's available panels, exact close semantics and
+// live theme. The kit owns the one fitted paint/hitbox plan.
+fn kit_panel(panel: RailPanel) -> codewhale_ratatui::WorkbarPanel {
+    use codewhale_ratatui::WorkbarPanel as P;
+    match panel {
+        RailPanel::Tasks => P::Tasks,
+        RailPanel::Agents => P::Fleet,
+        RailPanel::Background => P::Jobs,
+        RailPanel::Files => P::Files,
+        RailPanel::Notepad => P::Notes,
+        RailPanel::Context => P::Context,
+        RailPanel::Git => P::Git,
+        RailPanel::Price => P::Cost,
+    }
+}
+
+fn native_target(target: codewhale_ratatui::DockTabTarget) -> DockTabTarget {
+    use codewhale_ratatui::{DockTabTarget as T, WorkbarPanel as P};
+    match target {
+        T::Close => DockTabTarget::Close,
+        T::Panel(panel) => DockTabTarget::Panel(match panel {
+            P::Tasks => RailPanel::Tasks,
+            P::Fleet => RailPanel::Agents,
+            P::Jobs => RailPanel::Background,
+            P::Files => RailPanel::Files,
+            P::Notes => RailPanel::Notepad,
+            P::Context => RailPanel::Context,
+            P::Git => RailPanel::Git,
+            P::Cost => RailPanel::Price,
+        }),
+    }
 }
 
 fn render_dock_tabs(frame: &mut Frame, area: Rect, app: &mut App) {
-    let width = usize::from(area.width);
-    let mut entries = Vec::new();
-    for panel in RailPanel::ORDER {
-        let count = dock_tab_count(app, panel);
-        let useful =
-            count.is_some_and(|count| count > 0) || super::views::view_always_has_content(panel);
-        if useful || panel == app.work_surface.panel {
-            entries.push(DockTab {
-                target: DockTabTarget::Panel(panel),
-                label: match panel {
-                    RailPanel::Tasks => "Tasks",
-                    RailPanel::Agents => "Fleet",
-                    RailPanel::Background => "Jobs",
-                    RailPanel::Files => "Files",
-                    RailPanel::Notepad => "Notes",
-                    RailPanel::Context => "Context",
-                    RailPanel::Git => "Git",
-                    RailPanel::Price => "Cost",
-                }
-                .into(),
-                count: count.unwrap_or(0),
-            });
-        }
-    }
-
+    use codewhale_ratatui::{DockTabRow, DockTabStyles, DockTabTarget as T, WorkbarTab};
+    let entries = RailPanel::ORDER
+        .into_iter()
+        .filter_map(|panel| {
+            let count = dock_tab_count(app, panel);
+            let useful = count.is_some_and(|count| count > 0)
+                || super::views::view_always_has_content(panel);
+            (useful || panel == app.work_surface.panel).then_some(WorkbarTab {
+                panel: kit_panel(panel),
+                count,
+            })
+        })
+        .collect::<Vec<_>>();
     let close_mark = if crate::tui::color_compat::ascii_safe_enabled() {
         "x"
     } else {
         "×"
     };
-    // #6502: name Esc beside the close control only while Esc really closes
-    // the dock — the dock owns keyboard focus and has something to close
-    // (`input::handle_key`). Otherwise Esc belongs to the composer and stops
-    // the running turn, which the posture bar already says with the turn
-    // status; a bare `×` here keeps the two from reading as one shortcut.
+    // Name Esc only while Engine's actual keyboard action closes this dock.
     let esc_closes = app.work_surface.focused
         && !super::interaction::opened_detail_on_screen(app)
         && (app.work_surface.explicit_view || !visible_rows_for_panel(app).is_empty());
@@ -643,118 +633,48 @@ fn render_dock_tabs(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         format!(" {close_mark} ")
     };
-    let close_width = close.width().min(width);
-    let mut show_counts = true;
-    let fits = |tabs: &[DockTab], counts: bool| {
-        tabs.iter()
-            .map(|tab| {
-                UnicodeWidthStr::width(tab.label.as_ref())
-                    + if counts && tab.count > 0 {
-                        1 + tab.count.to_string().len()
-                    } else {
-                        0
-                    }
-                    + 2
-            })
-            .sum::<usize>()
-            .saturating_add(tabs.len().saturating_sub(1).saturating_mul(2))
-            .saturating_add(close_width + 2)
-            <= width
-    };
-    if !fits(&entries, true) {
-        show_counts = false;
-    }
-    // Shed from the right (price, git, context, notepad, files… in reverse
-    // cycle order), never the active tab: a narrow dock keeps the work views.
-    while !fits(&entries, show_counts) && entries.len() > 1 {
-        let remove = entries
-            .iter()
-            .rposition(|tab| tab.target != DockTabTarget::Panel(app.work_surface.panel));
-        let Some(index) = remove else { break };
-        entries.remove(index);
-    }
-
-    let tab_y = if app.work_surface.effective_placement == WorkSurfacePlacement::Bottom {
-        area.y
-            .saturating_add(1)
-            .min(area.bottom().saturating_sub(1))
-    } else {
-        area.y
-    };
-    let tab_area = Rect {
-        x: area.x,
-        y: tab_y,
-        width: area.width,
-        height: 1,
-    };
-    let close_area = Rect {
-        x: tab_area.right().saturating_sub(close_width as u16),
-        y: tab_y,
-        width: close_width as u16,
-        height: 1,
-    };
-    app.work_surface.dock_tabs.clear();
-    for tab in &entries {
-        let label = if show_counts && tab.count > 0 {
-            format!("{} {}", tab.label, tab.count)
-        } else {
-            tab.label.to_string()
-        };
-        let tab_width = u16::try_from(UnicodeWidthStr::width(label.as_str()).saturating_add(2))
-            .unwrap_or(u16::MAX)
-            .min(tab_area.width);
-        let x = tab_area.x.saturating_add(
-            app.work_surface
-                .dock_tabs
-                .last()
-                .map(|hitbox| hitbox.area.right().saturating_sub(tab_area.x) + 2)
-                .unwrap_or(1),
-        );
-        if x.saturating_add(tab_width) > close_area.x {
-            break;
-        }
-        let hitbox = Rect {
-            x,
-            y: tab_y,
-            width: tab_width,
-            height: 1,
-        };
-        let active = tab.target == DockTabTarget::Panel(app.work_surface.panel);
-        let pressed = app.work_surface.pressed_tab == Some(tab.target);
-        let hovered = app.work_surface.hovered_tab == Some(tab.target);
-        let style = if active || pressed {
-            Style::default()
+    let row = DockTabRow {
+        tabs: &entries,
+        active: kit_panel(app.work_surface.panel),
+        bottom: app.work_surface.effective_placement == WorkSurfacePlacement::Bottom,
+        close: close.into(),
+        hovered: app.work_surface.hovered_tab.map(|target| match target {
+            DockTabTarget::Panel(panel) => T::Panel(kit_panel(panel)),
+            DockTabTarget::Close => T::Close,
+        }),
+        pressed: app
+            .work_surface
+            .pressed_tab
+            .and_then(|target| match target {
+                DockTabTarget::Panel(panel) => Some(kit_panel(panel)),
+                DockTabTarget::Close => None,
+            }),
+        styles: DockTabStyles {
+            idle: chrome_style(&app.ui_theme, ChromeInk::Metadata),
+            active: Style::default()
                 .fg(app.ui_theme.text_body)
                 .bg(app.ui_theme.selection_bg)
-                .add_modifier(Modifier::BOLD)
-        } else if hovered {
-            Style::default()
+                .add_modifier(Modifier::BOLD),
+            hovered: Style::default()
                 .fg(app.ui_theme.text_body)
                 .bg(app.ui_theme.elevated_bg)
-                .add_modifier(Modifier::UNDERLINED)
-        } else {
-            chrome_style(&app.ui_theme, ChromeInk::Metadata)
-        };
-        Paragraph::new(Line::from(Span::styled(format!(" {label} "), style)))
-            .render(hitbox, frame.buffer_mut());
-        app.work_surface.dock_tabs.push(DockTabHitbox {
-            target: tab.target,
-            area: hitbox,
-        });
-    }
-    let close_style = if app.work_surface.hovered_tab == Some(DockTabTarget::Close) {
-        chrome_style(&app.ui_theme, ChromeInk::Info)
-            .bg(app.ui_theme.elevated_bg)
-            .add_modifier(Modifier::UNDERLINED)
-    } else {
-        chrome_style(&app.ui_theme, ChromeInk::MetadataHint)
+                .add_modifier(Modifier::UNDERLINED),
+            close: chrome_style(&app.ui_theme, ChromeInk::MetadataHint),
+            close_hovered: chrome_style(&app.ui_theme, ChromeInk::Info)
+                .bg(app.ui_theme.elevated_bg)
+                .add_modifier(Modifier::UNDERLINED),
+        },
     };
-    Paragraph::new(Line::from(Span::styled(close, close_style)))
-        .render(close_area, frame.buffer_mut());
-    app.work_surface.dock_tabs.push(DockTabHitbox {
-        target: DockTabTarget::Close,
-        area: close_area,
-    });
+    let plan = row.plan(area);
+    plan.paint(frame.buffer_mut());
+    app.work_surface.dock_tabs = plan
+        .hitboxes()
+        .into_iter()
+        .map(|(target, area)| DockTabHitbox {
+            target: native_target(target),
+            area,
+        })
+        .collect();
 }
 
 /// The badge on a view's tab: how many rows of *work* it holds. `None` for
@@ -832,29 +752,18 @@ fn render_scrollbar(
     total: usize,
     app: &App,
 ) {
-    let rail_height = area.height;
-    if rail_height == 0 || total == 0 {
-        return;
+    codewhale_ratatui::WorkbarScrollbar {
+        offset,
+        visible,
+        total,
+        thumb: "┃",
+        track: "│",
+        thumb_style: Style::default()
+            .fg(app.ui_theme.status_working)
+            .bg(app.ui_theme.panel_bg),
+        track_style: Style::default()
+            .fg(app.ui_theme.border)
+            .bg(app.ui_theme.panel_bg),
     }
-    let thumb_height = ((usize::from(rail_height) * visible) / total)
-        .max(1)
-        .min(usize::from(rail_height));
-    let max_offset = total.saturating_sub(visible).max(1);
-    let max_start = usize::from(rail_height).saturating_sub(thumb_height);
-    let thumb_start = offset.saturating_mul(max_start) / max_offset;
-    let x = area.right().saturating_sub(1);
-    for row in 0..usize::from(rail_height) {
-        let in_thumb = row >= thumb_start && row < thumb_start.saturating_add(thumb_height);
-        frame.buffer_mut()[(x, area.y.saturating_add(row as u16))]
-            // Match the transcript rail exactly: a fine border track with a
-            // brighter, narrow thumb. The old solid block looked like a
-            // separate native scrollbar bolted onto the work surface.
-            .set_symbol(if in_thumb { "┃" } else { "│" })
-            .set_fg(if in_thumb {
-                app.ui_theme.status_working
-            } else {
-                app.ui_theme.border
-            })
-            .set_bg(app.ui_theme.panel_bg);
-    }
+    .paint(area, frame.buffer_mut());
 }

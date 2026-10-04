@@ -324,7 +324,94 @@ pub enum SkillSource {
         plugin_id: String,
         plugin_name: String,
         authority: Box<crate::plugins::types::PluginAuthority>,
+        native_registration: Option<crate::extension_host::skills::NativeSkillRef>,
     },
+}
+
+/// Legacy declarative receipts retain their serialized shape. Native roots
+/// carry only public lifetime facts beside the same reviewed bundle receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum SkillProvenance {
+    NativeRoot(NativeSkillProvenance),
+    Plugin(crate::plugins::types::PluginAuthority),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSkillProvenance {
+    pub authority: crate::plugins::types::PluginAuthority,
+    pub registration: crate::extension_host::skills::NativeSkillRef,
+}
+
+impl From<crate::plugins::types::PluginAuthority> for SkillProvenance {
+    fn from(authority: crate::plugins::types::PluginAuthority) -> Self {
+        Self::Plugin(authority)
+    }
+}
+
+impl SkillProvenance {
+    pub fn authority(&self) -> &crate::plugins::types::PluginAuthority {
+        match self {
+            Self::Plugin(authority) => authority,
+            Self::NativeRoot(source) => &source.authority,
+        }
+    }
+    pub(crate) fn verify_for(
+        &self,
+        workspace: &Path,
+        plugins: Option<&crate::plugins::PluginRegistry>,
+    ) -> Result<(), String> {
+        if let Self::NativeRoot(source) = self {
+            crate::extension_host::manager().shared.check_selection(
+                source.registration.selection,
+                plugins,
+                source.authority.plugin_id.as_str(),
+                &source.authority.content_hash,
+                source.registration.scope.as_ref(),
+            )?;
+        }
+        self.verify_current(workspace)
+    }
+    #[cfg(test)]
+    pub(crate) fn verify(&self, workspace: &Path) -> Result<(), String> {
+        self.verify_for(workspace, None)
+    }
+    fn verify_current(&self, workspace: &Path) -> Result<(), String> {
+        let authority = self.authority();
+        if authority.workspace != workspace {
+            return Err("plugin skill belongs to a different workspace".to_string());
+        }
+        match self {
+            Self::Plugin(authority) => crate::plugins::registry::verify_plugin_component_authority(
+                authority,
+                crate::plugins::activation::PluginActivationCapability::Skills,
+            ),
+            Self::NativeRoot(source) => crate::extension_host::skills::verify_native_skill(
+                &source.authority,
+                &source.registration,
+            ),
+        }
+    }
+}
+
+impl SkillSource {
+    pub(crate) fn provenance(&self) -> Option<SkillProvenance> {
+        match self {
+            Self::Native => None,
+            Self::Plugin {
+                authority,
+                native_registration,
+                ..
+            } => Some(match native_registration {
+                Some(registration) => SkillProvenance::NativeRoot(NativeSkillProvenance {
+                    authority: authority.as_ref().clone(),
+                    registration: registration.clone(),
+                }),
+                None => SkillProvenance::Plugin(authority.as_ref().clone()),
+            }),
+        }
+    }
 }
 
 impl Skill {
@@ -444,7 +531,7 @@ impl SkillRegistry {
     /// Defends against pathological configurations (e.g. a user pointing
     /// `skills_dir` at `~`) without artificially limiting realistic
     /// vendored layouts like `<root>/<org>/<repo>/<skill>/SKILL.md`.
-    const MAX_DISCOVERY_DEPTH: usize = 8;
+    pub(crate) const MAX_DISCOVERY_DEPTH: usize = 8;
 
     /// Discover skills from the given directory.
     ///
@@ -474,10 +561,32 @@ impl SkillRegistry {
     /// with its metadata stamp. The discovery cache validates hits by
     /// re-stat()ing only this set instead of re-walking every root.
     pub(crate) fn discover_watched(dir: &Path) -> (Self, WatchedPaths) {
+        Self::discover_watched_confined(dir, None)
+    }
+
+    /// [`Self::discover_watched`] for a root that belongs to a workspace.
+    ///
+    /// With a `confine_to` workspace, the walk never follows a link: a linked
+    /// root, a linked skill directory, and a linked `SKILL.md` are each named
+    /// in a warning and skipped, so a repository cannot make discovery read
+    /// files outside itself. Operator-owned roots (`confine_to == None`) keep
+    /// following links, because users link skill libraries there on purpose.
+    pub(crate) fn discover_watched_confined(
+        dir: &Path,
+        confine_to: Option<&Path>,
+    ) -> (Self, WatchedPaths) {
         #[cfg(test)]
         record_root_discovery_call();
         let mut registry = Self::default();
         let mut watched = WatchedPaths::default();
+        if let Some(workspace) = confine_to
+            && let Err(error) = crate::fleet::files::reject_linked_path(workspace, dir)
+        {
+            registry.push_warning(format!(
+                "{error}: workspace skills must stay inside the workspace."
+            ));
+            return (registry, watched);
+        }
         let Ok(canonical_dir) = fs::canonicalize(dir) else {
             return (registry, watched);
         };
@@ -486,7 +595,7 @@ impl SkillRegistry {
         }
 
         let mut visited = HashSet::new();
-        Self::discover_recursive(dir, 0, &mut registry, &mut visited);
+        Self::discover_recursive(dir, 0, confine_to, &mut registry, &mut visited);
         registry
             .skills
             .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
@@ -503,6 +612,7 @@ impl SkillRegistry {
     fn discover_recursive(
         dir: &Path,
         depth: usize,
+        confine_to: Option<&Path>,
         registry: &mut Self,
         visited: &mut HashSet<PathBuf>,
     ) {
@@ -550,8 +660,25 @@ impl SkillRegistry {
                 continue;
             }
 
-            let Ok(metadata) = fs::metadata(&path) else {
-                continue;
+            let metadata = if confine_to.is_some() {
+                // Under a workspace a link is never followed, whatever it
+                // points at; say so instead of dropping the entry silently.
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        registry.push_warning(format!(
+                            "Refusing symlinked skill entry {}: workspace skills must stay inside the workspace.",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                    Ok(metadata) => metadata,
+                    Err(_) => continue,
+                }
+            } else {
+                let Ok(metadata) = fs::metadata(&path) else {
+                    continue;
+                };
+                metadata
             };
             if !metadata.is_dir() {
                 continue;
@@ -560,7 +687,11 @@ impl SkillRegistry {
             let skill_path = path.join("SKILL.md");
             #[cfg(test)]
             record_skill_md_read_attempt();
-            match fs::read_to_string(&skill_path) {
+            let read_result = match confine_to {
+                Some(workspace) => crate::fs_confined::read_to_string(workspace, &skill_path),
+                None => fs::read_to_string(&skill_path),
+            };
+            match read_result {
                 Ok(content) => match Self::parse_verified_content(&skill_path, &content) {
                     Ok((mut skill, warnings)) => {
                         for warning in warnings {
@@ -612,7 +743,10 @@ impl SkillRegistry {
                         continue;
                     }
                 },
-                Err(err) if skill_path.exists() => {
+                Err(err)
+                    if skill_path.exists()
+                        || (confine_to.is_some() && fs::symlink_metadata(&skill_path).is_ok()) =>
+                {
                     if !Self::mark_discovered_dir(&path, visited) {
                         continue;
                     }
@@ -626,7 +760,7 @@ impl SkillRegistry {
                 }
             }
 
-            Self::discover_recursive(&path, depth + 1, registry, visited);
+            Self::discover_recursive(&path, depth + 1, confine_to, registry, visited);
         }
     }
 
@@ -1044,8 +1178,9 @@ pub fn discover_in_workspace_with_mode_and_plugins(
     mode: SkillDiscoveryMode,
     plugins: Option<&crate::plugins::PluginRegistry>,
 ) -> SkillRegistry {
-    let registry = discover_from_directories_with_plugins(
+    let registry = discover_from_directories_in_workspace(
         skills_directories_for_mode(workspace, mode),
+        Some(workspace),
         plugins,
     );
     with_untrusted_project_skills_warning(registry, workspace, None, mode)
@@ -1104,7 +1239,7 @@ pub fn discover_for_workspace_and_dir_with_mode_and_plugins(
     plugins: Option<&crate::plugins::PluginRegistry>,
 ) -> SkillRegistry {
     let dirs = skill_directories_for_workspace_and_dir(workspace, skills_dir, mode);
-    let registry = discover_from_directories_with_plugins(dirs, plugins);
+    let registry = discover_from_directories_in_workspace(dirs, Some(workspace), plugins);
     with_untrusted_project_skills_warning(registry, workspace, Some(skills_dir), mode)
 }
 
@@ -1153,15 +1288,27 @@ fn insert_configured_skills_dir(
     dirs.insert(insert_at, skills_dir.to_path_buf());
 }
 
+#[cfg(test)]
 pub(crate) fn discover_from_directories_with_plugins(
     dirs: impl IntoIterator<Item = PathBuf>,
+    plugins: Option<&crate::plugins::PluginRegistry>,
+) -> SkillRegistry {
+    discover_from_directories_in_workspace(dirs, None, plugins)
+}
+
+/// Discover from `dirs`, confining every directory that lives under
+/// `workspace` to it (see [`SkillRegistry::discover_watched_confined`]).
+/// Directories elsewhere, such as the user's home roots, are read as before.
+pub(crate) fn discover_from_directories_in_workspace(
+    dirs: impl IntoIterator<Item = PathBuf>,
+    workspace: Option<&Path>,
     plugins: Option<&crate::plugins::PluginRegistry>,
 ) -> SkillRegistry {
     let dirs: Vec<PathBuf> = dirs.into_iter().collect();
     // The watched-validated cache covers the disk-walk merge. Plugin skills
     // merge from the in-memory plugin registry per call, so plugin state
     // changes apply immediately and the cache needs no plugin identity.
-    let merged = cached_merged_discovery(dirs);
+    let merged = cached_merged_discovery(dirs, workspace.map(Path::to_path_buf));
     merge_plugin_skills(merged, plugins)
 }
 
@@ -1171,18 +1318,34 @@ fn merge_plugin_skills(
 ) -> SkillRegistry {
     if let Some(plugins) = plugins {
         merge_active_plugin_skills(&mut merged, plugins);
+        for (root, authority, reference) in
+            crate::extension_host::skills::roots_for_plugins(plugins)
+        {
+            merge_plugin_skill_snapshots(
+                &mut merged,
+                &authority.plugin_id.to_string(),
+                &authority.plugin_name.clone(),
+                &authority,
+                root.snapshots,
+                Some(reference),
+            );
+        }
     }
     merged
 }
 
 /// Merge every directory's registry with first-match-wins precedence,
 /// collecting each directory's watched filesystem set for cache validation.
-fn merge_watched_directories(dirs: Vec<PathBuf>) -> (SkillRegistry, WatchedPaths) {
+fn merge_watched_directories(
+    dirs: Vec<PathBuf>,
+    workspace: Option<&Path>,
+) -> (SkillRegistry, WatchedPaths) {
     let mut merged = SkillRegistry::default();
     let mut watched = WatchedPaths::default();
     for dir in dirs {
         watched.push((dir.clone(), watched_path_stamp(&dir)));
-        let (registry, dir_watched) = SkillRegistry::discover_watched(&dir);
+        let confine_to = workspace.filter(|workspace| dir.starts_with(workspace));
+        let (registry, dir_watched) = SkillRegistry::discover_watched_confined(&dir, confine_to);
         watched.extend(dir_watched);
         for skill in registry.skills {
             if let Some(existing) = merged.skills.iter().find(|s| s.name == skill.name) {
@@ -1214,8 +1377,11 @@ struct DiscoveryCacheEntry {
 /// limit; a full cache is simply cleared on the next miss.
 const MAX_DISCOVERY_CACHE_ENTRIES: usize = 8;
 
-fn discovery_cache() -> &'static RwLock<HashMap<Vec<PathBuf>, DiscoveryCacheEntry>> {
-    static CACHE: OnceLock<RwLock<HashMap<Vec<PathBuf>, DiscoveryCacheEntry>>> = OnceLock::new();
+type DiscoveryCacheKey = (Vec<PathBuf>, Option<PathBuf>);
+
+fn discovery_cache() -> &'static RwLock<HashMap<DiscoveryCacheKey, DiscoveryCacheEntry>> {
+    static CACHE: OnceLock<RwLock<HashMap<DiscoveryCacheKey, DiscoveryCacheEntry>>> =
+        OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -1231,12 +1397,13 @@ pub fn clear_skill_discovery_cache() {
 /// Merged discovery for one resolved directory set, cached by that set.
 /// A hit re-stats only the watched entries (each visited directory and
 /// parsed `SKILL.md`); any metadata or readability change re-walks fully.
-fn cached_merged_discovery(dirs: Vec<PathBuf>) -> SkillRegistry {
+fn cached_merged_discovery(dirs: Vec<PathBuf>, workspace: Option<PathBuf>) -> SkillRegistry {
+    let key = (dirs, workspace);
     {
         let read = discovery_cache()
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = read.get(&dirs)
+        if let Some(entry) = read.get(&key)
             && entry
                 .watched
                 .iter()
@@ -1245,7 +1412,7 @@ fn cached_merged_discovery(dirs: Vec<PathBuf>) -> SkillRegistry {
             return entry.registry.clone();
         }
     }
-    let (merged, watched) = merge_watched_directories(dirs.clone());
+    let (merged, watched) = merge_watched_directories(key.0.clone(), key.1.as_deref());
     let mut write = discovery_cache()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1253,7 +1420,7 @@ fn cached_merged_discovery(dirs: Vec<PathBuf>) -> SkillRegistry {
         write.clear();
     }
     write.insert(
-        dirs,
+        key,
         DiscoveryCacheEntry {
             watched,
             registry: merged.clone(),
@@ -1301,41 +1468,59 @@ fn merge_plugin_skills_from_plugins(
         {
             continue;
         }
-        let plugin_id = plugin.id.to_string();
         let plugin_name = plugin.name().to_string();
-        for snapshot in plugin.skill_snapshots {
-            let qualified_name = format!("{plugin_name}:{}", snapshot.name);
-            if let Some(existing) = registry
-                .skills
-                .iter()
-                .find(|skill| skill.name == qualified_name)
-            {
-                registry.push_warning(format!(
-                    "Plugin skill `{qualified_name}` at {} is shadowed by {}.",
-                    snapshot.path.display(),
-                    existing.path.display()
-                ));
-                continue;
-            }
-            registry.skills.push(Skill {
-                name: qualified_name,
-                legacy_activation_name: snapshot
-                    .legacy_activation_name
-                    .map(|legacy| format!("{plugin_name}:{legacy}")),
-                description: snapshot.description,
-                localized_descriptions: snapshot.localized_descriptions,
-                invocation: snapshot.invocation,
-                aliases: snapshot.aliases,
-                argument_hint: snapshot.argument_hint,
-                body: snapshot.body,
-                path: snapshot.path,
-                source: SkillSource::Plugin {
-                    plugin_id: plugin_id.clone(),
-                    plugin_name: plugin_name.clone(),
-                    authority: Box::new(authority.clone()),
-                },
-            });
+        merge_plugin_skill_snapshots(
+            registry,
+            &plugin.id.to_string(),
+            &plugin_name,
+            &authority,
+            plugin.skill_snapshots,
+            None,
+        );
+    }
+}
+
+fn merge_plugin_skill_snapshots(
+    registry: &mut SkillRegistry,
+    plugin_id: &str,
+    plugin_name: &str,
+    authority: &crate::plugins::types::PluginAuthority,
+    snapshots: Vec<crate::plugins::types::PluginSkillSnapshot>,
+    native_registration: Option<crate::extension_host::skills::NativeSkillRef>,
+) {
+    for snapshot in snapshots {
+        let qualified_name = format!("{plugin_name}:{}", snapshot.name);
+        if let Some(existing) = registry
+            .skills
+            .iter()
+            .find(|skill| skill.name == qualified_name)
+        {
+            registry.push_warning(format!(
+                "Plugin skill `{qualified_name}` at {} is shadowed by {}.",
+                snapshot.path.display(),
+                existing.path.display()
+            ));
+            continue;
         }
+        registry.skills.push(Skill {
+            name: qualified_name,
+            legacy_activation_name: snapshot
+                .legacy_activation_name
+                .map(|legacy| format!("{plugin_name}:{legacy}")),
+            description: snapshot.description,
+            localized_descriptions: snapshot.localized_descriptions,
+            invocation: snapshot.invocation,
+            aliases: snapshot.aliases,
+            argument_hint: snapshot.argument_hint,
+            body: snapshot.body,
+            path: snapshot.path,
+            source: SkillSource::Plugin {
+                plugin_id: plugin_id.to_string(),
+                plugin_name: plugin_name.to_string(),
+                authority: Box::new(authority.clone()),
+                native_registration: native_registration.clone(),
+            },
+        });
     }
 }
 
@@ -1375,7 +1560,7 @@ pub(crate) fn discover_for_workspace_and_dir_with_home_and_mode_and_plugins(
 ) -> SkillRegistry {
     let mut dirs = skills_directories_with_home_and_mode(workspace, home_dir, mode);
     insert_configured_skills_dir(&mut dirs, workspace, home_dir, skills_dir);
-    discover_from_directories_with_plugins(dirs, plugins)
+    discover_from_directories_in_workspace(dirs, Some(workspace), plugins)
 }
 
 /// Test-only convenience wrapper for rendering the system-prompt skills block
@@ -1395,8 +1580,9 @@ pub fn render_available_skills_context_for_workspace_with_mode_and_plugins(
     plugins: Option<&crate::plugins::PluginRegistry>,
     budget_chars: usize,
 ) -> Option<String> {
-    let registry = discover_from_directories_with_plugins(
+    let registry = discover_from_directories_in_workspace(
         skills_directories_for_mode(workspace, mode),
+        Some(workspace),
         plugins,
     )
     .into_enabled();
@@ -1425,8 +1611,9 @@ pub fn render_available_skills_context_for_workspace_and_dir_with_mode_and_plugi
     plugins: Option<&crate::plugins::PluginRegistry>,
     budget_chars: usize,
 ) -> Option<String> {
-    let registry = discover_from_directories_with_plugins(
+    let registry = discover_from_directories_in_workspace(
         skill_directories_for_workspace_and_dir(workspace, skills_dir, mode),
+        Some(workspace),
         plugins,
     )
     .into_enabled();

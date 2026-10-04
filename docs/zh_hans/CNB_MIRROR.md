@@ -73,7 +73,7 @@ CNB 不会提前发布该版本。已有 CNB 标签必须与源码一致；恢�
 - `cargo check --workspace --all-targets --locked`
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
 - `cargo test --workspace --all-features --locked`
-- `cargo build --release --locked -p codewhale-cli -p codewhale-tui`
+- `cargo build --release --locked -p codewhale-cli --bin codewhale`
 - `node scripts/release/npm-wrapper-smoke.js`
 
 匹配 `work/v*` 的发布分支还会运行

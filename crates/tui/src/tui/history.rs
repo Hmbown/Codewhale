@@ -707,6 +707,12 @@ pub fn history_cells_from_message(msg: &Message) -> Vec<HistoryCell> {
             content: format!("MCP server guidance shown to the model:\n{guidance}"),
         }];
     }
+    if let Some(instructions) = crate::runtime_handoff::extension_prompt_contributions_display(msg)
+    {
+        return vec![HistoryCell::System {
+            content: instructions.to_string(),
+        }];
+    }
     // Raw runtime handoffs have live tool/status receipts, not user cells.
     // Keep their model-facing payload intact and filter only the display.
     if crate::runtime_handoff::is_internal_runtime_handoff(msg) {

@@ -29,7 +29,7 @@ use serde_json::Value;
 
 use crate::agent_roster::{AgentRosterRow, RosterState};
 use crate::compaction::CompactionConfig;
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::core::engine::preview::PreviewUnresolved;
 use crate::core::events::{
     Event, RouteBillingEnvelope, ToolGate, ToolGateVerdict, TurnOutcomeStatus, TurnRoute,
@@ -135,7 +135,7 @@ fn capability_metadata_str(metadata: McpServerCapabilityMetadata) -> &'static st
     }
 }
 
-fn provider_str(provider: ApiProvider) -> String {
+fn provider_str(provider: ProviderKind) -> String {
     provider.as_str().to_string()
 }
 
@@ -395,7 +395,7 @@ fn turn_spec_to_wire(spec: &crate::core::ops::TurnSpec) -> wire_op::TurnSpec {
         images: spec.images.clone(),
         mode: app_mode_str(spec.mode).to_string(),
         model: Some(spec.route.model.clone()),
-        model_provider: Some(spec.route.identity.key.clone()),
+        model_provider: Some(spec.route.identity.key.to_string()),
         allowed_tools: spec.allowed_tools.clone(),
         dynamic_tools: spec.dynamic_tools.clone(),
         provenance: spec.provenance.as_str().to_string(),
@@ -489,6 +489,17 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             thread_id,
             session_id,
             index: count(*index),
+        },
+        Event::ToolExecutionStarted { id } => wire::EventMsg::ToolExecutionStarted {
+            thread_id,
+            session_id,
+            tool_call_id: id.clone(),
+        },
+        Event::ToolResultContent { id, blocks } => wire::EventMsg::ToolResultContent {
+            thread_id,
+            session_id,
+            tool_call_id: id.clone(),
+            blocks: to_value(blocks),
         },
         Event::ToolCallStarted {
             id, name, input, ..
@@ -903,6 +914,11 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             intent_summary: intent_summary.clone(),
             approval_force_prompt: *approval_force_prompt,
         },
+        Event::ApprovalWithdrawn { id } => wire::EventMsg::ApprovalWithdrawn {
+            thread_id,
+            session_id,
+            id: id.clone(),
+        },
         Event::UserInputRequired { id, request } => wire::EventMsg::UserInputRequired {
             thread_id,
             session_id,
@@ -1183,7 +1199,7 @@ pub fn op_to_protocol(op: &Op) -> wire_op::Op {
         } => wire_op::Op::CompactContext {
             id: id.clone(),
             model: route.model.clone(),
-            model_provider: route.identity.key.clone(),
+            model_provider: route.identity.key.to_string(),
             compaction: compaction_to_wire(compaction),
         },
         Op::CancelCompaction { id } => wire_op::Op::CancelCompaction { id: id.clone() },
@@ -1749,5 +1765,30 @@ mod tests {
             wildcard_arms.is_empty(),
             "protocol_parity.rs must match engine variants exhaustively; found {wildcard_arms:?}"
         );
+    }
+    #[test]
+    fn acp_optional_tool_facts_round_trip_with_core_routing_identity() {
+        let ids = ids();
+        for event in [
+            Event::ToolExecutionStarted {
+                id: "core-call".into(),
+            },
+            Event::ToolResultContent {
+                id: "core-call".into(),
+                blocks: vec![codewhale_tools::ToolResultContentBlock::Image {
+                    mime_type: "image/png".into(),
+                    data: "QUJD".into(),
+                }],
+            },
+        ] {
+            let projected = event_to_protocol(&event, &ids);
+            assert_eq!(projected.thread_id(), &ids.thread_id);
+            assert_eq!(projected.session_id(), &ids.session_id);
+            let value = serde_json::to_value(&projected).unwrap();
+            assert_eq!(
+                serde_json::from_value::<wire::EventMsg>(value).unwrap(),
+                projected
+            );
+        }
     }
 }

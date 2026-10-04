@@ -417,14 +417,14 @@ mod tests {
     /// field entirely must not change the cost by a single cent.
     #[test]
     fn reasoning_parser_fixtures_never_exceed_or_add_to_billable_output() {
-        use crate::config::ApiProvider;
+        use crate::config::ProviderKind;
         use crate::pricing::{calculate_turn_cost_estimate_for_provider, token_usage_for_pricing};
 
         // (label, provider, model, payload)
-        let fixtures: [(&str, ApiProvider, &str, serde_json::Value); 3] = [
+        let fixtures: [(&str, ProviderKind, &str, serde_json::Value); 3] = [
             (
                 "moonshot",
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 "kimi-k2.7-code",
                 json!({
                     "prompt_tokens": 30_000,
@@ -436,7 +436,7 @@ mod tests {
             ),
             (
                 "minimax",
-                ApiProvider::Minimax,
+                ProviderKind::Minimax,
                 "minimax-m3",
                 json!({
                     "prompt_tokens": 12_000,
@@ -448,7 +448,7 @@ mod tests {
             ),
             (
                 "openrouter",
-                ApiProvider::Openrouter,
+                ProviderKind::Openrouter,
                 "qwen/qwen3.7-plus",
                 json!({
                     "prompt_tokens": 8_000,

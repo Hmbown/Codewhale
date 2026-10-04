@@ -75,6 +75,19 @@ pub struct CompactionConfig {
 pub trait CompactionNoticeSink: Send + Sync + std::fmt::Debug {
     /// Deliver one already-rendered, user-visible sentence.
     fn notice(&self, message: String);
+    /// Captured dispatch origin for a child; ordinary engines retain the existing billing path.
+    fn accounting_origin(&self) -> Option<(crate::cost_status::CostScopeToken, String, String)> {
+        None
+    }
+    /// Projection after the existing billing block has settled this exact response once.
+    fn settled_usage<'a>(
+        &'a self,
+        _source: &'a str,
+        _route: &'a crate::cost_status::EffectiveRouteEnvelope,
+        _usage: &'a Usage,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
 }
 
 /// Host-prepared configuration carried from compaction eligibility through
@@ -1910,7 +1923,10 @@ async fn create_summary(
 
         // Capture the session scope before awaiting so a late response cannot
         // accrue into a subsequently loaded/new session.
-        let cost_scope = crate::cost_status::scope_token();
+        let accounting_origin = notice_sink.and_then(CompactionNoticeSink::accounting_origin);
+        let cost_scope = accounting_origin
+            .as_ref()
+            .map_or_else(crate::cost_status::scope_token, |origin| origin.0);
         let response = match client.create_message(request).await {
             Ok(response) => response,
             // A byte-side size rejection can also read like a length problem
@@ -2006,22 +2022,63 @@ async fn create_summary(
         // A rejected summary or canceled retry still consumed these tokens.
         crate::core::turn::add_usage_to(invocation_usage, &response.usage);
 
-        // Compaction summary calls are billed; route the tokens through the
-        // side-channel so the dashboard total matches the website (#526).
-        crate::cost_status::report_effective_route_for_runtime(
-            cost_scope,
-            config.runtime_cost_owner.as_deref(),
-            &format!(
-                "compaction:dispatch:{}:response:{}",
-                cost_route
-                    .dispatched_at
-                    .timestamp_nanos_opt()
-                    .unwrap_or_default(),
-                response.id
-            ),
-            &cost_route,
-            &response.usage,
+        let source_id = format!(
+            "compaction:dispatch:{}:response:{}",
+            cost_route
+                .dispatched_at
+                .timestamp_nanos_opt()
+                .unwrap_or_default(),
+            response.id
         );
+        if let Some((scope, session, agent)) = accounting_origin.as_ref() {
+            if crate::core::engine::turn_loop::usage_has_reported_data(&response.usage) {
+                if let Some(owner) = config.runtime_cost_owner.as_deref() {
+                    crate::cost_status::report_effective_route_for_runtime(
+                        *scope,
+                        Some(owner),
+                        &source_id,
+                        &cost_route,
+                        &response.usage,
+                    );
+                } else {
+                    crate::cost_status::report_effective_route_for_interactive_origin(
+                        *scope,
+                        session,
+                        agent,
+                        &source_id,
+                        &cost_route,
+                        &response.usage,
+                    );
+                }
+            } else if let Some(owner) = config.runtime_cost_owner.as_deref() {
+                crate::cost_status::report_unreceipted_provider_success(
+                    *scope,
+                    Some(owner),
+                    &source_id,
+                    &cost_route,
+                );
+            } else {
+                crate::cost_status::report_unreceipted_for_interactive_origin(
+                    *scope,
+                    session,
+                    agent,
+                    &source_id,
+                    &cost_route,
+                );
+            }
+        } else {
+            crate::cost_status::report_effective_route_for_runtime(
+                cost_scope,
+                config.runtime_cost_owner.as_deref(),
+                &source_id,
+                &cost_route,
+                &response.usage,
+            );
+        }
+        if let Some(sink) = notice_sink {
+            sink.settled_usage(&source_id, &cost_route, &response.usage)
+                .await;
+        }
 
         // Usage above is already billed; a provider-declared incomplete
         // summary must still fail rather than replace the session history
@@ -3154,7 +3211,7 @@ mod tests {
         assert_eq!(
             request.max_tokens,
             crate::route_budget::effective_max_output_tokens_for_route(
-                crate::config::ApiProvider::Custom,
+                crate::config::ProviderKind::Custom,
                 "test-model",
                 None,
             )
@@ -3688,12 +3745,12 @@ mod tests {
         for (route_label, provider, model) in [
             (
                 "thinking-default route",
-                crate::config::ApiProvider::Deepseek,
+                crate::config::ProviderKind::Deepseek,
                 "deepseek-v4-flash",
             ),
             (
                 "fixed-sampling route",
-                crate::config::ApiProvider::Moonshot,
+                crate::config::ProviderKind::Moonshot,
                 "k3",
             ),
         ] {

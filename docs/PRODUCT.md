@@ -50,10 +50,10 @@ no hosted runtime to sell.
   `web/lib/content/vocabulary.ts` and `docs/public-surface-facts.json`.
 - Localised through shared dictionaries in `web/lib/i18n/dictionaries/` with
   locale-key parity enforced; no page-local copy forks.
-- The 0.9.12 shell (on the integration branch): transcript first, composer
-  plate, one info line, and a bottom dock with tabs Tasks / Agents / Context /
-  Pinned (+ ×). There is no top bar; docs that describe the shell describe the
-  dock.
+- The terminal puts the conversation above the composer, posture and metrics.
+  Its workbar exposes Tasks, Fleet, Jobs, Files, Notes, Context, Git and Cost.
+  Product previews come from the installed native TUI's actual PTY cells;
+  the Ratatui explorer separately demonstrates reusable components with example data.
 
 ## Capabilities and Constraints
 
@@ -61,12 +61,12 @@ no hosted runtime to sell.
   compatibility identifiers (GitHub org/repo, package scopes).
 - Provider and model names are first-class and neutral; never rank providers
   in copy.
-- The 0.9.12 shell is not yet released. `web/lib/media-manifest.ts` marks
-  session video `pending`; the site must not ship mockups as screenshots. The
-  one real screenshot on hand is `web/public/codewhale-tui.png` — the
-  founder's 2026-09-04 capture of the v0.9.12 development build (new session,
-  braille C-curl whale, Work mode, Full Access). It is captioned as a
-  development build, never as a release.
+- `web/lib/media-manifest.ts` records the exact captured native build and
+  shared README image. Home, composer, workbar, provider selection and help
+  are captured in an isolated offline session, with their original text and
+  colors. They appear on the homepage, product page and getting-started guide.
+  Session video remains `pending`; static UI captures do not claim a completed
+  provider workflow. Build captions distinguish development builds from releases.
 - `/context-window` does not exist on the current base; do not document it.
 - Subagent role identifiers are those the code accepts (`general`, `explore`,
   `planner`, `reviewer`, `implement`, `test`, `advisor`, `custom`); the older

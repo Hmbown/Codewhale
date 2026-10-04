@@ -124,7 +124,7 @@ pub struct RouteBillingEnvelope {
 /// Provider/model route resolved for a model-backed turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnRoute {
-    /// `ApiProvider` key (`deepseek`, `openai`, `custom`, ...).
+    /// `ProviderKind` key (`deepseek`, `openai`, `custom`, ...).
     pub provider: String,
     /// Exact non-secret configured route key.
     pub provider_identity: String,
@@ -355,6 +355,17 @@ pub enum EventMsg {
     ToolCallHeartbeat {
         thread_id: ThreadId,
         session_id: SessionId,
+    },
+    ToolExecutionStarted {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        tool_call_id: String,
+    },
+    ToolResultContent {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        tool_call_id: String,
+        blocks: Value,
     },
     ToolCallComplete {
         thread_id: ThreadId,
@@ -694,6 +705,11 @@ pub enum EventMsg {
         intent_summary: Option<String>,
         approval_force_prompt: bool,
     },
+    ApprovalWithdrawn {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        id: String,
+    },
     UserInputRequired {
         thread_id: ThreadId,
         session_id: SessionId,
@@ -825,6 +841,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "pause_events",
     "resume_events",
     "approval_required",
+    "approval_withdrawn",
     "user_input_required",
     "session_updated",
     "elevation_required",
@@ -847,6 +864,8 @@ impl EventMsg {
             Self::ThinkingComplete { .. } => "thinking_complete",
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallHeartbeat { .. } => "tool_call_heartbeat",
+            Self::ToolExecutionStarted { .. } => "tool_execution_started",
+            Self::ToolResultContent { .. } => "tool_result_content",
             Self::ToolCallComplete { .. } => "tool_call_complete",
             Self::OperationActivityStarted { .. } => "operation_activity_started",
             Self::OperationActivityCompleted { .. } => "operation_activity_completed",
@@ -881,6 +900,7 @@ impl EventMsg {
             Self::PauseEvents { .. } => "pause_events",
             Self::ResumeEvents { .. } => "resume_events",
             Self::ApprovalRequired { .. } => "approval_required",
+            Self::ApprovalWithdrawn { .. } => "approval_withdrawn",
             Self::UserInputRequired { .. } => "user_input_required",
             Self::SessionUpdated { .. } => "session_updated",
             Self::ElevationRequired { .. } => "elevation_required",
@@ -903,6 +923,8 @@ impl EventMsg {
             | Self::ThinkingComplete { thread_id, .. }
             | Self::ToolCallStarted { thread_id, .. }
             | Self::ToolCallHeartbeat { thread_id, .. }
+            | Self::ToolExecutionStarted { thread_id, .. }
+            | Self::ToolResultContent { thread_id, .. }
             | Self::ToolCallComplete { thread_id, .. }
             | Self::OperationActivityStarted { thread_id, .. }
             | Self::OperationActivityCompleted { thread_id, .. }
@@ -937,6 +959,7 @@ impl EventMsg {
             | Self::PauseEvents { thread_id, .. }
             | Self::ResumeEvents { thread_id, .. }
             | Self::ApprovalRequired { thread_id, .. }
+            | Self::ApprovalWithdrawn { thread_id, .. }
             | Self::UserInputRequired { thread_id, .. }
             | Self::SessionUpdated { thread_id, .. }
             | Self::ElevationRequired { thread_id, .. }
@@ -959,6 +982,8 @@ impl EventMsg {
             | Self::ThinkingComplete { session_id, .. }
             | Self::ToolCallStarted { session_id, .. }
             | Self::ToolCallHeartbeat { session_id, .. }
+            | Self::ToolExecutionStarted { session_id, .. }
+            | Self::ToolResultContent { session_id, .. }
             | Self::ToolCallComplete { session_id, .. }
             | Self::OperationActivityStarted { session_id, .. }
             | Self::OperationActivityCompleted { session_id, .. }
@@ -993,6 +1018,7 @@ impl EventMsg {
             | Self::PauseEvents { session_id, .. }
             | Self::ResumeEvents { session_id, .. }
             | Self::ApprovalRequired { session_id, .. }
+            | Self::ApprovalWithdrawn { session_id, .. }
             | Self::UserInputRequired { session_id, .. }
             | Self::SessionUpdated { session_id, .. }
             | Self::ElevationRequired { session_id, .. }
@@ -1394,6 +1420,11 @@ mod tests {
                 approval_grouping_key: "g".into(),
                 intent_summary: None,
                 approval_force_prompt: true,
+            },
+            EventMsg::ApprovalWithdrawn {
+                thread_id: t.clone(),
+                session_id: s.clone(),
+                id: "c1".into(),
             },
             EventMsg::UserInputRequired {
                 thread_id: t.clone(),

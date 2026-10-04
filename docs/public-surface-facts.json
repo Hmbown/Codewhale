@@ -33,7 +33,7 @@
       "crates/tui/src/sandbox/mod.rs",
       "web/scripts/derive-facts.mjs"
     ],
-    "providerCountDefinition": "Website-derived ApiProvider labels in this source snapshot, excluding Custom, DeepseekCN and retired Antigravity; includes protocol/plan variants. Not a count of distinct vendors, ProviderKind identities, live catalogs, or providers in any published release."
+    "providerCountDefinition": "Website descriptor identities in this source snapshot, excluding Custom and retired identities; includes protocol/plan variants. Not a count of distinct vendors, ProviderKind identities, live catalogs, or providers in any published release."
   },
   "latestPublishedRelease": {
     "tag": "v0.10.0",
@@ -240,19 +240,21 @@
     ]
   },
   "screenshot": {
-    "readme": "web/public/codewhale-tui-5765d80.png",
-    "website": "web/public/codewhale-tui-5765d80.png",
-    "sourceVersion": "0.10.0",
-    "sourceCommit": "5765d80278f7184d187fa6682ba96b403a006523",
-    "sourceSha256": "359359275fefed015ba0e3772fee9e09d64048813d311c31d6ee2a83b1ee85b5",
-    "terminal": "real PTY cell capture; the website renders the cells as live HTML text, and the README image is the same frame rasterized with Menlo by web/scripts/render-terminal-capture.mjs",
+    "readme": "web/public/codewhale-tui-e940149.png",
+    "website": "web/public/codewhale-tui-e940149.png",
+    "sourceVersion": "0.10.1",
+    "sourceCommit": "e9401490969d58935b4544388d75dc7f276b81a4",
+    "sourceSha256": "6cc9098de48310a6b7d946df47e733fb40de4b9034145ff770851b328917198c",
+    "terminal": "real PTY cell capture; the website renders native cells as selectable HTML text, and the README image is the same frame exported as SVG by web/scripts/render-terminal-capture.mjs and rasterized as PNG",
     "theme": "Underwater (default)",
-    "capture": "Captured on 2026-09-25 from a development build of source 5765d80278f7 (0.10.0 dev) by crates/tui/tests/cucumber/launch_card_pty.rs::website_current_terminal_capture: a sealed HOME with the workspace at ~/my-project, no provider connected (explored offline), no network probes, no animations. Shows the whale mark, the first-run starter prompt in the composer, Ask permissions, Work mode and the model status. Rendered directly from terminal cells without changing the content. No fixture conversations or provider requests. This documents appearance, not a published release or completed task. Ask/Work is the captured posture, not a default claim.",
+    "capture": "Captured on 2026-10-02 from the installed development build of source e9401490969d (0.10.1), using crates/tui/tests/support/qa_harness and the website_current_terminal_capture input sequence. Sealed HOME with workspace ~/my-project, no provider connected, no submitted prompts or fixture history, no network probes, no animations. Home, unsent composer, provider selection, help, Tasks and Fleet workbar are actual application output. The capture describes this installed build, not newer unqualified source work or a published release. Ask/Work is the captured posture, not a default claim.",
     "sources": [
+      "crates/tui/tests/support/qa_harness",
       "crates/tui/tests/cucumber/launch_card_pty.rs",
+      "web/lib/terminal-captures/manifest.json",
       "web/lib/terminal-captures/website-home-100x24.json",
       "web/scripts/render-terminal-capture.mjs",
-      "web/public/codewhale-tui-5765d80.png"
+      "web/public/codewhale-tui-e940149.png"
     ]
   }
 }

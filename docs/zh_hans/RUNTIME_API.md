@@ -407,6 +407,64 @@ HTTP `POST /prompt` 都会在运行时上执行一个**真实回合**，经由
 并回复 `status: "completed"`，`events` 中带上流式帧——而
 它以前只是回复 `accepted` 而什么都不做。
 
+### 线程标识与重启
+
+规范线程 owner 保留完整已保存会话图、当前分支以及线程/会话绑定。
+兼容控制接口使用同一个已认证 owner；旧 SQLite 历史只作为受保护的只读导入来源。
+导入会在发布规范别名之前比较完整来源图和当前叶节点。别名发布失败时，
+来源和已完成的规范结果都会保留，恢复时可以说明实际完成了什么。
+
+已验证的旧目标导入同一个 owner 目标存储。导入时活动目标暂停；旧数据不会启动
+提供商调用。来源目标字段参与同一个受保护的来源比较。
+
+已保存会话的 fork 保留完整日志，包括非活动分支，并把已验证的本地会话目标
+sidecar 复制到新会话。活动本地目标复制为暂停状态；来源保持不变。
+该 sidecar 与公开的 Runtime 线程目标分开。原生 Runtime 线程 fork 不会自动
+继承公开线程目标。
+
+`thread/create`、`thread/start`、`thread/resume` 和 `thread/fork` 携带
+客户端生成的 `operation_key`。每个用户意图在发送前生成一个键；响应不确定时
+保留该键，并用它恢复同一个意图。Create 将键放在 `metadata.operation_key`；
+Start、Resume 和 Fork 使用 `operation_key`。两次有意的 fork 使用不同键。恢复查询现有
+owner 存储中的原始操作；响应丢失或来源历史后来增长不会创建另一个线程。
+
+`POST /v1/thread-history/operations/lookup` 是只读查询。封闭请求包含
+`version: 1`、`operation_key`、`expected_data_dir`、`expected_execution_scope`
+和 `workspace`；响应为 `absent`、`pending` 或 `committed`。待决和已提交响应
+包含保留的回执以及准确的操作/来源 `association`。
+
+`POST /v1/thread-history/operations/recover` 在 `operation` 中接收该查询请求，
+并接收预期的 `association`。它在同一个 owner 下验证已保存文档、完整图、
+工作区、检查点和操作/来源身份，然后明确完成已准备好的目标。
+它不会从可能已变化的来源重新构造原始意图。尚未准备好的目标保持待决；
+变化或无法验证的目标拒绝完成。使用同一个键重复恢复会观察到同一个已提交结果。
+
+选定工作区来自已确认的 owner 或明确获准的请求。历史和旧回执不能提供权限、
+凭据、端点或另一个 owner。绑定存储缺失、变化、繁忙或不兼容时明确失败。
+规范目标缺失不会启动一个空的替代会话。
+
+`codewhale thread resume` 和 `codewhale thread fork` 执行持久化 owner 控制，
+并输出已提交的线程、会话和操作回执。这两个命令不启动交互式界面。
+
+全局 `--workspace`（也可用 `--cd`）、`--profile` 和 `--config` 选择明确的
+控制范围。相对路径在挂接前确定；客户端先认证 owner，再使用同一个 owner
+回执和已捕获的 worker 设置接纳该范围。不兼容的 profile 或配置、缺失的范围
+信息或 owner 变化都会明确失败。省略这些选项时，工作区来自已确认的 owner。
+线程列表仍覆盖整个存储。
+
+新的 `thread resume` 或 `thread fork` 可通过全局 `--provider`、`--model`、
+`--approval-policy` 和 `--sandbox-mode` 向现有 owner 解码器和权限检查提交
+提议。对应的 `--set` 键为 `provider`、`model`、`default_text_model`、
+`approval_policy` 和 `sandbox_mode`。凭据和端点由 owner 保管：这些控制拒绝
+`--api-key`、`--base-url` 和其他单次运行设置。请先配置并认证所属 Runtime。
+携带保留的 `--operation-key` 时，新提交的模型、提供商、策略或 sandbox 提议
+都会被拒绝；恢复只观察原本已接纳的意图。
+
+交互式 `codewhale resume` 和 `codewhale fork` 使用同一个规范历史操作。
+只有在非活动的本地 owner 已关闭并等待退出之后，现有 TUI 才取得会话租约和存储。
+活动 owner 或不确定的交接会拒绝挂接。`--operation-key <KEY>` 恢复原始结果；
+可以完成已验证并准备好的目标；尚未准备好或无法验证的结果保留不确定性。
+
 ### 回答澄清提问
 
 当一个无头回合调用 `request_user_input` 时，运行时会发出一个
@@ -470,26 +528,46 @@ stdio 探针针对一份一次性配置运行，因此它从不读取真实密�
 
 ## ACP stdio 适配器：`codewhale serve --acp`
 
-`codewhale serve --acp` 为兼容 ACP 的编辑器客户端通过换行分隔的 stdio 讲 JSON-RPC 2.0。
-最初的适配器实现了 ACP 基线：
+ACP 以换行分隔的 stdio JSON-RPC 投影现有 RuntimeThreadManager 与 Engine。
+它不再维护独立的提供商/工具回合循环、可执行注册表、提示词组合器或会话写入器。
+服务端加载实际选定的配置、profile 与插件发现结果；每个提示词复用规范线程、
+Core 回合、事件时间线、审批等待器和完整 Engine 会话快照。
 
-- `initialize`
-- `session/new`
-- `session/prompt`
-- `session/cancel`
+编辑器接口支持 `initialize`、`session/new`、`session/list`、`session/load`
+（含持久 ID 前缀）、`session/prompt`、`session/cancel`、模型发现/选择，
+以及声明的模式/模型配置选项。新会话先持久化裸 UUID 和空检查点，不调用提供商。
+连接最多保留64个空闲绑定；淘汰绑定不删除持久会话。恢复复用已有线程绑定。
+完整历史、工具调用/结果配对、签名、媒体和部分执行回执通过 HTTP 同用的检查点
+守卫与会话写入租约保存。ACP 展示文本可以缩短，持久历史仍是完整 Core 快照。
 
-提示词请求经由已配置的 Codewhale 客户端与当前默认模型路由。
-响应以 `session/update` 智能体消息块的形式发出，随后是一个
-`session/prompt` 响应，带 `stopReason: "end_turn"`。
+受信任的本地 ACP profile 将 Core 收窄到文件/搜索/git/patch，以及获准的前台
+shell 工具。Shell 同时要求编辑器声明 terminal 支持、操作者允许 `allow_shell`；
+指定的外部沙箱不可用时不提供 shell。此接口不提供 MCP、动态工具、任务、PTY、
+后台 shell、解释器、子智能体或 RLM 生命周期。内置工具覆盖会移除整个兼容别名族。
+最终派发再次校验 profile；伪造别名、hook 改写或目录中缺失的工具不能绕过限制。
+Full Access 下 Plan 仍只读。Full Access 与普通审批姿态是服务端拥有的只读选项，
+编辑器不能放宽。Core 的类型化规则、严格 hooks、仓库约束、Headless Auto-Review
+与硬性下限仍生效；工作区写入不享受免审批例外，需要 guardian 的裁决会明确拒绝。
 
-每个会话都通过一个注册表在本地执行工具调用，该注册表由
-与 CLI exec 智能体相同的文件/搜索/git/patch/shell 工具构建，
-受 `session/request_permission` 门控，并作为 `tool_call` / `tool_call_update`
-会话更新上报。ACP 会话仍然缺少的是完整的线程/回合
-运行时：没有持久线程、快照、引导，也没有与
-`/v1/*` 对等的审批（由 #5835 跟踪）。完整的本地
-运行时 API 请使用 `codewhale serve --http`；当另一个客户端需要把
-Codewhale 的工具当作 MCP 工具使用时，请使用 `codewhale serve --mcp`。
+工具首先显示 `pending`；只有 Core 到达最终派发才显示 `in_progress`。
+`completed`/`failed` 和类型化图片块来自实际 Core 结果。审批请求的私有 JSON-RPC ID
+绑定同一个 Runtime 铸造的待决审批与 Core 执行 ID。只有精确匹配、仍有效的
+`allow-once` 响应能释放等待器；错误 ID 被忽略，无效选项拒绝，取消会撤销等待器。
+ACP 不授予记忆权限或 Native 能力。
+
+重放复用有界事件读取器，按序号去重，并在每个事件之间处理输入；每次传输写入
+最多等待30秒。重放缺口、
+owner 关闭或无法产生终态的存储故障会明确报错，不会重新执行。取消、EOF 和写入器
+故障只中断本连接实际声明的 Core 回合；结算依赖真实终态回执并保留已完成的效果。
+无法确认取消时不伪造成功。`stopReason` 为 `end_turn`、`cancelled` 或类型化的
+`max_turn_requests`；Core 失败仍是错误。单次提示词最多50个模型步骤（更小的配置
+上限仍有效），并复用 Core 的有界最终报告响应；此 profile 不派发自主目标续跑。
+
+ACP 当前声明一个独占的规范 Runtime owner。其他进程已持有该存储时，启动拒绝；
+会话绑定另一 Runtime 存储时也拒绝。经过身份校验的跨进程 owner 附着尚未完成验证，
+ACP 不把活跃会话复制到随机存储。它也不向编辑器提供全部 `/v1/*` 引导、任务或
+控制方法；完整运行时 API 请使用 `codewhale app-server --http`。
+
 
 ## 能力端点：`codewhale doctor --json`
 

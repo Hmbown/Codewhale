@@ -32,7 +32,7 @@ impl Respond for RetryThenSuccess {
 
         ResponseTemplate::new(200)
             .insert_header("Content-Type", "text/event-stream")
-            .set_body_string("data: [DONE]\n\n")
+            .set_body_string("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
     }
 }
 
@@ -88,7 +88,8 @@ fn test_codex_config(server: &MockServer) -> Config {
         }),
         providers: Some(ProvidersConfig {
             openai_codex: ProviderConfig {
-                base_url: Some(server.uri()),
+                base_url: Some(format!("{}/v1", server.uri())),
+                api_key: Some("test-token".to_string()),
                 ..ProviderConfig::default()
             },
             ..ProvidersConfig::default()
@@ -102,7 +103,7 @@ async fn responses_stream_retries_rate_limited_request() {
     let server = MockServer::start().await;
     let attempts = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
-        .and(path(CODEX_RESPONSES_PATH))
+        .and(path("/v1/responses"))
         .respond_with(RetryThenSuccess {
             attempts: Arc::clone(&attempts),
             retry_status: 429,
@@ -111,21 +112,18 @@ async fn responses_stream_retries_rate_limited_request() {
         .mount(&server)
         .await;
 
-    let client = {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _codex_token =
-            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-        let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
-    };
+    let client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
     let mut request = minimal_responses_request();
     request.max_tokens = 384_000;
     let prepared = client
         .prepare_outbound_request(request, true)
         .expect("responses request prepares");
-    // The Codex OAuth Responses endpoint rejects `max_output_tokens`
-    // ("Unsupported parameter"), so the prepared body must omit it even
-    // though the resolved request envelope carries a cap.
+    assert_eq!(
+        prepared.endpoint.url,
+        format!("{}/v1/responses", server.uri())
+    );
+    // The official ChatGPT plan preview does not support output-cap fields;
+    // omit them while retaining the allowance in the resolved envelope.
     assert!(prepared.body.get("max_output_tokens").is_none());
     let mut stream = client.handle_responses_stream(&prepared).await.unwrap();
 
@@ -135,7 +133,7 @@ async fn responses_stream_retries_rate_limited_request() {
         }
     })
     .await
-    .expect("Responses retry stream should finish after [DONE]");
+    .expect("Responses retry stream should finish after response.completed");
 
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     let requests = server
@@ -147,7 +145,7 @@ async fn responses_stream_retries_rate_limited_request() {
         let body: Value = serde_json::from_slice(&request.body).expect("Responses JSON");
         assert!(
             body.get("max_output_tokens").is_none(),
-            "Codex Responses body must not name the unsupported output cap: {body}"
+            "ChatGPT plan body must not name the unsupported output cap: {body}"
         );
     }
 }
@@ -157,7 +155,7 @@ async fn responses_stream_retries_transient_server_error() {
     let server = MockServer::start().await;
     let attempts = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
-        .and(path(CODEX_RESPONSES_PATH))
+        .and(path("/v1/responses"))
         .respond_with(RetryThenSuccess {
             attempts: Arc::clone(&attempts),
             retry_status: 503,
@@ -166,13 +164,7 @@ async fn responses_stream_retries_transient_server_error() {
         .mount(&server)
         .await;
 
-    let client = {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _codex_token =
-            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-        let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
-    };
+    let client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
     let mut stream = client
         .handle_responses_stream(
             &client
@@ -188,7 +180,7 @@ async fn responses_stream_retries_transient_server_error() {
         }
     })
     .await
-    .expect("Responses retry stream should finish after [DONE]");
+    .expect("Responses retry stream should finish after response.completed");
 
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
@@ -198,7 +190,7 @@ async fn responses_stream_retries_upstream_499_before_streaming() {
     let server = MockServer::start().await;
     let attempts = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
-        .and(path(CODEX_RESPONSES_PATH))
+        .and(path("/v1/responses"))
         .respond_with(RetryThenSuccess {
             attempts: Arc::clone(&attempts),
             retry_status: 499,
@@ -207,13 +199,7 @@ async fn responses_stream_retries_upstream_499_before_streaming() {
         .mount(&server)
         .await;
 
-    let client = {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _codex_token =
-            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-        let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
-    };
+    let client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
     let mut stream = client
         .handle_responses_stream(
             &client
@@ -229,15 +215,15 @@ async fn responses_stream_retries_upstream_499_before_streaming() {
         }
     })
     .await
-    .expect("Responses retry stream should finish after [DONE]");
+    .expect("Responses retry stream should finish after response.completed");
 
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
-async fn collect_responses_stream(sse_body: &'static str) -> Vec<Result<StreamEvent>> {
+async fn collect_responses_stream(sse_body: &str) -> Vec<Result<StreamEvent>> {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path(CODEX_RESPONSES_PATH))
+        .and(path("/v1/responses"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/event-stream")
@@ -245,13 +231,7 @@ async fn collect_responses_stream(sse_body: &'static str) -> Vec<Result<StreamEv
         )
         .mount(&server)
         .await;
-    let client = {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _codex_token =
-            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-        let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
-    };
+    let client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
     let stream = client
         .handle_responses_stream(
             &client
@@ -283,9 +263,173 @@ async fn responses_stream_eof_without_a_terminal_event_is_an_error() {
             .last()
             .is_some_and(|event| event.as_ref().is_err_and(|error| error
                 .to_string()
-                .contains("closed before response.completed"))),
+                .contains("closed before a successful completion event"))),
         "{events:?}"
     );
+}
+
+#[tokio::test]
+async fn chatgpt_stream_requires_valid_successful_completion() {
+    for body in [
+        "data: [DONE]\n\n",
+        "data: {\"type\":\"response.completed\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"failed\"}}\n\n",
+        "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+        concat!(
+            "data: {invalid-json}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+        ),
+    ] {
+        let events = collect_responses_stream(body).await;
+        assert!(
+            events.last().is_some_and(Result::is_err),
+            "{body}: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::MessageStop))),
+            "an invalid or incomplete response must not settle the turn: {body}: {events:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn chatgpt_stream_validates_returned_function_namespace() {
+    let events = collect_responses_stream(concat!(
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"namespace\":\"codewhale\",\"call_id\":\"call_1\",\"id\":\"fc_1\",\"name\":\"read\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{}\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+    )).await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Ok(StreamEvent::ContentBlockStart {
+                content_block: ContentBlockStart::ToolUse { id, name, .. }, ..
+            }) if id == "call_1|fc_1" && name == "read"
+        )),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event, Ok(StreamEvent::MessageDelta { delta, .. })
+                if delta.stop_reason.as_deref() == Some("tool_use")
+        )),
+        "{events:?}"
+    );
+    assert!(matches!(events.last(), Some(Ok(StreamEvent::MessageStop))));
+
+    for body in [
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"namespace\":\"untrusted\",\"call_id\":\"call_1\",\"name\":\"read\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\"}}\n\n",
+    ] {
+        let events = collect_responses_stream(body).await;
+        assert!(events.last().is_some_and(Result::is_err), "{events:?}");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Ok(StreamEvent::ContentBlockStart {
+                    content_block: ContentBlockStart::ToolUse { .. },
+                    ..
+                })
+            )),
+            "unrecognized namespaces must not invoke local tools: {events:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn chatgpt_plan_usage_errors_explain_where_to_check_allowance() {
+    for body in [
+        "data: {\"type\":\"error\",\"code\":\"subscription_sharing_usage_limit_exceeded\",\"message\":\"opaque upstream message\"}\n\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"subscription_sharing_usage_unavailable\",\"message\":\"opaque upstream message\"}}}\n\n",
+    ] {
+        let events = collect_responses_stream(body).await;
+        let error = events
+            .last()
+            .unwrap()
+            .as_ref()
+            .expect_err("plan usage error");
+        let typed = error
+            .downcast_ref::<crate::llm_client::LlmError>()
+            .expect("typed allowance error");
+        assert!(matches!(
+            typed,
+            crate::llm_client::LlmError::QuotaExhausted(_)
+        ));
+        assert!(!typed.is_retryable());
+        assert!(error.to_string().contains("ChatGPT plan usage"), "{error}");
+        assert!(
+            error.to_string().contains("ChatGPT Settings > Usage"),
+            "{error}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::MessageStop))),
+            "{events:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn chatgpt_terminal_failures_preserve_usage_without_settling() {
+    for response in [
+        json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}),
+        json!({"status":"failed","error":{"code":"subscription_sharing_usage_unavailable"}}),
+    ] {
+        let event_type = if response["status"] == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.failed"
+        };
+        let mut response = response;
+        response["usage"] = json!({"input_tokens":13,"output_tokens":5});
+        let events = collect_responses_stream(&format!(
+            "data: {}\n\n",
+            json!({"type":event_type,"response":response})
+        ))
+        .await;
+        assert!(events.iter().any(|event| matches!(event, Ok(StreamEvent::MessageDelta { usage: Some(usage), .. }) if usage.input_tokens == 13 && usage.output_tokens == 5)));
+        let error = events.last().unwrap().as_ref().unwrap_err();
+        let typed = error.downcast_ref::<crate::llm_client::LlmError>().unwrap();
+        assert!(!typed.is_retryable());
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::MessageStop)))
+        );
+    }
+}
+
+#[tokio::test]
+async fn chatgpt_http_usage_limit_is_not_retried() {
+    let server = MockServer::start().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(AlwaysError {
+            attempts: Arc::clone(&attempts),
+            status: 429,
+            body: r#"{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"opaque"}}"#,
+        }).mount(&server).await;
+    let client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
+    let request = client
+        .prepare_outbound_request(minimal_responses_request(), true)
+        .unwrap();
+    let error = match client.handle_responses_stream(&request).await {
+        Ok(_) => panic!("allowance error must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let typed = error.downcast_ref::<crate::llm_client::LlmError>().unwrap();
+    assert!(matches!(
+        typed,
+        crate::llm_client::LlmError::QuotaExhausted(_)
+    ));
+    assert!(!typed.is_retryable());
 }
 
 #[tokio::test]
@@ -294,7 +438,7 @@ async fn responses_stream_joins_multiline_data_fields_into_one_event() {
         "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"m\"}}\n\n",
         "data: {\"type\":\"response.output_text.delta\",\n",
         "data: \"delta\":\"joined\"}\n\n",
-        "data: [DONE]\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
     ))
     .await;
     assert!(
@@ -318,7 +462,7 @@ async fn responses_stream_finishes_on_semantic_terminal_event_without_done_marke
         "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
     );
     Mock::given(method("POST"))
-        .and(path(CODEX_RESPONSES_PATH))
+        .and(path("/v1/responses"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/event-stream")
@@ -327,13 +471,7 @@ async fn responses_stream_finishes_on_semantic_terminal_event_without_done_marke
         .mount(&server)
         .await;
 
-    let client = {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _codex_token =
-            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-        let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
-    };
+    let client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
     let mut stream = client
         .handle_responses_stream(
             &client
@@ -344,16 +482,22 @@ async fn responses_stream_finishes_on_semantic_terminal_event_without_done_marke
         .expect("semantic Responses stream opens");
 
     let mut saw_stop = false;
+    let mut usage = None;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while let Some(event) = stream.next().await {
-            if matches!(event.unwrap(), StreamEvent::MessageStop) {
-                saw_stop = true;
+            match event.unwrap() {
+                StreamEvent::MessageStop => saw_stop = true,
+                StreamEvent::MessageDelta { usage: value, .. } => usage = value,
+                _ => {}
             }
         }
     })
     .await
     .expect("terminal event ends the stream without [DONE]");
     assert!(saw_stop);
+    let usage = usage.expect("completed response carries usage");
+    assert_eq!(usage.input_tokens, 3);
+    assert_eq!(usage.output_tokens, 2);
 }
 
 #[tokio::test]
@@ -366,7 +510,7 @@ async fn responses_stream_surfaces_notice_for_web_search_call_items() {
         "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
     );
     Mock::given(method("POST"))
-        .and(path(CODEX_RESPONSES_PATH))
+        .and(path("/v1/responses"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/event-stream")
@@ -375,13 +519,7 @@ async fn responses_stream_surfaces_notice_for_web_search_call_items() {
         .mount(&server)
         .await;
 
-    let client = {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _codex_token =
-            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-        let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
-    };
+    let client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
     let mut stream = client
         .handle_responses_stream(
             &client
@@ -414,7 +552,7 @@ async fn responses_stream_fails_fast_on_non_retryable_provider_error() {
     let server = MockServer::start().await;
     let attempts = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
-        .and(path(CODEX_RESPONSES_PATH))
+        .and(path("/v1/responses"))
         .respond_with(AlwaysError {
             attempts: Arc::clone(&attempts),
             status: 403,
@@ -423,13 +561,7 @@ async fn responses_stream_fails_fast_on_non_retryable_provider_error() {
         .mount(&server)
         .await;
 
-    let client = {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _codex_token =
-            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-        let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
-    };
+    let client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
 
     let err = match client
         .handle_responses_stream(
@@ -473,9 +605,15 @@ fn responses_body_serializes_the_child_catalog_without_duplication() {
     let mut request = minimal_responses_request();
     request.tools = Some(tools);
     let body = build_responses_body(&request);
-    let serialized = body["tools"]
+    assert_eq!(body["parallel_tool_calls"], false);
+    let generic = build_responses_body_for_provider(&request, ProviderKind::Openai, None);
+    assert_eq!(generic["parallel_tool_calls"], true);
+    assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(body["tools"][0]["type"], "namespace");
+    assert_eq!(body["tools"][0]["name"], "codewhale");
+    let serialized = body["tools"][0]["tools"]
         .as_array()
-        .expect("tools serialize as an array");
+        .expect("functions serialize inside the Codewhale namespace");
     let reads: Vec<_> = serialized
         .iter()
         .filter(|tool| tool["name"] == "read")
@@ -505,32 +643,22 @@ async fn responses_stream_open_preserves_wire_headers_through_shared_seam() {
     use wiremock::matchers::header;
 
     let server = MockServer::start().await;
-    // Every wire-specific header (SSE accept, Responses beta opt-in,
-    // originator, bearer auth from the default headers) must survive the
-    // shared stream-entry open path; the mock only answers when all are
-    // present.
+    // Public API requests retain bearer/SSE headers and Codewhale identity
+    // through the shared stream-entry transport; no backend headers survive.
     Mock::given(method("POST"))
-        .and(path(CODEX_RESPONSES_PATH))
+        .and(path("/v1/responses"))
         .and(header("Accept", "text/event-stream"))
-        .and(header("OpenAI-Beta", "responses=experimental"))
-        .and(header("originator", "codex_cli_rs"))
         .and(header("Authorization", "Bearer test-token"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/event-stream")
-                .set_body_string("data: [DONE]\n\n"),
+                .set_body_string("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"),
         )
         .expect(1)
         .mount(&server)
         .await;
 
-    let client = {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _codex_token =
-            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-        let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
-    };
+    let client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
     let mut stream = client
         .handle_responses_stream(
             &client
@@ -546,7 +674,27 @@ async fn responses_stream_open_preserves_wire_headers_through_shared_seam() {
         }
     })
     .await
-    .expect("stream should finish after [DONE]");
+    .expect("stream should finish after response.completed");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("recorded public API request");
+    assert_eq!(requests.len(), 1);
+    let user_agent = requests[0]
+        .headers
+        .get("user-agent")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(user_agent.contains("codewhale/"), "{user_agent}");
+    assert!(!user_agent.contains("codex_cli_rs"), "{user_agent}");
+    for header in ["openai-beta", "originator", "chatgpt-account-id"] {
+        assert!(
+            requests[0].headers.get(header).is_none(),
+            "{header} must not reach the public API"
+        );
+    }
 }
 
 #[tokio::test]
@@ -559,10 +707,10 @@ async fn responses_stream_inserts_boundary_between_reasoning_summary_parts() {
         "data: {\"type\":\"response.reasoning_summary_part.added\",\"item_id\":\"rs_1\",\"summary_index\":1,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n",
         "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"partB\"}\n\n",
         "data: {\"type\":\"response.output_item.done\"}\n\n",
-        "data: [DONE]\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
     );
     Mock::given(method("POST"))
-        .and(path(CODEX_RESPONSES_PATH))
+        .and(path("/v1/responses"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/event-stream")
@@ -571,13 +719,7 @@ async fn responses_stream_inserts_boundary_between_reasoning_summary_parts() {
         .mount(&server)
         .await;
 
-    let client = {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _codex_token =
-            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-        let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
-    };
+    let client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
     let mut stream = client
         .handle_responses_stream(
             &client
@@ -600,7 +742,7 @@ async fn responses_stream_inserts_boundary_between_reasoning_summary_parts() {
         }
     })
     .await
-    .expect("Responses reasoning stream should finish after [DONE]");
+    .expect("Responses reasoning stream should finish after response.completed");
 
     // The second summary part must be separated from the first by a
     // paragraph break, and no separator may precede the first part.
@@ -628,29 +770,23 @@ async fn codex_selected_effort_reaches_preview_wire_and_restored_receipt_unchang
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path(CODEX_RESPONSES_PATH))
+        .and(path("/v1/responses"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/event-stream")
-                .set_body_string("data: [DONE]\n\n"),
+                .set_body_string("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"),
         )
         .expect(6)
         .mount(&server)
         .await;
-    let client = {
-        let _lock = crate::test_support::lock_test_env();
-        let _token =
-            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-        let _legacy = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
-    };
+    let client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
     let receipts = tempfile::tempdir().unwrap();
     for effort in ["low", "medium", "high", "xhigh", "max", "ultra"] {
         let selected = ReasoningEffort::parse_strict(effort).unwrap();
         let activity = WorkActivityEvent::ReasoningEffortChanged {
             requested: selected.into(),
             effective: selected.into(),
-            provider_kind: Some(ApiProvider::OpenaiCodex),
+            provider_kind: Some(ProviderKind::OpenaiCodex),
             provider: "openai-codex".to_string(),
             endpoint_identity: Some(crate::config::DEFAULT_OPENAI_CODEX_BASE_URL.to_string()),
             model: Some("gpt-6-astra".to_string()),
@@ -671,7 +807,7 @@ async fn codex_selected_effort_reaches_preview_wire_and_restored_receipt_unchang
         let mut request = minimal_responses_request();
         request.model = "gpt-6-astra".to_string();
         request.reasoning_effort = restored
-            .api_value_for_provider(ApiProvider::OpenaiCodex)
+            .api_value_for_provider(ProviderKind::OpenaiCodex)
             .map(str::to_string);
         let prepared = client.prepare_outbound_request(request, true).unwrap();
         assert_eq!(
@@ -702,11 +838,13 @@ fn codex_tiers_do_not_change_other_responses_provider_dialects() {
     for effort in ["max", "ultra"] {
         request.reasoning_effort = Some(effort.to_string());
         assert_eq!(
-            build_responses_body_for_provider(&request, ApiProvider::Concentrate)["reasoning"]["effort"],
+            build_responses_body_for_provider(&request, ProviderKind::Concentrate, None)["reasoning"]
+                ["effort"],
             "xhigh"
         );
         assert_eq!(
-            build_responses_body_for_provider(&request, ApiProvider::Deepseek)["reasoning"]["effort"],
+            build_responses_body_for_provider(&request, ProviderKind::Deepseek, None)["reasoning"]
+                ["effort"],
             "max"
         );
     }
@@ -742,7 +880,7 @@ fn concentrate_responses_body_sends_only_documented_fields() {
         cache_control: None,
     }]);
 
-    let body = build_responses_body_for_provider(&request, ApiProvider::Concentrate);
+    let body = build_responses_body_for_provider(&request, ProviderKind::Concentrate, None);
     let documented = [
         "model",
         "input",
@@ -791,7 +929,7 @@ fn concentrate_responses_body_sends_only_documented_fields() {
 
     // The same request on the generic Responses path still carries the
     // OpenAI-only fields, so the Concentrate branch is a deliberate subset.
-    let generic = build_responses_body_for_provider(&request, ApiProvider::Openai);
+    let generic = build_responses_body_for_provider(&request, ProviderKind::Openai, None);
     assert!(
         generic.get("store").is_some()
             && generic.get("include").is_some()
@@ -818,7 +956,7 @@ fn deepseek_flash_responses_body_uses_stateless_0731_contract() {
         },
     );
 
-    let body = build_responses_body_for_provider(&request, ApiProvider::Deepseek);
+    let body = build_responses_body_for_provider(&request, ProviderKind::Deepseek, None);
 
     assert_eq!(body["model"], "deepseek-v4-flash");
     assert_eq!(body["max_output_tokens"], 128);
@@ -843,34 +981,33 @@ fn deepseek_flash_responses_body_uses_stateless_0731_contract() {
 }
 
 #[test]
-fn codex_responses_body_omits_the_output_cap_the_backend_rejects() {
-    // The Codex OAuth Responses endpoint answers `max_output_tokens` with
-    // "Unsupported parameter: max_output_tokens", which killed every
-    // gpt-5.6-sol sub-agent turn. The omission must be route-specific:
-    // other Responses providers keep the central cap on the wire.
+fn chatgpt_plan_body_omits_unsupported_output_caps() {
+    // The official ChatGPT plan preview does not support output-cap fields.
+    // Other Responses providers keep the central cap on the wire.
     let mut request = minimal_responses_request();
     request.max_tokens = 4_096;
 
-    let codex = build_responses_body_for_provider(&request, ApiProvider::OpenaiCodex);
+    let codex = build_responses_body_for_provider(&request, ProviderKind::OpenaiCodex, None);
     assert!(
         codex.get("max_output_tokens").is_none(),
-        "Codex Responses body names a parameter its backend rejects: {codex}"
+        "ChatGPT plan body names an unsupported output cap: {codex}"
     );
     assert!(
         codex.get("max_tokens").is_none() && codex.get("max_completion_tokens").is_none(),
         "no alternate output-cap spelling may sneak onto the Codex wire: {codex}"
     );
 
-    let deepseek = build_responses_body_for_provider(&request, ApiProvider::Deepseek);
+    let deepseek = build_responses_body_for_provider(&request, ProviderKind::Deepseek, None);
     assert_eq!(deepseek["max_output_tokens"], json!(4_096));
 }
 
 #[test]
-fn codex_replays_only_exact_model_opaque_reasoning_state() {
+fn chatgpt_replays_only_exact_grant_and_model_opaque_reasoning_state() {
     const SENTINEL: &str = "readable private reasoning must not be replayed";
+    const SCOPE: &str = "openai-responses-siwc-v1:test-grant";
     let state = OpaqueReasoningState {
-        provider: ApiProvider::OpenaiCodex.as_str().to_string(),
-        api: "openai-responses".to_string(),
+        provider: ProviderKind::OpenaiCodex.as_str().to_string(),
+        api: SCOPE.to_string(),
         model: "gpt-5.5".to_string(),
         id: Some("rs_opaque".to_string()),
         encrypted_content: "enc_opaque_payload".to_string(),
@@ -888,7 +1025,7 @@ fn codex_replays_only_exact_model_opaque_reasoning_state() {
         },
     );
 
-    let exact = build_responses_body_for_provider(&request, ApiProvider::OpenaiCodex);
+    let exact = build_responses_body_for_provider(&request, ProviderKind::OpenaiCodex, Some(SCOPE));
     let exact_wire = exact.to_string();
     assert!(!exact_wire.contains(SENTINEL), "{exact}");
     assert_eq!(exact.pointer("/input/0/type"), Some(&json!("reasoning")));
@@ -899,8 +1036,26 @@ fn codex_replays_only_exact_model_opaque_reasoning_state() {
         Some(&json!("enc_opaque_payload"))
     );
 
+    for other_scope in [None, Some("openai-responses-siwc-v1:another-grant")] {
+        let body =
+            build_responses_body_for_provider(&request, ProviderKind::OpenaiCodex, other_scope);
+        assert!(!body.to_string().contains("enc_opaque_payload"), "{body}");
+        assert!(!body.to_string().contains(SENTINEL), "{body}");
+    }
+    let mut legacy = request.clone();
+    if let ContentBlock::Thinking {
+        state: Some(state), ..
+    } = &mut legacy.messages[0].content[0]
+    {
+        state.api = "openai-responses".to_string();
+    }
+    let legacy_body =
+        build_responses_body_for_provider(&legacy, ProviderKind::OpenaiCodex, Some(SCOPE));
+    assert!(!legacy_body.to_string().contains("enc_opaque_payload"));
+
     request.model = "gpt-5.6".to_string();
-    let switched_model = build_responses_body_for_provider(&request, ApiProvider::OpenaiCodex);
+    let switched_model =
+        build_responses_body_for_provider(&request, ProviderKind::OpenaiCodex, Some(SCOPE));
     assert!(!switched_model.to_string().contains(SENTINEL));
     assert!(
         switched_model
@@ -910,7 +1065,8 @@ fn codex_replays_only_exact_model_opaque_reasoning_state() {
         "{switched_model}"
     );
 
-    let switched_provider = build_responses_body_for_provider(&request, ApiProvider::Deepseek);
+    let switched_provider =
+        build_responses_body_for_provider(&request, ProviderKind::Deepseek, None);
     let switched_wire = switched_provider.to_string();
     assert!(!switched_wire.contains(SENTINEL), "{switched_provider}");
     assert!(
@@ -920,16 +1076,16 @@ fn codex_replays_only_exact_model_opaque_reasoning_state() {
 }
 
 #[tokio::test]
-async fn codex_stream_captures_encrypted_reasoning_as_opaque_state() {
+async fn chatgpt_stream_captures_only_scoped_encrypted_reasoning() {
     let server = MockServer::start().await;
     let sse_body = concat!(
         "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n",
         "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"visible summary\"}\n\n",
         "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"enc_state\"}}\n\n",
-        "data: [DONE]\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
     );
     Mock::given(method("POST"))
-        .and(path(CODEX_RESPONSES_PATH))
+        .and(path("/v1/responses"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/event-stream")
@@ -938,38 +1094,44 @@ async fn codex_stream_captures_encrypted_reasoning_as_opaque_state() {
         .mount(&server)
         .await;
 
-    let client = {
-        let _env_lock = crate::test_support::lock_test_env();
-        let _codex_token =
-            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-        let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
-    };
-    let mut stream = client
-        .handle_responses_stream(
-            &client
-                .prepare_outbound_request(minimal_responses_request(), true)
-                .expect("responses request prepares"),
-        )
-        .await
-        .unwrap();
-    let mut captured = None;
-    while let Some(event) = stream.next().await {
-        if let StreamEvent::ContentBlockDelta {
-            delta: Delta::ReasoningStateDelta { state },
-            ..
-        } = event.unwrap()
-        {
-            captured = Some(state);
+    for scope in [Some("openai-responses-siwc-v1:verified-test-grant"), None] {
+        let mut client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
+        // The local HTTP fixture stands in for the official transport; production
+        // obtains this frozen marker only from its selected verified grant.
+        client.chatgpt_reasoning_api = scope.map(str::to_string);
+        let mut stream = client
+            .handle_responses_stream(
+                &client
+                    .prepare_outbound_request(minimal_responses_request(), true)
+                    .expect("responses request prepares"),
+            )
+            .await
+            .unwrap();
+        let mut captured = None;
+        while let Some(event) = stream.next().await {
+            if let StreamEvent::ContentBlockDelta {
+                delta: Delta::ReasoningStateDelta { state },
+                ..
+            } = event.unwrap()
+            {
+                captured = Some(state);
+            }
         }
-    }
 
-    let state = captured.expect("encrypted reasoning state delta");
-    assert_eq!(state.provider, ApiProvider::OpenaiCodex.as_str());
-    assert_eq!(state.api, "openai-responses");
-    assert_eq!(state.model, "gpt-5.5");
-    assert_eq!(state.id.as_deref(), Some("rs_1"));
-    assert_eq!(state.encrypted_content, "enc_state");
+        let Some(scope) = scope else {
+            assert!(
+                captured.is_none(),
+                "a custom API-key route cannot mint grant state"
+            );
+            continue;
+        };
+        let state = captured.expect("encrypted reasoning state delta");
+        assert_eq!(state.provider, ProviderKind::OpenaiCodex.as_str());
+        assert_eq!(state.api, scope);
+        assert_eq!(state.model, "gpt-5.5");
+        assert_eq!(state.id.as_deref(), Some("rs_1"));
+        assert_eq!(state.encrypted_content, "enc_state");
+    }
 }
 
 #[test]
@@ -988,6 +1150,90 @@ fn deepseek_responses_reasoning_effort_uses_documented_labels() {
     // minimal stays a low tier for DeepSeek (undocumented label preserved
     // for Codex compatibility).
     assert_eq!(responses_reasoning_effort("minimal", true), Some("low"));
+}
+
+#[tokio::test]
+async fn generic_responses_captures_and_replays_opaque_reasoning() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("Content-Type", "text/event-stream")
+            .set_body_string(concat!(
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_generic\"}}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_generic\",\"encrypted_content\":\"enc_generic\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            )))
+        .mount(&server).await;
+    let config = Config {
+        provider: Some("openai".into()),
+        providers: Some(ProvidersConfig {
+            openai: ProviderConfig {
+                api_key: Some("test-token".into()),
+                base_url: Some(format!("{}/v1", server.uri())),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let client = CodewhaleClient::from_parts(
+        format!("{}/v1", server.uri()),
+        "gpt-5.5".into(),
+        codewhale_config::provider::WireFormat::Responses,
+        None,
+        &config,
+    )
+    .unwrap();
+    assert!(client.chatgpt_reasoning_api.is_none());
+    let prepared = client
+        .prepare_outbound_request(minimal_responses_request(), true)
+        .unwrap();
+    assert_eq!(
+        prepared.endpoint.url,
+        format!("{}/v1/responses", server.uri())
+    );
+    let mut stream = client.handle_responses_stream(&prepared).await.unwrap();
+    let mut captured = None;
+    while let Some(event) = stream.next().await {
+        if let StreamEvent::ContentBlockDelta {
+            delta: Delta::ReasoningStateDelta { state },
+            ..
+        } = event.unwrap()
+        {
+            captured = Some(state);
+        }
+    }
+    let state = captured.expect("generic Responses must retain encrypted state");
+    assert_eq!(state.provider, "openai");
+    assert_eq!(state.api, "openai-responses");
+    assert_eq!(state.model, "gpt-5.5");
+    let mut continuation = minimal_responses_request();
+    continuation.messages.push(Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Thinking {
+            thinking: "readable-private-summary".into(),
+            signature: None,
+            state: Some(state),
+        }],
+    });
+    let replay = client
+        .prepare_outbound_request(continuation.clone(), true)
+        .unwrap();
+    assert!(
+        replay.body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "reasoning" && item["encrypted_content"] == "enc_generic")
+    );
+    assert!(!replay.body.to_string().contains("readable-private-summary"));
+    continuation.model = "another-model".into();
+    let wrong_model = build_responses_body_for_provider(&continuation, ProviderKind::Openai, None);
+    assert!(!wrong_model.to_string().contains("enc_generic"));
+    let wrong_provider =
+        build_responses_body_for_provider(&continuation, ProviderKind::Deepseek, None);
+    assert!(!wrong_provider.to_string().contains("enc_generic"));
 }
 
 #[test]
@@ -1193,7 +1439,7 @@ fn parse_responses_usage_keeps_old_shape_with_cache_write_fallback() {
 /// `output_tokens_details.reasoning_tokens` a subset of it.
 #[test]
 fn responses_usage_reaches_pricing_conversion_without_double_billing_reasoning() {
-    use crate::config::ApiProvider;
+    use crate::config::ProviderKind;
     use crate::pricing::{calculate_turn_cost_estimate_for_provider, token_usage_for_pricing};
 
     let usage = parse_responses_usage(&json!({
@@ -1211,7 +1457,7 @@ fn responses_usage_reaches_pricing_conversion_without_double_billing_reasoning()
     assert_eq!(classes.cache_write, 0);
 
     // gpt-5.5: 0.50 cache-read / 5.00 input / 30.00 output per million.
-    let cost = calculate_turn_cost_estimate_for_provider(ApiProvider::Openai, "gpt-5.5", &usage)
+    let cost = calculate_turn_cost_estimate_for_provider(ProviderKind::Openai, "gpt-5.5", &usage)
         .expect("direct OpenAI route is priced");
     let expected = 0.006 * 0.50 + 0.004 * 5.00 + 0.004 * 30.00;
     assert!(
@@ -1266,11 +1512,12 @@ fn responses_input_includes_user_role_tool_results() {
         top_p: None,
     };
 
-    let input = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex);
+    let input = convert_messages_to_responses_input(&request, ProviderKind::OpenaiCodex, None);
 
     assert_eq!(input[0]["type"], "function_call");
     assert_eq!(input[0]["call_id"], "call_abc");
     assert_eq!(input[0]["name"], "checklist_write");
+    assert_eq!(input[0]["namespace"], "codewhale");
     assert_eq!(input[1]["type"], "function_call_output");
     assert_eq!(input[1]["call_id"], "call_abc");
     assert_eq!(input[1]["output"], "<6 items>");
@@ -1303,10 +1550,13 @@ fn responses_input_encodes_tool_call_names() {
         top_p: None,
     };
 
-    let input = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex);
+    let input = convert_messages_to_responses_input(&request, ProviderKind::OpenaiCodex, None);
 
     assert_eq!(input[0]["type"], "function_call");
     assert_eq!(input[0]["name"], to_api_tool_name("web.run"));
+    assert_eq!(input[0]["namespace"], "codewhale");
+    let generic = convert_messages_to_responses_input(&request, ProviderKind::Openai, None);
+    assert!(generic[0].get("namespace").is_none());
 }
 
 #[test]
@@ -1430,7 +1680,7 @@ fn user_image_becomes_an_input_image_item() {
         },
     });
 
-    let items = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex);
+    let items = convert_messages_to_responses_input(&request, ProviderKind::OpenaiCodex, None);
 
     let user = items
         .iter()
@@ -1484,7 +1734,7 @@ fn tool_result_image_becomes_native_function_output_content() {
         },
     ];
 
-    let items = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex);
+    let items = convert_messages_to_responses_input(&request, ProviderKind::OpenaiCodex, None);
     let output = items
         .iter()
         .find(|item| item["type"] == "function_call_output")
@@ -1512,7 +1762,7 @@ fn tool_result_image_becomes_native_function_output_content() {
 /// (`request_builder_preserves_internal_system_messages`); dropping it here
 /// silently deletes the only record of everything the compaction replaced.
 #[test]
-fn responses_input_keeps_system_role_history_messages() {
+fn responses_input_preserves_system_history_with_the_provider_role() {
     let mut request = minimal_responses_request();
     request.messages.insert(
         0,
@@ -1525,18 +1775,22 @@ fn responses_input_keeps_system_role_history_messages() {
         },
     );
 
-    let items = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex);
-
-    let system = items
-        .iter()
-        .find(|item| item["role"] == "system")
-        .expect("system-role history message survives conversion");
-    assert_eq!(system["type"], "message");
-    assert_eq!(
-        system["content"][0],
-        serde_json::json!({
-            "type": "input_text",
-            "text": "[compaction summary] the user is porting the parser",
-        })
-    );
+    for (provider, role) in [
+        (ProviderKind::OpenaiCodex, "developer"),
+        (ProviderKind::Openai, "system"),
+    ] {
+        let items = convert_messages_to_responses_input(&request, provider, None);
+        let system = items
+            .iter()
+            .find(|item| item["role"] == role)
+            .expect("system history survives under the provider-supported role");
+        assert_eq!(system["type"], "message");
+        assert_eq!(
+            system["content"][0],
+            serde_json::json!({
+                "type": "input_text",
+                "text": "[compaction summary] the user is porting the parser",
+            })
+        );
+    }
 }

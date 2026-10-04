@@ -90,3 +90,23 @@ pub(crate) fn approve_project_hooks(workspace: &Path, reviewed_digest: &str) -> 
         .map_err(|_| "Could not save hook approval in user config".to_string())?;
     Ok(())
 }
+
+/// The Native floor is sufficient for Native-authored shell contributions; it is not a legacy Hooks grant.
+pub(crate) fn verify_hook(hook: &super::Hook) -> Result<(), String> {
+    if hook.native_shell.is_some() {
+        let authority = hook
+            .plugin_authority
+            .as_ref()
+            .ok_or("Native hook has no authority")?;
+        crate::plugins::registry::verify_plugin_component_authority(
+            authority,
+            crate::plugins::activation::PluginActivationCapability::Native,
+        )?;
+        Ok(())
+    } else {
+        verify_hook_authorities(
+            hook.plugin_authority.as_ref(),
+            hook.project_authority.as_ref(),
+        )
+    }
+}

@@ -37,12 +37,12 @@ import type { LocalizedText } from "./content/vocabulary";
  */
 export const TERMINAL_SCREENSHOT = {
   capture: "web/lib/terminal-captures/website-home-100x24.json",
-  src: "/codewhale-tui-5765d80.png",
-  width: 1872,
-  height: 956,
-  version: "0.10.0",
-  sourceCommit: "5765d80278f7184d187fa6682ba96b403a006523",
-  sha256: "359359275fefed015ba0e3772fee9e09d64048813d311c31d6ee2a83b1ee85b5",
+  src: "/codewhale-tui-e940149.png",
+  width: 1000,
+  height: 480,
+  version: "0.10.1",
+  sourceCommit: "e9401490969d58935b4544388d75dc7f276b81a4",
+  sha256: "6cc9098de48310a6b7d946df47e733fb40de4b9034145ff770851b328917198c",
 } as const;
 
 /** Published-asset budgets; see the module contract for what tests inspect. */

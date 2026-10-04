@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -75,12 +75,110 @@ pub struct PluginRegistry {
     workspace: PathBuf,
     discovery_context: Option<std::sync::Arc<super::context::PluginDiscoveryContext>>,
     catalog_stamp: super::discovery::PluginCatalogStamp,
+    /// Ephemeral caller binding, never persisted in plugin state.
+    caller_selection: Option<crate::extension_host::composition_scope::SelectionRevision>,
+    selected_native_entries: Vec<crate::extension_host::composition_scope::NativePresetRef>,
+    /// Catalog-only Native owners with no upstream default. Ephemeral caller
+    /// selection data; an empty entry list must not broaden these owners.
+    unselected_native_catalogs: BTreeSet<String>,
 }
 
 impl PluginRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn caller_selection(
+        &self,
+    ) -> Option<crate::extension_host::composition_scope::SelectionRevision> {
+        self.caller_selection
+    }
+    pub(crate) fn bind_caller(
+        &self,
+        revision: crate::extension_host::composition_scope::SelectionRevision,
+    ) -> Self {
+        let mut view = self.clone();
+        view.caller_selection = Some(revision);
+        view
+    }
+    pub(crate) fn selected_native_entries(
+        &self,
+    ) -> &[crate::extension_host::composition_scope::NativePresetRef] {
+        &self.selected_native_entries
+    }
+    /// Keep a narrowed selector across rediscovery even when its receipt is now
+    /// invalid. Desired-owner admission then withdraws it; failure must never
+    /// widen this caller back to every Native entry.
+    pub(crate) fn retain_native_selection_from(&self, previous: &Self) -> Self {
+        let mut view = self.clone();
+        if !previous.selected_native_entries.is_empty()
+            || !previous.unselected_native_catalogs.is_empty()
+        {
+            view.selected_native_entries = previous.selected_native_entries.clone();
+            view.unselected_native_catalogs = previous.unselected_native_catalogs.clone();
+        }
+        view
+    }
+
+    pub(crate) fn native_catalog_requires_selection(&self, plugin_id: &str) -> bool {
+        self.unselected_native_catalogs.contains(plugin_id)
+    }
+
+    pub(crate) fn native_entry_selected(&self, plugin_id: &str, path: &str, sha256: &str) -> bool {
+        if self.unselected_native_catalogs.contains(plugin_id) {
+            return false;
+        }
+        if self.selected_native_entries.is_empty() {
+            return true;
+        }
+        self.selected_native_entries.iter().any(|selected| {
+            selected.plugin_id == plugin_id
+                && selected.entry.path == path
+                && selected.entry.sha256 == sha256
+                && self
+                    .get(plugin_id)
+                    .is_some_and(|plugin| plugin.content_hash == selected.content_hash)
+        })
+    }
+
+    /// Select one reviewed Native inventory entry. No additional Agent capability.
+    pub(crate) fn with_native_preset(
+        &self,
+        selected: crate::extension_host::composition_scope::NativePresetRef,
+    ) -> Result<Self, String> {
+        let (sources, _) =
+            super::runtime::active_component_sources(self, PluginActivationCapability::Native);
+        let source = sources
+            .into_iter()
+            .find(|source| {
+                source.authority.plugin_id.as_str() == selected.plugin_id
+                    && source.authority.content_hash == selected.content_hash
+                    && source.path.to_string_lossy() == selected.entry.path
+            })
+            .ok_or("Native preset is not in the current reviewed inventory")?;
+        if let Some(problem) = super::runtime::native_entry_problem(&source.path, true) {
+            return Err(problem.into());
+        }
+        let file = super::manifest::open_bundle_file(&source.path)
+            .map_err(|_| "Native preset cannot be opened")?;
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "Native preset cannot be read")?;
+        if bytes.len() > 64 * 1024 * 1024 {
+            return Err("Native preset entry exceeds the bundle limit".into());
+        }
+        if crate::hashing::sha256_hex(&bytes) != selected.entry.sha256 {
+            return Err("Native preset bytes changed".into());
+        }
+        let mut view = self.clone();
+        view.caller_selection = None;
+        view.unselected_native_catalogs.remove(&selected.plugin_id);
+        view.selected_native_entries
+            .retain(|entry| entry.plugin_id != selected.plugin_id);
+        view.selected_native_entries.push(selected);
+        Ok(view)
     }
 
     /// Construct a fail-closed registry for a workspace without consulting
@@ -146,6 +244,9 @@ impl PluginRegistry {
             workspace,
             discovery_context,
             catalog_stamp,
+            caller_selection: None,
+            selected_native_entries: Vec::new(),
+            unselected_native_catalogs: BTreeSet::new(),
         };
         for plugin in plugins {
             registry.register_loaded(plugin);
@@ -220,6 +321,12 @@ impl PluginRegistry {
                     }
                 }
             }
+        }
+        if self.selected_native_entries.is_empty() && self.unselected_native_catalogs.is_empty() {
+            (
+                self.selected_native_entries,
+                self.unselected_native_catalogs,
+            ) = super::native_presets::default_selection(self);
         }
     }
 
@@ -672,6 +779,10 @@ impl PluginRegistry {
         mutate(&mut next)?;
         save_state(path, &next)?;
         self.state = next;
+        // Runtime selection rechecks the persisted review through its own
+        // read lock. Publish the completed state transaction before deriving
+        // that view; retaining the writer here would deadlock on enable.
+        drop(_guard);
         self.apply_state();
         Ok(())
     }

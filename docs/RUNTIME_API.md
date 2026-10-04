@@ -1,8 +1,9 @@
-# Runtime API & Integration Contract
+# Codewhale Engine Runtime API & Integration Contract
 
 > 阅读简体中文版：[zh_hans/RUNTIME_API.md](zh_hans/RUNTIME_API.md)。
 
-`codewhale app-server` is the canonical local runtime API and control plane.
+`codewhale app-server` exposes the [Codewhale Engine](ARCHITECTURE.md) through
+its canonical local Runtime API and control plane.
 Local SDKs, mobile/remote-control clients, and editor integrations talk to it
 instead of screen-scraping terminal output. It serves the full HTTP/SSE runtime
 API (`/v1/*`), a JSON-RPC control transport over stdio, and the phone-friendly
@@ -20,7 +21,7 @@ shares the same runtime, provider/model resolution, permission profiles, and
 event vocabulary.
 
 This document is the stable integration contract for native workbench
-applications (and other local supervisors) that embed the Codewhale engine.
+applications (and other local supervisors) that embed the Codewhale Engine.
 
 ## Architecture
 
@@ -462,24 +463,85 @@ created fails with `-32004` (`thread_not_found`) on stdio, or HTTP `404` on
 and `prompt/run` are different: their optional `thread_id` is any key the
 caller chooses, and a new key starts a new conversation.
 
-The runtime thread behind each created thread is recorded in the state store,
-so a message sent after the app-server restarts continues the same
-conversation. If the runtime no longer has that thread (its data directory was
-removed or replaced), the next message starts a new runtime thread in the
-thread's recorded workspace and records it; the earlier conversation is not
-recovered. `thread/resume` and `thread/fork` without `cwd` keep the recorded
-workspace (a fork uses its parent's). A new fork, or a persisted thread resumed
-through a fresh metadata manager, can record an explicit `cwd`. This control
-transport does not move an already linked Runtime thread: its workspace remains
-owned by the Runtime API. Updating that thread's workspace requires the Runtime
-`PATCH /v1/threads/{id}` operation; cached metadata resume also does not persist
-an explicit cwd change. These paths are not a cross-store workspace transaction.
+The authenticated canonical owner keeps the full saved conversation graph,
+its selected branch and the thread/session binding. Compatibility controls use
+that owner; the old SQLite history remains a protected, read-only import source.
+Import compares the complete source graph and selected leaf before publishing
+the canonical alias. A failed alias publication retains the source and the
+actual canonical result so recovery can report what completed.
+
+Existing validated legacy goals are imported into the owner goal store. Active
+goals are paused during import; historical data never starts a provider call.
+Source goal fields participate in the same protected source comparison.
+
+Saved-session forks preserve the complete journal, including inactive branches,
+and copy a validated local session-goal sidecar into the new saved session.
+An active local goal is copied as paused; the source remains unchanged.
+That sidecar is separate from the public Runtime thread goal. A native Runtime
+thread fork does not automatically inherit the public thread goal.
+
+`thread/create`, `thread/start`, `thread/resume` and `thread/fork` carry a
+client-generated `operation_key`. Capture one key for each user intent before
+sending it, retain it after an uncertain response, and reuse it when recovering
+that same intent. Create carries the key in `metadata.operation_key`; Start,
+Resume and Fork carry it in `operation_key`. Two intentional forks use different
+keys. Recovery checks
+the original operation in the existing owner store; it never creates another
+thread merely because the response was lost or the source later grew.
+
+`POST /v1/thread-history/operations/lookup` is read-only. Its closed request
+contains `version: 1`, `operation_key`, `expected_data_dir`,
+`expected_execution_scope` and `workspace`; the response is `absent`, `pending`
+or `committed`. A pending or committed response includes the retained receipt
+and its exact action/source `association`.
+
+`POST /v1/thread-history/operations/recover` accepts that lookup request in
+`operation` and the expected `association`. It explicitly finishes an already
+prepared target under the same owner, after checking the saved document, full
+graph, workspace, checkpoint and action/source identity. It does not rebuild
+the original intent from a source that may already have changed. An unprepared
+target stays pending; a changed or unverifiable target refuses completion.
+Repeat recovery with the same key to observe the same committed result.
+
+The selected workspace comes from the acknowledged owner or the explicitly
+admitted request. History and historical receipts cannot supply permissions,
+credentials, endpoints or a different owner. A missing, changed, busy or
+incompatible bound store is an explicit failure. A missing canonical target
+does not start an empty replacement conversation.
+
+`codewhale thread resume` and `codewhale thread fork` perform the durable
+owner control and print its committed thread, session and operation receipt.
+They do not launch an interactive frontend.
+
+Global `--workspace` (also `--cd`), `--profile` and `--config` select an explicit
+control scope. Relative paths are captured before attachment; the client
+authenticates the owner, then admits that scope against the same owner receipt
+and its captured worker setting. An incompatible profile or config, missing
+scope facts, or a changed owner fails explicitly. Without these options, the
+acknowledged owner supplies the workspace. Thread listing remains store-wide.
+
+For a fresh `thread resume` or `thread fork`, global `--provider`, `--model`,
+`--approval-policy` and `--sandbox-mode` supply proposals to the existing owner
+decoder and permission checks. The corresponding `--set` keys are `provider`,
+`model`, `default_text_model`, `approval_policy` and `sandbox_mode`. Credentials
+and endpoints stay with the owner: `--api-key`, `--base-url` and other per-run
+settings are refused for these controls. Configure and authenticate the owning
+Runtime before using them. With a retained `--operation-key`, newly supplied
+model, provider, policy or sandbox proposals are refused; recovery observes
+the original admitted intent.
+
+Interactive `codewhale resume` and `codewhale fork` use the same canonical
+history operation. An inactive local owner is shut down and joined before the
+existing TUI acquires the saved-session lease and store. A live owner or an
+uncertain handoff refuses attachment. `--operation-key <KEY>` recovers the
+original outcome, including completing a verified prepared target; an
+unprepared or unverifiable result preserves uncertainty.
 
 ### Changing config
 
 `app/config/set` and `app/config/unset` write the change to the config file
-before replying: the `--config` path, or the default `config.toml` the runtime
-child also reads when no `--config` is given. They change user settings that
+before replying: the `--config` path, or the default `config.toml` used by the
+canonical owner when no `--config` is given. They change user settings that
 outlive the app-server, not just this session. The change is applied to the
 file as it is on disk, so edits saved by other processes are kept. If the file
 cannot be read, parsed, or written, the reply is `ok: false` and nothing
@@ -553,26 +615,61 @@ binary.
 
 ## ACP stdio adapter: `codewhale serve --acp`
 
-`codewhale serve --acp` speaks JSON-RPC 2.0 over newline-delimited stdio for
-ACP-compatible editor clients. The initial adapter implements the ACP baseline:
+ACP JSON-RPC over newline-delimited stdio is a transport over the existing
+RuntimeThreadManager and Engine. It has no provider/tool round loop, executable
+registry, prompt composer, or conversation writer of its own. The server loads
+the selected config/profile and plugin discovery once; each prompt uses a
+canonical thread, Core turn, event timeline, approval waiter, and full Engine
+session snapshot.
 
-- `initialize`
-- `session/new`
-- `session/prompt`
-- `session/cancel`
+The editor surface supports `initialize`, `session/new`, `session/list`,
+`session/load` (including durable ID prefixes), `session/prompt`, `session/cancel`,
+model discovery/selection, and the advertised mode/model config options.
+`session/new` creates a durable bare UUID and empty checkpoint without calling a
+provider. At most 64 idle transport bindings are retained; eviction keeps the
+durable conversation. Resume deduplicates against the existing thread binding.
+Full histories, tool pairs, signatures, media and partial-effect receipts are
+saved under the same checkpoint guard and session write lease used by HTTP.
+ACP display text may be shortened; the saved history is the full Core snapshot.
 
-Prompt requests are routed through the configured Codewhale client and current
-default model. Responses are emitted as `session/update` agent message chunks
-followed by a `session/prompt` response with `stopReason: "end_turn"`.
+The trusted local ACP profile narrows Core to file/search/git/patch and admitted
+foreground shell tools. Shell requires both editor terminal support and operator
+`allow_shell`; a requested external sandbox that is unavailable removes shell.
+MCP, dynamic tools, task/PTY/background shell, interpreter, subagent and RLM
+lifecycles are unavailable on this transport. Built-in overrides remove the
+whole compatibility alias family. Final dispatch rechecks the profile, so a
+fabricated alias, hook rewrite or omitted catalog entry cannot bypass it. Plan
+remains read-only under Full Access. Full Access and the ordinary approval
+posture are server-owned read-only options; the editor cannot widen them.
 
-Each session executes tool calls locally through a registry built from the
-same file/search/git/patch/shell tools as the CLI exec agent, gated by
-`session/request_permission` and reported as `tool_call` / `tool_call_update`
-session updates. What ACP sessions still lack is the full thread/turn
-runtime: no durable threads, snapshots, steering, or approval parity with
-`/v1/*` (tracked by #5835). Use `codewhale serve --http` for the full local
-runtime API and `codewhale serve --mcp` when another client needs
-Codewhale's tools as MCP tools.
+Tool updates begin `pending`. `in_progress` means Core reached final dispatch;
+`completed`/`failed` and typed image blocks come from the actual Core result.
+`session/request_permission` correlates a private JSON-RPC ID to the same
+Runtime-minted pending approval and Core execution ID. Only an exact live
+`allow-once` response can release that waiter; wrong IDs are ignored, invalid
+options deny, and cancellation withdraws it. ACP grants neither remembered
+permissions nor Native capabilities. Core typed rules, strict hooks, repo law,
+Headless Auto-Review and hard floors remain in force, including the absence of a
+workspace-write carve-out; a guardian-only decision refuses on this host.
+
+Replay uses the existing bounded event reader and sequence deduplication. A
+replay gap, closed owner or terminal store fault is an explicit error, never a
+re-execution. Input is serviced between replayed events; each transport write has a 30-second
+deadline. Cancel, EOF and writer
+failure interrupt only this transport's claimed Core turn; settlement uses its
+actual terminal receipt and preserves any completed effects. An unconfirmed
+cancellation does not fabricate success. `stopReason` is `end_turn`, `cancelled`,
+or typed `max_turn_requests`; Core failure remains an error. Prompts use at most
+50 model steps (a lower configured limit still wins) and Core's bounded final
+report response; this profile does not dispatch autonomous goal continuations.
+
+ACP presently claims its own exclusive canonical Runtime owner. If another
+process holds that store, startup refuses. A saved conversation bound to another
+Runtime store also refuses; authenticated cross-process owner attachment remains
+unqualified and ACP does not copy a live conversation into a random store. This
+does not expose every `/v1/*` steering, job or control method to an ACP editor.
+Use `codewhale app-server --http` for that full runtime API.
+
 
 ## Capability endpoint: `codewhale doctor --json`
 

@@ -29,7 +29,7 @@
 //! - **Replace a built-in.** A drop-in script whose name is already registered
 //!   is refused by `ToolRegistry::load_plugins`, and a `[tools.overrides]`
 //!   `script` / `command` entry keyed by a built-in is refused by
-//!   `ToolRegistry::apply_overrides`; `disabled` still turns a built-in off.
+//!   `ToolRegistry::apply_overrides_with_executor`; `disabled` still turns a built-in off.
 //!
 //! Known limitation: an unrecognised `# approval:` value (a typo such as
 //! `requried`) still falls back to the default without a diagnostic.
@@ -49,6 +49,43 @@ use crate::config::ToolOverride;
 
 /// Timeout for plugin script execution (120 seconds).
 const PLUGIN_EXECUTION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Captured at catalogue preparation. Enabled host errors never select Legacy.
+#[derive(Clone)]
+pub(crate) enum PluginExecutor {
+    Legacy,
+    Host(Arc<crate::extension_host::ExtensionHostManager>),
+}
+impl PluginExecutor {
+    pub(crate) fn for_engine() -> Self {
+        if crate::plugins::activation::extension_host_policy_enabled() {
+            let manager = crate::extension_host::manager();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                manager.bind_engine_handle(handle);
+            }
+            Self::Host(manager)
+        } else {
+            Self::Legacy
+        }
+    }
+    async fn run(
+        &self,
+        mut command: tokio::process::Command,
+        label: &str,
+        input: Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        match self {
+            Self::Legacy if !crate::plugins::activation::extension_host_policy_enabled() => {
+                run_plugin_child_raw(&mut command, label, input).await
+            }
+            Self::Legacy => Err(ToolError::not_available(
+                "script catalogue predates enabled execution; prepare tools again",
+            )),
+            Self::Host(manager) => manager.execute_script(command, input, context).await,
+        }
+    }
+}
 
 /// Metadata extracted from a plugin script's frontmatter header.
 #[derive(Debug, Clone)]
@@ -86,6 +123,7 @@ fn warn_auto_approval_ignored(tool_name: &str) {
 /// plugins directory. The script receives JSON input on stdin and writes
 /// a JSON `ToolResult` to stdout.
 struct ScriptPluginTool {
+    executor: PluginExecutor,
     metadata: PluginMetadata,
     /// Absolute path to the script.
     script_path: PathBuf,
@@ -143,16 +181,26 @@ impl ToolSpec for ScriptPluginTool {
         self.metadata.approval
     }
 
-    async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let (interpreter, script_args) = script_command_parts(&self.script_path, &self.args);
-        let label = self.script_path.display().to_string();
-        run_plugin_child(&interpreter, &script_args, &label, input).await
+        let mut command = tokio::process::Command::new(&interpreter);
+        crate::utils::suppress_tokio_console_window(&mut command);
+        command.args(script_args);
+        self.executor
+            .run(
+                command,
+                &self.script_path.display().to_string(),
+                input,
+                context,
+            )
+            .await
     }
 }
 
 /// A tool backed by an arbitrary shell command from config.toml overrides.
 /// Behaves like `ScriptPluginTool` but uses the user-specified command string.
 struct CommandPluginTool {
+    executor: PluginExecutor,
     name: String,
     description: String,
     input_schema: Value,
@@ -203,7 +251,7 @@ impl ToolSpec for CommandPluginTool {
         self.approval
     }
 
-    async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         // On Windows, if the command doesn't have an extension, try wrapping
         // in `cmd /c` or use `powershell` for `.ps1` files. For portability
         // we let tokio::process::Command resolve via PATH.
@@ -219,7 +267,7 @@ impl ToolSpec for CommandPluginTool {
         };
         cmd.args(&self.args);
         let label = format!("command '{}'", self.command);
-        run_plugin_child_raw(&mut cmd, &label, input).await
+        self.executor.run(cmd, &label, input, context).await
     }
 }
 
@@ -308,19 +356,6 @@ fn read_prefix_to_string(reader: impl std::io::Read, max_bytes: u64) -> Option<S
 // ---------------------------------------------------------------------------
 // Shared child process helpers
 // ---------------------------------------------------------------------------
-
-/// Spawn a command, pipe JSON input to stdin, collect ToolResult from stdout.
-async fn run_plugin_child(
-    command: &str,
-    args: &[String],
-    label: &str,
-    input: Value,
-) -> Result<ToolResult, ToolError> {
-    let mut cmd = tokio::process::Command::new(command);
-    crate::utils::suppress_tokio_console_window(&mut cmd);
-    cmd.args(args);
-    run_plugin_child_raw(&mut cmd, label, input).await
-}
 
 /// Run a pre-configured tokio Command, pipe JSON input, collect ToolResult.
 async fn run_plugin_child_raw(
@@ -499,7 +534,14 @@ pub fn scan_plugin_dir(dir: &Path) -> Vec<(PathBuf, PluginMetadata)> {
 
 /// Load all plugin tools from a directory. Each eligible script becomes
 /// a registered `ScriptPluginTool`.
+#[cfg(test)]
 pub fn load_plugin_tools(plugin_dir: &Path) -> Vec<Arc<dyn ToolSpec>> {
+    load_plugin_tools_with_executor(plugin_dir, PluginExecutor::for_engine())
+}
+pub(crate) fn load_plugin_tools_with_executor(
+    plugin_dir: &Path,
+    executor: PluginExecutor,
+) -> Vec<Arc<dyn ToolSpec>> {
     let discovered = scan_plugin_dir(plugin_dir);
     let mut tools: Vec<Arc<dyn ToolSpec>> = Vec::with_capacity(discovered.len());
 
@@ -513,6 +555,7 @@ pub fn load_plugin_tools(plugin_dir: &Path) -> Vec<Arc<dyn ToolSpec>> {
             warn_auto_approval_ignored(&meta.name);
         }
         tools.push(Arc::new(ScriptPluginTool {
+            executor: executor.clone(),
             metadata: meta,
             script_path: path,
             args: Vec::new(),
@@ -525,12 +568,26 @@ pub fn load_plugin_tools(plugin_dir: &Path) -> Vec<Arc<dyn ToolSpec>> {
 /// Create a single tool from a `ToolOverride` config entry.
 ///
 /// Returns `None` for `Disabled` (the caller handles removal separately).
-/// This builds the tool only; `ToolRegistry::apply_overrides` decides whether
+/// This builds the tool only; `ToolRegistry::apply_overrides_with_executor` decides whether
 /// the name may be taken, and refuses one owned by a built-in.
+#[cfg(test)]
 pub fn tool_from_override(
     tool_name: &str,
     override_cfg: &ToolOverride,
     plugin_dir: &Path,
+) -> Option<Arc<dyn ToolSpec>> {
+    tool_from_override_with_executor(
+        tool_name,
+        override_cfg,
+        plugin_dir,
+        PluginExecutor::for_engine(),
+    )
+}
+pub(crate) fn tool_from_override_with_executor(
+    tool_name: &str,
+    override_cfg: &ToolOverride,
+    plugin_dir: &Path,
+    executor: PluginExecutor,
 ) -> Option<Arc<dyn ToolSpec>> {
     match override_cfg {
         ToolOverride::Disabled => None,
@@ -568,6 +625,7 @@ pub fn tool_from_override(
             }
 
             Some(Arc::new(ScriptPluginTool {
+                executor,
                 metadata: meta,
                 script_path,
                 args: args.clone().unwrap_or_default(),
@@ -579,6 +637,7 @@ pub fn tool_from_override(
             let cmd_args = args.clone().unwrap_or_default();
 
             Some(Arc::new(CommandPluginTool {
+                executor,
                 name: tool_name.to_string(),
                 description,
                 input_schema: serde_json::json!({"type": "object"}),

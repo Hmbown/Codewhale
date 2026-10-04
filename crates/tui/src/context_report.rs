@@ -350,9 +350,20 @@ pub fn build_prompt_context(app: &App) -> PromptContext {
 
 pub fn build_headless_context_report(config: &Config, workspace: &Path) -> PromptSourceMap {
     let model = config.default_model();
-    let provider = config.api_provider();
-    let provider_identity = config.provider_identity_for(provider);
-    let route = crate::route_runtime::resolve_runtime_route(config, provider, Some(&model)).ok();
+    let identity = config.active_provider_identity().ok();
+    let provider = identity
+        .as_ref()
+        .map_or(crate::config::ProviderKind::Custom, |identity| {
+            identity.provider
+        });
+    let provider_identity = identity
+        .as_ref()
+        .map(|identity| identity.key.to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    let route = identity.as_ref().and_then(|identity| {
+        crate::route_runtime::resolve_runtime_route_for_identity(config, identity, Some(&model))
+            .ok()
+    });
     // A route we could not resolve does not erase an operator-configured
     // window: doctor must report the same number the session would use.
     let context_window = route.as_ref().map_or_else(
@@ -361,8 +372,12 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
                 provider,
                 &model,
                 None,
-                config.context_window_for_provider_config(provider),
-                config.model_context_windows_for(provider),
+                identity
+                    .as_ref()
+                    .and_then(|identity| config.context_window_for_provider_config(identity)),
+                identity
+                    .as_ref()
+                    .and_then(|identity| config.model_context_windows_for(identity)),
             )
         },
         |route| route.context_window,
@@ -885,7 +900,7 @@ mod pressure_fixture_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ApiProvider, Config};
+    use crate::config::{Config, ProviderKind};
     use crate::route_runtime::{ContextWindowResolution, ContextWindowSource};
     use codewhale_config::route::RouteLimits;
     use codewhale_models::Role;
@@ -1049,6 +1064,7 @@ mod tests {
                 custom: std::collections::HashMap::from([(
                     "custom".to_string(),
                     crate::config::ProviderConfig {
+                        kind: Some("openai-compatible".to_string()),
                         api_key: Some("test-private-key".to_string()),
                         base_url: Some("https://private.test/v1".to_string()),
                         model: Some("private-1m-deployment-v9".to_string()),
@@ -1336,7 +1352,7 @@ mod tests {
             output_tokens: None,
         };
         let resolved = crate::route_runtime::resolve_context_window(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek-v4-pro",
             Some(limits),
             None,

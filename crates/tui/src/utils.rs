@@ -904,7 +904,11 @@ where
     F: FnOnce() + Send + 'static,
 {
     let location = std::panic::Location::caller();
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
     tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         if let Err(panic_info) = result {
             let msg = panic_message(&*panic_info);

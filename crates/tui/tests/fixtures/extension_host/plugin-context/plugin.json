@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "plugin-context",
+  "version": "0.1.0",
+  "description": "Test fixture: reports the config, workspace and data directory a plugin is given, and writes into its data directory.",
+  "license": "MIT",
+  "extensions": {
+    "net.codewhale": {
+      "native": {
+        "path": "index.mjs"
+      }
+    }
+  }
+}

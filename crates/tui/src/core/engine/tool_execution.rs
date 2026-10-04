@@ -440,6 +440,45 @@ impl Engine {
         mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
         context_override: Option<crate::tools::ToolContext>,
     ) -> Result<RichToolResult, ToolError> {
+        let child = context_override
+            .as_ref()
+            .or_else(|| registry.map(|registry| registry.context()))
+            .and_then(|context| context.child_host.clone());
+        let execution = Self::execute_tool_admitted(
+            lock,
+            supports_parallel,
+            interactive,
+            tx_event,
+            cancel_token,
+            tool_name,
+            activity_call_id,
+            tool_input,
+            workspace,
+            registry,
+            mcp_pool,
+            context_override,
+        );
+        match child {
+            Some(child) => child.run_tool_bounded(execution).await,
+            None => execution.await,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_tool_admitted(
+        lock: Arc<RwLock<()>>,
+        supports_parallel: bool,
+        interactive: bool,
+        tx_event: mpsc::Sender<Event>,
+        cancel_token: Option<CancellationToken>,
+        tool_name: String,
+        activity_call_id: Option<String>,
+        tool_input: serde_json::Value,
+        workspace: PathBuf,
+        registry: Option<&crate::tools::ToolRegistry>,
+        mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
+        context_override: Option<crate::tools::ToolContext>,
+    ) -> Result<RichToolResult, ToolError> {
         if cancel_token
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
@@ -598,6 +637,79 @@ impl Engine {
             return Err(ToolError::cancelled("Tool activity admission cancelled."));
         }
 
+        let child_mcp_call = if McpPool::is_mcp_tool(&tool_name) {
+            let context = context_override
+                .as_ref()
+                .or_else(|| registry.map(|registry| registry.context()));
+            if context.is_some_and(|context| context.child_host.is_some()) {
+                let registry = registry.ok_or_else(|| {
+                    ToolError::permission_denied(
+                        "child MCP call has no canonical registered capability",
+                    )
+                })?;
+                registry
+                    .admit_child_call(
+                        &tool_name,
+                        &tool_input,
+                        context.expect("captured child context"),
+                    )
+                    .await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(context) = context_override
+            .as_ref()
+            .or_else(|| registry.map(|registry| registry.context()))
+            && (context.acp_host.is_some() || context.child_host.is_some())
+        {
+            let spec = registry
+                .and_then(|registry| registry.get(&tool_name))
+                .ok_or_else(|| {
+                    ToolError::not_available("ACP call has no admitted registered tool")
+                })?;
+            crate::tools::registry::enforce_tool_authority(
+                &tool_name,
+                &tool_input,
+                spec.as_ref(),
+                context,
+            )?;
+            crate::extension_host::validate_caller_plugins(context.plugin_registry.as_deref())
+                .map_err(ToolError::not_available)?;
+            if let Some(id) = activity_call_id.as_ref() {
+                if let Ok(permit) = super::streaming::reserve_event_capacity(
+                    &tx_event,
+                    cancel_token.as_ref(),
+                    super::streaming::EventReservationPolicy::Receipt,
+                )
+                .await
+                {
+                    // Event backpressure is an await boundary. Recheck the
+                    // exact captured authority before claiming dispatch.
+                    if cancel_token
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled)
+                    {
+                        return Err(ToolError::cancelled("ACP dispatch admission cancelled"));
+                    }
+                    crate::tools::registry::enforce_tool_authority(
+                        &tool_name,
+                        &tool_input,
+                        spec.as_ref(),
+                        context,
+                    )?;
+                    crate::extension_host::validate_caller_plugins(
+                        context.plugin_registry.as_deref(),
+                    )
+                    .map_err(ToolError::not_available)?;
+                    permit.send(Event::ToolExecutionStarted { id: id.clone() });
+                } else {
+                    return Err(ToolError::cancelled("ACP dispatch observation unavailable"));
+                }
+            }
+        }
         let outcome: Result<RichToolResult, ToolError> = if McpPool::is_mcp_tool(&tool_name) {
             if let Some(pool) = mcp_pool {
                 let disallowed_tools = context_override
@@ -678,6 +790,11 @@ impl Engine {
                 .await;
         }
 
+        if outcome.as_ref().is_ok_and(|result| result.result.success)
+            && let Some((authority, writes)) = child_mcp_call
+        {
+            authority.record_settled_writes(writes).await;
+        }
         let duration_ms = started_at.elapsed().as_millis() as u64;
         // The surface-agnostic choke point for every tool call, so this one
         // bump covers exec and the CLI as well as the TUI. `memory_search` is

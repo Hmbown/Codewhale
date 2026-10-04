@@ -7,7 +7,6 @@ fn main() {
     );
     println!("cargo:rerun-if-env-changed=CARGO_MANIFEST_DIR");
     codewhale_build_support::declare_rerun_conditions(&manifest_dir);
-    codewhale_build_support::configure_windows_main_stack("codewhale-tui");
     build_computer_use_helper(&manifest_dir);
     codewhale_build_support::emit_build_version(&manifest_dir, env!("CARGO_PKG_VERSION"));
 }

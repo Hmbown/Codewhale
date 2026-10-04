@@ -18,21 +18,21 @@ The internal runtime type is `FleetRole` (formerly
 compatibility adapter during v0.9.x. New prompts and config should use fleet
 names.
 
-Architecturally, sub-agents should not be a second execution substrate. The
-durable primitive is the fleet-backed worker run described in
-[`AGENT_RUNTIME.md`](AGENT_RUNTIME.md): retries, terminal status, receipts,
-artifact refs, inspection, and restart behavior belong there. The
-model-facing launcher is the single `agent` tool and detached work should
-converge on the same lifecycle as Agent fleet.
+Child assignments run through the same `Engine::run_turn` planner, executor,
+Session and approval inbox as ordinary turns. The private captured ChildGrant
+narrows tool actions, shell, workspace, network and descendant depth at the final
+execution boundary. The existing SubAgentManager still owns launch slots,
+coordination, worker checkpoints and terminal delivery; it does not run another
+model/tool loop. Work and the single bounded reporting turn share that configured
+child Engine and its original deadline.
 
-The current `agent` implementation delegates to the durable sub-agent runtime
-while that cutover completes. It can still be useful for short in-session
-delegation. Transient provider header/stream/time-out failures are retried with
-backoff inside the child runtime before the worker is marked interrupted; if the
-retry budget is exhausted, Codewhale preserves a checkpoint and returns a
-continuation handle instead of leaving the parent to infer what happened. For
-work that must survive process restarts, sleep, or remote execution, prefer
-fleet or a Workflow-backed fleet run.
+Transient provider failures use Core's dispatch and retry boundaries. An exhausted
+budget or interrupted request preserves the recorded checkpoint and a continuation
+handle. Each actually dispatched attempt carries its original session, route and
+source identity: provider usage is billed once, then projected to the worker
+ledger. A successful response without usage and an unknown request outcome retain
+distinct coverage gaps; neither is priced as zero. For work that must survive
+process restarts, sleep or remote execution, use Fleet or a Workflow-backed run.
 
 Sub-agents inherit the parent's permitted tool registry, including `agent`
 coordination. Spawning obeys one absolute depth ceiling: the root is depth 0,
@@ -387,7 +387,7 @@ OUTPUT: VERDICT, EVIDENCE, GAPS, NEXT.
 
 ```text
 QUESTION: Is the focused prompt/subagent test filter valid, and what fails if not?
-SCOPE: cargo test -p codewhale-tui --bin codewhale-tui --locked prompt; subagent filter if needed.
+SCOPE: cargo test -p codewhale-tui --lib --locked prompt; subagent filter if needed.
 ALREADY_KNOWN: Do not fix failures; capture exact command, exit code, and first relevant assertion.
 EFFORT: medium
 STOP_CONDITION: Stop after one clean PASS or one reproducible failing assertion with command evidence.

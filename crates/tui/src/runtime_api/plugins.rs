@@ -443,9 +443,12 @@ async fn run_plugin_mutation(
         PluginMutationOutcome::Uninstalled => "uninstalled",
     };
 
-    // Mutations can change merged plugin MCP servers; drop the cached pool
-    // exactly like the MCP config write endpoints do.
-    *state.mcp_pool.lock().await = None;
+    // Mutations can change merged plugin MCP servers. Advance the existing
+    // shared generation so each captured workspace pool reloads on next use.
+    state
+        .workspace_scopes
+        .mcp_generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let plugin = registry_for_state(state)
         .get(receipt.name.as_str())
@@ -513,7 +516,10 @@ async fn run_registry_mutation(
         ApiError::conflict(format!("{action} failed for '{selector}': {error}"))
     })?;
 
-    *state.mcp_pool.lock().await = None;
+    state
+        .workspace_scopes
+        .mcp_generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let fresh = registry_for_state(state);
     crate::extension_host::plugins_changed(Arc::clone(&fresh));

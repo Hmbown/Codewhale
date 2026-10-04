@@ -586,7 +586,7 @@ done
     expect(readme).toContain(matrix.screenshot.readme);
     expect(`web/public${TERMINAL_SCREENSHOT.src}`).toBe(matrix.screenshot.website);
     expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
-    expect(homepage).toContain('<TerminalCapture\n                    frame="home"');
+    expect(homepage).toContain('<NativeTerminalGallery\n                    locale={locale}\n                    defaultFrame="home"');
     expect(TERMINAL_SCREENSHOT.capture).toBe("web/lib/terminal-captures/website-home-100x24.json");
     expect(matrix.screenshot.sources).toContain(TERMINAL_SCREENSHOT.capture);
     // Every locale describes the actual capture; build identity comes from

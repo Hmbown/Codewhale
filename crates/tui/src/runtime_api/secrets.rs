@@ -4,7 +4,7 @@ use codewhale_config::ConfigStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 
 use super::{ApiError, ProviderCredentialState, RuntimeApiState};
 
@@ -26,7 +26,13 @@ pub(super) struct SetProviderKeyRequest {
 /// mutates a user's provider slot or durable config. Running turns retain their
 /// materialized client: server-side device/session revocation is authoritative.
 fn account_model_access_receipt(config: &crate::config::Config) -> Value {
-    let api_base = config.base_url_for_route(ApiProvider::Codewhale);
+    let identity = config
+        .builtin_provider_identity(ProviderKind::Codewhale)
+        .ok();
+    let api_base = identity
+        .as_ref()
+        .map(|identity| config.base_url_for_route(identity))
+        .unwrap_or_default();
     let supported = api_base.trim_end_matches('/') == crate::config::DEFAULT_CODEWHALE_BASE_URL
         && super::runtime_account_api_base()
             == codewhale_secrets::account::DEFAULT_ACCOUNT_API_BASE;
@@ -37,7 +43,7 @@ fn account_model_access_receipt(config: &crate::config::Config) -> Value {
     json!({
         "apiBase": if supported { api_base.as_str() } else { "" },
         "supported": supported,
-        "configured": config.account_model_api_key(ApiProvider::Codewhale).is_some(),
+        "configured": identity.as_ref().and_then(|identity| config.account_model_api_key(identity)).is_some(),
         "catalogRefreshNeeded": false,
         "sessionId": live.map(|a| a.session_id.as_str()),
         "expiresAt": live.map(|a| a.expires_at),
@@ -91,12 +97,12 @@ fn install_account_model_access(
     profile: Option<&str>,
     request: SetAccountModelAccessRequest,
 ) -> Result<bool, ApiError> {
+    let identity = config
+        .builtin_provider_identity(ProviderKind::Codewhale)
+        .map_err(ApiError::conflict)?;
     let expected_base = crate::config::DEFAULT_CODEWHALE_BASE_URL;
     if request.api_base.trim_end_matches('/') != expected_base
-        || config
-            .base_url_for_route(ApiProvider::Codewhale)
-            .trim_end_matches('/')
-            != expected_base
+        || config.base_url_for_route(&identity).trim_end_matches('/') != expected_base
         || super::runtime_account_api_base() != codewhale_secrets::account::DEFAULT_ACCOUNT_API_BASE
     {
         return Err(ApiError::conflict(
@@ -141,7 +147,9 @@ fn install_account_model_access(
     // so even an inactive unmarked durable slot is checked. Never replace it.
     let mut existing = config.clone();
     existing.account_model_access = Default::default();
-    existing.provider = Some("codewhale".into());
+    existing
+        .scope_to_provider_identity(&identity)
+        .map_err(ApiError::conflict)?;
     let stored_key_present = match crate::config::credential_secret_store() {
         Some(secrets) => secrets
             .get("codewhale")
@@ -153,10 +161,10 @@ fn install_account_model_access(
     };
     if stored_key_present
         || existing
-            .provider_config_for(ApiProvider::Codewhale)
+            .provider_config_for(&identity)
             .is_some_and(|entry| entry.auth.is_some() || entry.api_key_env.is_some())
-        || !credential_writeability(&existing, ApiProvider::Codewhale).writable
-        || crate::config::has_api_key_for(&existing, ApiProvider::Codewhale)
+        || !credential_writeability(&existing, &identity).writable
+        || crate::config::has_api_key_for(&existing, &identity)
     {
         return Err(ApiError::conflict(
             "This Codewhale route already has its own credential.",
@@ -222,18 +230,25 @@ fn remove_account_model_access(
 // Beginning a generation already invalidates this account-only memory roster
 // and all older in-flight tickets. No network request or second cache is needed.
 fn invalidate_account_catalog(config: &crate::config::Config) {
+    let Ok(identity) = config.builtin_provider_identity(ProviderKind::Codewhale) else {
+        return;
+    };
     crate::provider_catalog_live::begin_refresh_for_identity(
-        ApiProvider::Codewhale,
+        ProviderKind::Codewhale,
         "codewhale",
-        &config.base_url_for_route(ApiProvider::Codewhale),
+        &config.base_url_for_route(&identity),
     );
 }
 
 pub(super) fn invalidate_stale_account_catalog(config: &crate::config::Config) {
+    let identity = config
+        .builtin_provider_identity(ProviderKind::Codewhale)
+        .ok();
     let bound = config.account_model_access.read().is_some();
     if bound
-        && config
-            .account_model_api_key(ApiProvider::Codewhale)
+        && identity
+            .as_ref()
+            .and_then(|identity| config.account_model_api_key(identity))
             .is_none()
     {
         invalidate_account_catalog(config);
@@ -261,7 +276,8 @@ pub(super) async fn set_provider_key(
     // slot, and — the half #6179 was missing — a credential this route does
     // not own, which must refuse before the write rather than appear to
     // succeed against a source that still wins at request time.
-    let (provider, kind) = writable_provider(&state, &id)?;
+    let identity = writable_provider(&state, &id)?;
+    let kind = identity.provider;
     if kind == codewhale_config::ProviderKind::OpenaiCodex {
         return Err(ApiError::bad_request(
             codewhale_config::credentials::OPENAI_CODEX_API_KEY_REFUSAL,
@@ -286,7 +302,7 @@ pub(super) async fn set_provider_key(
     let store_path = state.config_path.clone();
     let kind_owned = kind;
     let key_owned = key.to_string();
-    let provider_owned = provider;
+    let provider_owned = identity.clone();
     let (backend, saved_config_path) = tokio::task::spawn_blocking(move || {
         let mut store = ConfigStore::load(store_path)
             .map_err(|error| ApiError::internal(format!("config store unavailable: {error}")))?;
@@ -324,15 +340,20 @@ pub(super) async fn set_provider_key(
         let mut config = state.config.write();
         // Match the shared writer: the root marker belongs only to the
         // active provider, while an inactive provider keeps its own marker.
-        if provider_owned == config.api_provider() {
+        config
+            .verify_provider_identity(&provider_owned)
+            .map_err(ApiError::conflict)?;
+        if config.active_provider_identity().as_ref().ok() == Some(&provider_owned) {
             config.auth_mode = Some("api_key".to_string());
         }
         {
-            let entry = config.provider_config_for_mut(provider_owned);
+            let entry = config
+                .provider_config_for_mut(&provider_owned)
+                .map_err(|error| ApiError::conflict(error.to_string()))?;
             entry.auth_mode = Some("api_key".to_string());
             entry.external_credentials = None;
             entry.api_key = None;
-            if provider_owned == ApiProvider::Xai {
+            if provider_owned.provider == ProviderKind::Xai {
                 entry.oauth_credential_generation = None;
             }
         }
@@ -343,12 +364,12 @@ pub(super) async fn set_provider_key(
     let credential_state: ProviderCredentialState =
         crate::provider_readiness::credential_state_for_provider(
             &state.config.read(),
-            provider_owned,
+            &provider_owned,
         )
         .into();
 
     Ok(Json(json!({
-        "provider": provider_owned.as_str(),
+        "provider": provider_owned.key,
         "stored": true,
         "backend": backend,
         "credentialState": credential_state,
@@ -392,9 +413,19 @@ pub(super) struct CredentialWriteability {
 /// an environment value, or an auth command.
 pub(super) fn credential_writeability(
     config: &crate::config::Config,
-    provider: ApiProvider,
+    identity: &crate::config::ProviderIdentity,
 ) -> CredentialWriteability {
-    let auth_mode = config.auth_mode_for_provider(provider);
+    if config.verify_provider_identity(identity).is_err() {
+        return CredentialWriteability {
+            source: ProviderCredentialSource::None,
+            writable: false,
+            reason: Some(
+                "This route has no admitted credential authority; repair its provider selection.",
+            ),
+        };
+    }
+    let provider = identity.provider;
+    let auth_mode = config.auth_mode_for_provider(identity);
     if codewhale_config::auth_mode_disables_api_key(auth_mode.as_deref()) {
         return CredentialWriteability {
             source: ProviderCredentialSource::None,
@@ -402,7 +433,7 @@ pub(super) fn credential_writeability(
             reason: Some("This route is configured to send no credential."),
         };
     }
-    if provider.kind().is_none() {
+    if provider == ProviderKind::Custom {
         return CredentialWriteability {
             source: ProviderCredentialSource::None,
             writable: false,
@@ -413,7 +444,7 @@ pub(super) fn credential_writeability(
     // would not change what the route sends, so a write here must refuse
     // rather than report a success the user cannot observe.
     if config
-        .external_credential_consent_status(provider)
+        .external_credential_consent_status(identity)
         .is_some_and(|status| status.route_state == "active")
     {
         return CredentialWriteability {
@@ -427,7 +458,7 @@ pub(super) fn credential_writeability(
     // A literal key in a config document is a plaintext credential Codewhale
     // did not put there. Writing the secret store would leave the literal in
     // place and still winning, so refuse and name the file-owned source.
-    if let Some(entry) = config.provider_config_for(provider)
+    if let Some(entry) = config.provider_config_for(identity)
         && let Some(existing) = entry.api_key.as_deref()
         && codewhale_config::classify_config_api_key_value(existing)
             == codewhale_config::ConfigApiKeyValueKind::Literal
@@ -443,7 +474,7 @@ pub(super) fn credential_writeability(
     let account_bound = config.account_model_access.read().is_some();
     if account_bound
         && matches!(
-            crate::config::resolve_credential_source(config, provider).source,
+            crate::config::resolve_credential_source(config, identity).source,
             crate::credentials::CredentialSource::AccountSession
         )
     {
@@ -464,18 +495,23 @@ pub(super) fn credential_writeability(
 fn writable_provider(
     state: &RuntimeApiState,
     id: &str,
-) -> Result<(ApiProvider, codewhale_config::ProviderKind), ApiError> {
-    let provider = ApiProvider::parse(id)
+) -> Result<crate::config::ProviderIdentity, ApiError> {
+    let config = state.config.read();
+    let row = codewhale_config::descriptors::compatibility_for_selector(id)
         .ok_or_else(|| ApiError::bad_request(format!("Unknown provider id '{id}'")))?;
-    if provider == ApiProvider::DeepseekCN {
-        return Err(ApiError::bad_request(
-            "provider 'deepseek-cn' is a legacy alias; use 'deepseek' instead",
-        ));
+    if row.id != row.kind.as_str() {
+        return Err(ApiError::bad_request(format!(
+            "provider '{id}' is a legacy alias; use '{}' instead",
+            row.kind.as_str()
+        )));
     }
-    let kind = provider
-        .kind()
-        .ok_or_else(|| ApiError::bad_request("provider has no credential slot"))?;
-    let writeability = credential_writeability(&state.config.read(), provider);
+    let identity = config
+        .builtin_provider_identity(row.kind)
+        .map_err(ApiError::bad_request)?;
+    if identity.provider == ProviderKind::Custom {
+        return Err(ApiError::bad_request("provider has no credential slot"));
+    }
+    let writeability = credential_writeability(&config, &identity);
     if !writeability.writable {
         return Err(ApiError::conflict(
             writeability
@@ -483,7 +519,7 @@ fn writable_provider(
                 .unwrap_or("This route's credential is not managed by Codewhale."),
         ));
     }
-    Ok((provider, kind))
+    Ok(identity)
 }
 
 /// `DELETE /v1/providers/{id}/key` — remove a Codewhale-owned credential.
@@ -497,7 +533,8 @@ pub(super) async fn clear_provider_key(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let (provider, kind) = writable_provider(&state, &id)?;
+    let identity = writable_provider(&state, &id)?;
+    let kind = identity.provider;
 
     let secrets = crate::config::credential_secret_store().ok_or_else(|| {
         ApiError::internal("no credential store is available in this environment")
@@ -530,9 +567,14 @@ pub(super) async fn clear_provider_key(
     // the provider as configured until the next process start.
     {
         let mut config = state.config.write();
-        let entry = config.provider_config_for_mut(provider);
+        config
+            .verify_provider_identity(&identity)
+            .map_err(ApiError::conflict)?;
+        let entry = config
+            .provider_config_for_mut(&identity)
+            .map_err(|error| ApiError::conflict(error.to_string()))?;
         entry.api_key = None;
-        if provider == ApiProvider::Xai {
+        if kind == ProviderKind::Xai {
             entry.auth_mode = None;
             entry.external_credentials = None;
             entry.oauth_credential_generation = None;
@@ -540,7 +582,7 @@ pub(super) async fn clear_provider_key(
     }
 
     let credential_state: ProviderCredentialState =
-        crate::provider_readiness::credential_state_for_provider(&state.config.read(), provider)
+        crate::provider_readiness::credential_state_for_provider(&state.config.read(), &identity)
             .into();
 
     if let Some(error) = outcome.secret_store_error {
@@ -551,7 +593,7 @@ pub(super) async fn clear_provider_key(
     }
 
     Ok(Json(json!({
-        "provider": provider.as_str(),
+        "provider": identity.key,
         "cleared": true,
         "credentialState": credential_state,
     })))
@@ -630,7 +672,7 @@ mod tests {
         );
         assert!(crate::config::has_api_key_for(
             &config,
-            ApiProvider::Codewhale
+            &(config).test_identity_for_kind(ProviderKind::Codewhale)
         ));
         assert!(!format!("{config:?}").contains("cwc_fixture"));
         assert!(
@@ -638,7 +680,11 @@ mod tests {
                 .to_string()
                 .contains("cwc_fixture")
         );
-        assert!(config.provider_config_for(ApiProvider::Codewhale).is_none());
+        assert!(
+            config
+                .provider_config_for(&config.test_identity_for_kind(ProviderKind::Codewhale))
+                .is_none()
+        );
         assert!(
             crate::config::credential_secret_store()
                 .unwrap()
@@ -651,7 +697,7 @@ mod tests {
         };
         let endpoint = crate::config::DEFAULT_CODEWHALE_BASE_URL;
         let ticket = crate::provider_catalog_live::begin_refresh_for_identity(
-            ApiProvider::Codewhale,
+            ProviderKind::Codewhale,
             "codewhale",
             endpoint,
         );
@@ -671,7 +717,7 @@ mod tests {
         );
         assert!(
             crate::provider_catalog_live::cached_entry_for_route(
-                ApiProvider::Codewhale,
+                ProviderKind::Codewhale,
                 "codewhale",
                 endpoint
             )
@@ -689,7 +735,7 @@ mod tests {
         invalidate_stale_account_catalog(&config);
         assert!(
             crate::provider_catalog_live::cached_entry_for_route(
-                ApiProvider::Codewhale,
+                ProviderKind::Codewhale,
                 "codewhale",
                 endpoint
             )
@@ -732,18 +778,22 @@ mod tests {
             ..Default::default()
         };
         config
-            .provider_config_for_mut(ApiProvider::Codewhale)
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Codewhale))
+            .unwrap()
             .base_url = Some("https://api.codewhale.net/other/v1".into());
         assert!(install_account_model_access(&config, None, account_request(None)).is_err());
         config
-            .provider_config_for_mut(ApiProvider::Codewhale)
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Codewhale))
+            .unwrap()
             .base_url = None;
         config
-            .provider_config_for_mut(ApiProvider::Codewhale)
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Codewhale))
+            .unwrap()
             .api_key = Some("existing-user-key".into());
         assert!(install_account_model_access(&config, None, account_request(None)).is_err());
         config
-            .provider_config_for_mut(ApiProvider::Codewhale)
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Codewhale))
+            .unwrap()
             .api_key = None;
         let mut expired = account_request(None);
         expired.expires_at = chrono::Utc::now().timestamp() - 1;
@@ -755,25 +805,28 @@ mod tests {
         assert!(remove_account_model_access(&config, "stale-session").is_err());
         assert!(
             config
-                .account_model_api_key(ApiProvider::Codewhale)
+                .account_model_api_key(&config.test_identity_for_kind(ProviderKind::Codewhale))
                 .is_some()
         );
         config
-            .provider_config_for_mut(ApiProvider::Codewhale)
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Codewhale))
+            .unwrap()
             .api_key = Some("new-user-key".into());
         assert_eq!(
             config.active_route_api_key_read_only().unwrap(),
             "new-user-key"
         );
         config
-            .provider_config_for_mut(ApiProvider::Codewhale)
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Codewhale))
+            .unwrap()
             .api_key = None;
         config
-            .provider_config_for_mut(ApiProvider::Codewhale)
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Codewhale))
+            .unwrap()
             .base_url = Some("https://api.codewhale.net/other/v1".into());
         assert!(
             config
-                .account_model_api_key(ApiProvider::Codewhale)
+                .account_model_api_key(&config.test_identity_for_kind(ProviderKind::Codewhale))
                 .is_none()
         );
     }
@@ -783,7 +836,8 @@ mod tests {
         let _env = crate::test_support::lock_test_env();
         let mut config = Config::default();
         config
-            .provider_config_for_mut(ApiProvider::Codewhale)
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Codewhale))
+            .unwrap()
             .api_key = Some("manual-key".into());
         *config.account_model_access.write() = Some(crate::config::AccountModelAccess {
             session_id: "current".into(),
@@ -800,7 +854,7 @@ mod tests {
         assert!(clone.account_model_access.read().is_none());
         assert_eq!(
             config
-                .provider_config_for(ApiProvider::Codewhale)
+                .provider_config_for(&config.test_identity_for_kind(ProviderKind::Codewhale))
                 .unwrap()
                 .api_key
                 .as_deref(),
@@ -813,7 +867,10 @@ mod tests {
     #[test]
     fn a_codewhale_owned_route_is_writable_through_the_secret_store() {
         let config = Config::default();
-        let writeability = credential_writeability(&config, ApiProvider::Openai);
+        let writeability = credential_writeability(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Openai),
+        );
         assert_eq!(writeability.source, ProviderCredentialSource::SecretStore);
         assert!(writeability.writable);
         assert!(writeability.reason.is_none());
@@ -825,10 +882,15 @@ mod tests {
     #[test]
     fn a_literal_config_key_refuses_the_write_and_says_why() {
         let mut config = Config::default();
-        config.provider_config_for_mut(ApiProvider::Openai).api_key =
-            Some("sk-literal-in-a-config-file".to_string());
+        config
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Openai))
+            .unwrap()
+            .api_key = Some("sk-literal-in-a-config-file".to_string());
 
-        let writeability = credential_writeability(&config, ApiProvider::Openai);
+        let writeability = credential_writeability(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Openai),
+        );
         assert_eq!(writeability.source, ProviderCredentialSource::Config);
         assert!(!writeability.writable);
         let reason = writeability.reason.expect("a refusal must name its reason");
@@ -842,10 +904,15 @@ mod tests {
     #[test]
     fn the_secret_store_sentinel_is_not_a_file_owned_key() {
         let mut config = Config::default();
-        config.provider_config_for_mut(ApiProvider::Openai).api_key =
-            Some(codewhale_config::API_KEYRING_SENTINEL.to_string());
+        config
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Openai))
+            .unwrap()
+            .api_key = Some(codewhale_config::API_KEYRING_SENTINEL.to_string());
 
-        let writeability = credential_writeability(&config, ApiProvider::Openai);
+        let writeability = credential_writeability(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Openai),
+        );
         assert_eq!(writeability.source, ProviderCredentialSource::SecretStore);
         assert!(writeability.writable);
     }
@@ -856,10 +923,14 @@ mod tests {
     fn a_no_auth_route_reports_no_credential_source() {
         let mut config = Config::default();
         config
-            .provider_config_for_mut(ApiProvider::Openai)
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Openai))
+            .unwrap()
             .auth_mode = Some("none".to_string());
 
-        let writeability = credential_writeability(&config, ApiProvider::Openai);
+        let writeability = credential_writeability(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Openai),
+        );
         assert_eq!(writeability.source, ProviderCredentialSource::None);
         assert!(!writeability.writable);
         assert!(writeability.reason.is_some());

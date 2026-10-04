@@ -56,7 +56,12 @@ fn private_route_config() -> Config {
 }
 
 fn resolve(config: &Config, model: &str) -> ResolvedRuntimeRoute {
-    resolve_runtime_route(config, config.api_provider(), Some(model)).expect("resolve route")
+    resolve_runtime_route(
+        config,
+        config.active_provider_identity().unwrap().provider,
+        Some(model),
+    )
+    .expect("resolve route")
 }
 
 fn fixture_compaction() -> CompactionConfig {

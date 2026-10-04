@@ -248,6 +248,15 @@ impl DegradedReason {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CapturedSearchEntry {
+    pub(crate) title: String,
+    pub(crate) url: String,
+    pub(crate) snippet: Option<String>,
+    pub(crate) published: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SearchResult {
     pub(crate) rank: u8,

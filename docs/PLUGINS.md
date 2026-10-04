@@ -41,9 +41,11 @@ Codewhale is helpful about plugins, not pushy. The rules:
   marketplace's `check-marketplace.mjs` share one stoplist.
 - **Only what runs here.** Plugins whose `when.os` excludes this OS are not
   offered.
-- **The true next step.** A model-requested review row says Install, Review
-  trust, or Enable to match what the plugin needs. Only that button acts, and
-  it opens `/plugin show <name>`; it never installs, trusts, or enables.
+- **Review before acting.** A model-requested row offers Review. Its button
+  opens the existing Extensions inventory: Plugins for an installed bundle,
+  Marketplace for a suggestion that is not installed. Nothing is installed,
+  trusted, or enabled by that click. Choose the inventory's explicit action;
+  trust still reviews the exact installed content before activation.
 - **Reversible dismissal.** Esc clears a non-empty draft first, then hides the
   row for this session only. "Don't suggest again" is the explicit,
   persisted choice. `/plugin dismissals` lists both kinds, and

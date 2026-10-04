@@ -35,8 +35,8 @@ pub(super) use crate::tools::js_execution::JS_EXECUTION_TOOL_NAME;
 pub(crate) const TOOL_SEARCH_NAME: &str = "tool_search";
 const TOOL_RESULT_RETRIEVAL_NAME: &str = "retrieve_tool_result";
 const TOOL_SEARCH_TYPE: &str = "tool_search_20251119";
-const LEGACY_TOOL_SEARCH_REGEX_NAME: &str = "tool_search_tool_regex";
-const LEGACY_TOOL_SEARCH_BM25_NAME: &str = "tool_search_tool_bm25";
+pub(super) const LEGACY_TOOL_SEARCH_REGEX_NAME: &str = "tool_search_tool_regex";
+pub(super) const LEGACY_TOOL_SEARCH_BM25_NAME: &str = "tool_search_tool_bm25";
 const TOOL_SEARCH_DEFAULT_MAX_RESULTS: usize = 8;
 const TOOL_SEARCH_MAX_RESULTS_LIMIT: usize = 8;
 
@@ -613,6 +613,21 @@ impl ToolSurfacePolicy {
 
     pub(super) fn passes_allow_list(&self, name: &str) -> bool {
         tool_allowed(self.allowed_tools.as_deref(), name)
+    }
+
+    /// A configured-server handshake may only serve this captured turn's
+    /// MCP namespace. Do not replace the command-scoped ceiling with config.
+    pub(super) fn permits_mcp_discovery(&self, server: &str) -> bool {
+        !crate::mcp::McpPool::server_denied_by(
+            self.disallowed_tools.as_deref().unwrap_or_default(),
+            server,
+        ) && self.allowed_tools.as_ref().is_none_or(|rules| {
+            let normalized = rules
+                .iter()
+                .map(|rule| rule.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            crate::mcp::tool_selection_covers_server(&normalized, server)
+        })
     }
 
     pub(super) fn denies_tool(&self, name: &str) -> bool {

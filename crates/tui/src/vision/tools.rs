@@ -8,7 +8,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
 use crate::client::CodewhaleClient;
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::config::VisionModelConfig;
 use crate::llm_client::{LlmError, RetryConfig, sanitize_http_error_body, with_retry};
 use crate::tools::spec::{
@@ -199,7 +199,7 @@ impl ImageAnalyzeTool {
                     // request; a matched active client above carries exact
                     // route limits when the vision route is shared.
                     crate::route_budget::effective_max_output_tokens_for_route(
-                        ApiProvider::Custom,
+                        ProviderKind::Custom,
                         &self.config.model,
                         None,
                     )
@@ -319,7 +319,7 @@ impl ToolSpec for ImageAnalyzeTool {
             let json: Value = response.json().await.map_err(|e| {
                 ToolError::execution_failed(format!("Failed to parse response: {e}"))
             })?;
-            Ok(json)
+            Ok::<Value, ToolError>(json)
         })
         .await
         .map_err(|_| ToolError::Timeout {
@@ -389,7 +389,7 @@ mod tests {
     fn standalone_vision_cap(model: &str) -> u64 {
         u64::from(
             crate::route_budget::effective_max_output_tokens_for_route(
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 model,
                 None,
             )

@@ -133,12 +133,18 @@ jobs:
     uses: ./.github/workflows/release-parity.yml
 
   artifacts:
+    permissions:
+      contents: read
+      actions: read
     needs: [parity, resolve]
     if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.parity.result == 'success' }}
     uses: ./.github/workflows/release-artifacts.yml
     with:
       source_sha: ${{ needs.resolve.outputs.sha }}
       version: ${{ needs.resolve.outputs.version }}
+      compiled_host_delivery: ${{ vars.CODEWHALE_COMPILED_HOST_DELIVERY == '1' }}
+      compiled_host_run_id: ${{ vars.CODEWHALE_COMPILED_HOST_QUALIFICATION_RUN_ID || '' }}
+      compiled_host_targets: ${{ vars.CODEWHALE_COMPILED_HOST_TARGETS || 'linux-x64,macos-arm64,windows-x64' }}
       retention_days: 14
 
   docker-build:

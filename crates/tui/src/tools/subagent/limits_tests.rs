@@ -293,6 +293,12 @@ async fn launch_narrows_all_limits_and_continuation_cannot_restart_deadline() {
     let profile = &guard.worker_records[&child.agent_id].spec.runtime_profile;
     assert_eq!(profile.max_steps, 4);
     assert!(profile.wall_time_secs.unwrap() <= 10);
+    // Continuation admission requires the same actor to settle before its saved deadline is checked.
+    let requested = guard.cancel_agent(&child.agent_id).unwrap();
+    drop(guard);
+    let settled = settle_requested_child(&manager, requested).await;
+    assert_eq!(settled.status, SubAgentStatus::Cancelled);
+    let mut guard = manager.write().await;
     guard
         .worker_records
         .get_mut(&child.agent_id)
@@ -422,12 +428,19 @@ async fn root_fork_of_depth_two_leaf_cannot_regain_a_generation() {
     runtime.manager = Arc::clone(&manager);
     runtime.cancel_token.cancel();
     let mut guard = manager.write().await;
-    let mut source = make_worker_spec("leaf", tmp.path().to_path_buf());
+    let (canonical, directory) = crate::runtime_api::open_workspace_directory(tmp.path()).unwrap();
+    guard
+        .admit_coordination_workspace(tmp.path().to_path_buf(), canonical, Arc::new(directory))
+        .unwrap();
+    let source_id = guard.insert_test_running_direct_child("leaf", tmp.path());
+    guard.cancel_agent(&source_id).unwrap();
+    let mut source = make_worker_spec(&source_id, tmp.path().to_path_buf());
     source.spawn_depth = 2;
     source.max_spawn_depth = 2;
     source.runtime_profile.spawn_depth = 2;
     source.runtime_profile.max_spawn_depth = 2;
-    guard.register_worker(source);
+    // Preserve the existing actor/origin/session receipt while installing the depth-2 profile.
+    guard.worker_records.get_mut(&source_id).unwrap().spec = source;
     let child = guard
         .spawn_background_with_assignment_options(
             Arc::clone(&manager),
@@ -437,7 +450,7 @@ async fn root_fork_of_depth_two_leaf_cannot_regain_a_generation() {
             SubAgentAssignment::new("fork leaf".to_string(), None),
             Some(vec![]),
             SubAgentSpawnOptions {
-                resume_from_agent_id: Some("leaf".to_string()),
+                resume_from_agent_id: Some(source_id),
                 ..Default::default()
             },
             None,

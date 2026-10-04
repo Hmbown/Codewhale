@@ -1,11 +1,11 @@
-<!-- source: README.md sha256:925619135f77 -->
+<!-- source: README.md sha256:a59c459aea4d -->
 # Codewhale
 
 Codewhale, seçtiğiniz barındırılan veya yerel bir modeli kullanarak projenizi okuyan, dosyaları düzenleyen, komutları çalıştıran ve yaptığı işi kontrol eden açık kaynaklı bir ajandır. Terminalde tek bir görevle başlayın. Daha büyük bir işte, işin bölümlerini farklı model ve rollere sahip ajanlara verin.
 
-![Terminalde çalışan Codewhale](web/public/codewhale-tui-5765d80.png)
+![Terminalde çalışan Codewhale](web/public/codewhale-tui-e940149.png)
 
-*v0.10.0 geliştirme derlemesinden terminal önizlemesi.*
+*v0.10.1 geliştirme derlemesinden terminal önizlemesi.*
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
@@ -51,7 +51,7 @@ Codewhale deponuzu okuyabilir, dosyaları düzenleyebilir, komutları çalışt�
 
 ## Terminal, uygulamalar ve Computer Use
 
-Terminal ve grafik istemciler, ajanı ve araçlarını çalıştıran Codewhale Runtime’a bağlanır:
+Terminal ve grafik istemciler, ajanı ve araçlarını çalıştıran [Codewhale Engine](docs/ARCHITECTURE.md)’e bağlanır:
 
 - **Terminal:** `codewhale` etkileşimli arayüzü açar; `codewhale exec` bir betikten veya CI işinden görev çalıştırır.
 - **Yerel tarayıcı:** `codewhale web`, aynı çalışma zamanı için paketle birlikte gelen [yerel web istemcisini](docs/WEB.md) açar.

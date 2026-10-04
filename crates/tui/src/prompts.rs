@@ -3426,16 +3426,12 @@ mod tests {
     #[test]
     fn legacy_rlm_compatibility_descriptions_remain_available() {
         let descriptions = [
-            RlmTool::alias("rlm_open", "open", None)
+            RlmTool::alias("rlm_open", "open").description().to_string(),
+            RlmTool::alias("rlm_eval", "eval").description().to_string(),
+            RlmTool::alias("rlm_configure", "configure")
                 .description()
                 .to_string(),
-            RlmTool::alias("rlm_eval", "eval", None)
-                .description()
-                .to_string(),
-            RlmTool::alias("rlm_configure", "configure", None)
-                .description()
-                .to_string(),
-            RlmTool::alias("rlm_close", "close", None)
+            RlmTool::alias("rlm_close", "close")
                 .description()
                 .to_string(),
             HandleReadTool.description().to_string(),

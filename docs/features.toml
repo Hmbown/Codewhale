@@ -147,13 +147,112 @@ owner = "crates/tui/src/tools/codemode.rs"
 [[feature]]
 id = "extension-host"
 name = "Extension host"
-summary = "Runs reviewed plugins' native TypeScript/JavaScript tool code in a Bun or Node sidecar."
+summary = "Runs reviewed plugins' native TypeScript/JavaScript tool and slash-command code in a Bun or Node sidecar."
 status = "flagged"
 surfaces = { tui = "preview", web = "none", api = "none" }
 since = "0.10.1"
 flag = "extension_host"
 docs = "docs/EXTENSIONS.md"
 owner = "crates/tui/src/extension_host"
+
+[[feature]]
+id = "finance-host"
+name = "Finance host"
+summary = "Routes opted-in finance tools through the bundled Native host under the existing permission and sandbox gates."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "finance_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/finance.rs"
+
+[[feature]]
+id = "data-host"
+name = "Data host"
+summary = "Routes opted-in data validation through the bundled Native host with owned input and output bounds."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "data_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/validate_data.rs"
+
+[[feature]]
+id = "speech-host"
+name = "Speech host"
+summary = "Routes opted-in speech tools through the bundled Native host while Rust retains credentials and permissions."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "speech_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/speech.rs"
+
+[[feature]]
+id = "pdf-host"
+name = "PDF host"
+summary = "Routes opted-in PDF extraction through the bundled Native host with the same Rust path and size guards."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "pdf_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/pdf.rs"
+
+[[feature]]
+id = "ocr-host"
+name = "OCR host"
+summary = "Routes opted-in image OCR through the bundled Native host under existing media and permission guards."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "ocr_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/image_ocr.rs"
+
+[[feature]]
+id = "github-host"
+name = "GitHub host"
+summary = "Routes opted-in GitHub operations through the bundled Native host while Rust retains credentials and approvals."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "github_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/github"
+
+[[feature]]
+id = "web-search-host"
+name = "Web search host"
+summary = "Routes opted-in web search through the bundled Native host with the existing Rust credential and network gates."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "web_search_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/web/adapter.rs"
+
+[[feature]]
+id = "web-extract-host"
+name = "Web extract host"
+summary = "Routes opted-in web extraction through the bundled Native host with owned URL and response bounds."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "web_extract_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/web/extract.rs"
+
+[[feature]]
+id = "review-host"
+name = "Review host"
+summary = "Routes opted-in review tools through the bundled Native host while Rust retains route and permission authority."
+status = "flagged"
+surfaces = { tui = "preview", api = "preview" }
+since = "0.10.1"
+flag = "review_host"
+docs = "docs/TOOL_SURFACE.md"
+owner = "crates/tui/src/tools/review_host.rs"
 
 # --- Working with the agent ---
 
@@ -541,3 +640,13 @@ status = "experimental"
 surfaces = { tui = "preview" }
 docs = "docs/TERMUX.md"
 owner = ".github/workflows/release-artifacts.yml"
+
+[[feature]]
+id = "chatgpt-plan-sign-in"
+name = "Sign in with ChatGPT"
+summary = "Uses official OAuth and the selected account catalog for eligible ChatGPT plan requests in the local OSS app."
+status = "experimental"
+surfaces = { tui = "preview", api = "partial", web = "none" }
+since = "unreleased"
+docs = "docs/PROVIDERS.md#sign-in-with-chatgpt"
+owner = "crates/tui/src/oauth.rs"

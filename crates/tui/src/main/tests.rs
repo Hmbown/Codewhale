@@ -5,10 +5,10 @@ use tempfile::TempDir;
 
 #[test]
 fn doctor_api_key_rows_never_name_the_retired_antigravity_slot() {
-    let rows: Vec<crate::config::ApiProvider> = doctor_api_key_providers().collect();
-    assert!(!rows.contains(&crate::config::ApiProvider::Antigravity));
-    assert!(rows.contains(&crate::config::ApiProvider::Deepseek));
-    assert!(rows.contains(&crate::config::ApiProvider::Google));
+    let rows: Vec<crate::config::ProviderKind> = doctor_api_key_providers().collect();
+    assert!(!rows.contains(&crate::config::ProviderKind::Antigravity));
+    assert!(rows.contains(&crate::config::ProviderKind::Deepseek));
+    assert!(rows.contains(&crate::config::ProviderKind::Google));
     assert!(
         rows.iter()
             .all(|provider| provider.as_str() != "antigravity")
@@ -284,12 +284,13 @@ fn doctor_mcp_reports_redact_url_argv_and_env_values() {
 }
 #[test]
 fn doctor_provider_json_redacts_every_credential_url_to_its_authority() {
-    let mut providers = crate::config::ApiProvider::all().to_vec();
-    providers.push(crate::config::ApiProvider::DeepseekCN);
-
-    for provider in providers {
+    for row in codewhale_config::descriptors::provider_compatibility() {
+        if row.kind == crate::config::ProviderKind::Antigravity {
+            continue;
+        }
+        let provider = row.id;
         let config = Config {
-            provider: Some(provider.as_str().to_string()),
+            provider: Some(provider.to_string()),
             ..Config::default()
         };
         let report = doctor_provider_model_report_json(&config);
@@ -400,12 +401,12 @@ fn explicit_doctor_api_probes_may_load_workspace_dotenv_credentials() {
 #[test]
 fn hosted_provider_does_not_probe_without_explicit_opt_in() {
     assert!(!doctor_should_probe_api(
-        crate::config::ApiProvider::Deepseek,
+        crate::config::ProviderKind::Deepseek,
         "https://api.deepseek.com/beta",
         crate::doctor::DoctorProbeRequest::default(),
     ));
     assert!(doctor_should_probe_api(
-        crate::config::ApiProvider::Deepseek,
+        crate::config::ProviderKind::Deepseek,
         "https://api.deepseek.com/beta",
         crate::doctor::DoctorProbeRequest {
             probe_api: true,
@@ -735,13 +736,13 @@ fn sentinel_placeholders_never_become_attemptable_routes_or_metered_evidence() {
         assert_eq!(
             crate::provider_readiness::credential_state_for_provider(
                 &named_custom,
-                crate::config::ApiProvider::Custom,
+                &(named_custom).test_identity_for_kind(crate::config::ProviderKind::Custom),
             ),
             crate::provider_readiness::CredentialState::MissingKey
         );
         let readiness = crate::provider_readiness::resolve_for_model(
             &named_custom,
-            crate::config::ApiProvider::Custom,
+            &(named_custom).test_identity_for_kind(crate::config::ProviderKind::Custom),
             "sentinel-model",
             &crate::provider_readiness::ProviderReadinessSnapshot::default(),
         );
@@ -752,9 +753,10 @@ fn sentinel_placeholders_never_become_attemptable_routes_or_metered_evidence() {
         assert!(!readiness.can_attempt());
         assert!(
             crate::model_inventory::ModelInventory::from_config(&named_custom)
+                .unwrap()
                 .candidates
                 .iter()
-                .all(|candidate| candidate.provider != crate::config::ApiProvider::Custom)
+                .all(|candidate| candidate.provider != crate::config::ProviderKind::Custom)
         );
 
         let xai = Config {
@@ -771,7 +773,7 @@ fn sentinel_placeholders_never_become_attemptable_routes_or_metered_evidence() {
         assert_eq!(
             crate::provider_readiness::credential_state_for_provider(
                 &xai,
-                crate::config::ApiProvider::Xai,
+                &(xai).test_identity_for_kind(crate::config::ProviderKind::Xai),
             ),
             crate::provider_readiness::CredentialState::MissingKey
         );
@@ -783,7 +785,10 @@ fn sentinel_placeholders_never_become_attemptable_routes_or_metered_evidence() {
             ..Default::default()
         };
         assert_eq!(
-            crate::route_billing::for_route(&xiaomi, crate::config::ApiProvider::XiaomiMimo),
+            crate::route_billing::for_route(
+                &xiaomi,
+                &(xiaomi).test_identity_for_kind(crate::config::ProviderKind::XiaomiMimo)
+            ),
             crate::route_billing::BillingPresentation::Subscription("MiMo token plan")
         );
     }

@@ -5,20 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Provider request/response models and the offline model metadata catalog for Codewhale."
+description = "Provider request/response models and intrinsic metadata projections for Codewhale."
 
 [features]
-# Exposes the catalog test hooks (`test_catalog_lock`,
-# `replace_active_catalog_for_test`) that used to be reachable as `#[cfg(test)]`
-# items inside `codewhale-tui`. Enabled only from dev-dependencies.
+# Exposes compaction comparison helpers only to dev-dependencies.
 test-support = []
 
 [lints]
 workspace = true
 
 [dependencies]
-anyhow.workspace = true
-chrono.workspace = true
 codewhale-config = { path = "../config", version = "0.10.1" }
 codewhale-core = { path = "../core", version = "0.10.1" }
 serde.workspace = true

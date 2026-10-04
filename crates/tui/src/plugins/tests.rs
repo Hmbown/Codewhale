@@ -152,6 +152,42 @@ fn trust_and_enablement_are_separate_atomic_state_transitions() {
 }
 
 #[test]
+fn native_review_mutation_finishes_then_rechecks_current_default_receipt() {
+    let _policy = super::activation::TestPolicyGuard::extension_host(true);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(tmp.path());
+    let plugin = config.user_plugins_dir.join("native-preset");
+    fs::create_dir_all(&plugin).unwrap();
+    fs::write(
+        plugin.join("plugin.json"),
+        r#"{"$schema":"https://agent-plugins.org/schemas/plugin.json","name":"native-preset","version":"1.0.0","extensions":{"net.codewhale":{"native":{"paths":["index.mjs"]}}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        plugin.join("index.mjs"),
+        "// codewhale-native-preset-v1 {\"id\":\"reviewer\",\"trust\":\"user\",\"is_default\":true}\nexport function apply() {}\n",
+    )
+    .unwrap();
+    let mut registry = discover_with_config(&config);
+    registry.trust("native-preset").unwrap();
+    registry.enable("native-preset").unwrap();
+    let selected = registry.selected_native_entries().to_vec();
+    assert_eq!(selected.len(), 1);
+    let fresh = discover_with_config(&config);
+    assert_eq!(fresh.selected_native_entries(), selected);
+    assert!(fresh.with_native_preset(selected[0].clone()).is_ok());
+
+    registry.disable("native-preset").unwrap();
+    assert!(registry.with_native_preset(selected[0].clone()).is_err());
+    assert!(!discover_with_config(&config).is_active("native-preset"));
+    registry.enable("native-preset").unwrap();
+    assert!(registry.with_native_preset(selected[0].clone()).is_ok());
+    registry.revoke_trust("native-preset").unwrap();
+    assert!(registry.with_native_preset(selected[0].clone()).is_err());
+    assert!(!discover_with_config(&config).is_active("native-preset"));
+}
+
+#[test]
 fn declarative_runtime_sources_survive_restart_only_from_the_staged_snapshot() {
     let fixture = super::test_fixture::DeclarativePluginFixture::new();
     let plugin = fixture.registry.get("runtime-demo").expect("plugin");

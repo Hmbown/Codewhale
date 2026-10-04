@@ -102,11 +102,10 @@ fn composer_line_bounds(text: &str, pos: usize) -> (usize, usize) {
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::tui::app::{App, SidebarRowAction, StatusToastLevel};
 use crate::tui::command_palette::{
-    CommandPaletteView, build_entries as build_command_palette_entries,
+    CommandPaletteView, build_entries_with_plugins as build_command_palette_entries,
 };
 use crate::tui::context_menu::{ContextMenuEntry, ContextMenuView};
 use crate::tui::scrolling::{ScrollDirection, TranscriptScroll};
@@ -167,106 +166,30 @@ fn toggle_tool_run_expand(app: &mut App, mouse: MouseEvent) -> bool {
 /// in the composer input string. Uses the canonical prompt-adjusted text rect
 /// for coordinate mapping, and accounts for vertical padding and scroll offset.
 fn mouse_pos_to_char_index(app: &App, col: u16, row: u16, text_area: Rect) -> Option<usize> {
-    let rel_col = col.saturating_sub(text_area.x) as usize;
-    let rel_row = row.saturating_sub(text_area.y) as usize;
-
-    if app.input.is_empty() {
-        return Some(0);
-    }
-
-    let width = text_area.width.max(1) as usize;
-    let wrapped = crate::tui::widgets::wrap_input_lines_for_mouse(&app.input, width);
-
-    // Subtract the vertical top-padding (centering of short inputs).
-    let text_row = rel_row.saturating_sub(app.viewport.last_composer_top_padding);
-
-    // Add the scroll offset (lines scrolled out of view).
-    let absolute_row = text_row + app.viewport.last_composer_scroll_offset;
-
-    if absolute_row >= wrapped.len() {
-        return Some(app.input.chars().count());
-    }
-
-    let (line_start, line_text) = &wrapped[absolute_row];
-
-    let mut char_offset = 0usize;
-    let mut col_used = 0usize;
-    for g in line_text.graphemes(true) {
-        // Painted cells: ratatui strips control characters, so a tab takes
-        // no column here, matching the wrap and caret math.
-        let gw = crate::tui::widgets::visible_grapheme_width(g);
-        if col_used + gw > rel_col {
-            break;
-        }
-        col_used += gw;
-        char_offset += g.chars().count();
-    }
-    Some(line_start + char_offset)
+    Some(codewhale_ratatui::native_composer_source_at(
+        &app.input,
+        usize::from(text_area.width.max(1)),
+        usize::from(col.saturating_sub(text_area.x)),
+        usize::from(row.saturating_sub(text_area.y)),
+        app.viewport.last_composer_scroll_offset,
+        app.viewport.last_composer_top_padding,
+    ))
 }
 
-fn composer_wrapped_cursor_row_col(
-    input: &str,
-    cursor: usize,
-    wrapped: &[(usize, String)],
-) -> (usize, usize) {
-    let total = input.chars().count();
-    let cursor = cursor.min(total);
-
-    for (idx, (line_start, line_text)) in wrapped.iter().enumerate() {
-        let next_start = wrapped
-            .get(idx + 1)
-            .map(|(start, _)| *start)
-            .unwrap_or_else(|| total.saturating_add(1));
-
-        if cursor >= *line_start && cursor < next_start {
-            let line_len = line_text.chars().count();
-            return (idx, cursor.saturating_sub(*line_start).min(line_len));
-        }
-    }
-
-    let row = wrapped.len().saturating_sub(1);
-    let col = wrapped
-        .get(row)
-        .map(|(_, line_text)| line_text.chars().count())
-        .unwrap_or(0);
-    (row, col)
-}
-
-/// Move the composer caret by wrapped rows. Returns whether the caret actually
-/// moved: a draft that is empty, unwrapped, or already at the boundary in this
-/// direction reports `false` so the wheel can reach the transcript instead of
-/// dying in the composer (#5223).
+/// Wheel dispatch stays with the existing editor; row projection is shared
+/// with painting and caret geometry, preserving its scalar-column policy.
 fn move_composer_cursor_by_wrapped_rows(app: &mut App, text_area: Rect, rows: isize) -> bool {
-    if app.input.is_empty() || rows == 0 {
+    let Some(cursor) = codewhale_ratatui::native_composer_step_row(
+        &app.input,
+        app.cursor_position,
+        usize::from(text_area.width.max(1)),
+        rows,
+        codewhale_ratatui::NativeComposerRowColumn::SourceScalars,
+    ) else {
         return false;
-    }
-
-    let width = text_area.width.max(1) as usize;
-    let wrapped = crate::tui::widgets::wrap_input_lines_for_mouse(&app.input, width);
-    if wrapped.len() <= 1 {
-        return false;
-    }
-
-    let (current_row, current_col) =
-        composer_wrapped_cursor_row_col(&app.input, app.cursor_position, &wrapped);
-    let max_row = wrapped.len().saturating_sub(1);
-    let target_row = if rows.is_negative() {
-        current_row.saturating_sub(rows.unsigned_abs())
-    } else {
-        current_row.saturating_add(rows as usize).min(max_row)
     };
-
-    if target_row == current_row {
-        return false;
-    }
-
-    let (target_start, target_text) = &wrapped[target_row];
-    let target_len = target_text.chars().count();
-    let total = app.input.chars().count();
     app.clear_selection();
-    app.cursor_position = target_start
-        .saturating_add(current_col.min(target_len))
-        .min(total);
+    app.cursor_position = cursor;
     app.needs_redraw = true;
     true
 }
@@ -296,16 +219,14 @@ fn handle_plugin_cta_mouse(app: &mut App, mouse: MouseEvent) -> Option<Vec<ViewE
         let _ = app.dismiss_plugin_cta();
         return Some(Vec::new());
     }
-    // Only the labelled button acts, and it opens `/plugin show <name>`;
-    // install, trust, and enable stay the person's own next command. A click
-    // elsewhere on the row is consumed and does nothing.
+    // Only the labelled Review button opens the existing inventory. A click
+    // elsewhere is consumed; no suggested command or mutation is dispatched.
     if mouse_hits_rect(mouse, app.viewport.last_plugin_cta_review_area)
-        && let Some(command) = app.accept_plugin_cta_command()
+        && let Some(tab) = app.accept_plugin_cta_review()
+        && app.view_stack.top_kind() != Some(crate::tui::views::ModalKind::Extensions)
     {
-        return Some(apply_sidebar_row_action(
-            app,
-            crate::tui::app::SidebarRowAction::Command(command),
-        ));
+        app.view_stack
+            .push(crate::tui::views::extensions::ExtensionsView::new(app, tab));
     }
     Some(Vec::new())
 }
@@ -1835,6 +1756,7 @@ pub(crate) fn apply_context_menu_action(
                     &app.workspace,
                     &app.mcp_config_path,
                     app.mcp_snapshot.as_ref(),
+                    app.extension_plugin_view().as_ref(),
                 ),
             ));
         }
@@ -1843,8 +1765,7 @@ pub(crate) fn apply_context_menu_action(
         }
         ContextMenuAction::OpenHelp => {
             let help =
-                HelpView::new_for_workspace(app.ui_locale, &app.workspace, &app.cached_skills)
-                    .with_groups_expanded(app.help_expand_groups);
+                HelpView::new_for_app(app, false).with_groups_expanded(app.help_expand_groups);
             app.view_stack.push(help);
         }
         ContextMenuAction::OpenFileAtLine { path, line } => {
@@ -2427,6 +2348,42 @@ mod tests {
         // Legacy strip geometry (see ui.rs); Bottom default has its own tests.
         app.work_surface.placement = crate::tui::work_surface::WorkSurfacePlacement::Top;
         app
+    }
+
+    #[test]
+    fn plugin_review_click_opens_inventory_and_emits_no_install_or_trust_command() {
+        let _lock = crate::test_support::lock_test_env();
+        let root = tempdir().unwrap();
+        let _home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path().join("home"));
+        let mut app = App::new(
+            crate::test_support::test_tui_options(root.path()),
+            &Config::default(),
+        );
+        app.surface_plugin_review_request("catalog-only", "/plugin install arbitrary-source");
+        assert!(app.plugin_cta.phase.is_visible());
+        let before = app.plugin_registry.list().len();
+        let area = Rect::new(0, 0, 140, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        crate::tui::plugin_suggestions::draw_plugin_cta(&mut app, area, &mut buffer);
+        assert!(
+            super::handle_plugin_cta_mouse(&mut app, left_click(0, 0))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(app.view_stack.is_empty());
+        assert!(app.plugin_cta.phase.is_visible());
+        let button = app.viewport.last_plugin_cta_review_area.unwrap();
+        let events =
+            super::handle_plugin_cta_mouse(&mut app, left_click(button.x, button.y)).unwrap();
+        assert!(
+            events.is_empty(),
+            "review navigation must not dispatch commands"
+        );
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Extensions));
+        assert!(!app.plugin_cta.phase.is_visible());
+        assert_eq!(app.plugin_registry.list().len(), before);
+        assert!(app.plugin_registry.get("catalog-only").is_none());
     }
 
     #[test]

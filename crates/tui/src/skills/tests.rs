@@ -2643,3 +2643,88 @@ fn frontmatter_warnings_reach_registry_once() {
         );
     }
 }
+
+/// A repository must not make skill discovery read outside itself: a linked
+/// skill directory, a linked `SKILL.md` and a linked skills root under the
+/// workspace are each refused with a warning, while the same layout under an
+/// operator-owned root (no workspace) still follows links on purpose.
+#[cfg(unix)]
+#[test]
+fn workspace_skill_discovery_does_not_follow_links_out_of_the_workspace() {
+    use std::os::unix::fs::symlink;
+    super::clear_skill_discovery_cache();
+    let workspace = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    write_skill(
+        outside.path(),
+        "smuggled-dir",
+        "outside dir",
+        "Outside body",
+    );
+    let linked_file_skill = outside.path().join("linked-file-source");
+    write_skill(
+        &linked_file_skill,
+        "smuggled-file",
+        "outside file",
+        "Outside body",
+    );
+
+    let root = workspace.path().join(".agents").join("skills");
+    write_skill(&root, "inside", "inside the workspace", "Inside body");
+    symlink(outside.path().join("smuggled-dir"), root.join("linked-dir")).unwrap();
+    std::fs::create_dir_all(root.join("linked-file")).unwrap();
+    symlink(
+        linked_file_skill.join("smuggled-file").join("SKILL.md"),
+        root.join("linked-file").join("SKILL.md"),
+    )
+    .unwrap();
+
+    let registry = super::discover_from_directories_in_workspace(
+        vec![root.clone()],
+        Some(workspace.path()),
+        None,
+    );
+    let names = registry
+        .list()
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["inside"], "{:?}", registry.warnings());
+    let warnings = registry.warnings().join("\n");
+    assert!(
+        warnings.contains("Refusing symlinked skill entry"),
+        "{warnings}"
+    );
+    assert!(warnings.contains("linked-file"), "{warnings}");
+
+    // The same tree read as an operator-owned root still follows links.
+    super::clear_skill_discovery_cache();
+    let operator = super::discover_from_directories_with_plugins(vec![root.clone()], None);
+    assert!(
+        operator
+            .list()
+            .iter()
+            .any(|skill| skill.name == "smuggled-dir"),
+        "operator-owned roots keep following links"
+    );
+
+    // A linked skills root under the workspace is refused as a whole.
+    super::clear_skill_discovery_cache();
+    let other = TempDir::new().unwrap();
+    std::fs::create_dir_all(other.path().join(".agents")).unwrap();
+    symlink(outside.path(), other.path().join(".agents").join("skills")).unwrap();
+    let registry = super::discover_from_directories_in_workspace(
+        vec![other.path().join(".agents").join("skills")],
+        Some(other.path()),
+        None,
+    );
+    assert!(registry.list().is_empty());
+    assert!(
+        registry
+            .warnings()
+            .join("\n")
+            .contains("Refusing symlinked path"),
+        "{:?}",
+        registry.warnings()
+    );
+}

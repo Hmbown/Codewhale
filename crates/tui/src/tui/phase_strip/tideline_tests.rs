@@ -468,6 +468,7 @@ fn completed_subagent(id: &str) -> crate::tools::subagent::SubAgentResult {
         git_branch: None,
         agent_type: crate::tools::subagent::FleetRole::Worker,
         assignment: crate::tools::subagent::SubAgentAssignment {
+            native_preset: None,
             objective: format!("objective-{id}"),
             role: Some("worker".to_string()),
         },

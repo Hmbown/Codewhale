@@ -320,6 +320,18 @@ The package is a small wrapper. Its `postinstall` step downloads the same
 manifest, and links `codewhale` and `codew` into npm's global `bin`. The whole
 thing took 6 s here.
 
+**Windows npm sessions:** Node remains the native program's launcher for the
+whole session. A process-name kill such as `taskkill /IM node.exe` or
+`Get-Process node | Stop-Process -Force` can interrupt this and other npm
+Codewhale sessions and prevent normal terminal cleanup. Stop only the server
+PID you started or the process owning its port, or use Codewhale's task
+cancellation. The Windows
+native archive/installer avoids this npm-parent dependency; this does not
+remove Node requirements for optional JavaScript tools. Codewhale's Windows
+shell safety floor holds recognized image-wide Node kills even in Full Access.
+An external hard kill or an arbitrary program that terminates the launcher
+cannot be made graceful by this shell-command check.
+
 ### If you get `EACCES: permission denied`
 
 That means Node is installed system-wide (apt, `/usr/local`, `/opt`), and your
@@ -378,7 +390,7 @@ sudo apt-get install -y build-essential pkg-config libdbus-1-dev git
 # Rust via rustup (the distro's cargo is too old for this edition-2024 workspace)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
-rustc --version            # the workspace declares rust-version = 1.88
+rustc --version            # the workspace declares rust-version = 1.89
 ```
 
 `libdbus-1-dev` **is required**. Without it the build fails after about a
@@ -407,7 +419,8 @@ Tested result: **works**, with current stable Rust (1.98.1).
 * `codewhale --version` prints `codewhale 0.10.0`, with no commit hash.
 * Headless and TUI smoke tests passed.
 
-> **The docs say "Rust 1.88+". That's wrong for v0.10.0.** With 1.88.0 the
+> **v0.10.0 declared "Rust 1.88+", which was wrong.** The workspace now
+> declares 1.89, the version CI's MSRV job builds. With 1.88.0 the v0.10.0
 > install fails in seconds:
 > `rustc 1.88.0 is not supported by the following package: serde-saphyr@1.3.0 requires rustc 1.89`.
 > Use current stable (`rustup update stable`).
@@ -1377,7 +1390,7 @@ Building on Windows requires the **MSVC C toolchain** from
 
 1. Install Visual Studio 2022 Build Tools — select the **"Desktop development
    with C++"** workload.
-2. Install [Rust](https://rustup.rs) 1.88+ (see the
+2. Install [Rust](https://rustup.rs) 1.89+ (see the
    [China mirror instructions](#china--mirror-friendly-install) above if
    downloading from mainland China).
 3. Install [Git for Windows](https://git-scm.com/download/win) (provides `git`
@@ -1493,6 +1506,22 @@ codewhale update
 The mirror directory must contain `codewhale-artifacts-sha256.txt` and the
 platform binaries from the GitHub release. The legacy
 `DEEPSEEK_TUI_RELEASE_BASE_URL` mirror variable remains supported as an alias.
+
+`codewhale update` only talks HTTPS, and only to GitHub's release hosts, the CNB
+mirror, and the host of the `CODEWHALE_RELEASE_BASE_URL` you set; every
+redirect hop is held to the same rule, so a plain-`http://` mirror is refused.
+A private mirror therefore works as soon as its base URL is HTTPS. If that
+mirror redirects asset downloads to a separate download host (a CDN or an
+object-store domain), name that host too:
+
+```bash
+CODEWHALE_UPDATE_ALLOWED_HOSTS=cdn.your-mirror.example.com,objects.example.net \
+CODEWHALE_RELEASE_BASE_URL=https://your-mirror.example.com/CodeWhale/vX.Y.Z/ \
+CODEWHALE_VERSION=X.Y.Z \
+codewhale update
+```
+
+The error message for a refused host names it and this variable.
 
 ### Windows and npm-download troubleshooting
 

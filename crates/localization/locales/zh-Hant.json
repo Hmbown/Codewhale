@@ -1,5 +1,7 @@
 {
+  "ExtensionPromptUnavailable": "擴充功能指令無法使用；請透過 /plugin show 查看。",
   "ComposerOversizedSubmitHeld": "未傳送：訊息超過 {limit} 個字元，無法儲存為貼上文字檔案（{error}）。完整文字仍保留在輸入框中：請縮短內容，或允許寫入 .codewhale/pastes，然後再次按 Enter。",
+  "ComposerOversizedSubmitHeldShort": "未傳送：超過 {limit} 個字元；貼上檔案未儲存。",
   "CmdPluginOwnerReport": "擴充功能主機：\n  狀態：{state}\n  活動工具（{count}）：{tools}",
   "CmdPluginOwnerActivating": "正在啟用",
   "CmdPluginOwnerActive": "已啟用",
@@ -2437,6 +2439,12 @@
   "ModelPickerReadinessRefreshed": "已重新整理模型就緒狀態 · 已重建目錄列",
   "ModelPickerOpenToRefresh": "開啟 /model 以重新整理就緒狀態和目錄",
   "ModelPickerPinnedChip": "已釘選",
+  "AuthSignedInAs": "已以 {account} 身分登入 {provider}。",
+  "AuthSignedInWithoutEmail": "已登入 {provider}（簽發者未提供帳戶電子郵件）。",
+  "AuthReplacedPreviousSignInAs": "已取代先前的 Codewhale {provider} 登入（{account}）。",
+  "AuthReplacedPreviousSignIn": "已取代先前的 Codewhale {provider} 登入。",
+  "AuthSameAccountAsBefore": "這與先前是同一個帳戶；若要使用其他 {provider} 帳戶，請先在瀏覽器中登出該帳戶（或使用無痕視窗），然後重新登入。",
+  "AuthEnvTokenOutranksSignIn": "此環境已設定 OPENAI_CODEX_ACCESS_TOKEN 或 CODEX_ACCESS_TOKEN，其優先順序高於本次登入；在取消設定之前，請求會繼續使用該權杖的帳戶。",
   "TranscriptThought": "思考完畢",
   "TranscriptThoughtFor": "思考耗時 {duration}",
   "PinnedPromptJumpToMessage": "跳轉到這則訊息"

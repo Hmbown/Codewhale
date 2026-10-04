@@ -2628,6 +2628,19 @@ mod tests {
         );
     }
 
+    /// The workspace lock sidecar is created through the confined, private
+    /// file helper: owner-only, never umask-widened.
+    #[cfg(unix)]
+    #[test]
+    fn ledger_lock_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let workspace = TempDir::new().unwrap();
+        let ledger = FleetLedger::open(workspace.path()).unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&ledger.lock_path), 0o600);
+        assert_eq!(mode(ledger.path()), 0o600);
+    }
+
     #[test]
     fn ledger_rejects_replaced_lock_identity() {
         let workspace = TempDir::new().unwrap();

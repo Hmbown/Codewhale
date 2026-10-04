@@ -659,11 +659,24 @@ fn fire_tool_completion_hooks(
         return;
     }
 
+    let input = app
+        .active_tool_details
+        .get(id)
+        .or_else(|| {
+            app.tool_cells
+                .get(id)
+                .and_then(|index| app.tool_details_by_cell.get(index))
+        })
+        .map(|detail| detail.input.clone());
     let context = app
         .base_hook_context()
         .with_tool_name(name)
         .with_tool_call_id(id)
         .with_tool_outcome(result);
+    let context = input.as_ref().map_or_else(
+        || context.clone(),
+        |input| context.clone().with_tool_args(input),
+    );
     let failed = context.tool_success == Some(false);
     let error_context = (wants_error && failed).then(|| {
         let text = context.tool_result.as_deref().unwrap_or_default();

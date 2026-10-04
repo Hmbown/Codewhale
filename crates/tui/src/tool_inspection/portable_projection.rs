@@ -71,6 +71,7 @@ pub(crate) fn tool_snapshot(
                 step_budget_source: terminal.step_budget_source.to_string(),
                 model_step_index: terminal.model_step_index,
                 model_requests_started: terminal.model_requests_started,
+                transport_retries: terminal.transport_retries,
                 transparent_stream_retries: terminal.transparent_stream_retries,
                 stream_resumes: terminal.stream_resumes,
                 reasoning_only_reprompts: terminal.reasoning_only_reprompts,

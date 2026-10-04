@@ -18,11 +18,11 @@ agents with different models and roles.
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="web/public/codewhale-tui-5765d80.png">
-  <img src="web/public/codewhale-tui-5765d80.png" alt="A Codewhale terminal session" width="720">
+  <source media="(prefers-color-scheme: dark)" srcset="web/public/codewhale-tui-e940149.png">
+  <img src="web/public/codewhale-tui-e940149.png" alt="A Codewhale terminal session" width="720">
 </picture>
 
-*Terminal preview from a v0.10.0 development build.*
+*Terminal preview from a v0.10.1 development build.*
 
 ## Install
 
@@ -83,8 +83,8 @@ or shell execution, and `/mode work` when you want it to make changes. Press
 
 ## Terminal, apps, and Computer Use
 
-The terminal and graphical clients connect to the Codewhale Runtime, which runs
-the agent and its tools:
+The terminal and graphical clients connect to the
+[Codewhale Engine](docs/ARCHITECTURE.md), which runs the agent and its tools:
 
 - **Terminal:** `codewhale` opens the interactive interface; `codewhale exec`
   runs a task from a script or CI job.

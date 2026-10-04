@@ -32,12 +32,12 @@
 //! below is a separate route/usage copy (never another money counter), and the
 //! shared test reset clears both stores.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::pricing::{CostEstimate, TurnCostAudit};
 use crate::route_billing::BillingPresentation;
 use codewhale_models::Usage;
@@ -84,6 +84,11 @@ pub struct PendingBackgroundCost {
     /// batch. These travel with the money so a session snapshot can make a
     /// replay idempotent after reload.
     pub usage_source_fingerprints: BTreeSet<String>,
+    /// Exact unresolved coverage in this same source ledger, bounded to 64.
+    pub missing_usage_sources: BTreeMap<String, MissingUsageCoverage>,
+    /// A late real receipt supersedes only this exact unresolved source.
+    pub resolved_missing_usage_sources: BTreeSet<String>,
+    pub missing_usage_overflowed: bool,
     /// Prompt-cache classes the background routes reported, through
     /// [`crate::pricing::token_usage_for_pricing`] so they never exceed the
     /// input they partition (#6565). `None` until a child reports cache
@@ -96,16 +101,34 @@ pub struct PendingBackgroundCost {
 /// Immutable, non-secret route evidence captured before a provider request.
 /// It contains enough information to audit the eventual usage without reading
 /// mutable parent/app config at completion time.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveRouteEnvelope {
-    pub provider: ApiProvider,
+    pub provider: ProviderKind,
     pub provider_identity: String,
     pub model: String,
     /// Requested OpenRouter upstream, frozen with the client that dispatched.
-    #[serde(default)]
     pub openrouter_vendor: Option<String>,
     pub billing_surface: Option<String>,
     pub endpoint_fingerprint: Option<String>,
+    /// Frozen provider-live or signed cloud rates captured from the exact catalog scope
+    /// at CodeWhale's pre-permit application-dispatch boundary. Legacy
+    /// receipts omit this and therefore cannot meter a reviewed custom route
+    /// retroactively.
+    pub provider_live_pricing: Option<crate::provider_catalog_live::ProviderLivePricingQuote>,
+    pub billing_mode: RouteBillingMode,
+    pub dispatched_at: DateTime<Utc>,
+}
+
+#[derive(serde::Deserialize)]
+struct EffectiveRouteEnvelopeWire {
+    provider: String,
+    provider_identity: String,
+    model: String,
+    /// Requested OpenRouter upstream, frozen with the client that dispatched.
+    #[serde(default)]
+    openrouter_vendor: Option<String>,
+    billing_surface: Option<String>,
+    endpoint_fingerprint: Option<String>,
     /// Frozen provider-live or signed cloud rates captured from the exact catalog scope
     /// at CodeWhale's pre-permit application-dispatch boundary. Legacy
     /// receipts omit this and therefore cannot meter a reviewed custom route
@@ -114,10 +137,35 @@ pub struct EffectiveRouteEnvelope {
         default,
         deserialize_with = "crate::provider_catalog_live::deserialize_optional_provider_live_pricing"
     )]
-    pub provider_live_pricing: Option<crate::provider_catalog_live::ProviderLivePricingQuote>,
+    provider_live_pricing: Option<crate::provider_catalog_live::ProviderLivePricingQuote>,
     #[serde(default)]
-    pub billing_mode: RouteBillingMode,
-    pub dispatched_at: DateTime<Utc>,
+    billing_mode: RouteBillingMode,
+    dispatched_at: DateTime<Utc>,
+}
+
+impl<'de> serde::Deserialize<'de> for EffectiveRouteEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = <EffectiveRouteEnvelopeWire as serde::Deserialize>::deserialize(deserializer)?;
+        let provider = codewhale_config::descriptors::kind_from_tui_wire_tag(
+            &wire.provider,
+            &wire.provider_identity,
+        )
+        .ok_or_else(|| serde::de::Error::custom("contradictory usage provider identity"))?;
+        Ok(Self {
+            provider,
+            provider_identity: wire.provider_identity,
+            model: wire.model,
+            openrouter_vendor: wire.openrouter_vendor,
+            billing_surface: wire.billing_surface,
+            endpoint_fingerprint: wire.endpoint_fingerprint,
+            provider_live_pricing: wire.provider_live_pricing,
+            billing_mode: wire.billing_mode,
+            dispatched_at: wire.dispatched_at,
+        })
+    }
 }
 
 impl serde::Serialize for EffectiveRouteEnvelope {
@@ -132,7 +180,12 @@ impl serde::Serialize for EffectiveRouteEnvelope {
             "EffectiveRouteEnvelope",
             8 + usize::from(route.openrouter_vendor.is_some()),
         )?;
-        state.serialize_field("provider", &route.provider)?;
+        let provider = codewhale_config::descriptors::tui_wire_tag_for_route(
+            route.provider,
+            &route.provider_identity,
+        )
+        .ok_or_else(|| serde::ser::Error::custom("contradictory usage provider identity"))?;
+        state.serialize_field("provider", provider)?;
         state.serialize_field("provider_identity", &route.provider_identity)?;
         state.serialize_field("model", &route.model)?;
         if let Some(vendor) = &route.openrouter_vendor {
@@ -181,20 +234,79 @@ impl From<BillingPresentation> for RouteBillingMode {
 }
 
 impl EffectiveRouteEnvelope {
+    /// Provider-neutral observation. This never opens configuration or credentials.
     #[must_use]
-    pub fn capture(
-        config: Option<&crate::config::Config>,
-        provider: ApiProvider,
+    pub fn capture_observed(
+        provider: ProviderKind,
         provider_identity: impl Into<String>,
         model: impl Into<String>,
         base_url: Option<&str>,
         dispatched_at: DateTime<Utc>,
     ) -> Self {
-        let provider_identity = provider_identity.into();
+        let key = provider_identity.into();
+        Self::from_facts(None, (provider, &key), model, base_url, dispatched_at)
+    }
+
+    #[cfg(test)]
+    pub fn capture(
+        config: Option<&crate::config::Config>,
+        provider: ProviderKind,
+        provider_identity: impl Into<String>,
+        model: impl Into<String>,
+        base_url: Option<&str>,
+        dispatched_at: DateTime<Utc>,
+    ) -> Self {
+        let key = provider_identity.into();
+        if let Some(config) = config
+            && let Ok(identity) =
+                config.resolve_persisted_provider_identity(Some(provider.as_str()), Some(&key))
+        {
+            Self::from_admitted(Some(config), &identity, model, base_url, dispatched_at)
+        } else {
+            Self::capture_observed(provider, key, model, base_url, dispatched_at)
+        }
+    }
+
+    #[must_use]
+    pub fn from_admitted(
+        config: Option<&crate::config::Config>,
+        identity: &crate::config::ProviderIdentity,
+        model: impl Into<String>,
+        base_url: Option<&str>,
+        dispatched_at: DateTime<Utc>,
+    ) -> Self {
+        let admission = config
+            .filter(|config| config.verify_provider_identity(identity).is_ok())
+            .map(|config| (config, identity));
+        Self::from_facts(
+            admission,
+            (identity.provider, identity.key.as_str()),
+            model,
+            base_url,
+            dispatched_at,
+        )
+    }
+
+    fn from_facts(
+        admission: Option<(&crate::config::Config, &crate::config::ProviderIdentity)>,
+        facts: (ProviderKind, &str),
+        model: impl Into<String>,
+        base_url: Option<&str>,
+        dispatched_at: DateTime<Utc>,
+    ) -> Self {
+        let (provider, provider_identity) = facts;
+        let config = admission.map(|(config, _)| config);
         let model = model.into();
-        let billing = config.map_or_else(
+        let billing = admission.map_or_else(
             || crate::route_billing::for_endpoint_without_config(provider, base_url),
-            |config| crate::route_billing::for_route(config, provider),
+            |(config, identity)| {
+                base_url.map_or_else(
+                    || crate::route_billing::for_route(config, identity),
+                    |endpoint| {
+                        crate::route_billing::for_route_with_endpoint(config, identity, endpoint)
+                    },
+                )
+            },
         );
         let endpoint_fingerprint = base_url.and_then(endpoint_fingerprint);
         let provider_live_pricing = base_url.and_then(|base_url| {
@@ -206,7 +318,7 @@ impl EffectiveRouteEnvelope {
                             crate::provider_catalog_live::configured_dispatch_pricing_quote_at(
                                 config.custom_models.as_deref().unwrap_or_default(),
                                 provider,
-                                &provider_identity,
+                                provider_identity,
                                 &model,
                                 base_url,
                                 at,
@@ -215,7 +327,7 @@ impl EffectiveRouteEnvelope {
                         || {
                             crate::provider_catalog_live::fresh_dispatch_pricing_quote_at(
                                 provider,
-                                &provider_identity,
+                                provider_identity,
                                 &model,
                                 base_url,
                                 at,
@@ -226,19 +338,27 @@ impl EffectiveRouteEnvelope {
         });
         Self {
             provider,
-            provider_identity: sanitize_persisted_route_label(&provider_identity),
+            provider_identity: sanitize_persisted_route_label(provider_identity),
             model: sanitize_persisted_route_label(&model),
-            openrouter_vendor: config
-                .filter(|_| provider == ApiProvider::Openrouter)
-                .and_then(|config| config.provider_config_for(provider))
+            openrouter_vendor: admission
+                .filter(|_| provider == ProviderKind::Openrouter)
+                .and_then(|(config, identity)| config.provider_config_for(identity))
                 .and_then(|entry| entry.vendor.as_deref())
                 .map(str::trim)
                 .filter(|vendor| !vendor.is_empty())
                 .map(sanitize_persisted_route_label),
-            billing_surface: crate::route_billing::billing_surface_for_dispatch(
-                config, provider, base_url,
-            )
-            .map(str::to_string),
+            billing_surface: admission
+                .map_or_else(
+                    || crate::pricing::billing_surface_for_route(provider, base_url),
+                    |(config, identity)| {
+                        crate::route_billing::billing_surface_for_dispatch(
+                            Some(config),
+                            identity,
+                            base_url,
+                        )
+                    },
+                )
+                .map(str::to_string),
             endpoint_fingerprint,
             provider_live_pricing,
             billing_mode: billing.into(),
@@ -286,7 +406,7 @@ impl EffectiveRouteEnvelope {
         // price. An endpoint match alone must not promote that aggregate rate.
         // An operator's own declared rate for this exact route is not the
         // aggregate catalog, so it still prices the pinned turn.
-        if self.provider == ApiProvider::Openrouter
+        if self.provider == ProviderKind::Openrouter
             && self.openrouter_vendor.is_some()
             && !declared_quote.is_some_and(|quote| quote.carries_rates())
         {
@@ -539,14 +659,10 @@ pub fn attach_child_usage_batch_metadata(
         .drop_records
         .iter()
         .take(remaining)
-        .map(|record| {
-            serde_json::json!({
-                "source_id": format!(
-                    "routed:{}",
-                    usage_source_fingerprint(&record.source_id)
-                ),
-                "route": record.route.sanitized_for_persistence(),
-            })
+        .map(|record| RuntimeUsageDropRecord {
+            reason: record.reason,
+            source_id: format!("routed:{}", usage_source_fingerprint(&record.source_id)),
+            route: record.route.sanitized_for_persistence(),
         })
         .collect::<Vec<_>>();
     object.insert(
@@ -654,6 +770,12 @@ pub fn child_usage_records_from_metadata(
                     .ok()?
                     .sanitized_for_persistence();
             Some(RuntimeUsageDropRecord {
+                reason: value
+                    .get("reason")
+                    .map(|value| serde_json::from_value(value.clone()))
+                    .transpose()
+                    .ok()?
+                    .unwrap_or_default(),
                 source_id: usage_source_fingerprint(source_id),
                 route,
             })
@@ -719,7 +841,7 @@ pub fn child_route_envelope_from_metadata(
         && dispatched_at.is_some();
     Some(
         EffectiveRouteEnvelope {
-            provider: provider.unwrap_or(ApiProvider::Custom),
+            provider: provider.unwrap_or(ProviderKind::Custom),
             provider_identity: provider_identity.unwrap_or_else(|| "legacy-unreported".to_string()),
             model,
             openrouter_vendor: metadata
@@ -811,6 +933,8 @@ struct ScopedPendingBackgroundCost {
     /// All provider responses accepted in this session generation, including
     /// batches already drained into the live session projection.
     seen_usage_source_fingerprints: HashSet<String>,
+    missing_usage_sources: BTreeMap<String, MissingUsageCoverage>,
+    missing_usage_overflowed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -894,10 +1018,94 @@ pub struct RuntimeUsageRecord {
 /// subscription/local calls without consulting mutable completion-time config.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeUsageDropRecord {
+    #[serde(default, skip_serializing_if = "RuntimeUsageMissingReason::is_success")]
+    pub reason: RuntimeUsageMissingReason,
     pub source_id: String,
     pub route: EffectiveRouteEnvelope,
 }
 
+/// Why this dispatched request has no usable usage receipt. Legacy bytes
+/// mean a successful response omitted usage, never an inferred failure charge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeUsageMissingReason {
+    #[default]
+    SuccessWithoutUsage,
+    RequestOutcomeUnknown,
+}
+impl RuntimeUsageMissingReason {
+    pub fn is_success(&self) -> bool {
+        *self == Self::SuccessWithoutUsage
+    }
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::SuccessWithoutUsage => "provider_success_missing_usage",
+            Self::RequestOutcomeUnknown => "request_outcome_unknown",
+        }
+    }
+}
+/// Minimal, redacted unresolved-source metadata carried by the existing cost
+/// snapshot. It retains no endpoint/model/secret and never infers token usage.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MissingUsageCoverage {
+    pub reason: RuntimeUsageMissingReason,
+    pub money_metered: bool,
+    pub route_sha256: String,
+}
+pub(crate) const MAX_MISSING_USAGE_SOURCES: usize = 64;
+pub(crate) fn deserialize_missing_usage_sources<'de, D>(
+    d: D,
+) -> Result<BTreeMap<String, MissingUsageCoverage>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let values = BTreeMap::<String, MissingUsageCoverage>::deserialize(d)?;
+    if values.len() > MAX_MISSING_USAGE_SOURCES
+        || values
+            .keys()
+            .any(|key| key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()))
+        || values.values().any(|value| {
+            !value.route_sha256.is_empty()
+                && (value.route_sha256.len() != 64
+                    || !value
+                        .route_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit()))
+        })
+    {
+        return Err(serde::de::Error::custom(
+            "unbounded or invalid missing-usage source ledger",
+        ));
+    }
+    Ok(values)
+}
+impl MissingUsageCoverage {
+    pub(crate) fn for_route(
+        route: &EffectiveRouteEnvelope,
+        reason: RuntimeUsageMissingReason,
+    ) -> Self {
+        Self {
+            reason,
+            money_metered: !matches!(
+                route.billing_mode,
+                RouteBillingMode::Subscription | RouteBillingMode::Local
+            ),
+            route_sha256: serde_json::to_string(&route.sanitized_for_persistence())
+                .map(|value| usage_source_fingerprint(&value))
+                .unwrap_or_default(),
+        }
+    }
+    pub(crate) fn matches_route(&self, route: &EffectiveRouteEnvelope) -> bool {
+        !self.route_sha256.is_empty()
+            && self.route_sha256 == Self::for_route(route, self.reason).route_sha256
+    }
+}
+impl RuntimeUsageDropRecord {
+    pub(crate) fn coverage(&self) -> MissingUsageCoverage {
+        MissingUsageCoverage::for_route(&self.route, self.reason)
+    }
+}
 /// Provider decision evidence attached to the existing origin-turn ledger.
 /// It is diagnostic evidence, never an instruction to change the model route.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -998,7 +1206,7 @@ struct RuntimeUsageSinkEntry {
 pub(crate) fn decision_receipt_fixture(source_id: &str) -> RuntimeDecisionReceipt {
     let mut route = EffectiveRouteEnvelope::capture(
         None,
-        crate::config::ApiProvider::Custom,
+        crate::config::ProviderKind::Custom,
         "typesafe",
         "jev-latest",
         Some("https://api.typesafe.ai/v1"),
@@ -1154,6 +1362,26 @@ fn record_runtime_usage(
     }
     with_runtime_usage_journal_mut(|journal| {
         let owner_journal = journal.entry(owner.to_string()).or_default();
+        if owner_journal.records.iter().any(|old| {
+            usage_source_fingerprint(&old.source_id) == usage_source_fingerprint(source_id)
+        }) {
+            return;
+        }
+        let fingerprint = usage_source_fingerprint(source_id);
+        if let Some(index) = owner_journal
+            .drop_records
+            .iter()
+            .position(|old| usage_source_fingerprint(&old.source_id) == fingerprint)
+        {
+            if owner_journal.drop_records[index].route != record.usage.route {
+                return;
+            }
+            owner_journal.drop_records.remove(index);
+            owner_journal.dropped_records = owner_journal.dropped_records.saturating_sub(1);
+            owner_journal
+                .dropped_source_fingerprints
+                .remove(&fingerprint);
+        }
         if owner_journal.records.len() == MAX_RUNTIME_USAGE_RECORDS_PER_OWNER {
             owner_journal.records.pop_front();
             owner_journal.dropped_records = owner_journal.dropped_records.saturating_add(1);
@@ -1163,6 +1391,19 @@ fn record_runtime_usage(
 }
 
 fn record_runtime_usage_drop(owner: &str, source_id: &str, route: &EffectiveRouteEnvelope) {
+    record_runtime_usage_missing(
+        owner,
+        source_id,
+        route,
+        RuntimeUsageMissingReason::SuccessWithoutUsage,
+    );
+}
+fn record_runtime_usage_missing(
+    owner: &str,
+    source_id: &str,
+    route: &EffectiveRouteEnvelope,
+    reason: RuntimeUsageMissingReason,
+) {
     let owner = owner.trim();
     if owner.is_empty() {
         return;
@@ -1174,6 +1415,7 @@ fn record_runtime_usage_drop(owner: &str, source_id: &str, route: &EffectiveRout
             .and_then(|entry| entry.dropped_sink.as_ref().map(Arc::clone))
     });
     let record = RuntimeUsageDropRecord {
+        reason,
         source_id: source_id.to_string(),
         route: route.sanitized_for_persistence(),
     };
@@ -1182,6 +1424,13 @@ fn record_runtime_usage_drop(owner: &str, source_id: &str, route: &EffectiveRout
     }
     with_runtime_usage_journal_mut(|journal| {
         let owner_journal = journal.entry(owner.to_string()).or_default();
+        if owner_journal
+            .records
+            .iter()
+            .any(|old| usage_source_fingerprint(&old.source_id) == fingerprint)
+        {
+            return;
+        }
         if owner_journal
             .dropped_source_fingerprints
             .contains(&fingerprint)
@@ -1417,12 +1666,13 @@ fn register_persistent_interactive_runtime_usage_sink_at(
         Some(Arc::new(move |record| {
             crate::session_manager::SessionManager::new(sessions_dir.clone())
                 .map(|manager| {
-                    report_unreceipted_for_interactive_origin_with_manager(
+                    report_missing_usage_for_interactive_origin_with_manager(
                         scope,
                         &drop_session_id,
                         &drop_turn_id,
                         &record.source_id,
                         &record.route,
+                        record.reason,
                         &manager,
                     )
                 })
@@ -1607,6 +1857,8 @@ pub fn close_current_scope() -> PendingBackgroundCost {
         let pending = std::mem::take(&mut state.pending);
         state.generation = state.generation.wrapping_add(1);
         state.seen_usage_source_fingerprints.clear();
+        state.missing_usage_sources.clear();
+        state.missing_usage_overflowed = false;
         pending
     })
 }
@@ -1614,10 +1866,30 @@ pub fn close_current_scope() -> PendingBackgroundCost {
 /// Restore the durable response identities belonging to the newly loaded
 /// session. Callers close the previous scope before loading, so replacing the
 /// set cannot make another session's usage visible here.
+#[cfg(test)]
 pub(crate) fn restore_usage_source_fingerprints(fingerprints: impl IntoIterator<Item = String>) {
     with_pending_state_mut(|state| {
         state.seen_usage_source_fingerprints = fingerprints.into_iter().collect();
     })
+}
+
+pub(crate) fn restore_usage_source_ledger(
+    fingerprints: impl IntoIterator<Item = String>,
+    missing: &BTreeMap<String, MissingUsageCoverage>,
+    overflowed: bool,
+) {
+    with_pending_state_mut(|state| {
+        state.missing_usage_sources = missing
+            .iter()
+            .take(MAX_MISSING_USAGE_SOURCES)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        state.missing_usage_overflowed = overflowed || missing.len() > MAX_MISSING_USAGE_SOURCES;
+        state.seen_usage_source_fingerprints = fingerprints
+            .into_iter()
+            .filter(|key| !state.missing_usage_sources.contains_key(key))
+            .collect();
+    });
 }
 
 /// Mark a deleted origin's response handled in its original live generation.
@@ -1639,7 +1911,10 @@ fn acknowledge_retired_usage_source(scope: CostScopeToken, source_id: &str) {
 #[must_use]
 pub(crate) fn usage_source_seen(source_id: &str) -> bool {
     let fingerprint = usage_source_fingerprint(source_id);
-    with_pending_state_mut(|state| state.seen_usage_source_fingerprints.contains(&fingerprint))
+    with_pending_state_mut(|state| {
+        state.seen_usage_source_fingerprints.contains(&fingerprint)
+            || state.missing_usage_sources.contains_key(&fingerprint)
+    })
 }
 
 /// The non-secret identity of a background LLM call's route.
@@ -1653,7 +1928,7 @@ pub(crate) fn usage_source_seen(source_id: &str) -> bool {
 #[cfg(test)]
 pub struct BackgroundRoute<'a> {
     /// Provider kind serving the call.
-    pub provider: ApiProvider,
+    pub provider: ProviderKind,
     /// Configured route identity (the `[providers.<name>]` key), when the
     /// caller has one. This is a user-chosen label, not a credential.
     pub provider_identity: Option<&'a str>,
@@ -1670,7 +1945,7 @@ pub struct BackgroundRoute<'a> {
 impl<'a> BackgroundRoute<'a> {
     /// A route with no endpoint information.
     #[must_use]
-    pub fn new(provider: ApiProvider, wire_model: &'a str) -> Self {
+    pub fn new(provider: ProviderKind, wire_model: &'a str) -> Self {
         Self {
             provider,
             provider_identity: None,
@@ -1731,7 +2006,7 @@ impl<'a> BackgroundRoute<'a> {
 /// background pool cannot describe the same route two different ways.
 #[must_use]
 pub fn route_receipt(
-    provider: ApiProvider,
+    provider: ProviderKind,
     provider_identity: Option<&str>,
     wire_model: &str,
     billing_surface: Option<&str>,
@@ -2065,10 +2340,27 @@ pub(crate) fn report_unreceipted_for_interactive_origin(
     source_id: &str,
     route: &EffectiveRouteEnvelope,
 ) {
+    report_missing_usage_for_interactive_origin(
+        scope,
+        session_id,
+        turn_id,
+        source_id,
+        route,
+        RuntimeUsageMissingReason::SuccessWithoutUsage,
+    );
+}
+pub(crate) fn report_missing_usage_for_interactive_origin(
+    scope: CostScopeToken,
+    session_id: &str,
+    turn_id: &str,
+    source_id: &str,
+    route: &EffectiveRouteEnvelope,
+    reason: RuntimeUsageMissingReason,
+) {
     let persisted =
         crate::session_manager::SessionManager::default_location().is_ok_and(|manager| {
-            report_unreceipted_for_interactive_origin_with_manager(
-                scope, session_id, turn_id, source_id, route, &manager,
+            report_missing_usage_for_interactive_origin_with_manager(
+                scope, session_id, turn_id, source_id, route, reason, &manager,
             )
         });
     if !persisted {
@@ -2078,6 +2370,7 @@ pub(crate) fn report_unreceipted_for_interactive_origin(
     }
 }
 
+#[cfg(test)]
 fn report_unreceipted_for_interactive_origin_with_manager(
     scope: CostScopeToken,
     session_id: &str,
@@ -2086,7 +2379,27 @@ fn report_unreceipted_for_interactive_origin_with_manager(
     route: &EffectiveRouteEnvelope,
     manager: &crate::session_manager::SessionManager,
 ) -> bool {
+    report_missing_usage_for_interactive_origin_with_manager(
+        scope,
+        session_id,
+        turn_id,
+        source_id,
+        route,
+        RuntimeUsageMissingReason::SuccessWithoutUsage,
+        manager,
+    )
+}
+fn report_missing_usage_for_interactive_origin_with_manager(
+    scope: CostScopeToken,
+    session_id: &str,
+    turn_id: &str,
+    source_id: &str,
+    route: &EffectiveRouteEnvelope,
+    reason: RuntimeUsageMissingReason,
+    manager: &crate::session_manager::SessionManager,
+) -> bool {
     let record = RuntimeUsageDropRecord {
+        reason,
         source_id: source_id.to_string(),
         route: route.sanitized_for_persistence(),
     };
@@ -2119,12 +2432,28 @@ pub(crate) fn report_unreceipted_provider_success(
     source_id: &str,
     route: &EffectiveRouteEnvelope,
 ) {
+    report_missing_runtime_usage(
+        scope,
+        runtime_owner,
+        source_id,
+        route,
+        RuntimeUsageMissingReason::SuccessWithoutUsage,
+    );
+}
+pub(crate) fn report_missing_runtime_usage(
+    scope: CostScopeToken,
+    runtime_owner: Option<&str>,
+    source_id: &str,
+    route: &EffectiveRouteEnvelope,
+    reason: RuntimeUsageMissingReason,
+) {
     if let Some(owner) = runtime_owner {
-        record_runtime_usage_drop(owner, source_id, route);
+        record_runtime_usage_missing(owner, source_id, route, reason);
     } else {
         record_interactive_runtime_usage_drop(
             scope,
             RuntimeUsageDropRecord {
+                reason,
                 source_id: source_id.to_string(),
                 route: route.sanitized_for_persistence(),
             },
@@ -2158,7 +2487,13 @@ pub(crate) fn report_runtime_usage_batch(
         );
     }
     for record in &batch.drop_records {
-        report_unreceipted_provider_success(scope, runtime_owner, &record.source_id, &record.route);
+        report_missing_runtime_usage(
+            scope,
+            runtime_owner,
+            &record.source_id,
+            &record.route,
+            record.reason,
+        );
     }
 
     let residual = batch
@@ -2203,6 +2538,7 @@ pub(crate) fn background_cost_for_runtime_usage(
 ) -> PendingBackgroundCost {
     if record.usage.usage == Usage::default() {
         return background_cost_for_runtime_drop(&RuntimeUsageDropRecord {
+            reason: crate::cost_status::RuntimeUsageMissingReason::default(),
             source_id: record.source_id.clone(),
             route: record.usage.route.clone(),
         });
@@ -2211,7 +2547,10 @@ pub(crate) fn background_cost_for_runtime_usage(
     let fingerprint = usage_source_fingerprint(&record.source_id);
     let audit = record.usage.route.audit(&record.usage.usage);
     let receipt = record.usage.route.receipt(&audit);
-    pending.usage_source_fingerprints.insert(fingerprint);
+    pending
+        .usage_source_fingerprints
+        .insert(fingerprint.clone());
+    pending.resolved_missing_usage_sources.insert(fingerprint);
     fold_audit_into_pending(&mut pending, receipt, &audit, &record.usage.usage);
     pending
 }
@@ -2221,23 +2560,82 @@ pub(crate) fn background_cost_for_runtime_drop(
     record: &RuntimeUsageDropRecord,
 ) -> PendingBackgroundCost {
     let mut pending = PendingBackgroundCost::default();
+    let fingerprint = usage_source_fingerprint(&record.source_id);
     pending
         .usage_source_fingerprints
-        .insert(usage_source_fingerprint(&record.source_id));
-    if !matches!(
-        record.route.billing_mode,
-        RouteBillingMode::Subscription | RouteBillingMode::Local
-    ) {
+        .insert(fingerprint.clone());
+    pending
+        .missing_usage_sources
+        .insert(fingerprint, record.coverage());
+    if record.coverage().money_metered {
         pending.unpriced_turns = 1;
         pending.cny_unpriced_turns = 1;
-        pending
-            .unpriced_reasons
-            .insert("provider_success_missing_usage");
-        pending
-            .cny_unpriced_reasons
-            .insert("provider_success_missing_usage");
+        pending.unpriced_reasons.insert(record.reason.label());
+        pending.cny_unpriced_reasons.insert(record.reason.label());
     }
     pending
+}
+/// Reconcile exact missing slots in a projection before adding real usage.
+/// Overflow and legacy unattributed gaps are never erased by this operation.
+pub(crate) fn reconcile_missing_usage_sources(
+    missing: &mut BTreeMap<String, MissingUsageCoverage>,
+    resolved: &BTreeSet<String>,
+    unpriced: &mut u32,
+    cny_unpriced: &mut u32,
+) {
+    for fingerprint in resolved {
+        if missing
+            .remove(fingerprint)
+            .is_some_and(|coverage| coverage.money_metered)
+        {
+            *unpriced = unpriced.saturating_sub(1);
+            *cny_unpriced = cny_unpriced.saturating_sub(1);
+        }
+    }
+}
+
+/// Apply bounded unresolved metadata to an existing cost projection. The
+/// returned batch omits exact identities whose missing slots overflowed; a
+/// real receipt for such an id can still settle once, but cannot erase the gap.
+pub(crate) fn project_missing_usage_ledger(
+    missing: &mut BTreeMap<String, MissingUsageCoverage>,
+    overflowed: &mut bool,
+    unpriced: &mut u32,
+    cny_unpriced: &mut u32,
+    pool: &PendingBackgroundCost,
+) -> PendingBackgroundCost {
+    reconcile_missing_usage_sources(
+        missing,
+        &pool.resolved_missing_usage_sources,
+        unpriced,
+        cny_unpriced,
+    );
+    let mut pool = pool.clone();
+    for (fingerprint, coverage) in &pool.missing_usage_sources {
+        if missing.contains_key(fingerprint) {
+            continue;
+        }
+        if missing.len() < MAX_MISSING_USAGE_SOURCES {
+            missing.insert(fingerprint.clone(), coverage.clone());
+        } else {
+            pool.usage_source_fingerprints.remove(fingerprint);
+            if coverage.money_metered {
+                pool.unpriced_turns = pool.unpriced_turns.saturating_sub(1);
+                pool.cny_unpriced_turns = pool.cny_unpriced_turns.saturating_sub(1);
+            }
+            if !*overflowed && !pool.missing_usage_overflowed {
+                pool.missing_usage_overflowed = true;
+                pool.unpriced_turns = pool.unpriced_turns.saturating_add(1);
+                pool.cny_unpriced_turns = pool.cny_unpriced_turns.saturating_add(1);
+                pool.unpriced_reasons
+                    .insert("missing_usage_source_overflow");
+                pool.cny_unpriced_reasons
+                    .insert("missing_usage_source_overflow");
+            }
+        }
+    }
+    *overflowed |= pool.missing_usage_overflowed;
+    pool
 }
 
 /// Fold one already-computed audit into the pending pool.
@@ -2256,6 +2654,7 @@ fn record_interactive_runtime_usage(scope: CostScopeToken, record: RuntimeUsageR
         return record_interactive_runtime_usage_drop(
             scope,
             RuntimeUsageDropRecord {
+                reason: RuntimeUsageMissingReason::SuccessWithoutUsage,
                 source_id: record.source_id,
                 route: record.usage.route,
             },
@@ -2266,11 +2665,37 @@ fn record_interactive_runtime_usage(scope: CostScopeToken, record: RuntimeUsageR
             return false;
         }
         let fingerprint = usage_source_fingerprint(&record.source_id);
+        if state
+            .missing_usage_sources
+            .get(&fingerprint)
+            .is_some_and(|coverage| !coverage.matches_route(&record.usage.route))
+        {
+            return true;
+        }
         if !state
             .seen_usage_source_fingerprints
             .insert(fingerprint.clone())
         {
             return true;
+        }
+        if let Some(coverage) = state.missing_usage_sources.remove(&fingerprint) {
+            if state
+                .pending
+                .missing_usage_sources
+                .remove(&fingerprint)
+                .is_some()
+            {
+                if coverage.money_metered {
+                    state.pending.unpriced_turns = state.pending.unpriced_turns.saturating_sub(1);
+                    state.pending.cny_unpriced_turns =
+                        state.pending.cny_unpriced_turns.saturating_sub(1);
+                }
+            } else {
+                state
+                    .pending
+                    .resolved_missing_usage_sources
+                    .insert(fingerprint.clone());
+            }
         }
         let audit = record.usage.route.audit(&record.usage.usage);
         let receipt = record.usage.route.receipt(&audit);
@@ -2279,7 +2704,6 @@ fn record_interactive_runtime_usage(scope: CostScopeToken, record: RuntimeUsageR
         true
     })
 }
-
 fn record_interactive_runtime_usage_drop(
     scope: CostScopeToken,
     record: RuntimeUsageDropRecord,
@@ -2289,29 +2713,47 @@ fn record_interactive_runtime_usage_drop(
             return false;
         }
         let fingerprint = usage_source_fingerprint(&record.source_id);
-        if !state
-            .seen_usage_source_fingerprints
-            .insert(fingerprint.clone())
+        if state.seen_usage_source_fingerprints.contains(&fingerprint)
+            || state.missing_usage_sources.contains_key(&fingerprint)
         {
             return true;
         }
-        state.pending.usage_source_fingerprints.insert(fingerprint);
-        if matches!(
-            record.route.billing_mode,
-            RouteBillingMode::Subscription | RouteBillingMode::Local
-        ) {
+        if state.missing_usage_sources.len() == MAX_MISSING_USAGE_SOURCES {
+            if !state.missing_usage_overflowed {
+                state.missing_usage_overflowed = true;
+                state.pending.missing_usage_overflowed = true;
+                state.pending.unpriced_turns = state.pending.unpriced_turns.saturating_add(1);
+                state.pending.cny_unpriced_turns =
+                    state.pending.cny_unpriced_turns.saturating_add(1);
+                state
+                    .pending
+                    .unpriced_reasons
+                    .insert("missing_usage_source_overflow");
+                state
+                    .pending
+                    .cny_unpriced_reasons
+                    .insert("missing_usage_source_overflow");
+            }
             return true;
         }
-        state.pending.unpriced_turns = state.pending.unpriced_turns.saturating_add(1);
-        state.pending.cny_unpriced_turns = state.pending.cny_unpriced_turns.saturating_add(1);
+        let coverage = record.coverage();
+        state
+            .missing_usage_sources
+            .insert(fingerprint.clone(), coverage.clone());
         state
             .pending
-            .unpriced_reasons
-            .insert("provider_success_missing_usage");
-        state
-            .pending
-            .cny_unpriced_reasons
-            .insert("provider_success_missing_usage");
+            .missing_usage_sources
+            .insert(fingerprint.clone(), coverage.clone());
+        state.pending.usage_source_fingerprints.insert(fingerprint);
+        if coverage.money_metered {
+            state.pending.unpriced_turns = state.pending.unpriced_turns.saturating_add(1);
+            state.pending.cny_unpriced_turns = state.pending.cny_unpriced_turns.saturating_add(1);
+            state.pending.unpriced_reasons.insert(record.reason.label());
+            state
+                .pending
+                .cny_unpriced_reasons
+                .insert(record.reason.label());
+        }
         true
     })
 }
@@ -2435,6 +2877,8 @@ pub fn reset_for_tests() {
     with_pending_state_mut(|state| {
         state.pending = PendingBackgroundCost::default();
         state.seen_usage_source_fingerprints.clear();
+        state.missing_usage_sources.clear();
+        state.missing_usage_overflowed = false;
     });
     with_runtime_usage_journal_mut(HashMap::clear);
 }
@@ -2466,7 +2910,7 @@ mod tests {
         .unwrap();
         let receipt = EffectiveRouteEnvelope::capture(
             Some(&config),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek",
             "deepseek-v4.1-flash-expires-on-0910",
             Some("https://models.example.test/v1"),
@@ -2538,7 +2982,7 @@ mod tests {
         assert!(unknown.provider_live_pricing.is_some());
         assert!(unknown.audit(&usage).estimate.is_none());
         let mut pinned = receipt;
-        pinned.provider = ApiProvider::Openrouter;
+        pinned.provider = ProviderKind::Openrouter;
         pinned.openrouter_vendor = Some("exact-upstream".into());
         pinned.billing_mode = RouteBillingMode::Metered;
         assert_eq!(
@@ -2553,7 +2997,7 @@ mod tests {
         config.set_legacy_root(Some("fixture-not-a-provider-credential".into()), None);
         let id = "deepseek-v4.1-flash-expires-on-0910";
         let route =
-            crate::route_runtime::resolve_runtime_route(&config, ApiProvider::Deepseek, Some(id))
+            crate::route_runtime::resolve_runtime_route(&config, ProviderKind::Deepseek, Some(id))
                 .unwrap();
         let client =
             crate::client::CodewhaleClient::from_candidate(&config, &route.candidate).unwrap();
@@ -2594,7 +3038,7 @@ mod tests {
     ) -> crate::client::CodewhaleClient {
         let route = crate::route_runtime::resolve_runtime_route(
             config,
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             Some(DECLARED_OPENROUTER_MODEL),
         )
         .expect("declared OpenRouter route");
@@ -2628,7 +3072,7 @@ mod tests {
         let quote_for = |client: &crate::client::CodewhaleClient| {
             crate::client::main_turn_pricing_quote_at(
                 Some(client),
-                ApiProvider::Openrouter,
+                ProviderKind::Openrouter,
                 "openrouter",
                 DECLARED_OPENROUTER_MODEL,
                 &fingerprint,
@@ -2690,7 +3134,7 @@ mod tests {
         let capture = |extra: &str| {
             EffectiveRouteEnvelope::capture(
                 Some(&openrouter_declared_config(extra, Some("cerebras"))),
-                ApiProvider::Openrouter,
+                ProviderKind::Openrouter,
                 "openrouter",
                 DECLARED_OPENROUTER_MODEL,
                 Some(crate::config::DEFAULT_OPENROUTER_BASE_URL),
@@ -2770,7 +3214,7 @@ mod tests {
         dispatched_at: DateTime<Utc>,
     ) -> EffectiveRouteEnvelope {
         provider_live_usage_envelope(
-            ApiProvider::Custom,
+            ProviderKind::Custom,
             identity,
             model,
             fingerprint,
@@ -2781,7 +3225,7 @@ mod tests {
     }
 
     fn provider_live_usage_envelope(
-        provider: ApiProvider,
+        provider: ProviderKind,
         identity: &str,
         model: &str,
         fingerprint: &str,
@@ -3027,8 +3471,8 @@ mod tests {
         let fetched_at = u64::try_from(now.timestamp()).expect("nonnegative timestamp");
         let cases = [
             (
-                ApiProvider::Openrouter,
-                ApiProvider::Openrouter.as_str(),
+                ProviderKind::Openrouter,
+                ProviderKind::Openrouter.as_str(),
                 "synthetic-openrouter-frozen-price",
                 codewhale_config::catalog::base_url_fingerprint(
                     crate::config::DEFAULT_OPENROUTER_BASE_URL,
@@ -3037,7 +3481,7 @@ mod tests {
                 RouteBillingMode::Metered,
             ),
             (
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 codewhale_config::catalog::BASETEN_PROVIDER_ID,
                 "synthetic-baseten-frozen-price",
                 codewhale_config::catalog::base_url_fingerprint(
@@ -3108,7 +3552,7 @@ mod tests {
                 &fingerprint,
                 codewhale_config::catalog::CatalogRefreshError::Unauthorized,
             );
-            if provider == ApiProvider::Custom {
+            if provider == ProviderKind::Custom {
                 // Baseten's same URL can represent another account after a key
                 // switch. Starting that refresh clears the mutable old scope.
                 let _new_key_refresh = crate::provider_catalog_live::begin_refresh_for_identity(
@@ -3153,8 +3597,8 @@ mod tests {
         let fetched_at = u64::try_from(now.timestamp()).expect("nonnegative timestamp");
         let routes = [
             provider_live_usage_envelope(
-                ApiProvider::Openrouter,
-                ApiProvider::Openrouter.as_str(),
+                ProviderKind::Openrouter,
+                ProviderKind::Openrouter.as_str(),
                 "synthetic-openrouter-legacy",
                 &codewhale_config::catalog::base_url_fingerprint(
                     crate::config::DEFAULT_OPENROUTER_BASE_URL,
@@ -3192,7 +3636,7 @@ mod tests {
             });
             assert_eq!(
                 audit.unpriced_reason,
-                Some(if route.provider == ApiProvider::Openrouter {
+                Some(if route.provider == ProviderKind::Openrouter {
                     crate::pricing::UnpricedReason::NoPricingRow
                 } else {
                     crate::pricing::UnpricedReason::UnverifiedLivePricing
@@ -3219,8 +3663,8 @@ mod tests {
             crate::config::DEFAULT_OPENROUTER_BASE_URL,
         );
         let route = provider_live_usage_envelope(
-            ApiProvider::Openrouter,
-            ApiProvider::Openrouter.as_str(),
+            ProviderKind::Openrouter,
+            ProviderKind::Openrouter.as_str(),
             model,
             &fingerprint,
             Some(crate::pricing::AGGREGATOR_BILLING_SURFACE),
@@ -3246,7 +3690,7 @@ mod tests {
         // A later mutable refresh cannot change a turn that had no quote at
         // the application-dispatch boundary.
         crate::provider_catalog_live::record_success(priced_provider_delta_with_rates(
-            ApiProvider::Openrouter.as_str(),
+            ProviderKind::Openrouter.as_str(),
             model,
             &fingerprint,
             fetched_at,
@@ -3279,8 +3723,8 @@ mod tests {
         let future_unix = dispatch_unix.saturating_add(1);
         let cases = [
             (
-                ApiProvider::Openrouter,
-                ApiProvider::Openrouter.as_str(),
+                ProviderKind::Openrouter,
+                ProviderKind::Openrouter.as_str(),
                 "synthetic-openrouter-future",
                 codewhale_config::catalog::base_url_fingerprint(
                     crate::config::DEFAULT_OPENROUTER_BASE_URL,
@@ -3289,7 +3733,7 @@ mod tests {
                 RouteBillingMode::Metered,
             ),
             (
-                ApiProvider::Custom,
+                ProviderKind::Custom,
                 codewhale_config::catalog::BASETEN_PROVIDER_ID,
                 "synthetic-baseten-future",
                 codewhale_config::catalog::base_url_fingerprint(
@@ -3323,7 +3767,7 @@ mod tests {
             assert!(no_future_quote.provider_live_pricing.is_none());
             assert_eq!(
                 no_future_quote.audit(&usage).unpriced_reason,
-                Some(if provider == ApiProvider::Openrouter {
+                Some(if provider == ProviderKind::Openrouter {
                     crate::pricing::UnpricedReason::NoPricingRow
                 } else {
                     crate::pricing::UnpricedReason::UnverifiedLivePricing
@@ -3373,7 +3817,7 @@ mod tests {
             );
             assert_eq!(
                 wrong_endpoint.audit(&usage).unpriced_reason,
-                Some(if provider == ApiProvider::Custom {
+                Some(if provider == ProviderKind::Custom {
                     crate::pricing::UnpricedReason::UnknownBillingBasis
                 } else {
                     crate::pricing::UnpricedReason::UnverifiedLivePricing
@@ -3561,15 +4005,18 @@ mod tests {
     }
 
     fn deepseek() -> BackgroundRoute<'static> {
-        BackgroundRoute::new(ApiProvider::Deepseek, "deepseek-v4-flash")
+        BackgroundRoute::new(ProviderKind::Deepseek, "deepseek-v4-flash")
             .with_base_url(Some(crate::config::DEFAULT_DEEPSEEK_BASE_URL))
     }
 
     fn deepseek_envelope() -> EffectiveRouteEnvelope {
-        EffectiveRouteEnvelope::capture(
-            None,
-            ApiProvider::Deepseek,
-            "deepseek-primary",
+        let config = crate::config::Config::default();
+        let identity = config
+            .active_provider_identity()
+            .expect("captured DeepSeek identity");
+        EffectiveRouteEnvelope::from_admitted(
+            Some(&config),
+            &identity,
             "deepseek-v4-flash",
             Some(crate::config::DEFAULT_DEEPSEEK_BASE_URL),
             Utc::now(),
@@ -3764,10 +4211,10 @@ mod tests {
         crate::provider_lake::clear_live_snapshot();
         let mut route = EffectiveRouteEnvelope::capture(
             None,
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             "openrouter",
             "qwen/qwen3.7-plus",
-            Some(ApiProvider::Openrouter.default_base_url()),
+            Some(ProviderKind::Openrouter.provider().default_base_url()),
             Utc::now(),
         );
         let usage = small_usage();
@@ -3847,18 +4294,20 @@ mod tests {
             ..Default::default()
         };
         config
-            .provider_config_for_mut(ApiProvider::Openrouter)
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Openrouter))
+            .unwrap()
             .vendor = Some("cerebras".to_string());
         let route = EffectiveRouteEnvelope::capture(
             Some(&config),
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             "openrouter",
             "qwen/qwen3.7-plus",
-            Some(ApiProvider::Openrouter.default_base_url()),
+            Some(ProviderKind::Openrouter.provider().default_base_url()),
             Utc::now(),
         );
         config
-            .provider_config_for_mut(ApiProvider::Openrouter)
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Openrouter))
+            .unwrap()
             .vendor = None;
         assert_eq!(route.openrouter_vendor.as_deref(), Some("cerebras"));
 
@@ -4029,7 +4478,7 @@ mod tests {
     fn route_labels_redact_local_paths_but_preserve_model_namespaces() {
         let route = EffectiveRouteEnvelope {
             openrouter_vendor: None,
-            provider: ApiProvider::Openrouter,
+            provider: ProviderKind::Openrouter,
             provider_identity: "/Users/alice/.config/provider-secret".to_string(),
             model: "/Volumes/private/checkpoints/model.gguf".to_string(),
             billing_surface: None,
@@ -4095,7 +4544,7 @@ mod tests {
     fn serialized_route_envelopes_records_and_child_receipts_are_secret_free() {
         let route = EffectiveRouteEnvelope {
             openrouter_vendor: Some("Authorization: Bearer vendor-secret".to_string()),
-            provider: ApiProvider::Custom,
+            provider: ProviderKind::Custom,
             provider_identity: "Authorization: Bearer provider-secret".to_string(),
             model: "MODEL_API_KEY=sk-model-secret".to_string(),
             billing_surface: Some(
@@ -4383,7 +4832,7 @@ mod tests {
         // route *is* money-metered — so the turn is missing spend, not absent.
         report(
             scope_token(),
-            &BackgroundRoute::new(ApiProvider::NvidiaNim, "deepseek-ai/deepseek-v4-pro"),
+            &BackgroundRoute::new(ProviderKind::NvidiaNim, "deepseek-ai/deepseek-v4-pro"),
             &small_usage(),
         );
         let drained = drain();
@@ -4398,7 +4847,7 @@ mod tests {
         let _g = test_scope();
         report(
             scope_token(),
-            &BackgroundRoute::new(ApiProvider::OpenaiCodex, "gpt-5.5")
+            &BackgroundRoute::new(ProviderKind::OpenaiCodex, "gpt-5.5")
                 .with_base_url(Some("https://chatgpt.com/backend-api/codex")),
             &small_usage(),
         );
@@ -4416,12 +4865,12 @@ mod tests {
         let _g = test_scope();
         report(
             scope_token(),
-            &BackgroundRoute::new(ApiProvider::Stepfun, "step-3.7-flash"),
+            &BackgroundRoute::new(ProviderKind::Stepfun, "step-3.7-flash"),
             &small_usage(),
         );
         report(
             scope_token(),
-            &BackgroundRoute::new(ApiProvider::Openrouter, "step-3.7-flash"),
+            &BackgroundRoute::new(ProviderKind::Openrouter, "step-3.7-flash"),
             &small_usage(),
         );
         let drained = drain();
@@ -4438,18 +4887,18 @@ mod tests {
         let _g = test_scope();
         report(
             scope_token(),
-            &BackgroundRoute::new(ApiProvider::Ollama, "llama3.2"),
+            &BackgroundRoute::new(ProviderKind::Ollama, "llama3.2"),
             &small_usage(),
         );
         report(
             scope_token(),
-            &BackgroundRoute::new(ApiProvider::Zai, "glm-5.2")
+            &BackgroundRoute::new(ProviderKind::Zai, "glm-5.2")
                 .with_base_url(Some("https://api.z.ai/api/coding/paas/v4")),
             &small_usage(),
         );
         report(
             scope_token(),
-            &BackgroundRoute::new(ApiProvider::Moonshot, "kimi-for-coding")
+            &BackgroundRoute::new(ProviderKind::Moonshot, "kimi-for-coding")
                 .with_base_url(Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL)),
             &small_usage(),
         );
@@ -4511,7 +4960,7 @@ mod tests {
     fn receipt_fields_are_bounded_and_secret_bearing_urls_are_not_hashed() {
         let hostile = format!("model\nAuthorization: bearer {}", "x".repeat(400));
         let receipt = route_receipt(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             Some("identity\r\nforged=yes"),
             &hostile,
             Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE),
@@ -4576,7 +5025,7 @@ mod tests {
         };
         report(
             scope_token(),
-            &BackgroundRoute::new(ApiProvider::Moonshot, "kimi-k2.7-code")
+            &BackgroundRoute::new(ProviderKind::Moonshot, "kimi-k2.7-code")
                 .with_base_url(Some("https://api.moonshot.ai/v1")),
             &write_heavy,
         );
@@ -4592,5 +5041,317 @@ mod tests {
                 .any(|receipt| receipt.contains("cache_write=yes")),
             "{drained:?}"
         );
+    }
+
+    #[test]
+    fn missing_usage_reason_preserves_legacy_bytes_and_metadata_identity() {
+        let route = deepseek_envelope();
+        let old = serde_json::json!({"source_id":"opaque-response", "route":route});
+        let legacy: RuntimeUsageDropRecord = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(
+            legacy.reason,
+            RuntimeUsageMissingReason::SuccessWithoutUsage
+        );
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), old);
+        let unknown = RuntimeUsageDropRecord {
+            reason: RuntimeUsageMissingReason::RequestOutcomeUnknown,
+            ..legacy
+        };
+        let mut metadata = serde_json::json!({});
+        attach_child_usage_batch_metadata(
+            &mut metadata,
+            &RuntimeUsageBatch {
+                drop_records: vec![unknown],
+                dropped_records: 1,
+                ..Default::default()
+            },
+        );
+        let recovered = child_usage_records_from_metadata(&metadata).unwrap();
+        assert_eq!(
+            recovered.drop_records[0].reason,
+            RuntimeUsageMissingReason::RequestOutcomeUnknown
+        );
+        assert_eq!(
+            recovered.drop_records[0].source_id,
+            usage_source_fingerprint("opaque-response")
+        );
+        assert_eq!(recovered.dropped_records, 1);
+        assert!(
+            !serde_json::to_string(&metadata)
+                .unwrap()
+                .contains("opaque-response")
+        );
+    }
+
+    #[test]
+    fn exact_missing_usage_promotes_once_before_drain_and_rejects_changed_route() {
+        let _scope = test_scope();
+        let route = deepseek_envelope();
+        report_missing_runtime_usage(
+            scope_token(),
+            None,
+            "attempt",
+            &route,
+            RuntimeUsageMissingReason::RequestOutcomeUnknown,
+        );
+        let mut changed = route.clone();
+        changed.model = "another-model".into();
+        report_effective_route_for_runtime(
+            scope_token(),
+            None,
+            "attempt",
+            &changed,
+            &small_usage(),
+        );
+        report_effective_route_for_runtime(scope_token(), None, "attempt", &route, &small_usage());
+        report_effective_route_for_runtime(scope_token(), None, "attempt", &route, &small_usage());
+        report_missing_runtime_usage(
+            scope_token(),
+            None,
+            "attempt",
+            &route,
+            RuntimeUsageMissingReason::RequestOutcomeUnknown,
+        );
+        let pool = drain();
+        assert_eq!(pool.priced_turns, 1);
+        assert_eq!(pool.unpriced_turns, 0);
+        assert_eq!(pool.cny_unpriced_turns, 0);
+        assert!(pool.missing_usage_sources.is_empty());
+        assert!(pool.estimate.usd > 0.0);
+        assert_eq!(pool.usage_source_fingerprints.len(), 1);
+    }
+
+    #[test]
+    fn drained_missing_slot_restores_and_late_receipt_resolves_only_its_origin() {
+        let _scope = test_scope();
+        let route = deepseek_envelope();
+        report_missing_runtime_usage(
+            scope_token(),
+            None,
+            "restored-attempt",
+            &route,
+            RuntimeUsageMissingReason::RequestOutcomeUnknown,
+        );
+        let missing = drain();
+        let mut slots = missing.missing_usage_sources.clone();
+        let mut overflow = false;
+        let mut unpriced = missing.unpriced_turns;
+        let mut cny_unpriced = missing.cny_unpriced_turns;
+        assert!(close_current_scope().is_empty());
+        restore_usage_source_ledger(missing.usage_source_fingerprints.clone(), &slots, overflow);
+        report_effective_route_for_runtime(
+            scope_token(),
+            None,
+            "restored-attempt",
+            &route,
+            &small_usage(),
+        );
+        let known = drain();
+        let projected = project_missing_usage_ledger(
+            &mut slots,
+            &mut overflow,
+            &mut unpriced,
+            &mut cny_unpriced,
+            &known,
+        );
+        assert!(slots.is_empty());
+        assert_eq!((unpriced, cny_unpriced), (0, 0));
+        assert_eq!(projected.priced_turns, 1);
+        report_effective_route_for_runtime(
+            scope_token(),
+            None,
+            "restored-attempt",
+            &route,
+            &small_usage(),
+        );
+        assert!(drain().is_empty());
+        // A legacy snapshot retained only consumed identities. Its unattributed
+        // coverage remains conservative rather than being erased by a replay.
+        assert!(close_current_scope().is_empty());
+        restore_usage_source_fingerprints(missing.usage_source_fingerprints);
+        report_effective_route_for_runtime(
+            scope_token(),
+            None,
+            "restored-attempt",
+            &route,
+            &small_usage(),
+        );
+        assert!(drain().is_empty());
+    }
+
+    #[test]
+    fn missing_usage_overflow_is_bounded_and_cannot_be_erased_by_late_receipts() {
+        let _scope = test_scope();
+        let route = deepseek_envelope();
+        for index in 0..65 {
+            for _ in 0..2 {
+                report_missing_runtime_usage(
+                    scope_token(),
+                    None,
+                    &format!("attempt-{index}"),
+                    &route,
+                    RuntimeUsageMissingReason::RequestOutcomeUnknown,
+                );
+            }
+        }
+        let missing = drain();
+        assert_eq!(
+            missing.missing_usage_sources.len(),
+            MAX_MISSING_USAGE_SOURCES
+        );
+        assert_eq!(missing.unpriced_turns, 65);
+        assert!(missing.missing_usage_overflowed);
+        let mut slots = missing.missing_usage_sources.clone();
+        let mut overflow = missing.missing_usage_overflowed;
+        let mut unpriced = missing.unpriced_turns;
+        let mut cny_unpriced = missing.cny_unpriced_turns;
+        for index in 0..65 {
+            for _ in 0..2 {
+                report_effective_route_for_runtime(
+                    scope_token(),
+                    None,
+                    &format!("attempt-{index}"),
+                    &route,
+                    &small_usage(),
+                );
+            }
+        }
+        let known = drain();
+        let projected = project_missing_usage_ledger(
+            &mut slots,
+            &mut overflow,
+            &mut unpriced,
+            &mut cny_unpriced,
+            &known,
+        );
+        assert_eq!(projected.priced_turns, 65);
+        assert_eq!((unpriced, cny_unpriced), (1, 1));
+        assert!(slots.is_empty());
+        assert!(overflow);
+        assert!(projected.estimate.usd > 0.0);
+    }
+
+    #[test]
+    fn runtime_unknown_batch_keeps_reason_and_promotes_without_new_response_identity() {
+        let _scope = test_scope();
+        let route = deepseek_envelope();
+        let owner = "unknown-batch-owner";
+        report_missing_runtime_usage(
+            scope_token(),
+            Some(owner),
+            "batch-attempt",
+            &route,
+            RuntimeUsageMissingReason::RequestOutcomeUnknown,
+        );
+        let batch = take_runtime_usage(owner);
+        assert_eq!(
+            batch.drop_records[0].reason,
+            RuntimeUsageMissingReason::RequestOutcomeUnknown
+        );
+        let mut metadata = serde_json::json!({});
+        attach_child_usage_batch_metadata(&mut metadata, &batch);
+        let batch = child_usage_records_from_metadata(&metadata).unwrap();
+        report_runtime_usage_batch(scope_token(), None, &batch);
+        report_runtime_usage_batch(scope_token(), None, &batch);
+        let missing = drain();
+        assert_eq!(missing.unpriced_turns, 1);
+        assert!(missing.unpriced_reasons.contains("request_outcome_unknown"));
+        report_effective_route_for_runtime(
+            scope_token(),
+            None,
+            "batch-attempt",
+            &route,
+            &small_usage(),
+        );
+        let known = drain();
+        assert_eq!(known.priced_turns, 1);
+        assert_eq!(
+            known.resolved_missing_usage_sources,
+            BTreeSet::from([usage_source_fingerprint("batch-attempt")])
+        );
+    }
+
+    #[test]
+    fn late_unknown_receipt_promotes_after_restart_without_charging_replacement_session() {
+        let _scope = test_scope();
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let manager = crate::session_manager::SessionManager::new(sessions.clone()).unwrap();
+        for id in ["unknown-origin", "replacement"] {
+            let session = crate::session_manager::create_saved_session_with_id_and_mode(
+                id.into(),
+                &[],
+                "deepseek-v4-flash",
+                tmp.path(),
+                0,
+                None,
+                Some("agent"),
+            );
+            manager.save_session(&session).unwrap();
+        }
+        let origin = scope_token();
+        assert!(close_current_scope().is_empty());
+        let route = deepseek_envelope();
+        assert!(report_missing_usage_for_interactive_origin_with_manager(
+            origin,
+            "unknown-origin",
+            "origin-turn",
+            "late-attempt",
+            &route,
+            RuntimeUsageMissingReason::RequestOutcomeUnknown,
+            &manager
+        ));
+        let missing = manager.load_session_snapshot("unknown-origin").unwrap();
+        assert_eq!(missing.metadata.cost.unpriced_turns, 1);
+        assert_eq!(missing.metadata.cost.missing_usage_sources.len(), 1);
+        assert!(
+            missing
+                .metadata
+                .cost
+                .unpriced_reasons
+                .contains("request_outcome_unknown")
+        );
+        manager.save_session(&missing).unwrap();
+        drop(manager);
+        let manager = crate::session_manager::SessionManager::new(sessions).unwrap();
+        for _ in 0..2 {
+            assert!(report_effective_route_for_interactive_origin_with_manager(
+                origin,
+                "unknown-origin",
+                "origin-turn",
+                "late-attempt",
+                &route,
+                &small_usage(),
+                &manager
+            ));
+            let known = manager.load_session_snapshot("unknown-origin").unwrap();
+            assert_eq!(known.metadata.cost.priced_turns, 1);
+            assert_eq!(known.metadata.cost.unpriced_turns, 0);
+            assert!(known.metadata.cost.missing_usage_sources.is_empty());
+            assert_eq!(
+                known.metadata.total_tokens,
+                u64::from(small_usage().input_tokens) + u64::from(small_usage().output_tokens)
+            );
+            manager.save_session(&known).unwrap();
+        }
+        assert!(!report_effective_route_for_interactive_origin_with_manager(
+            origin,
+            "unknown-origin",
+            "different-turn",
+            "late-attempt",
+            &route,
+            &small_usage(),
+            &manager
+        ));
+        let replacement = manager.load_session_snapshot("replacement").unwrap();
+        assert_eq!(replacement.metadata.total_tokens, 0);
+        assert_eq!(
+            (
+                replacement.metadata.cost.priced_turns,
+                replacement.metadata.cost.unpriced_turns
+            ),
+            (0, 0)
+        );
+        assert!(drain().is_empty());
     }
 }

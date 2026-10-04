@@ -1,5 +1,7 @@
 {
+  "ExtensionPromptUnavailable": "拡張機能の指示を利用できません。/plugin show で確認してください。",
   "ComposerOversizedSubmitHeld": "未送信：メッセージが {limit} 文字を超えており、貼り付けファイルに保存できませんでした（{error}）。全文は入力欄に残っています。短くするか .codewhale/pastes を書き込み可能にしてから、もう一度 Enter を押してください。",
+  "ComposerOversizedSubmitHeldShort": "未送信：{limit} 文字超。貼り付けファイルは未保存です。",
   "CmdPluginOwnerReport": "拡張機能ホスト:\n  状態: {state}\n  有効なツール ({count}): {tools}",
   "CmdPluginOwnerActivating": "有効化中",
   "CmdPluginOwnerActive": "有効",
@@ -2439,5 +2441,11 @@
   "ModelPickerReadinessRefreshed": "モデルの準備状況を更新しました · カタログ行を再構築しました",
   "ModelPickerOpenToRefresh": "準備状況とカタログを更新するには /model を開いてください",
   "ModelPickerPinnedChip": "ピン留め",
+  "AuthSignedInAs": "{provider} に {account} としてサインインしました。",
+  "AuthSignedInWithoutEmail": "{provider} にサインインしました（発行元からアカウントのメールアドレスが送られませんでした）。",
+  "AuthReplacedPreviousSignInAs": "以前の Codewhale の {provider} サインイン（{account}）を置き換えました。",
+  "AuthReplacedPreviousSignIn": "以前の Codewhale の {provider} サインインを置き換えました。",
+  "AuthSameAccountAsBefore": "以前と同じアカウントです。別の {provider} アカウントを使うには、ブラウザーでこのアカウントからサインアウトして（またはプライベートウィンドウを使って）、もう一度サインインしてください。",
+  "AuthEnvTokenOutranksSignIn": "この環境には OPENAI_CODEX_ACCESS_TOKEN または CODEX_ACCESS_TOKEN が設定されており、このサインインより優先されます。設定を解除するまで、リクエストはそのトークンのアカウントを使い続けます。",
   "PinnedPromptJumpToMessage": "このメッセージへジャンプ"
 }

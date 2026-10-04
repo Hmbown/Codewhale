@@ -81,23 +81,12 @@ jobs:
             -A clippy::too_many_arguments \
             -A clippy::unnecessary_map_or
       - name: Build headroom
-        # The headroom trace below showed this job's test build using all of
-        # the runner's memory and swap (15574/15989 MiB and 3052/3071 MiB on
-        # 2c95b7de7), which is how the runner came to shut it down on earlier
-        # candidates. Same step as ci.yml's "Ubuntu build headroom": drop
-        # preinstalled SDKs this job never uses and add swap. release.yml
-        # calls this workflow after the tag, so the tagged tree needs it too.
+        # Same fixed ephemeral-runner provisioning as CI Safety, Lint, and Test.
+        # Resource headroom is preventive; a shutdown alone does not prove OOM.
         shell: bash
-        run: |
-          df -h / /mnt; free -m
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          if sudo fallocate -l 8G /mnt/cw-swapfile && sudo chmod 600 /mnt/cw-swapfile \
-            && sudo mkswap /mnt/cw-swapfile >/dev/null && sudo swapon /mnt/cw-swapfile; then
-            echo "Added 8 GiB swap at /mnt/cw-swapfile"
-          else
-            echo "::warning::Could not add swap; continuing with the runner default"
-          fi
-          df -h / /mnt; free -m
+        run: bash scripts/prepare-ubuntu-build-headroom.sh
+      - name: Build canonical executable for acceptance tests
+        run: cargo build -p codewhale-cli --bin codewhale --all-features --locked
       - name: Workspace tests
         # Same test binaries as `cargo test`, run by cargo-nextest: one process
         # per test. This gate used libtest, where every test shares one process,

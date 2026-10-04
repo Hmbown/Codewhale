@@ -60,6 +60,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use codewhale_models::Tool;
 use codewhale_workflow_js::{
@@ -211,6 +212,45 @@ pub(crate) struct NestedCallRequest {
     pub(crate) name: String,
     pub(crate) input: Value,
     pub(crate) reply: oneshot::Sender<NestedCallVerdict>,
+    /// Fires when the caller no longer wants an answer (an extension's host
+    /// cancelled the request, its owner was revoked, the host exited, the
+    /// invocation ended). The server must not start work for a request whose
+    /// token has fired ([`Self::is_stale`]) and must stop waiting on a person
+    /// when it fires: an approval is withdrawn, never silently decided.
+    pub(crate) withdraw: Option<CancellationToken>,
+}
+
+impl NestedCallRequest {
+    /// Nobody is waiting for the answer any more.
+    pub(crate) fn is_stale(&self) -> bool {
+        self.reply.is_closed()
+            || self
+                .withdraw
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+    }
+}
+
+/// Who an extension's `core/call` is made for, as the core knows it: composed
+/// by Rust from the extension tool's registration, never from anything the host
+/// says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionCaller {
+    /// `extension:<plugin>`: named on the approval card and in audit records.
+    pub(crate) origin: String,
+    /// The extension tool the calls are made inside.
+    pub(crate) tool: String,
+    /// The approval-grant scope of that plugin build (`ext:<id>@<hash>`); the
+    /// approval keys of its calls are scoped by it, so a grant given to the
+    /// model never covers an extension's call and the reverse.
+    pub(crate) scope: String,
+}
+
+/// What an extension tool's gate carries beyond the channel: who it is for,
+/// and the tool snapshot its calls run against.
+struct ExtensionGate {
+    caller: ExtensionCaller,
+    specs: Vec<Arc<dyn ToolSpec>>,
 }
 
 /// Handle a running program uses to reach the engine turn that launched it.
@@ -222,6 +262,9 @@ pub(crate) struct NestedCallGate {
     mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
     tx_event: mpsc::Sender<Event>,
     deadline: Duration,
+    /// Set only on the gate of an extension tool's call
+    /// ([`Self::for_extension`]).
+    extension: Option<Arc<ExtensionGate>>,
 }
 
 impl NestedCallGate {
@@ -240,30 +283,77 @@ impl NestedCallGate {
                 mcp_pool,
                 tx_event,
                 deadline,
+                extension: None,
             },
             receiver,
         )
     }
 
+    /// This gate serves one extension tool's call: `caller` is who it is for
+    /// and `specs` the tool snapshot its core calls run against.
+    pub(crate) fn for_extension(
+        mut self,
+        caller: ExtensionCaller,
+        specs: Vec<Arc<dyn ToolSpec>>,
+    ) -> Self {
+        self.extension = Some(Arc::new(ExtensionGate { caller, specs }));
+        self
+    }
+
+    /// The caller and tool snapshot of an extension tool's gate; `None` for
+    /// the gate of an `execute_tools` program or an `rlm` call.
+    pub(crate) fn extension(&self) -> Option<(&ExtensionCaller, &[Arc<dyn ToolSpec>])> {
+        self.extension
+            .as_deref()
+            .map(|gate| (&gate.caller, gate.specs.as_slice()))
+    }
+
     /// Ask the serving turn loop to decide one nested call. A gate nobody
     /// serves any more refuses.
     pub(crate) async fn ask(&self, name: String, input: Value) -> NestedCallVerdict {
+        self.ask_withdrawable(name, input, None).await
+    }
+
+    /// [`Self::ask`], withdrawn when `withdraw` fires: the request is dropped
+    /// if the server has not started it, and the server stops waiting on a
+    /// person if it has (the approval is recorded cancelled).
+    pub(crate) async fn ask_withdrawable(
+        &self,
+        name: String,
+        input: Value,
+        withdraw: Option<CancellationToken>,
+    ) -> NestedCallVerdict {
         let unavailable = || NestedCallVerdict::Refused {
             error: ToolError::not_available(
                 "the turn that launched this program is no longer serving its permission gate",
             ),
             decision: NestedDecision::Refused,
         };
+        let cancelled = || NestedCallVerdict::Refused {
+            error: ToolError::cancelled("the call was withdrawn before the gate answered"),
+            decision: NestedDecision::Refused,
+        };
         let (reply, answer) = oneshot::channel();
-        if self
-            .requests
-            .send(NestedCallRequest { name, input, reply })
-            .await
-            .is_err()
-        {
-            return unavailable();
+        let request = NestedCallRequest {
+            name,
+            input,
+            reply,
+            withdraw: withdraw.clone(),
+        };
+        let wait = async {
+            if self.requests.send(request).await.is_err() {
+                return unavailable();
+            }
+            answer.await.unwrap_or_else(|_| unavailable())
+        };
+        match withdraw {
+            None => wait.await,
+            Some(withdraw) => tokio::select! {
+                biased;
+                () = withdraw.cancelled() => cancelled(),
+                verdict = wait => verdict,
+            },
         }
-        answer.await.unwrap_or_else(|_| unavailable())
     }
 }
 
@@ -384,7 +474,10 @@ struct CallReceipt {
 
 /// Run clock that stops while the program waits on the gate, so a person
 /// taking a minute on an approval card does not spend the program's budget.
-struct PauseClock {
+/// An extension tool's `tool/call` deadline runs on the same clock
+/// (`extension_host::supervisor::HostProcess::call_with_clock`), paused while
+/// one of its `core/call`s waits on the gate.
+pub(crate) struct PauseClock {
     started: Instant,
     paused: Duration,
     depth: usize,
@@ -392,7 +485,7 @@ struct PauseClock {
 }
 
 impl PauseClock {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             started: Instant::now(),
             paused: Duration::ZERO,
@@ -420,6 +513,19 @@ impl PauseClock {
     fn active(&self) -> Duration {
         let paused = self.paused + self.since.map_or(Duration::ZERO, |since| since.elapsed());
         self.started.elapsed().saturating_sub(paused)
+    }
+
+    /// Time left before `deadline`, or `None` once it has passed. While the
+    /// clock is paused its budget is frozen, so the caller looks again shortly
+    /// ([`PAUSED_WATCHDOG_POLL`]): sleeping out the whole deadline would let it
+    /// overrun by that much once the pause ends.
+    pub(crate) fn remaining(&self, deadline: Duration) -> Option<Duration> {
+        if self.depth > 0 {
+            return Some(PAUSED_WATCHDOG_POLL.min(deadline));
+        }
+        deadline
+            .checked_sub(self.active())
+            .filter(|left| !left.is_zero())
     }
 }
 
@@ -461,8 +567,36 @@ pub(crate) struct CodemodeInvoker {
     /// share it, mirroring how the engine schedules direct calls.
     order: RwLock<()>,
     receipts: Mutex<Vec<CallReceipt>>,
-    clock: Mutex<PauseClock>,
+    clock: Arc<Mutex<PauseClock>>,
     spill_prefix: String,
+    /// Refusals beyond code mode's own, decided from the request alone before
+    /// the gate is asked (an extension's list: `extension_host::core_call`).
+    extra_refusal: Option<ExtraRefusal>,
+}
+
+/// A refusal decided from the specs, the tool name and its input.
+pub(crate) type ExtraRefusal = fn(&[Arc<dyn ToolSpec>], &str, &Value) -> Option<String>;
+
+/// Why a gated call did not produce a result. The decision is what the gate
+/// recorded; a caller that is not code mode maps it to its own error codes.
+#[derive(Debug)]
+pub(crate) enum NestedFailure {
+    /// Refused or denied: nothing ran.
+    Rejected {
+        decision: NestedDecision,
+        message: String,
+    },
+    /// The seam broke, the call timed out or was cancelled.
+    Unavailable(String),
+}
+
+impl From<NestedFailure> for DriverError {
+    fn from(failure: NestedFailure) -> Self {
+        match failure {
+            NestedFailure::Rejected { message, .. } => DriverError::Rejected(message),
+            NestedFailure::Unavailable(message) => DriverError::Unavailable(message),
+        }
+    }
 }
 
 impl CodemodeInvoker {
@@ -473,6 +607,38 @@ impl CodemodeInvoker {
             .origin_tool_call_id
             .clone()
             .unwrap_or_else(|| EXECUTE_TOOLS_TOOL_NAME.to_string());
+        Self::with_gate(specs, context, gate, spill_prefix, None)
+    }
+
+    /// The machinery for an extension tool's `core/call`s: the same gate,
+    /// executor, receipts, concurrency cap and pausable clock as a program's
+    /// nested calls, with `extra_refusal` added to what is refused outright.
+    /// `context` is the extension tool's own; its gate is the one given here,
+    /// which the tool's calls then never see again.
+    pub(crate) fn for_extension(
+        specs: Vec<Arc<dyn ToolSpec>>,
+        mut context: ToolContext,
+        gate: NestedCallGate,
+        spill_prefix: String,
+        extra_refusal: ExtraRefusal,
+    ) -> Self {
+        context.execution.nested_call_gate = None;
+        Self::with_gate(
+            specs,
+            context,
+            Some(gate),
+            spill_prefix,
+            Some(extra_refusal),
+        )
+    }
+
+    fn with_gate(
+        specs: Vec<Arc<dyn ToolSpec>>,
+        context: ToolContext,
+        gate: Option<NestedCallGate>,
+        spill_prefix: String,
+        extra_refusal: Option<ExtraRefusal>,
+    ) -> Self {
         Self {
             specs,
             context,
@@ -481,8 +647,9 @@ impl CodemodeInvoker {
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CALLS)),
             order: RwLock::new(()),
             receipts: Mutex::new(Vec::new()),
-            clock: Mutex::new(PauseClock::new()),
+            clock: Arc::new(Mutex::new(PauseClock::new())),
             spill_prefix,
+            extra_refusal,
         }
     }
 
@@ -499,18 +666,15 @@ impl CodemodeInvoker {
         PauseGuard(&self.clock)
     }
 
-    /// Time left before the deadline, or `None` once it has passed. While
-    /// the program is paused on the gate its budget is frozen, so the
-    /// watchdog looks again shortly: sleeping out the whole deadline here
-    /// would let the program overrun by that much once the gate answers.
+    /// Time left before the deadline ([`PauseClock::remaining`]).
     fn remaining(&self, deadline: Duration) -> Option<Duration> {
-        let clock = self.clock.lock().ok()?;
-        if clock.depth > 0 {
-            return Some(PAUSED_WATCHDOG_POLL.min(deadline));
-        }
-        deadline
-            .checked_sub(clock.active())
-            .filter(|left| !left.is_zero())
+        self.clock.lock().ok()?.remaining(deadline)
+    }
+
+    /// The clock the run's deadline is measured on, for a caller whose own
+    /// deadline must stop while this run waits on the gate.
+    pub(crate) fn clock(&self) -> Arc<Mutex<PauseClock>> {
+        Arc::clone(&self.clock)
     }
 
     fn begin(&self, tool: &str) -> usize {
@@ -554,14 +718,17 @@ impl CodemodeInvoker {
         started: Instant,
         decision: NestedDecision,
         note: String,
-    ) -> DriverError {
+    ) -> NestedFailure {
         self.finish(seq, |receipt| {
             receipt.decision = Some(decision);
             receipt.status = CallStatus::Refused;
             receipt.elapsed_ms = started.elapsed().as_millis() as u64;
             receipt.note = Some(note.clone());
         });
-        DriverError::Rejected(note)
+        NestedFailure::Rejected {
+            decision,
+            message: note,
+        }
     }
 
     /// Phase-1 admission when no engine gate serves the program.
@@ -630,7 +797,11 @@ impl CodemodeInvoker {
             };
             enforce_tool_authority(name, &input, spec.as_ref(), &self.context)?;
             let context = self.context.clone();
-            Box::pin(async move { spec.execute_rich(input, &context).await })
+            Box::pin(async move {
+                crate::extension_host::validate_caller_plugins(context.plugin_registry.as_deref())
+                    .map_err(ToolError::not_available)?;
+                spec.execute_rich(input, &context).await
+            })
         };
         match self.runtime.as_ref() {
             Some(runtime) => {
@@ -654,7 +825,7 @@ impl CodemodeInvoker {
         name: &str,
         decision: NestedDecision,
         outcome: Result<RichToolResult, ToolError>,
-    ) -> Result<ToolCallResponse, DriverError> {
+    ) -> Result<ToolCallResponse, NestedFailure> {
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match outcome {
             Ok(rich) => {
@@ -709,7 +880,7 @@ impl CodemodeInvoker {
                             receipt.elapsed_ms = elapsed_ms;
                             receipt.note = Some(message.clone());
                         });
-                        Err(DriverError::Unavailable(message))
+                        Err(NestedFailure::Unavailable(message))
                     }
                     ToolError::ExecutionFailed { .. } => {
                         let bytes = message.len();
@@ -784,20 +955,59 @@ impl CodemodeInvoker {
     }
 }
 
-#[async_trait]
-impl ToolInvoker for CodemodeInvoker {
-    async fn invoke(&self, request: ToolCallRequest) -> Result<ToolCallResponse, DriverError> {
-        let _permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| DriverError::Unavailable("code-mode run shut down".to_string()))?;
+/// The receipts' bounds when they are attached to another tool's result.
+const RECEIPT_NOTE_BYTES: usize = 256;
+
+impl CodemodeInvoker {
+    /// The receipts of the calls so far as JSON, at most `max` of them with
+    /// each note cut short: what an extension tool's result records about the
+    /// core calls it made. The count says how many there were in all.
+    pub(crate) fn receipts_json(&self, max: usize) -> Value {
+        let receipts = self.drain();
+        let total = receipts.len();
+        let shown: Vec<CallReceipt> = receipts
+            .into_iter()
+            .take(max)
+            .map(|mut receipt| {
+                receipt.note = receipt
+                    .note
+                    .map(|note| char_prefix(&note, RECEIPT_NOTE_BYTES));
+                receipt.hook_context = None;
+                receipt
+            })
+            .collect();
+        json!({ "total": total, "calls": shown })
+    }
+
+    /// One gated call: refuse it outright if it is on a refusal list, ask the
+    /// engine's gate (the program is paused meanwhile), then run it and shape
+    /// the answer, recording a receipt throughout. `withdraw` stops the wait
+    /// for a slot, the gate's wait on a person, and the execution.
+    pub(crate) async fn call(
+        &self,
+        tool: String,
+        input: Value,
+        withdraw: Option<&CancellationToken>,
+    ) -> Result<ToolCallResponse, NestedFailure> {
+        let permit = self.semaphore.clone().acquire_owned();
+        let _permit = match withdraw {
+            None => permit.await,
+            Some(withdraw) => tokio::select! {
+                biased;
+                () = withdraw.cancelled() => {
+                    return Err(NestedFailure::Unavailable("the call was withdrawn".to_string()));
+                }
+                permit = permit => permit,
+            },
+        }
+        .map_err(|_| NestedFailure::Unavailable("code-mode run shut down".to_string()))?;
         let started = Instant::now();
-        let ToolCallRequest { tool, input } = request;
         let seq = self.begin(&tool);
 
-        if let Some(note) = refusal_before_gate(&tool, &input, self.gate.is_some()) {
+        if let Some(note) = refusal_before_gate(&tool, &input, self.gate.is_some()).or_else(|| {
+            self.extra_refusal
+                .and_then(|refuse| refuse(&self.specs, &tool, &input))
+        }) {
             return Err(self.refused(seq, started, NestedDecision::Refused, note));
         }
 
@@ -805,7 +1015,8 @@ impl ToolInvoker for CodemodeInvoker {
             Some(gate) => {
                 let verdict = {
                     let _paused = self.pause();
-                    gate.ask(tool.clone(), input).await
+                    gate.ask_withdrawable(tool.clone(), input, withdraw.cloned())
+                        .await
                 };
                 match verdict {
                     NestedCallVerdict::Run {
@@ -847,14 +1058,36 @@ impl ToolInvoker for CodemodeInvoker {
             receipt.hook_context = hook_context;
         });
 
-        let outcome = if supports_parallel {
-            let _shared = self.order.read().await;
-            self.execute(&name, input).await
-        } else {
-            let _exclusive = self.order.write().await;
-            self.execute(&name, input).await
+        let run = async {
+            if supports_parallel {
+                let _shared = self.order.read().await;
+                self.execute(&name, input).await
+            } else {
+                let _exclusive = self.order.write().await;
+                self.execute(&name, input).await
+            }
+        };
+        let outcome = match withdraw {
+            None => run.await,
+            Some(withdraw) => tokio::select! {
+                biased;
+                () = withdraw.cancelled() => {
+                    Err(ToolError::cancelled("the call was withdrawn while it ran"))
+                }
+                outcome = run => outcome,
+            },
         };
         self.deliver(seq, started, &name, decision, outcome)
+    }
+}
+
+#[async_trait]
+impl ToolInvoker for CodemodeInvoker {
+    async fn invoke(&self, request: ToolCallRequest) -> Result<ToolCallResponse, DriverError> {
+        let ToolCallRequest { tool, input } = request;
+        self.call(tool, input, None)
+            .await
+            .map_err(DriverError::from)
     }
 }
 

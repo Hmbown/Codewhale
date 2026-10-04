@@ -139,6 +139,7 @@ Codewhale 确认激活后，再发送普通消息 `请打个招呼。`。
 | Commands | Markdown 命令文件；参见[命令元数据](../architecture/command-dispatch.md#user-commands)。 |
 | Agent profiles | Fleet TOML 配置文件；参见[Fleet 编写指南](./FLEET.md#编写-agent-配置fleet-setup)。 |
 | Hooks | `HooksConfig` TOML 文件；参见[事件与进程行为](./HOOKS.md)。 |
+| Native mod（实验性） | 已审查的 ESM 入口，可注册工具、命令、执行前监听器、提示词片段及插件本地 JSON 状态；参见[扩展契约](./EXTENSIONS.md)。 |
 
 Commands、Agents 和 Hooks 的路径声明放在 `plugin.json` 的
 `extensions["net.codewhale"]` 中，详见
@@ -151,7 +152,44 @@ ES 模块文件，由 TypeScript 扩展宿主运行，`/plugin validate` 会拒�
 Full Access（完全访问）、Bypass，或针对该已审查构建的精确会话授权，都可以满足这一要求而不再弹出审批
 （[设计文档](../design/TS_EXTENSION_HOST.md#as-built-phase-1-2026-09-25)）。
 可运行的类型化示例、生命周期和按插件归属显示的诊断见
-[扩展工具编写指南](../EXTENSIONS.md)。`.mts` 只支持 Node 可直接擦除的类型语法，无需单独的编译器；需要转换的语法不受支持。
+[扩展编写指南](./EXTENSIONS.md)。`.mts` 只支持 Node 可直接擦除的类型语法，无需单独的编译器；需要转换的语法不受支持。
+
+## 编写有明确作用范围的 Native mod
+
+[mod-extension 示例](../examples/plugins/mod-extension/README.md) 是可运行的
+ESM 插件包，不需要安装依赖或运行编译器。它注册 `mod_counter` 工具、
+`/mod-count` 用户命令、一个提示词片段，以及只处理自身工具的执行前监听器。
+工具返回结构化 JSON 计数结果；`ctx.storage` 将计数保存在 Rust 指定的插件目录中。
+清理函数可重复调用，会撤销注册并等待排队的工作结束。停用后监听器和提示词片段
+被撤回，计数状态仍然保留。
+
+先明确开启实验性的 `extension_host` 功能，再安装示例目录，验证并查看其 Native
+能力。由本人审查源代码和精确的内容/能力哈希，执行审查给出的信任命令后再启用。
+功能关闭时，Native 代码只列入清单，不执行。源文件变更需要重新审查；
+`/plugin reload` 是手动刷新，不是自动监视或热重载。
+
+可用的编写服务包括 `tools`、`commands`、`prompt`、`storage`、`logger` 和 Cordis
+生命周期机制。`ctx.on('tools/pre-execute', ...)` 可以返回不干预、拒绝、请求审批、
+修订对象输入或补充上下文。Rust 合并这些提议；输入变更后重新准备调用并检查权限。
+`allow` 不授予批准，`next()` 只表示不干预。异常、格式错误、超时及已撤销的所有者
+都会使当前调用被拒绝。这是执行前提议契约，不提供包裹实际执行的中间件，也不支持
+改写执行后的结果。
+
+`ctx.prompt.registerSection({id, text})` 提交有边界、带来源的指令，通过现有 Engine
+运行时消息进入上下文。`ctx.storage.get/set/delete` 保存有大小限制的插件本地 JSON，
+可跨代保留。两者都不能替换系统提示词、会话存储或凭据服务。工具和命令调用可获得
+本次调用的只读 `sessionId`、`agentId`、`originTurnId` 字符串，Rust 未提供时字段缺省；
+这些是标识标签，不是运行时操作句柄。目前没有已发布的插件编写 SDK，示例使用文档
+规定的宿主适配服务。
+
+自定义 Ratatui/GPUI 控件、DSH 浏览器 UI 插槽、skill 根目录注册、原生执行
+`dsh.bundle.patch` 及 DSH 自身的 agent 运行时尚未提供。下文的静态导入器仍只转换
+可移植子集。兼容的 Claude 插件包仍使用原有的声明组件适配器；此 Native API 不加载
+Claude 的 agent loop，也不会自动适配 Pi 扩展 API。可执行 mod 需按文档中的宿主契约
+移植。扩展工具只有在模型直接调用它、且共享 turn gate 正在处理本次调用时，
+才能使用 `exec.core.call`。命令及激活代码没有 core 句柄。嵌套 shell 和网络调用必须
+弹出用户审批；无法打开审批的模式会拒绝执行。完整的拒绝列表、取消语义和调用上限
+见[请求核心执行工具](./EXTENSIONS.md#请求核心执行工具)。
 
 插件信任**不是操作系统沙箱**。本地 MCP 服务器或 hook 可以启动进程；
 启用前需审查其代码和权限。Skills 不授予权限：仓库指令、权限规则、沙箱策略
@@ -266,7 +304,9 @@ patch 操作也会出现在结构化的手工移植列表中，并附带其来�
 转换；包外的服务器会被跳过，宿主路径永远不会被复制。`@deepseek-ai/dsh-skill-filesystem`
 条目只有在其字面的 `customSkillDirs` 子目录位于包内时，才会贡献这些子目录。默认的用户
 和项目 skill 根目录、文件监视器以及外部服务依赖都不会被导入。任意 DSH TypeScript
-插件的执行不在此兼容范围之内。
+插件的执行不在此静态导入器的兼容范围内。明确编写 Native 入口的插件可通过实验性的
+TypeScript 扩展宿主提供工具、用户命令、执行前提议、提示词片段和插件本地状态；
+宿主不会执行导入的 `dsh.bundle.patch` 组合。参见[扩展编写指南](./EXTENSIONS.md)。
 
 ### 本地 Node MCP 服务器
 

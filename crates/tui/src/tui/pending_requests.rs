@@ -85,7 +85,7 @@ pub(crate) fn retire(app: &mut App, approval_id: &str) -> bool {
     retired || withdrawn
 }
 
-/// Child-approval bookkeeping for one engine event, run before any session
+/// Approval retirement and child bookkeeping, run before any session
 /// or idle filter (approvals M1, minor 4):
 ///
 /// - agent lifecycle events record which conversation owns each agent, so a
@@ -94,11 +94,16 @@ pub(crate) fn retire(app: &mut App, approval_id: &str) -> bool {
 ///   waiting ends that wait by identity — answered anywhere, cancelled,
 ///   stopped — whatever conversation is active. The engine sends it without
 ///   back-pressure drops.
+/// - a typed withdrawal retires any approval card and its web mirror by id.
 ///
-/// Returns `true` when the event was only a withdrawal for an agent that has
-/// already ended (terminal status): nothing else should process it.
+/// Returns `true` when the event only retires a request: nothing else should
+/// process it.
 pub(crate) fn observe_engine_event(app: &mut App, event: &EngineEvent) -> bool {
     match event {
+        EngineEvent::ApprovalWithdrawn { id } => {
+            retire(app, id);
+            true
+        }
         EngineEvent::AgentSpawned {
             owner_session_id,
             id,

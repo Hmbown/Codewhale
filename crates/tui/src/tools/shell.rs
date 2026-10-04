@@ -5970,9 +5970,21 @@ impl ToolSpec for BashTool {
             HashMap::new()
         } else if let Some(hook_executor) = &context.runtime.hook_executor {
             let hook_ctx = crate::hooks::HookContext::new()
+                .with_tool_context(context)
                 .with_tool_name("exec_shell")
                 .with_tool_args(&input);
-            hook_executor.collect_shell_env(&hook_ctx)
+            let executor = Arc::clone(hook_executor);
+            let policy = crate::plugins::activation::extension_host_policy_enabled();
+            #[cfg(test)]
+            let env_scope = crate::test_support::env_scope_ticket();
+            tokio::task::spawn_blocking(move || {
+                let _policy = crate::plugins::activation::PolicyScope::propagate(policy);
+                #[cfg(test)]
+                let _env_scope = crate::test_support::join_env_scope(env_scope);
+                executor.collect_shell_env(&hook_ctx)
+            })
+            .await
+            .unwrap_or_default()
         } else {
             std::collections::HashMap::new()
         };
@@ -7333,3 +7345,49 @@ impl ToolSpec for NoteTool {
 mod enforced_readonly_tests;
 #[cfg(test)]
 mod tests;
+
+pub(crate) fn foreground_command_requests_detach(command: &str) -> bool {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    let chars = command.chars().collect::<Vec<_>>();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !single_quoted {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !double_quoted {
+            single_quoted = !single_quoted;
+            continue;
+        }
+        if ch == '"' && !single_quoted {
+            double_quoted = !double_quoted;
+            continue;
+        }
+        if ch != '&' || single_quoted || double_quoted {
+            continue;
+        }
+        let previous = index.checked_sub(1).and_then(|i| chars.get(i)).copied();
+        let next = chars.get(index + 1).copied();
+        // `&&`, `&>`/`&>>`, and `>&` are chaining/redirection rather than a
+        // detached child. Any other unquoted ampersand is a background
+        // control operator and is unavailable in ACP.
+        if previous != Some('&') && next != Some('&') && next != Some('>') && previous != Some('>')
+        {
+            return true;
+        }
+    }
+
+    shell_words::split(command).is_ok_and(|words| {
+        words.iter().any(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "nohup" | "disown" | "setsid" | "daemonize"
+            )
+        })
+    })
+}

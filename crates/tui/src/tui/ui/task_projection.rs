@@ -349,7 +349,12 @@ const AUTOMATION_PANEL_RUN_SCAN: usize = 25;
 /// one scan is in flight; a slow disk costs the band latency, never the
 /// frame. Returns whether the visible state changed, so the idle tick can
 /// skip the redraw (#3757).
-pub(super) async fn refresh_automation_panel(app: &mut App) -> bool {
+///
+/// `start_next` says whether the next scan may begin once a finished one is
+/// folded. The caller passes [`automation_scan_is_due`], so a quiet session
+/// with nothing scheduled does not re-read the store every 2.5 s (#6728); a
+/// scan already in flight is still folded on every tick.
+pub(super) async fn refresh_automation_panel(app: &mut App, start_next: bool) -> bool {
     let mut changed = false;
     if let Some(scan) = app.automation_scan.take() {
         if scan.is_finished() {
@@ -364,8 +369,50 @@ pub(super) async fn refresh_automation_panel(app: &mut App) -> bool {
             return false;
         }
     }
-    app.automation_scan = start_automation_scan(app, false);
+    if start_next {
+        app.automation_scan = start_automation_scan(app, false);
+    }
     changed
+}
+
+/// The 2.5 s cadence the activity band is scanned at whenever it has
+/// something to show or the user is around.
+pub(super) const AUTOMATION_SCAN_BUSY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(2_500);
+
+/// The cadence for a quiet session whose band shows nothing: a new
+/// automation created from outside this process lights the band within this
+/// long. Anything created from inside it (a command, a tool call, a click) is
+/// input or an engine event, which restores the busy cadence at once.
+pub(super) const AUTOMATION_SCAN_QUIET_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// How long to wait between automation scans. Pure: busy unless the UI is
+/// quiet *and* the band has nothing to track *and* no automation surface is
+/// open. A scan already in flight does not matter here: it is folded on every
+/// 2.5 s tick whatever this says, and only the *start* of the next one waits.
+pub(super) fn automation_scan_interval(app: &App, ui_quiet: bool) -> std::time::Duration {
+    let panel = &app.automation_panel;
+    let band_tracks_something = panel.active_automations > 0
+        || panel.live_runs > 0
+        || !panel.live_run_owners().is_empty()
+        || panel.has_unacknowledged_failure();
+    let surface_open = app.view_stack.top_kind() == Some(crate::tui::views::ModalKind::Automations);
+    if ui_quiet && !band_tracks_something && !surface_open {
+        AUTOMATION_SCAN_QUIET_INTERVAL
+    } else {
+        AUTOMATION_SCAN_BUSY_INTERVAL
+    }
+}
+
+/// Whether the next automation scan may start, `since_last_scan` after the
+/// previous one.
+pub(super) fn automation_scan_is_due(
+    app: &App,
+    ui_quiet: bool,
+    since_last_scan: std::time::Duration,
+) -> bool {
+    since_last_scan >= automation_scan_interval(app, ui_quiet)
 }
 
 /// Startup variant: take one scan and wait for it, so the first frame
@@ -668,4 +715,88 @@ pub(super) fn active_rlm_task_entries(app: &App) -> Vec<TaskPanelEntry> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod automation_scan_gate_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn app() -> App {
+        crate::test_support::test_app_with_options(crate::tui::app::TuiOptions {
+            skip_onboarding: true,
+            ..crate::test_support::test_tui_options(std::path::PathBuf::from("."))
+        })
+    }
+
+    #[test]
+    fn a_quiet_session_with_nothing_scheduled_rescans_on_the_long_interval() {
+        let app = app();
+        assert_eq!(
+            automation_scan_interval(&app, true),
+            AUTOMATION_SCAN_QUIET_INTERVAL
+        );
+        assert!(!automation_scan_is_due(&app, true, Duration::from_secs(14)));
+        assert!(automation_scan_is_due(&app, true, Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn a_session_in_use_keeps_the_busy_cadence() {
+        let app = app();
+        assert_eq!(
+            automation_scan_interval(&app, false),
+            AUTOMATION_SCAN_BUSY_INTERVAL
+        );
+        assert!(!automation_scan_is_due(
+            &app,
+            false,
+            Duration::from_millis(2_499)
+        ));
+        assert!(automation_scan_is_due(
+            &app,
+            false,
+            Duration::from_millis(2_500)
+        ));
+    }
+
+    #[test]
+    fn scheduled_work_in_the_band_keeps_the_busy_cadence_even_when_quiet() {
+        let mut app = app();
+        app.automation_panel.active_automations = 1;
+        assert_eq!(
+            automation_scan_interval(&app, true),
+            AUTOMATION_SCAN_BUSY_INTERVAL,
+            "an active automation can start a run at any moment"
+        );
+
+        let mut app = self::app();
+        app.automation_panel.live_runs = 1;
+        assert_eq!(
+            automation_scan_interval(&app, true),
+            AUTOMATION_SCAN_BUSY_INTERVAL,
+            "a live run settles into a receipt the scan produces"
+        );
+    }
+
+    #[test]
+    fn a_finished_scan_is_folded_without_starting_the_next_one() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut app = app();
+        rt.block_on(async {
+            let scan =
+                tokio::spawn(async { crate::tui::automation_panel::AutomationScan::default() });
+            while !scan.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            app.automation_scan = Some(scan);
+            // Not due: the scan is folded and nothing replaces it, so a
+            // quiet session does not chain scan after scan.
+            let changed = refresh_automation_panel(&mut app, false).await;
+            assert!(!changed, "an empty store changes nothing visible");
+        });
+        assert!(app.automation_scan.is_none());
+    }
 }

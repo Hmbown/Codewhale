@@ -4,7 +4,7 @@ use cucumber::{World as _, given, then, when, writer::Stats as _};
 use tempfile::TempDir;
 
 use crate::commands::{self, CommandResult};
-use crate::config::{ApiProvider, Config};
+use crate::config::{Config, ProviderKind};
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use crate::tui::app::{App, TuiOptions};
 use crate::tui::history::HistoryCell;
@@ -46,7 +46,7 @@ fn core_command_workspace(world: &mut CoreCommandWorld) {
     let tmpdir = TempDir::new().expect("core command TempDir");
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     app.ui_locale = codewhale_localization::Locale::En;
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = "deepseek-v4-pro".to_string();
     app.auto_model = false;
     app.model_ids_passthrough = false;

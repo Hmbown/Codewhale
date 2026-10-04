@@ -373,6 +373,7 @@ async fn evaluate(
                     .report(crate::cost_status::RuntimeUsageBatch {
                         decisions: Vec::new(),
                         drop_records: vec![crate::cost_status::RuntimeUsageDropRecord {
+                            reason: crate::cost_status::RuntimeUsageMissingReason::default(),
                             source_id: auto_route_usage_source_id(
                                 &request_route,
                                 "shadow:dispatched-unreceipted",

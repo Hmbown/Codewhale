@@ -1,5 +1,7 @@
 {
+  "ExtensionPromptUnavailable": "Anweisungen von Erweiterungen sind nicht verfügbar; prüfe /plugin show.",
   "ComposerOversizedSubmitHeld": "Nicht gesendet: Diese Nachricht enthält mehr als {limit} Zeichen und konnte nicht als Einfügedatei gespeichert werden ({error}). Der vollständige Text steht noch im Eingabefeld: Kürze ihn oder mache .codewhale/pastes beschreibbar und drücke dann erneut Enter.",
+  "ComposerOversizedSubmitHeldShort": "Nicht gesendet: über {limit} Zeichen; Einfügedatei nicht gespeichert.",
   "CmdPluginOwnerReport": "Erweiterungshost:\n  Status: {state}\n  Aktive Werkzeuge ({count}): {tools}",
   "CmdPluginOwnerActivating": "Wird aktiviert",
   "CmdPluginOwnerActive": "Aktiv",
@@ -2439,5 +2441,11 @@
   "ModelPickerReadinessRefreshed": "Modellbereitschaft aktualisiert · Katalogzeilen neu aufgebaut",
   "ModelPickerOpenToRefresh": "Öffne /model, um Bereitschaft und Katalog zu aktualisieren",
   "ModelPickerPinnedChip": "angeheftet",
+  "AuthSignedInAs": "Bei {provider} als {account} angemeldet.",
+  "AuthSignedInWithoutEmail": "Bei {provider} angemeldet (der Aussteller hat keine Konto-E-Mail gesendet).",
+  "AuthReplacedPreviousSignInAs": "Die vorherige Codewhale-Anmeldung bei {provider} ({account}) wurde ersetzt.",
+  "AuthReplacedPreviousSignIn": "Die vorherige Codewhale-Anmeldung bei {provider} wurde ersetzt.",
+  "AuthSameAccountAsBefore": "Das ist dasselbe Konto wie zuvor. Um ein anderes {provider}-Konto zu verwenden, melde dich im Browser davon ab (oder nutze ein privates Fenster) und melde dich erneut an.",
+  "AuthEnvTokenOutranksSignIn": "OPENAI_CODEX_ACCESS_TOKEN oder CODEX_ACCESS_TOKEN ist in dieser Umgebung gesetzt und hat Vorrang vor dieser Anmeldung; Anfragen nutzen weiter das Konto dieses Tokens, bis du die Variable entfernst.",
   "PinnedPromptJumpToMessage": "Zu dieser Nachricht springen"
 }

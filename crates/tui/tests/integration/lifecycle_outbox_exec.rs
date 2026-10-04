@@ -130,7 +130,7 @@ fn run_exec_with_outbox_config(
     )
     .expect("write exec config");
 
-    let mut command = Command::new(codewhale_tui_binary());
+    let mut command = Command::new(crate::binary::codewhale());
     preserve_host_env(&mut command);
     command
         .current_dir(workspace.path())
@@ -164,14 +164,11 @@ fn run_exec_with_outbox_config(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command.spawn().expect("spawn codewhale-tui exec");
+    let mut child = command.spawn().expect("spawn codewhale exec");
     let stdout_reader = read_pipe_in_background(child.stdout.take().expect("stdout pipe"));
     let stderr_reader = read_pipe_in_background(child.stderr.take().expect("stderr pipe"));
 
-    let status = match child
-        .wait_timeout(RUN_TIMEOUT)
-        .expect("wait for codewhale-tui")
-    {
+    let status = match child.wait_timeout(RUN_TIMEOUT).expect("wait for codewhale") {
         Some(status) => status,
         None => {
             let _ = child.kill();
@@ -179,7 +176,7 @@ fn run_exec_with_outbox_config(
             let stdout = join_pipe_reader(stdout_reader, "stdout");
             let stderr = join_pipe_reader(stderr_reader, "stderr");
             panic!(
-                "codewhale-tui exec timed out after {RUN_TIMEOUT:?}\nstdout:\n{}\nstderr:\n{}",
+                "codewhale exec timed out after {RUN_TIMEOUT:?}\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&stdout),
                 String::from_utf8_lossy(&stderr)
             );
@@ -191,7 +188,7 @@ fn run_exec_with_outbox_config(
     assert_eq!(
         status.code(),
         Some(expected_exit_code),
-        "codewhale-tui exec returned the wrong exit status\nstdout:\n{}\nstderr:\n{}",
+        "codewhale exec returned the wrong exit status\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&stdout),
         String::from_utf8_lossy(&stderr)
     );
@@ -227,23 +224,6 @@ fn read_outbox_lines(path: &Path) -> Vec<Value> {
                 .unwrap_or_else(|err| panic!("outbox line should parse: {err}\nline: {line}"))
         })
         .collect()
-}
-
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
 }
 
 fn home_outbox_path(home: &TempDir) -> PathBuf {

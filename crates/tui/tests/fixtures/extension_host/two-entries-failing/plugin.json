@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "two-entries-failing",
+  "version": "0.1.0",
+  "description": "Test fixture: a two-entry plugin whose second entry throws, so the first entry's tool must be rolled back too.",
+  "license": "MIT",
+  "extensions": {
+    "net.codewhale": {
+      "native": {
+        "paths": ["first.mjs", "second.mjs"]
+      }
+    }
+  }
+}

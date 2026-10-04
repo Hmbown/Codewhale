@@ -39,6 +39,221 @@ pub trait Status {
     fn is_paused(&self) -> bool;
 }
 
+/// A single message entry in a conversation thread.
+///
+/// Messages form a tree structure via [`parent_entry_id`](Self::parent_entry_id),
+/// enabling conversation branching and forking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageRecord {
+    /// Auto-incremented unique identifier for this message.
+    pub id: i64,
+    /// ID of the thread this message belongs to.
+    pub thread_id: String,
+    /// Role of the message sender (e.g. `"user"`, `"assistant"`, `"system"`).
+    pub role: String,
+    /// Text content of the message.
+    pub content: String,
+    /// Optional structured item payload (tool calls, tool results, etc.).
+    pub item: Option<Value>,
+    /// Unix timestamp (seconds) when the message was created.
+    pub created_at: i64,
+    /// ID of the parent message, forming a tree structure. `None` for root messages.
+    pub parent_entry_id: Option<i64>,
+}
+
+/// A complete immutable legacy SQLite graph, not a limit or active-branch projection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyThreadHistory {
+    pub version: u32,
+    pub state_store_id: String,
+    pub thread_id: String,
+    pub current_leaf_id: Option<i64>,
+    pub messages: Vec<MessageRecord>,
+    /// Captured in the same SQLite snapshot; imported Active goals stay paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<ThreadGoal>,
+}
+
+pub const MAX_CANONICAL_HISTORY_ENTRIES: usize = 16_384;
+pub const MAX_CANONICAL_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+
+/// An authenticated import proposal carries conversation data only. Routing and
+/// permissions remain the current owner's create-thread policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalHistoryImportRequest {
+    pub version: u32,
+    pub operation_key: String,
+    pub expected_data_dir: PathBuf,
+    pub expected_execution_scope: String,
+    /// Existing bare compatibility links attach their full source graph here;
+    /// the owner verifies the actual bound canonical document, never remints it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_runtime_thread_id: Option<String>,
+    pub workspace: PathBuf,
+    pub model: Option<String>,
+    pub history: LegacyThreadHistory,
+}
+
+/// Durable result of the actual canonical owner operation. Its scope fields are
+/// captured from RuntimeStoreBinding; historical receipts never authenticate a
+/// current process or convey credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalThreadReceipt {
+    pub version: u32,
+    pub data_dir: PathBuf,
+    pub execution_scope: String,
+    pub operation_key: String,
+    pub request_digest: String,
+    pub history_digest: String,
+    pub runtime_thread_id: String,
+    pub session_id: String,
+}
+
+/// A complete read projection from the actual Engine and its existing saved
+/// journal. `session` retains the established SavedSession wire shape, including
+/// every branch; it is data, never a policy or operation-commit receipt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalThreadSnapshot {
+    pub version: u32,
+    pub data_dir: PathBuf,
+    pub execution_scope: String,
+    pub runtime_thread_id: String,
+    pub saved_session_id: Option<String>,
+    pub saved_document_digest: Option<String>,
+    pub document_digest: String,
+    pub session_goal_digest: String,
+    pub session: Value,
+}
+
+/// One client-captured intent. The key is retained after an uncertain reply;
+/// retrying it never allocates another canonical identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalThreadMutationRequest {
+    pub version: u32,
+    pub operation_key: String,
+    pub expected_data_dir: PathBuf,
+    pub expected_execution_scope: String,
+    pub workspace: PathBuf,
+    pub mutation: CanonicalThreadMutation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CanonicalThreadMutation {
+    /// The existing CreateThreadRequest shape, checked by the owner. Conversation
+    /// data and an imported document never supply a routing or permission ceiling.
+    Create { config: Value },
+    Resume {
+        source: CanonicalHistorySource,
+        #[serde(default)]
+        options: CanonicalHistoryOptions,
+    },
+    Fork {
+        source: CanonicalHistorySource,
+        #[serde(default)]
+        options: CanonicalHistoryOptions,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_entry_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalHistoryOptions {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered_history: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub overrides: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_session_goal_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CanonicalHistorySource {
+    Thread {
+        runtime_thread_id: String,
+        expected_document_digest: String,
+    },
+    /// Local mounted handoff supplies the already protected complete document;
+    /// the actual owner reopens it and compares the same whole-document digest.
+    SavedSession {
+        session: Value,
+        expected_document_digest: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalThreadOperationKind {
+    Create,
+    Resume,
+    Fork,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalThreadOperationAssociation {
+    pub kind: CanonicalThreadOperationKind,
+    pub source_runtime_thread_id: Option<String>,
+    pub source_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalThreadOperationLookup {
+    pub version: u32,
+    pub operation_key: String,
+    pub expected_data_dir: PathBuf,
+    pub expected_execution_scope: String,
+    pub workspace: PathBuf,
+}
+
+/// Explicit completion of an already-prepared retained intent, with no source proposal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalThreadOperationRecovery {
+    pub operation: CanonicalThreadOperationLookup,
+    pub association: CanonicalThreadOperationAssociation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CanonicalThreadOperationStatus {
+    Absent,
+    Pending {
+        receipt: CanonicalThreadReceipt,
+        association: CanonicalThreadOperationAssociation,
+    },
+    Committed {
+        receipt: CanonicalThreadReceipt,
+        association: CanonicalThreadOperationAssociation,
+    },
+}
+
+/// Closed routing receipt captured from the held Runtime owner, never a bearer.
+/// Authentication also requires the actual connected kernel peer identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeOwnerReceipt {
+    pub version: u32,
+    pub data_dir: PathBuf,
+    pub execution_scope: String,
+    pub lease_generation: String,
+    pub pid: u32,
+    pub process_start: String,
+    pub principal: String,
+    pub socket_path: PathBuf,
+    pub config_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope<T> {
     pub request_id: String,
@@ -222,6 +437,9 @@ impl ThreadGoal {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadStartParams {
+    /// Captured once for this user intent and retained for an uncertain reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,6 +452,9 @@ pub struct ThreadStartParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadResumeParams {
+    /// Captured once for this user intent and retained for an uncertain reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_key: Option<String>,
     pub thread_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history: Option<Vec<Value>>,
@@ -263,6 +484,9 @@ pub struct ThreadResumeParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadForkParams {
+    /// Captured once for this user intent and retained for an uncertain reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_key: Option<String>,
     pub thread_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,

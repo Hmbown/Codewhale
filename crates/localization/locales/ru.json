@@ -1,5 +1,7 @@
 {
+  "ExtensionPromptUnavailable": "Инструкции расширений недоступны; проверьте /plugin show.",
   "ComposerOversizedSubmitHeld": "Не отправлено: сообщение длиннее {limit} символов, и его не удалось сохранить в файл вставленного текста ({error}). Полный текст остался в поле ввода: сократите его или разрешите запись в .codewhale/pastes, затем снова нажмите Enter.",
+  "ComposerOversizedSubmitHeldShort": "Не отправлено: больше {limit} символов; файл вставки не сохранён.",
   "CmdPluginOwnerReport": "Хост расширений:\n  Состояние: {state}\n  Активные инструменты ({count}): {tools}",
   "CmdPluginOwnerActivating": "Активация",
   "CmdPluginOwnerActive": "Активен",
@@ -2439,5 +2441,11 @@
   "ModelPickerReadinessRefreshed": "Готовность моделей обновлена · строки каталога перестроены",
   "ModelPickerOpenToRefresh": "Откройте /model, чтобы обновить готовность и каталог",
   "ModelPickerPinnedChip": "закреплено",
+  "AuthSignedInAs": "Вход в {provider} выполнен как {account}.",
+  "AuthSignedInWithoutEmail": "Вход в {provider} выполнен (издатель не передал адрес электронной почты аккаунта).",
+  "AuthReplacedPreviousSignInAs": "Предыдущий вход Codewhale в {provider} ({account}) заменён.",
+  "AuthReplacedPreviousSignIn": "Предыдущий вход Codewhale в {provider} заменён.",
+  "AuthSameAccountAsBefore": "Это тот же аккаунт, что и раньше; чтобы использовать другой аккаунт {provider}, выйдите из него в браузере (или откройте приватное окно) и войдите снова.",
+  "AuthEnvTokenOutranksSignIn": "В этой среде задана переменная OPENAI_CODEX_ACCESS_TOKEN или CODEX_ACCESS_TOKEN, и она важнее этого входа; запросы будут использовать аккаунт этого токена, пока вы её не удалите.",
   "PinnedPromptJumpToMessage": "Перейти к этому сообщению"
 }

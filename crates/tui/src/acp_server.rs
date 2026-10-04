@@ -1,1566 +1,274 @@
-//! Minimal Agent Client Protocol stdio adapter.
-//!
-//! This starts from the ACP baseline: initialize, new session, prompt, and
-//! cancel. It keeps stdout protocol-clean for editor clients and routes
-//! prompts through the same configured provider route as one-shot CLI mode.
-//!
-//! `session/new` and `session/load` expose mode/model configuration. Standard
-//! setters change only the addressed in-memory session between turns. Plan
-//! uses the shared read-only tool authority and sandbox; changing mode is an
-//! explicit prompt-prefix invalidation for the next turn. In-flight turns
-//! keep their frozen prefix and return the existing busy error for setters.
-//! Configuration is connection-local, not a new durable preference store;
-//! legacy unscoped `selectModel` changes defaults for future sessions.
-//!
-//! `session/prompt` streams the provider response: each text delta is emitted
-//! as a `session/update` agent_message_chunk as it arrives, instead of buffering
-//! the whole turn and sending one chunk at the end. The stream is consumed
-//! concurrently with the input reader so that a `session/cancel` for the same
-//! session can interrupt the turn mid-stream (returning `stopReason: "cancelled"`)
-//! instead of being queued behind it. A single writer task is preserved so
-//! stdout stays protocol-clean.
-//!
-//! Each ACP session owns a [`crate::tools::ToolRegistry`] built from the same
-//! file/search/git/patch/shell tools the CLI `exec` agent and the MCP server
-//! adapter (`crate::mcp_server`) already use. When the model emits a tool call,
-//! the turn driver executes it locally through that registry (no duplicate
-//! filesystem/shell implementation), reports progress to the client as
-//! `tool_call` / `tool_call_update` session updates, feeds the result back as
-//! a `tool_result` content block, and re-opens the provider stream so the
-//! model can keep going until it produces a final answer with no further tool
-//! calls.
-
+//! ACP stdio projection of the existing Runtime/Engine owner.
+//! History, provider requests, tools, approval and cancellation are Core facts.
+//! This module keeps only connection configuration, canonical bindings and
+//! JSON-RPC correlation. Secure cross-process attachment is not yet qualified.
+use crate::config::{Config, ProviderKind};
+#[cfg(test)]
+use crate::runtime_threads::RuntimeThreadManagerConfig;
+use crate::runtime_threads::{CreateThreadRequest, RuntimeThreadManager, UpdateThreadRequest};
+use anyhow::{Result, anyhow};
+use codewhale_config::AppMode;
+use codewhale_execpolicy::ApprovalMode;
+use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-
-use anyhow::{Result, anyhow};
-use futures_util::StreamExt;
-use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
-use tokio_util::sync::CancellationToken;
-
-use crate::client::CodewhaleClient;
-use crate::config::{ApiProvider, Config};
-use crate::core::engine::turn_loop::run_tool_call_before_hooks;
-use crate::core::engine::{
-    AutoReviewPlanDecision, ToolAskRuleDecision, auto_review_plan_decision_for_context,
-    exec_shell_ask_rule_decision_for_policy, file_tool_ask_rule_decision_for_policy,
-};
-use crate::llm_client::{LlmClient, StreamEventBox};
-use crate::tools::spec::{ApprovalRequirement, PreparedToolCall, RichToolResult, ToolError};
-use crate::tools::{ToolContext, ToolRegistry, ToolRegistryBuilder};
-use crate::worker_profile::ShellPolicy;
-use codewhale_config::AppMode;
-use codewhale_execpolicy::ApprovalMode;
-use codewhale_models::Role;
-use codewhale_models::{
-    ContentBlock, ContentBlockStart, Delta, Message, MessageRequest, StreamEvent, SystemPrompt,
-};
-
+#[cfg(test)]
+use tokio::io::BufReader;
+use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
+mod runtime;
 const ACP_PROTOCOL_VERSION: u64 = 1;
-
-/// Hard cap on LLM <-> tool round-trips within a single `session/prompt`
-/// turn. Guards against a model that never stops calling tools; each round is
-/// one provider stream plus zero or more tool executions.
-const MAX_ACP_TOOL_ROUNDS: usize = 50;
-
-/// Maximum number of concurrent sessions kept in memory. When this limit is
-/// exceeded, the oldest session with no in-flight prompt is evicted.
 const MAX_ACP_SESSIONS: usize = 64;
-
-/// A conforming ACP client answers every pending permission request with a
-/// `cancelled` outcome when the prompt is cancelled. Bound that hand-off so a
-/// broken client cannot strand the stdio server forever after cancellation.
-const ACP_PERMISSION_CANCEL_GRACE: Duration = Duration::from_secs(2);
-
-/// How long a cancelled tool gets to observe its token and wind down (kill a
-/// child, flush a write) before the turn stops waiting and drops it. A tool
-/// that ignores its token must not hold the stdio server forever.
-const ACP_TOOL_CANCEL_GRACE: Duration = Duration::from_secs(5);
-
-/// Agent-originated JSON-RPC request ids have their own namespace. Strings
-/// avoid the client-specific numeric response-id compatibility shim used for
-/// replies to client-originated requests.
+const TOOL_CALL_CONTENT_PREVIEW_CHARS: usize = 4_000;
 static NEXT_ACP_PERMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Content is streamed to the model in full (no truncation); this cap only
-/// bounds how much of a tool's output is echoed into the `tool_call_update`
-/// notification the editor renders, so a large `File`/`Bash`
-/// result does not flood the client UI.
-const TOOL_CALL_CONTENT_PREVIEW_CHARS: usize = 4_000;
-
-pub async fn run_acp_server(config: Config, model: String, default_cwd: PathBuf) -> Result<()> {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin).lines();
-    let mut writer = tokio::io::BufWriter::new(stdout);
-    let mut server = AcpServer::new(config, model, default_cwd);
-
-    while let Some(line) = reader.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let message: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(err) => {
-                write_jsonrpc_error(&mut writer, None, -32700, format!("invalid json: {err}"))
-                    .await?;
-                continue;
-            }
-        };
-
-        if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-            write_jsonrpc_error(
-                &mut writer,
-                message
-                    .get("id")
-                    .cloned()
-                    .map(|id| server.response_id_policy.response_id(id)),
-                -32600,
-                "jsonrpc version must be 2.0",
-            )
-            .await?;
-            continue;
-        }
-
-        let id = message.get("id").cloned();
-        let method = match message.get("method").and_then(Value::as_str) {
-            Some(method) => method,
-            None if is_jsonrpc_response(&message) => {
-                // A late response to an agent-originated request (most notably
-                // permission after cancellation) has no request semantics and
-                // must not be answered with another JSON-RPC error.
-                continue;
-            }
-            None => {
-                write_jsonrpc_error(
-                    &mut writer,
-                    id.map(|id| server.response_id_policy.response_id(id)),
-                    -32600,
-                    "missing method",
-                )
-                .await?;
-                continue;
-            }
-        };
-        let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
-
-        // `session/prompt` is driven concurrently with the reader so a
-        // `session/cancel` can interrupt the in-flight provider call or a
-        // running tool. Every other method is request/response and handled
-        // synchronously below.
-        if method == "session/prompt" {
-            match server.begin_prompt(params) {
-                Ok(prepared) => {
-                    let PreparedPrompt {
-                        session_id,
-                        messages,
-                        cwd,
-                        config,
-                        model,
-                    } = prepared;
-                    let response_id_policy = server.response_id_policy;
-                    let Some(tool_registry) = server.session_tool_registry(&session_id) else {
-                        let id = id.map(|id| response_id_policy.response_id(id));
-                        write_jsonrpc_error(&mut writer, id, -32603, "unknown sessionId").await?;
-                        continue;
-                    };
-                    // Freeze the first round's fully composed system prompt
-                    // for this entire `session/prompt`. Tool calls may edit
-                    // AGENTS.md, memory, or configured instruction files, but
-                    // self-authored content cannot become same-turn system
-                    // authority on a later provider round.
-                    let frozen_system_prompt =
-                        Arc::new(std::sync::Mutex::new(None::<SystemPrompt>));
-                    // The stream-opening closure borrows `&server` only
-                    // briefly per round; each returned `StreamEventBox` is
-                    // `'static`, so it can be raced against the reader
-                    // without holding a borrow on the server across an
-                    // await, and the main task keeps exclusive ownership of
-                    // stdout.
-                    let outcome = run_agentic_prompt_turn(
-                        AcpTurnContext {
-                            config: &config,
-                            model: &model,
-                            session_id: &session_id,
-                            tool_registry: &tool_registry,
-                            response_id_policy,
-                        },
-                        messages,
-                        &mut reader,
-                        &mut writer,
-                        |msgs| {
-                            // Rebind to references before the `async move`
-                            // block: `async move` moves every path it
-                            // touches, and these are already-`Copy`
-                            // references, so only `msgs` (the per-round
-                            // owned clone) is actually moved in — `server`,
-                            // `cwd`, and `tool_registry` stay borrowed from
-                            // the enclosing scope across every call this
-                            // `FnMut` closure makes.
-                            let server = &server;
-                            let cwd = &cwd;
-                            let config = &config;
-                            let model = &model;
-                            let tool_registry = &tool_registry;
-                            let frozen_system_prompt = Arc::clone(&frozen_system_prompt);
-                            async move {
-                                server
-                                    .open_prompt_stream(
-                                        config,
-                                        model,
-                                        &msgs,
-                                        cwd,
-                                        tool_registry,
-                                        &frozen_system_prompt,
-                                    )
-                                    .await
-                            }
-                        },
-                    )
-                    .await;
-                    match outcome {
-                        Ok((PromptOutcome::Completed(_text), full_messages)) => {
-                            // Chunks were already streamed; record the full
-                            // conversation (including any tool rounds) for
-                            // the next prompt.
-                            server.commit_turn_messages(&session_id, full_messages);
-                            if let Some(id) = id {
-                                let id = response_id_policy.response_id(id);
-                                write_jsonrpc_result(
-                                    &mut writer,
-                                    id,
-                                    json!({ "stopReason": "end_turn" }),
-                                )
-                                .await?;
-                            }
-                        }
-                        Ok((PromptOutcome::Cancelled, partial_messages)) => {
-                            // The turn driver keeps complete receipts for every
-                            // proposed tool call, including calls cancelled
-                            // before execution, so partial side effects remain
-                            // visible and no dangling tool_use block is stored.
-                            server.commit_turn_messages(&session_id, partial_messages);
-                            if let Some(id) = id {
-                                let id = response_id_policy.response_id(id);
-                                write_jsonrpc_result(
-                                    &mut writer,
-                                    id,
-                                    json!({ "stopReason": "cancelled" }),
-                                )
-                                .await?;
-                            }
-                        }
-                        Ok((PromptOutcome::MaxRounds(_text), full_messages)) => {
-                            // Max rounds reached — commit what we have
-                            // (unlike cancel, this is a normal completion).
-                            server.commit_turn_messages(&session_id, full_messages);
-                            if let Some(id) = id {
-                                let id = response_id_policy.response_id(id);
-                                write_jsonrpc_result(
-                                    &mut writer,
-                                    id,
-                                    json!({ "stopReason": "max_turn_requests" }),
-                                )
-                                .await?;
-                            }
-                        }
-                        Err(err) => {
-                            if let Some(partial_messages) = err.partial_messages {
-                                // A later provider round failed after one or
-                                // more tools completed. Preserve those
-                                // side-effect receipts in session history.
-                                server.commit_turn_messages(&session_id, partial_messages);
-                            } else {
-                                // The user message was already pushed into
-                                // session history by `begin_prompt`; roll it
-                                // back when no tool receipt exists yet.
-                                server.rollback_user_message(&session_id);
-                            }
-                            let id = id.map(|id| response_id_policy.response_id(id));
-                            write_jsonrpc_error(&mut writer, id, -32603, err.source.to_string())
-                                .await?;
-                        }
-                    }
-                }
-                Err(err) => {
-                    let id = id.map(|id| server.response_id_policy.response_id(id));
-                    write_jsonrpc_error(&mut writer, id, err.code, err.message).await?;
-                }
-            }
-            continue;
-        }
-
-        match server.handle_request(method, params).await {
-            Ok(AcpDispatch::Response(result)) => {
-                if let Some(id) = id {
-                    let id = server.response_id_policy.response_id(id);
-                    write_jsonrpc_result(&mut writer, id, result).await?;
-                }
-            }
-            Ok(AcpDispatch::Shutdown) => {
-                if let Some(id) = id {
-                    let id = server.response_id_policy.response_id(id);
-                    write_jsonrpc_result(&mut writer, id, json!(null)).await?;
-                }
-                break;
-            }
-            Err(err) => {
-                let id = id.map(|id| server.response_id_policy.response_id(id));
-                write_jsonrpc_error(&mut writer, id, err.code, err.message).await?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn is_jsonrpc_response(message: &Value) -> bool {
-    message.get("id").is_some()
-        && (message.get("result").is_some() || message.get("error").is_some())
-}
-
-/// Outcome of a `session/prompt` turn driven against the input stream.
-#[derive(Debug, PartialEq, Eq)]
-enum PromptOutcome {
-    /// The provider call finished first; carries the assistant text.
-    Completed(String),
-    /// A matching `session/cancel` arrived before the call finished.
-    Cancelled,
-    /// The turn reached the maximum number of tool-call round-trips.
-    /// Carries whatever text the model produced in the final round.
-    MaxRounds(String),
-}
-
-#[derive(Debug)]
-struct AgenticPromptError {
-    source: anyhow::Error,
-    /// Present once at least one complete tool-result batch has been appended.
-    /// Those receipts may describe real side effects and must survive a later
-    /// provider failure.
-    partial_messages: Option<Vec<Message>>,
-}
-
-impl std::fmt::Display for AgenticPromptError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.source.fmt(f)
-    }
-}
-
-impl AgenticPromptError {
-    fn new(source: anyhow::Error, messages: &[Message], has_tool_receipts: bool) -> Self {
-        Self {
-            source,
-            partial_messages: has_tool_receipts.then(|| messages.to_vec()),
-        }
-    }
-}
-
-/// A tool call the model requested, assembled from streamed
-/// `content_block_start` / `content_block_delta` / `content_block_stop`
-/// events. `parse_error` is set when the accumulated `input_json_delta`
-/// bytes did not parse as JSON — the call is still surfaced (rather than
-/// silently dropped) so the model gets a clear tool-result error instead of
-/// the turn hanging.
-#[derive(Debug, Clone)]
-struct PendingToolCall {
-    /// Original provider pairing, retained only for wire history.
-    id: String,
-    execution_id: String,
-    caller: Option<codewhale_models::ToolCaller>,
-    thought_signature: Option<String>,
-    name: String,
-    input: Value,
-    parse_error: Option<String>,
-}
-
-/// Accumulates one streamed `tool_use` content block until its
-/// `content_block_stop`.
-#[derive(Debug, Default)]
-struct ToolUseAccumulator {
-    id: String,
-    caller: Option<codewhale_models::ToolCaller>,
-    thought_signature: Option<String>,
-    name: String,
-    initial_input: Value,
-    buffer: String,
-}
-
-impl ToolUseAccumulator {
-    fn finalize(self) -> PendingToolCall {
-        let execution_id = uuid::Uuid::new_v4().to_string();
-        if self.buffer.trim().is_empty() {
-            return PendingToolCall {
-                id: self.id,
-                execution_id,
-                caller: self.caller,
-                thought_signature: self.thought_signature,
-                name: self.name,
-                input: self.initial_input,
-                parse_error: None,
-            };
-        }
-        match serde_json::from_str(&self.buffer) {
-            Ok(input) => PendingToolCall {
-                id: self.id,
-                execution_id,
-                caller: self.caller,
-                thought_signature: self.thought_signature,
-                name: self.name,
-                input,
-                parse_error: None,
-            },
-            Err(_) => PendingToolCall {
-                id: self.id,
-                execution_id,
-                caller: self.caller,
-                thought_signature: self.thought_signature,
-                name: self.name,
-                input: json!({}),
-                parse_error: Some(self.buffer),
-            },
-        }
-    }
-}
-
-/// The text payload an ACP client should see for a given stream event, if any.
-/// ACP baseline is text-only, so thinking/tool/control events carry no chunk.
-fn stream_text_chunk(event: &StreamEvent) -> Option<&str> {
-    match event {
-        StreamEvent::ContentBlockDelta {
-            delta: Delta::TextDelta { text },
-            ..
-        } => Some(text),
-        StreamEvent::ContentBlockStart {
-            content_block: ContentBlockStart::Text { text },
-            ..
-        } => Some(text),
-        _ => None,
-    }
-}
-
-/// Consume a provider response `stream`, emitting each text delta as a
-/// `session/update` chunk, while concurrently watching `reader` for a
-/// `session/cancel` targeting `session_id`.
-///
-/// This is the streaming + cancellation control point. It is generic over the
-/// reader/writer and takes the boxed stream, so it is unit-tested with canned
-/// in-memory streams and readers — no real provider call required. The caller
-/// keeps the only writer, so streamed chunks and acknowledgements all stay on
-/// the single protocol-clean stdout stream.
-///
-/// Returns [`PromptOutcome::Completed`] with the full accumulated text once the
-/// stream ends (or emits `message_stop`), plus any `tool_use` blocks the model
-/// emitted during the round, so the caller can execute them and continue the
-/// turn. A matching `session/cancel` (request or notification form) ends it
-/// early with [`PromptOutcome::Cancelled`] — dropping the stream aborts the
-/// underlying provider connection. The turn is single-flight: a cancel for a
-/// different session is acknowledged and ignored; any other concurrent *request*
-/// is rejected with a clear error so the client is not left waiting;
-/// notifications without an id are ignored.
-async fn drive_prompt_stream<R, W>(
-    mut stream: StreamEventBox,
-    session_id: &str,
-    response_id_policy: JsonRpcResponseIdPolicy,
-    reader: &mut Lines<R>,
-    writer: &mut W,
-) -> Result<(PromptOutcome, Vec<PendingToolCall>)>
-where
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut accumulated = String::new();
-    let mut tool_calls: Vec<PendingToolCall> = Vec::new();
-    let mut pending_tool_uses: HashMap<u32, ToolUseAccumulator> = HashMap::new();
-    // Once input closes mid-turn we stop selecting on the reader and just drain
-    // the stream to completion, rather than spinning on repeated EOFs.
-    let mut reader_open = true;
-    loop {
-        tokio::select! {
-            event = stream.next() => {
-                match event {
-                    // Stream exhausted without an explicit stop: turn is done.
-                    None => return Ok((PromptOutcome::Completed(accumulated), tool_calls)),
-                    Some(Ok(event)) => {
-                        if let Some(text) = stream_text_chunk(&event)
-                            && !text.is_empty() {
-                                accumulated.push_str(text);
-                                write_session_update(writer, session_id, text.to_string()).await?;
-                            }
-                        match event {
-                            StreamEvent::ContentBlockStart {
-                                index,
-                                content_block: ContentBlockStart::ToolUse { id, name, input, caller, thought_signature },
-                            } => {
-                                pending_tool_uses.insert(
-                                    index,
-                                    ToolUseAccumulator {
-                                        id,
-                                        caller,
-                                        thought_signature,
-                                        name,
-                                        initial_input: input,
-                                        buffer: String::new(),
-                                    },
-                                );
-                            }
-                            StreamEvent::ContentBlockDelta {
-                                index,
-                                delta: Delta::InputJsonDelta { partial_json },
-                            } => {
-                                if let Some(acc) = pending_tool_uses.get_mut(&index) {
-                                    acc.buffer.push_str(&partial_json);
-                                }
-                            }
-                            StreamEvent::ContentBlockStop { index } => {
-                                if let Some(acc) = pending_tool_uses.remove(&index) {
-                                    tool_calls.push(acc.finalize());
-                                }
-                            }
-                            StreamEvent::MessageStop => {
-                                return Ok((PromptOutcome::Completed(accumulated), tool_calls));
-                            }
-                            StreamEvent::Error { error } => {
-                                return Err(anyhow!("provider stream error: {error}"));
-                            }
-                            _ => {}
-                        }
-                    }
-                    Some(Err(err)) => return Err(err),
-                }
-            }
-            line = reader.next_line(), if reader_open => {
-                let line = match line? {
-                    Some(line) => line,
-                    // Input closed mid-turn: stop watching it, keep draining.
-                    None => {
-                        reader_open = false;
-                        continue;
-                    }
-                };
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let message: Value = match serde_json::from_str(&line) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        write_jsonrpc_error(writer, None, -32700, format!("invalid json: {err}"))
-                            .await?;
-                        continue;
-                    }
-                };
-                let id = message.get("id").cloned();
-                match message.get("method").and_then(Value::as_str) {
-                    Some("session/cancel") => {
-                        let target = message.pointer("/params/sessionId").and_then(Value::as_str);
-                        // A cancel with no sessionId is treated as targeting the
-                        // single in-flight turn.
-                        if target.is_none() || target == Some(session_id) {
-                            if let Some(id) = id {
-                                let id = response_id_policy.response_id(id);
-                                write_jsonrpc_result(writer, id, json!(null)).await?;
-                            }
-                            // Dropping `stream` on return aborts the provider call.
-                            return Ok((PromptOutcome::Cancelled, tool_calls));
-                        }
-                        // Cancel for some other session: acknowledge, keep going.
-                        if let Some(id) = id {
-                            let id = response_id_policy.response_id(id);
-                            write_jsonrpc_result(writer, id, json!(null)).await?;
-                        }
-                    }
-                    _ => {
-                        // The turn is single-flight; do not silently drop a
-                        // request the client expects a response to.
-                        if let Some(id) = id {
-                            let id = response_id_policy.response_id(id);
-                            write_jsonrpc_error(
-                                writer,
-                                Some(id),
-                                -32603,
-                                "a session/prompt turn is already in progress",
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Outcome of executing one batch of tool calls from a single round.
-enum ToolBatchOutcome {
-    /// Every tool call ran to completion; carries the `tool_result` messages
-    /// to append to the conversation, in call order.
-    Completed(Vec<Message>),
-    /// A matching `session/cancel` arrived while a tool was awaiting approval
-    /// or running. Carries receipts for every proposed call so completed or
-    /// partially completed side effects never disappear from history.
-    Cancelled(Vec<Message>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AcpToolAdmission {
-    Auto,
-    RequestPermission(String),
-    Block(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AcpPermissionDecision {
-    Allow,
-    Reject(String),
-    Cancelled,
-}
-
-fn acp_shell_command_requests_detach(command: &str) -> bool {
-    let mut single_quoted = false;
-    let mut double_quoted = false;
-    let mut escaped = false;
-    let chars = command.chars().collect::<Vec<_>>();
-    for (index, ch) in chars.iter().copied().enumerate() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' && !single_quoted {
-            escaped = true;
-            continue;
-        }
-        if ch == '\'' && !double_quoted {
-            single_quoted = !single_quoted;
-            continue;
-        }
-        if ch == '"' && !single_quoted {
-            double_quoted = !double_quoted;
-            continue;
-        }
-        if ch != '&' || single_quoted || double_quoted {
-            continue;
-        }
-        let previous = index.checked_sub(1).and_then(|i| chars.get(i)).copied();
-        let next = chars.get(index + 1).copied();
-        // `&&`, `&>`/`&>>`, and `>&` are chaining/redirection rather than a
-        // detached child. Any other unquoted ampersand is a background
-        // control operator and is unavailable in ACP.
-        if previous != Some('&') && next != Some('&') && next != Some('>') && previous != Some('>')
-        {
-            return true;
-        }
-    }
-
-    shell_words::split(command).is_ok_and(|words| {
-        words.iter().any(|word| {
-            matches!(
-                word.to_ascii_lowercase().as_str(),
-                "nohup" | "disown" | "setsid" | "daemonize"
-            )
-        })
-    })
-}
-
-#[derive(Debug)]
-struct PreparedAcpTool {
-    call: PreparedToolCall,
-    admission: AcpToolAdmission,
-    additional_context: Option<String>,
-}
-
-/// Prepare one registered call and fold every policy layer that can tighten
-/// its admission. ACP deliberately does not use the TUI's workspace-write
-/// carve-out: a remembered exact allow rule may clear the ordinary tool hold,
-/// but the built-in safety floor and repository law can always re-add a prompt
-/// or hard block afterwards.
-async fn prepare_acp_tool_admission(
-    config: &Config,
-    registry: &ToolRegistry,
-    call: &PendingToolCall,
-) -> std::result::Result<(PreparedToolCall, AcpToolAdmission), ToolError> {
-    let spec = registry.get(&call.name).ok_or_else(|| {
-        ToolError::not_available(format!("tool '{}' is not registered", call.name))
-    })?;
-    let prepared = spec.prepare(call.input.clone(), registry.context())?;
-    let canonical_name =
-        crate::tools::canonical_action::canonical_action_alias(&call.name, &prepared.input);
-    if matches!(call.name.as_str(), "bash" | "Bash" | "exec_shell")
-        || canonical_name.starts_with("exec_shell")
-    {
-        let action = prepared
-            .input
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("run");
-        let requests_stateful_shell = action != "run"
-            || prepared.starts_detached
-            || prepared.input.get("interactive").and_then(Value::as_bool) == Some(true)
-            || prepared.input.get("persist").and_then(Value::as_bool) == Some(true)
-            || prepared
-                .input
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(acp_shell_command_requests_detach);
-        if requests_stateful_shell {
-            return Ok((
-                prepared,
-                AcpToolAdmission::Block(
-                    "ACP v0.9.6 exposes foreground Bash runs only; background, TTY, interactive, persistent, and background-task control actions are unavailable."
-                        .to_string(),
-                ),
-            ));
-        }
-    }
-    let mut permission_reason =
-        (prepared.approval != ApprovalRequirement::Auto).then(|| prepared.description.clone());
-    let approval_mode = acp_approval_mode(config);
-    let workspace = registry.context().workspace.as_path();
-
-    let typed_rule = exec_shell_ask_rule_decision_for_policy(
-        &config.exec_policy_engine,
-        &call.name,
-        &prepared.input,
-        workspace,
-        approval_mode,
-    )
-    .or_else(|| {
-        file_tool_ask_rule_decision_for_policy(
-            &config.exec_policy_engine,
-            &call.name,
-            &prepared.input,
-            workspace,
-            approval_mode,
-        )
-    });
-    match typed_rule {
-        Some(ToolAskRuleDecision::Allow) => permission_reason = None,
-        Some(ToolAskRuleDecision::Prompt(reason)) => permission_reason = Some(reason),
-        Some(ToolAskRuleDecision::Block(reason)) => {
-            return Ok((prepared, AcpToolAdmission::Block(reason)));
-        }
-        None => {}
-    }
-
-    let run_origin = if prepared.starts_detached {
-        crate::tui::auto_review::RunOrigin::Background
-    } else {
-        crate::tui::auto_review::RunOrigin::Headless
-    };
-    let review_context = crate::tui::auto_review::AutoReviewContext::from_tool_call_async(
-        &call.name,
-        &prepared.input,
-        run_origin,
-        approval_mode,
-        Some(workspace),
-    )
-    .await?;
-    let (auto_review, _audit) =
-        auto_review_plan_decision_for_context(&config.auto_review_policy(), &review_context);
-    match auto_review {
-        AutoReviewPlanDecision::NoChange | AutoReviewPlanDecision::Allow => {}
-        AutoReviewPlanDecision::ForcePrompt(reason) => permission_reason = Some(reason),
-        // Headless adapters keep the deterministic-only tier: a fallback hold
-        // that interactive Auto posture would send to the model guardian is
-        // a hard block here (the reviewer is an interactive-session feature).
-        AutoReviewPlanDecision::ConsultReviewer(reason) | AutoReviewPlanDecision::Block(reason) => {
-            return Ok((prepared, AcpToolAdmission::Block(reason)));
-        }
-    }
-
-    if let Some(repo_law) =
-        crate::repo_law::repo_law_plan_decision(workspace, &call.name, &prepared.input)
-    {
-        match repo_law {
-            crate::repo_law::RepoLawPlanDecision::ForcePrompt(reason) => {
-                permission_reason = Some(reason);
-            }
-            crate::repo_law::RepoLawPlanDecision::Block(reason) => {
-                return Ok((prepared, AcpToolAdmission::Block(reason)));
-            }
-        }
-    }
-
-    let admission = permission_reason
-        .map(AcpToolAdmission::RequestPermission)
-        .unwrap_or(AcpToolAdmission::Auto);
-    // #6337: Bypass pre-approves prompts so an unattended `--yolo` session
-    // executes instead of stalling on permission requests no client answers.
-    // Hard blocks above (safety floor, repo law, reviewer consult) return
-    // early and are never downgraded.
-    let admission = if approval_mode == ApprovalMode::Bypass
-        && matches!(admission, AcpToolAdmission::RequestPermission(_))
-    {
-        AcpToolAdmission::Auto
-    } else {
-        admission
-    };
-    Ok((prepared, admission))
-}
-
-/// Run the same strict pre-tool hook gate as the native turn loop, then
-/// prepare and evaluate policy from the hook's final input. The initial
-/// preparation is deliberately side-effect free and catches malformed input
-/// before an operator hook is asked to reason about it; any rewrite is fully
-/// re-prepared and all policy layers run again from that rewritten value.
-async fn prepare_acp_tool_with_hooks(
-    config: &Config,
-    model: &str,
-    registry: &ToolRegistry,
-    call: &PendingToolCall,
-) -> std::result::Result<PreparedAcpTool, ToolError> {
-    let spec = registry.get(&call.name).ok_or_else(|| {
-        ToolError::not_available(format!("tool '{}' is not registered", call.name))
-    })?;
-    // Initial validation mirrors the native prepare-before-hooks contract.
-    spec.prepare(call.input.clone(), registry.context())?;
-
-    let hook_outcome = run_tool_call_before_hooks(
-        registry.context().runtime.hook_executor.as_ref(),
-        &call.name,
-        &call.execution_id,
-        &call.input,
-        acp_mode(config),
-        registry.context().workspace.as_path(),
-        model,
-    )
-    .await?;
-
-    let mut final_call = call.clone();
-    if let Some(updated_input) = hook_outcome.updated_input {
-        final_call.input = updated_input;
-    }
-    let (prepared, mut admission) =
-        prepare_acp_tool_admission(config, registry, &final_call).await?;
-    if hook_outcome.requires_approval && matches!(admission, AcpToolAdmission::Auto) {
-        admission = AcpToolAdmission::RequestPermission(
-            "A ToolCallBefore hook requires explicit approval for this call.".to_string(),
-        );
-    }
-
-    Ok(PreparedAcpTool {
-        call: prepared,
-        admission,
-        additional_context: hook_outcome.additional_context,
-    })
-}
-
-fn next_acp_permission_request_id() -> Value {
-    Value::String(format!(
-        "codewhale-permission-{}",
-        NEXT_ACP_PERMISSION_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
-async fn write_tool_permission_request<W>(
-    writer: &mut W,
-    request_id: &Value,
-    session_id: &str,
-    call: &PendingToolCall,
-    reason: &str,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    write_json_line(
-        writer,
-        json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "session/request_permission",
-            "params": {
-                "sessionId": session_id,
-                "toolCall": {
-                    "toolCallId": call.execution_id,
-                    "title": tool_call_title(call),
-                    "kind": tool_call_kind(call),
-                    "status": "pending",
-                    "rawInput": call.input,
-                    "content": [{
-                        "type": "content",
-                        "content": { "type": "text", "text": reason }
-                    }]
-                },
-                "options": [
-                    {
-                        "optionId": "allow-once",
-                        "name": "Allow once",
-                        "kind": "allow_once"
-                    },
-                    {
-                        "optionId": "reject-once",
-                        "name": "Reject",
-                        "kind": "reject_once"
-                    }
-                ]
-            }
-        }),
+pub async fn run_acp_server(
+    config: Config,
+    model: String,
+    default_cwd: PathBuf,
+    plugins: Arc<crate::plugins::PluginDiscoveryContext>,
+    config_path: Option<PathBuf>,
+    config_profile: Option<String>,
+) -> Result<()> {
+    crate::runtime_api::run_http_server(
+        config,
+        default_cwd,
+        plugins,
+        crate::runtime_api::RuntimeApiOptions {
+            port: 0,
+            config_path,
+            config_profile,
+            control_frontend: Some(codewhale_app_server::RuntimeControlFrontend::Acp { model }),
+            ..Default::default()
+        },
     )
     .await
 }
 
-/// Ask the ACP client to approve one sensitive call. The client owns the UI
-/// and ACP v1 requires it to answer a pending request with `cancelled` when the
-/// prompt turn is cancelled. Unknown, malformed, or errored responses all fail
-/// closed as rejection; only the exact offered `allow-once` id authorizes work.
-async fn request_tool_permission<R, W>(
-    reader: &mut Lines<R>,
-    writer: &mut W,
-    response_id_policy: JsonRpcResponseIdPolicy,
-    session_id: &str,
-    call: &PendingToolCall,
-    reason: &str,
-) -> Result<AcpPermissionDecision>
-where
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let request_id = next_acp_permission_request_id();
-    write_tool_permission_request(writer, &request_id, session_id, call, reason).await?;
-    let mut cancel_deadline = None;
-
-    loop {
-        let line = if let Some(deadline) = cancel_deadline {
-            match tokio::time::timeout_at(deadline, reader.next_line()).await {
-                Ok(line) => line?,
-                Err(_) => return Ok(AcpPermissionDecision::Cancelled),
-            }
-        } else {
-            reader.next_line().await?
-        };
-        let Some(line) = line else {
-            return Ok(AcpPermissionDecision::Reject(
-                "Permission denied: ACP client disconnected before answering.".to_string(),
-            ));
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let message: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(err) => {
-                write_jsonrpc_error(writer, None, -32700, format!("invalid json: {err}")).await?;
-                continue;
-            }
-        };
-
-        if let Some(method) = message.get("method").and_then(Value::as_str) {
-            let message_id = message.get("id").cloned();
-            if method == "session/cancel" {
-                let target = message.pointer("/params/sessionId").and_then(Value::as_str);
-                if target.is_none() || target == Some(session_id) {
-                    if let Some(message_id) = message_id {
-                        let message_id = response_id_policy.response_id(message_id);
-                        write_jsonrpc_result(writer, message_id, json!(null)).await?;
-                    }
-                    cancel_deadline.get_or_insert_with(|| {
-                        tokio::time::Instant::now() + ACP_PERMISSION_CANCEL_GRACE
-                    });
-                    continue;
-                }
-                if let Some(message_id) = message_id {
-                    let message_id = response_id_policy.response_id(message_id);
-                    write_jsonrpc_result(writer, message_id, json!(null)).await?;
-                }
-                continue;
-            }
-
-            if let Some(message_id) = message_id {
-                let message_id = response_id_policy.response_id(message_id);
-                write_jsonrpc_error(
-                    writer,
-                    Some(message_id),
-                    -32603,
-                    "a session/prompt turn is already in progress",
-                )
-                .await?;
-            }
-            continue;
-        }
-
-        if message.get("id") != Some(&request_id) {
-            // This is a response, not a request; there is nothing valid to send
-            // back. Ignore stale/unrelated agent-response traffic without
-            // allowing it to satisfy the permission gate.
-            continue;
-        }
-        if cancel_deadline.is_some() {
-            return Ok(AcpPermissionDecision::Cancelled);
-        }
-        if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-            return Ok(AcpPermissionDecision::Reject(
-                "Permission denied: malformed ACP response.".to_string(),
-            ));
-        }
-        if message.get("error").is_some() {
-            return Ok(AcpPermissionDecision::Reject(
-                "Permission denied: ACP client returned an error.".to_string(),
-            ));
-        }
-        match message
-            .pointer("/result/outcome/outcome")
-            .and_then(Value::as_str)
-        {
-            Some("cancelled") => return Ok(AcpPermissionDecision::Cancelled),
-            Some("selected") => {
-                let option_id = message
-                    .pointer("/result/outcome/optionId")
-                    .and_then(Value::as_str);
-                return Ok(match option_id {
-                    Some("allow-once") => AcpPermissionDecision::Allow,
-                    Some("reject-once") => AcpPermissionDecision::Reject(
-                        "Permission denied by the user; the tool was not executed.".to_string(),
-                    ),
-                    _ => AcpPermissionDecision::Reject(
-                        "Permission denied: ACP client selected an unknown option.".to_string(),
-                    ),
-                });
-            }
-            _ => {
-                return Ok(AcpPermissionDecision::Reject(
-                    "Permission denied: malformed ACP response.".to_string(),
-                ));
-            }
-        }
-    }
+pub(crate) struct CapturedAcpFrontend {
+    config: Config,
+    model: String,
+    cwd: PathBuf,
+    manager: Arc<RuntimeThreadManager>,
+    sessions_dir: PathBuf,
+    config_path: Option<PathBuf>,
+    config_profile: Option<String>,
 }
-
-async fn record_tool_execution_result<W>(
-    writer: &mut W,
-    session_id: &str,
-    call: &PendingToolCall,
-    result: std::result::Result<RichToolResult, ToolError>,
-) -> Result<Message>
-where
-    W: AsyncWrite + Unpin,
-{
-    let (content, is_error, rich_blocks) = match result {
-        Ok(tool_result) => (
-            tool_result.result.content,
-            !tool_result.result.success,
-            tool_result.content_blocks,
-        ),
-        Err(err) => (format!("Error: {err}"), true, Vec::new()),
-    };
-    let status = if is_error { "failed" } else { "completed" };
-    write_tool_call_update_with_blocks(
-        writer,
-        session_id,
-        call,
-        status,
-        Some(&content),
-        &rich_blocks,
-    )
-    .await?;
-    Ok(tool_result_message_with_blocks(
-        call,
-        content,
-        is_error,
-        rich_blocks
-            .iter()
-            .filter_map(|block| serde_json::to_value(block).ok())
-            .collect(),
-    ))
-}
-
-async fn record_unstarted_cancelled_calls<W, I>(
-    writer: &mut W,
-    session_id: &str,
-    calls: I,
-) -> Result<Vec<Message>>
-where
-    W: AsyncWrite + Unpin,
-    I: IntoIterator<Item = PendingToolCall>,
-{
-    let mut messages = Vec::new();
-    for call in calls {
-        write_tool_call_start(writer, session_id, &call).await?;
-        let content = "Cancelled before execution; the tool was not run.";
-        write_tool_call_update(writer, session_id, &call, "failed", Some(content)).await?;
-        messages.push(tool_result_message(&call, content.to_string(), true));
-    }
-    Ok(messages)
-}
-
-#[derive(Clone, Copy)]
-struct AcpTurnContext<'a> {
-    config: &'a Config,
-    model: &'a str,
-    session_id: &'a str,
-    tool_registry: &'a ToolRegistry,
-    response_id_policy: JsonRpcResponseIdPolicy,
-}
-
-/// Execute `tool_calls` in order against `registry`, reporting each one to
-/// the client as `tool_call` / `tool_call_update` session updates, while
-/// racing every execution against the reader for a `session/cancel`
-/// targeting `session_id`. On cancel, the tool's [`CancellationToken`] is
-/// signalled and the in-flight call is awaited to completion (so a
-/// cancel-aware tool like `Bash` gets a chance to kill its child
-/// process) before returning [`ToolBatchOutcome::Cancelled`].
-async fn execute_tool_calls_with_cancellation<R, W>(
-    context: AcpTurnContext<'_>,
-    tool_calls: Vec<PendingToolCall>,
-    reader: &mut Lines<R>,
-    writer: &mut W,
-) -> Result<ToolBatchOutcome>
-where
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let AcpTurnContext {
+pub(crate) fn capture_frontend(
+    config: Config,
+    model: String,
+    cwd: PathBuf,
+    manager: Arc<RuntimeThreadManager>,
+    sessions_dir: PathBuf,
+    config_path: Option<PathBuf>,
+    config_profile: Option<String>,
+) -> Result<Arc<CapturedAcpFrontend>> {
+    Ok(Arc::new(CapturedAcpFrontend {
         config,
         model,
-        session_id,
-        tool_registry: registry,
-        response_id_policy,
-    } = context;
-    let mut result_messages = Vec::with_capacity(tool_calls.len());
-    let mut reader_open = true;
-    let mut calls = tool_calls.into_iter();
-
-    while let Some(mut call) = calls.next() {
-        write_tool_call_start(writer, session_id, &call).await?;
-
-        if let Some(parse_error) = call.parse_error.clone() {
-            let content = format!("Error: tool arguments were not valid JSON: {parse_error}");
-            write_tool_call_update(writer, session_id, &call, "failed", Some(&content)).await?;
-            result_messages.push(tool_result_message(&call, content, true));
-            continue;
-        }
-
-        let prepared = match prepare_acp_tool_with_hooks(config, model, registry, &call).await {
-            Ok(prepared) => prepared,
-            Err(err) => {
-                let content = format!("Error: {err}");
-                write_tool_call_update(writer, session_id, &call, "failed", Some(&content)).await?;
-                result_messages.push(tool_result_message(&call, content, true));
-                continue;
-            }
-        };
-        call.input = prepared.call.input;
-
-        match prepared.admission {
-            AcpToolAdmission::Auto => {}
-            AcpToolAdmission::Block(reason) => {
-                let content = format!("Blocked by Codewhale policy: {reason}");
-                write_tool_call_update(writer, session_id, &call, "failed", Some(&content)).await?;
-                result_messages.push(tool_result_message(&call, content, true));
-                continue;
-            }
-            AcpToolAdmission::RequestPermission(reason) => {
-                match request_tool_permission(
-                    reader,
-                    writer,
-                    response_id_policy,
-                    session_id,
-                    &call,
-                    &reason,
-                )
-                .await?
-                {
-                    AcpPermissionDecision::Allow => {}
-                    AcpPermissionDecision::Reject(content) => {
-                        write_tool_call_update(writer, session_id, &call, "failed", Some(&content))
-                            .await?;
-                        result_messages.push(tool_result_message(&call, content, true));
-                        continue;
-                    }
-                    AcpPermissionDecision::Cancelled => {
-                        let content = "Cancelled while awaiting permission; the tool was not run.";
-                        write_tool_call_update(writer, session_id, &call, "failed", Some(content))
-                            .await?;
-                        result_messages.push(tool_result_message(&call, content.to_string(), true));
-                        result_messages.extend(
-                            record_unstarted_cancelled_calls(writer, session_id, calls).await?,
-                        );
-                        return Ok(ToolBatchOutcome::Cancelled(result_messages));
-                    }
-                }
-            }
-        }
-
-        write_tool_call_update(writer, session_id, &call, "in_progress", None).await?;
-
-        let cancel_token = CancellationToken::new();
-        let mut turn_context = registry
-            .context()
-            .clone()
-            .with_origin_tool_call_id(call.execution_id.clone());
-        turn_context.cancel_token = Some(cancel_token.clone());
-        let exec_fut = registry.execute_rich_full_with_context(
-            &call.name,
-            call.input.clone(),
-            Some(&turn_context),
-        );
-        tokio::pin!(exec_fut);
-
-        let mut cancelled = false;
-        let exec_result = loop {
-            tokio::select! {
-                result = &mut exec_fut => break result,
-                line = reader.next_line(), if reader_open => {
-                    let line = match line? {
-                        Some(line) => line,
-                        None => {
-                            reader_open = false;
-                            continue;
-                        }
-                    };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let message: Value = match serde_json::from_str(&line) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            write_jsonrpc_error(writer, None, -32700, format!("invalid json: {err}"))
-                                .await?;
-                            continue;
-                        }
-                    };
-                    let msg_id = message.get("id").cloned();
-                    match message.get("method").and_then(Value::as_str) {
-                        Some("session/cancel") => {
-                            let target = message.pointer("/params/sessionId").and_then(Value::as_str);
-                            if target.is_none() || target == Some(session_id) {
-                                if let Some(msg_id) = msg_id {
-                                    let msg_id = response_id_policy.response_id(msg_id);
-                                    write_jsonrpc_result(writer, msg_id, json!(null)).await?;
-                                }
-                                cancel_token.cancel();
-                                // Give the tool a bounded chance to observe the
-                                // token and wind down (e.g. kill a running child
-                                // process) before we drop it.
-                                cancelled = true;
-                                break match tokio::time::timeout(
-                                    ACP_TOOL_CANCEL_GRACE,
-                                    &mut exec_fut,
-                                )
-                                .await
-                                {
-                                    Ok(result) => result,
-                                    Err(_) => Err(ToolError::cancelled(format!(
-                                        "the tool did not stop within {}s of cancellation and was abandoned",
-                                        ACP_TOOL_CANCEL_GRACE.as_secs()
-                                    ))),
-                                };
-                            }
-                            if let Some(msg_id) = msg_id {
-                                let msg_id = response_id_policy.response_id(msg_id);
-                                write_jsonrpc_result(writer, msg_id, json!(null)).await?;
-                            }
-                        }
-                        _ => {
-                            if let Some(msg_id) = msg_id {
-                                let msg_id = response_id_policy.response_id(msg_id);
-                                write_jsonrpc_error(
-                                    writer,
-                                    Some(msg_id),
-                                    -32603,
-                                    "a session/prompt turn is already in progress",
-                                )
-                                .await?;
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        let exec_result = exec_result.map(|mut result| {
-            if let Some(context) = prepared.additional_context.as_deref() {
-                result.result.content =
-                    format!("{}\n\n[hook context] {context}", result.result.content);
-            }
-            result
-        });
-        result_messages
-            .push(record_tool_execution_result(writer, session_id, &call, exec_result).await?);
-        if cancelled {
-            result_messages
-                .extend(record_unstarted_cancelled_calls(writer, session_id, calls).await?);
-            return Ok(ToolBatchOutcome::Cancelled(result_messages));
-        }
-    }
-
-    Ok(ToolBatchOutcome::Completed(result_messages))
+        cwd,
+        manager,
+        sessions_dir,
+        config_path,
+        config_profile,
+    }))
 }
-
-fn tool_result_message(call: &PendingToolCall, content: String, is_error: bool) -> Message {
-    tool_result_message_with_blocks(call, content, is_error, Vec::new())
-}
-
-fn tool_result_message_with_blocks(
-    call: &PendingToolCall,
-    content: String,
-    is_error: bool,
-    content_blocks: Vec<Value>,
-) -> Message {
-    Message {
-        role: Role::User,
-        content: vec![ContentBlock::ToolResult {
-            execution_id: Some(call.execution_id.clone()),
-            tool_use_id: call.id.clone(),
-            content,
-            is_error: Some(is_error),
-            content_blocks: (!content_blocks.is_empty()).then_some(content_blocks),
-        }],
-    }
-}
-
-/// Drive one `session/prompt` turn to completion, looping through as many
-/// LLM <-> tool round-trips as the model requests (bounded by
-/// [`MAX_ACP_TOOL_ROUNDS`]).
-///
-/// Recorded interim exception to the one-turn-loop rule (#6088, named in
-/// `crates/core/tests/single_turn_loop.rs`): ACP IDE sessions do not run on
-/// the full thread/turn runtime yet. #5835 converges them onto
-/// `Engine::run_turn` and deletes this loop along with the exception.
-///
-/// `open_stream` opens a fresh provider stream for the given message
-/// history; production callers wire it to [`AcpServer::open_prompt_stream`],
-/// while tests supply canned per-round streams so the loop can be exercised
-/// without a real provider. Returns the outcome of the final round plus the
-/// full message history (including any tool-call/tool-result rounds), which
-/// the caller commits to session history only when the turn completed
-/// normally.
-///
-/// `open_stream` takes the message history *by value* (a clone per round)
-/// rather than `&[Message]`: an `async fn`'s returned future captures the
-/// lifetime of every reference parameter, so a borrowed slice here would
-/// force `Fut` to depend on each call's borrow lifetime — which `FnMut`'s
-/// single associated `Fut` type cannot express. Taking ownership sidesteps
-/// that; production callers move the clone into an `async move` block.
-async fn run_agentic_prompt_turn<R, W, F, Fut>(
-    context: AcpTurnContext<'_>,
-    mut messages: Vec<Message>,
-    reader: &mut Lines<R>,
-    writer: &mut W,
-    mut open_stream: F,
-) -> std::result::Result<(PromptOutcome, Vec<Message>), AgenticPromptError>
-where
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
-    F: FnMut(Vec<Message>) -> Fut,
-    Fut: Future<Output = Result<(StreamEventBox, codewhale_config::provider::WireFormat)>>,
-{
-    let AcpTurnContext {
-        session_id,
-        response_id_policy,
-        ..
-    } = context;
-    let mut has_tool_receipts = false;
-    // #6310: the engine turn loop's empty-stop budget, shared so both loops
-    // recover the same way. It is turn-scoped, like the engine's.
-    let mut empty_stop_retries: u32 = 0;
-    let mut empty_stop_nudge = false;
-    for _round in 0..MAX_ACP_TOOL_ROUNDS {
-        let (outcome, tool_calls, protocol) = loop {
-            let mut outbound = messages.clone();
-            // Request-scoped: the nudge rides this one request and is never
-            // committed to the session history.
-            let nudge = context.config.reasoning_only_reprompt_message();
-            if std::mem::take(&mut empty_stop_nudge) && !nudge.trim().is_empty() {
-                outbound.push(Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::Text {
-                        text: nudge.to_string(),
-                        cache_control: None,
-                    }],
-                });
-            }
-            let (stream, protocol) = open_stream(outbound)
-                .await
-                .map_err(|error| AgenticPromptError::new(error, &messages, has_tool_receipts))?;
-            let (outcome, tool_calls) =
-                drive_prompt_stream(stream, session_id, response_id_policy, reader, writer)
-                    .await
-                    .map_err(|error| {
-                        AgenticPromptError::new(error, &messages, has_tool_receipts)
-                    })?;
-            let answerless = matches!(&outcome, PromptOutcome::Completed(text) if text.trim().is_empty())
-                && tool_calls.is_empty();
-            if !answerless {
-                break (outcome, tool_calls, protocol);
-            }
-            // Nothing was streamed to the client for this response, so a
-            // retry is invisible to it until the budget is spent.
-            match crate::core::engine::turn_loop::plan_empty_stop_retry(empty_stop_retries) {
-                Some(retry) => {
-                    empty_stop_retries += 1;
-                    empty_stop_nudge = matches!(
-                        retry,
-                        crate::core::engine::turn_loop::EmptyStopRetry::Nudged
-                    );
-                    crate::logging::warn(format!(
-                        "ACP: model returned no answer or tool call (attempt {empty_stop_retries}/{}); re-requesting",
-                        crate::core::engine::turn_loop::EMPTY_STOP_MAX_RETRIES
-                    ));
-                }
-                None => {
-                    return Err(AgenticPromptError::new(
-                        anyhow!(
-                            "Model returned no answer or tool call (after {empty_stop_retries} retries)."
-                        ),
-                        &messages,
-                        has_tool_receipts,
-                    ));
-                }
-            }
-        };
-
-        let text = match outcome {
-            PromptOutcome::Cancelled => return Ok((PromptOutcome::Cancelled, messages)),
-            PromptOutcome::Completed(text) => text,
-            PromptOutcome::MaxRounds(text) => text,
-        };
-
-        if let Err(error) = crate::client::validate_tool_call_ids_for_protocol(
-            protocol,
-            tool_calls.iter().map(|call| call.id.as_str()),
-        ) {
-            // Text already shown remains real; ambiguous provider pairs never
-            // enter history or reach hooks, permission prompts, or dispatch.
-            if !text.is_empty() {
-                messages.push(Message {
-                    role: Role::Assistant,
-                    content: vec![ContentBlock::Text {
-                        text,
-                        cache_control: None,
-                    }],
-                });
-            }
-            return Err(AgenticPromptError::new(error, &messages, true));
-        }
-
-        let mut assistant_content = Vec::new();
-        if !text.is_empty() {
-            assistant_content.push(ContentBlock::Text {
-                text: text.clone(),
-                cache_control: None,
-            });
-        }
-        for call in &tool_calls {
-            assistant_content.push(ContentBlock::ToolUse {
-                execution_id: Some(call.execution_id.clone()),
-                id: call.id.clone(),
-                name: call.name.clone(),
-                input: call.input.clone(),
-                caller: call.caller.clone(),
-                thought_signature: call.thought_signature.clone(),
-            });
-        }
-        if !assistant_content.is_empty() {
-            messages.push(Message {
-                role: Role::Assistant,
-                content: assistant_content,
-            });
-        }
-
-        if tool_calls.is_empty() {
-            return Ok((PromptOutcome::Completed(text), messages));
-        }
-
-        let batch = execute_tool_calls_with_cancellation(context, tool_calls, reader, writer)
-            .await
-            .map_err(|error| AgenticPromptError::new(error, &messages, has_tool_receipts))?;
-        match batch {
-            ToolBatchOutcome::Cancelled(tool_result_messages) => {
-                messages.extend(tool_result_messages);
-                return Ok((PromptOutcome::Cancelled, messages));
-            }
-            ToolBatchOutcome::Completed(tool_result_messages) => {
-                messages.extend(tool_result_messages);
-                has_tool_receipts = true;
-            }
-        }
-    }
-
-    // Max rounds reached: return the text accumulated in the final round
-    // rather than an error, so the client gets a structured completion
-    // with a clear stop reason.
-    let final_text = messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "assistant")
-        .and_then(|m| {
-            m.content.iter().find_map(|b| match b {
-                ContentBlock::Text { text, .. } => Some(text.clone()),
-                _ => None,
-            })
+impl CapturedAcpFrontend {
+    pub(crate) fn serve(
+        &self,
+        input: Box<dyn AsyncBufRead + Send + Unpin>,
+        mut output: Box<dyn AsyncWrite + Send + Unpin>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            let mut server = AcpServer::new(
+                self.config.clone(),
+                self.model.clone(),
+                self.cwd.clone(),
+                self.manager.clone(),
+                self.sessions_dir.clone(),
+                self.config_path.clone(),
+                self.config_profile.clone(),
+            );
+            let mut input = codewhale_app_server::BoundedLines::new(input);
+            server.serve(&mut input, &mut output).await
         })
-        .unwrap_or_default();
-    Ok((PromptOutcome::MaxRounds(final_text), messages))
+    }
+}
+
+#[cfg(test)]
+impl codewhale_app_server::RuntimeOwnerFrontend for CapturedAcpFrontend {
+    fn validate_selection<'a>(
+        &'a self,
+        selection: &'a codewhale_app_server::RuntimeOwnerFrontendSelection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            anyhow::ensure!(
+                matches!(
+                    selection,
+                    codewhale_app_server::RuntimeOwnerFrontendSelection::Acp { .. }
+                ),
+                "ACP fixture does not capture HTTP services"
+            );
+            Ok(())
+        })
+    }
+    fn serve(
+        &self,
+        selection: codewhale_app_server::RuntimeOwnerFrontendSelection,
+        _compatibility: codewhale_app_server::AppState,
+        input: Box<dyn AsyncBufRead + Send + Unpin>,
+        output: Box<dyn AsyncWrite + Send + Unpin>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            anyhow::ensure!(
+                matches!(
+                    selection,
+                    codewhale_app_server::RuntimeOwnerFrontendSelection::Acp { .. }
+                ),
+                "ACP fixture does not capture HTTP services"
+            );
+            CapturedAcpFrontend::serve(self, input, output).await
+        })
+    }
 }
 
 struct AcpServer {
     config: Config,
     model: String,
     default_cwd: PathBuf,
+    runtime: Arc<RuntimeThreadManager>,
+    sessions_dir: PathBuf,
+    config_path: Option<PathBuf>,
+    config_profile: Option<String>,
     sessions: HashMap<String, AcpSession>,
-    /// Insertion-order tracking of session ids. Used to evict the *oldest*
-    /// session (by insertion order, not arbitrary HashMap iteration) when
-    /// the session cap is reached.
     insertion_order: VecDeque<String>,
-    /// Whether the connected client accepts `terminal` tool calls, from
-    /// `initialize` params `clientCapabilities.terminal`. Defaults to `false`
-    /// (restrictive): clients that omit the field get no shell access. Older
-    /// ACP clients predating the `terminal` capability get a working agent
-    /// without shell, which is safe; the client can re-declare support when it
-    /// reconnects.
     client_supports_terminal: bool,
     response_id_policy: JsonRpcResponseIdPolicy,
 }
-
+/// A transport binding, never another conversation or executable registry.
 struct AcpSession {
-    cwd: PathBuf,
-    messages: Vec<Message>,
-    config: Config,
-    model: String,
-    /// Built once per session over the session `cwd`, then reused for every
-    /// prompt turn: `to_api_tools()` memoises the serialised catalog, and
-    /// `file_read_tracker` / the shell manager need to persist across turns.
-    tool_registry: Arc<ToolRegistry>,
+    thread_id: String,
+    cursor: u64,
 }
-
-/// The `&mut self` result of validating a `session/prompt`: the user turn is
-/// already recorded, and the cloned conversation + cwd are ready for the
-/// borrow-free provider call that the prompt driver races against cancellation.
-struct PreparedPrompt {
-    session_id: String,
-    messages: Vec<Message>,
-    cwd: PathBuf,
-    config: Config,
-    model: String,
+struct PendingToolCall {
+    execution_id: String,
+    name: String,
+    input: Value,
 }
-
 enum AcpDispatch {
     Response(Value),
     Shutdown,
 }
-
 #[derive(Debug)]
 struct AcpError {
     code: i32,
     message: String,
 }
-
 impl AcpServer {
-    fn new(config: Config, model: String, default_cwd: PathBuf) -> Self {
+    fn new(
+        config: Config,
+        model: String,
+        default_cwd: PathBuf,
+        runtime: Arc<RuntimeThreadManager>,
+        sessions_dir: PathBuf,
+        config_path: Option<PathBuf>,
+        config_profile: Option<String>,
+    ) -> Self {
         Self {
             config,
             model,
             default_cwd,
+            runtime,
+            sessions_dir,
+            config_path,
+            config_profile,
             sessions: HashMap::new(),
             insertion_order: VecDeque::new(),
             client_supports_terminal: false,
             response_id_policy: JsonRpcResponseIdPolicy::Preserve,
         }
     }
-
+    async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+        &mut self,
+        reader: &mut codewhale_app_server::BoundedLines<R>,
+        writer: &mut W,
+    ) -> Result<()> {
+        while let Some(line) = reader.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let message: Value = match serde_json::from_str(&line) {
+                Ok(value) => value,
+                Err(error) => {
+                    write_jsonrpc_error(writer, None, -32700, format!("invalid json: {error}"))
+                        .await?;
+                    continue;
+                }
+            };
+            if codewhale_app_server::is_control_input_closed(&message) {
+                break;
+            }
+            let response_id = message
+                .get("id")
+                .cloned()
+                .map(|id| self.response_id_policy.response_id(id));
+            if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+                write_jsonrpc_error(writer, response_id, -32600, "jsonrpc version must be 2.0")
+                    .await?;
+                continue;
+            }
+            let Some(method) = message.get("method").and_then(Value::as_str) else {
+                if is_jsonrpc_response(&message) {
+                    continue;
+                }
+                write_jsonrpc_error(writer, response_id, -32600, "missing method").await?;
+                continue;
+            };
+            let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+            if method == "session/prompt" {
+                if let Err(error) = self.validate_prompt(&params) {
+                    write_jsonrpc_error(writer, response_id, error.code, error.message).await?;
+                    continue;
+                }
+                let result = self.drive_prompt(params, reader, writer).await;
+                match result {
+                    Ok(reason) => {
+                        if let Some(id) = response_id {
+                            write_jsonrpc_result(writer, id, json!({"stopReason":reason})).await?;
+                        }
+                    }
+                    Err(error) => {
+                        write_jsonrpc_error(
+                            writer,
+                            response_id,
+                            -32603,
+                            crate::client::redact_model_bound_text(&error.to_string(), &[]),
+                        )
+                        .await?
+                    }
+                }
+                continue;
+            }
+            match self.handle_request(method, params).await {
+                Ok(AcpDispatch::Response(result)) => {
+                    if let Some(id) = response_id {
+                        write_jsonrpc_result(writer, id, result).await?;
+                    }
+                }
+                Ok(AcpDispatch::Shutdown) => {
+                    if let Some(id) = response_id {
+                        write_jsonrpc_result(writer, id, json!(null)).await?;
+                    }
+                    break;
+                }
+                Err(error) => {
+                    write_jsonrpc_error(writer, response_id, error.code, error.message).await?
+                }
+            }
+        }
+        Ok(())
+    }
     // `session/prompt` is handled in the main loop (it needs to run concurrently
     // with the reader for cancellation); every other method is request/response.
     async fn handle_request(
@@ -1582,15 +290,15 @@ impl AcpServer {
                     &self.config,
                 )))
             }
-            "session/new" => Ok(AcpDispatch::Response(self.new_session(params)?)),
+            "session/new" => Ok(AcpDispatch::Response(self.new_session(params).await?)),
             "session/list" => Ok(AcpDispatch::Response(self.list_sessions(params)?)),
-            "session/load" => Ok(AcpDispatch::Response(self.load_session(params)?)),
+            "session/load" => Ok(AcpDispatch::Response(self.load_session(params).await?)),
             "session/listProviders" => Ok(AcpDispatch::Response(self.list_providers())),
             "session/currentModel" => Ok(AcpDispatch::Response(self.current_model())),
             "session/selectModel" => Ok(AcpDispatch::Response(self.select_model(params)?)),
-            "session/set_config_option" => {
-                Ok(AcpDispatch::Response(self.set_session_config(params)?))
-            }
+            "session/set_config_option" => Ok(AcpDispatch::Response(
+                self.set_session_config(params).await?,
+            )),
             "session/set_mode" | "session/set_model" => {
                 let (config_id, field) = if method == "session/set_mode" {
                     ("mode", "modeId")
@@ -1601,7 +309,8 @@ impl AcpServer {
                     "sessionId": params.get("sessionId"),
                     "configId": config_id,
                     "value": params.get(field),
-                }))?;
+                }))
+                .await?;
                 Ok(AcpDispatch::Response(json!({})))
             }
             // A cancel that arrives with no prompt in flight is an idempotent
@@ -1612,51 +321,90 @@ impl AcpServer {
         }
     }
 
-    fn new_session(&mut self, params: Value) -> std::result::Result<Value, AcpError> {
+    fn validate_prompt(&self, params: &Value) -> std::result::Result<(String, String), AcpError> {
+        let id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AcpError::invalid_params("sessionId is required"))?;
+        if !self.sessions.contains_key(id) {
+            return Err(AcpError::invalid_params("unknown sessionId"));
+        }
+        let prompt = extract_prompt_text(params.get("prompt"))
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| AcpError::invalid_params("prompt must include text content"))?;
+        Ok((id.to_string(), prompt))
+    }
+    fn shell_allowed(&self) -> bool {
+        self.client_supports_terminal && self.config.allow_shell()
+    }
+    fn remember(&mut self, id: String, thread_id: String, cursor: u64) {
+        if self.sessions.contains_key(&id) {
+            return;
+        }
+        if self.sessions.len() >= MAX_ACP_SESSIONS
+            && let Some(old) = self.insertion_order.pop_front()
+        {
+            self.sessions.remove(&old);
+        }
+        self.insertion_order.push_back(id.clone());
+        self.sessions.insert(id, AcpSession { thread_id, cursor });
+    }
+    async fn new_session(&mut self, params: Value) -> std::result::Result<Value, AcpError> {
         let cwd = params
             .get("cwd")
             .and_then(Value::as_str)
             .map(PathBuf::from)
             .unwrap_or_else(|| self.default_cwd.clone());
-        // A bare uuid, the same shape `create_saved_session` produces and the
-        // same shape `session/list` advertises. The old `codewhale-` prefix put
-        // this id in a namespace no other method understood, so a client that
-        // replayed it into `session/load` — the normal thing to do — got
-        // `-32602` for an id we had just handed it (#6174).
-        let session_id = uuid::Uuid::new_v4().to_string();
-        let tool_registry = Arc::new(build_acp_tool_registry(
-            &self.config,
-            &cwd,
-            self.client_supports_terminal,
-        ));
-
-        // Evict oldest session when at capacity.
-        if self.sessions.len() >= MAX_ACP_SESSIONS {
-            // `VecDeque` preserves true insertion order; HashMap iteration
-            // does not. Pop from the front to evict the session created
-            // earliest.
-            if let Some(oldest) = self.insertion_order.pop_front() {
-                self.sessions.remove(&oldest);
-            }
-        }
-
-        self.insertion_order.push_back(session_id.clone());
-        self.sessions.insert(
-            session_id.clone(),
-            AcpSession {
-                cwd,
-                messages: Vec::new(),
-                config: self.config.clone(),
-                model: self.model.clone(),
-                tool_registry,
-            },
-        );
-        Ok(self.session_configuration(&session_id))
+        let identity = self
+            .config
+            .active_provider_identity()
+            .map_err(|error| AcpError::internal(error.to_string()))?;
+        let thread = self
+            .runtime
+            .create_thread_with_shell_policy(
+                CreateThreadRequest {
+                    model: Some(self.model.clone()),
+                    model_provider: Some(identity.persisted_kind().to_string()),
+                    model_provider_id: identity.persisted_id().map(str::to_string),
+                    workspace: Some(cwd),
+                    mode: Some(
+                        if acp_mode(&self.config) == AppMode::Plan {
+                            "plan"
+                        } else {
+                            "agent"
+                        }
+                        .to_string(),
+                    ),
+                    permission_posture: Some(self.permission_value().to_string()),
+                    allow_shell: Some(self.shell_allowed()),
+                    ..Default::default()
+                },
+                self.config_path.as_deref(),
+                self.config_profile.as_deref(),
+            )
+            .await
+            .map_err(|error| AcpError::internal(error.to_string()))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        crate::runtime_api::sessions::initialize_empty_session(
+            &self.runtime,
+            &self.sessions_dir,
+            &thread.id,
+            &id,
+        )
+        .await
+        .map_err(|error| AcpError::internal(error.message))?;
+        let cursor = self
+            .runtime
+            .get_thread_detail(&thread.id)
+            .await
+            .map_err(|error| AcpError::internal(error.to_string()))?
+            .latest_seq;
+        self.remember(id.clone(), thread.id, cursor);
+        self.session_configuration(&id).await
     }
-
     /// Durable Codewhale sessions an ACP client can resume (#5864).
     ///
-    /// ACP sessions are in-memory and capped; Codewhale's own sessions are the
+    /// ACP transport bindings are in-memory and capped; Core sessions are the
     /// durable record, and an IDE that offers "resume" means those. A store
     /// that cannot be read is an empty list, not a failed request: enumeration
     /// is discovery, and a client asking what exists should not be broken by a
@@ -1673,7 +421,8 @@ impl AcpServer {
                 ));
             }
         };
-        let sessions = Self::session_manager()
+        let sessions = crate::session_manager::SessionManager::new(self.sessions_dir.clone())
+            .ok()
             .and_then(|manager| manager.list_sessions().ok())
             .unwrap_or_default();
         let sessions: Vec<Value> = sessions
@@ -1697,85 +446,105 @@ impl AcpServer {
         Ok(json!({ "sessions": sessions }))
     }
 
-    /// Rehydrate a durable Codewhale session as this connection's ACP session.
-    ///
-    /// The loaded session keeps its own id so a client can list, load, and
-    /// prompt against one identity. Its `cwd` comes from the saved workspace,
-    /// not the server default, because the tool registry is built over it.
-    fn load_session(&mut self, params: Value) -> std::result::Result<Value, AcpError> {
-        let session_id = params
+    async fn load_session(&mut self, params: Value) -> std::result::Result<Value, AcpError> {
+        let requested = params
             .get("sessionId")
             .and_then(Value::as_str)
-            .ok_or_else(|| AcpError::invalid_params("session/load requires sessionId"))?
-            .to_string();
-        // Sessions this connection already holds resolve from memory. `session/new`
-        // sessions live only here — nothing on the ACP path writes them to the
-        // durable store — so consulting the store first would fail every id we
-        // minted ourselves. This also makes reloading an already-loaded durable
-        // session cheap and free of store side effects.
-        if self.sessions.contains_key(&session_id) {
-            return Ok(self.session_configuration(&session_id));
+            .ok_or_else(|| AcpError::invalid_params("session/load requires sessionId"))?;
+        if self.sessions.contains_key(requested) {
+            return self.session_configuration(requested).await;
         }
-        let manager = Self::session_manager()
-            .ok_or_else(|| AcpError::internal("no Codewhale session store is available"))?;
-        let saved = manager
-            .resume_session_by_prefix(&session_id)
+        let store = crate::session_manager::SessionManager::new(self.sessions_dir.clone())
+            .map_err(|error| AcpError::internal(error.to_string()))?;
+        let saved = store
+            .resume_session_by_prefix(requested)
             .map_err(|error| {
-                AcpError::invalid_params(format!("could not load session {session_id}: {error}"))
+                AcpError::invalid_params(format!("could not load session {requested}: {error}"))
             })?
             .session;
-
-        let cwd = saved.metadata.workspace.clone();
-        let tool_registry = Arc::new(build_acp_tool_registry(
-            &self.config,
-            &cwd,
-            self.client_supports_terminal,
-        ));
-        let resolved_id = saved.metadata.id.clone();
-        // A short prefix can resolve to an id this connection already
-        // tracks: the in-memory fast path above checked the prefix, not the
-        // resolved id. Pushing again would duplicate the id in
-        // `insertion_order` while `sessions.insert` merely overwrites, and a
-        // later capacity eviction would then pop the stale front copy and
-        // remove a live, recently reloaded session (#6245).
-        if self.sessions.contains_key(&resolved_id) {
-            return Ok(self.session_configuration(&resolved_id));
+        let id = saved.metadata.id;
+        if self.sessions.contains_key(&id) {
+            return self.session_configuration(&id).await;
         }
-        if self.sessions.len() >= MAX_ACP_SESSIONS
-            && let Some(oldest) = self.insertion_order.pop_front()
-        {
-            self.sessions.remove(&oldest);
-        }
-        self.insertion_order.push_back(resolved_id.clone());
-        self.sessions.insert(
-            resolved_id.clone(),
-            AcpSession {
-                cwd,
-                messages: saved.messages,
-                config: self.config.clone(),
-                model: self.model.clone(),
-                tool_registry,
+        let (_, axum::Json(resumed)) = crate::runtime_api::sessions::resume_session_in_runtime(
+            &self.runtime,
+            &self.sessions_dir,
+            &id,
+            crate::runtime_api::sessions::ResumeSessionRequest {
+                model: None,
+                mode: Some(
+                    if acp_mode(&self.config) == AppMode::Plan {
+                        "plan"
+                    } else {
+                        saved.metadata.mode.as_deref().unwrap_or("agent")
+                    }
+                    .to_string(),
+                ),
             },
-        );
-        Ok(self.session_configuration(&resolved_id))
+            (self.config_path.as_deref(), self.config_profile.as_deref()),
+            Some(self.shell_allowed()),
+        )
+        .await
+        .map_err(|error| AcpError::internal(error.message))?;
+        // A saved posture cannot widen the server, and connection terminal
+        // negotiation only narrows the canonical thread's shell ceiling.
+        self.runtime
+            .update_thread_with_shell_policy(
+                &resumed.thread_id,
+                UpdateThreadRequest {
+                    permission_posture: Some(self.permission_value().to_string()),
+                    allow_shell: Some(self.shell_allowed()),
+                    ..Default::default()
+                },
+                self.config_path.as_deref(),
+                self.config_profile.as_deref(),
+            )
+            .await
+            .map_err(|error| AcpError::internal(error.to_string()))?;
+        let cursor = self
+            .runtime
+            .get_thread_detail(&resumed.thread_id)
+            .await
+            .map_err(|error| AcpError::internal(error.to_string()))?
+            .latest_seq;
+        self.remember(id.clone(), resumed.thread_id, cursor);
+        self.session_configuration(&id).await
     }
-
-    fn session_models(session: &AcpSession) -> Vec<String> {
-        let provider = session.config.api_provider();
-        let mut models =
-            crate::provider_lake::models_for_provider(&session.config, provider, provider);
-        if !models.contains(&session.model) {
-            models.push(session.model.clone());
+    fn permission_value(&self) -> &'static str {
+        match acp_approval_mode(&self.config) {
+            ApprovalMode::Bypass => "full-access",
+            ApprovalMode::Auto => "auto-review",
+            ApprovalMode::Never => "never",
+            ApprovalMode::Suggest => "ask",
         }
-        models
     }
-
-    fn session_configuration(&self, session_id: &str) -> Value {
+    async fn session_configuration(
+        &self,
+        session_id: &str,
+    ) -> std::result::Result<Value, AcpError> {
         use codewhale_localization::{MessageId, resolve_locale, tr};
         let settings = crate::settings::Settings::load().unwrap_or_default();
         let locale = resolve_locale(&settings.locale);
-        let session = &self.sessions[session_id];
-        let models = Self::session_models(session);
+        let binding = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| AcpError::invalid_params("unknown sessionId"))?;
+        let thread = self
+            .runtime
+            .get_thread(&binding.thread_id)
+            .await
+            .map_err(|error| AcpError::internal(error.to_string()))?;
+        let identity = self
+            .config
+            .resolve_persisted_provider_identity(
+                thread.model_provider.as_deref(),
+                thread.model_provider_id.as_deref(),
+            )
+            .map_err(AcpError::invalid_params)?;
+        let mut models = crate::provider_lake::models_for_provider(&self.config, &identity);
+        if !models.contains(&thread.model) {
+            models.push(thread.model.clone());
+        }
         let mut modes = vec![
             json!({"id": "plan", "name": tr(locale, MessageId::AppModePlan), "description": tr(locale, MessageId::AppModePlanHint)}),
         ];
@@ -1783,7 +552,7 @@ impl AcpServer {
         // relax it), but it must be discoverable. Work under Full Access must
         // not claim that edits ask for approval, and the posture is surfaced
         // below as a read-only select that names how Full Access is enabled.
-        let posture = acp_approval_mode(&session.config);
+        let posture = acp_approval_mode(&self.config);
         let agent_hint = if posture == ApprovalMode::Bypass {
             tr(locale, MessageId::HomeYoloModeTip)
         } else {
@@ -1792,7 +561,7 @@ impl AcpServer {
         if acp_mode(&self.config) != AppMode::Plan {
             modes.insert(0, json!({"id": "agent", "name": tr(locale, MessageId::AppModeAgent), "description": agent_hint}));
         }
-        let current_mode = if acp_mode(&session.config) == AppMode::Plan {
+        let current_mode = if thread.mode == "plan" {
             "plan"
         } else {
             "agent"
@@ -1819,17 +588,17 @@ impl AcpServer {
                 MessageId::PermissionsPostureAsk,
             ),
         };
-        json!({
+        Ok(json!({
             "sessionId": session_id,
             "modes": {"currentModeId": current_mode, "availableModes": modes},
             "models": {
-                "currentModelId": session.model,
+                "currentModelId": thread.model,
                 "availableModels": models.iter().map(|model| json!({"modelId": model, "name": model})).collect::<Vec<_>>()
             },
             "configOptions": [
                 {"id": "mode", "name": tr(locale, MessageId::SettingSubjectMode), "category": "mode", "type": "select", "currentValue": current_mode,
                  "options": modes.iter().map(|mode| json!({"value": mode["id"], "name": mode["name"], "description": mode["description"]})).collect::<Vec<_>>()},
-                {"id": "model", "name": tr(locale, MessageId::SettingSubjectModel), "category": "model", "type": "select", "currentValue": session.model,
+                {"id": "model", "name": tr(locale, MessageId::SettingSubjectModel), "category": "model", "type": "select", "currentValue": thread.model,
                  "options": models.iter().map(|model| json!({"value": model, "name": model})).collect::<Vec<_>>()},
                 // Exactly one option: the posture the server was started
                 // with. Offering a looser value here would let a client relax
@@ -1842,10 +611,10 @@ impl AcpServer {
                      "enableFullAccess": ACP_FULL_ACCESS_HINT,
                  }}}
             ]
-        })
+        }))
     }
 
-    fn set_session_config(&mut self, params: Value) -> std::result::Result<Value, AcpError> {
+    async fn set_session_config(&mut self, params: Value) -> std::result::Result<Value, AcpError> {
         let session_id = params
             .get("sessionId")
             .and_then(Value::as_str)
@@ -1861,7 +630,7 @@ impl AcpServer {
         if !self.sessions.contains_key(session_id) {
             return Err(AcpError::invalid_params("unknown sessionId"));
         }
-        let state = self.session_configuration(session_id);
+        let state = self.session_configuration(session_id).await?;
         let offered = state["configOptions"]
             .as_array()
             .unwrap()
@@ -1879,79 +648,50 @@ impl AcpServer {
                 "unknown configuration option or value",
             ));
         }
-        let session = self.sessions.get_mut(session_id).unwrap();
-        match config_id {
-            "model" => session.model = value.to_string(),
-            "mode" => {
-                session.config.sandbox_mode = if value == "plan" {
-                    Some("read-only".to_string())
-                } else {
-                    self.config.sandbox_mode.clone()
-                };
-                // Rebuild at this explicit between-turn authority boundary.
-                // Both the next prompt prefix and tools reflect the new mode;
-                // an in-flight turn keeps its frozen prefix and rejects setters.
-                session.tool_registry = Arc::new(build_acp_tool_registry(
-                    &session.config,
-                    &session.cwd,
-                    self.client_supports_terminal,
-                ));
-            }
-            // The only offered permission value is the current posture.
-            "permission" => {}
+        let binding = &self.sessions[session_id];
+        let request = match config_id {
+            "model" => UpdateThreadRequest {
+                model: Some(value.to_string()),
+                ..Default::default()
+            },
+            "mode" => UpdateThreadRequest {
+                mode: Some(value.to_string()),
+                allow_shell: Some(value != "plan" && self.shell_allowed()),
+                ..Default::default()
+            },
+            "permission" => return Ok(json!({"configOptions": state["configOptions"]})),
             _ => unreachable!("validated offered option"),
-        }
-        Ok(json!({"configOptions": self.session_configuration(session_id)["configOptions"]}))
-    }
-
-    fn session_manager() -> Option<crate::session_manager::SessionManager> {
-        let dir = crate::session_manager::default_sessions_dir().ok()?;
-        crate::session_manager::SessionManager::new(dir).ok()
-    }
-
-    fn session_tool_registry(&self, session_id: &str) -> Option<Arc<ToolRegistry>> {
-        self.sessions
-            .get(session_id)
-            .map(|session| session.tool_registry.clone())
+        };
+        self.runtime
+            .update_thread_with_shell_policy(
+                &binding.thread_id,
+                request,
+                self.config_path.as_deref(),
+                self.config_profile.as_deref(),
+            )
+            .await
+            .map_err(|error| AcpError::internal(error.to_string()))?;
+        Ok(json!({"configOptions": self.session_configuration(session_id).await?["configOptions"]}))
     }
 
     fn list_providers(&self) -> Value {
-        let mut providers = ApiProvider::sorted_for_display()
-            .into_iter()
-            .map(|provider| {
-                json!({
-                    "id": provider.as_str(),
-                    "displayName": provider.display_name(),
-                    "defaultModel": provider.metadata().map(|metadata| metadata.default_model())
-                })
-            })
-            .collect::<Vec<_>>();
-
-        // Include user-defined `[providers.<name>]` custom entries so ACP
-        // clients can discover and round-trip the provider names that
-        // `session/selectModel` now accepts (#1519).
-        if let Some(custom) = self.config.providers.as_ref().map(|p| &p.custom) {
-            let mut names = custom.keys().collect::<Vec<_>>();
-            names.sort();
-            for name in names {
-                providers.push(json!({
-                    "id": name,
-                    "displayName": name,
-                    "defaultModel": custom.get(name).and_then(|cfg| cfg.model.clone())
-                }));
-            }
-        }
-
-        json!({ "providers": providers })
+        let mut providers = self.config.provider_identities().into_iter().filter(|identity| identity.provider != ProviderKind::Antigravity).map(|identity| {
+            json!({"id": identity.key, "displayName": identity.compatibility().map(|row| row.label).unwrap_or(identity.key.as_str()), "defaultModel": crate::model_inventory::provider_default_model(&self.config, &identity)})
+        }).collect::<Vec<_>>();
+        providers.extend(self.config.unadmitted_provider_keys().into_iter().map(|key| json!({"id": key, "displayName": format!("{key} (unavailable)"), "defaultModel": "", "available": false, "reason": "provider_identity_unavailable"})));
+        json!({"providers": providers})
     }
 
     fn current_model(&self) -> Value {
         // Prefer the raw configured provider key so a custom `[providers.<name>]`
         // entry round-trips through ACP instead of canonicalizing to "custom".
-        let provider = match self.config.provider.as_deref() {
-            Some(name) if !name.trim().is_empty() => name.to_string(),
-            _ => self.config.api_provider().as_str().to_string(),
-        };
+        let provider = self
+            .config
+            .active_provider_identity()
+            .ok()
+            .map(|identity| identity.key.to_string())
+            .or_else(|| self.config.provider.clone())
+            .unwrap_or_else(|| "unavailable".to_string());
         json!({
             "provider": provider,
             "model": self.model.as_str()
@@ -1969,292 +709,19 @@ impl AcpServer {
             let provider_name = provider_value
                 .as_str()
                 .ok_or_else(|| AcpError::invalid_params("provider must be a string"))?;
-            // Accept either a built-in provider id/alias or a user-defined
-            // custom provider name that has a `[providers.<name>]` table. For
-            // custom providers, preserve the raw key so routing can still find
-            // the configured base URL / auth / model (#1519); canonicalizing to
-            // "custom" would lose that table key.
-            let is_custom = self
+            let identity = self
                 .config
-                .providers
-                .as_ref()
-                .and_then(|providers| providers.custom_provider_config(provider_name))
-                .is_some();
-            if !is_custom && ApiProvider::parse(provider_name).is_none() {
-                return Err(AcpError::invalid_params(format!(
-                    "unknown provider: {provider_name}"
-                )));
-            }
-            self.config.provider = Some(provider_name.to_string());
+                .resolve_provider_selection_identity(provider_name)
+                .map_err(AcpError::invalid_params)?;
+            self.config
+                .scope_to_provider_identity(&identity)
+                .map_err(AcpError::invalid_params)?;
         }
 
         self.model = model;
         Ok(self.current_model())
     }
-
-    /// Validate a `session/prompt` request and append the user turn to history,
-    /// returning the cloned conversation for the (borrow-free) provider call.
-    ///
-    /// This is the `&mut self` half of a prompt turn; the streaming provider
-    /// call lives in [`AcpServer::open_prompt_stream`] (which borrows `&self`
-    /// only and returns a `'static` stream) so it can be raced against the
-    /// reader for cancellation.
-    fn begin_prompt(&mut self, params: Value) -> std::result::Result<PreparedPrompt, AcpError> {
-        let session_id = params
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AcpError::invalid_params("sessionId is required"))?
-            .to_string();
-        let prompt = extract_prompt_text(params.get("prompt"))
-            .filter(|text| !text.trim().is_empty())
-            .ok_or_else(|| AcpError::invalid_params("prompt must include text content"))?;
-
-        let (messages, cwd, config, model) = {
-            let session = self
-                .sessions
-                .get_mut(&session_id)
-                .ok_or_else(|| AcpError::invalid_params("unknown sessionId"))?;
-            session.messages.push(Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: prompt,
-                    cache_control: None,
-                }],
-            });
-            (
-                session.messages.clone(),
-                session.cwd.clone(),
-                session.config.clone(),
-                session.model.clone(),
-            )
-        };
-
-        Ok(PreparedPrompt {
-            session_id,
-            messages,
-            cwd,
-            config,
-            model,
-        })
-    }
-
-    /// Commit the full message list produced by a completed turn into the
-    /// session's history — the original history plus every assistant/tool-
-    /// call/tool-result round the turn drove.
-    ///
-    /// Called on **all** outcomes: normal completion, max-rounds, AND cancel.
-    /// (The caller strips dangling assistant tool_use blocks on cancel before
-    /// committing, which produces a clean partial history the next prompt can
-    /// continue from instead of leaving the pre-turn state untouched.)
-    fn commit_turn_messages(&mut self, session_id: &str, messages: Vec<Message>) {
-        if let Some(session) = self.sessions.get_mut(session_id) {
-            session.messages = messages;
-        }
-    }
-
-    /// Remove the last user message from the session history. Used to unwind
-    /// the `begin_prompt` push when the turn itself fails (e.g. provider
-    /// stream error), so the next prompt doesn't start with two consecutive
-    /// `user` messages.
-    fn rollback_user_message(&mut self, session_id: &str) {
-        if let Some(session) = self.sessions.get_mut(session_id)
-            && session.messages.last().map(|m| m.role.as_str()) == Some("user")
-        {
-            session.messages.pop();
-        }
-    }
-
-    /// Resolve the route, build the streaming request, and open the provider
-    /// response stream. Borrows `&self` only to read config/model; the returned
-    /// [`StreamEventBox`] is `'static`, so the caller can race it against the
-    /// reader without holding any borrow on the server. The cwd guard only needs
-    /// to cover route resolution and client construction, not stream
-    /// consumption, so it is dropped here.
-    async fn open_prompt_stream(
-        &self,
-        config: &Config,
-        selected_model: &str,
-        messages: &[Message],
-        cwd: &PathBuf,
-        tool_registry: &ToolRegistry,
-        frozen_system_prompt: &std::sync::Mutex<Option<SystemPrompt>>,
-    ) -> Result<(StreamEventBox, codewhale_config::provider::WireFormat)> {
-        let _cwd_guard = ScopedCurrentDir::new(cwd)?;
-        let last_user_text = messages
-            .iter()
-            .rev()
-            .find_map(|m| {
-                if m.role == "user" {
-                    m.content.iter().find_map(|b| match b {
-                        ContentBlock::Text { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
-            })
-            .unwrap_or("");
-        let route = crate::resolve_cli_auto_route(config, selected_model, last_user_text).await?;
-        let execution_config = crate::config_for_cli_route(config, &route);
-        let client = CodewhaleClient::new(&execution_config)?;
-        let model = route.model;
-        let request_route = client.effective_route_envelope(&model, chrono::Utc::now());
-        let reasoning_effort = route
-            .reasoning_effort
-            .and_then(|effort| {
-                effort.api_value_for_route(
-                    execution_config.api_provider(),
-                    &execution_config.active_route_base_url(),
-                    &model,
-                )
-            })
-            .map(str::to_string);
-
-        let tools = tool_registry.to_api_tools();
-        let (route_limits, image_input) =
-            resolve_acp_route_facts(&execution_config, request_route.provider, &model);
-        let system = frozen_acp_system_prompt(
-            frozen_system_prompt,
-            &execution_config,
-            cwd,
-            request_route.provider,
-            &request_route.model,
-            route_limits,
-        );
-
-        let mut outbound_messages = messages.to_vec();
-        crate::image_attach::strip_images_when_unsupported(
-            &mut outbound_messages,
-            image_input,
-            &request_route.model,
-        );
-        let request = MessageRequest {
-            model,
-            messages: outbound_messages,
-            max_tokens: crate::route_budget::effective_max_output_tokens_for_route(
-                request_route.provider,
-                &request_route.model,
-                route_limits,
-            ),
-            system: Some(system),
-            tools: Some(tools.clone()),
-            tool_choice: if tools.is_empty() {
-                None
-            } else {
-                Some(json!({ "type": "auto" }))
-            },
-            metadata: None,
-            thinking: None,
-            reasoning_effort,
-            stream: Some(true),
-            temperature: None,
-            top_p: None,
-        };
-
-        let protocol = client.wire_format();
-        Ok((client.create_message_stream(request).await?, protocol))
-    }
 }
-
-fn resolve_acp_route_facts(
-    config: &Config,
-    provider: ApiProvider,
-    model: &str,
-) -> (
-    Option<codewhale_config::route::RouteLimits>,
-    crate::model_profile::SupportState,
-) {
-    let Ok(route) = crate::route_runtime::resolve_runtime_route(config, provider, Some(model))
-    else {
-        return (None, crate::model_profile::SupportState::Unknown);
-    };
-    (
-        crate::route_budget::known_route_limits(route.candidate.limits()),
-        route.candidate.capabilities().image_input,
-    )
-}
-
-/// Return the first fully composed ACP system prompt for this user turn.
-/// Later tool rounds clone that exact value instead of re-reading mutable
-/// instruction sources from disk.
-fn frozen_acp_system_prompt(
-    slot: &std::sync::Mutex<Option<SystemPrompt>>,
-    config: &Config,
-    workspace: &std::path::Path,
-    provider: ApiProvider,
-    model: &str,
-    route_limits: Option<codewhale_config::route::RouteLimits>,
-) -> SystemPrompt {
-    let mut slot = match slot.lock() {
-        Ok(slot) => slot,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if let Some(system) = slot.as_ref() {
-        return system.clone();
-    }
-    let system = build_acp_system_prompt(config, workspace, provider, model, route_limits);
-    *slot = Some(system.clone());
-    system
-}
-
-/// Compose ACP's stable prompt through the same headless host seam as
-/// `codewhale exec`. Tool availability remains owned by the request catalog;
-/// this function supplies the shared constitution, project instructions,
-/// configured instruction files, memory, locale, and route context.
-fn build_acp_system_prompt(
-    config: &Config,
-    workspace: &std::path::Path,
-    provider: ApiProvider,
-    model: &str,
-    route_limits: Option<codewhale_config::route::RouteLimits>,
-) -> SystemPrompt {
-    let settings = crate::settings::Settings::load().unwrap_or_default();
-    let locale_tag = codewhale_localization::resolve_locale(&settings.locale)
-        .tag()
-        .to_string();
-    let instructions = config
-        .instructions_paths()
-        .into_iter()
-        .map(crate::prompts::InstructionSource::from)
-        .collect::<Vec<_>>();
-    let skills_dir = config.skills_dir();
-    let user_memory_block = crate::native_memory::native_prompt_block(
-        config.memory_enabled(),
-        &config.memory_path(),
-        workspace,
-    );
-
-    crate::prompts::system_prompt_for_mode_with_context_skills_session_and_approval_for_host(
-        workspace,
-        None,
-        Some(&skills_dir),
-        Some(&instructions),
-        crate::prompts::PromptSessionContext {
-            user_memory_block: user_memory_block.as_deref(),
-            goal_objective: None,
-            project_context_pack_enabled: config.project_context_pack_enabled(),
-            locale_tag: &locale_tag,
-            translation_enabled: false,
-            model_id: model,
-            context_window_override: Some(crate::route_budget::route_context_window_tokens(
-                provider,
-                model,
-                route_limits,
-            )),
-            verbosity: config.verbosity.as_deref(),
-            skills_discovery_mode: crate::skills::SkillDiscoveryMode::from_config(
-                &config.skills_config(),
-            ),
-            plugin_registry: None,
-            recovery_hint: None,
-            mode: acp_mode(config),
-        },
-        crate::prompts::PromptHost::Headless,
-    )
-}
-
-/// How an operator starts an ACP server in Full Access. The posture is chosen
-/// when the server is launched, never by a client request (#6310).
 const ACP_FULL_ACCESS_HINT: &str = "Start the server with `codewhale --approval-policy full-access serve --acp`, or set approval_policy = \"full-access\" in config.toml. Full Access also turns off Codewhale's own sandbox unless sandbox_mode tightens it; Plan stays read-only.";
 
 fn acp_mode(config: &Config) -> AppMode {
@@ -2279,143 +746,6 @@ fn acp_approval_mode(config: &Config) -> ApprovalMode {
             .as_deref()
             .and_then(ApprovalMode::from_config_value)
             .unwrap_or_default()
-    }
-}
-
-/// Build the tool registry for one ACP session, rooted at the session's
-/// `cwd`. Reuses the shared registry builders used by headless `exec` and the
-/// MCP adapter — no ACP-specific tool implementations.
-///
-/// Outside Plan mode, `Bash` is registered only when all three gates allow it: the
-/// client declares `clientCapabilities.terminal`, headless shell access is
-/// explicitly enabled in config, and the stable shell feature is enabled.
-/// Omitting any gate fails closed. The context also inherits the current
-/// mode-derived/configured sandbox boundary.
-/// `ToolContext::new` leaves `auto_approve` at its default (`false`), so the
-/// shell's own last-line safety check remains active after ACP's shared
-/// prepared-call, typed-policy, auto-review, repository-law, and explicit
-/// `session/request_permission` gates have admitted the call.
-fn build_acp_tool_registry(
-    config: &Config,
-    workspace: &std::path::Path,
-    client_supports_terminal: bool,
-) -> ToolRegistry {
-    let features = config.features();
-    let external_sandbox_requested = config.sandbox_backend.as_deref().is_some_and(|kind| {
-        let kind = kind.trim();
-        !kind.is_empty() && !kind.eq_ignore_ascii_case("none")
-    });
-    let sandbox_backend = match crate::sandbox::backend::create_backend(config) {
-        Ok(backend) => backend
-            .filter(|backend| backend.kind() != crate::sandbox::backend::SandboxKind::Unsupported)
-            .map(std::sync::Arc::from),
-        Err(error) => {
-            tracing::warn!("Failed to create ACP sandbox backend: {error}");
-            None
-        }
-    };
-    // A requested external sandbox is an execution boundary, not a hint. If
-    // it cannot be constructed, omit Bash instead of silently running the
-    // command on the local host.
-    let sandbox_backend_ready = !external_sandbox_requested || sandbox_backend.is_some();
-    let allow_shell = acp_mode(config) != AppMode::Plan
-        && client_supports_terminal
-        && config.allow_shell()
-        && features.enabled(crate::features::Feature::ShellTool)
-        && sandbox_backend_ready;
-    let shell_policy = if allow_shell {
-        ShellPolicy::Full
-    } else {
-        ShellPolicy::None
-    };
-    let sandbox_policy = crate::core::authority::sandbox_policy_for_turn(
-        acp_mode(config),
-        acp_approval_mode(config),
-        config.sandbox_mode.as_deref(),
-        workspace,
-        crate::core::authority::SandboxNetworkAccess::from_config(config.sandbox_network_access),
-    );
-    let mut context = ToolContext::new(workspace)
-        .with_shell_policy(shell_policy)
-        .with_elevated_sandbox_policy(sandbox_policy);
-    if acp_mode(config) == AppMode::Plan {
-        // Use the shared headless authority cap for file/Git dispatch too:
-        // an OS shell sandbox alone cannot prevent in-process tool writes.
-        context.tool_authority = Some(Arc::new(crate::tools::spec::ToolAuthorityEnvelope {
-            schema_version: 1,
-            owner: "acp-plan".to_string(),
-            authority: crate::tools::spec::ToolMutationAuthority::ReadOnly,
-            network_access: Some(false),
-            shell: crate::tools::spec::ToolShellAuthority::None,
-            verification: crate::tools::spec::ToolVerificationAuthority::None,
-            writable_roots: Vec::new(),
-            writable_files: Vec::new(),
-            coordination_contracts: Vec::new(),
-        }));
-    }
-    match context.shell_manager.lock() {
-        Ok(mut manager) => manager.set_prefer_bwrap(config.prefer_bwrap.unwrap_or(false)),
-        Err(poisoned) => poisoned
-            .into_inner()
-            .set_prefer_bwrap(config.prefer_bwrap.unwrap_or(false)),
-    }
-    if let Some(backend) = sandbox_backend {
-        context = context.with_sandbox_backend(backend);
-    }
-    let hooks_config =
-        crate::hooks::HooksConfig::load_with_project(config.hooks_config(), workspace);
-    context.runtime.hook_executor = Some(Arc::new(crate::hooks::HookExecutor::new(
-        hooks_config,
-        workspace.to_path_buf(),
-    )));
-
-    let mut builder = ToolRegistryBuilder::new()
-        .with_file_tools()
-        .with_search_tools()
-        .with_git_tools();
-    if features.enabled(crate::features::Feature::ApplyPatch) {
-        builder = builder.with_patch_tools();
-    }
-    if allow_shell {
-        builder = builder.with_foreground_shell_tools();
-    }
-
-    let mut registry = builder.build(context);
-    // ACP does not load arbitrary plugin replacements in v0.9.6, but it must
-    // never fall through to a built-in the operator disabled or replaced.
-    if let Some(overrides) = config
-        .tools
-        .as_ref()
-        .and_then(|tools| tools.overrides.as_ref())
-    {
-        for tool_name in overrides.keys() {
-            remove_acp_overridden_builtin(&mut registry, tool_name);
-        }
-    }
-    registry
-}
-
-/// ACP does not load executable tool replacements in v0.9.6. Remove the
-/// built-in compatibility family for every configured override so neither a
-/// hidden legacy alias nor a newly canonical lowercase name can fall through
-/// to the original implementation.
-fn remove_acp_overridden_builtin(registry: &mut ToolRegistry, tool_name: &str) {
-    let aliases: &[&str] = match tool_name {
-        "bash" | "Bash" | "exec_shell" => &["bash", "Bash", "exec_shell"],
-        "read" | "write" | "edit" | "File" | "read_file" | "write_file" | "edit_file" => &[
-            "read",
-            "write",
-            "edit",
-            "File",
-            "read_file",
-            "write_file",
-            "edit_file",
-        ],
-        "apply_patch" => &["apply_patch"],
-        _ => std::slice::from_ref(&tool_name),
-    };
-    for alias in aliases {
-        registry.remove_tool(alias);
     }
 }
 
@@ -2549,28 +879,6 @@ where
     write_json_line(writer, notification).await
 }
 
-struct ScopedCurrentDir {
-    prior: PathBuf,
-}
-
-impl ScopedCurrentDir {
-    fn new(cwd: &PathBuf) -> Result<Self> {
-        let prior = std::env::current_dir()?;
-        if cwd.as_os_str().is_empty() {
-            return Ok(Self { prior });
-        }
-        std::env::set_current_dir(cwd)
-            .map_err(|err| anyhow!("failed to enter ACP session cwd {}: {err}", cwd.display()))?;
-        Ok(Self { prior })
-    }
-}
-
-impl Drop for ScopedCurrentDir {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.prior);
-    }
-}
-
 impl AcpError {
     fn invalid_params(message: impl Into<String>) -> Self {
         Self {
@@ -2635,7 +943,12 @@ fn initialize_result(client_protocol_version: Option<u64>, config: &Config) -> V
 }
 
 fn acp_auth_methods(config: &Config) -> Value {
-    let provider = config.api_provider().as_str();
+    let Some(identity) = config.active_provider_identity().ok().filter(|identity| {
+        identity.provider != ProviderKind::Custom && identity.provider != ProviderKind::Antigravity
+    }) else {
+        return json!([]);
+    };
+    let provider = identity.provider.as_str();
     json!([
         {
             "id": "codewhale-terminal-auth",
@@ -2753,9 +1066,13 @@ async fn write_json_line<W>(writer: &mut W, value: Value) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    writer.write_all(value.to_string().as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        writer.write_all(value.to_string().as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| anyhow!("ACP transport write did not settle within 30 seconds"))??;
     Ok(())
 }
 
@@ -2789,436 +1106,405 @@ impl JsonRpcResponseIdPolicy {
     }
 }
 
+fn is_jsonrpc_response(message: &Value) -> bool {
+    message.get("id").is_some()
+        && (message.get("result").is_some() || message.get("error").is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::collections::VecDeque;
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    use codewhale_models::{ContentBlock, Role};
+    use std::time::Duration;
 
-    #[tokio::test]
-    async fn tool_update_emits_typed_acp_image_content() {
-        let mut output = Vec::new();
-        let call = PendingToolCall {
-            execution_id: uuid::Uuid::new_v4().to_string(),
-            caller: None,
-            thought_signature: None,
-            id: "call_image_1".to_string(),
-            name: "read".to_string(),
-            input: json!({"path": "shot.png"}),
-            parse_error: None,
-        };
-        write_tool_call_update_with_blocks(
-            &mut output,
-            "session_1",
-            &call,
-            "completed",
-            Some("screenshot captured"),
-            &[codewhale_tools::ToolResultContentBlock::Image {
-                mime_type: "image/png".to_string(),
-                data: "QUJD".to_string(),
-            }],
-        )
-        .await
-        .expect("ACP update");
-
-        let lines = parse_lines(output);
-        let content = lines[0]["params"]["update"]["content"]
-            .as_array()
-            .expect("ACP content blocks");
-        assert_eq!(content[0]["content"]["type"], "text");
-        assert_eq!(content[1]["content"]["type"], "image");
-        assert_eq!(content[1]["content"]["mimeType"], "image/png");
-        assert_eq!(content[1]["content"]["data"], "QUJD");
+    fn parse_lines(output: Vec<u8>) -> Vec<Value> {
+        String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
-
-    /// #5864: `serve --acp` implemented `initialize` and `session/new` and
-    /// nothing else, so ACP clients that offer session history could not
-    /// enumerate or resume anything. ACP sessions are in-memory and capped;
-    /// the durable Codewhale sessions are what "resume" means.
-    #[tokio::test]
-    async fn session_list_and_load_reach_the_durable_codewhale_sessions() {
-        let _guard = crate::test_support::lock_test_env();
-        let home = tempfile::TempDir::new().expect("isolated codewhale home");
-        let _home_guard =
-            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path().as_os_str());
-
-        let workspace = home.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace");
-        let saved = crate::session_manager::create_saved_session(
-            &[Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "what did we decide?".to_string(),
-                    cache_control: None,
-                }],
-            }],
-            "deepseek-v4-flash",
-            &workspace,
-            42,
-            None,
-        );
-        let saved_id = saved.metadata.id.clone();
-        let manager = crate::session_manager::SessionManager::new(
-            crate::session_manager::default_sessions_dir().expect("sessions dir"),
-        )
-        .expect("session manager");
-        manager.save_session(&saved).expect("save fixture session");
-
-        let mut server = AcpServer::new(
-            Config::default(),
-            "deepseek-v4-flash".to_string(),
-            workspace.clone(),
-        );
-
-        let listed = server.list_sessions(json!({})).expect("session/list");
-        let ids: Vec<&str> = listed["sessions"]
-            .as_array()
-            .expect("sessions array")
-            .iter()
-            .filter_map(|entry| entry["sessionId"].as_str())
-            .collect();
-        assert!(
-            ids.contains(&saved_id.as_str()),
-            "session/list must enumerate durable sessions: {ids:?}"
-        );
-
-        let other_workspace = home.path().join("other-workspace");
-        std::fs::create_dir_all(&other_workspace).unwrap();
-        let other = crate::session_manager::create_saved_session(
-            &saved.messages,
-            "deepseek-v4-flash",
-            &other_workspace,
-            0,
-            None,
-        );
-        manager.save_session(&other).unwrap();
-        for filter in [workspace.clone(), workspace.join(".")] {
-            let AcpDispatch::Response(filtered) = server
-                .handle_request("session/list", json!({"cwd": filter}))
-                .await
-                .expect("filtered session/list")
-            else {
-                panic!("session/list returned shutdown");
+    pub(super) fn fixture_config() -> Config {
+        let mut config = Config {
+            provider: Some("acp-fixture".into()),
+            providers: Some(crate::config::ProvidersConfig {
+                custom: HashMap::from([(
+                    "acp-fixture".into(),
+                    crate::config::ProviderConfig {
+                        kind: Some("openai-compatible".into()),
+                        base_url: Some("http://127.0.0.1:18181/v1".into()),
+                        model: Some("fixture-model".into()),
+                        api_key: Some("local-test-key".into()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }),
+            snapshots: Some(crate::config::SnapshotsConfig {
+                enabled: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        config.set_feature("mcp", false).unwrap();
+        config.set_feature("subagents", false).unwrap();
+        config
+    }
+    pub(super) struct Rig {
+        pub(super) server: AcpServer,
+        mock: Arc<MockLlmClient>,
+        pub(super) workspace: PathBuf,
+        _home: crate::test_support::SealedHome,
+        _dir: tempfile::TempDir,
+    }
+    impl Rig {
+        pub(super) fn new(
+            config: Config,
+            turns: Vec<crate::llm_client::mock::CannedTurn>,
+        ) -> Result<Self> {
+            Self::with_base(config, turns, true)
+        }
+        fn with_base(
+            config: Config,
+            turns: Vec<crate::llm_client::mock::CannedTurn>,
+            acp: bool,
+        ) -> Result<Self> {
+            let dir = tempfile::tempdir()?;
+            let home = crate::test_support::SealedHome::at(dir.path());
+            let workspace = dir.path().join("workspace");
+            std::fs::create_dir(&workspace)?;
+            let runtime_dir = dir.path().join("runtime");
+            let manager_config = RuntimeThreadManagerConfig {
+                data_dir: runtime_dir.clone(),
+                task_data_dir: runtime_dir,
+                sessions_dir: None,
+                max_active_threads: 4,
             };
-            let entries = filtered["sessions"].as_array().unwrap();
-            assert_eq!(
-                entries.len(),
-                1,
-                "workspace filter must not include another directory"
-            );
-            assert_eq!(entries[0]["sessionId"], saved_id);
-        }
-        let AcpDispatch::Response(all) = server
-            .handle_request("session/list", json!({}))
-            .await
-            .unwrap()
-        else {
-            panic!("session/list returned shutdown");
-        };
-        assert_eq!(all["sessions"].as_array().unwrap().len(), 2);
-        let AcpDispatch::Response(empty) = server
-            .handle_request(
-                "session/list",
-                json!({"cwd": home.path().join("missing-workspace")}),
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("session/list returned shutdown");
-        };
-        assert!(empty["sessions"].as_array().unwrap().is_empty());
-        for invalid in [json!("relative"), json!(""), json!(42)] {
-            let error = server
-                .handle_request("session/list", json!({"cwd": invalid}))
-                .await
-                .err()
-                .expect("invalid cwd must be rejected");
-            assert_eq!(error.code, -32602);
-        }
-
-        let loaded = server
-            .load_session(json!({ "sessionId": saved_id }))
-            .expect("session/load");
-        assert_eq!(loaded["sessionId"], saved_id);
-        assert!(
-            loaded["configOptions"]
-                .as_array()
-                .is_some_and(|options| options.len() == 3)
-        );
-        let session = server
-            .sessions
-            .get(&saved_id)
-            .expect("loaded session is addressable by its own id");
-        assert_eq!(session.cwd, workspace, "cwd comes from the saved workspace");
-        assert_eq!(
-            session.messages.len(),
-            1,
-            "the conversation is rehydrated, not started empty"
-        );
-
-        // A session that does not exist is a client error, not a panic.
-        let missing = server.load_session(json!({ "sessionId": "codewhale-nope" }));
-        assert_eq!(missing.expect_err("unknown session").code, -32602);
-        let no_id = server.load_session(json!({}));
-        assert_eq!(no_id.expect_err("missing sessionId").code, -32602);
-    }
-
-    /// #6245: reloading a tracked session by a short prefix must not push a
-    /// duplicate `insertion_order` entry. The duplicate made the deque
-    /// disagree with `sessions`, so a later capacity eviction popped the
-    /// stale front copy of a just-reloaded session and removed a live
-    /// conversation.
-    #[tokio::test]
-    async fn loading_a_tracked_session_by_prefix_does_not_duplicate_ordering() {
-        let _guard = crate::test_support::lock_test_env();
-        let home = tempfile::TempDir::new().expect("isolated codewhale home");
-        let _home_guard =
-            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path().as_os_str());
-
-        let workspace = home.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace");
-        let saved = crate::session_manager::create_saved_session(
-            &[Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "reload me by prefix".to_string(),
-                    cache_control: None,
-                }],
-            }],
-            "deepseek-v4-flash",
-            &workspace,
-            42,
-            None,
-        );
-        let saved_id = saved.metadata.id.clone();
-        let manager = crate::session_manager::SessionManager::new(
-            crate::session_manager::default_sessions_dir().expect("sessions dir"),
-        )
-        .expect("session manager");
-        manager.save_session(&saved).expect("save fixture session");
-
-        let mut server = AcpServer::new(
-            Config::default(),
-            "deepseek-v4-flash".to_string(),
-            workspace.clone(),
-        );
-
-        // Load by the full id first: the session becomes tracked exactly once.
-        let loaded = server
-            .load_session(json!({ "sessionId": saved_id }))
-            .expect("load by full id");
-        assert_eq!(loaded["sessionId"], saved_id);
-
-        // A prefix resolving to the same tracked id must be idempotent, not
-        // a second insertion.
-        let prefix: String = saved_id.chars().take(8).collect();
-        let reloaded = server
-            .load_session(json!({ "sessionId": prefix }))
-            .expect("load by prefix");
-        assert_eq!(reloaded["sessionId"], saved_id);
-
-        assert_eq!(server.sessions.len(), 1);
-        assert_eq!(
-            server.insertion_order.len(),
-            server.sessions.len(),
-            "a prefix reload of a tracked session must not duplicate the ordering entry"
-        );
-        assert_eq!(
-            server
-                .insertion_order
-                .iter()
-                .filter(|id| *id == &saved_id)
-                .count(),
-            1,
-            "the ordering deque holds the tracked id exactly once"
-        );
-    }
-
-    #[tokio::test]
-    async fn standard_session_configuration_is_offered_and_scoped_to_one_session() {
-        let workspace = tempfile::tempdir().unwrap();
-        let mut server = AcpServer::new(
-            Config::default(),
-            "deepseek-v4-flash".into(),
-            workspace.path().into(),
-        );
-        let first = server.new_session(json!({})).unwrap();
-        let second = server.new_session(json!({})).unwrap();
-        let first_id = first["sessionId"].as_str().unwrap();
-        let second_id = second["sessionId"].as_str().unwrap();
-        assert_eq!(first["modes"]["currentModeId"], "agent");
-        assert_eq!(first["models"]["currentModelId"], "deepseek-v4-flash");
-        let alternative = first["models"]["availableModels"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find_map(|row| {
-                row["modelId"]
-                    .as_str()
-                    .filter(|model| *model != "deepseek-v4-flash")
+            let plugins = Arc::new(crate::plugins::PluginRegistry::empty(&workspace));
+            let manager = Arc::new(if acp {
+                RuntimeThreadManager::open_acp(
+                    config.clone(),
+                    workspace.clone(),
+                    manager_config,
+                    plugins,
+                )?
+            } else {
+                RuntimeThreadManager::open_with_plugin_registry(
+                    config.clone(),
+                    workspace.clone(),
+                    manager_config,
+                    plugins,
+                )?
+            });
+            let mock = Arc::new(MockLlmClient::new(turns));
+            manager.set_test_model_client(mock.clone());
+            let sessions = crate::session_manager::default_sessions_dir()?;
+            Ok(Self {
+                server: AcpServer::new(
+                    config,
+                    "fixture-model".into(),
+                    workspace.clone(),
+                    manager,
+                    sessions,
+                    None,
+                    None,
+                ),
+                mock,
+                workspace,
+                _home: home,
+                _dir: dir,
             })
-            .expect("shared active-provider catalog offers another model");
-
-        server
-            .handle_request(
-                "session/set_model",
-                json!({"sessionId": first_id, "modelId": alternative}),
-            )
-            .await
-            .unwrap();
-        let AcpDispatch::Response(configured) = server
-            .handle_request(
-                "session/set_config_option",
-                json!({"sessionId": first_id, "configId": "mode", "value": "plan"}),
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("configuration response")
-        };
-        assert_eq!(configured["configOptions"].as_array().unwrap().len(), 3);
-        assert_eq!(configured["configOptions"][2]["currentValue"], "ask");
-        assert_eq!(configured["configOptions"][0]["currentValue"], "plan");
-        assert_eq!(configured["configOptions"][1]["currentValue"], alternative);
-        assert_eq!(
-            server.session_configuration(second_id),
-            second,
-            "another session is unchanged"
-        );
-        let prepared = server
-            .begin_prompt(
-                json!({"sessionId": first_id, "prompt": [{"type": "text", "text": "review this"}]}),
-            )
-            .unwrap();
-        assert_eq!(
-            prepared.model, alternative,
-            "provider request receives the session model"
-        );
-        assert_eq!(acp_mode(&prepared.config), AppMode::Plan);
-        server
-            .handle_request(
-                "session/set_mode",
-                json!({"sessionId": first_id, "modeId": "agent"}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            server.sessions[first_id].messages.len(),
-            1,
-            "configuration retains history"
-        );
-        assert_eq!(
-            server.sessions[first_id].config.sandbox_mode,
-            server.config.sandbox_mode
-        );
-        assert_eq!(
-            server.model, "deepseek-v4-flash",
-            "session setters do not alter defaults"
-        );
-    }
-
-    #[tokio::test]
-    async fn plan_configuration_enforces_shared_read_only_tools() {
-        let workspace = tempfile::tempdir().unwrap();
-        let config = Config {
-            allow_shell: Some(true),
-            sandbox_mode: Some("danger-full-access".into()),
-            ..Config::default()
-        };
-        let mut server =
-            AcpServer::new(config, "deepseek-v4-flash".into(), workspace.path().into());
-        server.client_supports_terminal = true;
-        let new = server.new_session(json!({})).unwrap();
-        let id = new["sessionId"].as_str().unwrap();
-        server
-            .set_session_config(json!({"sessionId": id, "configId": "mode", "value": "plan"}))
-            .unwrap();
-        let registry = server.session_tool_registry(id).unwrap();
-        assert!(
-            registry.get("Bash").is_none(),
-            "Plan does not offer shell execution"
-        );
-        let target = workspace.path().join("must-not-exist.txt");
-        assert!(
-            registry.get("write").is_some(),
-            "exercise the real shared file writer"
-        );
-        let outcome = registry
-            .execute_full(
-                "write",
-                json!({"path": target, "content": "unauthorized write"}),
-            )
-            .await;
-        assert!(
-            matches!(outcome, Err(ToolError::PermissionDenied { .. })),
-            "the shared authority must reject mutation: {outcome:?}"
-        );
-        assert!(!target.exists());
-    }
-
-    #[test]
-    fn full_access_posture_is_discoverable_but_never_client_selectable() {
-        // #6310: the mode list alone gave an ACP client no way to see or
-        // learn about Full Access, and Work claimed edits ask for approval
-        // even under `--yolo`.
-        let workspace = tempfile::tempdir().unwrap();
-        let mut ask = AcpServer::new(
-            Config::default(),
-            "deepseek-v4-flash".into(),
-            workspace.path().into(),
-        );
-        let state = ask.new_session(json!({})).unwrap();
-        let id = state["sessionId"].as_str().unwrap().to_string();
-        let permission = &state["configOptions"][2];
-        assert_eq!(permission["id"], "permission");
-        assert_eq!(permission["currentValue"], "ask");
-        assert_eq!(permission["options"].as_array().unwrap().len(), 1);
-        assert_eq!(permission["_meta"]["codewhale"]["fullAccess"], false);
-        assert!(
-            permission["_meta"]["codewhale"]["enableFullAccess"]
+        }
+        pub(super) async fn new_session(&mut self) -> String {
+            self.server.new_session(json!({})).await.unwrap()["sessionId"]
                 .as_str()
                 .unwrap()
-                .contains("--approval-policy full-access"),
-            "the posture names how Full Access is enabled"
-        );
-        for value in ["full-access", "bypass"] {
-            let error = ask
-                .set_session_config(
-                    json!({"sessionId": id, "configId": "permission", "value": value}),
-                )
-                .unwrap_err();
-            assert_eq!(error.code, -32602, "a client cannot select {value}");
+                .to_string()
         }
-        assert_eq!(
-            acp_approval_mode(&ask.sessions[&id].config),
-            ApprovalMode::Suggest
-        );
-        // Re-selecting the offered (current) value is a harmless no-op.
-        ask.set_session_config(json!({"sessionId": id, "configId": "permission", "value": "ask"}))
-            .unwrap();
-
-        // The hint's own spelling must actually reach Full Access.
-        let mut yolo = AcpServer::new(
-            Config {
-                approval_policy: Some("full-access".into()),
-                ..Config::default()
+        async fn prompt(
+            &mut self,
+            session: &str,
+            text: &str,
+        ) -> Result<(&'static str, Vec<Value>)> {
+            // Keep the transport input open: an empty reader is a real EOF/cancel.
+            let (client, input) = tokio::io::duplex(4096);
+            let mut reader = codewhale_app_server::BoundedLines::new(BufReader::new(input));
+            let mut output = Vec::new();
+            let result = tokio::time::timeout(
+                Duration::from_secs(20),
+                self.server.drive_prompt(
+                    json!({"sessionId":session,"prompt":text}),
+                    &mut reader,
+                    &mut output,
+                ),
+            )
+            .await??;
+            drop(client);
+            Ok((result, parse_lines(output)))
+        }
+        async fn history(&self, session: &str) -> Vec<codewhale_models::Message> {
+            let thread = &self.server.sessions[session].thread_id;
+            self.server
+                .runtime
+                .get_engine(thread)
+                .await
+                .unwrap()
+                .get_session_snapshot()
+                .await
+                .unwrap()
+                .messages
+        }
+        pub(super) async fn close(&self) {
+            self.server.runtime.shutdown_and_wait().await.unwrap();
+        }
+    }
+    #[cfg(any(unix, windows))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_acp_owner_projects_actual_engine_and_guest_eof_preserves_lease()
+    -> Result<()> {
+        authenticated_owner_profile_case(true).await
+    }
+    #[cfg(any(unix, windows))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn normal_owner_admits_authenticated_acp_then_ordinary_successor_without_profile_leak()
+    -> Result<()> {
+        authenticated_owner_profile_case(false).await
+    }
+    #[cfg(any(unix, windows))]
+    async fn authenticated_owner_profile_case(base_acp: bool) -> Result<()> {
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        async fn correlated(
+            guest: &mut codewhale_app_server::daemon_client::OwnerClient,
+            id: Value,
+        ) -> Result<Value> {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let frame = guest
+                        .recv()
+                        .await?
+                        .ok_or_else(|| anyhow!("ACP owner closed before reply"))?;
+                    if frame["id"] == id {
+                        return Ok(frame);
+                    }
+                }
+            })
+            .await?
+        }
+        let config = fixture_config();
+        let rig = Rig::with_base(
+            config.clone(),
+            vec![canned::simple_text_turn("same owner answer")],
+            base_acp,
+        )?;
+        let manager = rig.server.runtime.clone();
+        let capture = manager.clone();
+        let (binding, generation) = codewhale_app_server::daemon_socket::owner_work(move || {
+            capture.capture_control_owner()
+        })
+        .await?;
+        #[cfg(unix)]
+        let socket_directory = rig._dir.path().canonicalize()?.join("endpoint");
+        #[cfg(unix)]
+        let _socket_directory =
+            codewhale_config::private_directory::PrivateDirectory::open(&socket_directory)?;
+        #[cfg(unix)]
+        let socket_path = socket_directory.join("acp-owner.sock");
+        #[cfg(windows)]
+        let socket_path = PathBuf::from(format!(
+            r"\\.\pipe\codewhale-acp-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        #[cfg(unix)]
+        let principal =
+            codewhale_config::private_directory::PrivateDirectory::current_user_id().to_string();
+        #[cfg(windows)]
+        let principal = codewhale_app_server::daemon_socket::owner_work(|| {
+            codewhale_config::windows_identity::CurrentWindowsUser::open()?.sid_string()
+        })
+        .await?;
+        let receipt = codewhale_protocol::RuntimeOwnerReceipt {
+            version: 1,
+            data_dir: binding.data_dir,
+            execution_scope: binding.execution_scope,
+            lease_generation: generation,
+            pid: std::process::id(),
+            process_start: codewhale_app_server::daemon_socket::capture_process_start(
+                std::process::id(),
+            )
+            .await?,
+            principal,
+            socket_path: socket_path.clone(),
+            config_path: None,
+        };
+        let frontend = capture_frontend(
+            config,
+            "fixture-model".into(),
+            rig.workspace.clone(),
+            manager.clone(),
+            rig.server.sessions_dir.clone(),
+            None,
+            None,
+        )?;
+        // ACP calls the held manager directly through its captured projection;
+        // this closed endpoint has no fake HTTP service and is never used.
+        let (daemon, _state) = codewhale_app_server::bind_runtime_frontends(
+            None,
+            None,
+            receipt.clone(),
+            codewhale_app_server::RuntimeOwnerRouting {
+                workers: None,
+                workspace: Some(rig.workspace.clone()),
+                endpoint: "127.0.0.1:1".parse()?,
+                mobile: false,
+                web: false,
+                acp: true,
+                acp_only: base_acp,
             },
-            "deepseek-v4-flash".into(),
-            workspace.path().into(),
-        );
-        let state = yolo.new_session(json!({})).unwrap();
-        let permission = &state["configOptions"][2];
-        assert_eq!(permission["currentValue"], "full-access");
-        assert_eq!(permission["_meta"]["codewhale"]["fullAccess"], true);
-        let agent_hint = state["modes"]["availableModes"][0]["description"]
+            Some(frontend),
+        )
+        .await?;
+        let shutdown = daemon.shutdown_handle();
+        let owner = tokio::spawn(daemon.serve());
+        let _abort = AbortOnDrop(owner.abort_handle());
+        let mut guest = codewhale_app_server::daemon_client::connect_acp_if_published(
+            None,
+            Some(socket_path.clone()),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("published ACP owner unavailable"))?;
+        assert_eq!(guest.receipt(), &receipt);
+        assert!(guest.routing().is_some_and(|routing| routing.acp));
+        guest
+            .send(
+                json!(1),
+                "initialize",
+                json!({"protocolVersion":1,"clientCapabilities":{}}),
+            )
+            .await?;
+        assert!(correlated(&mut guest, json!(1)).await?["error"].is_null());
+        guest
+            .send(json!(2), "session/new", json!({"cwd":rig.workspace}))
+            .await?;
+        let created = correlated(&mut guest, json!(2)).await?;
+        let session = created["result"]["sessionId"]
             .as_str()
-            .unwrap()
+            .ok_or_else(|| anyhow!("{created}"))?
             .to_string();
-        assert_ne!(
-            state["modes"]["availableModes"][0]["description"],
-            ask.session_configuration(&id)["modes"]["availableModes"][0]["description"],
-            "Work under Full Access must not reuse the ask-for-approval hint: {agent_hint}"
+        guest
+            .send(
+                json!(3),
+                "session/prompt",
+                json!({"sessionId":session,"prompt":"one actual turn"}),
+            )
+            .await?;
+        let completed = correlated(&mut guest, json!(3)).await?;
+        assert_eq!(completed["result"]["stopReason"], "end_turn", "{completed}");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            guest.forward(tokio::io::empty(), tokio::io::sink()),
+        )
+        .await??;
+        let mut shutdown_guest = codewhale_app_server::daemon_client::connect_acp_if_published(
+            None,
+            Some(socket_path.clone()),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("owner ended after guest EOF"))?;
+        shutdown_guest.send(json!(4), "shutdown", json!({})).await?;
+        let closed = correlated(&mut shutdown_guest, json!(4)).await?;
+        assert!(closed["error"].is_null());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), shutdown_guest.recv())
+                .await??
+                .is_none(),
+            "ACP shutdown closes only this connection"
         );
+        let rows = manager
+            .list_threads(
+                crate::runtime_threads::ThreadListFilter::IncludeArchived,
+                None,
+            )
+            .await?;
+        assert_eq!(rows.len(), 1);
+        let detail = manager.get_thread_detail(&rows[0].id).await?;
+        assert_eq!(detail.turns.len(), 1);
+        assert_eq!(rig.mock.call_count(), 1);
+        if !base_acp {
+            rig.mock
+                .push_turn(canned::simple_text_turn("ordinary successor"));
+            let ordinary = manager
+                .start_turn(
+                    &rows[0].id,
+                    crate::runtime_threads::StartTurnRequest {
+                        prompt: "ordinary successor".into(),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let detail = manager.get_thread_detail(&rows[0].id).await?;
+                    if detail.turns.iter().any(|t| {
+                        t.id == ordinary.id
+                            && t.status == crate::runtime_threads::RuntimeTurnStatus::Completed
+                    }) {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await??;
+            let requests = rig.mock.captured_requests();
+            assert_eq!(requests.len(), 2);
+            let acp = requests[0]
+                .tools
+                .as_ref()
+                .ok_or_else(|| anyhow!("ACP tools missing"))?;
+            assert!(acp.iter().all(|tool| !matches!(
+                tool.name.as_str(),
+                "update_goal"
+                    | "create_goal"
+                    | "request_user_input"
+                    | "tool_search"
+                    | "spawn_agent"
+            )));
+            let normal = requests[1]
+                .tools
+                .as_ref()
+                .ok_or_else(|| anyhow!("ordinary tools missing"))?;
+            assert_ne!(
+                acp.iter().map(|t| &t.name).collect::<Vec<_>>(),
+                normal.iter().map(|t| &t.name).collect::<Vec<_>>(),
+                "ordinary successor must rebuild its ordinary catalog"
+            );
+            assert_eq!(manager.get_thread_detail(&rows[0].id).await?.turns.len(), 2);
+        }
+        let capture = manager.clone();
+        let (after, generation) = codewhale_app_server::daemon_socket::owner_work(move || {
+            capture.capture_control_owner()
+        })
+        .await?;
+        assert_eq!(after.data_dir, receipt.data_dir);
+        assert_eq!(
+            generation, receipt.lease_generation,
+            "guest EOF cannot release the host lease"
+        );
+        shutdown.trigger();
+        tokio::time::timeout(Duration::from_secs(5), owner).await???;
+        assert!(
+            codewhale_app_server::daemon_client::connect_acp_if_published(None, Some(socket_path))
+                .await?
+                .is_none(),
+            "shutdown withdraws the authenticated owner receipt instead of advertising a guest"
+        );
+        rig.close().await;
+        Ok(())
     }
 
     #[test]
@@ -3235,87 +1521,6 @@ mod tests {
         };
         assert_eq!(acp_approval_mode(&policy), ApprovalMode::Never);
         assert_eq!(acp_approval_mode(&Config::default()), ApprovalMode::Suggest);
-    }
-
-    #[tokio::test]
-    async fn yolo_admission_auto_executes_write_without_permission_round_trip() {
-        // #6337: an unattended `--yolo` session must execute tools instead of
-        // stalling on permission requests no headless client answers.
-        let (dir, registry) = workspace_registry();
-        let config = Config {
-            yolo: Some(true),
-            ..Config::default()
-        };
-        let call = pending_call(
-            "File",
-            json!({"action": "write", "path": "yolo.txt", "content": "yolo"}),
-        );
-        let (_, admission) = prepare_acp_tool_admission(&config, &registry, &call)
-            .await
-            .unwrap();
-        assert_eq!(admission, AcpToolAdmission::Auto);
-        assert_eq!(registry.context().workspace, dir.path());
-    }
-
-    #[tokio::test]
-    async fn default_admission_still_requests_permission_for_write() {
-        // Pins the Ask default the yolo test above contrasts with: without
-        // `--yolo`, a write surfaces a permission request to the client.
-        let (_dir, registry) = workspace_registry();
-        let call = pending_call(
-            "File",
-            json!({"action": "write", "path": "ask.txt", "content": "ask"}),
-        );
-        let (_, admission) = prepare_acp_tool_admission(&Config::default(), &registry, &call)
-            .await
-            .unwrap();
-        assert!(matches!(admission, AcpToolAdmission::RequestPermission(_)));
-    }
-
-    #[tokio::test]
-    async fn plan_mode_stays_read_only_under_yolo() {
-        // The posture derivation must never loosen the Plan guardrail.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = Config {
-            yolo: Some(true),
-            sandbox_mode: Some("read-only".into()),
-            ..Config::default()
-        };
-        let registry = build_acp_tool_registry(&config, dir.path(), false);
-        let target = dir.path().join("must-not-exist.txt");
-        let outcome = registry
-            .execute_full("write", json!({"path": target, "content": "x"}))
-            .await;
-        assert!(
-            matches!(outcome, Err(ToolError::PermissionDenied { .. })),
-            "Plan stays read-only under yolo: {outcome:?}"
-        );
-        assert!(!target.exists());
-    }
-
-    #[test]
-    fn session_configuration_cannot_relax_a_configured_floor_or_invent_values() {
-        let workspace = tempfile::tempdir().unwrap();
-        let config = Config {
-            sandbox_mode: Some("read-only".into()),
-            ..Config::default()
-        };
-        let mut server =
-            AcpServer::new(config, "deepseek-v4-flash".into(), workspace.path().into());
-        let before = server.new_session(json!({})).unwrap();
-        let id = before["sessionId"].as_str().unwrap();
-        assert_eq!(before["modes"]["currentModeId"], "plan");
-        for params in [
-            json!({"sessionId": id, "configId": "mode", "value": "agent"}),
-            json!({"sessionId": id, "configId": "model", "value": "unknown-model"}),
-            json!({"sessionId": id, "configId": "permission", "value": "bypass"}),
-            json!({"sessionId": id, "configId": "mode", "value": true}),
-            json!({"sessionId": "missing", "configId": "mode", "value": "plan"}),
-            json!({"configId": "mode", "value": "plan"}),
-        ] {
-            assert_eq!(server.set_session_config(params).unwrap_err().code, -32602);
-            assert_eq!(server.session_configuration(id), before);
-        }
     }
 
     #[test]
@@ -3359,85 +1564,6 @@ mod tests {
         let result = initialize_result(Some(1), &Config::default());
 
         assert_eq!(result["agentCapabilities"]["modelSelection"], true);
-    }
-
-    #[test]
-    fn list_providers_returns_provider_set() {
-        let server = AcpServer::new(
-            Config::default(),
-            "deepseek-chat".into(),
-            PathBuf::from("/tmp"),
-        );
-        let result = server.list_providers();
-        let providers = result["providers"].as_array().expect("providers array");
-
-        assert!(!providers.is_empty());
-        assert!(
-            providers
-                .iter()
-                .any(|provider| provider["id"] == "deepseek")
-        );
-    }
-
-    #[test]
-    fn current_model_reflects_constructor_default() {
-        let config = Config::default();
-        let expected_provider = config.api_provider().as_str();
-        let server = AcpServer::new(config, "deepseek-reasoner".into(), PathBuf::from("/tmp"));
-        let result = server.current_model();
-
-        assert_eq!(result["provider"], expected_provider);
-        assert_eq!(result["model"], "deepseek-reasoner");
-    }
-
-    #[test]
-    fn select_model_updates_active_selection() {
-        let mut server = AcpServer::new(
-            Config::default(),
-            "deepseek-chat".into(),
-            PathBuf::from("/tmp"),
-        );
-
-        let result = server
-            .select_model(json!({ "provider": "openai", "model": "gpt-4o" }))
-            .expect("select model");
-
-        assert_eq!(result["provider"], "openai");
-        assert_eq!(result["model"], "gpt-4o");
-        assert_eq!(server.current_model()["provider"], "openai");
-        assert_eq!(server.current_model()["model"], "gpt-4o");
-    }
-
-    #[test]
-    fn select_model_rejects_unknown_provider() {
-        let mut server = AcpServer::new(
-            Config::default(),
-            "deepseek-chat".into(),
-            PathBuf::from("/tmp"),
-        );
-        let before = server.current_model();
-
-        let err = server
-            .select_model(json!({ "provider": "unknown-provider", "model": "gpt-4o" }))
-            .expect_err("unknown provider rejected");
-
-        assert_eq!(err.code, -32602);
-        assert_eq!(server.current_model(), before);
-    }
-
-    #[test]
-    fn select_model_rejects_missing_model() {
-        let mut server = AcpServer::new(
-            Config::default(),
-            "deepseek-chat".into(),
-            PathBuf::from("/tmp"),
-        );
-
-        let err = server
-            .select_model(json!({ "provider": "openai" }))
-            .expect_err("missing model rejected");
-
-        assert_eq!(err.code, -32602);
     }
 
     #[test]
@@ -3540,1869 +1666,1027 @@ mod tests {
         assert_eq!(value["error"]["code"], -32700);
     }
 
-    #[test]
-    fn new_session_starts_with_empty_messages() {
-        let mut server = AcpServer::new(
-            Config::default(),
-            "test-model".to_string(),
-            PathBuf::from("/tmp"),
-        );
-        let result = server
-            .new_session(json!({ "cwd": "/tmp" }))
-            .expect("new session");
-        let session_id = result["sessionId"].as_str().expect("session id");
-        let session = server.sessions.get(session_id).expect("session exists");
-        assert!(session.messages.is_empty());
-    }
-
-    /// #6174: an ACP client has no id for a session it just created other than
-    /// the one `session/new` returned, so that id must be loadable. It used to
-    /// come back `codewhale-<uuid>` — a namespace `session/load` did not
-    /// understand and the durable store never held — and replaying it, which is
-    /// the normal client behaviour, failed with `-32602`.
-    #[test]
-    fn session_new_returns_an_id_that_session_load_resolves() {
-        let mut server = AcpServer::new(
-            Config::default(),
-            "test-model".to_string(),
-            PathBuf::from("/tmp"),
-        );
-        let created = server
-            .new_session(json!({ "cwd": "/tmp" }))
-            .expect("new session");
-        let session_id = created["sessionId"]
-            .as_str()
-            .expect("session id")
-            .to_string();
-
-        // The id is in the one namespace every method understands: the bare
-        // uuid shape `session/list` advertises for durable sessions.
-        assert!(
-            !session_id.starts_with("codewhale-"),
-            "session/new must not mint a prefixed id, got {session_id}"
-        );
-        uuid::Uuid::parse_str(&session_id)
-            .unwrap_or_else(|e| panic!("session/new must mint a bare uuid, got {session_id}: {e}"));
-
-        // Replaying that exact id resolves, and resolves to the same session.
-        let loaded = server
-            .load_session(json!({ "sessionId": session_id }))
-            .expect("session/load must resolve an id session/new returned");
-        assert_eq!(loaded["sessionId"].as_str(), Some(session_id.as_str()));
-    }
-
-    /// The memory hit must not paper over a genuinely unknown id: that still
-    /// has to reach the durable store and fail there.
-    #[test]
-    fn session_load_still_rejects_an_id_no_one_minted() {
-        let mut server = AcpServer::new(
-            Config::default(),
-            "test-model".to_string(),
-            PathBuf::from("/tmp"),
-        );
-        let unknown = uuid::Uuid::new_v4().to_string();
-        assert!(
-            server
-                .load_session(json!({ "sessionId": unknown }))
-                .is_err(),
-            "an id from no namespace must not resolve"
-        );
-    }
-
-    #[test]
-    fn prompt_appends_user_and_assistant_messages_to_history() {
-        let mut server = AcpServer::new(
-            Config::default(),
-            "test-model".to_string(),
-            PathBuf::from("/tmp"),
-        );
-        let result = server
-            .new_session(json!({ "cwd": "/tmp" }))
-            .expect("new session");
-        let session_id = result["sessionId"].as_str().unwrap().to_string();
-
-        // Simulate adding a user message (same logic as prompt() but without LLM call)
-        {
-            let session = server.sessions.get_mut(&session_id).unwrap();
-            session.messages.push(Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "1+1".to_string(),
-                    cache_control: None,
-                }],
-            });
-        }
-
-        // Simulate assistant response
-        {
-            let session = server.sessions.get_mut(&session_id).unwrap();
-            session.messages.push(Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "2".to_string(),
-                    cache_control: None,
-                }],
-            });
-        }
-
-        // Second user message
-        {
-            let session = server.sessions.get_mut(&session_id).unwrap();
-            session.messages.push(Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "add one more".to_string(),
-                    cache_control: None,
-                }],
-            });
-        }
-
-        // Verify full conversation history
-        let session = server.sessions.get(&session_id).unwrap();
-        assert_eq!(session.messages.len(), 3);
-        assert_eq!(session.messages[0].role, "user");
-        assert_eq!(session.messages[1].role, "assistant");
-        assert_eq!(session.messages[2].role, "user");
-
-        // Verify text content
-        assert_eq!(
-            match &session.messages[0].content[0] {
-                ContentBlock::Text { text, .. } => text.clone(),
-                _ => String::new(),
-            },
-            "1+1"
-        );
-        assert_eq!(
-            match &session.messages[1].content[0] {
-                ContentBlock::Text { text, .. } => text.clone(),
-                _ => String::new(),
-            },
-            "2"
-        );
-        assert_eq!(
-            match &session.messages[2].content[0] {
-                ContentBlock::Text { text, .. } => text.clone(),
-                _ => String::new(),
-            },
-            "add one more"
-        );
-    }
-
-    fn lines_from(input: &'static str) -> Lines<BufReader<&'static [u8]>> {
-        BufReader::new(input.as_bytes()).lines()
-    }
-
-    fn text_delta(text: &str) -> StreamEvent {
-        StreamEvent::ContentBlockDelta {
-            index: 0,
-            delta: Delta::TextDelta {
-                text: text.to_string(),
-            },
-        }
-    }
-
-    /// Simulate one streamed `tool_use` content block at `index`: a start
-    /// event carrying the id/name, an `input_json_delta` with the full
-    /// arguments JSON, and the closing stop event — matching the real
-    /// provider's per-index streaming shape closely enough to exercise
-    /// [`drive_prompt_stream`]'s accumulator.
-    fn tool_use_events(index: u32, id: &str, name: &str, input_json: &str) -> Vec<StreamEvent> {
-        vec![
-            StreamEvent::ContentBlockStart {
-                index,
-                content_block: ContentBlockStart::ToolUse {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                    input: json!({}),
-                    caller: None,
-                    thought_signature: None,
-                },
-            },
-            StreamEvent::ContentBlockDelta {
-                index,
-                delta: Delta::InputJsonDelta {
-                    partial_json: input_json.to_string(),
-                },
-            },
-            StreamEvent::ContentBlockStop { index },
-        ]
-    }
-
-    /// A stream that yields the given events immediately, then ends.
-    fn ready_stream(events: Vec<StreamEvent>) -> StreamEventBox {
-        Box::pin(futures_util::stream::iter(
-            events.into_iter().map(Ok::<_, anyhow::Error>),
-        ))
-    }
-
-    fn error_stream(message: &'static str) -> StreamEventBox {
-        Box::pin(futures_util::stream::iter(vec![Err(anyhow!(message))]))
-    }
-
-    /// A stream that never yields, so a concurrent cancel always wins.
-    fn pending_stream() -> StreamEventBox {
-        Box::pin(futures_util::stream::pending::<Result<StreamEvent>>())
-    }
-
-    /// A stream that yields `events` immediately, then emits `message_stop`
-    /// after a short delay — long enough that an already-buffered reader line is
-    /// processed first, making the ordering deterministic in tests.
-    fn events_then_delayed_stop(events: Vec<StreamEvent>) -> StreamEventBox {
-        let head = futures_util::stream::iter(events.into_iter().map(Ok::<_, anyhow::Error>));
-        let tail = futures_util::stream::once(async {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            Ok(StreamEvent::MessageStop)
-        });
-        Box::pin(head.chain(tail))
-    }
-
-    fn parse_lines(out: Vec<u8>) -> Vec<Value> {
-        String::from_utf8(out)
-            .expect("utf8")
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str(line).expect("json"))
-            .collect()
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum PermissionClientScript {
-        Allow,
-        Reject,
-        WrongIdThenReject,
-        CancelThenLateAllow,
-        AllowThenCancelRunning,
-    }
-
-    async fn write_client_message(writer: &mut tokio::io::DuplexStream, message: Value) {
-        writer
-            .write_all(format!("{message}\n").as_bytes())
-            .await
-            .expect("write simulated ACP client message");
-    }
-
-    async fn drive_permission_client(
-        output: tokio::io::DuplexStream,
-        mut input: tokio::io::DuplexStream,
-        script: PermissionClientScript,
-        must_not_exist_before_response: Option<PathBuf>,
-    ) -> Vec<Value> {
-        let mut output = BufReader::new(output).lines();
-        let mut seen = Vec::new();
-        let mut sent_running_cancel = false;
-        while let Some(line) = output.next_line().await.expect("read agent output") {
-            let message: Value = serde_json::from_str(&line).expect("agent output json");
-            seen.push(message.clone());
-
-            if message.get("method").and_then(Value::as_str) == Some("session/request_permission") {
-                if let Some(path) = must_not_exist_before_response.as_ref() {
-                    assert!(
-                        !path.exists(),
-                        "sensitive tool ran before the permission response: {}",
-                        path.display()
-                    );
-                }
-                let request_id = message["id"].clone();
-                let selected = |option_id: &str| {
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": request_id.clone(),
-                        "result": {
-                            "outcome": {
-                                "outcome": "selected",
-                                "optionId": option_id
-                            }
-                        }
-                    })
-                };
-                match script {
-                    PermissionClientScript::Allow
-                    | PermissionClientScript::AllowThenCancelRunning => {
-                        write_client_message(&mut input, selected("allow-once")).await;
-                    }
-                    PermissionClientScript::Reject => {
-                        write_client_message(&mut input, selected("reject-once")).await;
-                    }
-                    PermissionClientScript::WrongIdThenReject => {
-                        write_client_message(
-                            &mut input,
-                            json!({
-                                "jsonrpc": "2.0",
-                                "id": "wrong-agent-request-id",
-                                "result": {
-                                    "outcome": {
-                                        "outcome": "selected",
-                                        "optionId": "allow-once"
-                                    }
-                                }
-                            }),
-                        )
-                        .await;
-                        write_client_message(&mut input, selected("reject-once")).await;
-                    }
-                    PermissionClientScript::CancelThenLateAllow => {
-                        write_client_message(
-                            &mut input,
-                            json!({
-                                "jsonrpc": "2.0",
-                                "method": "session/cancel",
-                                "params": { "sessionId": "sess_1" }
-                            }),
-                        )
-                        .await;
-                        write_client_message(
-                            &mut input,
-                            json!({
-                                "jsonrpc": "2.0",
-                                "id": request_id.clone(),
-                                "result": { "outcome": { "outcome": "cancelled" } }
-                            }),
-                        )
-                        .await;
-                        write_client_message(&mut input, selected("allow-once")).await;
-                    }
-                }
-            }
-
-            let update_status = message
-                .pointer("/params/update/status")
-                .and_then(Value::as_str);
-            if script == PermissionClientScript::AllowThenCancelRunning
-                && update_status == Some("in_progress")
-                && !sent_running_cancel
-            {
-                sent_running_cancel = true;
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                write_client_message(
-                    &mut input,
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": 7,
-                        "method": "session/cancel",
-                        "params": { "sessionId": "sess_1" }
-                    }),
-                )
-                .await;
-            }
-            if matches!(update_status, Some("completed" | "failed")) {
-                break;
-            }
-        }
-        seen
-    }
-
-    async fn execute_one_with_permission_client(
-        config: &Config,
-        registry: &ToolRegistry,
-        call: PendingToolCall,
-        script: PermissionClientScript,
-        response_id_policy: JsonRpcResponseIdPolicy,
-        must_not_exist_before_response: Option<PathBuf>,
-    ) -> (ToolBatchOutcome, Vec<Value>, Option<Value>) {
-        let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
-        let (agent_output, client_output) = tokio::io::duplex(64 * 1024);
-        let client = tokio::spawn(drive_permission_client(
-            client_output,
-            client_input,
-            script,
-            must_not_exist_before_response,
-        ));
-        let mut reader = BufReader::new(agent_input).lines();
-        let mut writer = agent_output;
-
-        let outcome = execute_tool_calls_with_cancellation(
-            AcpTurnContext {
-                config,
-                model: "test-model",
-                session_id: "sess_1",
-                tool_registry: registry,
-                response_id_policy,
-            },
-            vec![call],
-            &mut reader,
-            &mut writer,
-        )
-        .await
-        .expect("execute ACP tool batch");
-        let late_response = if script == PermissionClientScript::CancelThenLateAllow {
-            let line = tokio::time::timeout(Duration::from_secs(1), reader.next_line())
-                .await
-                .expect("late permission response arrived")
-                .expect("read late permission response")
-                .expect("late permission response line");
-            Some(serde_json::from_str(&line).expect("late response json"))
-        } else {
-            None
-        };
-        drop(writer);
-        let seen = client.await.expect("simulated ACP client joins");
-        (outcome, seen, late_response)
-    }
-
     #[tokio::test]
-    async fn drive_prompt_streams_each_delta_as_a_chunk_then_completes() {
-        let stream = ready_stream(vec![
-            text_delta("hello"),
-            text_delta(" world"),
-            StreamEvent::MessageStop,
-        ]);
-        let mut reader = lines_from("");
-        let mut out = Vec::new();
-
-        let (outcome, tool_calls) = drive_prompt_stream(
-            stream,
-            "sess_1",
-            JsonRpcResponseIdPolicy::Preserve,
-            &mut reader,
-            &mut out,
-        )
-        .await
-        .expect("driver ok");
-
-        // Full text is accumulated for history...
-        assert_eq!(outcome, PromptOutcome::Completed("hello world".to_string()));
-        assert!(tool_calls.is_empty());
-        // ...and each delta was emitted as its own session/update chunk.
-        let updates = parse_lines(out);
-        assert_eq!(updates.len(), 2);
-        assert!(updates.iter().all(|u| u["method"] == "session/update"));
-        assert_eq!(updates[0]["params"]["update"]["content"]["text"], "hello");
-        assert_eq!(updates[1]["params"]["update"]["content"]["text"], " world");
-    }
-
-    #[tokio::test]
-    async fn drive_prompt_cancels_when_matching_cancel_arrives() {
-        // A provider stream that never finishes within the test.
-        let stream = pending_stream();
-        let mut reader = lines_from(
-            r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"sess_1"}}"#,
-        );
-        let mut out = Vec::new();
-
-        let (outcome, tool_calls) = drive_prompt_stream(
-            stream,
-            "sess_1",
-            JsonRpcResponseIdPolicy::Preserve,
-            &mut reader,
-            &mut out,
-        )
-        .await
-        .expect("driver ok");
-
-        assert_eq!(outcome, PromptOutcome::Cancelled);
-        assert!(tool_calls.is_empty());
-        // Notification-form cancel (no id) is acknowledged by acting, not writing.
-        assert!(out.is_empty());
-    }
-
-    #[tokio::test]
-    async fn drive_prompt_ignores_cancel_for_a_different_session() {
-        // The unrelated cancel line is buffered and ready; the delayed stop makes
-        // it process first, proving it does not abort the turn.
-        let stream = events_then_delayed_stop(vec![text_delta("kept")]);
-        let mut reader = lines_from(
-            r#"{"jsonrpc":"2.0","id":7,"method":"session/cancel","params":{"sessionId":"other"}}"#,
-        );
-        let mut out = Vec::new();
-
-        let (outcome, _tool_calls) = drive_prompt_stream(
-            stream,
-            "sess_1",
-            JsonRpcResponseIdPolicy::StringifyNumeric,
-            &mut reader,
-            &mut out,
-        )
-        .await
-        .expect("driver ok");
-
-        assert_eq!(outcome, PromptOutcome::Completed("kept".to_string()));
-        // The other-session cancel carried an id, so it was acknowledged with null.
-        let lines = parse_lines(out);
-        assert!(
-            lines
-                .iter()
-                .any(|v| v["id"] == "7" && v["result"] == Value::Null),
-            "expected a null ack for the other-session cancel, got {lines:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn drive_prompt_rejects_a_concurrent_request_but_keeps_running() {
-        let stream = events_then_delayed_stop(vec![text_delta("done")]);
-        // A non-cancel request arrives mid-turn.
-        let mut reader =
-            lines_from(r#"{"jsonrpc":"2.0","id":9,"method":"session/new","params":{}}"#);
-        let mut out = Vec::new();
-
-        let (outcome, _tool_calls) = drive_prompt_stream(
-            stream,
-            "sess_1",
-            JsonRpcResponseIdPolicy::StringifyNumeric,
-            &mut reader,
-            &mut out,
-        )
-        .await
-        .expect("driver ok");
-
-        assert_eq!(outcome, PromptOutcome::Completed("done".to_string()));
-        let lines = parse_lines(out);
-        assert!(
-            lines
-                .iter()
-                .any(|v| v["id"] == "9" && v["error"]["code"] == -32603),
-            "expected a prompt-in-progress error for the concurrent request, got {lines:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn drive_prompt_assembles_a_single_streamed_tool_call() {
-        let mut events = tool_use_events(0, "call_1", "read_file", r#"{"path":"src/lib.rs"}"#);
-        events.push(StreamEvent::MessageStop);
-        let stream = ready_stream(events);
-        let mut reader = lines_from("");
-        let mut out = Vec::new();
-
-        let (outcome, tool_calls) = drive_prompt_stream(
-            stream,
-            "sess_1",
-            JsonRpcResponseIdPolicy::Preserve,
-            &mut reader,
-            &mut out,
-        )
-        .await
-        .expect("driver ok");
-
-        assert_eq!(outcome, PromptOutcome::Completed(String::new()));
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].id, "call_1");
-        assert_eq!(tool_calls[0].name, "read_file");
-        assert_eq!(tool_calls[0].input, json!({"path": "src/lib.rs"}));
-        assert!(tool_calls[0].parse_error.is_none());
-    }
-
-    #[tokio::test]
-    async fn drive_prompt_assembles_multiple_parallel_tool_calls_in_order() {
-        let mut events = tool_use_events(0, "call_1", "read_file", r#"{"path":"a.rs"}"#);
-        events.extend(tool_use_events(
-            1,
-            "call_2",
-            "read_file",
-            r#"{"path":"b.rs"}"#,
-        ));
-        events.push(StreamEvent::MessageStop);
-        let stream = ready_stream(events);
-        let mut reader = lines_from("");
-        let mut out = Vec::new();
-
-        let (_outcome, tool_calls) = drive_prompt_stream(
-            stream,
-            "sess_1",
-            JsonRpcResponseIdPolicy::Preserve,
-            &mut reader,
-            &mut out,
-        )
-        .await
-        .expect("driver ok");
-
-        assert_eq!(tool_calls.len(), 2);
-        assert_eq!(tool_calls[0].id, "call_1");
-        assert_eq!(tool_calls[1].id, "call_2");
-    }
-
-    #[tokio::test]
-    async fn drive_prompt_reports_malformed_tool_arguments_instead_of_dropping_the_call() {
-        let mut events = tool_use_events(0, "call_1", "read_file", "{not json");
-        events.push(StreamEvent::MessageStop);
-        let stream = ready_stream(events);
-        let mut reader = lines_from("");
-        let mut out = Vec::new();
-
-        let (_outcome, tool_calls) = drive_prompt_stream(
-            stream,
-            "sess_1",
-            JsonRpcResponseIdPolicy::Preserve,
-            &mut reader,
-            &mut out,
-        )
-        .await
-        .expect("driver ok");
-
-        assert_eq!(tool_calls.len(), 1);
-        assert!(tool_calls[0].parse_error.is_some());
-    }
-
-    #[test]
-    fn different_sessions_have_independent_history() {
-        let mut server = AcpServer::new(
-            Config::default(),
-            "test-model".to_string(),
-            PathBuf::from("/tmp"),
-        );
-        let result1 = server
-            .new_session(json!({ "cwd": "/tmp" }))
-            .expect("session 1");
-        let result2 = server
-            .new_session(json!({ "cwd": "/tmp" }))
-            .expect("session 2");
-        let sid1 = result1["sessionId"].as_str().unwrap().to_string();
-        let sid2 = result2["sessionId"].as_str().unwrap().to_string();
-
-        // Add messages to session 1
-        {
-            let session = server.sessions.get_mut(&sid1).unwrap();
-            session.messages.push(Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "hello".to_string(),
-                    cache_control: None,
-                }],
-            });
-        }
-
-        // Session 2 should remain empty
-        let session2 = server.sessions.get(&sid2).unwrap();
-        assert!(session2.messages.is_empty());
-
-        // Session 1 should have the message
-        let session1 = server.sessions.get(&sid1).unwrap();
-        assert_eq!(session1.messages.len(), 1);
-    }
-
-    #[test]
-    fn concurrent_sessions_each_get_their_own_tool_registry() {
-        let mut server = AcpServer::new(
-            Config {
-                allow_shell: Some(true),
-                ..Config::default()
-            },
-            "test-model".to_string(),
-            PathBuf::from("/tmp"),
-        );
-        // Both config opt-in and the client terminal capability are present.
-        server.client_supports_terminal = true;
-        let s1 = server.new_session(json!({ "cwd": "/tmp" })).unwrap();
-        let s2 = server.new_session(json!({ "cwd": "/tmp" })).unwrap();
-        let id1 = s1["sessionId"].as_str().unwrap();
-        let id2 = s2["sessionId"].as_str().unwrap();
-
-        let reg1 = server.session_tool_registry(id1).expect("registry 1");
-        let reg2 = server.session_tool_registry(id2).expect("registry 2");
-        assert!(!Arc::ptr_eq(&reg1, &reg2));
-        // Both sessions expose the same reusable tool surface: the
-        // canonical `File` action tool (read/list/search/write/edit),
-        // `Git`, the `apply_patch` back-compat alias, and `Bash` (#4625
-        // consolidated the old per-action tool names).
-        assert!(reg1.contains("File"));
-        assert!(reg1.contains("Git"));
-        assert!(reg1.contains("apply_patch"));
-        assert!(reg1.contains("bash"));
-        assert!(reg1.contains("Bash"));
-        assert!(
-            reg1.names()
-                .into_iter()
-                .all(|name| !name.starts_with("terminal/")),
-            "ACP must not expose stateful terminal tools"
-        );
-        assert!(reg1.context().runtime.hook_executor.is_some());
-    }
-
-    #[test]
-    fn shell_tool_omitted_when_client_declares_no_terminal_support() {
-        let workspace = std::env::temp_dir();
-        let config = Config {
-            allow_shell: Some(true),
-            ..Config::default()
-        };
-        let registry = build_acp_tool_registry(&config, &workspace, false);
-        assert!(!registry.contains("Bash"));
-        assert!(registry.contains("File"));
-    }
-
-    #[test]
-    fn shell_tool_omitted_without_headless_config_opt_in() {
-        let workspace = std::env::temp_dir();
-        let registry = build_acp_tool_registry(&Config::default(), &workspace, true);
-        assert!(!registry.contains("Bash"));
-        assert_eq!(registry.context().shell_policy, ShellPolicy::None);
-        assert!(!registry.context().auto_approve);
-    }
-
-    #[test]
-    fn acp_shell_uses_configured_external_sandbox_or_fails_closed() {
-        let workspace = std::env::temp_dir();
-        let configured = Config {
-            allow_shell: Some(true),
-            sandbox_backend: Some("opensandbox".to_string()),
-            sandbox_url: Some("http://127.0.0.1:8080".to_string()),
-            ..Config::default()
-        };
-        let registry = build_acp_tool_registry(&configured, &workspace, true);
-        assert!(registry.contains("bash"));
-        assert!(registry.context().sandbox_backend.is_some());
-
-        let unsupported = Config {
-            allow_shell: Some(true),
-            sandbox_backend: Some("unsupported-backend".to_string()),
-            ..Config::default()
-        };
-        let registry = build_acp_tool_registry(&unsupported, &workspace, true);
-        assert!(!registry.contains("bash"));
-        assert!(!registry.contains("Bash"));
-        assert!(registry.context().sandbox_backend.is_none());
-    }
-
-    #[test]
-    fn acp_tool_override_removes_every_builtin_compatibility_alias() {
-        let mut overrides = std::collections::HashMap::new();
-        overrides.insert("Bash".to_string(), crate::config::ToolOverride::Disabled);
-        let config = Config {
-            allow_shell: Some(true),
-            tools: Some(crate::config::ToolsConfig {
-                overrides: Some(overrides),
-                ..crate::config::ToolsConfig::default()
-            }),
-            ..Config::default()
-        };
-        let registry = build_acp_tool_registry(&config, &std::env::temp_dir(), true);
-        assert!(!registry.contains("bash"));
-        assert!(!registry.contains("Bash"));
-        assert!(
-            registry
-                .names()
-                .into_iter()
-                .all(|name| !name.starts_with("terminal/"))
-        );
-    }
-
-    #[test]
-    fn acp_prompt_uses_the_stable_headless_composer() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        std::fs::write(
-            workspace.path().join("AGENTS.md"),
-            "# ACP project law\n\nKeep the acp-project-marker visible.",
-        )
-        .expect("write project instructions");
-        let extra = workspace.path().join("maintainer-instructions.md");
-        std::fs::write(&extra, "Keep the acp-config-marker visible.")
-            .expect("write configured instructions");
-        let config = Config {
-            instructions: Some(vec![extra.to_string_lossy().into_owned()]),
-            ..Config::default()
-        };
-
-        let prompt = build_acp_system_prompt(
-            &config,
-            workspace.path(),
-            ApiProvider::Deepseek,
-            "deepseek-v4-pro",
-            None,
-        );
-        let text = crate::prompts::system_prompt_flat_text(&prompt);
-
-        assert!(text.contains(crate::prompts::text::BASE_PROMPT.trim()));
-        assert!(text.contains("acp-project-marker"));
-        assert!(text.contains("acp-config-marker"));
-        assert!(!text.contains("You are a coding assistant inside an ACP-compatible editor."));
-    }
-
-    #[test]
-    fn acp_system_prompt_is_byte_stable_after_round_one_agents_write() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let agents = workspace.path().join("AGENTS.md");
-        std::fs::write(&agents, "round-one-authority").expect("write initial AGENTS");
-        let config = Config::default();
-        let slot = std::sync::Mutex::new(None);
-
-        let round_one = frozen_acp_system_prompt(
-            &slot,
-            &config,
-            workspace.path(),
-            ApiProvider::Deepseek,
-            "deepseek-v4-pro",
-            None,
-        );
-        // Simulate a model tool changing project instructions during round 1.
-        std::fs::write(&agents, "round-two-self-authored-authority")
-            .expect("mutate AGENTS between rounds");
-        let round_two = frozen_acp_system_prompt(
-            &slot,
-            &config,
-            workspace.path(),
-            ApiProvider::Deepseek,
-            "deepseek-v4-pro",
-            None,
-        );
-
-        assert_eq!(
-            serde_json::to_vec(&round_one).unwrap(),
-            serde_json::to_vec(&round_two).unwrap(),
-            "later rounds must receive the byte-identical first-round system prompt"
-        );
-        let freshly_composed = build_acp_system_prompt(
-            &config,
-            workspace.path(),
-            ApiProvider::Deepseek,
-            "deepseek-v4-pro",
-            None,
-        );
-        assert!(
-            crate::prompts::system_prompt_flat_text(&freshly_composed)
-                .contains("round-two-self-authored-authority"),
-            "fixture must prove the mutable source really changed"
-        );
-        assert!(
-            !crate::prompts::system_prompt_flat_text(&round_two)
-                .contains("round-two-self-authored-authority")
-        );
-    }
-
-    fn workspace_registry() -> (tempfile::TempDir, ToolRegistry) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = Config {
-            allow_shell: Some(true),
-            ..Config::default()
-        };
-        let registry = build_acp_tool_registry(&config, dir.path(), true);
-        (dir, registry)
-    }
-
-    fn pending_call(name: &str, input: Value) -> PendingToolCall {
-        PendingToolCall {
+    async fn tool_update_emits_typed_acp_image_content() {
+        let mut output = Vec::new();
+        let call = PendingToolCall {
             execution_id: uuid::Uuid::new_v4().to_string(),
-            caller: None,
-            thought_signature: None,
-            id: "call_1".to_string(),
-            name: name.to_string(),
-            input,
-            parse_error: None,
-        }
-    }
-
-    fn config_with_policy_rule(rule: codewhale_execpolicy::ToolAskRule) -> Config {
-        Config {
-            exec_policy_engine: codewhale_execpolicy::ExecPolicyEngine::with_rulesets(vec![
-                codewhale_execpolicy::Ruleset::user(vec![], vec![]).with_ask_rules(vec![rule]),
-            ]),
-            ..Config::default()
-        }
-    }
-
-    fn tool_call_hook_command(payload: &Value) -> String {
-        let payload = payload.to_string();
-        if cfg!(windows) {
-            format!("echo {payload}")
-        } else {
-            format!("printf '%s\\n' '{payload}'")
-        }
-    }
-
-    fn config_with_tool_call_hook(mut config: Config, payload: Value, strict: bool) -> Config {
-        let mut hook = crate::hooks::Hook::new(
-            crate::hooks::HookEvent::ToolCallBefore,
-            &tool_call_hook_command(&payload),
-        );
-        hook.continue_on_error = !strict;
-        config.hooks = Some(crate::hooks::HooksConfig {
-            enabled: true,
-            hooks: vec![hook],
-            ..crate::hooks::HooksConfig::default()
-        });
-        config
-    }
-
-    #[tokio::test]
-    async fn acp_strict_tool_call_before_deny_blocks_before_execution() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = config_with_tool_call_hook(
-            Config::default(),
-            json!({"decision": "deny", "reason": "release gate"}),
-            true,
-        );
-        let registry = build_acp_tool_registry(&config, dir.path(), false);
-        let error = prepare_acp_tool_with_hooks(
-            &config,
-            "test-model",
-            &registry,
-            &pending_call("File", json!({"action": "read", "path": "safe.txt"})),
-        )
-        .await
-        .expect_err("strict hook must deny");
-
-        assert!(error.to_string().contains("release gate"));
-    }
-
-    #[tokio::test]
-    async fn acp_hook_rewrite_is_reprepared_and_policy_is_re_evaluated() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let deny_rewritten_write = codewhale_execpolicy::ToolAskRule {
-            action: codewhale_execpolicy::PermissionAction::Deny,
-            ..codewhale_execpolicy::ToolAskRule::file_path("write_file", "rewritten.txt")
+            name: "read".to_string(),
+            input: json!({"path": "shot.png"}),
         };
-        let config = config_with_tool_call_hook(
-            config_with_policy_rule(deny_rewritten_write),
-            json!({
-                "updatedInput": {
-                    "action": "write",
-                    "path": "rewritten.txt",
-                    "content": "rewritten by hook"
-                }
-            }),
-            true,
-        );
-        let registry = build_acp_tool_registry(&config, dir.path(), false);
-        let raw = pending_call("File", json!({"action": "read", "path": "safe.txt"}));
-        let (_, raw_admission) = prepare_acp_tool_admission(&config, &registry, &raw)
-            .await
-            .unwrap();
-        assert_eq!(raw_admission, AcpToolAdmission::Auto);
-
-        let prepared = prepare_acp_tool_with_hooks(&config, "test-model", &registry, &raw)
-            .await
-            .expect("hook rewrite prepares");
-        assert_eq!(
-            prepared.call.input.get("action").and_then(Value::as_str),
-            Some("write")
-        );
-        assert!(matches!(prepared.admission, AcpToolAdmission::Block(_)));
-        assert!(!dir.path().join("rewritten.txt").exists());
-    }
-
-    #[tokio::test]
-    async fn acp_admission_is_input_specific_and_has_no_workspace_write_carve_out() {
-        let (dir, registry) = workspace_registry();
-        let config = Config::default();
-        let read = pending_call("File", json!({"action": "read", "path": "src/lib.rs"}));
-        let write = pending_call(
-            "File",
-            json!({"action": "write", "path": "src/lib.rs", "content": "new"}),
-        );
-
-        let (_, read_admission) = prepare_acp_tool_admission(&config, &registry, &read)
-            .await
-            .unwrap();
-        let (_, write_admission) = prepare_acp_tool_admission(&config, &registry, &write)
-            .await
-            .unwrap();
-
-        assert_eq!(read_admission, AcpToolAdmission::Auto);
-        assert!(matches!(
-            write_admission,
-            AcpToolAdmission::RequestPermission(_)
-        ));
-        assert_eq!(registry.context().workspace, dir.path());
-    }
-
-    #[tokio::test]
-    async fn acp_admission_folds_typed_rules_then_headless_safety_floor() {
-        let (dir, registry) = workspace_registry();
-        let workspace = dir.path().to_string_lossy().into_owned();
-        let input = json!({"action": "write", "path": "allowed.txt", "content": "new"});
-        let call = pending_call("File", input.clone());
-
-        let allow = codewhale_execpolicy::ToolAskRule::file_path("write_file", "allowed.txt")
-            .into_exact_workspace_allow(workspace.clone());
-        let (_, admission) =
-            prepare_acp_tool_admission(&config_with_policy_rule(allow), &registry, &call)
-                .await
-                .unwrap();
-        assert_eq!(admission, AcpToolAdmission::Auto);
-
-        let ask = codewhale_execpolicy::ToolAskRule::file_path("write_file", "allowed.txt");
-        let (_, admission) =
-            prepare_acp_tool_admission(&config_with_policy_rule(ask), &registry, &call)
-                .await
-                .unwrap();
-        assert!(matches!(
-            admission,
-            AcpToolAdmission::RequestPermission(reason) if reason.contains("requires approval")
-        ));
-
-        let deny = codewhale_execpolicy::ToolAskRule {
-            action: codewhale_execpolicy::PermissionAction::Deny,
-            ..codewhale_execpolicy::ToolAskRule::file_path("write_file", "allowed.txt")
-        };
-        let (_, admission) =
-            prepare_acp_tool_admission(&config_with_policy_rule(deny), &registry, &call)
-                .await
-                .unwrap();
-        assert!(matches!(admission, AcpToolAdmission::Block(_)));
-
-        let command = "rm -rf ~/";
-        let shell_allow = codewhale_execpolicy::ToolAskRule::exec_shell(command)
-            .into_exact_workspace_allow(workspace);
-        let shell_call = pending_call("Bash", json!({"command": command}));
-        let (_, admission) = prepare_acp_tool_admission(
-            &config_with_policy_rule(shell_allow),
-            &registry,
-            &shell_call,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            admission,
-            AcpToolAdmission::RequestPermission(reason)
-                if reason.contains("Built-in safety gate")
-        ));
-    }
-
-    #[tokio::test]
-    async fn acp_admission_blocks_detached_and_stateful_bash_inputs() {
-        let (_dir, registry) = workspace_registry();
-        for input in [
-            json!({"command": "sleep 30", "background": true}),
-            json!({"command": "sleep 30", "tty": true}),
-            json!({"command": "echo hi", "interactive": true}),
-            json!({"command": "serve", "background": true, "persist": true}),
-            json!({"command": "sleep 30 &"}),
-            json!({"command": "nohup sleep 30"}),
-            json!({"action": "wait", "task_id": "shell-1"}),
-            json!({"action": "cancel", "task_id": "shell-1"}),
-        ] {
-            let call = pending_call("Bash", input);
-            let (_, admission) = prepare_acp_tool_admission(&Config::default(), &registry, &call)
-                .await
-                .unwrap();
-            assert!(matches!(
-                admission,
-                AcpToolAdmission::Block(reason)
-                    if reason.contains("foreground Bash runs only")
-            ));
-        }
-        assert!(!acp_shell_command_requests_detach("echo '&' && echo done"));
-    }
-
-    #[tokio::test]
-    async fn acp_admission_auto_review_and_repo_law_override_typed_allow() {
-        let (dir, registry) = workspace_registry();
-        let workspace = dir.path().to_string_lossy().into_owned();
-        let command = "cargo test";
-        let shell_allow = codewhale_execpolicy::ToolAskRule::exec_shell(command)
-            .into_exact_workspace_allow(workspace.clone());
-        let mut auto_review_block = config_with_policy_rule(shell_allow);
-        auto_review_block.auto_review = Some(crate::config::AutoReviewConfig {
-            block: vec![crate::config::AutoReviewRuleConfig {
-                id: Some("acp-shell-block".to_string()),
-                action_kind: Some("shell".to_string()),
-                reason: Some("ACP shell is disabled by policy".to_string()),
-                ..Default::default()
+        write_tool_call_update_with_blocks(
+            &mut output,
+            "session_1",
+            &call,
+            "completed",
+            Some("screenshot captured"),
+            &[codewhale_tools::ToolResultContentBlock::Image {
+                mime_type: "image/png".to_string(),
+                data: "QUJD".to_string(),
             }],
+        )
+        .await
+        .expect("ACP update");
+
+        let lines = parse_lines(output);
+        let content = lines[0]["params"]["update"]["content"]
+            .as_array()
+            .expect("ACP content blocks");
+        assert_eq!(content[0]["content"]["type"], "text");
+        assert_eq!(content[1]["content"]["type"], "image");
+        assert_eq!(content[1]["content"]["mimeType"], "image/png");
+        assert_eq!(content[1]["content"]["data"], "QUJD");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_session_returns_durable_bare_uuid_without_provider_or_history() -> Result<()> {
+        let mut rig = Rig::new(fixture_config(), vec![])?;
+        let id = rig.new_session().await;
+        uuid::Uuid::parse_str(&id)?;
+        let store = crate::session_manager::SessionManager::new(rig.server.sessions_dir.clone())?;
+        let saved = store.load_session(&id)?;
+        assert!(saved.messages.is_empty());
+        assert_eq!(
+            saved.metadata.runtime_store.as_ref(),
+            Some(&rig.server.runtime.session_store_binding())
+        );
+        let thread = rig.server.sessions[&id].thread_id.clone();
+        assert_eq!(
+            rig.server
+                .runtime
+                .get_thread(&thread)
+                .await?
+                .session_id
+                .as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(rig.mock.call_count(), 0);
+        let loaded = rig
+            .server
+            .load_session(json!({"sessionId":&id[..8]}))
+            .await
+            .unwrap();
+        assert_eq!(loaded["sessionId"], id);
+        assert_eq!(rig.server.sessions.len(), 1);
+        assert_eq!(rig.server.insertion_order.len(), 1);
+        assert!(
+            rig.server
+                .load_session(json!({"sessionId":uuid::Uuid::new_v4().to_string()}))
+                .await
+                .is_err()
+        );
+        rig.close().await;
+        Ok(())
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn canonical_sessions_keep_independent_history_and_scoped_configuration() -> Result<()> {
+        let mut rig = Rig::new(
+            fixture_config(),
+            vec![
+                canned::simple_text_turn("A answer"),
+                canned::simple_text_turn("B answer"),
+            ],
+        )?;
+        let a = rig.new_session().await;
+        let b = rig.new_session().await;
+        rig.server
+            .set_session_config(json!({"sessionId":a,"configId":"mode","value":"plan"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            rig.server.session_configuration(&a).await.unwrap()["modes"]["currentModeId"],
+            "plan"
+        );
+        assert_eq!(
+            rig.server.session_configuration(&b).await.unwrap()["modes"]["currentModeId"],
+            "agent"
+        );
+        assert!(
+            rig.server
+                .set_session_config(
+                    json!({"sessionId":a,"configId":"permission","value":"full-access"})
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            rig.server
+                .set_session_config(json!({"sessionId":a,"configId":"mode","value":"fabricated"}))
+                .await
+                .is_err()
+        );
+        assert_eq!(rig.prompt(&a, "A prompt").await?.0, "end_turn");
+        assert_eq!(rig.prompt(&b, "B prompt").await?.0, "end_turn");
+        let ah = serde_json::to_string(&rig.history(&a).await)?;
+        let bh = serde_json::to_string(&rig.history(&b).await)?;
+        assert!(ah.contains("A prompt") && ah.contains("A answer") && !ah.contains("B prompt"));
+        assert!(bh.contains("B prompt") && bh.contains("B answer") && !bh.contains("A prompt"));
+        let listed = rig
+            .server
+            .list_sessions(json!({"cwd":rig.workspace}))
+            .unwrap();
+        assert_eq!(listed["sessions"].as_array().unwrap().len(), 2);
+        rig.close().await;
+        Ok(())
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn agentic_turn_chains_real_write_read_and_retains_full_core_pairs() -> Result<()> {
+        let mut config = fixture_config();
+        config.yolo = Some(true);
+        let mut rig = Rig::new(
+            config,
+            vec![
+                canned::tool_call_turn(
+                    "provider-write",
+                    "write",
+                    r#"{"path":"receipt.txt","content":"full receipt"}"#,
+                ),
+                canned::tool_call_turn("provider-read", "read", r#"{"path":"receipt.txt"}"#),
+                canned::simple_text_turn("done"),
+            ],
+        )?;
+        let id = rig.new_session().await;
+        let (reason, wire) = rig.prompt(&id, "write then read").await?;
+        assert_eq!(reason, "end_turn");
+        assert_eq!(
+            std::fs::read_to_string(rig.workspace.join("receipt.txt"))?,
+            "full receipt"
+        );
+        assert!(
+            !wire
+                .iter()
+                .any(|v| v["method"] == "session/request_permission")
+        );
+        let statuses: Vec<_> = wire
+            .iter()
+            .filter_map(|v| v.pointer("/params/update/status").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                "pending",
+                "in_progress",
+                "completed",
+                "pending",
+                "in_progress",
+                "completed"
+            ]
+        );
+        let history = rig.history(&id).await;
+        let uses = history
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            .count();
+        let results = history
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            .count();
+        assert_eq!(uses, 2);
+        assert_eq!(results, 2);
+        let saved = crate::session_manager::SessionManager::new(rig.server.sessions_dir.clone())?
+            .load_session(&id)?;
+        assert_eq!(
+            saved.messages, history,
+            "checkpoint is the full Engine snapshot, not display chunks"
+        );
+        let request = rig.mock.captured_requests();
+        assert_eq!(request.len(), 3);
+        assert!(
+            request.iter().all(
+                |r| r.tools.as_ref().is_some_and(|t| t.iter().all(|t| !matches!(
+                    t.name.as_str(),
+                    "code_execution"
+                        | "js_execution"
+                        | "execute_tools"
+                        | "tool_search"
+                        | "task"
+                        | "subagent"
+                )))
+            )
+        );
+        rig.close().await;
+        Ok(())
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn agentic_turn_preserves_core_partial_write_when_later_provider_fails() -> Result<()> {
+        let mut config = fixture_config();
+        config.yolo = Some(true);
+        let mut rig = Rig::new(
+            config,
+            vec![canned::tool_call_turn(
+                "partial",
+                "write",
+                r#"{"path":"partial.txt","content":"completed effect"}"#,
+            )],
+        )?;
+        rig.mock.push_error("fixture terminal provider refusal");
+        let id = rig.new_session().await;
+        let error = rig.prompt(&id, "write then fail").await.unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(rig.workspace.join("partial.txt"))?,
+            "completed effect"
+        );
+        let history = rig.history(&id).await;
+        assert!(
+            history
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        );
+        let saved = crate::session_manager::SessionManager::new(rig.server.sessions_dir.clone())?
+            .load_session(&id)?;
+        assert_eq!(saved.messages, history);
+        let detail = rig
+            .server
+            .runtime
+            .get_thread_detail(&rig.server.sessions[&id].thread_id)
+            .await?;
+        assert_eq!(
+            detail.turns.last().unwrap().status,
+            crate::runtime_threads::RuntimeTurnStatus::Failed
+        );
+        rig.close().await;
+        Ok(())
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn core_prompt_is_stable_after_instruction_write_and_streams_each_text_delta()
+    -> Result<()> {
+        let mut config = fixture_config();
+        config.yolo = Some(true);
+        let final_turn = vec![
+            canned::message_start("final"),
+            canned::text_block_start(0),
+            canned::text_delta(0, "hello"),
+            canned::text_delta(0, " world"),
+            canned::block_stop(0),
+            canned::message_delta("end_turn", None),
+            canned::message_stop(),
+        ];
+        let mut rig = Rig::new(
+            config,
+            vec![
+                canned::tool_call_turn(
+                    "law-write",
+                    "write",
+                    r#"{"path":"AGENTS.md","content":"new-self-authored-law"}"#,
+                ),
+                final_turn,
+            ],
+        )?;
+        std::fs::write(rig.workspace.join("AGENTS.md"), "initial-project-law")?;
+        let id = rig.new_session().await;
+        let (reason, wire) = rig.prompt(&id, "update instructions then answer").await?;
+        assert_eq!(reason, "end_turn");
+        assert_eq!(
+            std::fs::read_to_string(rig.workspace.join("AGENTS.md"))?,
+            "new-self-authored-law"
+        );
+        let requests = rig.mock.captured_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            serde_json::to_vec(&requests[0].system)?,
+            serde_json::to_vec(&requests[1].system)?
+        );
+        let prompt = crate::prompts::system_prompt_flat_text(requests[0].system.as_ref().unwrap());
+        assert!(prompt.contains(crate::prompts::text::BASE_PROMPT.trim()));
+        assert!(prompt.contains("initial-project-law"));
+        assert!(!prompt.contains("new-self-authored-law"));
+        let chunks: Vec<_> = wire
+            .iter()
+            .filter(|v| {
+                v.pointer("/params/update/sessionUpdate") == Some(&json!("agent_message_chunk"))
+            })
+            .filter_map(|v| {
+                v.pointer("/params/update/content/text")
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        // Runtime may coalesce provider frames. ACP must project its durable
+        // deltas once each, rather than inventing a second streaming source.
+        let events = rig
+            .server
+            .runtime
+            .events_since(&rig.server.sessions[&id].thread_id, None)?;
+        let deltas: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.event == "item.delta"
+                    && event.payload["kind"].as_str() == Some("agent_message")
+            })
+            .collect();
+        let canonical_chunks: Vec<_> = deltas
+            .iter()
+            .map(|event| event.payload["delta"].as_str().unwrap())
+            .collect();
+        assert!(!chunks.is_empty());
+        assert_eq!(chunks, canonical_chunks);
+        assert_eq!(chunks.concat(), "hello world");
+        let completed = events
+            .iter()
+            .find(|event| event.event == "turn.completed")
+            .unwrap();
+        assert!(deltas.iter().all(|event| event.seq < completed.seq));
+        let history = serde_json::to_string(&rig.history(&id).await)?;
+        assert!(history.contains("hello world"));
+        rig.close().await;
+        Ok(())
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn core_file_batch_orders_real_results_and_returns_missing_path_to_model() -> Result<()> {
+        let mut events = vec![canned::message_start("file-batch")];
+        for (index, id, name, input) in [
+            (0, "list", "File", r#"{"action":"list","path":"."}"#),
+            (1, "read", "read", r#"{"path":"present.txt"}"#),
+            (2, "missing", "read", r#"{"path":"missing.txt"}"#),
+        ] {
+            events.extend([
+                canned::tool_use_block_start(index, id, name),
+                canned::tool_input_delta(index, input),
+                canned::block_stop(index),
+            ]);
+        }
+        events.extend([
+            canned::message_delta("tool_use", None),
+            canned::message_stop(),
+        ]);
+        let mut rig = Rig::new(
+            fixture_config(),
+            vec![events, canned::simple_text_turn("handled file failure")],
+        )?;
+        std::fs::write(rig.workspace.join("present.txt"), "real-file-marker")?;
+        let id = rig.new_session().await;
+        let (reason, wire) = rig
+            .prompt(&id, "list then read present and missing")
+            .await?;
+        assert_eq!(reason, "end_turn");
+        let statuses: Vec<_> = wire
+            .iter()
+            .filter_map(|v| v.pointer("/params/update/status").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                "pending",
+                "pending",
+                "pending",
+                "in_progress",
+                "completed",
+                "in_progress",
+                "completed",
+                "in_progress",
+                "failed"
+            ]
+        );
+        let requests = rig.mock.captured_requests();
+        assert_eq!(requests.len(), 2);
+        let feedback = serde_json::to_string(&requests[1].messages)?;
+        assert!(
+            feedback.contains("present.txt")
+                && feedback.contains("real-file-marker")
+                && feedback.contains("missing.txt")
+        );
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(|b| matches!(
+                    b,
+                    ContentBlock::ToolResult {
+                        is_error: Some(true),
+                        ..
+                    }
+                ))
+        );
+        rig.close().await;
+        Ok(())
+    }
+    #[derive(Clone, Copy)]
+    enum PermissionReply {
+        AllowAfterWrong,
+        ForeignCancelAndBusy,
+        Reject,
+        CancelLateAllow,
+        Eof,
+    }
+    async fn permission_case(reply: PermissionReply) -> Result<()> {
+        permission_case_with_base(reply, true).await
+    }
+    async fn permission_case_with_base(reply: PermissionReply, base_acp: bool) -> Result<()> {
+        let mut rig = Rig::with_base(
+            fixture_config(),
+            vec![
+                canned::tool_call_turn(
+                    "provider-id-not-authority",
+                    "write",
+                    r#"{"path":"ask.txt","content":"allowed"}"#,
+                ),
+                canned::simple_text_turn("settled"),
+            ],
+            base_acp,
+        )?;
+        let id = rig.new_session().await;
+        let thread = rig.server.sessions[&id].thread_id.clone();
+        let manager = Arc::clone(&rig.server.runtime);
+        let target = rig.workspace.join("ask.txt");
+        let (client, transport) = tokio::io::duplex(65536);
+        let (read, mut write) = tokio::io::split(transport);
+        let mut reader = codewhale_app_server::BoundedLines::new(BufReader::new(read));
+        let (cr, mut cw) = tokio::io::split(client);
+        let mut cr = codewhale_app_server::BoundedLines::new(BufReader::new(cr));
+        let sid = id.clone();
+        let target_in = target.clone();
+        let client = async move {
+            let mut seen = Vec::new();
+            loop {
+                let line = cr
+                    .next_line()
+                    .await?
+                    .ok_or_else(|| anyhow!("permission request missing"))?;
+                let v: Value = serde_json::from_str(&line)?;
+                seen.push(v.clone());
+                if v["method"] != "session/request_permission" {
+                    continue;
+                }
+                let detail = manager.get_thread_detail(&thread).await?;
+                let pending = detail
+                    .pending_approvals
+                    .first()
+                    .ok_or_else(|| anyhow!("actual pending approval missing"))?;
+                assert_eq!(
+                    pending.tool_call_id.as_deref(),
+                    v.pointer("/params/toolCall/toolCallId")
+                        .and_then(Value::as_str)
+                );
+                assert!(!target_in.exists());
+                assert!(
+                    !seen
+                        .iter()
+                        .any(|v| v.pointer("/params/update/status") == Some(&json!("in_progress"))),
+                    "no dispatch before the real decision"
+                );
+                match reply {
+                    PermissionReply::AllowAfterWrong=>{
+                        write_json_line(&mut cw,json!({"jsonrpc":"2.0","id":"wrong-id","result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}})).await?;
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        assert!(!target_in.exists());assert_eq!(manager.get_thread_detail(&thread).await?.pending_approvals.len(),1);
+                        write_json_line(&mut cw,json!({"jsonrpc":"2.0","id":v["id"],"result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}})).await?;
+                    },
+                    PermissionReply::ForeignCancelAndBusy=>{
+                        write_json_line(&mut cw,json!({"jsonrpc":"2.0","id":41,"method":"session/cancel","params":{"sessionId":"foreign-session"}})).await?;
+                        write_json_line(&mut cw,json!({"jsonrpc":"2.0","id":42,"method":"session/prompt","params":{"sessionId":sid,"prompt":"must not run"}})).await?;
+                        for expected in [41,42] {
+                            let response:Value=serde_json::from_str(&cr.next_line().await?.ok_or_else(||anyhow!("control response missing"))?)?;
+                            assert_eq!(response["id"],expected);
+                            if expected==41 {assert_eq!(response["result"],Value::Null);} else {assert_eq!(response["error"]["code"],-32603);}
+                            seen.push(response);
+                        }
+                        assert!(!target_in.exists());
+                        assert_eq!(manager.get_thread_detail(&thread).await?.pending_approvals.len(),1);
+                        write_json_line(&mut cw,json!({"jsonrpc":"2.0","id":v["id"],"result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}})).await?;
+                    },
+                    PermissionReply::Reject=>write_json_line(&mut cw,json!({"jsonrpc":"2.0","id":v["id"],"result":{"outcome":{"outcome":"selected","optionId":"fabricated"}}})).await?,
+                    PermissionReply::Eof=>cw.shutdown().await?,
+                    PermissionReply::CancelLateAllow=>{
+                        write_json_line(&mut cw,json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":sid}})).await?;
+                        write_json_line(&mut cw,json!({"jsonrpc":"2.0","id":v["id"],"result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}})).await?;
+                    },
+                }
+                return Ok::<_, anyhow::Error>((cr, cw, seen));
+            }
+        };
+        let driver = rig.server.drive_prompt(
+            json!({"sessionId":id,"prompt":"write under Ask"}),
+            &mut reader,
+            &mut write,
+        );
+        let (result, client) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(driver, client)
+        })
+        .await?;
+        let (mut cr, _cw, mut wire) = client?;
+        write.shutdown().await?;
+        while let Some(line) = cr.next_line().await? {
+            wire.push(serde_json::from_str(&line)?);
+        }
+        match reply {
+            PermissionReply::AllowAfterWrong | PermissionReply::ForeignCancelAndBusy => {
+                assert_eq!(result?, "end_turn");
+                assert_eq!(std::fs::read_to_string(&target)?, "allowed");
+                assert_eq!(
+                    wire.iter()
+                        .filter(
+                            |v| v.pointer("/params/update/status") == Some(&json!("in_progress"))
+                        )
+                        .count(),
+                    1
+                );
+            }
+            PermissionReply::Reject => {
+                assert_eq!(result?, "end_turn");
+                assert!(!target.exists());
+            }
+            PermissionReply::CancelLateAllow | PermissionReply::Eof => {
+                assert_eq!(result?, "cancelled");
+                assert!(!target.exists());
+            }
+        }
+        let saved = crate::session_manager::SessionManager::new(rig.server.sessions_dir.clone())?
+            .load_session(&id)?;
+        assert!(saved.messages.iter().any(|m| m.role == Role::User));
+        if !base_acp {
+            let thread = rig.server.sessions[&id].thread_id.clone();
+            let successor = rig
+                .server
+                .runtime
+                .start_turn(
+                    &thread,
+                    crate::runtime_threads::StartTurnRequest {
+                        prompt: "ordinary after cancelled ACP".into(),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            wait_real_turn(&rig.server.runtime, &thread, &successor.id).await?;
+            let requests = rig.mock.captured_requests();
+            assert_eq!(
+                requests.len(),
+                2,
+                "cancelled approval cannot replay the original model request"
+            );
+            assert_ne!(
+                requests[0].tools, requests[1].tools,
+                "cancelled ACP narrowing must not leak into its ordinary successor"
+            );
+            assert!(
+                !target.exists(),
+                "late allow cannot execute after cancellation"
+            );
+        }
+        rig.close().await;
+        Ok(())
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn normal_owner_acp_cancel_then_ordinary_successor_keeps_effects_and_profile_scoped()
+    -> Result<()> {
+        permission_case_with_base(PermissionReply::CancelLateAllow, false).await
+    }
+
+    async fn wait_real_turn(
+        manager: &RuntimeThreadManager,
+        thread: &str,
+        turn: &str,
+    ) -> Result<crate::runtime_threads::TurnRecord> {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let detail = manager.get_thread_detail(thread).await?;
+                if let Some(record) = detail.turns.iter().find(|record| {
+                    record.id == turn
+                        && !matches!(
+                            record.status,
+                            crate::runtime_threads::RuntimeTurnStatus::InProgress
+                                | crate::runtime_threads::RuntimeTurnStatus::Queued
+                        )
+                }) && manager
+                    .events_since_async(thread, None)
+                    .await?
+                    .iter()
+                    .any(|event| {
+                        event.event == "turn.completed" && event.turn_id.as_deref() == Some(turn)
+                    })
+                {
+                    return Ok::<_, anyhow::Error>(record.clone());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await?
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_normal_engine_acp_operation_replay_is_profile_bound_and_successor_is_ordinary()
+    -> Result<()> {
+        let mut rig = Rig::with_base(
+            fixture_config(),
+            vec![canned::simple_text_turn("ACP initial")],
+            false,
+        )?;
+        let session = rig.new_session().await;
+        let thread = rig.server.sessions[&session].thread_id.clone();
+        let request = crate::runtime_threads::StartTurnRequest {
+            prompt: "same semantic request".into(),
+            operation_key: Some("acp-operation".into()),
+            ..Default::default()
+        };
+        let first = rig
+            .server
+            .runtime
+            .start_acp_turn(&thread, request.clone())
+            .await?;
+        let replay = rig
+            .server
+            .runtime
+            .start_acp_turn(&thread, request.clone())
+            .await?;
+        assert_eq!(replay.id, first.id);
+        assert!(
+            rig.server
+                .runtime
+                .start_turn(&thread, request.clone())
+                .await
+                .is_err(),
+            "ordinary admission cannot redeem an ACP operation binding"
+        );
+        assert_eq!(
+            wait_real_turn(&rig.server.runtime, &thread, &first.id)
+                .await?
+                .status,
+            crate::runtime_threads::RuntimeTurnStatus::Completed
+        );
+        assert_eq!(
+            rig.mock.call_count(),
+            1,
+            "exact replay executes the Engine once"
+        );
+        rig.mock
+            .push_turn(canned::simple_text_turn("ordinary initial"));
+        let ordinary_request = crate::runtime_threads::StartTurnRequest {
+            operation_key: Some("ordinary-operation".into()),
+            ..request
+        };
+        let ordinary = rig
+            .server
+            .runtime
+            .start_turn(&thread, ordinary_request.clone())
+            .await?;
+        assert!(
+            rig.server
+                .runtime
+                .start_acp_turn(&thread, ordinary_request.clone())
+                .await
+                .is_err(),
+            "ACP admission cannot redeem an ordinary historical binding"
+        );
+        assert_eq!(
+            wait_real_turn(&rig.server.runtime, &thread, &ordinary.id)
+                .await?
+                .status,
+            crate::runtime_threads::RuntimeTurnStatus::Completed
+        );
+        assert_eq!(
+            rig.server
+                .runtime
+                .start_turn(&thread, ordinary_request)
+                .await?
+                .id,
+            ordinary.id
+        );
+        assert_eq!(rig.mock.call_count(), 2);
+        assert_eq!(
+            rig.server
+                .runtime
+                .get_thread_detail(&thread)
+                .await?
+                .turns
+                .len(),
+            2
+        );
+        let requests = rig.mock.captured_requests();
+        assert_ne!(
+            requests[0].tools, requests[1].tools,
+            "ordinary successor must retain its own catalog"
+        );
+        rig.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn acp_permission_allow_after_wrong_id_executes_once() -> Result<()> {
+        permission_case(PermissionReply::AllowAfterWrong).await
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreign_cancel_and_busy_request_leave_the_same_core_approval_pending() -> Result<()> {
+        permission_case(PermissionReply::ForeignCancelAndBusy).await
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn acp_permission_invalid_option_refuses_without_effect() -> Result<()> {
+        permission_case(PermissionReply::Reject).await
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn acp_permission_cancel_ignores_late_allow_and_never_runs_tool() -> Result<()> {
+        permission_case(PermissionReply::CancelLateAllow).await
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn plan_and_operator_floor_cannot_be_relaxed_by_full_access_or_client() -> Result<()> {
+        let mut config = fixture_config();
+        config.yolo = Some(true);
+        config.sandbox_mode = Some("read-only".into());
+        let mut rig = Rig::new(
+            config,
+            vec![
+                canned::tool_call_turn(
+                    "write-denied",
+                    "write",
+                    r#"{"path":"denied.txt","content":"forbidden"}"#,
+                ),
+                canned::simple_text_turn("read only"),
+            ],
+        )?;
+        let id = rig.new_session().await;
+        assert!(
+            rig.server
+                .set_session_config(json!({"sessionId":id,"configId":"mode","value":"agent"}))
+                .await
+                .is_err()
+        );
+        let view = rig.server.session_configuration(&id).await.unwrap();
+        assert_eq!(view["modes"]["currentModeId"], "plan");
+        assert_eq!(
+            view["configOptions"][2]["options"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let (_, wire) = rig.prompt(&id, "try write").await?;
+        assert!(!rig.workspace.join("denied.txt").exists());
+        assert!(
+            !wire
+                .iter()
+                .any(|v| v["method"] == "session/request_permission")
+        );
+        rig.close().await;
+        Ok(())
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreign_canonical_store_refuses_before_allocating_or_copying_history() -> Result<()> {
+        let mut rig = Rig::new(fixture_config(), vec![])?;
+        let id = rig.new_session().await;
+        let store = crate::session_manager::SessionManager::new(rig.server.sessions_dir.clone())?;
+        let mut saved = store.load_session(&id)?;
+        let path = store.save_session(&saved)?;
+        let original = std::fs::read(&path)?;
+        saved.metadata.runtime_store.as_mut().unwrap().data_dir =
+            rig.workspace.join("foreign-owner");
+        let write_error = store.save_session(&saved).unwrap_err();
+        assert_eq!(write_error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&path)?, original);
+        // A normal writer rejects this binding. Inject a synthetic stale
+        // document only into this private fixture to exercise load refusal.
+        std::fs::write(&path, serde_json::to_vec_pretty(&saved)?)?;
+        rig.server.sessions.clear();
+        rig.server.insertion_order.clear();
+        let before = rig
+            .server
+            .runtime
+            .list_threads(
+                crate::runtime_threads::ThreadListFilter::IncludeArchived,
+                None,
+            )
+            .await?
+            .len();
+        let error = rig
+            .server
+            .load_session(json!({"sessionId":id}))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("secure owner attachment"));
+        assert_eq!(
+            rig.server
+                .runtime
+                .list_threads(
+                    crate::runtime_threads::ThreadListFilter::IncludeArchived,
+                    None
+                )
+                .await?
+                .len(),
+            before
+        );
+        assert_eq!(rig.mock.call_count(), 0);
+        rig.close().await;
+        Ok(())
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_eof_cancels_actual_turn_and_retains_checkpoint() -> Result<()> {
+        permission_case(PermissionReply::Eof).await
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_image_tool_result_projects_typed_blocks_without_losing_core_history() -> Result<()>
+    {
+        use base64::Engine as _;
+        let mut rig = Rig::new(
+            fixture_config(),
+            vec![
+                canned::tool_call_turn("image", "read", r#"{"path":"shot.png"}"#),
+                canned::simple_text_turn("image read"),
+            ],
+        )?;
+        let image = crate::image_attach::tests::runtime_image_fixture(21);
+        std::fs::write(
+            rig.workspace.join("shot.png"),
+            base64::engine::general_purpose::STANDARD.decode(image.data_base64)?,
+        )?;
+        let id = rig.new_session().await;
+        let (_, wire) = rig.prompt(&id, "read image").await?;
+        assert!(
+            wire.iter()
+                .filter_map(|v| v
+                    .pointer("/params/update/content")
+                    .and_then(Value::as_array))
+                .flatten()
+                .any(|block| block.pointer("/content/type") == Some(&json!("image")))
+        );
+        assert!(rig.history(&id).await.iter().flat_map(|m|&m.content).any(|b|matches!(b,ContentBlock::ToolResult{content_blocks:Some(blocks),..} if !blocks.is_empty())));
+        rig.close().await;
+        Ok(())
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn finite_engine_step_budget_is_a_typed_acp_stop_reason() -> Result<()> {
+        finite_engine_step_budget_case(true).await
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn normal_owner_acp_step_stop_preserves_ordinary_successor() -> Result<()> {
+        finite_engine_step_budget_case(false).await
+    }
+    async fn finite_engine_step_budget_case(base_acp: bool) -> Result<()> {
+        let mut config = fixture_config();
+        config.tui = Some(crate::config::TuiConfig {
+            max_model_steps: Some(1),
             ..Default::default()
         });
-        let (_, admission) = prepare_acp_tool_admission(
-            &auto_review_block,
-            &registry,
-            &pending_call("Bash", json!({"command": command})),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            admission,
-            AcpToolAdmission::Block(reason) if reason.contains("ACP shell is disabled by policy")
-        ));
-
-        let law_dir = dir.path().join(".codewhale");
-        std::fs::create_dir_all(&law_dir).unwrap();
-        std::fs::write(
-            law_dir.join("constitution.json"),
-            r#"{
-                "protected_invariants": [
-                    { "text": "Never rewrite the wire", "paths": ["wire.rs"], "action": "block" },
-                    { "text": "Review release notes", "paths": ["CHANGELOG.md"] }
-                ]
-            }"#,
-        )
-        .unwrap();
-
-        for (path, expected_block) in [("wire.rs", true), ("CHANGELOG.md", false)] {
-            let allow = codewhale_execpolicy::ToolAskRule::file_path("write_file", path)
-                .into_exact_workspace_allow(workspace.clone());
-            let config = config_with_policy_rule(allow);
-            let call = pending_call(
-                "File",
-                json!({"action": "write", "path": path, "content": "new"}),
+        let mut rig = Rig::with_base(
+            config,
+            vec![
+                canned::tool_call_turn("budget", "read", r#"{"path":"one.txt"}"#),
+                canned::simple_text_turn("bounded final report"),
+            ],
+            base_acp,
+        )?;
+        std::fs::write(rig.workspace.join("one.txt"), "one")?;
+        let id = rig.new_session().await;
+        assert_eq!(
+            rig.prompt(&id, "read until budget").await?.0,
+            "max_turn_requests"
+        );
+        let detail = rig
+            .server
+            .runtime
+            .get_thread_detail(&rig.server.sessions[&id].thread_id)
+            .await?;
+        assert_eq!(
+            detail
+                .turns
+                .last()
+                .unwrap()
+                .model_request_diagnostics
+                .as_ref()
+                .unwrap()
+                .stop_reason,
+            Some(crate::runtime_threads::RuntimeTurnStopReason::StepBudgetExhausted)
+        );
+        assert_eq!(
+            rig.mock.call_count(),
+            2,
+            "one admitted model step plus existing Core final-report step"
+        );
+        if !base_acp {
+            rig.mock
+                .push_turn(canned::simple_text_turn("ordinary after ACP step stop"));
+            let thread = rig.server.sessions[&id].thread_id.clone();
+            let successor = rig
+                .server
+                .runtime
+                .start_turn(
+                    &thread,
+                    crate::runtime_threads::StartTurnRequest {
+                        prompt: "ordinary after step stop".into(),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            assert_eq!(
+                wait_real_turn(&rig.server.runtime, &thread, &successor.id)
+                    .await?
+                    .status,
+                crate::runtime_threads::RuntimeTurnStatus::Completed
             );
-            let (_, admission) = prepare_acp_tool_admission(&config, &registry, &call)
-                .await
-                .unwrap();
-            if expected_block {
-                assert!(matches!(
-                    admission,
-                    AcpToolAdmission::Block(reason) if reason.contains("Never rewrite the wire")
-                ));
-            } else {
-                assert!(matches!(
-                    admission,
-                    AcpToolAdmission::RequestPermission(reason)
-                        if reason.contains("Review release notes")
-                ));
-            }
+            let requests = rig.mock.captured_requests();
+            assert_eq!(requests.len(), 3);
+            assert_ne!(requests[0].tools, requests[2].tools);
         }
+        rig.close().await;
+        Ok(())
     }
-
-    #[tokio::test]
-    async fn acp_read_runs_without_permission_but_reports_pending_before_in_progress() {
-        let (dir, registry) = workspace_registry();
-        std::fs::write(dir.path().join("read.txt"), "safe").unwrap();
-        let mut reader = lines_from("");
-        let mut out = Vec::new();
-
-        let outcome = execute_tool_calls_with_cancellation(
-            AcpTurnContext {
-                config: &Config::default(),
-                model: "test-model",
-                session_id: "sess_1",
-                tool_registry: &registry,
-                response_id_policy: JsonRpcResponseIdPolicy::Preserve,
-            },
-            vec![pending_call(
-                "File",
-                json!({"action": "read", "path": "read.txt"}),
-            )],
-            &mut reader,
-            &mut out,
-        )
-        .await
-        .unwrap();
-
-        assert!(matches!(outcome, ToolBatchOutcome::Completed(_)));
-        let messages = parse_lines(out);
-        assert!(!messages.iter().any(|message| {
-            message.get("method").and_then(Value::as_str) == Some("session/request_permission")
-        }));
-        let statuses = messages
-            .iter()
-            .filter_map(|message| {
-                message
-                    .pointer("/params/update/status")
-                    .and_then(Value::as_str)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(statuses, vec!["pending", "in_progress", "completed"]);
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_prompt_and_rpc_shapes_refuse_before_core_admission() -> Result<()> {
+        let mut rig = Rig::new(fixture_config(), vec![])?;
+        let id = rig.new_session().await;
+        let input = format!(
+            "{}\n{}\n{}\n{}\n",
+            json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":id,"prompt":[]}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"unknown","prompt":"x"}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"fabricated"}),
+            json!({"jsonrpc":"2.0","id":6,"method":"shutdown"})
+        );
+        let mut reader = codewhale_app_server::BoundedLines::new(BufReader::new(input.as_bytes()));
+        let mut output = Vec::new();
+        rig.server.serve(&mut reader, &mut output).await?;
+        let wire = parse_lines(output);
+        assert_eq!(wire[0]["error"]["code"], -32602);
+        assert_eq!(wire[1]["error"]["code"], -32602);
+        assert_eq!(wire[2]["error"]["code"], -32601);
+        assert_eq!(wire[0]["id"], 3);
+        assert_eq!(rig.mock.call_count(), 0);
+        assert!(
+            rig.server
+                .runtime
+                .get_thread_detail(&rig.server.sessions[&id].thread_id)
+                .await?
+                .turns
+                .is_empty()
+        );
+        rig.close().await;
+        Ok(())
     }
-
-    #[tokio::test]
-    async fn acp_permission_allow_executes_write_once_after_response() {
-        let (dir, registry) = workspace_registry();
-        let target = dir.path().join("allowed.txt");
-        let (outcome, messages, late) = execute_one_with_permission_client(
-            &Config::default(),
-            &registry,
-            pending_call(
-                "File",
-                json!({"action": "write", "path": "allowed.txt", "content": "written once"}),
-            ),
-            PermissionClientScript::Allow,
-            JsonRpcResponseIdPolicy::Preserve,
-            Some(target.clone()),
-        )
-        .await;
-
-        assert!(late.is_none());
-        assert!(matches!(outcome, ToolBatchOutcome::Completed(_)));
-        assert_eq!(std::fs::read_to_string(target).unwrap(), "written once");
-        let request = messages
-            .iter()
-            .find(|message| message["method"] == "session/request_permission")
-            .expect("permission request");
-        assert_eq!(request["params"]["toolCall"]["status"], "pending");
-        assert_eq!(request["params"]["options"][0]["kind"], "allow_once");
-        assert_eq!(request["params"]["options"][1]["kind"], "reject_once");
-        let statuses = messages
-            .iter()
-            .filter_map(|message| {
-                message
-                    .pointer("/params/update/status")
-                    .and_then(Value::as_str)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(statuses, vec!["pending", "in_progress", "completed"]);
-    }
-
-    #[tokio::test]
-    async fn acp_permission_reject_and_wrong_id_fail_closed_without_write() {
-        for script in [
-            PermissionClientScript::Reject,
-            PermissionClientScript::WrongIdThenReject,
+    #[tokio::test(flavor = "current_thread")]
+    async fn canonical_thread_shell_ceiling_requires_operator_and_client_opt_in() -> Result<()> {
+        for (operator, client, expected) in [
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
         ] {
-            let (dir, registry) = workspace_registry();
-            let target = dir.path().join("denied.txt");
-            let (outcome, messages, _) = execute_one_with_permission_client(
-                &Config::default(),
-                &registry,
-                pending_call(
-                    "File",
-                    json!({"action": "write", "path": "denied.txt", "content": "forbidden"}),
-                ),
-                script,
-                JsonRpcResponseIdPolicy::Preserve,
-                Some(target.clone()),
-            )
-            .await;
-
-            assert!(!target.exists(), "{script:?} must not authorize the write");
-            let ToolBatchOutcome::Completed(results) = outcome else {
-                panic!("rejection should complete with a failed tool result");
-            };
-            assert_eq!(results.len(), 1);
-            let ContentBlock::ToolResult { is_error, .. } = &results[0].content[0] else {
-                panic!("expected tool result");
-            };
-            assert_eq!(*is_error, Some(true));
-            assert!(!messages.iter().any(|message| {
-                message
-                    .pointer("/params/update/status")
-                    .and_then(Value::as_str)
-                    == Some("in_progress")
-            }));
+            let mut config = fixture_config();
+            config.allow_shell = Some(operator);
+            let operator_config = format!("allow_shell = {operator}\n");
+            let mut rig = Rig::new(config, vec![])?;
+            let config_path = rig._dir.path().join("operator.toml");
+            std::fs::write(&config_path, operator_config)?;
+            rig.server.config_path = Some(config_path);
+            rig.server.client_supports_terminal = client;
+            let id = rig.new_session().await;
+            let thread = rig
+                .server
+                .runtime
+                .get_thread(&rig.server.sessions[&id].thread_id)
+                .await?;
+            assert_eq!(thread.allow_shell, expected);
+            assert_eq!(rig.mock.call_count(), 0);
+            rig.close().await;
         }
-    }
-
-    #[tokio::test]
-    async fn acp_permission_cancel_ignores_late_allow_and_never_runs_tool() {
-        let (dir, registry) = workspace_registry();
-        let target = dir.path().join("cancelled.txt");
-        let (outcome, messages, late) = execute_one_with_permission_client(
-            &Config::default(),
-            &registry,
-            pending_call(
-                "File",
-                json!({"action": "write", "path": "cancelled.txt", "content": "forbidden"}),
-            ),
-            PermissionClientScript::CancelThenLateAllow,
-            JsonRpcResponseIdPolicy::Preserve,
-            Some(target.clone()),
-        )
-        .await;
-
-        assert!(!target.exists());
-        assert!(matches!(outcome, ToolBatchOutcome::Cancelled(_)));
-        assert!(messages.iter().any(|message| {
-            message
-                .pointer("/params/update/status")
-                .and_then(Value::as_str)
-                == Some("failed")
-        }));
-        let late = late.expect("late allow remains queued for the outer dispatcher");
-        assert!(is_jsonrpc_response(&late));
-        assert_eq!(
-            late.pointer("/result/outcome/optionId")
-                .and_then(Value::as_str),
-            Some("allow-once")
-        );
-    }
-
-    #[tokio::test]
-    async fn tool_registry_read_file_returns_real_contents() {
-        let (dir, registry) = workspace_registry();
-        std::fs::write(dir.path().join("hello.txt"), "hi there").unwrap();
-
-        let result = registry
-            .execute_full("File", json!({"action": "read", "path": "hello.txt"}))
-            .await
-            .expect("read_file succeeds");
-
-        assert!(result.success);
-        assert!(result.content.contains("hi there"));
-    }
-
-    #[tokio::test]
-    async fn tool_registry_write_file_creates_a_real_file() {
-        let (dir, registry) = workspace_registry();
-
-        let result = registry
-            .execute_full(
-                "File",
-                json!({"action": "write", "path": "created.txt", "content": "new content"}),
-            )
-            .await
-            .expect("write_file succeeds");
-
-        assert!(result.success);
-        let on_disk = std::fs::read_to_string(dir.path().join("created.txt")).unwrap();
-        assert_eq!(on_disk, "new content");
-    }
-
-    #[tokio::test]
-    async fn tool_registry_list_dir_reports_real_directory_contents() {
-        let (dir, registry) = workspace_registry();
-        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
-        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
-
-        let result = registry
-            .execute_full("File", json!({"action": "list", "path": "."}))
-            .await
-            .expect("list_dir succeeds");
-
-        assert!(result.success);
-        assert!(result.content.contains("a.txt"));
-        assert!(result.content.contains("b.txt"));
-    }
-
-    #[tokio::test]
-    async fn tool_registry_bash_runs_a_real_command() {
-        let (_dir, registry) = workspace_registry();
-
-        let result = registry
-            .execute_full("Bash", json!({"command": "echo acp-terminal-check"}))
-            .await
-            .expect("Bash succeeds");
-
-        assert!(result.content.contains("acp-terminal-check"));
-    }
-
-    #[tokio::test]
-    async fn tool_registry_read_file_reports_failure_for_missing_path() {
-        let (_dir, registry) = workspace_registry();
-
-        let err = registry
-            .execute_full(
-                "File",
-                json!({"action": "read", "path": "does-not-exist.txt"}),
-            )
-            .await
-            .expect_err("missing file is a tool error");
-
-        assert!(!err.to_string().is_empty());
-    }
-
-    /// Feeds [`run_agentic_prompt_turn`] a fixed sequence of canned per-round
-    /// streams (no real provider), so the multi-round tool loop — including
-    /// nested tool calls across several rounds — is exercised end-to-end
-    /// against the real file-tool registry. A plain struct + inherent async
-    /// method (rather than a boxed closure) lets each test's `|msgs| scripted.next()`
-    /// closure return the async method's own anonymous future type directly,
-    /// so `Fut` is inferred without needing a `dyn Future` trait object.
-    struct ScriptedStreams(RefCell<VecDeque<StreamEventBox>>);
-
-    impl ScriptedStreams {
-        fn new(streams: Vec<StreamEventBox>) -> Self {
-            Self(RefCell::new(VecDeque::from(streams)))
-        }
-
-        async fn next(&self) -> Result<(StreamEventBox, codewhale_config::provider::WireFormat)> {
-            self.next_for_protocol(codewhale_config::provider::WireFormat::ChatCompletions)
-                .await
-        }
-
-        async fn next_for_protocol(
-            &self,
-            protocol: codewhale_config::provider::WireFormat,
-        ) -> Result<(StreamEventBox, codewhale_config::provider::WireFormat)> {
-            Ok((
-                self.0
-                    .borrow_mut()
-                    .pop_front()
-                    .expect("test provided enough scripted rounds"),
-                protocol,
-            ))
-        }
-    }
-
-    #[tokio::test]
-    async fn agentic_turn_refuses_ambiguous_pairing_before_observation_or_effects() {
-        use codewhale_config::provider::WireFormat;
-        for (protocol, ids) in [
-            (WireFormat::ChatCompletions, ["same", "same"]),
-            (WireFormat::AnthropicMessages, ["valid", ""]),
-            (WireFormat::Responses, ["same|item-a", "same|item-b"]),
-        ] {
-            let (dir, registry) = workspace_registry();
-            let mut events = vec![text_delta("Kept response text")];
-            for (index, id) in ids.into_iter().enumerate() {
-                events.extend(tool_use_events(
-                    index as u32,
-                    id,
-                    "File",
-                    r#"{"action":"write","path":"must-not-exist","content":"no"}"#,
-                ));
-            }
-            events.push(StreamEvent::MessageStop);
-            let scripted = ScriptedStreams::new(vec![ready_stream(events)]);
-            let mut reader = lines_from("");
-            let mut out = Vec::new();
-            let error = run_agentic_prompt_turn(
-                AcpTurnContext {
-                    config: &Config::default(),
-                    model: "test-model",
-                    session_id: "pairing",
-                    tool_registry: &registry,
-                    response_id_policy: JsonRpcResponseIdPolicy::Preserve,
-                },
-                Vec::new(),
-                &mut reader,
-                &mut out,
-                |_| scripted.next_for_protocol(protocol),
-            )
-            .await
-            .expect_err("invalid whole batch is refused");
-            assert!(!dir.path().join("must-not-exist").exists());
-            let messages = error.partial_messages.expect("already shown text retained");
-            assert_eq!(messages.len(), 1);
-            assert!(
-                matches!(&messages[0].content[0], ContentBlock::Text { text, .. } if text == "Kept response text")
-            );
-            assert!(
-                messages
-                    .iter()
-                    .flat_map(|m| &m.content)
-                    .all(|b| b.tool_call_key().is_none())
-            );
-            let updates = parse_lines(out);
-            assert!(
-                updates
-                    .iter()
-                    .all(|message| message["method"] != "session/request_permission"
-                        && message["params"]["update"]["sessionUpdate"] != "tool_call"
-                        && message["params"]["update"]["sessionUpdate"] != "tool_call_update")
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn agentic_turn_executes_a_tool_call_then_streams_the_final_answer() {
-        let (dir, registry) = workspace_registry();
-        std::fs::write(dir.path().join("VERSION"), "9.9.9").unwrap();
-
-        let round1 = ready_stream({
-            let mut events =
-                tool_use_events(0, "call_1", "File", r#"{"action":"read","path":"VERSION"}"#);
-            events.push(StreamEvent::MessageStop);
-            events
-        });
-        let round2 = ready_stream(vec![
-            text_delta("The version is 9.9.9"),
-            StreamEvent::MessageStop,
-        ]);
-
-        let scripted = ScriptedStreams::new(vec![round1, round2]);
-        let mut reader = lines_from("");
-        let mut out = Vec::new();
-
-        let (outcome, messages) = run_agentic_prompt_turn(
-            AcpTurnContext {
-                config: &Config::default(),
-                model: "test-model",
-                session_id: "sess_1",
-                tool_registry: &registry,
-                response_id_policy: JsonRpcResponseIdPolicy::Preserve,
-            },
-            vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "What version is this?".to_string(),
-                    cache_control: None,
-                }],
-            }],
-            &mut reader,
-            &mut out,
-            |_msgs| scripted.next(),
-        )
-        .await
-        .expect("turn completes");
-
-        assert_eq!(
-            outcome,
-            PromptOutcome::Completed("The version is 9.9.9".to_string())
-        );
-        // user -> assistant(tool_use) -> user(tool_result) -> assistant(text)
-        assert_eq!(messages.len(), 4);
-        assert!(matches!(
-            messages[1].content[0],
-            ContentBlock::ToolUse { .. }
-        ));
-        let ContentBlock::ToolResult {
-            content, is_error, ..
-        } = &messages[2].content[0]
-        else {
-            panic!("expected a tool_result message");
-        };
-        assert!(content.contains("9.9.9"));
-        assert_eq!(*is_error, Some(false));
-
-        // The client saw a tool_call start, a completed update, and the
-        // streamed final-answer chunk.
-        let lines = parse_lines(out);
+        let mut config = fixture_config();
+        config.allow_shell = Some(true);
+        let mut rig = Rig::new(config, vec![])?;
+        rig.server.client_supports_terminal = true;
+        let error = rig.server.new_session(json!({})).await.unwrap_err();
+        assert!(error.message.contains("unresolved configuration source"));
+        assert!(rig.server.sessions.is_empty());
         assert!(
-            lines
+            rig.server
+                .runtime
+                .list_threads(
+                    crate::runtime_threads::ThreadListFilter::IncludeArchived,
+                    None,
+                )
+                .await?
+                .is_empty()
+        );
+        assert_eq!(rig.mock.call_count(), 0);
+        rig.close().await;
+        Ok(())
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn model_discovery_and_selection_keep_custom_provider_identity_and_refuse_invalid_values()
+    -> Result<()> {
+        let mut rig = Rig::new(fixture_config(), vec![])?;
+        assert_eq!(rig.server.current_model()["provider"], "acp-fixture");
+        assert_eq!(rig.server.current_model()["model"], "fixture-model");
+        assert!(
+            rig.server.list_providers()["providers"]
+                .as_array()
+                .unwrap()
                 .iter()
-                .any(|v| v["params"]["update"]["sessionUpdate"] == "tool_call")
-        );
-        assert!(lines.iter().any(
-            |v| v["params"]["update"]["sessionUpdate"] == "tool_call_update"
-                && v["params"]["update"]["status"] == "completed"
-        ));
-        assert!(lines.iter().any(|v| v["params"]["update"]["sessionUpdate"]
-            == "agent_message_chunk"
-            && v["params"]["update"]["content"]["text"] == "The version is 9.9.9"));
-    }
-
-    #[tokio::test]
-    async fn agentic_turn_preserves_tool_receipts_when_later_provider_round_fails() {
-        let (dir, registry) = workspace_registry();
-        std::fs::write(dir.path().join("receipt.txt"), "observed").unwrap();
-        let round1 = ready_stream({
-            let mut events = tool_use_events(
-                0,
-                "call_receipt",
-                "File",
-                r#"{"action":"read","path":"receipt.txt"}"#,
-            );
-            events.push(StreamEvent::MessageStop);
-            events
-        });
-        let scripted = ScriptedStreams::new(vec![round1, error_stream("provider unavailable")]);
-        let mut reader = lines_from("");
-        let mut out = Vec::new();
-
-        let error = run_agentic_prompt_turn(
-            AcpTurnContext {
-                config: &Config::default(),
-                model: "test-model",
-                session_id: "sess_1",
-                tool_registry: &registry,
-                response_id_policy: JsonRpcResponseIdPolicy::Preserve,
-            },
-            vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "Read receipt.txt".to_string(),
-                    cache_control: None,
-                }],
-            }],
-            &mut reader,
-            &mut out,
-            |_msgs| scripted.next(),
-        )
-        .await
-        .expect_err("second provider round fails");
-
-        assert!(error.source.to_string().contains("provider unavailable"));
-        let messages = error
-            .partial_messages
-            .expect("completed tool receipt must be returned for commit");
-        assert_eq!(messages.len(), 3);
-        assert!(matches!(
-            &messages[2].content[0],
-            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_receipt"
-        ));
-    }
-
-    #[tokio::test]
-    async fn agentic_turn_chains_nested_tool_calls_across_rounds() {
-        let (dir, registry) = workspace_registry();
-        std::fs::write(dir.path().join("a.txt"), "contents-of-a").unwrap();
-        std::fs::write(dir.path().join("b.txt"), "contents-of-b").unwrap();
-
-        let round1 = ready_stream({
-            let mut events =
-                tool_use_events(0, "call_1", "File", r#"{"action":"read","path":"a.txt"}"#);
-            events.push(StreamEvent::MessageStop);
-            events
-        });
-        // After seeing a.txt's contents, the model asks for b.txt too.
-        let round2 = ready_stream({
-            let mut events =
-                tool_use_events(0, "call_1", "File", r#"{"action":"read","path":"b.txt"}"#);
-            events.push(StreamEvent::MessageStop);
-            events
-        });
-        let round3 = ready_stream(vec![
-            text_delta("Both files read"),
-            StreamEvent::MessageStop,
-        ]);
-
-        let scripted = ScriptedStreams::new(vec![round1, round2, round3]);
-        let outbound = RefCell::new(Vec::new());
-        let mut reader = lines_from("");
-        let mut out = Vec::new();
-
-        let (outcome, messages) = run_agentic_prompt_turn(
-            AcpTurnContext {
-                config: &Config::default(),
-                model: "test-model",
-                session_id: "sess_1",
-                tool_registry: &registry,
-                response_id_policy: JsonRpcResponseIdPolicy::Preserve,
-            },
-            vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "Read both files".to_string(),
-                    cache_control: None,
-                }],
-            }],
-            &mut reader,
-            &mut out,
-            |msgs| {
-                outbound.borrow_mut().push(msgs);
-                scripted.next()
-            },
-        )
-        .await
-        .expect("turn completes");
-
-        assert_eq!(
-            outcome,
-            PromptOutcome::Completed("Both files read".to_string())
-        );
-        // user, assistant(tool_use a), user(result a), assistant(tool_use b),
-        // user(result b), assistant(text)
-        assert_eq!(messages.len(), 6);
-        let ContentBlock::ToolResult {
-            content: a_content, ..
-        } = &messages[2].content[0]
-        else {
-            panic!("expected tool_result for a.txt");
-        };
-        assert!(a_content.contains("contents-of-a"));
-        let ContentBlock::ToolResult {
-            content: b_content, ..
-        } = &messages[4].content[0]
-        else {
-            panic!("expected tool_result for b.txt");
-        };
-        assert!(b_content.contains("contents-of-b"));
-        let first = messages[1].content[0].tool_call_key().unwrap();
-        let second = messages[3].content[0].tool_call_key().unwrap();
-        assert!(matches!(first, codewhale_models::ToolCallKey::Execution(_)));
-        assert!(matches!(
-            second,
-            codewhale_models::ToolCallKey::Execution(_)
-        ));
-        assert_ne!(
-            first, second,
-            "wire ID reuse must not reuse local observations"
-        );
-        assert_eq!(first, messages[2].content[0].tool_call_key().unwrap());
-        assert_eq!(second, messages[4].content[0].tool_call_key().unwrap());
-        for index in [1, 3] {
-            assert!(
-                matches!(&messages[index].content[0], ContentBlock::ToolUse { id, .. } if id == "call_1")
-            );
-        }
-        for index in [2, 4] {
-            assert!(
-                matches!(&messages[index].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call_1")
-            );
-        }
-        assert_eq!(&outbound.borrow()[2], &messages[..5]);
-        let updates = parse_lines(out);
-        let started: Vec<_> = updates
-            .iter()
-            .filter(|message| message["params"]["update"]["sessionUpdate"] == "tool_call")
-            .map(|message| message["params"]["update"]["toolCallId"].as_str().unwrap())
-            .collect();
-        assert_eq!(started, [first.as_str(), second.as_str()]);
-    }
-
-    fn empty_stop_stream() -> StreamEventBox {
-        ready_stream(vec![StreamEvent::MessageStop])
-    }
-
-    async fn run_empty_stop_acp_turn(
-        streams: Vec<StreamEventBox>,
-    ) -> (
-        std::result::Result<(PromptOutcome, Vec<Message>), AgenticPromptError>,
-        Vec<Vec<Message>>,
-    ) {
-        let (_dir, registry) = workspace_registry();
-        let scripted = ScriptedStreams::new(streams);
-        let requests = RefCell::new(Vec::new());
-        let mut reader = lines_from("");
-        let mut out = Vec::new();
-        let result = run_agentic_prompt_turn(
-            AcpTurnContext {
-                config: &Config::default(),
-                model: "test-model",
-                session_id: "sess_1",
-                tool_registry: &registry,
-                response_id_policy: JsonRpcResponseIdPolicy::Preserve,
-            },
-            vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "Answer me".to_string(),
-                    cache_control: None,
-                }],
-            }],
-            &mut reader,
-            &mut out,
-            |msgs| {
-                requests.borrow_mut().push(msgs);
-                scripted.next()
-            },
-        )
-        .await;
-        (result, requests.into_inner())
-    }
-
-    /// #6310 through the ACP prompt loop: one answerless clean stop is
-    /// retried with the identical request and the turn completes.
-    #[tokio::test]
-    async fn agentic_turn_retries_an_empty_clean_stop_then_completes() {
-        let (result, requests) = run_empty_stop_acp_turn(vec![
-            empty_stop_stream(),
-            ready_stream(vec![text_delta("recovered"), StreamEvent::MessageStop]),
-        ])
-        .await;
-        let (outcome, messages) = result.expect("turn completes after one retry");
-        assert_eq!(outcome, PromptOutcome::Completed("recovered".to_string()));
-        assert_eq!(requests.len(), 2, "exactly one retry");
-        assert_eq!(requests[0], requests[1], "exact-prefix retry");
-        // user -> assistant(text); the empty response left nothing behind.
-        assert_eq!(messages.len(), 2);
-    }
-
-    /// #6310 through the ACP prompt loop: an answerless clean stop on every
-    /// attempt fails visibly after the shared budget; the second retry is
-    /// nudged and the nudge never joins the committed history.
-    #[tokio::test]
-    async fn agentic_turn_fails_visibly_when_every_stop_is_empty() {
-        let (result, requests) = run_empty_stop_acp_turn(vec![
-            empty_stop_stream(),
-            empty_stop_stream(),
-            empty_stop_stream(),
-        ])
-        .await;
-        let Err(error) = result else {
-            panic!("an always-empty model must fail the turn");
-        };
-        assert!(
-            error.to_string().contains("no answer or tool call")
-                && error.to_string().contains("after 2 retries"),
-            "{error}"
-        );
-        assert!(error.partial_messages.is_none());
-        assert_eq!(
-            requests.len(),
-            1 + crate::core::engine::turn_loop::EMPTY_STOP_MAX_RETRIES as usize
-        );
-        assert_eq!(requests[0], requests[1]);
-        assert_eq!(requests[2].len(), requests[0].len() + 1, "nudged retry");
-        let nudge = crate::config::DEFAULT_REASONING_ONLY_REPROMPT_MESSAGE;
-        assert!(matches!(
-            requests[2].last().map(|m| &m.content[0]),
-            Some(ContentBlock::Text { text, .. }) if text == nudge
-        ));
-    }
-
-    #[tokio::test]
-    async fn agentic_turn_reports_a_tool_failure_back_to_the_model_and_keeps_going() {
-        let (_dir, registry) = workspace_registry();
-
-        let round1 = ready_stream({
-            let mut events = tool_use_events(
-                0,
-                "call_1",
-                "File",
-                r#"{"action":"read","path":"missing.txt"}"#,
-            );
-            events.push(StreamEvent::MessageStop);
-            events
-        });
-        let round2 = ready_stream(vec![
-            text_delta("That file does not exist"),
-            StreamEvent::MessageStop,
-        ]);
-
-        let scripted = ScriptedStreams::new(vec![round1, round2]);
-        let mut reader = lines_from("");
-        let mut out = Vec::new();
-
-        let (outcome, messages) = run_agentic_prompt_turn(
-            AcpTurnContext {
-                config: &Config::default(),
-                model: "test-model",
-                session_id: "sess_1",
-                tool_registry: &registry,
-                response_id_policy: JsonRpcResponseIdPolicy::Preserve,
-            },
-            vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: "Read missing.txt".to_string(),
-                    cache_control: None,
-                }],
-            }],
-            &mut reader,
-            &mut out,
-            |_msgs| scripted.next(),
-        )
-        .await
-        .expect("turn completes even though the tool failed");
-
-        assert_eq!(
-            outcome,
-            PromptOutcome::Completed("That file does not exist".to_string())
-        );
-        let ContentBlock::ToolResult { is_error, .. } = &messages[2].content[0] else {
-            panic!("expected a tool_result message");
-        };
-        assert_eq!(*is_error, Some(true));
-
-        let lines = parse_lines(out);
-        assert!(lines.iter().any(
-            |v| v["params"]["update"]["sessionUpdate"] == "tool_call_update"
-                && v["params"]["update"]["status"] == "failed"
-        ));
-    }
-
-    #[cfg(windows)]
-    const SLOW_SHELL_COMMAND: &str = "ping -n 6 127.0.0.1 >NUL";
-    #[cfg(not(windows))]
-    const SLOW_SHELL_COMMAND: &str = "sleep 5";
-
-    #[tokio::test]
-    async fn tool_batch_cancels_a_running_bash_and_applies_response_id_policy() {
-        let (_dir, registry) = workspace_registry();
-        let started = std::time::Instant::now();
-
-        let (outcome, messages, _) = execute_one_with_permission_client(
-            &Config::default(),
-            &registry,
-            pending_call("Bash", json!({ "command": SLOW_SHELL_COMMAND })),
-            PermissionClientScript::AllowThenCancelRunning,
-            JsonRpcResponseIdPolicy::StringifyNumeric,
-            None,
-        )
-        .await;
-
-        assert!(matches!(outcome, ToolBatchOutcome::Cancelled(_)));
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(4),
-            "Bash cancellation must preempt the five-second command"
+                .any(|p| p["id"] == "acp-fixture")
         );
         assert!(
-            messages
-                .iter()
-                .any(|value| value["id"] == "7" && value["result"].is_null()),
-            "Zed-compatible cancellation response id was not stringified: {messages:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_acp_sessions_execute_tools_independently() {
-        let (dir1, registry1) = workspace_registry();
-        let (dir2, registry2) = workspace_registry();
-        std::fs::write(dir1.path().join("f.txt"), "session-one").unwrap();
-        std::fs::write(dir2.path().join("f.txt"), "session-two").unwrap();
-
-        let (result1, result2) = tokio::join!(
-            registry1.execute_full("File", json!({"action": "read", "path": "f.txt"})),
-            registry2.execute_full("File", json!({"action": "read", "path": "f.txt"})),
-        );
-
-        assert!(
-            result1
-                .expect("session 1 read")
-                .content
-                .contains("session-one")
+            rig.server
+                .select_model(json!({"provider":"not-a-provider","model":"x"}))
+                .is_err()
         );
         assert!(
-            result2
-                .expect("session 2 read")
-                .content
-                .contains("session-two")
+            rig.server
+                .select_model(json!({"provider":"acp-fixture"}))
+                .is_err()
         );
+        let selected = rig
+            .server
+            .select_model(json!({"provider":"acp-fixture","model":"fixture-model"}))
+            .unwrap();
+        assert_eq!(selected["provider"], "acp-fixture");
+        assert_eq!(rig.mock.call_count(), 0);
+        rig.close().await;
+        Ok(())
     }
 }

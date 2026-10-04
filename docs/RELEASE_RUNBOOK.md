@@ -138,7 +138,7 @@ published commands against that runtime: `codewhale doctor --help` and
 `codew --version`.
 
 ```bash
-cargo build --release --locked -p codewhale-cli -p codewhale-tui
+cargo build --release --locked -p codewhale-cli --bin codewhale
 node scripts/release/npm-wrapper-smoke.js
 ```
 

@@ -1,11 +1,11 @@
-<!-- source: README.md sha256:925619135f77 -->
+<!-- source: README.md sha256:a59c459aea4d -->
 # Codewhale
 
 Codewhale est un agent open source qui lit votre projet, modifie des fichiers, exécute des commandes et vérifie son travail avec un modèle hébergé ou local de votre choix. Commencez par une tâche dans votre terminal. Pour un travail plus important, confiez-en des parties à des agents utilisant différents modèles et rôles.
 
-![Codewhale en cours d’exécution dans un terminal](web/public/codewhale-tui-5765d80.png)
+![Codewhale en cours d’exécution dans un terminal](web/public/codewhale-tui-e940149.png)
 
-*Aperçu du terminal dans une version de développement de la v0.10.0.*
+*Aperçu du terminal dans une version de développement de la v0.10.1.*
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
@@ -51,7 +51,7 @@ Codewhale peut lire votre dépôt, modifier des fichiers, exécuter des commande
 
 ## Terminal, applications et Computer Use
 
-Le terminal et les clients graphiques se connectent au Runtime Codewhale, qui exécute l’agent et ses outils :
+Le terminal et les clients graphiques se connectent à [Codewhale Engine](docs/ARCHITECTURE.md), qui exécute l’agent et ses outils :
 
 - **Terminal :** `codewhale` ouvre l’interface interactive ; `codewhale exec` exécute une tâche depuis un script ou une tâche de CI.
 - **Navigateur local :** `codewhale web` ouvre le [client web local](docs/WEB.md) fourni, qui utilise le même runtime.

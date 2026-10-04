@@ -364,14 +364,14 @@ fn scanner_should_report_missing_path(world: &mut PluginE2EWorld) {
 /// Prove the binary still loads after the plugin module extraction.
 #[tokio::test(flavor = "current_thread")]
 async fn plugin_module_does_not_break_binary_load() {
-    let output = Command::new(codewhale_tui_binary())
+    let output = Command::new(crate::binary::codewhale())
         .arg("--version")
         .output()
-        .expect("codewhale-tui --version should start");
+        .expect("codewhale --version should start");
 
     assert!(
         output.status.success(),
-        "codewhale-tui --version failed\nstderr:\n{}",
+        "codewhale --version failed\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -870,7 +870,7 @@ async fn plugin_toml_binary_lifecycle_skill_and_stdio_mcp_acceptance() {
     ));
     std::fs::write(config_path, config).expect("configure sealed lifecycle receipt");
     let (base_url, shutdown_tx, model_thread) = spawn_hermetic_model_server();
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())
@@ -1103,20 +1103,3 @@ async fn run_scenario(name: &'static str, expected_steps: usize) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
-}

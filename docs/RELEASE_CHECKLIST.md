@@ -99,7 +99,7 @@ Run, in order, from the repo root:
 
 ## 4. npm wrapper smoke
 
-- [ ] `cargo build --release --locked -p codewhale-cli -p codewhale-tui`
+- [ ] `cargo build --release --locked -p codewhale-cli --bin codewhale`
 - [ ] `node scripts/release/npm-wrapper-smoke.js`
       (Set `DEEPSEEK_TUI_KEEP_SMOKE_DIR=1` if you need to inspect the temp
       install afterwards.)

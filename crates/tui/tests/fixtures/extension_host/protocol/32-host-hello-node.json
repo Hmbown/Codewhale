@@ -14,7 +14,9 @@
       "runtime": {
         "name": "node",
         "version": "26.10.0"
-      }
+      },
+      "tier": "plugin",
+      "builtin_modules": []
     }
   }
 }

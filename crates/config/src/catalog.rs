@@ -53,6 +53,7 @@ use crate::route::{ModelId, ProviderId, ProviderModelOffering, RouteLimits, Wire
 
 pub mod configured;
 pub mod corrections;
+pub mod reviewed;
 
 /// Provenance of a catalog row. Drives layer precedence and UI provenance.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,8 +285,13 @@ static BUNDLED_MODELS_DEV_CATALOG: OnceLock<ModelsDevCatalog> = OnceLock::new();
 #[must_use]
 pub fn bundled_models_dev_catalog() -> &'static ModelsDevCatalog {
     BUNDLED_MODELS_DEV_CATALOG.get_or_init(|| {
-        ModelsDevCatalog::parse_json(BUNDLED_MODELS_DEV_JSON)
-            .expect("committed bundled Models.dev asset must be valid JSON")
+        let catalog = ModelsDevCatalog::parse_json(BUNDLED_MODELS_DEV_JSON)
+            .expect("committed bundled Models.dev asset must be valid JSON");
+        catalog
+            .reviewed
+            .validate()
+            .expect("committed reviewed catalog must be valid");
+        catalog
     })
 }
 

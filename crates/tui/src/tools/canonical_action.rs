@@ -254,7 +254,7 @@ pub(crate) mod tests {
             .with_web_tools()
             .with_patch_tools()
             .with_handle_tools()
-            .with_rlm_tool(None, String::new())
+            .with_rlm_tool()
             .build(ToolContext::new(root.to_path_buf()))
     }
 

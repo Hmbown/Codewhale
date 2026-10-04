@@ -1956,11 +1956,26 @@ impl App {
         let file_path = self.workspace.join(&rel_path);
         let written = crate::fs_confined::write(&self.workspace, &file_path, self.input.as_bytes());
         if let Err(error) = written {
+            let limit = MAX_SUBMITTED_INPUT_CHARS.to_string();
+            // The toast row sheds clauses to fit and left only "Not sent", so
+            // the toast carries a short form and the full reason, including
+            // the write error, goes to the transcript where nothing is clipped.
+            let short = self
+                .tr(MessageId::ComposerOversizedSubmitHeldShort)
+                .replace("{limit}", &limit);
             let reason = self
                 .tr(MessageId::ComposerOversizedSubmitHeld)
-                .replace("{limit}", &MAX_SUBMITTED_INPUT_CHARS.to_string())
+                .replace("{limit}", &limit)
                 .replace("{error}", &error.to_string());
-            self.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+            self.push_status_toast(short, StatusToastLevel::Error, Some(8_000));
+            // Enter and paste both retry this; do not stack identical cells.
+            let already_noted = matches!(
+                self.history.last(),
+                Some(HistoryCell::System { content }) if *content == reason
+            );
+            if !already_noted {
+                self.add_message(HistoryCell::System { content: reason });
+            }
             self.needs_redraw = true;
             return false;
         }

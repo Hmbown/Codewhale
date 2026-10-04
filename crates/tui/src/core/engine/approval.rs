@@ -7,6 +7,8 @@
 
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::approval_log::{ApprovalDecider, ApprovalOutcome, ApprovalReceipt};
 use crate::core::events::Event;
 use crate::tools::spec::ToolError;
@@ -195,8 +197,40 @@ impl Engine {
         tool_name: &str,
         event: Event,
     ) -> Result<ApprovalResult, ToolError> {
+        self.request_tool_approval_until(tool_id, tool_name, event, None)
+            .await
+    }
+
+    /// [`Self::request_tool_approval`] that stops waiting when `withdraw`
+    /// fires, for an approval whose asker went away (an extension's host
+    /// cancelled the call, its owner was revoked, the host exited, the
+    /// invocation ended). The wait ends with a `Cancelled` outcome in the
+    /// approval log and a cancelled error; the call is never decided for the
+    /// person, and an answer that arrives afterwards finds no waiter.
+    pub(super) async fn request_tool_approval_until(
+        &mut self,
+        tool_id: &str,
+        tool_name: &str,
+        event: Event,
+        withdraw: Option<&CancellationToken>,
+    ) -> Result<ApprovalResult, ToolError> {
         self.commit_approval_receipt(ApprovalReceipt::asked(tool_id, tool_name))
             .await?;
+        if self
+            .child_host
+            .as_ref()
+            .is_some_and(|child| !child.authority.runtime.parent_can_prompt)
+        {
+            self.commit_approval_outcome(
+                tool_id,
+                ApprovalOutcome::Unavailable,
+                Some(ApprovalDecider::Host),
+            )
+            .await?;
+            return Err(ToolError::not_available(
+                "child caller has no host that can answer this approval",
+            ));
+        }
         if self.send_event(event).await.is_err() {
             self.commit_approval_outcome(
                 tool_id,
@@ -216,8 +250,12 @@ impl Engine {
         // came back. Every non-unwinding exit of `await_tool_approval` runs
         // through the resume below; a panic unwinds out of `run_turn`, which
         // restarts the clock on its next turn anyway.
+        let _child_person_wait = self
+            .child_host
+            .as_ref()
+            .map(|child| child.authority.pause_person_wait());
         self.turn_wall_clock.begin_human_wait();
-        let decision = self.await_tool_approval(tool_id).await;
+        let decision = self.await_tool_approval(tool_id, withdraw).await;
         self.turn_wall_clock.end_human_wait();
         decision
     }
@@ -240,6 +278,7 @@ impl Engine {
     pub(super) async fn await_tool_approval(
         &mut self,
         tool_id: &str,
+        withdraw: Option<&CancellationToken>,
     ) -> Result<ApprovalResult, ToolError> {
         let started = std::time::Instant::now();
         let mut heartbeat = tokio::time::interval(WAIT_HEARTBEAT);
@@ -250,22 +289,31 @@ impl Engine {
         let mut announced = false;
         loop {
             tokio::select! {
-                _ = heartbeat.tick() => {
-                    let waited = started.elapsed();
-                    let message = wait_announcement("tool approval", tool_id, waited);
-                    // Log every heartbeat; tell the user once, so a long park
-                    // leaves a trail without filling the transcript.
-                    tracing::warn!(tool_id, waited_secs = waited.as_secs(), "{message}");
-                    if !announced {
-                        announced = true;
-                        let _ = self.send_event(Event::Status { message }).await;
-                    }
-                }
+                // A withdrawn request cannot consume an already queued allow.
+                biased;
                 _ = self.cancel_token.cancelled() => {
                     let suffix = self.cancel_reason_suffix();
                     self.commit_approval_outcome(tool_id, ApprovalOutcome::Cancelled, Some(ApprovalDecider::Host)).await?;
+                    let _ = self.send_event(Event::ApprovalWithdrawn { id: tool_id.to_string() }).await;
                     return Err(ToolError::cancelled(
                         format!("Request cancelled while awaiting approval{suffix}"),
+                    ));
+                }
+                () = async {
+                    match withdraw {
+                        Some(withdraw) => withdraw.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.commit_approval_outcome(tool_id, ApprovalOutcome::Cancelled, Some(ApprovalDecider::Host)).await?;
+                    let _ = self.send_event(Event::ApprovalWithdrawn { id: tool_id.to_string() }).await;
+                    let _ = self.send_event(Event::Status {
+                        message: format!(
+                            "Approval for `{tool_id}` withdrawn: the call that asked for it no longer waits for the answer"
+                        ),
+                    }).await;
+                    return Err(ToolError::cancelled(
+                        "Approval withdrawn: the call that asked for it no longer waits for the answer".to_string(),
                     ));
                 }
                 decision = self.rx_approval.recv() => {
@@ -312,6 +360,17 @@ impl Engine {
                         // agent's answer never arrives here; the handle hands
                         // it to the agent directly.)
                         _ => continue,
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    let waited = started.elapsed();
+                    let message = wait_announcement("tool approval", tool_id, waited);
+                    // Log every heartbeat; tell the user once, so a long park
+                    // leaves a trail without filling the transcript.
+                    tracing::warn!(tool_id, waited_secs = waited.as_secs(), "{message}");
+                    if !announced {
+                        announced = true;
+                        let _ = self.send_event(Event::Status { message }).await;
                     }
                 }
             }
@@ -979,6 +1038,7 @@ mod tests {
     #[derive(Default)]
     struct NestedTurnOptions {
         tools: Vec<Arc<dyn ToolSpec>>,
+        tool_context: Option<ToolContext>,
         turn_wall_clock: Option<Duration>,
         hook_executor: Option<Arc<crate::hooks::HookExecutor>>,
     }
@@ -1051,6 +1111,9 @@ mod tests {
         use crate::tools::codemode::EXECUTE_TOOLS_TOOL_NAME;
 
         let tmp = tempfile::tempdir().expect("fixture directory");
+        let tool_context = options
+            .tool_context
+            .unwrap_or_else(|| ToolContext::new(tmp.path()));
         let args = json!({ "code": code }).to_string();
         let mock = Arc::new(MockLlmClient::new(vec![
             canned::tool_call_turn("exec-1", EXECUTE_TOOLS_TOOL_NAME, &args),
@@ -1059,7 +1122,7 @@ mod tests {
         let defaults = EngineConfig::default();
         let (mut engine, handle) = Engine::new_with_model_client(
             EngineConfig {
-                workspace: tmp.path().to_path_buf(),
+                workspace: tool_context.workspace.clone(),
                 snapshots_enabled: false,
                 subagents_enabled: false,
                 terminal_chrome_enabled: false,
@@ -1084,7 +1147,7 @@ mod tests {
         engine.approval_receipt_store = Ok(store.clone());
         let session_id = engine.session.id.clone();
         let executions = Arc::new(AtomicUsize::new(0));
-        let mut registry = crate::tools::ToolRegistry::new(ToolContext::new(tmp.path()));
+        let mut registry = crate::tools::ToolRegistry::new(tool_context);
         registry.register(Arc::new(ApprovalFixtureTool {
             executions: executions.clone(),
             claim_only: false,
@@ -1254,6 +1317,7 @@ mod tests {
         let _policy = crate::plugins::activation::TestPolicyGuard::extension_host(true);
         let fixture = crate::extension_host::tests::FixturePlugins::new(&["slow-tool"]).await;
         let manager = fixture.manager(node);
+        let _manager = crate::extension_host::TestManagerGuard::install(Arc::clone(&manager));
         let attachment = manager.attach(fixture.registry());
         attachment.sync().await.expect("host activation");
         let tool =
@@ -1269,6 +1333,10 @@ mod tests {
             code,
             NestedTurnOptions {
                 tools: vec![tool],
+                tool_context: Some(
+                    ToolContext::new(fixture.workspace())
+                        .with_plugin_registry(attachment.plugin_view()),
+                ),
                 ..NestedTurnOptions::default()
             },
         );
@@ -1939,6 +2007,613 @@ mod tests {
         assert!(
             task.await.expect("approval task").is_err(),
             "an approval decision without a committed terminal receipt must not grant execution"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // An extension tool's `core/call` through the real turn loop
+    // -----------------------------------------------------------------------
+
+    /// An extension tool without a host: it asks the core for tools exactly
+    /// as `HostToolSpec` does (`CodemodeInvoker::for_extension` over the
+    /// turn loop's gate), so the turn loop's planning, card and withdrawal are
+    /// the real ones. `input.calls` is a list of `{name, input}`; with
+    /// `input.parallel` they are asked at once.
+    struct FakeExtensionTool {
+        withdraw: Arc<tokio::sync::Notify>,
+    }
+
+    const FAKE_EXT: &str = "fake_ext_tool";
+    const FAKE_SCOPE: &str = "ext:fake@h1";
+
+    #[async_trait::async_trait]
+    impl ToolSpec for FakeExtensionTool {
+        fn name(&self) -> &str {
+            FAKE_EXT
+        }
+
+        fn description(&self) -> &str {
+            "An extension tool that asks the core to run tools."
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn capabilities(&self) -> Vec<ToolCapability> {
+            vec![ToolCapability::ReadOnly]
+        }
+
+        fn approval_requirement(&self) -> ApprovalRequirement {
+            ApprovalRequirement::Auto
+        }
+
+        fn approval_scope(&self) -> Option<String> {
+            Some(FAKE_SCOPE.to_string())
+        }
+
+        fn extension_caller(&self) -> Option<crate::tools::codemode::ExtensionCaller> {
+            Some(crate::tools::codemode::ExtensionCaller {
+                origin: "extension:fake".to_string(),
+                tool: FAKE_EXT.to_string(),
+                scope: FAKE_SCOPE.to_string(),
+            })
+        }
+
+        async fn execute(
+            &self,
+            input: Value,
+            context: &ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            use crate::tools::codemode::{CodemodeInvoker, NestedFailure};
+            let gate = context
+                .execution
+                .nested_call_gate
+                .clone()
+                .ok_or_else(|| ToolError::not_available("no gate"))?;
+            let specs = gate
+                .extension()
+                .map(|(_, specs)| specs.to_vec())
+                .ok_or_else(|| ToolError::not_available("not an extension gate"))?;
+            let invoker = CodemodeInvoker::for_extension(
+                specs,
+                context.clone(),
+                gate,
+                "fake-call".to_string(),
+                crate::extension_host::core_call::refusal,
+            );
+            let withdraw = tokio_util::sync::CancellationToken::new();
+            {
+                let (withdraw, trigger) = (withdraw.clone(), self.withdraw.clone());
+                tokio::spawn(async move {
+                    trigger.notified().await;
+                    withdraw.cancel();
+                });
+            }
+            let calls: Vec<(String, Value)> = input["calls"]
+                .as_array()
+                .expect("calls")
+                .iter()
+                .map(|call| {
+                    (
+                        call["name"].as_str().unwrap().to_string(),
+                        call["input"].clone(),
+                    )
+                })
+                .collect();
+            let one = |name: String, input: Value| {
+                let (invoker, withdraw) = (&invoker, &withdraw);
+                async move {
+                    match invoker.call(name, input, Some(withdraw)).await {
+                        Ok(response) => json!({"ok": response.ok, "result": response.result}),
+                        Err(NestedFailure::Rejected { decision, message }) => {
+                            json!({"rejected": format!("{decision:?}"), "message": message})
+                        }
+                        Err(NestedFailure::Unavailable(message)) => {
+                            json!({"unavailable": message})
+                        }
+                    }
+                }
+            };
+            let results = if input["parallel"].as_bool() == Some(true) {
+                futures_util::future::join_all(calls.into_iter().map(|(n, i)| one(n, i))).await
+            } else {
+                let mut results = Vec::new();
+                for (name, input) in calls {
+                    results.push(one(name, input).await);
+                }
+                results
+            };
+            Ok(ToolResult::success(
+                json!({"results": results, "receipts": invoker.receipts_json(50)}).to_string(),
+            ))
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Posture {
+        Ask,
+        FullAccess,
+    }
+
+    struct ExtensionTurn {
+        tmp: tempfile::TempDir,
+        task: tokio::task::JoinHandle<(crate::core::events::TurnOutcomeStatus, Option<String>)>,
+        events: Arc<tokio::sync::RwLock<tokio::sync::mpsc::Receiver<Event>>>,
+        handle: crate::core::engine::EngineHandle,
+        store: crate::approval_log::ApprovalReceiptStore,
+        session_id: String,
+        withdraw: Arc<tokio::sync::Notify>,
+    }
+
+    /// A turn whose model calls the extension tool (id `ext-1`) with `input`,
+    /// over the file, shell and web tools.
+    fn start_extension_turn(input: Value, posture: Posture) -> ExtensionTurn {
+        let tmp = tempfile::tempdir().expect("fixture directory");
+        std::fs::write(tmp.path().join("a.txt"), "alpha").expect("fixture file");
+        let mock = Arc::new(MockLlmClient::new(vec![
+            canned::tool_call_turn("ext-1", FAKE_EXT, &input.to_string()),
+            canned::simple_text_turn("Extension finished."),
+        ]));
+        let (mut engine, handle) = Engine::new_with_model_client(
+            EngineConfig {
+                workspace: tmp.path().to_path_buf(),
+                snapshots_enabled: false,
+                subagents_enabled: false,
+                terminal_chrome_enabled: false,
+                ..EngineConfig::default()
+            },
+            &Config::default(),
+            mock,
+        );
+        let full = posture == Posture::FullAccess;
+        engine.session.auto_approve = full;
+        engine.session.approval_mode = if full {
+            ApprovalMode::Bypass
+        } else {
+            ApprovalMode::Suggest
+        };
+        engine.session.mcp_config_path = tmp.path().join("mcp.json");
+        engine.session.add_message(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Run the extension.".into(),
+                cache_control: None,
+            }],
+        });
+        let store = crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions"));
+        engine.approval_receipt_store = Ok(store.clone());
+        let session_id = engine.session.id.clone();
+        let mut context = ToolContext::new(tmp.path());
+        context.auto_approve = full;
+        let withdraw = Arc::new(tokio::sync::Notify::new());
+        let mut registry = crate::tools::registry::ToolRegistryBuilder::new()
+            .with_file_tools()
+            .with_shell_tools()
+            .with_web_tools()
+            .build(context);
+        registry.register(Arc::new(FakeExtensionTool {
+            withdraw: withdraw.clone(),
+        }));
+        let catalog = registry.to_api_tools_with_cache(true);
+        let surface = ToolSurfacePolicy::new(
+            registry,
+            Some(catalog),
+            AppMode::Agent,
+            &engine.config.tools_always_load,
+            &[],
+            false,
+            None,
+            None,
+            Some(8),
+            crate::core::engine::tool_catalog::ToolMode::Direct,
+        );
+        let events = handle.rx_event.clone();
+        let task = tokio::spawn(async move {
+            engine
+                .run_turn(&mut TurnContext::new(8), surface, None, None)
+                .await
+        });
+        ExtensionTurn {
+            tmp,
+            task,
+            events,
+            handle,
+            store,
+            session_id,
+            withdraw,
+        }
+    }
+
+    /// The next approval request, whole.
+    async fn next_approval_event(
+        events: &Arc<tokio::sync::RwLock<tokio::sync::mpsc::Receiver<Event>>>,
+        seen: &mut Vec<Event>,
+    ) -> Event {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut events = events.write().await;
+            while let Some(event) = events.recv().await {
+                if matches!(event, Event::ApprovalRequired { .. }) {
+                    return event;
+                }
+                seen.push(event);
+            }
+            panic!("event channel closed before an approval request");
+        })
+        .await
+        .expect("approval request deadline")
+    }
+
+    /// Finish the turn; the extension tool's JSON result, and every event.
+    async fn finish_extension_turn(turn: &mut ExtensionTurn, seen: &mut Vec<Event>) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), &mut turn.task)
+            .await
+            .expect("turn deadline")
+            .expect("turn");
+        {
+            let mut rx = turn.events.write().await;
+            while let Ok(event) = rx.try_recv() {
+                seen.push(event);
+            }
+        }
+        let content = seen
+            .iter()
+            .find_map(|event| match event {
+                Event::ToolCallComplete {
+                    name,
+                    result: Ok(result),
+                    ..
+                } if name == FAKE_EXT => Some(result.content.clone()),
+                _ => None,
+            })
+            .expect("the extension tool completed");
+        serde_json::from_str(&content).expect("the tool answers JSON")
+    }
+
+    fn approval_fields(event: &Event) -> (&str, &str, &str, &str, &str, bool) {
+        match event {
+            Event::ApprovalRequired {
+                id,
+                tool_name,
+                description,
+                approval_key,
+                approval_grouping_key,
+                approval_force_prompt,
+                ..
+            } => (
+                id,
+                tool_name,
+                description,
+                approval_key,
+                approval_grouping_key,
+                *approval_force_prompt,
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A shell call an extension makes forces a prompt in every posture that
+    /// can open one, Full Access included. The UI's shared disposition keeps
+    /// that extension-origin card open for the human. The card is Rust's text naming
+    /// the extension and its tool, and its keys are the extension's own.
+    #[tokio::test]
+    async fn an_extensions_shell_call_forces_a_prompt_in_every_posture_and_names_the_extension() {
+        for posture in [Posture::Ask, Posture::FullAccess] {
+            let mut turn = start_extension_turn(
+                json!({"calls": [{"name": "bash", "input": {"command": "echo hi"}}]}),
+                posture,
+            );
+            let events = turn.events.clone();
+            let mut seen = Vec::new();
+            let event = next_approval_event(&events, &mut seen).await;
+            let (id, tool, description, key, grouping, force) = approval_fields(&event);
+            let execution_id = fixture_execution_id(&seen, "ext-1");
+            assert_eq!(id, format!("{execution_id}.1"), "<parent call id>.<seq>");
+            assert_eq!(tool, "bash");
+            assert!(force, "a shell call from an extension is a forced prompt");
+            assert!(
+                description.contains("extension:fake") && description.contains(FAKE_EXT),
+                "{description}"
+            );
+            assert!(
+                key.starts_with("extcall:ext:fake@h1:")
+                    && grouping.starts_with("extcall:ext:fake@h1:"),
+                "{key} / {grouping}"
+            );
+            let (model_key, model_grouping) = crate::tools::approval_cache::approval_keys_for_call(
+                None,
+                "bash",
+                &json!({"command": "echo hi"}),
+            );
+            assert_ne!(key, model_key.0);
+            assert_ne!(grouping, model_grouping.0);
+            turn.handle.deny_tool_call(id).await.expect("deny");
+            let answer = finish_extension_turn(&mut turn, &mut seen).await;
+            assert_eq!(answer["results"][0]["rejected"], "Denied", "{answer}");
+            assert!(
+                answer["results"][0]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("denied by user"),
+                "{answer}"
+            );
+            let replay = turn.store.replay(&turn.session_id).expect("replay");
+            assert_eq!(
+                replay
+                    .completed
+                    .iter()
+                    .map(|receipt| receipt.outcome.clone())
+                    .collect::<Vec<_>>(),
+                vec![ApprovalOutcome::Denied]
+            );
+        }
+    }
+
+    /// A read-only workspace tool runs without a card; anything else needs one
+    /// (even where the model's own call would not), approved once it runs, and
+    /// both are in the result's receipts.
+    #[tokio::test]
+    async fn an_extensions_read_runs_unprompted_and_a_write_needs_its_own_card() {
+        let mut turn = start_extension_turn(
+            json!({"calls": [
+                {"name": "read_file", "input": {"path": "a.txt"}},
+                {"name": "write_file", "input": {"path": "b.txt", "content": "beta"}},
+            ]}),
+            Posture::Ask,
+        );
+        let events = turn.events.clone();
+        let mut seen = Vec::new();
+        let event = next_approval_event(&events, &mut seen).await;
+        let (id, tool, _, key, _, force) = approval_fields(&event);
+        let execution_id = fixture_execution_id(&seen, "ext-1");
+        assert_eq!(id, format!("{execution_id}.2"), "the read raised no card");
+        assert_eq!(tool, "write_file");
+        assert!(
+            !force,
+            "an ordinary write is promptable, and a grant may satisfy it"
+        );
+        assert!(key.starts_with("extcall:ext:fake@h1:"), "{key}");
+        assert!(!turn.tmp.path().join("b.txt").exists());
+        turn.handle.approve_tool_call(id).await.expect("allow");
+        let answer = finish_extension_turn(&mut turn, &mut seen).await;
+        assert_eq!(answer["results"][0]["ok"], true, "{answer}");
+        assert_eq!(answer["results"][1]["ok"], true, "{answer}");
+        assert_eq!(
+            std::fs::read_to_string(turn.tmp.path().join("b.txt")).unwrap(),
+            "beta"
+        );
+        assert_eq!(answer["receipts"]["total"], 2);
+        assert_eq!(answer["receipts"]["calls"][0]["decision"], "auto");
+        assert_eq!(answer["receipts"]["calls"][1]["decision"], "approved");
+    }
+
+    /// Everything the core refuses an extension is refused without a card:
+    /// code mode's, no recursion (to execute_tools, to another or the same
+    /// extension tool), MCP, search, the memory writer.
+    #[tokio::test]
+    async fn refused_calls_never_raise_a_card() {
+        let names = [
+            "execute_tools",
+            "EXECUTE_TOOLS",
+            "agent",
+            "mcp_demo_tool",
+            "list_mcp_resources",
+            "tool_search",
+            "retrieve_tool_result",
+            "remember",
+            "request_plugin_install",
+            FAKE_EXT,
+            "FAKE_EXT_TOOL",
+        ];
+        let calls: Vec<Value> = names
+            .iter()
+            .map(|name| json!({"name": name, "input": {}}))
+            .collect();
+        let mut turn = start_extension_turn(json!({ "calls": calls }), Posture::Ask);
+        let mut seen = Vec::new();
+        let answer = finish_extension_turn(&mut turn, &mut seen).await;
+        for (index, name) in names.iter().enumerate() {
+            assert_eq!(
+                answer["results"][index]["rejected"], "Refused",
+                "{name}: {answer}"
+            );
+        }
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, Event::ApprovalRequired { .. })),
+            "a refused call raises no approval request"
+        );
+    }
+
+    /// When the asker goes away while a card is open, the wait is withdrawn:
+    /// the approval is recorded cancelled (never decided for the person), the
+    /// turn continues, and the call fails.
+    #[tokio::test]
+    async fn a_withdrawn_extension_call_records_its_approval_cancelled_and_the_turn_continues() {
+        let mut turn = start_extension_turn(
+            json!({"calls": [{"name": "bash", "input": {"command": "echo hi"}}]}),
+            Posture::Ask,
+        );
+        let events = turn.events.clone();
+        let mut seen = Vec::new();
+        let event = next_approval_event(&events, &mut seen).await;
+        let withdrawn_id = approval_fields(&event).0.to_string();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut turn.task)
+                .await
+                .is_err(),
+            "the turn waits on the card"
+        );
+        turn.withdraw.notify_one();
+        let answer = finish_extension_turn(&mut turn, &mut seen).await;
+        assert!(
+            answer["results"][0]["rejected"].is_string()
+                || answer["results"][0]["unavailable"].is_string(),
+            "{answer}"
+        );
+        let replay = turn.store.replay(&turn.session_id).expect("replay");
+        assert!(replay.unmatched_asks.is_empty(), "no ask is left open");
+        assert_eq!(
+            replay
+                .completed
+                .iter()
+                .map(|receipt| receipt.outcome.clone())
+                .collect::<Vec<_>>(),
+            vec![ApprovalOutcome::Cancelled]
+        );
+        assert!(
+            seen.iter().any(
+                |event| matches!(event, Event::Status { message } if message.contains("withdrawn"))
+            ),
+            "the withdrawal is announced"
+        );
+        assert!(
+            seen.iter().any(|event| {
+                matches!(event, Event::ApprovalWithdrawn { id } if id == &withdrawn_id)
+            }),
+            "every decision surface receives the withdrawn approval identity"
+        );
+        // An answer that arrives afterwards finds no waiter and changes nothing.
+        let _ = turn.handle.approve_tool_call("late-answer").await;
+    }
+
+    /// One approval card at a time per invocation: a second call that needs
+    /// approval waits behind the first.
+    #[tokio::test]
+    async fn an_invocation_has_one_outstanding_approval_at_a_time() {
+        let mut turn = start_extension_turn(
+            json!({"parallel": true, "calls": [
+                {"name": "bash", "input": {"command": "echo one"}},
+                {"name": "bash", "input": {"command": "echo two"}},
+            ]}),
+            Posture::Ask,
+        );
+        let events = turn.events.clone();
+        let mut seen = Vec::new();
+        let first = next_approval_event(&events, &mut seen).await;
+        let (first_id, ..) = approval_fields(&first);
+        let first_id = first_id.to_string();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), async {
+                let mut rx = events.write().await;
+                while let Some(event) = rx.recv().await {
+                    if matches!(event, Event::ApprovalRequired { .. }) {
+                        return;
+                    }
+                }
+            })
+            .await
+            .is_err(),
+            "no second card while the first is open"
+        );
+        turn.handle
+            .approve_tool_call(&first_id)
+            .await
+            .expect("allow");
+        let second = next_approval_event(&events, &mut seen).await;
+        let (second_id, ..) = approval_fields(&second);
+        assert_ne!(second_id, first_id);
+        turn.handle.deny_tool_call(second_id).await.expect("deny");
+        let answer = finish_extension_turn(&mut turn, &mut seen).await;
+        assert_eq!(answer["results"].as_array().unwrap().len(), 2);
+    }
+
+    /// `await_tool_approval` stops when its withdraw token fires, with a
+    /// cancelled outcome in the log, and ignores it otherwise.
+    #[tokio::test]
+    async fn withdrawal_wins_over_an_already_queued_allow() {
+        let tmp = tempfile::tempdir().expect("fixture directory");
+        let (mut engine, handle) = Engine::new(
+            EngineConfig {
+                workspace: tmp.path().to_path_buf(),
+                terminal_chrome_enabled: false,
+                ..EngineConfig::default()
+            },
+            &Config::default(),
+        );
+        let store = crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions"));
+        engine.approval_receipt_store = Ok(store.clone());
+        let session_id = engine.session.id.clone();
+        let withdraw = tokio_util::sync::CancellationToken::new();
+        withdraw.cancel();
+        handle
+            .approve_tool_call("withdrawn-ready")
+            .await
+            .expect("queue allow");
+        let outcome = engine
+            .request_tool_approval_until(
+                "withdrawn-ready",
+                "exec_shell",
+                approval_event("withdrawn-ready"),
+                Some(&withdraw),
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(ToolError::Cancelled { .. })),
+            "{outcome:?}"
+        );
+        let replay = store.replay(&session_id).expect("replay");
+        assert!(replay.unmatched_asks.is_empty());
+        assert_eq!(
+            replay
+                .completed
+                .iter()
+                .map(|receipt| receipt.outcome.clone())
+                .collect::<Vec<_>>(),
+            vec![ApprovalOutcome::Cancelled]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_withdraw_token_ends_an_approval_wait_with_a_cancelled_outcome() {
+        let tmp = tempfile::tempdir().expect("fixture directory");
+        let (mut engine, handle) = Engine::new(
+            EngineConfig {
+                workspace: tmp.path().to_path_buf(),
+                terminal_chrome_enabled: false,
+                ..EngineConfig::default()
+            },
+            &Config::default(),
+        );
+        let store = crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions"));
+        engine.approval_receipt_store = Ok(store.clone());
+        let session_id = engine.session.id.clone();
+        let withdraw = tokio_util::sync::CancellationToken::new();
+        let token = withdraw.clone();
+        let task = tokio::spawn(async move {
+            engine
+                .request_tool_approval_until(
+                    "withdrawn-1",
+                    "exec_shell",
+                    approval_event("withdrawn-1"),
+                    Some(&token),
+                )
+                .await
+        });
+        let emitted = handle
+            .rx_event
+            .write()
+            .await
+            .recv()
+            .await
+            .expect("approval event");
+        assert!(matches!(emitted, Event::ApprovalRequired { .. }));
+        withdraw.cancel();
+        let outcome = task.await.expect("approval task");
+        assert!(
+            matches!(outcome, Err(ToolError::Cancelled { .. })),
+            "{outcome:?}"
+        );
+        let replay = store.replay(&session_id).expect("replay");
+        assert!(replay.unmatched_asks.is_empty());
+        assert_eq!(
+            replay
+                .completed
+                .iter()
+                .map(|receipt| receipt.outcome.clone())
+                .collect::<Vec<_>>(),
+            vec![ApprovalOutcome::Cancelled]
         );
     }
 }

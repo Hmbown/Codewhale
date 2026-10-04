@@ -31,7 +31,7 @@ fn make_app(tmpdir: &tempfile::TempDir, locale: Locale, has_api_key: bool) -> Ap
         &config,
     );
     app.ui_locale = locale;
-    app.api_provider = crate::config::ApiProvider::Deepseek;
+    app.api_provider = crate::config::ProviderKind::Deepseek;
     app.model_ids_passthrough = false;
     app.onboarding_needs_api_key = !has_api_key;
     app

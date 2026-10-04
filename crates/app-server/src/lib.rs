@@ -2,9 +2,10 @@ use codewhale_protocol::runtime::{MAX_RUNTIME_IMAGE_BODY_BYTES, RuntimeImageInpu
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -19,7 +20,7 @@ use codewhale_core::Runtime;
 use codewhale_hooks::{HookDispatcher, JsonlHookSink, StdoutHookSink, UnixSocketHookSink};
 use codewhale_protocol::{
     AppRequest, AppResponse, EventFrame, PromptRequest, PromptResponse, ResponseChannel,
-    ThreadGoalClearParams, ThreadGoalGetParams, ThreadGoalSetParams, ThreadRequest, ThreadResponse,
+    ThreadGoalClearParams, ThreadGoalGetParams, ThreadGoalSetParams,
 };
 use codewhale_state::StateStore;
 use serde::Deserialize;
@@ -31,7 +32,21 @@ use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 mod chat_completions;
+mod thread_control;
+pub use codewhale_protocol::{
+    ThreadListParams, ThreadReadParams, ThreadRequest, ThreadResponse, ThreadSetNameParams,
+};
+pub use thread_control::{ThreadControlSelection, request_thread_control};
+
+/// Capture once in a client before sending a durable control. Servers require
+/// the caller's retained key and never manufacture a replacement on retry.
+pub fn capture_thread_operation_key() -> String {
+    Uuid::new_v4().to_string()
+}
+pub mod daemon_client;
 pub mod daemon_socket;
+#[cfg(windows)]
+mod daemon_windows;
 
 /// Legacy DeepSeek-era naming kept for external compatibility.
 ///
@@ -91,22 +106,157 @@ impl std::fmt::Debug for AppServerOptions {
     }
 }
 
+/// Selected frontend facts passed by the canonical CLI in memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeControlFrontend {
+    Stdio,
+    Socket { path: Option<PathBuf> },
+    LegacyHttp,
+    Acp { model: String },
+}
+
+/// A bounded listener request admitted only over the authenticated owner channel.
+/// The bearer is explicit operator input, never discovery or response data.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeListenerSelection {
+    pub workers: usize,
+    pub workspace: PathBuf,
+    pub config_profile: Option<String>,
+    #[serde(default)]
+    pub config_source: Option<PathBuf>,
+    pub host: String,
+    pub port: u16,
+    pub cors_origins: Vec<String>,
+    pub auth_token: Option<String>,
+    pub insecure_no_auth: bool,
+    pub mobile: bool,
+    pub web: bool,
+}
+impl std::fmt::Debug for RuntimeListenerSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeListenerSelection")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("mobile", &self.mobile)
+            .field("web", &self.web)
+            .finish_non_exhaustive()
+    }
+}
+impl RuntimeListenerSelection {
+    pub fn validate_bounds(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.workspace.as_os_str().len() <= 32768
+                && self
+                    .config_source
+                    .as_ref()
+                    .is_none_or(|path| path.as_os_str().len() <= 32768)
+                && self
+                    .config_profile
+                    .as_ref()
+                    .is_none_or(|profile| profile.len() <= 1024)
+                && self.host.len() <= 128
+                && self.cors_origins.len() <= 64
+                && self.cors_origins.iter().map(String::len).sum::<usize>() <= 32768
+                && self
+                    .auth_token
+                    .as_ref()
+                    .is_none_or(|token| token.len() <= 8192),
+            "selected frontend input exceeds its bounds"
+        );
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeFrontendScope {
+    pub workers: usize,
+    pub workspace: PathBuf,
+    pub config_profile: Option<String>,
+    #[serde(default)]
+    pub config_source: Option<PathBuf>,
+}
+impl RuntimeFrontendScope {
+    pub fn validate_bounds(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.workspace.as_os_str().len() <= 32768
+                && self
+                    .config_source
+                    .as_ref()
+                    .is_none_or(|path| path.as_os_str().len() <= 32768)
+                && self
+                    .config_profile
+                    .as_ref()
+                    .is_none_or(|profile| profile.len() <= 1024),
+            "selected frontend scope exceeds its bounds"
+        );
+        Ok(())
+    }
+}
+#[derive(Clone)]
+pub enum RuntimeOwnerFrontendSelection {
+    Control(RuntimeFrontendScope),
+    Acp {
+        scope: Option<RuntimeFrontendScope>,
+        model: Option<String>,
+    },
+    Listener(RuntimeListenerSelection),
+}
+/// Captured Runtime-owned IO projection. Implementations use the held manager
+/// and existing routers; this port owns neither a store nor a turn controller.
+pub trait RuntimeOwnerFrontend: Send + Sync {
+    fn validate_selection<'a>(
+        &'a self,
+        selection: &'a RuntimeOwnerFrontendSelection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+    fn serve(
+        &self,
+        selection: RuntimeOwnerFrontendSelection,
+        compatibility: AppState,
+        input: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
+        output: Box<dyn AsyncWrite + Send + Unpin>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeOwnerRouting {
+    pub endpoint: SocketAddr,
+    /// The owning manager's acknowledged workspace. A legacy cold wrapper
+    /// without one cannot supply a default mutation scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<PathBuf>,
+    /// Actual held scheduler setting; absent on historical cold wrappers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers: Option<usize>,
+    pub mobile: bool,
+    pub web: bool,
+    pub acp: bool,
+    #[serde(default)]
+    pub acp_only: bool,
+}
+
 /// Cached app-server→runtime bridge handle.
 ///
 /// The outer [`AppState::runtime_bridge`] mutex guards only the cache slot;
-/// this inner mutex serializes traffic on one bridge (single child process
-/// plus per-thread seq bookkeeping requires ordered access).
+/// this inner mutex serializes traffic and event cursors for the captured
+/// canonical owner. It never creates or replaces an execution process.
 type SharedRuntimeBridge = Arc<Mutex<RuntimeBridge>>;
 
 #[derive(Clone)]
-struct AppState {
+pub struct AppState {
+    captured_owner: Option<codewhale_protocol::RuntimeOwnerReceipt>,
+    captured_routing: Option<RuntimeOwnerRouting>,
+    frontend_workspace: Option<PathBuf>,
+    owner_frontend: Option<Arc<dyn RuntimeOwnerFrontend>>,
     config_path: Option<PathBuf>,
     config: Arc<RwLock<codewhale_config::ConfigToml>>,
-    /// Read/write split mirrors [`Runtime`]'s own receivers: `&self`
-    /// operations (status, MCP startup) share a read guard and
-    /// run concurrently; `&mut self` turns (prompt/thread) and config pushes
-    /// take the write guard because the runtime genuinely requires
-    /// exclusivity there.
+    /// Bookkeeping config/jobs and read-only historical archive access.
+    /// Actual turns and transcript writes belong to the captured owner.
     runtime: Arc<RwLock<Runtime>>,
     registry: ModelRegistry,
     auth_token: Option<String>,
@@ -116,14 +266,10 @@ struct AppState {
     runtime_bridge: Arc<Mutex<Option<SharedRuntimeBridge>>>,
     /// Client-facing thread key → durable runtime thread id.
     ///
-    /// Runtime threads are persisted by the child's on-disk store
-    /// (`RuntimeThreadStore` under the session/task data dir), so a mapping
-    /// stays valid across a bridge restart: the next child resolves the same
-    /// thread ids. Keeping this on `AppState` rather than `RuntimeBridge` is
-    /// the point — `invalidate_runtime_bridge` drops the child but must not
-    /// orphan live stdio threads onto silently minted replacements (#6246).
-    /// Callers already serialize on the bridge mutex, so the map needs no
-    /// ordering guarantees of its own.
+    /// Runtime threads are persisted by the captured owner's store. Durable
+    /// aliases keep their exact target across frontend detach/reconnect;
+    /// withdrawing a bridge never remints a replacement thread.
+    /// Callers serialize traffic on the bridge mutex.
     runtime_thread_map: Arc<Mutex<HashMap<String, String>>>,
     stdio_thread_hints: Arc<Mutex<HashMap<String, RuntimeThreadHint>>>,
     /// Turns currently streaming over stdio, keyed by stdio thread id.
@@ -168,15 +314,15 @@ const THREAD_NOT_FOUND_CODE: i64 = -32004;
 /// Only the unix listener raises it; gated so the Windows build (where the
 /// listener is a typed-unsupported stub) does not fail `warnings = "deny"`
 /// on dead code.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const ATTACH_REQUIRED_CODE: i64 = -32010;
 /// Server error: a `daemon/attach` claim lost to a live owner.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const DAEMON_ALREADY_CLAIMED_CODE: i64 = -32011;
 /// Server error: only the owning client may `shutdown` the daemon.
 const NOT_DAEMON_OWNER_CODE: i64 = -32012;
 /// Server error: the client refused the daemon's version at attach time.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const DAEMON_VERSION_SKEW_CODE: i64 = -32013;
 /// Server error: `daemon/attach` sent twice on one connection.
 const ALREADY_ATTACHED_CODE: i64 = -32014;
@@ -194,17 +340,25 @@ struct StdioDispatchResult {
     should_exit: bool,
 }
 
-#[derive(Debug)]
 struct RuntimeBridge {
     base_url: String,
     client: reqwest::Client,
     auth_token: Option<String>,
+    #[cfg(test)]
     child: Option<Child>,
-    /// Per-child SSE replay cursors, keyed by *runtime* thread id. Event
-    /// sequence numbering is per child process, so this resets with the
-    /// bridge: a replacement child replays from seq 0 and the turn filter
-    /// in `stream_turn_events` drops everything but the live turn.
+    /// Captured owner SSE cursors, keyed by Runtime thread identity.
     last_seq_by_thread: HashMap<String, u64>,
+}
+
+impl std::fmt::Debug for RuntimeBridge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeBridge")
+            .field("base_url", &self.base_url)
+            .field("authenticated", &self.auth_token.is_some())
+            .field("last_seq_by_thread", &self.last_seq_by_thread)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -251,7 +405,16 @@ impl AppTransport {
         match self {
             Self::Http => "http",
             Self::Stdio => "stdio",
-            Self::Socket => "unix-socket",
+            Self::Socket => {
+                #[cfg(windows)]
+                {
+                    "named-pipe"
+                }
+                #[cfg(not(windows))]
+                {
+                    "unix-socket"
+                }
+            }
         }
     }
 }
@@ -276,7 +439,7 @@ struct StdioLoopPolicy {
 }
 
 impl StdioLoopPolicy {
-    /// The loop owned by the process's own stdin/stdout.
+    /// Legacy stdio qualification comparator; production stdio attaches its owner.
     const fn process_stdio() -> Self {
         Self {
             transport: AppTransport::Stdio,
@@ -376,6 +539,21 @@ async fn shutdown_signal() {
 /// belongs on the Runtime API (`/v1/threads/*`, `POST /v1/approvals/{id}`).
 const ADVERTISED_ROUTES: &[&str] = &["/thread", "/app", "/prompt", "/jobs"];
 
+/// Existing compatibility routes adopted by the canonical host listener.
+/// Both callers share the exact existing dispatcher/auth/body-limit routes.
+pub fn runtime_compatibility_router(
+    mut state: AppState,
+    cors_origins: &[String],
+    auth_token: Option<String>,
+    workspace: Option<PathBuf>,
+) -> Router {
+    // Only the listener's gate changes. The captured bridge keeps the original
+    // owner's in-memory credential and all shared dispatcher state.
+    state.auth_token = auth_token;
+    state.frontend_workspace = workspace;
+    app_router(state, cors_origins)
+}
+
 fn app_router(state: AppState, cors_origins: &[String]) -> Router {
     let protected_routes = Router::new()
         .route(
@@ -409,26 +587,247 @@ fn app_router(state: AppState, cors_origins: &[String]) -> Router {
         .with_state(state)
 }
 
-pub async fn run_stdio(config_path: Option<PathBuf>) -> Result<()> {
-    let state = build_state_off_runtime(config_path, None, AppTransport::Stdio).await?;
-    let reader = BufReader::new(tokio::io::stdin()).lines();
+/// Attach the existing compatibility dispatcher to the actual held Runtime.
+/// Auth remains process-private; it is never part of the owner receipt or IPC.
+#[cfg(any(unix, windows))]
+pub async fn bind_runtime_owner(
+    config_path: Option<PathBuf>,
+    endpoint: SocketAddr,
+    auth_token: Option<String>,
+    owner: codewhale_protocol::RuntimeOwnerReceipt,
+) -> Result<daemon_socket::DaemonSocket> {
+    let (daemon, _) = bind_runtime_frontends(
+        config_path,
+        auth_token,
+        owner,
+        RuntimeOwnerRouting {
+            endpoint,
+            workspace: None,
+            workers: None,
+            mobile: false,
+            web: false,
+            acp: false,
+            acp_only: false,
+        },
+        None,
+    )
+    .await?;
+    Ok(daemon)
+}
+
+/// Build the actual compatibility state once for all owner frontends.
+#[cfg(any(unix, windows))]
+pub async fn bind_runtime_frontends(
+    config_path: Option<PathBuf>,
+    auth_token: Option<String>,
+    owner: codewhale_protocol::RuntimeOwnerReceipt,
+    routing: RuntimeOwnerRouting,
+    owner_frontend: Option<Arc<dyn RuntimeOwnerFrontend>>,
+) -> Result<(daemon_socket::DaemonSocket, AppState)> {
+    anyhow::ensure!(
+        owner.version == 1 && owner.pid == std::process::id() && !owner.lease_generation.is_empty(),
+        "invalid captured Runtime owner"
+    );
+    let mut state =
+        build_state_off_runtime(config_path, auth_token.clone(), AppTransport::Socket).await?;
+    install_rustls_crypto_provider();
+    let endpoint = routing.endpoint;
+    let address = match endpoint.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, endpoint.port()))
+        }
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
+            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, endpoint.port()))
+        }
+        _ => endpoint,
+    };
+    let bridge = RuntimeBridge {
+        base_url: format!("http://{address}"),
+        client: codewhale_release::platform_http_client_builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?,
+        auth_token,
+        #[cfg(test)]
+        child: None,
+        last_seq_by_thread: HashMap::new(),
+    };
+    state.captured_owner = Some(owner.clone());
+    anyhow::ensure!(
+        routing.acp == owner_frontend.is_some() && (!routing.acp_only || routing.acp),
+        "ACP projection must belong to its actual captured owner"
+    );
+    state.frontend_workspace = routing.workspace.clone();
+    state.captured_routing = Some(routing);
+    state.owner_frontend = owner_frontend;
+    *state.runtime_bridge.lock().await = Some(Arc::new(Mutex::new(bridge)));
+    let daemon = daemon_socket::bind_captured_owner(state.clone(), owner).await?;
+    Ok((daemon, state))
+}
+
+pub async fn run_owned_acp(state: AppState) -> Result<()> {
+    anyhow::ensure!(
+        state
+            .captured_owner
+            .as_ref()
+            .is_some_and(|owner| owner.pid == std::process::id()),
+        "ACP stdio must belong to its actual captured host"
+    );
+    state
+        .owner_frontend
+        .as_ref()
+        .context("captured owner has no ACP projection")?
+        .serve(
+            RuntimeOwnerFrontendSelection::Acp {
+                scope: None,
+                model: None,
+            },
+            state.clone(),
+            Box::new(BufReader::new(tokio::io::stdin())),
+            Box::new(tokio::io::BufWriter::new(tokio::io::stdout())),
+        )
+        .await
+}
+
+/// The existing charged socket connection invokes the same priority-aware
+/// dispatcher after its captured Runtime has admitted the selected scope.
+pub async fn run_guest_control(
+    mut state: AppState,
+    workspace: PathBuf,
+    input: Box<dyn AsyncBufRead + Send + Unpin>,
+    output: Box<dyn AsyncWrite + Send + Unpin>,
+) -> Result<()> {
+    anyhow::ensure!(
+        state
+            .captured_owner
+            .as_ref()
+            .is_some_and(|owner| owner.pid == std::process::id()),
+        "control projection requires its actual captured host"
+    );
+    state.frontend_workspace = Some(workspace);
+    let policy = StdioLoopPolicy {
+        transport: AppTransport::Socket,
+        shutdown: ShutdownAuthority::Denied,
+    };
+    run_stdio_loop(&state, BoundedLines::new(input), output, policy, None::<()>).await?;
+    Ok(())
+}
+
+/// Logical write EOF for duplex transports. This is only a per-connection
+/// lifecycle notification; it carries no tool, turn or host-shutdown authority.
+pub fn is_control_input_closed(message: &Value) -> bool {
+    message["jsonrpc"] == "2.0"
+        && message.get("id").is_none()
+        && message["method"] == "daemon/input_closed"
+        && message["params"]
+            .as_object()
+            .is_some_and(|params| params.is_empty())
+}
+
+pub async fn run_owned_stdio(state: AppState) -> Result<()> {
+    anyhow::ensure!(
+        state
+            .captured_owner
+            .as_ref()
+            .is_some_and(|owner| owner.pid == std::process::id()),
+        "stdio must belong to its actual captured Runtime host"
+    );
+    let lines = BoundedLines::new(BufReader::new(tokio::io::stdin()));
     let writer = tokio::io::BufWriter::new(tokio::io::stdout());
     run_stdio_loop(
         &state,
-        reader,
+        lines,
         writer,
         StdioLoopPolicy::process_stdio(),
         None::<()>,
     )
-    .await
-    .map(|_exit| ())
+    .await?;
+    Ok(())
+}
+
+pub async fn run_stdio(config_path: Option<PathBuf>) -> Result<()> {
+    daemon_client::forward_stdio(config_path).await
+}
+
+/// Cancellation-safe, allocation-bounded newline framing shared by every
+/// local control transport. Consumed partial bytes remain owned by the reader.
+pub struct BoundedLines<R> {
+    reader: R,
+    pending: Vec<u8>,
+}
+
+impl<R: AsyncBufRead + Unpin> BoundedLines<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            pending: Vec::new(),
+        }
+    }
+
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+    pub async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                if self.pending.is_empty() {
+                    return Ok(None);
+                }
+                if self.pending.len() > MAX_RUNTIME_IMAGE_BODY_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "control request exceeds the 8 MiB transport limit",
+                    ));
+                }
+                let bytes = std::mem::take(&mut self.pending);
+                return String::from_utf8(bytes).map(Some).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "control frame is not UTF-8",
+                    )
+                });
+            }
+            let newline = available.iter().position(|&byte| byte == b'\n');
+            let count = newline.unwrap_or(available.len());
+            if count > (MAX_RUNTIME_IMAGE_BODY_BYTES + 1).saturating_sub(self.pending.len()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "control request exceeds the 8 MiB transport limit",
+                ));
+            }
+            // Do not let Vec's geometric growth double an almost-full frame.
+            self.pending.reserve_exact(count);
+            self.pending.extend_from_slice(&available[..count]);
+            self.reader.consume(count + usize::from(newline.is_some()));
+            if self.pending.len() > MAX_RUNTIME_IMAGE_BODY_BYTES
+                && self.pending.last() != Some(&b'\r')
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "control request exceeds the 8 MiB transport limit",
+                ));
+            }
+            if newline.is_some() {
+                if self.pending.last() == Some(&b'\r') {
+                    self.pending.pop();
+                }
+                let bytes = std::mem::take(&mut self.pending);
+                return String::from_utf8(bytes).map(Some).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "control frame is not UTF-8",
+                    )
+                });
+            }
+        }
+    }
 }
 
 /// The stdio JSON-RPC loop, generic over its transport so it can be driven by
 /// a duplex pipe in tests rather than the process's real stdin/stdout.
 async fn run_stdio_loop<R, W, C>(
     state: &AppState,
-    mut reader: tokio::io::Lines<R>,
+    mut reader: BoundedLines<R>,
     mut writer: W,
     policy: StdioLoopPolicy,
     // Dropped the moment input closes, not when the in-flight turn ends. The
@@ -447,11 +846,16 @@ where
     // Work that arrived while a turn was streaming. The turn owns the writer
     // for its whole duration, so these wait for it rather than interleaving
     // into the middle of a response.
-    let mut pending: VecDeque<PendingStdioWork> = VecDeque::new();
+    let mut pending: VecDeque<(PendingStdioWork, usize)> = VecDeque::new();
+    let mut pending_bytes = 0usize;
     let mut stdin_open = true;
 
     loop {
-        let request = match pending.pop_front() {
+        let next = pending.pop_front().map(|(work, bytes)| {
+            pending_bytes -= bytes;
+            work
+        });
+        let request = match next {
             Some(PendingStdioWork::Response(response)) => {
                 write_stdio_line(&mut writer, &response).await?;
                 continue;
@@ -475,6 +879,10 @@ where
             }
         };
 
+        if is_control_detach(&request) {
+            drop(input_claim.take());
+            return Ok(StdioLoopExit::InputClosed);
+        }
         let id = request.id.clone();
         if request.method == "shutdown" && policy.shutdown == ShutdownAuthority::Denied {
             write_stdio_line(
@@ -508,7 +916,9 @@ where
                                 drop(input_claim.take());
                             }
                             Some(line) => {
-                                handle_line_during_turn(state, &line, &mut pending, policy).await;
+                                if matches!(parse_stdio_line(&line), ParsedStdioLine::Request(ref request) if is_control_detach(request)) {
+                                    stdin_open=false; drop(input_claim.take());
+                                } else {handle_line_during_turn(state, &line, &mut pending, &mut pending_bytes, policy).await?;}
                             }
                         }
                     }
@@ -545,6 +955,26 @@ enum PendingStdioWork {
     Response(Value),
     /// Not started yet; runs normally once the turn is done.
     Request(JsonRpcRequest),
+}
+
+/// Fixed retained queue limits; exhaustion is a visible connection refusal
+/// before deferred work is admitted. Already-running effects are never replayed.
+fn queue_stdio_work(
+    pending: &mut VecDeque<(PendingStdioWork, usize)>,
+    bytes: &mut usize,
+    work: PendingStdioWork,
+    input_bytes: usize,
+) -> Result<()> {
+    let retained = input_bytes
+        .checked_add(1024)
+        .context("control queue size overflow")?;
+    anyhow::ensure!(
+        pending.len() < 64 && retained <= MAX_RUNTIME_IMAGE_BODY_BYTES.saturating_sub(*bytes),
+        "control queue limit exceeded; deferred request not admitted, in-flight outcomes may be uncertain"
+    );
+    *bytes += retained;
+    pending.push_back((work, retained));
+    Ok(())
 }
 
 enum ParsedStdioLine {
@@ -596,14 +1026,19 @@ fn parse_stdio_line(line: &str) -> ParsedStdioLine {
 async fn handle_line_during_turn(
     state: &AppState,
     line: &str,
-    pending: &mut VecDeque<PendingStdioWork>,
+    pending: &mut VecDeque<(PendingStdioWork, usize)>,
+    pending_bytes: &mut usize,
     policy: StdioLoopPolicy,
-) {
+) -> Result<()> {
     let request = match parse_stdio_line(line) {
-        ParsedStdioLine::Blank => return,
+        ParsedStdioLine::Blank => return Ok(()),
         ParsedStdioLine::Rejected(response) => {
-            pending.push_back(PendingStdioWork::Response(response));
-            return;
+            return queue_stdio_work(
+                pending,
+                pending_bytes,
+                PendingStdioWork::Response(response),
+                line.len(),
+            );
         }
         ParsedStdioLine::Request(request) => request,
     };
@@ -623,22 +1058,53 @@ async fn handle_line_during_turn(
                 },
                 Err(err) => jsonrpc_error(id, err),
             };
-            pending.push_back(PendingStdioWork::Response(response));
+            queue_stdio_work(
+                pending,
+                pending_bytes,
+                PendingStdioWork::Response(response),
+                line.len(),
+            )?;
         }
         "shutdown" if policy.shutdown == ShutdownAuthority::Denied => {
             // A non-owner may not even interrupt the live turns: that is the
             // first half of what shutdown does.
-            pending.push_back(PendingStdioWork::Response(jsonrpc_error(
-                request.id,
-                JsonRpcError::not_daemon_owner(),
-            )));
+            queue_stdio_work(
+                pending,
+                pending_bytes,
+                PendingStdioWork::Response(jsonrpc_error(
+                    request.id,
+                    JsonRpcError::not_daemon_owner(),
+                )),
+                line.len(),
+            )?;
         }
         "shutdown" => {
             let _ = interrupt_all_stdio_turns(state).await;
-            pending.push_back(PendingStdioWork::Request(request));
+            queue_stdio_work(
+                pending,
+                pending_bytes,
+                PendingStdioWork::Request(request),
+                line.len(),
+            )?;
         }
-        _ => pending.push_back(PendingStdioWork::Request(request)),
+        _ => queue_stdio_work(
+            pending,
+            pending_bytes,
+            PendingStdioWork::Request(request),
+            line.len(),
+        )?,
     }
+    Ok(())
+}
+
+fn is_control_detach(request: &JsonRpcRequest) -> bool {
+    request.jsonrpc.as_deref() == Some("2.0")
+        && request.id.is_none()
+        && request.method == "daemon/input_closed"
+        && request
+            .params
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
 }
 
 async fn write_stdio_line<W: AsyncWrite + Unpin>(writer: &mut W, response: &Value) -> Result<()> {
@@ -698,27 +1164,9 @@ async fn thread_handler(State(state): State<AppState>, Json(req): Json<ThreadReq
             Err(err) => http_error_from_jsonrpc(err).into_response(),
         };
     }
-    let mut runtime = state.runtime.write().await;
-    match runtime.handle_thread(req).await {
+    match handle_thread_request(&state, req).await {
         Ok(res) => (StatusCode::OK, Json(res)).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ThreadResponse {
-                thread_id: "error".to_string(),
-                status: format!("error:{err}"),
-                thread: None,
-                threads: Vec::new(),
-                goal: None,
-                model: None,
-                model_provider: None,
-                cwd: None,
-                approval_policy: None,
-                sandbox: None,
-                events: Vec::new(),
-                data: json!({}),
-            }),
-        )
-            .into_response(),
+        Err(err) => http_error_from_jsonrpc(err).into_response(),
     }
 }
 
@@ -781,11 +1229,11 @@ async fn build_state_off_runtime(
     auth_token: Option<String>,
     transport: AppTransport,
 ) -> Result<AppState> {
-    tokio::task::spawn_blocking(move || {
+    daemon_socket::owner_work(move || {
         build_state_with_transport(config_path, auth_token, transport)
     })
     .await
-    .context("app-server state setup task failed")?
+    .context("app-server state setup task failed")
 }
 
 fn build_state_with_transport(
@@ -829,6 +1277,10 @@ fn build_state_with_transport(
     let runtime = Runtime::new(config.clone(), state_store, hooks);
 
     Ok(AppState {
+        captured_owner: None,
+        captured_routing: None,
+        frontend_workspace: None,
+        owner_frontend: None,
         config_path,
         config: Arc::new(RwLock::new(config)),
         runtime: Arc::new(RwLock::new(runtime)),
@@ -1039,7 +1491,7 @@ impl JsonRpcError {
 
     /// Server error (-32000..-32099): the daemon-socket connection has not
     /// completed `daemon/attach`, so nothing but `healthz` is allowed yet.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn attach_required(method: &str) -> Self {
         Self {
             code: ATTACH_REQUIRED_CODE,
@@ -1053,7 +1505,7 @@ impl JsonRpcError {
     }
 
     /// Server error (-32000..-32099): a `claim` attach lost to a live owner.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn daemon_already_claimed(owner: &Value) -> Self {
         Self {
             code: DAEMON_ALREADY_CLAIMED_CODE,
@@ -1077,7 +1529,7 @@ impl JsonRpcError {
 
     /// Server error (-32000..-32099): the client's expected daemon version
     /// does not match the running binary (bundle skew).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn daemon_version_skew(expected: &str, actual: &str) -> Self {
         Self {
             code: DAEMON_VERSION_SKEW_CODE,
@@ -1106,15 +1558,18 @@ async fn handle_thread_request(
     state: &AppState,
     req: ThreadRequest,
 ) -> std::result::Result<ThreadResponse, JsonRpcError> {
-    let mut runtime = state.runtime.write().await;
-    runtime
-        .handle_thread(req)
-        .await
-        .map_err(|err| JsonRpcError::internal(err.to_string()))
+    thread_control::handle(state, req).await
 }
 
 /// One turn's worth of routing decisions, shared by every surface that runs
 /// a turn through the bridge.
+struct RuntimeTurnInput<'a> {
+    input: &'a str,
+    images: &'a [RuntimeImageInput],
+    max_output_tokens: Option<std::num::NonZeroU32>,
+    expected_workspace: Option<&'a Path>,
+}
+
 struct BridgedTurn<'a> {
     max_output_tokens: Option<std::num::NonZeroU32>,
     /// Client-facing thread id; the bridge maps it to a runtime thread.
@@ -1156,53 +1611,35 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
     if let Some(model) = turn.model_override {
         hint.get_or_insert_with(RuntimeThreadHint::default).model = Some(model);
     }
-    // Resolve the thread before touching the runtime, so an unknown id never
-    // spawns a child or mints a thread.
-    let durable = if turn.ephemeral {
+    // Durable compatibility IDs resolve through full canonical history and
+    // exact owner receipts before the existing turn transport can begin.
+    let resolved = if turn.ephemeral {
         None
     } else {
-        restore_thread_link(state, turn.thread_key, turn.require_known_thread).await?
+        Some(
+            thread_control::resolve(state, turn.thread_key, true)
+                .await
+                .map_err(|error| thread_control::rpc_error(error, Some(turn.thread_key)))?,
+        )
     };
-    // After a daemon restart the in-memory hints are empty. A runtime thread
-    // minted for a persisted thread must still start in the workspace that
-    // thread recorded, not the runtime's default cwd.
-    if let Some(durable) = durable.as_ref()
-        && !durable.cwd.as_os_str().is_empty()
-    {
+    if turn.require_known_thread && resolved.is_none() {
+        return Err(JsonRpcError::thread_not_found(turn.thread_key));
+    }
+    if let Some((_, workspace)) = resolved.as_ref() {
+        hint.get_or_insert_with(RuntimeThreadHint::default)
+            .workspace = Some(workspace.clone());
+    } else if let Some(workspace) = state.frontend_workspace.as_ref() {
         hint.get_or_insert_with(RuntimeThreadHint::default)
             .workspace
-            .get_or_insert_with(|| durable.cwd.clone());
+            .get_or_insert_with(|| workspace.clone());
     }
-    // The inner bridge lock is held for the whole turn: one child process
-    // serves all threads and per-thread seq tracking requires ordered
-    // access. The cache slot itself stays unlocked, so config updates and
-    // bridge invalidation are never queued behind a streaming turn.
+    // Retain the acknowledged/observed scope across all transport awaits.
+    // The owning Runtime rechecks this assertion at its final turn admission.
+    let expected_workspace = hint.as_ref().and_then(|hint| hint.workspace.clone());
     let mut bridge = acquire_live_runtime_bridge(state).await?;
     let mut thread_map = state.runtime_thread_map.clone().lock_owned().await;
-    // A link restored from the store was written by an earlier process. If
-    // the runtime no longer has that thread (its data dir was wiped or
-    // moved), every turn would fail against it forever; start a new runtime
-    // thread and relink instead. Only a definite 404 counts as gone.
-    if !thread_map.contains_key(turn.thread_key)
-        && let Some(restored) = durable
-            .as_ref()
-            .and_then(|d| d.runtime_thread_id.as_deref())
-    {
-        // Do not install a restored mapping before validation. If this
-        // request fails or is cancelled, the next caller must check again.
-        if bridge
-            .runtime_thread_exists(restored)
-            .await
-            .map_err(|err| JsonRpcError::runtime_unavailable(err.to_string()))?
-        {
-            thread_map.insert(turn.thread_key.to_string(), restored.to_string());
-        } else {
-            tracing::warn!(
-                thread = turn.thread_key,
-                runtime_thread = restored,
-                "linked runtime thread no longer exists; starting a new runtime thread"
-            );
-        }
+    if let Some((id, _)) = resolved {
+        thread_map.insert(turn.thread_key.to_string(), id);
     }
     if turn.max_output_tokens.is_some() {
         let info = bridge
@@ -1214,7 +1651,7 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
                 ),
             )
             .await
-            .map_err(|err| JsonRpcError::runtime_unavailable(err.to_string()))?;
+            .map_err(|error| JsonRpcError::runtime_unavailable(error.to_string()))?;
         if info
             .pointer("/capabilities/turn_output_token_limit")
             .and_then(Value::as_bool)
@@ -1228,43 +1665,13 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
             bridge
                 .require_output_limited_model(hint.as_ref().and_then(|hint| hint.model.as_deref()))
                 .await
-                .map_err(|err| JsonRpcError::invalid_params(err.to_string()))?;
+                .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
         }
     }
-    let minted = !thread_map.contains_key(turn.thread_key);
     let runtime_thread_id = bridge
         .ensure_runtime_thread(&mut thread_map, turn.thread_key, hint)
         .await
-        .map_err(|err| JsonRpcError::runtime_unavailable(err.to_string()))?;
-    // Persist the link whenever the store lacks it, not only when this call
-    // minted the runtime thread: an earlier turn that was dropped between
-    // minting and saving leaves a mapped but unlinked thread, which would
-    // otherwise fork on the next restart. SQLite may wait for another
-    // process's writer, so save off-runtime. The worker owns both guards until
-    // the link is persisted or the new mapping is rolled back: cancelling the
-    // caller cannot expose a half-settled mapping to the next turn.
-    if let Some(durable) = durable.as_ref()
-        && (minted || durable.runtime_thread_id.is_none())
-    {
-        let store = durable.store.clone();
-        let thread_key = turn.thread_key.to_string();
-        let linked_runtime_id = runtime_thread_id.clone();
-        (bridge, thread_map) = tokio::task::spawn_blocking(move || {
-            if let Err(err) = store.set_runtime_thread_link(&thread_key, &linked_runtime_id) {
-                if minted {
-                    bridge.forget_thread(&mut thread_map, &thread_key);
-                }
-                return Err(JsonRpcError::internal(format!(
-                    "failed to save the runtime link for thread {thread_key}: {err}"
-                )));
-            }
-            Ok((bridge, thread_map))
-        })
-        .await
-        .map_err(|err| JsonRpcError::internal(format!("thread link save task failed: {err}")))??;
-    }
-    // The mapping is settled for this turn; drop the guard so a long stream
-    // never holds the map hostage. `forget_thread` re-locks below.
+        .map_err(|error| JsonRpcError::runtime_unavailable(error.to_string()))?;
     drop(thread_map);
     let registration = turn
         .interruptible
@@ -1272,9 +1679,12 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
     let result = bridge
         .message_thread(
             &runtime_thread_id,
-            turn.input,
-            turn.images,
-            turn.max_output_tokens,
+            RuntimeTurnInput {
+                input: turn.input,
+                images: turn.images,
+                max_output_tokens: turn.max_output_tokens,
+                expected_workspace: expected_workspace.as_deref(),
+            },
             writer,
             registration,
             transcript,
@@ -1288,69 +1698,6 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
         bridge.forget_thread(&mut thread_map, turn.thread_key);
     }
     result.map_err(|err| JsonRpcError::internal(err.to_string()))
-}
-
-/// A persisted client thread, resolved before a turn touches the runtime.
-struct DurableThread {
-    /// The state store, copied out so the link can be saved without taking
-    /// the runtime lock while the bridge and thread-map locks are held.
-    store: StateStore,
-    /// The workspace the thread recorded (`thread/create`, `thread/resume`).
-    cwd: PathBuf,
-    /// Saved link, checked against the runtime before installing it in the
-    /// in-memory map. A failed or cancelled check must remain retryable.
-    runtime_thread_id: Option<String>,
-}
-
-/// Read `thread_key`'s durable runtime link and persisted thread, if any,
-/// before taking the bridge lock. Installation follows runtime validation.
-///
-/// The in-memory map dies with the process; without the durable link, a
-/// thread created before a daemon restart silently continued on a brand-new,
-/// empty runtime thread. With `require_known`, an id that is neither mapped,
-/// linked, nor persisted is `thread_not_found`.
-async fn restore_thread_link(
-    state: &AppState,
-    thread_key: &str,
-    require_known: bool,
-) -> std::result::Result<Option<DurableThread>, JsonRpcError> {
-    let store = state
-        .runtime
-        .read()
-        .await
-        .thread_manager
-        .state_store()
-        .clone();
-    let internal = |err: anyhow::Error| JsonRpcError::internal(err.to_string());
-    let read_store = store.clone();
-    let lookup_key = thread_key.to_string();
-    let persisted = tokio::task::spawn_blocking(move || -> Result<_> {
-        let Some(metadata) = read_store.get_thread(&lookup_key)? else {
-            return Ok(None);
-        };
-        let runtime_thread_id = read_store.get_runtime_thread_link(&lookup_key)?;
-        Ok(Some((metadata, runtime_thread_id)))
-    })
-    .await
-    .map_err(|err| JsonRpcError::internal(format!("thread link lookup task failed: {err}")))?
-    .map_err(internal)?;
-    let Some((metadata, runtime_thread_id)) = persisted else {
-        if require_known
-            && !state
-                .runtime_thread_map
-                .lock()
-                .await
-                .contains_key(thread_key)
-        {
-            return Err(JsonRpcError::thread_not_found(thread_key));
-        }
-        return Ok(None);
-    };
-    Ok(Some(DurableThread {
-        store,
-        cwd: metadata.cwd,
-        runtime_thread_id,
-    }))
 }
 
 /// Run a prompt as a genuine model turn and return what the model actually
@@ -1526,14 +1873,9 @@ async fn record_stdio_thread_hint(state: &AppState, response: &ThreadResponse) {
     );
 }
 
-/// Fetch the cached stdio→runtime bridge, spawning one on first use.
-///
-/// The cache-slot lock is held only for the lookup/insert — never across
-/// the child spawn or any request traffic — so [`invalidate_runtime_bridge`]
-/// and other slot users are never blocked behind a slow bridge operation.
-/// `start` spawns the child; production passes [`RuntimeBridge::start`], and
-/// tests pass a stub so a respawn can be observed without a real runtime.
-async fn acquire_runtime_bridge<F, Fut>(
+/// Historical cold-child cache comparator. It has no production producer.
+#[cfg(all(test, unix))]
+async fn acquire_historical_runtime_bridge<F, Fut>(
     state: &AppState,
     start: F,
 ) -> std::result::Result<SharedRuntimeBridge, JsonRpcError>
@@ -1543,6 +1885,11 @@ where
 {
     if let Some(bridge) = state.runtime_bridge.lock().await.as_ref() {
         return Ok(bridge.clone());
+    }
+    if state.captured_owner.is_some() {
+        return Err(JsonRpcError::runtime_unavailable(
+            "the captured Runtime owner is unavailable; refusing another owner",
+        ));
     }
     let bridge =
         Arc::new(Mutex::new(start().await.map_err(|err| {
@@ -1554,19 +1901,32 @@ where
     Ok(slot.get_or_insert_with(|| bridge.clone()).clone())
 }
 
-/// Lock a cached bridge whose child is still running, respawning once when
-/// the cached child has exited (crash, OOM kill, external `kill`). Without
-/// this a dead child stayed cached and every later turn failed until the
-/// app-server itself restarted.
+/// Use the exact bridge installed by the held canonical owner. No process,
+/// store or transcript can be created when this captured connection is absent.
+async fn acquire_runtime_bridge(
+    state: &AppState,
+) -> std::result::Result<SharedRuntimeBridge, JsonRpcError> {
+    state
+        .runtime_bridge
+        .lock()
+        .await
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| {
+            JsonRpcError::runtime_unavailable(
+                "the captured Runtime owner is unavailable; refusing another owner",
+            )
+        })
+}
+
 async fn acquire_live_runtime_bridge(
     state: &AppState,
 ) -> std::result::Result<tokio::sync::OwnedMutexGuard<RuntimeBridge>, JsonRpcError> {
-    acquire_live_runtime_bridge_with(state, || RuntimeBridge::start(state.config_path.as_deref()))
-        .await
+    Ok(acquire_runtime_bridge(state).await?.lock_owned().await)
 }
 
-/// [`acquire_live_runtime_bridge`] with the child spawn supplied by the
-/// caller (see [`acquire_runtime_bridge`]).
+/// Historical respawn comparison; all actual frontends use the held owner.
+#[cfg(all(test, unix))]
 async fn acquire_live_runtime_bridge_with<F, Fut>(
     state: &AppState,
     start: F,
@@ -1576,7 +1936,7 @@ where
     Fut: std::future::Future<Output = Result<RuntimeBridge>>,
 {
     for _ in 0..2 {
-        let shared = acquire_runtime_bridge(state, &start).await?;
+        let shared = acquire_historical_runtime_bridge(state, &start).await?;
         let mut bridge = shared.clone().lock_owned().await;
         if !bridge.child_exited() {
             return Ok(bridge);
@@ -1665,51 +2025,20 @@ async fn interrupt_all_stdio_turns(state: &AppState) -> usize {
     interrupted
 }
 
-/// Drop the cached runtime bridge so the next stdio thread message spawns a
-/// fresh child that re-reads the persisted config. An in-flight message
-/// keeps its own [`SharedRuntimeBridge`] clone and finishes against the old
-/// child, which is killed when the last clone drops.
-///
-/// The stdio→runtime thread map is deliberately *not* here: it lives on
-/// [`AppState::runtime_thread_map`] because runtime threads are durable —
-/// the fresh child resolves the same ids from its on-disk store (#6246).
-/// Only per-child state (`last_seq_by_thread`) dies with the bridge.
+/// Historical config/cache comparator. Captured owners retain their bridge.
+#[cfg(test)]
 async fn invalidate_runtime_bridge(state: &AppState) {
+    if state.captured_owner.is_some() {
+        return;
+    }
     let mut bridge = state.runtime_bridge.lock().await;
     *bridge = None;
 }
 
 impl RuntimeBridge {
-    async fn start(config_path: Option<&Path>) -> Result<Self> {
-        install_rustls_crypto_provider();
-        let auth_token = format!("cwrt_{}", Uuid::new_v4().simple());
-        // The bearer token only ever goes to the endpoint the child itself
-        // reports, and never follows a redirect away from it.
-        let client = codewhale_release::platform_http_client_builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("failed to build runtime API client")?;
-        let mut child = Self::runtime_command(config_path, &auth_token)?
-            .spawn()
-            .context("failed to start runtime API bridge")?;
-        let stdout = child.stdout.take();
-        // Owned by the bridge from here on, so every failure below reaps it.
-        let mut bridge = Self {
-            base_url: String::new(),
-            client,
-            auth_token: Some(auth_token),
-            child: Some(child),
-            last_seq_by_thread: HashMap::new(),
-        };
-        let stdout = stdout.context("runtime API bridge has no stdout to report its endpoint")?;
-        let endpoint = runtime_child_endpoint(stdout, Duration::from_secs(15)).await?;
-        bridge.base_url = format!("http://{endpoint}");
-        bridge.wait_until_ready().await?;
-        Ok(bridge)
-    }
-
     /// The child binds an ephemeral loopback port itself (`--port 0`) and
     /// reports it on stdout; the parent never reserves a port for it to race.
+    #[cfg(test)]
     fn runtime_command(config_path: Option<&Path>, auth_token: &str) -> Result<Command> {
         let current_exe = std::env::current_exe().ok();
         let mut command = if let Some(path) = current_exe {
@@ -1739,35 +2068,6 @@ impl RuntimeBridge {
         Ok(command)
     }
 
-    async fn wait_until_ready(&mut self) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if let Some(child) = self.child.as_mut()
-                && let Some(status) = child.try_wait()?
-            {
-                return Err(anyhow!(
-                    "runtime API bridge exited before becoming ready (status {status})"
-                ));
-            }
-
-            match self
-                .client
-                .get(format!("{}/health", self.base_url))
-                .send()
-                .await
-            {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                _ if Instant::now() >= deadline => {
-                    bail!(
-                        "timed out waiting for runtime API bridge at {}/health",
-                        self.base_url
-                    )
-                }
-                _ => tokio::time::sleep(Duration::from_millis(50)).await,
-            }
-        }
-    }
-
     fn authed(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self.auth_token.as_deref() {
             Some(token) => builder.bearer_auth(token),
@@ -1776,17 +2076,7 @@ impl RuntimeBridge {
     }
 
     async fn request_json(&self, builder: reqwest::RequestBuilder) -> Result<Value> {
-        let response = builder.send().await?;
-        let status = response.status();
-        let body = response.text().await?;
-        if !status.is_success() {
-            let detail = body.trim();
-            if detail.is_empty() {
-                bail!("runtime API returned {status}");
-            }
-            bail!("runtime API returned {status}: {detail}");
-        }
-        serde_json::from_str(&body).with_context(|| format!("invalid runtime API json: {body}"))
+        thread_control::read_json_response(builder.send().await?).await
     }
 
     /// Read the existing Runtime catalog before a one-shot prompt can create
@@ -1877,26 +2167,6 @@ impl RuntimeBridge {
         Ok(runtime_thread_id)
     }
 
-    /// Whether the runtime still has `runtime_thread_id`. Only a 404 means
-    /// gone; any other failure is an error, never a reason to start over.
-    async fn runtime_thread_exists(&self, runtime_thread_id: &str) -> Result<bool> {
-        let status = self
-            .authed(
-                self.client
-                    .get(format!("{}/v1/threads/{runtime_thread_id}", self.base_url)),
-            )
-            .send()
-            .await?
-            .status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(false);
-        }
-        if !status.is_success() {
-            bail!("runtime API returned {status} for thread {runtime_thread_id}");
-        }
-        Ok(true)
-    }
-
     /// Drop a thread mapping (and its seq cursor) once no caller can name
     /// the client-facing key again.
     fn forget_thread(&mut self, thread_map: &mut HashMap<String, String>, stdio_thread_id: &str) {
@@ -1936,14 +2206,21 @@ impl RuntimeBridge {
     async fn message_thread<W: AsyncWrite + Unpin>(
         &mut self,
         thread_id: &str,
-        input: &str,
-        images: &[RuntimeImageInput],
-        max_output_tokens: Option<std::num::NonZeroU32>,
+        input: RuntimeTurnInput<'_>,
         writer: &mut W,
         registration: Option<(TurnRegistry, String)>,
         mut transcript: Option<&mut TurnTranscript>,
     ) -> Result<Value> {
+        let RuntimeTurnInput {
+            input,
+            images,
+            max_output_tokens,
+            expected_workspace,
+        } = input;
         let mut request = json!({ "prompt": input });
+        if let Some(workspace) = expected_workspace {
+            request["expected_workspace"] = json!(workspace);
+        }
         if !images.is_empty() {
             let info = self
                 .request_json(
@@ -2206,12 +2483,14 @@ impl RuntimeBridge {
     }
 }
 
+#[cfg(test)]
 impl RuntimeBridge {
-    /// Whether the managed child has exited. A bridge without a child (tests,
+    /// Whether the historical fixture child has exited. A bridge without a child (tests,
     /// or an externally managed runtime) never reports exited. A `try_wait`
     /// error counts as exited: with `WNOHANG` it only fails when the pid is no
     /// longer this process's child (already reaped elsewhere), and such a
     /// child can neither be tracked nor killed on drop.
+    #[cfg(unix)]
     fn child_exited(&mut self) -> bool {
         self.child
             .as_mut()
@@ -2230,6 +2509,7 @@ impl RuntimeBridge {
     }
 }
 
+#[cfg(test)]
 impl Drop for RuntimeBridge {
     fn drop(&mut self) {
         self.shutdown_child();
@@ -2238,12 +2518,15 @@ impl Drop for RuntimeBridge {
 
 /// The line the Runtime prints once it holds its listener (the Runtime's
 /// `RUNTIME_LISTENING_PREFIX`; this crate does not depend on that one).
+#[cfg(test)]
 const RUNTIME_LISTENING_PREFIX: &str = "Runtime API listening on http://";
 /// The endpoint line is short and comes first; anything larger is not it.
+#[cfg(test)]
 const RUNTIME_READY_MAX_BYTES: usize = 1024;
 
 /// The endpoint a Runtime child reports for itself: exactly a nonzero port on
 /// `127.0.0.1`, the host the parent asked it to bind.
+#[cfg(test)]
 fn parse_runtime_endpoint(line: &str) -> Result<std::net::SocketAddr> {
     let address = line
         .trim_end()
@@ -2260,6 +2543,7 @@ fn parse_runtime_endpoint(line: &str) -> Result<std::net::SocketAddr> {
 }
 
 /// Read the first stdout line, bounded.
+#[cfg(test)]
 fn read_runtime_ready_line(stdout: &mut impl std::io::Read) -> Result<String> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
@@ -2276,28 +2560,6 @@ fn read_runtime_ready_line(stdout: &mut impl std::io::Read) -> Result<String> {
         line.push(byte[0]);
     }
     String::from_utf8(line).context("runtime API bridge readiness line is not UTF-8")
-}
-
-/// Wait for the child to report the endpoint it bound. The reader thread then
-/// keeps draining stdout for the child's lifetime, so the child's later
-/// prints neither block on a full pipe nor fail on a closed one. On error the
-/// caller drops the bridge, which kills and reaps the child.
-async fn runtime_child_endpoint(
-    mut stdout: std::process::ChildStdout,
-    wait: Duration,
-) -> Result<std::net::SocketAddr> {
-    let (ready, endpoint) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        let _ = ready.send(
-            read_runtime_ready_line(&mut stdout).and_then(|line| parse_runtime_endpoint(&line)),
-        );
-        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
-    });
-    match tokio::time::timeout(wait, endpoint).await {
-        Ok(Ok(endpoint)) => endpoint,
-        Ok(Err(_)) => bail!("runtime API bridge readiness reader ended unexpectedly"),
-        Err(_) => bail!("timed out waiting for the runtime API bridge to report its endpoint"),
-    }
 }
 
 fn install_rustls_crypto_provider() {
@@ -2736,14 +2998,11 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
             }
         }
         "shutdown" => {
-            // A turn streaming right now holds the bridge mutex, so taking it
-            // to kill the child would block until that turn ends — the exact
-            // deadlock that made shutdown useless against a runaway turn.
-            // Interrupt live turns first; they release the mutex promptly.
+            // The transport checks shutdown authority before dispatch.
+            // Interrupt live turns before returning the flushed shutdown
+            // result to its captured host. Keep the shared bridge bound while
+            // that owner drains its manager and listeners.
             let _ = interrupt_all_stdio_turns(state).await;
-            if let Some(bridge) = state.runtime_bridge.lock().await.take() {
-                bridge.lock().await.shutdown_child();
-            }
             StdioDispatchResult {
                 result: json!({"ok": true, "status": "stopped"}),
                 should_exit: true,
@@ -2865,15 +3124,14 @@ async fn process_app_request(
             events: Vec::new(),
         },
         AppRequest::ThreadLoadedList => {
-            let mut runtime = state.runtime.write().await;
-            let response = runtime
-                .handle_thread(codewhale_protocol::ThreadRequest::List(
-                    codewhale_protocol::ThreadListParams {
-                        include_archived: false,
-                        limit: Some(50),
-                    },
-                ))
-                .await;
+            let response = handle_thread_request(
+                state,
+                ThreadRequest::List(ThreadListParams {
+                    include_archived: false,
+                    limit: Some(50),
+                }),
+            )
+            .await;
             match response {
                 Ok(thread_resp) => AppResponse {
                     ok: true,
@@ -2882,7 +3140,7 @@ async fn process_app_request(
                 },
                 Err(err) => AppResponse {
                     ok: false,
-                    data: json!({ "error": err.to_string() }),
+                    data: json!({ "error": err.message }),
                     events: Vec::new(),
                 },
             }
@@ -2918,23 +3176,46 @@ async fn process_app_request(
     }
 }
 
-/// Push the current `state.config` into the live [`Runtime`] and invalidate
-/// the cached stdio bridge so the next stdio request spawns a fresh child
-/// that reads the new on-disk config. The stdio→runtime thread map survives:
-/// runtime threads are durable, so the fresh child adopts the existing
-/// mappings rather than minting replacements (#6246).
-///
-/// The snapshot is read under the runtime write guard, so concurrent updates
-/// leave the runtime on the latest installed config whatever order their
-/// propagations run in. MCP server connections are NOT refreshed here; the
-/// TUI's explicit `/mcp reload` operation is a separate path.
-async fn propagate_config(state: &AppState) {
+/// Install the saved config in the bookkeeping Runtime, then apply it through
+/// the already captured canonical owner. Unbound production frontends refuse
+/// application while retaining the saved config for explicit recovery.
+/// A saved config whose owner reload fails is reported as retained but unapplied.
+async fn propagate_config(state: &AppState) -> Result<()> {
     {
         let mut runtime = state.runtime.write().await;
         let snapshot = state.config.read().await.clone();
         runtime.update_config(snapshot);
     }
-    invalidate_runtime_bridge(state).await;
+    if state.captured_owner.is_some() {
+        let shared = acquire_runtime_bridge(state)
+            .await
+            .map_err(|_| anyhow!("config saved but captured Runtime owner is unavailable"))?;
+        let request = {
+            let bridge = shared.lock().await;
+            bridge
+                .authed(
+                    bridge
+                        .client
+                        .post(format!("{}/v1/config/reload", bridge.base_url)),
+                )
+                .timeout(Duration::from_secs(10))
+        };
+        let response = request
+            .send()
+            .await
+            .context("config saved; captured owner reload outcome is uncertain, not replayed")?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "config saved but captured owner rejected reload (status {})",
+            response.status()
+        );
+    } else {
+        #[cfg(test)]
+        invalidate_runtime_bridge(state).await;
+        #[cfg(not(test))]
+        bail!("config saved but no captured Runtime owner can apply it");
+    }
+    Ok(())
 }
 
 /// Prefix of a config error that is the server's fault (the file could not
@@ -2993,7 +3274,7 @@ async fn update_config_store(
         })
         .await
         .map_err(|err| anyhow!("config store task failed: {err}"))??;
-        propagate_config(&state).await;
+        propagate_config(&state).await?;
         Ok(())
     })
     .await
@@ -3023,6 +3304,335 @@ mod tests {
     use std::fs;
     use tokio::io::AsyncReadExt;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn control_framing_accepts_exact_limit_crlf_and_preserves_next_frame() {
+        let mut input = vec![b'x'; MAX_RUNTIME_IMAGE_BODY_BYTES];
+        input.extend_from_slice(b"\r\nnext\n");
+        let mut reader = BoundedLines::new(BufReader::with_capacity(8192, input.as_slice()));
+        assert_eq!(
+            reader.next_line().await.unwrap().unwrap().len(),
+            MAX_RUNTIME_IMAGE_BODY_BYTES
+        );
+        assert_eq!(reader.next_line().await.unwrap().as_deref(), Some("next"));
+        assert!(reader.next_line().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn control_framing_refuses_oversize_before_retaining_extra_bytes() {
+        let input = vec![b'x'; MAX_RUNTIME_IMAGE_BODY_BYTES + 4096];
+        let mut reader = BoundedLines::new(BufReader::with_capacity(8192, input.as_slice()));
+        assert_eq!(
+            reader.next_line().await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(reader.pending.len() <= MAX_RUNTIME_IMAGE_BODY_BYTES + 1);
+        assert!(reader.pending.capacity() <= MAX_RUNTIME_IMAGE_BODY_BYTES + 1);
+    }
+
+    #[tokio::test]
+    async fn control_framing_keeps_consumed_prefix_when_read_future_is_cancelled() {
+        let (mut input, output) = tokio::io::duplex(64);
+        input.write_all(b"partial").await.unwrap();
+        let mut reader = BoundedLines::new(BufReader::new(output));
+        std::future::poll_fn(|cx| {
+            let mut read = std::pin::pin!(reader.next_line());
+            assert!(std::future::Future::poll(read.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(reader.pending, b"partial");
+        input.write_all(b"-continued\n").await.unwrap();
+        assert_eq!(
+            reader.next_line().await.unwrap().as_deref(),
+            Some("partial-continued")
+        );
+    }
+
+    #[tokio::test]
+    async fn control_framing_rejects_non_utf8_and_keeps_eof_line_contract() {
+        let mut invalid = BoundedLines::new(BufReader::new(&b"\xff\n"[..]));
+        assert_eq!(
+            invalid.next_line().await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let mut eof = BoundedLines::new(BufReader::new(&b"last\r"[..]));
+        assert_eq!(eof.next_line().await.unwrap().as_deref(), Some("last\r"));
+        assert!(eof.next_line().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn retained_control_queue_refuses_exhaustion_without_admitting_more_work() {
+        let mut pending = VecDeque::new();
+        let mut bytes = 0;
+        for _ in 0..64 {
+            queue_stdio_work(
+                &mut pending,
+                &mut bytes,
+                PendingStdioWork::Response(json!({})),
+                2,
+            )
+            .unwrap();
+        }
+        let before = bytes;
+        assert!(
+            queue_stdio_work(
+                &mut pending,
+                &mut bytes,
+                PendingStdioWork::Response(json!({})),
+                2
+            )
+            .is_err()
+        );
+        assert_eq!(pending.len(), 64);
+        assert_eq!(bytes, before);
+        let mut pending = VecDeque::new();
+        let mut bytes = 0;
+        assert!(
+            queue_stdio_work(
+                &mut pending,
+                &mut bytes,
+                PendingStdioWork::Response(json!({})),
+                MAX_RUNTIME_IMAGE_BODY_BYTES
+            )
+            .is_err()
+        );
+        assert!(pending.is_empty());
+        assert_eq!(bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn captured_owner_bridge_is_retained_and_never_spawns_a_replacement() {
+        install_test_crypto_provider();
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        fs::write(&config, "").unwrap();
+        let mut state = build_state(Some(config), None).unwrap();
+        state.captured_owner = Some(codewhale_protocol::RuntimeOwnerReceipt {
+            version: 1,
+            data_dir: tmp.path().join("runtime"),
+            execution_scope: "fixture".into(),
+            lease_generation: "fixture".into(),
+            pid: std::process::id(),
+            process_start: "fixture".into(),
+            principal: "fixture".into(),
+            socket_path: tmp.path().join("owner.sock"),
+            config_path: state.config_path.clone(),
+        });
+        let captured = Arc::new(Mutex::new(RuntimeBridge {
+            base_url: "http://127.0.0.1:1".into(),
+            client: codewhale_release::tls::reqwest_client(),
+            auth_token: None,
+            child: None,
+            last_seq_by_thread: HashMap::new(),
+        }));
+        *state.runtime_bridge.lock().await = Some(captured.clone());
+        invalidate_runtime_bridge(&state).await;
+        let live = acquire_runtime_bridge(&state).await.unwrap();
+        assert!(Arc::ptr_eq(&live, &captured));
+        *state.runtime_bridge.lock().await = None;
+        let refused = acquire_runtime_bridge(&state).await;
+        assert!(refused.is_err());
+    }
+
+    #[tokio::test]
+    async fn unbound_frontend_refuses_turn_without_creating_a_runtime_owner() {
+        install_test_crypto_provider();
+        let (state, _temporary) = capability_test_state();
+        assert!(state.runtime_bridge.lock().await.is_none());
+        let refused = dispatch_stdio_request(
+            &state,
+            "prompt/request",
+            json!({"prompt":"must not dispatch"}),
+        )
+        .await
+        .expect_err("no captured owner can execute this prompt");
+        assert_eq!(refused.code, RUNTIME_UNAVAILABLE_CODE);
+        assert!(refused.message.contains("refusing another owner"));
+        assert!(state.runtime_bridge.lock().await.is_none());
+        assert!(state.runtime_thread_map.lock().await.is_empty());
+        assert!(state.in_flight_turns.lock().await.is_empty());
+    }
+
+    #[test]
+    fn captured_bridge_diagnostics_redact_private_authentication() {
+        let mut bridge = RuntimeBridge::from_base_url_for_test("http://127.0.0.1:1".into());
+        bridge.auth_token = Some("private-bridge-token-must-stay-in-memory".into());
+        let diagnostic = format!("{bridge:?}");
+        assert!(!diagnostic.contains("private-bridge-token"));
+        assert!(diagnostic.contains("authenticated: true"));
+    }
+
+    #[tokio::test]
+    async fn full_control_queue_keeps_interrupt_priority_and_guest_shutdown_refusal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        async fn interrupted(State(count): State<Arc<AtomicUsize>>) -> StatusCode {
+            count.fetch_add(1, Ordering::SeqCst);
+            StatusCode::OK
+        }
+        install_test_crypto_provider();
+        let count = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/v1/threads/runtime/turns/turn/interrupt",
+                post(interrupted),
+            )
+            .with_state(count.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (state, _root) = capability_test_state();
+        state.in_flight_turns.lock().await.insert(
+            "client".into(),
+            InFlightTurn {
+                base_url: format!("http://{address}"),
+                auth_token: None,
+                runtime_thread_id: "runtime".into(),
+                turn_id: "turn".into(),
+            },
+        );
+        let mut pending = VecDeque::new();
+        let mut bytes = 0;
+        for _ in 0..64 {
+            queue_stdio_work(
+                &mut pending,
+                &mut bytes,
+                PendingStdioWork::Response(json!({})),
+                2,
+            )
+            .unwrap();
+        }
+        let guest = StdioLoopPolicy {
+            transport: AppTransport::Socket,
+            shutdown: ShutdownAuthority::Denied,
+        };
+        assert!(
+            handle_line_during_turn(
+                &state,
+                r#"{"id":1,"method":"shutdown","params":{}}"#,
+                &mut pending,
+                &mut bytes,
+                guest
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "guest must not interrupt before its denied shutdown"
+        );
+        assert!(
+            handle_line_during_turn(
+                &state,
+                r#"{"id":2,"method":"thread/interrupt","params":{"thread_id":"client"}}"#,
+                &mut pending,
+                &mut bytes,
+                guest
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "interrupt acts before its overloaded reply queue"
+        );
+        let owner = StdioLoopPolicy {
+            transport: AppTransport::Socket,
+            shutdown: ShutdownAuthority::Granted,
+        };
+        assert!(
+            handle_line_during_turn(
+                &state,
+                r#"{"id":3,"method":"shutdown","params":{}}"#,
+                &mut pending,
+                &mut bytes,
+                owner
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "authorized shutdown retains immediate interrupt priority"
+        );
+        assert_eq!(pending.len(), 64);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bound_owner_config_reload_uses_private_auth_and_preserves_rejected_owner() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        #[derive(Clone)]
+        struct ReloadFixture {
+            count: Arc<AtomicUsize>,
+            refuse: Arc<AtomicBool>,
+        }
+        async fn reload(
+            State(fixture): State<ReloadFixture>,
+            headers: axum::http::HeaderMap,
+        ) -> StatusCode {
+            assert_eq!(
+                headers.get(header::AUTHORIZATION).unwrap(),
+                "Bearer private-reload-fixture"
+            );
+            fixture.count.fetch_add(1, Ordering::SeqCst);
+            if fixture.refuse.load(Ordering::SeqCst) {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::OK
+            }
+        }
+        install_test_crypto_provider();
+        let fixture = ReloadFixture {
+            count: Arc::new(AtomicUsize::new(0)),
+            refuse: Arc::new(AtomicBool::new(false)),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/config/reload", post(reload))
+            .with_state(fixture.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut state, root) = capability_test_state();
+        state.captured_owner = Some(codewhale_protocol::RuntimeOwnerReceipt {
+            version: 1,
+            data_dir: root.path().join("runtime"),
+            execution_scope: "fixture".into(),
+            lease_generation: "fixture".into(),
+            pid: std::process::id(),
+            process_start: "fixture".into(),
+            principal: "fixture".into(),
+            socket_path: root.path().join("owner.sock"),
+            config_path: state.config_path.clone(),
+        });
+        let mut bridge = RuntimeBridge::from_base_url_for_test(format!("http://{address}"));
+        bridge.auth_token = Some("private-reload-fixture".into());
+        let captured = Arc::new(Mutex::new(bridge));
+        *state.runtime_bridge.lock().await = Some(captured.clone());
+        propagate_config(&state).await.unwrap();
+        assert_eq!(fixture.count.load(Ordering::SeqCst), 1);
+        fixture.refuse.store(true, Ordering::SeqCst);
+        assert!(
+            propagate_config(&state)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("config saved")
+        );
+        assert_eq!(fixture.count.load(Ordering::SeqCst), 2);
+        assert!(Arc::ptr_eq(
+            state.runtime_bridge.lock().await.as_ref().unwrap(),
+            &captured
+        ));
+        server.abort();
+    }
 
     fn app_with_config(auth_token: Option<&str>) -> (Router, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3469,391 +4079,233 @@ mod tests {
         );
     }
 
-    /// A stub runtime that records which thread ids turns ran on and how
-    /// many threads it was asked to mint.
-    #[derive(Clone)]
-    struct RecordingRuntime {
-        created: Arc<std::sync::atomic::AtomicUsize>,
-        turn_threads: Arc<Mutex<Vec<String>>>,
-        /// The `workspace` each minted thread was asked to start in.
-        workspaces: Arc<Mutex<Vec<Value>>>,
-        lookup_failures: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    async fn spawn_recording_runtime() -> (String, RecordingRuntime, tokio::task::JoinHandle<()>) {
-        async fn create_thread(
-            State(f): State<RecordingRuntime>,
-            Json(body): Json<Value>,
-        ) -> Json<Value> {
-            f.created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            f.workspaces.lock().await.push(body["workspace"].clone());
-            Json(json!({ "id": "thr_minted" }))
-        }
-        // Only the thread this runtime mints exists; any other id is gone.
-        async fn get_thread(
-            State(f): State<RecordingRuntime>,
-            AxumPath(thread_id): AxumPath<String>,
-        ) -> StatusCode {
-            use std::sync::atomic::Ordering::SeqCst;
-            let mut remaining = f.lookup_failures.load(SeqCst);
-            while remaining > 0 {
-                match f.lookup_failures.compare_exchange_weak(
-                    remaining,
-                    remaining - 1,
-                    SeqCst,
-                    SeqCst,
-                ) {
-                    Ok(_) => return StatusCode::SERVICE_UNAVAILABLE,
-                    Err(current) => remaining = current,
-                }
-            }
-            if thread_id == "thr_minted" {
-                StatusCode::OK
-            } else {
-                StatusCode::NOT_FOUND
-            }
-        }
-        async fn create_turn(
-            State(f): State<RecordingRuntime>,
-            AxumPath(thread_id): AxumPath<String>,
-        ) -> Json<Value> {
-            f.turn_threads.lock().await.push(thread_id);
-            Json(json!({ "turn": { "id": "turn_recorded" } }))
-        }
-        async fn thread_events(
-            AxumPath(_thread_id): AxumPath<String>,
-        ) -> ([(header::HeaderName, &'static str); 1], String) {
-            (
-                [(header::CONTENT_TYPE, "text/event-stream")],
-                sse_frame(
-                    "turn.completed",
-                    json!({
-                        "seq": 1,
-                        "turn_id": "turn_recorded",
-                        "payload": { "turn": { "status": "completed" } }
-                    }),
-                ),
-            )
-        }
-
-        let fixture = RecordingRuntime {
-            created: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            turn_threads: Arc::new(Mutex::new(Vec::new())),
-            workspaces: Arc::new(Mutex::new(Vec::new())),
-            lookup_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind recording runtime");
-        let addr = listener.local_addr().expect("listener addr");
-        let app = Router::new()
-            .route("/v1/threads", post(create_thread))
-            .route("/v1/threads/{id}", get(get_thread))
-            .route("/v1/threads/{id}/turns", post(create_turn))
-            .route("/v1/threads/{id}/events", get(thread_events))
-            .with_state(fixture.clone());
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("serve recording runtime");
-        });
-        (format!("http://{addr}"), fixture, server)
-    }
-
     #[tokio::test]
     async fn config_update_keeps_the_stdio_thread_mapping() {
-        crate::install_test_crypto_provider();
-        // #6246: config reload rebuilds the bridge child, but runtime
-        // threads are durable — the fresh child resolves the same ids. The
-        // bug dropped the stdio→runtime map with the old bridge, so the next
-        // `thread/message` silently minted a new runtime thread instead of
-        // resuming the mapped one.
-        let (base_url, fixture, server) = spawn_recording_runtime().await;
-        let (state, _tmp) = capability_test_state();
-        state
-            .runtime_thread_map
-            .lock()
+        let (state, _tmp, server) = thread_control::compatibility_fixture().await;
+        thread_control::resolve(&state, "canonical-1", true)
             .await
-            .insert("stdio-keep".to_string(), "thr_keep".to_string());
-        seed_bridge_at(&state, base_url.clone()).await;
-
-        // Reloading unchanged config still rebuilds the bridge child.
+            .unwrap();
+        let bridge = state.runtime_bridge.lock().await.clone().unwrap();
+        let response =
+            process_app_request(&state, AppRequest::ConfigReload, AppTransport::Stdio).await;
+        assert!(response.ok, "captured owner reload failed: {response:?}");
         assert!(
-            process_app_request(&state, AppRequest::ConfigReload, AppTransport::Stdio)
+            state
+                .runtime_bridge
+                .lock()
                 .await
-                .ok
-        );
-        assert!(
-            state.runtime_bridge.lock().await.is_none(),
-            "config update must drop the cached bridge",
+                .as_ref()
+                .is_some_and(|captured| Arc::ptr_eq(captured, &bridge)),
+            "reload keeps the already captured owner"
         );
         assert_eq!(
             state
                 .runtime_thread_map
                 .lock()
                 .await
-                .get("stdio-keep")
+                .get("canonical-1")
                 .map(String::as_str),
-            Some("thr_keep"),
-            "the thread mapping must survive the bridge rebuild",
+            Some("canonical-1")
         );
-
-        // The fresh child (seeded here in place of `RuntimeBridge::start`,
-        // which cannot spawn in-process) must resume the mapped thread.
-        seed_bridge_at(&state, base_url).await;
         let result = dispatch_stdio_request(
             &state,
             "thread/message",
-            json!({ "thread_id": "stdio-keep", "input": "next" }),
+            json!({"thread_id":"canonical-1","input":"next"}),
         )
         .await
-        .expect("thread/message on the mapped thread");
-
-        assert_eq!(result.result["status"], json!("accepted"));
-        assert_eq!(
-            fixture.turn_threads.lock().await.as_slice(),
-            ["thr_keep".to_string()],
-            "the turn must run on the pre-existing runtime thread",
-        );
-        assert_eq!(
-            fixture.created.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "no new runtime thread may be minted for a mapped stdio thread",
-        );
-
+        .unwrap();
+        assert_eq!(result.result["status"], "accepted");
         server.abort();
-        let _ = server.await;
     }
 
     #[tokio::test]
     async fn thread_message_on_an_unknown_thread_is_not_found() {
-        crate::install_test_crypto_provider();
-        // A typo'd or never-created id used to mint a fresh runtime thread
-        // and answer from an empty conversation.
-        let (base_url, fixture, server) = spawn_recording_runtime().await;
-        let (state, _tmp) = capability_test_state();
-        seed_bridge_at(&state, base_url).await;
-
-        let err = dispatch_stdio_request(
+        let (state, _tmp, server) = thread_control::compatibility_fixture().await;
+        let error = dispatch_stdio_request(
             &state,
             "thread/message",
-            json!({ "thread_id": "never-created", "input": "hello" }),
+            json!({"thread_id":"never-created","input":"hello"}),
         )
         .await
-        .expect_err("an unknown thread must be refused");
-        assert_eq!(err.code, THREAD_NOT_FOUND_CODE);
-        let http_err = run_http_thread_message(
+        .unwrap_err();
+        assert_eq!(error.code, THREAD_NOT_FOUND_CODE);
+        let error = run_http_thread_message(
             &state,
-            "never-created".to_string(),
-            "hello".to_string(),
+            "never-created".into(),
+            "hello".into(),
             Vec::new(),
             None,
         )
         .await
-        .expect_err("HTTP messages refuse unknown threads too");
-        assert_eq!(http_err.code, THREAD_NOT_FOUND_CODE);
-        assert_eq!(
-            fixture.created.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "no runtime thread may be minted for an unknown id",
-        );
-        assert!(fixture.turn_threads.lock().await.is_empty());
-
+        .unwrap_err();
+        assert_eq!(error.code, THREAD_NOT_FOUND_CODE);
+        assert!(state.runtime_thread_map.lock().await.is_empty());
+        assert!(state.in_flight_turns.lock().await.is_empty());
         server.abort();
-        let _ = server.await;
     }
 
     #[tokio::test]
     async fn thread_runtime_link_survives_an_app_server_restart() {
-        crate::install_test_crypto_provider();
-        // The client→runtime thread map lived only in memory, so after a
-        // daemon restart `thread/message` on an existing thread silently
-        // continued on a brand-new, empty runtime thread.
-        let (base_url, fixture, server) = spawn_recording_runtime().await;
-        let (state, tmp) = capability_test_state();
-        seed_client_thread(&state, "client-1").await;
-        seed_bridge_at(&state, base_url.clone()).await;
+        let (state, tmp, server) = thread_control::compatibility_fixture().await;
+        let workspace = state.frontend_workspace.clone().unwrap();
+        let owner = state.captured_owner.clone();
+        let store = state.runtime.read().await.state_store().clone();
+        let mut metadata = codewhale_state::ThreadMetadata {
+            cwd: workspace.clone(),
+            ..test_client_metadata("client-1")
+        };
+        metadata.model_provider = "fixture-account".into();
+        restore_test_thread_archive(&store, &metadata);
         dispatch_stdio_request(
             &state,
             "thread/message",
-            json!({ "thread_id": "client-1", "input": "first" }),
+            json!({"thread_id":"client-1","input":"first"}),
         )
         .await
-        .expect("first message");
+        .unwrap();
+        let receipt = store
+            .get_canonical_runtime_link("client-1", owner.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        let bridge = state.runtime_bridge.lock().await.clone();
         drop(state);
-
-        // Same state directory, fresh process state.
-        let restarted =
-            build_state(Some(tmp.path().join("config.toml")), None).expect("restarted state");
+        let mut restarted = build_state(Some(tmp.path().join("config.toml")), None).unwrap();
+        restarted.captured_owner = owner;
+        restarted.frontend_workspace = Some(workspace);
+        *restarted.runtime_bridge.lock().await = bridge;
         assert!(restarted.runtime_thread_map.lock().await.is_empty());
-        seed_bridge_at(&restarted, base_url).await;
         dispatch_stdio_request(
             &restarted,
             "thread/message",
-            json!({ "thread_id": "client-1", "input": "second" }),
+            json!({"thread_id":"client-1","input":"second"}),
         )
         .await
-        .expect("message after restart");
-
+        .unwrap();
         assert_eq!(
-            fixture.created.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the restarted server must reuse the linked runtime thread",
+            restarted
+                .runtime_thread_map
+                .lock()
+                .await
+                .get("client-1")
+                .map(String::as_str),
+            Some("canonical-1")
         );
         assert_eq!(
-            fixture.turn_threads.lock().await.as_slice(),
-            ["thr_minted".to_string(), "thr_minted".to_string()],
+            store
+                .get_canonical_runtime_link("client-1", restarted.captured_owner.as_ref().unwrap())
+                .unwrap()
+                .unwrap(),
+            receipt
         );
-
         server.abort();
-        let _ = server.await;
     }
 
     #[tokio::test]
     async fn a_mapped_thread_without_a_saved_link_is_linked_on_its_next_turn() {
-        crate::install_test_crypto_provider();
-        // The link used to be saved only by the call that minted the runtime
-        // thread. A turn dropped between minting and saving left the thread
-        // mapped but unlinked, and it forked on the next daemon restart.
-        let (base_url, fixture, server) = spawn_recording_runtime().await;
-        let (state, _tmp) = capability_test_state();
-        seed_client_thread(&state, "client-1").await;
+        let (state, _tmp, server) = thread_control::compatibility_fixture().await;
+        let store = state.runtime.read().await.state_store().clone();
+        restore_test_thread_archive(
+            &store,
+            &codewhale_state::ThreadMetadata {
+                cwd: state.frontend_workspace.clone().unwrap(),
+                ..test_client_metadata("client-1")
+            },
+        );
         state
             .runtime_thread_map
             .lock()
             .await
-            .insert("client-1".to_string(), "thr_minted".to_string());
-        seed_bridge_at(&state, base_url).await;
-
+            .insert("client-1".into(), "unreceipted-cache".into());
         dispatch_stdio_request(
             &state,
             "thread/message",
-            json!({ "thread_id": "client-1", "input": "hello" }),
+            json!({"thread_id":"client-1","input":"hello"}),
         )
         .await
-        .expect("message on the mapped thread");
-
-        assert_eq!(fixture.created.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let link = state
-            .runtime
-            .read()
-            .await
-            .thread_manager
-            .state_store()
-            .get_runtime_thread_link("client-1")
-            .expect("read link");
-        assert_eq!(link.as_deref(), Some("thr_minted"));
-
+        .unwrap();
+        let receipt = store
+            .get_canonical_runtime_link("client-1", state.captured_owner.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.runtime_thread_id, "canonical-1");
+        assert_eq!(
+            store
+                .get_runtime_thread_link("client-1")
+                .unwrap()
+                .as_deref(),
+            Some("canonical-1")
+        );
+        assert_eq!(
+            state
+                .runtime_thread_map
+                .lock()
+                .await
+                .get("client-1")
+                .map(String::as_str),
+            Some("canonical-1")
+        );
         server.abort();
-        let _ = server.await;
     }
 
     #[tokio::test]
     async fn a_thread_messaged_after_a_restart_starts_in_its_stored_workspace() {
-        crate::install_test_crypto_provider();
-        // After a restart the in-memory hints are empty, so a runtime thread
-        // minted by `thread/message` (without `thread/resume`) used to start
-        // in the runtime's default cwd instead of the thread's workspace.
-        let (base_url, fixture, server) = spawn_recording_runtime().await;
-        let (state, _tmp) = capability_test_state();
-        seed_client_thread(&state, "client-1").await;
-        seed_bridge_at(&state, base_url).await;
-
+        let (state, _tmp, server) = thread_control::compatibility_fixture().await;
+        let workspace = state.frontend_workspace.clone().unwrap();
+        let store = state.runtime.read().await.state_store().clone();
+        restore_test_thread_archive(
+            &store,
+            &codewhale_state::ThreadMetadata {
+                cwd: workspace.clone(),
+                ..test_client_metadata("client-1")
+            },
+        );
+        assert!(state.stdio_thread_hints.lock().await.is_empty());
         dispatch_stdio_request(
             &state,
             "thread/message",
-            json!({ "thread_id": "client-1", "input": "hello" }),
+            json!({"thread_id":"client-1","input":"hello"}),
         )
         .await
-        .expect("message");
-
+        .unwrap();
         assert_eq!(
-            fixture.workspaces.lock().await.as_slice(),
-            [json!("/tmp/codewhale")],
+            thread_control::resolve(&state, "client-1", true)
+                .await
+                .unwrap()
+                .1,
+            workspace
         );
-
+        assert_eq!(
+            store.get_thread("client-1").unwrap().unwrap().cwd,
+            workspace
+        );
         server.abort();
-        let _ = server.await;
     }
 
     #[tokio::test]
     async fn a_link_to_a_runtime_thread_that_is_gone_is_replaced() {
-        crate::install_test_crypto_provider();
-        // A saved link whose runtime thread no longer exists (runtime data
-        // dir wiped or moved) failed every later turn with a runtime 404.
-        let (base_url, fixture, server) = spawn_recording_runtime().await;
-        let (state, _tmp) = capability_test_state();
-        seed_client_thread(&state, "client-1").await;
-        let store = state
-            .runtime
-            .read()
-            .await
-            .thread_manager
-            .state_store()
-            .clone();
-        store
-            .set_runtime_thread_link("client-1", "thr_gone")
-            .expect("seed stale link");
-        seed_bridge_at(&state, base_url).await;
-
-        dispatch_stdio_request(
+        // Keep the historical case identity. Missing owner checkpoints now
+        // refuse; replacing them with an empty conversation loses history.
+        let (state, _tmp, server) = thread_control::compatibility_fixture().await;
+        let store = state.runtime.read().await.state_store().clone();
+        restore_test_thread_archive(
+            &store,
+            &codewhale_state::ThreadMetadata {
+                cwd: state.frontend_workspace.clone().unwrap(),
+                ..test_client_metadata("client-1")
+            },
+        );
+        rusqlite::Connection::open(store.db_path()).unwrap().execute(
+            "INSERT INTO thread_runtime_links(thread_id,runtime_thread_id,created_at) VALUES('client-1','thr_gone',1)", []
+        ).unwrap();
+        let before = store.snapshot_legacy_thread_history("client-1").unwrap();
+        let error = dispatch_stdio_request(
             &state,
             "thread/message",
-            json!({ "thread_id": "client-1", "input": "hello" }),
+            json!({"thread_id":"client-1","input":"hello"}),
         )
         .await
-        .expect("message on a thread with a stale link");
-
-        assert_eq!(fixture.created.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(
-            fixture.turn_threads.lock().await.as_slice(),
-            ["thr_minted".to_string()],
-        );
-        assert_eq!(
-            store
-                .get_runtime_thread_link("client-1")
-                .expect("read link")
-                .as_deref(),
-            Some("thr_minted"),
-            "the stale link is replaced",
-        );
-
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn restored_thread_link_retries_validation_after_a_transient_failure() {
-        crate::install_test_crypto_provider();
-        let (base_url, fixture, server) = spawn_recording_runtime().await;
-        let (state, _tmp) = capability_test_state();
-        seed_client_thread(&state, "client-1").await;
-        let store = state
-            .runtime
-            .read()
-            .await
-            .thread_manager
-            .state_store()
-            .clone();
-        store
-            .set_runtime_thread_link("client-1", "thr_gone")
-            .unwrap();
-        seed_bridge_at(&state, base_url).await;
-        fixture
-            .lookup_failures
-            .store(1, std::sync::atomic::Ordering::SeqCst);
-
-        let failed = dispatch_stdio_request(
-            &state,
-            "thread/message",
-            json!({ "thread_id": "client-1", "input": "first" }),
-        )
-        .await
-        .expect_err("an uncertain lookup must not mint or send a turn");
-        assert_eq!(failed.code, RUNTIME_UNAVAILABLE_CODE);
-        assert_eq!(fixture.created.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(fixture.turn_threads.lock().await.is_empty());
-        assert!(state.runtime_thread_map.lock().await.is_empty());
+        .unwrap_err();
+        assert_eq!(error.code, THREAD_NOT_FOUND_CODE);
         assert_eq!(
             store
                 .get_runtime_thread_link("client-1")
@@ -3861,25 +4313,58 @@ mod tests {
                 .as_deref(),
             Some("thr_gone")
         );
+        assert!(
+            store
+                .get_canonical_runtime_link("client-1", state.captured_owner.as_ref().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_value(store.snapshot_legacy_thread_history("client-1").unwrap())
+                .unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert!(state.in_flight_turns.lock().await.is_empty());
+        server.abort();
+    }
 
+    #[tokio::test]
+    async fn restored_thread_link_retries_validation_after_a_transient_failure() {
+        let (state, _tmp, server) = thread_control::compatibility_fixture().await;
+        let store = state.runtime.read().await.state_store().clone();
+        restore_test_thread_archive(
+            &store,
+            &codewhale_state::ThreadMetadata {
+                cwd: state.frontend_workspace.clone().unwrap(),
+                ..test_client_metadata("client-1")
+            },
+        );
+        thread_control::resolve(&state, "client-1", true)
+            .await
+            .unwrap();
+        let receipt = store
+            .get_canonical_runtime_link("client-1", state.captured_owner.as_ref().unwrap())
+            .unwrap();
+        let bridge = state.runtime_bridge.lock().await.take();
+        let first = acquire_live_runtime_bridge(&state)
+            .await
+            .expect_err("transient connection refused");
+        assert_eq!(first.code, RUNTIME_UNAVAILABLE_CODE);
+        *state.runtime_bridge.lock().await = bridge;
         dispatch_stdio_request(
             &state,
             "thread/message",
-            json!({ "thread_id": "client-1", "input": "retry" }),
+            json!({"thread_id":"client-1","input":"retry"}),
         )
         .await
-        .expect("the next caller rechecks and repairs the confirmed missing thread");
-        assert_eq!(fixture.created.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(fixture.turn_threads.lock().await.as_slice(), ["thr_minted"]);
+        .unwrap();
         assert_eq!(
             store
-                .get_runtime_thread_link("client-1")
-                .unwrap()
-                .as_deref(),
-            Some("thr_minted")
+                .get_canonical_runtime_link("client-1", state.captured_owner.as_ref().unwrap())
+                .unwrap(),
+            receipt
         );
         server.abort();
-        let _ = server.await;
     }
 
     #[cfg(unix)]
@@ -4525,133 +5010,88 @@ mod tests {
 
     #[tokio::test]
     async fn stdio_thread_goal_methods_round_trip_persisted_goal() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let config_path = tmp.path().join("config.toml");
-        fs::write(&config_path, "").expect("write config");
-        let state = build_state(Some(config_path), None).expect("state");
-
+        let (state, _tmp, server) = thread_control::compatibility_fixture().await;
         let capabilities = dispatch_stdio_request(&state, "thread/capabilities", json!({}))
             .await
-            .expect("thread capabilities");
+            .unwrap();
         assert!(
             capabilities.result["methods"]
                 .as_array()
-                .expect("methods")
+                .unwrap()
                 .iter()
                 .any(|method| method == "thread/goal/set")
         );
-
-        let started = dispatch_stdio_request(&state, "thread/start", json!({}))
-            .await
-            .expect("start thread");
-        let thread_id = started.result["thread_id"]
-            .as_str()
-            .expect("thread id")
-            .to_string();
-
+        let started = dispatch_stdio_request(
+            &state,
+            "thread/start",
+            json!({"operation_key":"goal-start"}),
+        )
+        .await
+        .unwrap();
+        let id = started.result["thread_id"].as_str().unwrap();
         let set = dispatch_stdio_request(
             &state,
             "thread/goal/set",
-            json!({
-                "thread_id": thread_id,
-                "objective": "Release 0.8.59",
-                "token_budget": 59000
-            }),
+            json!({"thread_id":id,"objective":"Release 0.10.1","token_budget":59000}),
         )
         .await
-        .expect("set goal");
-        assert_eq!(set.result["status"], "ok");
-        assert_eq!(set.result["goal"]["objective"], "Release 0.8.59");
+        .unwrap();
+        assert_eq!(set.result["goal"]["objective"], "Release 0.10.1");
         assert_eq!(set.result["goal"]["status"], "active");
-
-        let got = dispatch_stdio_request(
-            &state,
-            "thread/goal/get",
-            json!({
-                "thread_id": thread_id
-            }),
-        )
-        .await
-        .expect("get goal");
+        let got = dispatch_stdio_request(&state, "thread/goal/get", json!({"thread_id":id}))
+            .await
+            .unwrap();
         assert_eq!(got.result["goal"]["token_budget"], 59000);
-
-        let cleared = dispatch_stdio_request(
-            &state,
-            "thread/goal/clear",
-            json!({
-                "thread_id": thread_id
-            }),
-        )
-        .await
-        .expect("clear goal");
+        let cleared = dispatch_stdio_request(&state, "thread/goal/clear", json!({"thread_id":id}))
+            .await
+            .unwrap();
         assert_eq!(cleared.result["status"], "cleared");
         assert_eq!(cleared.result["data"]["cleared"], true);
+        server.abort();
     }
 
     #[tokio::test]
     async fn stdio_resume_of_missing_thread_fails_without_clobbering_the_hint() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let config_path = tmp.path().join("config.toml");
-        fs::write(&config_path, "").expect("write config");
-        let state = build_state(Some(config_path), None).expect("state");
-
-        // A cached hint for a thread the runtime no longer knows: the exact
-        // clobber scenario from #5171.
+        let (state, tmp, server) = thread_control::compatibility_fixture().await;
         let workspace = tmp.path().join("ws");
-        {
-            let mut hints = state.stdio_thread_hints.lock().await;
-            hints.insert(
-                "ghost-thread".to_string(),
-                RuntimeThreadHint {
-                    model: Some("deepseek-v4-pro".to_string()),
-                    workspace: Some(workspace.clone()),
-                },
-            );
+        state.stdio_thread_hints.lock().await.insert(
+            "ghost-thread".into(),
+            RuntimeThreadHint {
+                model: Some("fixture-model".into()),
+                workspace: Some(workspace.clone()),
+            },
+        );
+        for method in ["thread/resume", "thread/fork"] {
+            let error = dispatch_stdio_request(
+                &state,
+                method,
+                json!({"thread_id":"ghost-thread","operation_key":format!("{method}-missing")}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, THREAD_NOT_FOUND_CODE);
+            assert!(error.message.contains("ghost-thread"));
         }
-
-        let err = dispatch_stdio_request(
-            &state,
-            "thread/resume",
-            json!({ "thread_id": "ghost-thread" }),
-        )
-        .await
-        .expect_err("resuming a missing thread must fail with a named not-found error");
-        assert_eq!(err.code, -32004);
-        assert!(err.message.contains("ghost-thread"), "{}", err.message);
-
-        let fork_err = dispatch_stdio_request(
-            &state,
-            "thread/fork",
-            json!({ "thread_id": "ghost-thread" }),
-        )
-        .await
-        .expect_err("forking a missing thread must fail with a named not-found error");
-        assert_eq!(fork_err.code, -32004);
-
         let hints = state.stdio_thread_hints.lock().await;
-        let hint = hints.get("ghost-thread").expect("cached hint survives");
-        assert_eq!(hint.model.as_deref(), Some("deepseek-v4-pro"));
-        assert_eq!(hint.workspace.as_deref(), Some(workspace.as_path()));
+        assert_eq!(
+            hints["ghost-thread"].model.as_deref(),
+            Some("fixture-model")
+        );
+        assert_eq!(hints["ghost-thread"].workspace.as_ref(), Some(&workspace));
+        server.abort();
     }
 
     #[tokio::test]
     async fn stdio_archive_of_missing_thread_fails_instead_of_reporting_success() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let config_path = tmp.path().join("config.toml");
-        fs::write(&config_path, "").expect("write config");
-        let state = build_state(Some(config_path), None).expect("state");
+        let (state, _tmp, server) = thread_control::compatibility_fixture().await;
         for method in ["thread/archive", "thread/unarchive"] {
-            let err =
-                dispatch_stdio_request(&state, method, json!({ "thread_id": "ghost-thread" }))
-                    .await
-                    .expect_err("an unknown thread id must fail");
-            assert_eq!(err.code, -32004, "{method}");
-            assert!(
-                err.message.contains("ghost-thread"),
-                "{method}: {}",
-                err.message
-            );
+            let error = dispatch_stdio_request(&state, method, json!({"thread_id":"ghost-thread"}))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, THREAD_NOT_FOUND_CODE);
+            assert!(error.message.contains("ghost-thread"));
         }
+        server.abort();
     }
 
     fn sse_frame(event: &str, payload: Value) -> String {
@@ -4659,7 +5099,9 @@ mod tests {
     }
     /// A runtime whose turn never ends on its own — only an interrupt stops
     /// it. That is the shape of the runaway turn this protects against.
-    async fn spawn_uninterruptible_until_asked_runtime() -> (
+    async fn spawn_uninterruptible_until_asked_runtime(
+        owner_router: Router,
+    ) -> (
         String,
         Arc<tokio::sync::Notify>,
         tokio::task::JoinHandle<()>,
@@ -4726,7 +5168,8 @@ mod tests {
                 post(interrupt),
             )
             .route("/v1/threads/{thread_id}/events", get(thread_events))
-            .with_state(interrupted.clone());
+            .with_state(interrupted.clone())
+            .fallback_service(owner_router);
         let server = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
@@ -4737,8 +5180,9 @@ mod tests {
 
     #[tokio::test]
     async fn interrupt_stops_a_turn_that_would_otherwise_stream_forever() {
-        let (base_url, _notify, server) = spawn_uninterruptible_until_asked_runtime().await;
-        let (state, _tmp) = capability_test_state();
+        let (state, _tmp, owner_router) = thread_control::compatibility_router();
+        let (base_url, _notify, server) =
+            spawn_uninterruptible_until_asked_runtime(owner_router).await;
         seed_client_thread(&state, "thr_a").await;
         *state.runtime_bridge.lock().await = Some(Arc::new(Mutex::new(
             RuntimeBridge::from_base_url_for_test(base_url),
@@ -4752,7 +5196,7 @@ mod tests {
             let (rx, tx) = tokio::io::split(server_side);
             run_stdio_loop(
                 &loop_state,
-                BufReader::new(rx).lines(),
+                BoundedLines::new(BufReader::new(rx)),
                 tx,
                 StdioLoopPolicy::process_stdio(),
                 None::<()>,
@@ -4881,13 +5325,14 @@ mod tests {
             f.requests.lock().await.push(body);
             Json(json!({"turn":{"id":"turn_cap"}}))
         }
-        async fn events() -> impl IntoResponse {
+        async fn events(State(f): State<Fixture>) -> impl IntoResponse {
+            let seq = f.requests.lock().await.len();
             (
                 [(header::CONTENT_TYPE, "text/event-stream")],
                 sse_frame(
                     "turn.completed",
                     json!({
-                        "seq":1,"turn_id":"turn_cap","payload":{"turn":{"status":"completed"}}
+                        "seq":seq,"turn_id":"turn_cap","payload":{"turn":{"status":"completed"}}
                     }),
                 ),
             )
@@ -4899,6 +5344,7 @@ mod tests {
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (state, _tmp, owner_router) = thread_control::compatibility_router();
         let router = Router::new()
             .route("/v1/runtime/info", get(info))
             .route("/v1/providers", get(providers))
@@ -4906,9 +5352,9 @@ mod tests {
             .route("/v1/threads", post(create_thread))
             .route("/v1/threads/{id}/turns", post(create_turn))
             .route("/v1/threads/{id}/events", get(events))
-            .with_state(fixture.clone());
+            .with_state(fixture.clone())
+            .fallback_service(owner_router);
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let (state, _tmp) = capability_test_state();
         let mut bridge = RuntimeBridge::from_base_url_for_test(format!("http://{addr}"));
         bridge.auth_token = Some("fixture-output-cap".into());
         *state.runtime_bridge.lock().await = Some(Arc::new(Mutex::new(bridge)));
@@ -5059,7 +5505,18 @@ mod tests {
         let (mut reader, mut writer) = tokio::io::duplex(4096);
 
         let result = bridge
-            .message_thread("thr_test", "hello", &[], None, &mut writer, None, None)
+            .message_thread(
+                "thr_test",
+                RuntimeTurnInput {
+                    input: "hello",
+                    images: &[],
+                    max_output_tokens: None,
+                    expected_workspace: None,
+                },
+                &mut writer,
+                None,
+                None,
+            )
             .await
             .expect("message_thread should succeed");
         drop(writer);
@@ -5160,7 +5617,18 @@ mod tests {
         let mut bridge = RuntimeBridge::from_base_url_for_test(format!("http://{addr}"));
         let (mut reader, mut writer) = tokio::io::duplex(4096);
         let result = bridge
-            .message_thread("thr_broken", "hello", &[], None, &mut writer, None, None)
+            .message_thread(
+                "thr_broken",
+                RuntimeTurnInput {
+                    input: "hello",
+                    images: &[],
+                    max_output_tokens: None,
+                    expected_workspace: None,
+                },
+                &mut writer,
+                None,
+                None,
+            )
             .await;
         drop(writer);
         let mut stdout = Vec::new();
@@ -5249,7 +5717,9 @@ mod tests {
 
     /// A minimal but honest runtime: it creates threads, starts turns, and
     /// streams `agent_message` deltas followed by `turn.completed`.
-    async fn spawn_stub_runtime() -> (String, StubPrompts, tokio::task::JoinHandle<()>) {
+    async fn spawn_stub_runtime(
+        owner_router: Option<Router>,
+    ) -> (String, StubPrompts, tokio::task::JoinHandle<()>) {
         async fn create_thread(Json(body): Json<Value>) -> Json<Value> {
             Json(json!({
                 "id": "thr_stub",
@@ -5315,6 +5785,10 @@ mod tests {
             .route("/v1/threads/{thread_id}/turns", post(create_turn))
             .route("/v1/threads/{thread_id}/events", get(thread_events))
             .with_state(prompts.clone());
+        let app = match owner_router {
+            Some(owner) => app.fallback_service(owner),
+            None => app,
+        };
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -5330,7 +5804,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_request_executes_a_genuine_model_turn() {
         let (state, _tmp) = capability_test_state();
-        let (base_url, prompts, server) = spawn_stub_runtime().await;
+        let (base_url, prompts, server) = spawn_stub_runtime(None).await;
         seed_bridge_at(&state, base_url).await;
 
         let (mut reader, mut writer) = tokio::io::duplex(4096);
@@ -5435,9 +5909,9 @@ mod tests {
 
     #[tokio::test]
     async fn http_thread_message_runs_the_turn_instead_of_queueing_it() {
-        let (state, _tmp) = capability_test_state();
+        let (state, _tmp, owner_router) = thread_control::compatibility_router();
         seed_client_thread(&state, "thr_http").await;
-        let (base_url, prompts, server) = spawn_stub_runtime().await;
+        let (base_url, prompts, server) = spawn_stub_runtime(Some(owner_router)).await;
         seed_bridge_at(&state, base_url).await;
 
         let response = run_http_thread_message(
@@ -5468,7 +5942,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_thread_message_without_a_runtime_is_a_typed_error() {
-        let (state, _tmp) = capability_test_state();
+        let (state, _tmp, _owner_router) = thread_control::compatibility_router();
         seed_client_thread(&state, "thr_http").await;
         seed_bridge_at(&state, "http://127.0.0.1:9".to_string()).await;
 
@@ -5571,38 +6045,51 @@ mod tests {
 
     /// Persist a client thread under a fixed id, as `thread/create` would,
     /// so `thread/message` accepts it.
-    async fn seed_client_thread(state: &AppState, thread_id: &str) {
-        state
-            .runtime
-            .read()
-            .await
-            .thread_manager
-            .state_store()
-            .upsert_thread(&codewhale_state::ThreadMetadata {
-                id: thread_id.to_string(),
-                rollout_path: None,
-                preview: String::new(),
-                ephemeral: false,
-                model_provider: "deepseek".to_string(),
-                created_at: 1,
-                updated_at: 1,
-                status: codewhale_state::ThreadStatus::Idle,
-                path: None,
-                cwd: PathBuf::from("/tmp/codewhale"),
-                cli_version: "0.0.0-test".to_string(),
-                source: codewhale_state::SessionSource::Api,
-                name: None,
-                sandbox_policy: None,
-                approval_mode: None,
-                archived: false,
-                archived_at: None,
-                git_sha: None,
-                git_branch: None,
-                git_origin_url: None,
-                memory_mode: None,
-                current_leaf_id: None,
+    fn test_client_metadata(thread_id: &str) -> codewhale_state::ThreadMetadata {
+        codewhale_state::ThreadMetadata {
+            id: thread_id.to_string(),
+            rollout_path: None,
+            preview: String::new(),
+            ephemeral: false,
+            model_provider: "deepseek".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            status: codewhale_state::ThreadStatus::Idle,
+            path: None,
+            cwd: PathBuf::from("/tmp/codewhale"),
+            cli_version: "0.0.0-test".to_string(),
+            source: codewhale_state::SessionSource::Api,
+            name: None,
+            sandbox_policy: None,
+            approval_mode: None,
+            archived: false,
+            archived_at: None,
+            git_sha: None,
+            git_branch: None,
+            git_origin_url: None,
+            memory_mode: None,
+            current_leaf_id: None,
+        }
+    }
+
+    fn restore_test_thread_archive(store: &StateStore, metadata: &codewhale_state::ThreadMetadata) {
+        store
+            .restore_legacy_thread_archive(&codewhale_state::LegacyThreadArchive {
+                thread: metadata.clone(),
+                messages: Vec::new(),
+                goal: None,
+                checkpoints: Vec::new(),
             })
-            .expect("seed client thread");
+            .expect("restore absent historical fixture");
+    }
+
+    async fn seed_client_thread(state: &AppState, thread_id: &str) {
+        let mut metadata = test_client_metadata(thread_id);
+        if let Some(workspace) = state.frontend_workspace.as_ref() {
+            metadata.cwd = workspace.clone();
+        }
+        let store = state.runtime.read().await.state_store().clone();
+        restore_test_thread_archive(&store, &metadata);
     }
 
     #[tokio::test]
@@ -5639,7 +6126,12 @@ mod tests {
         )
         .await
         .expect("capabilities dispatch");
-        assert_eq!(caps.result["transport"], json!("unix-socket"));
+        let expected_transport = if cfg!(windows) {
+            "named-pipe"
+        } else {
+            "unix-socket"
+        };
+        assert_eq!(caps.result["transport"], json!(expected_transport));
         let methods: Vec<String> = caps.result["methods"]
             .as_array()
             .expect("methods array")
@@ -5968,9 +6460,12 @@ mod tests {
                 bridge
                     .message_thread(
                         "thr_fixture",
-                        "look",
-                        &images,
-                        None,
+                        RuntimeTurnInput {
+                            input: "look",
+                            images: &images,
+                            max_output_tokens: None,
+                            expected_workspace: None
+                        },
                         &mut writer,
                         None,
                         None

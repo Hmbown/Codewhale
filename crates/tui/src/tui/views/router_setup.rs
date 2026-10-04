@@ -36,7 +36,7 @@ use ratatui::{
 };
 
 use crate::client::system_one::DecisionRouterRoute;
-use crate::config::{ApiProvider, AutoConfig, AutoRouterConfig, Config};
+use crate::config::{AutoConfig, AutoRouterConfig, Config, ProviderKind};
 use crate::model_inventory::ModelInventory;
 use crate::model_routing::{AutoRouteSelection, provider_router_candidates};
 use crate::tui::app::{App, StatusToastLevel};
@@ -196,12 +196,12 @@ fn no_key_reason(locale: Locale, route: DecisionRouterRoute) -> String {
 }
 
 /// The active provider's runnable fast sibling, from route capabilities.
-fn runnable_fast_tier(config: &Config) -> Option<(ApiProvider, String)> {
-    let inventory = ModelInventory::from_config(config);
+fn runnable_fast_tier(config: &Config) -> Option<(ProviderKind, String)> {
+    let inventory = ModelInventory::from_config(config).ok()?;
     let active = inventory.active_default()?;
     let fast = provider_router_candidates(active.provider, &active.model).cheap?;
     let candidate = inventory
-        .candidate(active.provider, &fast)
+        .candidate(active.identity.key.as_str(), &fast)
         .filter(|candidate| candidate.readiness.can_attempt())?;
     Some((active.provider, candidate.model.clone()))
 }
@@ -426,7 +426,13 @@ fn describe_test_selection(
     let mut lines = vec![
         tr(locale, MessageId::RouterTestWouldRoute)
             .replace("{request}", crate::model_routing::ROUTER_TEST_REQUEST)
-            .replace("{provider}", selection.provider.display_name())
+            .replace(
+                "{provider}",
+                selection
+                    .provider
+                    .compatibility()
+                    .map_or(selection.provider.key.as_str(), |row| row.label),
+            )
             .replace("{model}", &selection.model)
             .replace("{latency}", &latency_ms.to_string()),
     ];
@@ -557,7 +563,7 @@ impl RouterSetupView {
             hint: match fast.as_ref() {
                 Some((provider, model)) => tr(locale, MessageId::RouterPresetFastHint)
                     .replace("{model}", model)
-                    .replace("{provider}", provider.display_name()),
+                    .replace("{provider}", provider.provider().display_name()),
                 None => unavailable(tr(locale, MessageId::RouterNoFastTier).into_owned()),
             },
             available: fast.is_some(),
@@ -578,12 +584,17 @@ impl RouterSetupView {
         let current = match config.auto.as_ref().and_then(|auto| auto.router.as_ref()) {
             None => tr(locale, MessageId::RouterCurrent)
                 .replace("{router}", &tr(locale, MessageId::ConfigValueOff)),
-            Some(router) => match inventory.router_setup_issue {
-                Some(issue) => tr(locale, MessageId::RouterCurrentFailing)
+            Some(router) => match inventory {
+                Err(reason) => tr(locale, MessageId::RouterCurrentFailing)
                     .replace("{router}", &router_summary(router, locale))
-                    .replace("{reason}", issue.label()),
-                None => tr(locale, MessageId::RouterCurrent)
-                    .replace("{router}", &router_summary(router, locale)),
+                    .replace("{reason}", &reason),
+                Ok(inventory) => match inventory.router_setup_issue {
+                    Some(issue) => tr(locale, MessageId::RouterCurrentFailing)
+                        .replace("{router}", &router_summary(router, locale))
+                        .replace("{reason}", issue.label()),
+                    None => tr(locale, MessageId::RouterCurrent)
+                        .replace("{router}", &router_summary(router, locale)),
+                },
             },
         };
         Self {

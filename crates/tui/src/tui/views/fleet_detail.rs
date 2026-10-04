@@ -23,7 +23,7 @@ use ratatui::{
     widgets::{Block, Clear, Paragraph, Widget, Wrap},
 };
 
-use crate::config::{ApiProvider, Config};
+use crate::config::Config;
 use crate::fleet::role::public_role_label;
 use crate::fleet::store::{
     FleetFile, FleetMember, FleetOperator, FleetScope, MemberCapability, load_fleet_in_scope,
@@ -1283,12 +1283,8 @@ fn build_route_rows(config: &Config) -> Vec<RouteRow> {
         roster_missing: false,
     }];
     let health = crate::provider_readiness::ProviderReadinessSnapshot::default();
-    let active = config
-        .provider
-        .as_deref()
-        .and_then(ApiProvider::parse)
-        .unwrap_or(ApiProvider::Deepseek);
-    let routes = super::fleet_setup::cross_provider_model_routes(config, active, &health);
+    let active = config.active_provider_identity().ok();
+    let routes = super::fleet_setup::cross_provider_model_routes(config, active.as_ref(), &health);
     for (provider, model, readiness) in routes {
         let provider_label = crate::tui::views::fleet_setup::provider_display_label(&provider);
         let readiness_label = readiness

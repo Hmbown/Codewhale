@@ -69,6 +69,7 @@ pub struct CommandPaletteView {
     hovered: Cell<Option<usize>>,
 }
 
+#[cfg(test)]
 pub fn build_entries(
     locale: Locale,
     skills_dir: &Path,
@@ -98,7 +99,7 @@ pub fn build_entries_with_plugins(
     plugins: &crate::plugins::PluginRegistry,
 ) -> Vec<CommandPaletteEntry> {
     let mut entries = Vec::new();
-    commands::user_registry::with_registry_for_workspace(Some(workspace), |user_registry| {
+    commands::user_registry::with_registry_for_plugins(plugins, |user_registry| {
         let all_user_commands = user_registry.iter().collect::<Vec<_>>();
         for command in commands::command_infos() {
             if command.is_unlisted() {

@@ -83,7 +83,7 @@ mod tests {
     };
     use ratatui::{Terminal, backend::TestBackend};
 
-    use crate::config::{ApiProvider, Config};
+    use crate::config::{Config, ProviderKind};
     use crate::tools::subagent::{
         AgentWorkerStatus, FleetRole, MailboxMessage, SubAgentAssignment, SubAgentResult,
         SubAgentStatus,
@@ -1006,6 +1006,7 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Builder,
             assignment: SubAgentAssignment {
+                native_preset: None,
                 objective: "Wire settled file activity".to_string(),
                 role: Some("general".to_string()),
             },
@@ -1096,6 +1097,7 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Builder,
             assignment: SubAgentAssignment {
+                native_preset: None,
                 objective: format!("objective for {id}"),
                 role: Some(role.to_string()),
             },
@@ -1386,10 +1388,10 @@ mod tests {
 
         let route = crate::cost_status::EffectiveRouteEnvelope::capture(
             None,
-            ApiProvider::Deepseek,
-            ApiProvider::Deepseek.as_str(),
+            ProviderKind::Deepseek,
+            ProviderKind::Deepseek.as_str(),
             "deepseek-v4-pro",
-            Some(ApiProvider::Deepseek.default_base_url()),
+            Some(ProviderKind::Deepseek.provider().default_base_url()),
             chrono::Utc::now(),
         );
         let usage = |source_id: &str, input_tokens, output_tokens| MailboxMessage::TokenUsage {
@@ -2006,6 +2008,7 @@ mod tests {
                 git_branch: Some("codex/details".to_string()),
                 agent_type: FleetRole::Builder,
                 assignment: SubAgentAssignment {
+                    native_preset: None,
                     objective: "Verify keyboard and mouse convergence".to_string(),
                     role: Some("worker".to_string()),
                 },

@@ -43,7 +43,7 @@ fn click(tui: &mut Harness, text: &str) {
 }
 
 fn open(workspace: &SealedWorkspace, store: &Path, rows: u16, cols: u16) -> Harness {
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())

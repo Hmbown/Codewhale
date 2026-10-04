@@ -1,0 +1,15 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "raw-agent-presets",
+  "version": "1.0.0",
+  "extensions": {
+    "net.codewhale": {
+      "native": {
+        "paths": [
+          "native/presets/a.mjs",
+          "native/presets/b.mjs"
+        ]
+      }
+    }
+  }
+}

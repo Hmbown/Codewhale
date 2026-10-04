@@ -40,7 +40,8 @@ const {
   shouldRaceFirstPartyMirrors,
   usesCnbMirror,
 } = require("./artifacts");
-const { preflightGlibc } = require("./preflight-glibc");
+const { preflightGlibc, detectHostGlibc, detectBinaryRequiredGlibc, _internal: glibc } = require("./preflight-glibc");
+const compiledHosts = require("./compiled-hosts");
 const pkg = require("../package.json");
 
 const DEFAULT_TIMEOUT_MS = 300_000; // 5 minutes per attempt
@@ -1575,6 +1576,116 @@ function shouldIgnoreInstallFailure(
   return isInstallContext(context) && isOptionalInstall(argv, env) && isRetryable(error);
 }
 
+function preflightCompiledHost(file, host) {
+  if (!host.target.startsWith("linux-")) return;
+  const required = detectBinaryRequiredGlibc(file);
+  const available = detectHostGlibc();
+  if (host.libc === "glibc" && (!available || (required && glibc.compareVersion(available, required) < 0))) {
+    throw new NonRetryableError("compiled Bun image requires a matching GNU libc; the Codewhale CLI remains static musl. Use Node on a musl-only installation.");
+  }
+  if (host.libc === "musl" && required) throw new NonRetryableError("qualified musl host unexpectedly contains GNU libc dependencies");
+}
+
+async function prepareCompiledHost({ version, releaseDir, source, context, options }) {
+  const catalogUrl = releaseAssetUrlFromBase(compiledHosts.HOST_CATALOG, source.baseUrl);
+  const fetchText = options.fetchText || downloadText;
+  const text = await fetchText(catalogUrl, { context });
+  compiledHosts.verifyBytes(Buffer.from(text), source.checksums.get(compiledHosts.HOST_CATALOG), compiledHosts.HOST_CATALOG);
+  const catalog = compiledHosts.parseCatalog(text, version);
+  const host = compiledHosts.selectedHost(catalog, options.platform, options.arch);
+  const suffix = host.target.startsWith("windows-") ? ".exe" : "";
+  const payloads = [
+    { asset: host.asset, name: compiledHosts.HOST_NAME + suffix, hash: host.sha256, executable: true },
+    { asset: host.notices_asset, name: compiledHosts.HOST_NAME + ".LICENSES.txt", hash: host.notices_sha256 },
+    { asset: host.source_asset, name: compiledHosts.HOST_NAME + ".relink-source.tar.gz", hash: host.source_sha256 },
+  ];
+  const stageDir = await fs.promises.mkdtemp(path.join(releaseDir, ".compiled-host-"));
+  const snapshots = [];
+  const published = [];
+  let retainBackups = false;
+  const existingHash = async (file) => {
+    try {
+      const metadata = await fs.promises.lstat(file);
+      if (!metadata.isFile() || metadata.isSymbolicLink()) throw new NonRetryableError(`refusing nonregular compiled host destination ${file}`);
+      return compiledHosts.sha256(await readFile(file));
+    } catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
+  };
+  const cleanup = async () => { if (!retainBackups) await fs.promises.rm(stageDir, { recursive: true, force: true }); };
+  const rollback = async (original) => {
+    const failures = [];
+    for (const snapshot of published.slice().reverse()) {
+      try {
+        if (await existingHash(snapshot.target) !== snapshot.newHash) throw new Error(`destination changed after publication: ${snapshot.target}`);
+        if (snapshot.hash) await rename(path.join(stageDir, snapshot.name + ".previous"), snapshot.target);
+        else await unlink(snapshot.target);
+      } catch (error) { failures.push(error.message); }
+    }
+    if (failures.length) {
+      retainBackups = true;
+      throw new NonRetryableError(`${original.message}; rollback incomplete: ${failures.join("; ")}. Recovery files retained at ${stageDir}`);
+    }
+    throw original;
+  };
+  try {
+    for (const payload of payloads) {
+      if (source.checksums.get(payload.asset) !== payload.hash) throw new NonRetryableError(`catalog and checksum manifest disagree for ${payload.asset}`);
+      const stage = path.join(stageDir, payload.name);
+      await (options.download || download)(releaseAssetUrlFromBase(payload.asset, source.baseUrl), stage, { context, assetName: payload.asset });
+      compiledHosts.verifyBytes(await readFile(stage), payload.hash, payload.asset);
+      if (payload.executable) preflightCompiledHost(stage, host);
+      if (process.platform !== "win32") await chmod(stage, payload.executable ? 0o755 : 0o644);
+    }
+    const receiptName = compiledHosts.HOST_NAME + ".release.json";
+    await writeFile(path.join(stageDir, receiptName), text, { mode: 0o644 });
+    const oldReceipt = path.join(releaseDir, receiptName);
+    const oldReceiptHash = await existingHash(oldReceipt);
+    let oldPayloadHashes;
+    if (oldReceiptHash) {
+      const previous = compiledHosts.selectedHost(compiledHosts.parseCatalog(await readFile(oldReceipt)), options.platform, options.arch);
+      oldPayloadHashes = [previous.sha256, previous.notices_sha256, previous.source_sha256];
+    }
+    const names = [...payloads.map((payload) => payload.name), receiptName];
+    for (const [index, name] of names.entries()) {
+      const target = path.join(releaseDir, name);
+      const hash = await existingHash(target);
+      if (index < payloads.length && hash && (!oldPayloadHashes || hash !== oldPayloadHashes[index])) throw new NonRetryableError(`refusing unclaimed or modified compiled host destination ${target}`);
+      if (hash) {
+        const backup = path.join(stageDir, name + ".previous");
+        await fs.promises.copyFile(target, backup);
+        if (compiledHosts.sha256(await readFile(backup)) !== hash) throw new NonRetryableError(`compiled host changed while backing up ${target}`);
+      }
+      snapshots.push({ name, target, hash, newHash: compiledHosts.sha256(await readFile(path.join(stageDir, name))) });
+    }
+  } catch (error) { await cleanup(); throw error; }
+  return {
+    cleanup,
+    async publish() {
+      try {
+        // Validate every destination before publication, then each immediately
+        // before replacement. Only bytes proven by the prior receipt are owned.
+        for (const snapshot of snapshots) if (await existingHash(snapshot.target) !== snapshot.hash) throw new NonRetryableError(`compiled host destination changed during installation: ${snapshot.target}`);
+        for (const snapshot of snapshots) {
+          if (await existingHash(snapshot.target) !== snapshot.hash) throw new NonRetryableError(`compiled host destination changed during installation: ${snapshot.target}`);
+          const staged = path.join(stageDir, snapshot.name);
+          if (snapshot.hash === undefined) {
+            await fs.promises.link(staged, snapshot.target); // fresh install never clobbers a raced-in file
+            published.push(snapshot);
+            await unlink(staged);
+          } else {
+            await rename(staged, snapshot.target);
+            published.push(snapshot);
+          }
+        }
+      } catch (error) { await rollback(error); }
+    },
+  };
+}
+
+async function installCompiledHost(options) {
+  const prepared = await prepareCompiledHost(options);
+  try { await prepared.publish(); } finally { await prepared.cleanup(); }
+}
+
 async function run(options = {}) {
   const context =
     options.context === undefined || options.context === null ? "runtime" : options.context;
@@ -1600,7 +1711,7 @@ async function run(options = {}) {
       sourcePromise = selectReleaseSource({
         version,
         repo,
-        requiredAssets: [paths.codewhale.asset, paths.codew.asset],
+        requiredAssets: [paths.codewhale.asset, paths.codew.asset, ...(compiledHosts.requested(env) ? [compiledHosts.HOST_CATALOG] : [])],
         context,
         env,
         platform: options.platform,
@@ -1613,7 +1724,13 @@ async function run(options = {}) {
   };
   const getChecksums = () => getSource().then((source) => source.checksums);
 
-  await Promise.all([
+  // Fully validate and stage an explicitly requested companion before any CLI
+  // replacement. Missing qualification cannot leave an updated CLI behind.
+  const preparedHost = compiledHosts.requested(env)
+    ? await prepareCompiledHost({ version, releaseDir, source: await getSource(), context, options })
+    : undefined;
+  try {
+    await Promise.all([
     ensureBinary(paths.codewhale.target, paths.codewhale.asset, version, repo, getChecksums, {
       context,
       getSource,
@@ -1627,6 +1744,8 @@ async function run(options = {}) {
       env,
     }),
   ]); // single binary
+    if (preparedHost) await preparedHost.publish();
+  } finally { if (preparedHost) await preparedHost.cleanup(); }
 }
 
 async function getBinaryPath(name) {
@@ -1665,6 +1784,9 @@ module.exports = {
     downloadTimeoutMs,
     downloadStallMs,
     binaryPaths,
+    installCompiledHost,
+    prepareCompiledHost,
+    preflightCompiledHost,
     ensureBinary,
     maxAttempts,
     withRetry,

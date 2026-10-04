@@ -484,11 +484,27 @@ codewhale mcp tools codewhale
 Session boot is lazy (#6033): a configured server is not spawned until
 something asks for it — a turn whose `allowed_tools`/`tools.always_load`
 selection covers its `mcp_<server>_*` names, a model call that resolves to
-one of its tools, or an explicit `/mcp` connect/retry. Servers marked
+one of its tools, or an explicit `/mcp retry <name>`. Servers marked
 `required` still connect eagerly at boot so their failure surfaces before the
 first turn. A configured-but-unstarted server shows as `configured`, never
 `connecting`; the connecting label only describes handshakes actually in
 flight.
+
+An MCP-focused `tool_search` is also explicit discovery intent: search a
+configured server name (for example `engram`), an exact `mcp_<server>_...`
+name, or use `{"query":"mcp_.*","match":"regex"}`. The current turn's
+allow/deny ceiling filters the configured servers before a batch of at most
+eight connects; the existing five-second wait and cancellation remain in
+force. General searches do not boot all optional servers. Only actual
+`tools/list` schemas enter the deferred catalogue; failed, disabled, or
+revoked servers do not acquire fabricated tools. Narrow a broad search by
+server name when more than eight configured servers match.
+
+`codewhale mcp connect`, `validate`, and `tools` inspect their own process's
+pool. They do not attach transports to a running TUI or exec session. Use
+in-session discovery or explicit tool selection. In the TUI,
+`/mcp retry <name>` connects through the current session's pool;
+`/mcp reload` re-reads its MCP configuration.
 
 ## Server Fields
 

@@ -596,7 +596,7 @@ fn check_contract_cancelled(token: Option<&CancellationToken>) -> Result<(), Too
 /// Read at most cap+1 actual bytes, including files that grow after metadata.
 /// Cancellation is polled between bounded reads; it cannot interrupt an OS
 /// syscall already in progress. This worker never mutates the file.
-fn read_contract_source(
+pub(super) fn read_contract_source(
     reader: &mut impl std::io::Read,
     cancel: Option<&CancellationToken>,
 ) -> Result<Vec<u8>, ToolError> {
@@ -1105,23 +1105,14 @@ impl ToolSpec for ReadFileTool {
         if let Some(result) = read_pdf_if_detected(
             &file_path,
             pages,
-            super::pdf::PdfTextCommand::system(context.cancel_token.as_ref()),
+            super::pdf::PdfTextCommand::system(Some(context)),
         )
         .await?
         {
             return Ok(result);
         }
         if is_image_for_ocr(&file_path) {
-            // OCR shells out to tesseract (or runs a Vision pass): the blocking
-            // subprocess call stays on the blocking pool (blocking-call
-            // convention, #6149).
-            let file_path = file_path.clone();
-            let requested_path = path_str.to_string();
-            return tokio::task::spawn_blocking(move || {
-                read_image_via_ocr(&file_path, &requested_path)
-            })
-            .await
-            .map_err(|e| ToolError::execution_failed(format!("Image OCR task: {e}")))?;
+            return read_image_via_ocr(&file_path, path_str, context).await;
         }
 
         // Open before parameter parsing so a missing file keeps the
@@ -1487,8 +1478,12 @@ fn render_line_window(
     }))
 }
 
-fn read_image_via_ocr(path: &Path, requested_path: &str) -> Result<ToolResult, ToolError> {
-    let text = crate::tools::image_ocr::ocr_image_path(path)?;
+async fn read_image_via_ocr(
+    path: &Path,
+    requested_path: &str,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let text = crate::tools::image_ocr::ocr_image_path(path, context).await?;
     Ok(ToolResult::success(format!(
         "<image_ocr path=\"{requested_path}\">\n{text}\n</image_ocr>"
     )))

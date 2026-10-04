@@ -2554,6 +2554,75 @@ async fn tools_call_round_trips() {
 }
 
 #[tokio::test]
+async fn native_callbacks_stay_on_the_originating_host_runtime() {
+    use codewhale_workflow_js::{
+        BudgetSnapshot, DriverError, SpawnedTask, TaskRequest, ToolCallRequest, ToolCallResponse,
+        ToolInvoker, WorkflowDriver,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct OriginCallbacks {
+        origin: std::thread::ThreadId,
+        calls: AtomicUsize,
+        driver: FakeDriver,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowDriver for OriginCallbacks {
+        async fn spawn_task(&self, request: TaskRequest) -> Result<SpawnedTask, DriverError> {
+            assert_eq!(std::thread::current().id(), self.origin);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.driver.spawn_task(request).await
+        }
+
+        fn cancel_all(&self) {
+            self.driver.cancel_all();
+        }
+
+        fn budget(&self) -> BudgetSnapshot {
+            self.driver.budget()
+        }
+
+        fn progress(&self, event: ProgressEvent) {
+            self.driver.progress(event);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolInvoker for OriginCallbacks {
+        async fn invoke(&self, request: ToolCallRequest) -> Result<ToolCallResponse, DriverError> {
+            assert_eq!(std::thread::current().id(), self.origin);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            EchoInvoker.invoke(request).await
+        }
+    }
+
+    let callbacks = Arc::new(OriginCallbacks {
+        origin: std::thread::current().id(),
+        calls: AtomicUsize::new(0),
+        driver: FakeDriver::new(),
+    });
+    let value = WorkflowVm::new()
+        .run_tools_script(
+            r#"const child = await task({ description: "origin-thread" });
+               const tool = await tools.call("read", { path: "original" });
+               return { child, path: tool.echo.path };"#,
+            json!(null),
+            callbacks.clone(),
+            callbacks.clone(),
+            WorkflowRunCancel::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        value,
+        json!({"child": "done:origin-thread", "path": "original"})
+    );
+    assert_eq!(callbacks.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(callbacks.driver.spawn_count(), 1);
+}
+
+#[tokio::test]
 async fn tools_call_refusal_throws_admission_kind() {
     let value = run_tools(
         r#"try { await tools.call("deny", {}); return "no-throw"; } catch (e) { return e.kind; }"#,

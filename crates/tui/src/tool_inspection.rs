@@ -75,6 +75,9 @@ pub struct TurnStopDiagnostics {
     /// Parent streaming ModelClient calls, including stream retries. Excludes
     /// HTTP retries inside the client, compaction and child calls; not invoices.
     pub model_requests_started: u32,
+    /// HTTP retries actually entered inside the captured parent request.
+    /// This is dispatch evidence, not provider usage or a bill.
+    pub transport_retries: u32,
     pub transparent_stream_retries: u32,
     pub stream_resumes: u32,
     pub reasoning_only_reprompts: u32,

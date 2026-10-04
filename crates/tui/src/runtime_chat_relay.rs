@@ -762,6 +762,7 @@ impl RuntimeChatRelayHost {
             .start_turn_with_reserved_id(
                 &binding.native_thread_id,
                 StartTurnRequest {
+                    expected_workspace: None,
                     max_output_tokens: command.max_output_tokens,
                     prompt: command.prompt.clone(),
                     images: command.images.clone(),
@@ -2004,10 +2005,11 @@ mod tests {
         host.bind_account("account_fixture", "target_fixture")
             .unwrap();
         host.authorize_run("run_fixture").unwrap();
-        let provider = host.config.api_provider();
+        let identity = host.config.active_provider_identity().unwrap();
+        let provider = identity.provider;
         let model_provider_id = host
             .config
-            .active_provider_identity(provider)
+            .active_provider_identity()
             .unwrap()
             .persisted_id()
             .unwrap_or_else(|| provider.as_str())

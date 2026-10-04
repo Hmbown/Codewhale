@@ -34,11 +34,27 @@ pub(super) enum AutoCompactionStep {
 #[derive(Debug)]
 struct EngineCompactionNoticeSink {
     tx: mpsc::Sender<Event>,
+    child: Option<Arc<crate::tools::subagent::engine::ChildAuthority>>,
 }
 
 impl crate::compaction::CompactionNoticeSink for EngineCompactionNoticeSink {
     fn notice(&self, message: String) {
         let _ = self.tx.try_send(Event::Status { message });
+    }
+    fn accounting_origin(&self) -> Option<(crate::cost_status::CostScopeToken, String, String)> {
+        self.child.as_ref().map(|child| child.accounting_origin())
+    }
+    fn settled_usage<'a>(
+        &'a self,
+        source: &'a str,
+        route: &'a crate::cost_status::EffectiveRouteEnvelope,
+        usage: &'a Usage,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(child) = self.child.as_ref() {
+                child.project_settled_response(source, route, usage).await;
+            }
+        })
     }
 }
 
@@ -113,7 +129,11 @@ impl Engine {
         details["session_id"] = serde_json::json!(self.session.id);
         details["thread_id"] = serde_json::json!(self.config.runtime_services.active_thread_id);
         details["model"] = serde_json::json!(self.config.model);
+        #[cfg(test)]
+        let env_ticket = crate::test_support::env_scope_ticket();
         if let Err(error) = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
             crate::audit::log_sensitive_event(event, details);
         })
         .await
@@ -212,6 +232,10 @@ impl Engine {
         prepared.session_id = Some(self.session.id.clone());
         prepared.notice_sink = Some(std::sync::Arc::new(EngineCompactionNoticeSink {
             tx: self.tx_event.clone(),
+            child: self
+                .child_host
+                .as_ref()
+                .map(|child| child.authority.clone()),
         }));
         // The summary request must carry the reasoning tier the turn sends:
         // reasoning routes render it at the head of the prompt, so omitting
@@ -390,6 +414,15 @@ impl Engine {
                     let retries_used = result.retries_used;
                     let coverage_clause = result.coverage.receipt_clause();
                     let path = result.coverage.path;
+                    if let Some(job) = self.child_job()
+                        && let Err(error) = job
+                            .before_replace(&self.session.messages, &result.messages)
+                            .await
+                    {
+                        self.cancel_token.cancel();
+                        tracing::error!(%error, "child compaction projection failed; original Session retained");
+                        return;
+                    }
                     self.session.replace_messages(result.messages);
                     if let Some(pm) = self.session.prefix_stability.as_mut() {
                         pm.note_history_reset("compaction");
@@ -643,6 +676,16 @@ impl Engine {
                         let retries_used = result.retries_used;
                         let coverage_clause = result.coverage.receipt_clause();
                         let path = result.coverage.path;
+                        if let Some(job) = self.child_job()
+                            && let Err(error) = job
+                                .before_replace(&self.session.messages, &result.messages)
+                                .await
+                        {
+                            return AutoCompactionStep::EndTurn(
+                                TurnOutcomeStatus::Failed,
+                                Some(format!("child compaction projection failed: {error:#}")),
+                            );
+                        }
                         self.session.replace_messages(result.messages);
                         turn.clear_parent_input_tokens();
                         if let Some(pm) = self.session.prefix_stability.as_mut() {
@@ -880,6 +923,15 @@ impl Engine {
         let recovered = after_tokens <= target_budget && after_tokens < before_tokens;
 
         if recovered {
+            if let Some(job) = self.child_job()
+                && let Err(error) = job
+                    .before_replace(&self.session.messages, &compacted_messages)
+                    .await
+            {
+                self.cancel_token.cancel();
+                tracing::error!(%error, "child recovery projection failed; original Session retained");
+                return false;
+            }
             self.session.replace_messages(compacted_messages);
             turn.clear_parent_input_tokens();
             if let Some(pm) = self.session.prefix_stability.as_mut() {
@@ -1000,7 +1052,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_notice_sink_delivers_a_status_event() {
         let (tx, mut rx) = mpsc::channel(4);
-        let sink = EngineCompactionNoticeSink { tx };
+        let sink = EngineCompactionNoticeSink { tx, child: None };
         sink.notice("Making room re-encoded 2 inline image(s)".to_string());
         match rx.recv().await {
             Some(Event::Status { message }) => {

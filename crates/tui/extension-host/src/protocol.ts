@@ -1,5 +1,5 @@
 /**
- * Codewhale extension-host protocol, version 1 (phase 1 subset).
+ * Codewhale extension-host protocol, version 1.
  *
  * The Rust serde types in `crates/tui/src/extension_host/protocol.rs` are the
  * source of truth. The constants, the method table, every params shape and the
@@ -13,11 +13,20 @@
  * Envelope: JSON-RPC 2.0.
  */
 import { MAGIC_ASCII, MAX_FRAME, HEADER_LEN, METHODS, SHAPES } from './protocol.generated.ts'
-import type { Direction, Kind, RpcErrorWire, Shape } from './protocol.generated.ts'
+import type { Direction, HostTier, Kind, RpcErrorWire, Shape } from './protocol.generated.ts'
 
 export * from './protocol.generated.ts'
 
 export const MAGIC = Buffer.from(MAGIC_ASCII, 'ascii')
+
+/** One row of the method table (`METHODS`). */
+export interface MethodRow {
+  readonly name: string
+  readonly direction: Direction
+  readonly request: boolean
+  readonly params: string
+  readonly tiers: readonly HostTier[]
+}
 
 export type Message =
   | { jsonrpc: '2.0'; id: number; method: string; params?: any }
@@ -147,12 +156,20 @@ function checkKind(where: string, value: unknown, kind: Kind): void {
 }
 
 /**
- * Validate one decoded message travelling in `direction`. Only methods in the
- * generated table are admitted, each with its params shape. Responses are
- * validated as envelopes only: their result shape depends on the request,
- * which the RPC layer checks.
+ * Validate one decoded message travelling in `direction` to or from a host of
+ * `tier`. Only methods in the generated table are admitted, each with its
+ * params shape and only on the tiers its row allows (a method reserved for the
+ * built-in tier is neither sent nor accepted by a plugin-tier host). Responses
+ * are validated as envelopes only: their result shape depends on the request,
+ * which the RPC layer checks. `methods` is the table to admit from; only a test
+ * of the tier rule passes anything but the generated one.
  */
-export function validateMessage(value: unknown, direction: Direction): Message {
+export function validateMessage(
+  value: unknown,
+  direction: Direction,
+  tier: HostTier,
+  methods: readonly MethodRow[] = METHODS,
+): Message {
   const strict = direction === 'host_to_core'
   if (!isObject(value)) throw new ProtocolError('message: expected an object')
   if (value.jsonrpc !== '2.0') throw new ProtocolError('message: jsonrpc must be "2.0"')
@@ -161,8 +178,9 @@ export function validateMessage(value: unknown, direction: Direction): Message {
   if ('method' in value) {
     checkShape('message', value, { strict, required: { jsonrpc: 'string', method: 'string' }, optional: { id: 'uint', params: 'json' } })
     const method = value.method as string
-    const spec = METHODS.find((entry) => entry.name === method && entry.direction === direction)
+    const spec = methods.find((entry) => entry.name === method && entry.direction === direction)
     if (!spec) throw new ProtocolError(`unknown ${direction} method \`${method}\``)
+    if (!spec.tiers.includes(tier)) throw new ProtocolError(`\`${method}\` is not allowed on the ${tier} tier`)
     if (spec.request !== hasId) {
       throw new ProtocolError(`\`${method}\` must be ${spec.request ? 'a request (with id)' : 'a notification (no id)'}`)
     }
@@ -171,6 +189,21 @@ export function validateMessage(value: unknown, direction: Direction): Message {
     // Rust checks this after decoding `HelloParams` (`parse_host_message`).
     if (method === 'host/hello' && params.runtime.name !== 'bun' && params.runtime.name !== 'node') {
       throw new ProtocolError(`host/hello.runtime.name: unknown runtime \`${params.runtime.name}\``)
+    }
+    // Which spec fields each kind uses: `RegisterParams::check_spec`.
+    if (method === 'registry/register') {
+      const { kind, spec } = params
+      const reason =
+        kind === 'tool' && spec.input_schema == null
+          ? 'a tool registration needs `spec.input_schema`'
+          : kind === 'tool' && spec.argument_hint != null
+            ? 'a tool registration has no `spec.argument_hint`'
+            : kind === 'command' && spec.input_schema != null
+              ? 'a command registration has no `spec.input_schema`'
+              : (kind === 'hook' || kind === 'prompt_section' || kind === 'prompt_template' || kind === 'skill_root' || kind === 'shell_hook' || kind === 'mcp_server') && (spec.input_schema != null || spec.argument_hint != null)
+                ? 'a hook, prompt or skill root registration has no input schema or argument hint'
+              : undefined
+      if (reason !== undefined) throw new ProtocolError(`${method}: ${reason}`)
     }
     return value as Message
   }

@@ -1,15 +1,15 @@
 # Fleet 与子智能体
 
 > 英文原文：[SUBAGENTS.md](../SUBAGENTS.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 最后与英文同步日期（last synced with English revision）：2026-10-02。
 
 Fleet 管理这些子智能体所用的已保存模型和角色分配。单项委派使用 `agent`；带有阶段、依赖和完成检查的工作使用 `workflow`。使用 Fleet 模型候选列表的计划，参见 [Workflow 编写指南](WORKFLOW_AUTHORING.md)。
 
 Fleet 角色是委派工作面向用户的词汇：父智能体通过 `agent` 启动一个专注的 `general`、`explore`、`planner`、`reviewer`、`implement`、`test` 或 `advisor`，`worker` 运行期间会拿回 `agent_id`、声明的交付文件和有效限制。默认回执是紧凑的；需要转录句柄或账本时，再按 ID 请求详情。内部运行时类型是 `FleetRole`（以前叫 `SubAgentType`）；旧的角色拼写（`worker`、`scout`、`plan`、`review`、`builder`、`verifier`、`consultant`、`oracle` 等）在 v0.9.x 期间仅作为持久化/反序列化的兼容适配层继续被接受。新的提示词和配置应使用 Fleet 的规范名称。
 
-从架构上讲，子智能体不应成为第二套执行基质。持久化的原语是 [`AGENT_RUNTIME.md`](AGENT_RUNTIME.md) 中描述的、由 Fleet 支撑的 `worker` 运行：重试、终态、回执、工件引用、检查和重启行为都归属那里。面向模型的启动器是单一的 `agent` 工具，detached 工作应当收敛到与 Agent Fleet 相同的生命周期。
+子任务与普通回合使用同一个 `Engine::run_turn` 规划器、执行器、Session 和审批收件箱。私有的已捕获 ChildGrant 在最终执行边界收窄工具动作、shell、工作区、网络和后代深度。原有 SubAgentManager 继续管理启动名额、协调、worker 检查点和终态交付，不再运行另一个模型/工具循环。工作回合与唯一的有界汇报回合共享这个已配置的子 Engine 和原始截止时间。
 
-在这次切换完成之前，当前的 `agent` 实现委托给持久化的子智能体运行时。它对会话内的短期委派仍然有用。来自提供商的瞬态 header/stream/超时失败，会先在子运行时内部以退避方式重试，之后才把 `worker` 标记为 interrupted；如果重试预算耗尽，Codewhale 会保留一个检查点并返回延续句柄，而不是让父智能体去推断发生了什么。对于必须经受进程重启、休眠或远程执行的工作，优先使用 Fleet，或由 Workflow 支撑的 Fleet 运行。
+提供商瞬态失败使用 Core 的分发与重试边界。预算耗尽或请求中断会保留已记录的检查点及延续句柄。每次实际分发的请求都携带原始会话、路由和来源标识：提供商用量只计费一次，然后投影到 worker 账本。成功但没有用量的响应与结果未知的请求分别保留覆盖缺口，均不会被标为零成本。需要经受进程重启、休眠或远程执行的工作请使用 Fleet 或由 Workflow 支撑的运行。
 
 子智能体继承父智能体被允许使用的工具注册表，包括 `agent` 协调。生成遵守同一个绝对深度上限：根为深度 0，它的子智能体为深度 1，处于 `max_spawn_depth` 的子智能体不能再生成。操作者默认值为 3，硬上限为 8。角色、已保存的 profile 或兼容请求只能收窄这个上限。恢复和转录分叉会保留来源的位置和限制，不会多换来一代。已移除的 `agent_open`/`agent_eval`/`agent_close` 生命周期工具不会出现在任何注册表中。
 
@@ -171,7 +171,7 @@ OUTPUT: VERDICT, EVIDENCE, GAPS, NEXT.
 
 ```text
 QUESTION: Is the focused prompt/subagent test filter valid, and what fails if not?
-SCOPE: cargo test -p codewhale-tui --bin codewhale-tui --locked prompt; subagent filter if needed.
+SCOPE: cargo test -p codewhale-tui --lib --locked prompt; subagent filter if needed.
 ALREADY_KNOWN: Do not fix failures; capture exact command, exit code, and first relevant assertion.
 EFFORT: medium
 STOP_CONDITION: Stop after one clean PASS or one reproducible failing assertion with command evidence.

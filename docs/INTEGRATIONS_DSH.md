@@ -7,10 +7,33 @@ configuration, provider/model selection, permissions, credentials, and
 lifecycle authority; DSH is not a second Fleet scheduler and never an
 authority bypass.
 
-Verified against `dsh 0.1.0-rc.6` (the latest published release at the time
-of writing). DSH is a developer preview that warns of compatibility-breaking
-changes; a newer `dsh` is reported as `stale-version` (launchable, unverified),
-an older one or one without `--patch` as `incompatible`.
+## Version support
+
+This launcher integration was last verified against `dsh 0.1.0-rc.6` in August
+2026 (the integration landed 2026-08-15; the last live check recorded below is
+2026-08-17). It has not been re-qualified since, and nothing newer is verified:
+the pinned import fixture's `0.1.7-alpha.2` (commit `00102833`) is a static
+import reference only, not a launcher qualification. DSH is a developer
+preview that warns of compatibility-breaking changes.
+
+What the code enforces (`crates/tui/src/integrations/dsh/detect.rs`): an older
+`dsh`, or any `dsh` that does not advertise `--patch`, is `incompatible` and
+refused. A newer `dsh` that parses and advertises `--patch` is reported as
+`stale-version`: a connected profile still launches, unverified. The version is
+read as semver, so current prerelease tags such as `0.1.7-alpha.2` parse and
+order correctly (`alpha` < `beta` < `rc` < the bare release, within a core
+version): `0.1.7-alpha.2` is newer than the verified `0.1.0-rc.6`, reported as
+`stale-version`, and never presented as verified. Only text that is not a
+semver version at all (for example `nightly` or `0.1`) is reported as
+`offline`, which is refused.
+
+This is an external-launcher integration: it runs the user's installed `dsh`
+with a Codewhale-written overlay. It is not [`/plugin import dsh`](PLUGIN_AUTHORING.md#deepseek-harness-dsh),
+which statically converts the MCP and skill rows of a DSH bundle package into a
+native Codewhale plugin without running DSH or any plugin code. It is also not
+the experimental TypeScript extension host ([EXTENSIONS.md](EXTENSIONS.md),
+[design](design/TS_EXTENSION_HOST.md)), which runs DSH TypeScript plugin code
+for tools behind the off-by-default `extension_host` feature.
 
 ## What is (and is not) connected
 
@@ -63,7 +86,7 @@ Codewhale **never**:
 | State | Meaning | Launch |
 | --- | --- | --- |
 | `not-installed` | `dsh` not on `PATH` | refused |
-| `offline` | `dsh` exists but `--version` failed | refused |
+| `offline` | `dsh` exists but `--version` failed or printed text that is not a semver version | refused |
 | `incompatible` | older than 0.1.0-rc.6 or no `--patch` | refused |
 | `detected` | usable dsh, no Codewhale overlay | refused (`connect` first) |
 | `connected` | overlay matches the current Codewhale route | allowed |

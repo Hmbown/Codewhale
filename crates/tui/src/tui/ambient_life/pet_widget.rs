@@ -4,11 +4,10 @@
 use super::pet_sim::{PetSim, PetState, braille};
 use ratatui::{
     buffer::Buffer,
-    layout::{Alignment, Rect},
+    layout::Rect,
     style::{Color, Style},
-    widgets::{Paragraph, Widget, Wrap},
+    widgets::Widget,
 };
-use unicode_width::UnicodeWidthStr;
 
 pub struct PetWidget<'a> {
     pub sim: &'a PetSim,
@@ -51,31 +50,17 @@ impl Widget for PetWidget<'_> {
 /// Shared paint path for the Rust cameo and the embedded world's live raster.
 /// A tiny viewport keeps the complete text cue before spending cells on dots.
 pub(crate) fn render_grid(area: Rect, buf: &mut Buffer, grid: &[u8], label: &str, style: Style) {
-    if area.width == 0 || area.height == 0 {
-        return;
+    codewhale_ratatui::BrailleFrame {
+        cells: grid,
+        caption: label,
+        style,
     }
-    if label.width() > usize::from(area.width) || area.height < 4 {
-        Paragraph::new(label)
-            .style(style)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false })
-            .render(area, buf);
-        return;
-    }
-    for y in 0..area.height - 1 {
-        for x in 0..area.width {
-            let bits = grid
-                .get(usize::from(y) * usize::from(area.width) + usize::from(x))
-                .copied()
-                .unwrap_or(0);
-            if bits != 0
-                && let Some(cell) = buf.cell_mut((area.x + x, area.y + y))
-            {
-                let glyph = char::from_u32(0x2800 + u32::from(bits)).expect("braille");
-                cell.set_symbol(&glyph.to_string()).set_style(style);
-            }
-        }
-    }
-    let x = area.x + (area.width - label.width() as u16) / 2;
-    buf.set_stringn(x, area.bottom() - 1, label, usize::from(area.width), style);
+    .render(area, buf);
 }
+
+#[cfg(test)]
+#[path = "pet_widget_legacy.rs"]
+mod pet_widget_legacy;
+#[cfg(test)]
+#[path = "pet_widget_tests.rs"]
+mod pet_widget_tests;

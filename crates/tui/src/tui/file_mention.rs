@@ -787,22 +787,48 @@ fn stable_attachment_name(file_name: &std::ffi::OsStr) -> String {
     file_name.to_string_lossy().replace(" at ", "-")
 }
 
+/// Largest screenshot copied to a stable location.
+const MAX_STABLE_ATTACHMENT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Copy a screencapture temp file to `artifact_dir` and return the stable
 /// destination. Returns `None` when the path is not a screencapture temp
 /// file, not a regular file, or the copy fails — callers keep the original
 /// reference then. Idempotent: an existing destination is reused without a
 /// second copy.
+///
+/// `artifact_dir` is `<root>/<name>`: the destination is written through the
+/// pinned no-follow writer anchored at `root`, so a linked `artifact_dir`, a
+/// linked destination, or a dangling link at the destination name is refused
+/// instead of being written through. `root` itself may be a user-selected link
+/// (a relocated `~/.codewhale`).
 fn stabilize_screencapture_file(path: &Path, artifact_dir: &Path) -> Option<PathBuf> {
     if !is_screencapture_temp_path(path) || !path.is_file() {
         return None;
     }
-    let dest = artifact_dir.join(stable_attachment_name(path.file_name()?));
-    if !dest.exists()
-        && (std::fs::create_dir_all(artifact_dir).is_err() || std::fs::copy(path, &dest).is_err())
-    {
+    let name = stable_attachment_name(path.file_name()?);
+    let dest = artifact_dir.join(&name);
+    let relative = Path::new(artifact_dir.file_name()?).join(&name);
+    let target =
+        crate::fleet::files::WorkspaceFile::open(artifact_dir.parent()?, &relative, true).ok()?;
+    // An existing regular destination is reused; a link there fails to open.
+    if target.open_file().is_ok() {
+        return Some(dest);
+    }
+    if std::fs::metadata(path).ok()?.len() > MAX_STABLE_ATTACHMENT_BYTES {
         return None;
     }
-    Some(dest)
+    let bytes = std::fs::read(path).ok()?;
+    match target.publish(&bytes) {
+        Ok(()) => Some(dest),
+        // Lost a race to another writer of the same name: reuse only if what
+        // is there is a regular file we may open.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists && target.open_file().is_ok() =>
+        {
+            Some(dest)
+        }
+        Err(_) => None,
+    }
 }
 
 /// A path reference found in inbound text: its byte span, the path text, and
@@ -2502,6 +2528,39 @@ mod tests {
         let stable = artifact_dir.join("截图");
         assert!(out.contains(&stable.display().to_string()), "got: {out}");
         assert!(!out.contains(&source.display().to_string()), "got: {out}");
+        let _ = tmp;
+    }
+
+    /// The stable copy is written through a no-follow writer: a dangling link
+    /// at the destination name, a linked destination, and a linked directory
+    /// are all refused, and nothing is created behind them.
+    #[cfg(unix)]
+    #[test]
+    fn stable_copies_are_never_written_through_a_link() {
+        use std::os::unix::fs::symlink;
+        let (tmp, source, artifact_dir) = screencapture_fixture();
+        let outside = TempDir::new().expect("outside");
+        let input = format!("see \"{}\"", source.display());
+        let name = "Screenshot 2026-08-10-01.09.39 截图.png";
+
+        // Dangling link at the destination name.
+        std::fs::create_dir_all(&artifact_dir).expect("mkdir");
+        let behind = outside.path().join("created-by-the-link");
+        symlink(&behind, artifact_dir.join(name)).expect("link");
+        assert_eq!(
+            stabilize_screenshot_references(&input, &artifact_dir),
+            input
+        );
+        assert!(
+            !behind.exists(),
+            "a dangling link must not be written through"
+        );
+
+        // A linked destination directory.
+        let linked_dir = tmp.path().join("linked-attachments");
+        symlink(outside.path(), &linked_dir).expect("link");
+        assert_eq!(stabilize_screenshot_references(&input, &linked_dir), input);
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
         let _ = tmp;
     }
 

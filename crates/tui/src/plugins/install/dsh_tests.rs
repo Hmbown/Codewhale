@@ -700,3 +700,173 @@ fn derived_names_are_native_plugin_names() {
     );
     assert_eq!(derived_plugin_name("@x/--"), None);
 }
+
+#[test]
+fn raw_agent_presets_import_emits_exact_native_entries_and_catalog() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/extension_host/raw-agent-presets/source");
+    let root = tempfile::tempdir().unwrap();
+    let output = root.path().join("raw-preset-output");
+    let converted = convert_package(&source, &output).unwrap();
+    assert!(converted.requires_native);
+    assert_eq!(converted.native_rows, ["@deepseek-ai/dsh-agent-presets"]);
+    let manifest: Json =
+        serde_json::from_slice(&fs::read(output.join("plugin.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["extensions"]["net.codewhale"]["native"]["paths"],
+        json!(["native/presets/a.mjs", "native/presets/b.mjs"])
+    );
+    assert!(
+        !output.join("native/index.mjs").exists(),
+        "no unselected global composition consumer remains"
+    );
+    let catalog: Json =
+        serde_json::from_slice(&fs::read(output.join("native/presets.json")).unwrap()).unwrap();
+    assert_eq!(catalog["default"], "a");
+    for row in catalog["presets"].as_array().unwrap() {
+        let entry = row["entry"]["path"].as_str().unwrap();
+        let bytes = fs::read(output.join(entry)).unwrap();
+        assert_eq!(row["entry"]["sha256"], sha256_hex(&bytes));
+        let data = crate::plugins::native_presets::metadata_from_bytes(&bytes).unwrap();
+        assert_eq!(data.id, row["id"].as_str().unwrap());
+    }
+    assert!(
+        crate::plugins::manifest::PluginManifest::validate_from_path(&output.join("plugin.json"))
+            .is_ok()
+    );
+}
+
+#[test]
+fn contained_bare_modules_never_walk_ambient_packages_or_escape_exports() {
+    let f = fixture(None, None);
+    let package = Package::open(&f.bundle).unwrap();
+    assert!(
+        presets::contained_module(&package, "js-yaml").is_err(),
+        "installed host dependency is not a package receipt"
+    );
+    let dir = f.bundle.join("node_modules/@demo/profile");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("package.json"), r#"{"name":"@demo/profile","type":"module","exports":{".":{"require":"./not.cjs","import":"./index.mjs"},"./escape":"../../../outside.mjs"}}"#).unwrap();
+    fs::write(dir.join("index.mjs"), "export function apply() {}\n").unwrap();
+    assert_eq!(
+        presets::contained_module(&package, "@demo/profile").unwrap(),
+        dir.join("index.mjs").canonicalize().unwrap()
+    );
+    assert!(presets::contained_module(&package, "@demo/profile/escape").is_err());
+    assert!(presets::contained_module(&package, "@demo/profile/../../outside").is_err());
+    fs::write(dir.join("package.json"),r#"{"name":"@demo/profile","type":"module","exports":{"node":null,"import":"./index.mjs"}}"#).unwrap();
+    assert!(
+        presets::contained_module(&package, "@demo/profile").is_err(),
+        "matched null export must not fall through"
+    );
+}
+
+#[test]
+fn contained_bare_native_row_imports_but_an_unresolved_sibling_never_installs_a_partial_graph() {
+    let build = |mixed: bool| {
+        let f = fixture(
+            Some(&format!(
+                "- insert:\n  - {{id: native-row, name: '@demo/profile'}}\n{}",
+                if mixed {
+                    "  - {id: missing, name: absent-package}\n"
+                } else {
+                    ""
+                }
+            )),
+            None,
+        );
+        let dir = f.bundle.join("node_modules/@demo/profile");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"@demo/profile","type":"module","exports":"./index.mjs"}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("index.mjs"),"export const inject=['prompt'];export function apply(ctx){ctx.prompt.registerSection({id:'profile',text:'actual closed bare module'})}\n").unwrap();
+        f
+    };
+    let valid = build(false);
+    let converted = convert_package(&valid.bundle, &valid.output).unwrap();
+    assert!(converted.requires_native);
+    assert_eq!(converted.native_rows, ["@demo/profile"]);
+    let spec: Json =
+        serde_json::from_slice(&fs::read(valid.output.join("native/composition.json")).unwrap())
+            .unwrap();
+    assert_eq!(spec["modules"][0]["name"], "@demo/profile");
+    assert_eq!(
+        spec["modules"][0]["path"],
+        "node_modules/@demo/profile/index.mjs"
+    );
+    assert!(
+        crate::plugins::manifest::PluginManifest::validate_from_path(
+            &valid.output.join("plugin.json")
+        )
+        .is_ok()
+    );
+    refused(&build(true), "no partial graph");
+}
+
+#[test]
+fn raw_catalog_broken_rows_remain_structured_manual_ports_beside_healthy_entries() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/extension_host/raw-agent-presets/source");
+    let root = tempfile::tempdir().unwrap();
+    let bundle = root.path().join("source");
+    fs::create_dir(&bundle).unwrap();
+    walk_files(&source, |path, is_dir| {
+        let target = bundle.join(path.strip_prefix(&source).unwrap());
+        if is_dir {
+            fs::create_dir_all(target)?;
+        } else {
+            fs::create_dir_all(target.parent().unwrap())?;
+            fs::copy(path, target)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    fs::create_dir_all(bundle.join("presets/broken")).unwrap();
+    fs::write(
+        bundle.join("presets/broken/agent.cordis.yml"),
+        "[invalid yaml\n",
+    )
+    .unwrap();
+    let output = root.path().join("converted");
+    let converted = convert_package(&bundle, &output).unwrap();
+    assert!(converted.requires_native);
+    let manual: Vec<_> = converted
+        .outcomes
+        .iter()
+        .filter(|row| row.kind == "native-preset")
+        .collect();
+    assert_eq!(manual.len(), 1);
+    assert_eq!(manual[0].row.as_deref(), Some("broken"));
+    assert!(manual[0].needs_manual_port());
+    let catalog: Json =
+        serde_json::from_slice(&fs::read(output.join("native/presets.json")).unwrap()).unwrap();
+    let broken = catalog["presets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "broken")
+        .unwrap();
+    assert!(broken.get("broken").is_some());
+    assert!(broken.get("entry").is_none());
+    assert_eq!(
+        catalog["presets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row.get("entry").is_some())
+            .count(),
+        2
+    );
+    let receipt: Json =
+        serde_json::from_slice(&fs::read(output.join("CONVERSION.json")).unwrap()).unwrap();
+    assert!(
+        receipt["required_manual_ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["row"] == "broken")
+    );
+}

@@ -1,0 +1,14 @@
+{
+  "direction": "core_to_host",
+  "valid": false,
+  "frame": {
+    "jsonrpc": "2.0",
+    "id": 7,
+    "method": "command/run",
+    "params": {
+      "command_id": "cmd-1",
+      "raw_input": "",
+      "deadline_ms": 30000
+    }
+  }
+}

@@ -16,6 +16,7 @@ mod opencode_go;
 pub use opencode_go::{opencode_go_endpoint_key, opencode_go_model_id, opencode_go_models};
 pub mod persistence;
 pub mod pricing;
+pub mod private_directory;
 pub mod provider;
 mod provider_defaults;
 mod provider_kind;
@@ -25,16 +26,20 @@ pub mod route;
 pub mod settings_schema;
 pub mod setup_state;
 pub mod user_constitution;
+#[cfg(windows)]
+pub mod windows_identity;
 mod xai_credentials;
 pub use config_document::{
     ConfigDocumentUndo, create_config_document, migrate_legacy_root_config, mutate_config_document,
-    mutate_config_document_undoable, mutate_config_document_with_migration,
-    preview_legacy_root_config, replace_config_document_if_unchanged, set_config_document_value,
-    unset_config_document_value, with_config_write_lock,
+    mutate_config_document_undoable, mutate_config_document_undoable_with_migration,
+    mutate_config_document_with_migration, preview_legacy_root_config,
+    replace_config_document_if_unchanged, set_config_document_value, unset_config_document_value,
+    with_config_write_lock,
 };
 pub use model_reference::{Modality, ModelReferenceCard, ModelReferenceDatabase};
 pub(crate) use provider_defaults::*;
 pub use provider_kind::ProviderKind;
+pub use route::ProviderId;
 pub use settings_schema::{
     SETTINGS_SCHEMA, SettingDef, SettingKind, SettingOption, SettingUi, schema_groups, schema_rows,
     schema_tabs, setting, setting_index,
@@ -52,7 +57,7 @@ pub use user_constitution::{
     UserConstitution, UserConstitutionLoad,
 };
 pub use xai_credentials::{
-    CHATGPT_OAUTH_GENERATION_PREFIX, CHATGPT_OAUTH_GENERATION_SUFFIX,
+    CHATGPT_HOST_FILE_NAME, CHATGPT_OAUTH_GENERATION_PREFIX, CHATGPT_OAUTH_GENERATION_SUFFIX,
     LEGACY_CHATGPT_OAUTH_FILE_NAME, LEGACY_XAI_OAUTH_FILE_NAME, XAI_OAUTH_GENERATION_PREFIX,
     XAI_OAUTH_GENERATION_SUFFIX, XaiOAuthCredentialStore, XaiOAuthRevocation,
     chatgpt_oauth_generation_path, clear_all_chatgpt_oauth_credentials,
@@ -4572,117 +4577,11 @@ fn canonical_orcarouter_recent_model_id(model: &str) -> Option<&'static str> {
 }
 
 fn default_model_for_provider(provider: ProviderKind) -> &'static str {
-    match provider {
-        ProviderKind::Deepseek => DEFAULT_DEEPSEEK_MODEL,
-        ProviderKind::DeepseekAnthropic => DEFAULT_DEEPSEEK_ANTHROPIC_MODEL,
-        ProviderKind::NvidiaNim => DEFAULT_NVIDIA_NIM_MODEL,
-        ProviderKind::Openai => DEFAULT_OPENAI_MODEL,
-        ProviderKind::Atlascloud => DEFAULT_ATLASCLOUD_MODEL,
-        ProviderKind::WanjieArk => DEFAULT_WANJIE_ARK_MODEL,
-        ProviderKind::Volcengine => DEFAULT_VOLCENGINE_MODEL,
-        ProviderKind::Openrouter => DEFAULT_OPENROUTER_MODEL,
-        ProviderKind::Orcarouter => DEFAULT_ORCAROUTER_MODEL,
-        ProviderKind::XiaomiMimo => DEFAULT_XIAOMI_MIMO_MODEL,
-        ProviderKind::Novita => DEFAULT_NOVITA_MODEL,
-        ProviderKind::Fireworks => DEFAULT_FIREWORKS_MODEL,
-        ProviderKind::Siliconflow | ProviderKind::SiliconflowCN => DEFAULT_SILICONFLOW_MODEL,
-        ProviderKind::Arcee => DEFAULT_ARCEE_MODEL,
-        ProviderKind::Moonshot => DEFAULT_MOONSHOT_MODEL,
-        ProviderKind::Sglang => DEFAULT_SGLANG_MODEL,
-        ProviderKind::Vllm => DEFAULT_VLLM_MODEL,
-        ProviderKind::Ollama => DEFAULT_OLLAMA_MODEL,
-        ProviderKind::OllamaCloud => DEFAULT_OLLAMA_CLOUD_MODEL,
-        ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_MODEL,
-        ProviderKind::Modelscope => DEFAULT_MODELSCOPE_MODEL,
-        ProviderKind::Together => DEFAULT_TOGETHER_MODEL,
-        ProviderKind::Qianfan => DEFAULT_QIANFAN_MODEL,
-        ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_MODEL,
-        ProviderKind::Anthropic => DEFAULT_ANTHROPIC_MODEL,
-        ProviderKind::Openmodel => DEFAULT_OPENMODEL_MODEL,
-        ProviderKind::Zai => DEFAULT_ZAI_MODEL,
-        ProviderKind::Stepfun => DEFAULT_STEPFUN_MODEL,
-        ProviderKind::Minimax | ProviderKind::MinimaxAnthropic => DEFAULT_MINIMAX_MODEL,
-        ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_MODEL,
-        ProviderKind::Sakana => DEFAULT_SAKANA_MODEL,
-        ProviderKind::LongCat => DEFAULT_LONGCAT_MODEL,
-        ProviderKind::OpencodeGo => DEFAULT_OPENCODE_GO_MODEL,
-        ProviderKind::OpencodeZen => DEFAULT_OPENCODE_ZEN_MODEL,
-        ProviderKind::Meta => DEFAULT_META_MODEL,
-        ProviderKind::Xai => DEFAULT_XAI_MODEL,
-        ProviderKind::Mistral => DEFAULT_MISTRAL_MODEL,
-        ProviderKind::Google => DEFAULT_GOOGLE_MODEL,
-        ProviderKind::Antigravity => DEFAULT_ANTIGRAVITY_MODEL,
-        ProviderKind::Telecomjs => DEFAULT_TELECOMJS_MODEL,
-        ProviderKind::Edenai => DEFAULT_EDENAI_MODEL,
-        ProviderKind::Zenmux => DEFAULT_ZENMUX_MODEL,
-        ProviderKind::Csdn => DEFAULT_CSDN_MODEL,
-        ProviderKind::Concentrate => DEFAULT_CONCENTRATE_MODEL,
-        ProviderKind::Codewhale => DEFAULT_CODEWHALE_MODEL,
-        ProviderKind::ModelstudioTokenPlan
-        | ProviderKind::ModelstudioTokenPlanAnthropic
-        | ProviderKind::ModelstudioCodingPlan
-        | ProviderKind::ModelstudioCodingPlanAnthropic => DEFAULT_MODELSTUDIO_TOKEN_PLAN_MODEL,
-        // No built-in default model; the registry placeholder keeps this total.
-        ProviderKind::Custom => provider.provider().default_model(),
-    }
+    provider.provider().default_model()
 }
 
 fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
-    match provider {
-        ProviderKind::Deepseek => DEFAULT_DEEPSEEK_BASE_URL,
-        ProviderKind::DeepseekAnthropic => DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL,
-        ProviderKind::NvidiaNim => DEFAULT_NVIDIA_NIM_BASE_URL,
-        ProviderKind::Openai => DEFAULT_OPENAI_BASE_URL,
-        ProviderKind::Atlascloud => DEFAULT_ATLASCLOUD_BASE_URL,
-        ProviderKind::WanjieArk => DEFAULT_WANJIE_ARK_BASE_URL,
-        ProviderKind::Volcengine => DEFAULT_VOLCENGINE_BASE_URL,
-        ProviderKind::Openrouter => DEFAULT_OPENROUTER_BASE_URL,
-        ProviderKind::Orcarouter => DEFAULT_ORCAROUTER_BASE_URL,
-        ProviderKind::XiaomiMimo => DEFAULT_XIAOMI_MIMO_BASE_URL,
-        ProviderKind::Novita => DEFAULT_NOVITA_BASE_URL,
-        ProviderKind::Fireworks => DEFAULT_FIREWORKS_BASE_URL,
-        ProviderKind::Siliconflow => DEFAULT_SILICONFLOW_BASE_URL,
-        ProviderKind::SiliconflowCN => DEFAULT_SILICONFLOW_CN_BASE_URL,
-        ProviderKind::Arcee => DEFAULT_ARCEE_BASE_URL,
-        ProviderKind::Moonshot => DEFAULT_MOONSHOT_BASE_URL,
-        ProviderKind::Sglang => DEFAULT_SGLANG_BASE_URL,
-        ProviderKind::Vllm => DEFAULT_VLLM_BASE_URL,
-        ProviderKind::Ollama => DEFAULT_OLLAMA_BASE_URL,
-        ProviderKind::OllamaCloud => DEFAULT_OLLAMA_CLOUD_BASE_URL,
-        ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_BASE_URL,
-        ProviderKind::Modelscope => DEFAULT_MODELSCOPE_BASE_URL,
-        ProviderKind::Together => DEFAULT_TOGETHER_BASE_URL,
-        ProviderKind::Qianfan => DEFAULT_QIANFAN_BASE_URL,
-        ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_BASE_URL,
-        ProviderKind::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
-        ProviderKind::Openmodel => DEFAULT_OPENMODEL_BASE_URL,
-        ProviderKind::Zai => DEFAULT_ZAI_BASE_URL,
-        ProviderKind::Stepfun => DEFAULT_STEPFUN_BASE_URL,
-        ProviderKind::Minimax => DEFAULT_MINIMAX_BASE_URL,
-        ProviderKind::MinimaxAnthropic => DEFAULT_MINIMAX_ANTHROPIC_BASE_URL,
-        ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL,
-        ProviderKind::Sakana => DEFAULT_SAKANA_BASE_URL,
-        ProviderKind::LongCat => DEFAULT_LONGCAT_BASE_URL,
-        ProviderKind::OpencodeGo => DEFAULT_OPENCODE_GO_BASE_URL,
-        ProviderKind::OpencodeZen => DEFAULT_OPENCODE_ZEN_BASE_URL,
-        ProviderKind::Meta => DEFAULT_META_BASE_URL,
-        ProviderKind::Xai => DEFAULT_XAI_BASE_URL,
-        ProviderKind::Mistral => DEFAULT_MISTRAL_BASE_URL,
-        ProviderKind::Google => DEFAULT_GOOGLE_BASE_URL,
-        ProviderKind::Antigravity => DEFAULT_ANTIGRAVITY_BASE_URL,
-        ProviderKind::Telecomjs => DEFAULT_TELECOMJS_BASE_URL,
-        ProviderKind::Edenai => DEFAULT_EDENAI_BASE_URL,
-        ProviderKind::Zenmux => DEFAULT_ZENMUX_BASE_URL,
-        ProviderKind::Csdn => DEFAULT_CSDN_BASE_URL,
-        ProviderKind::Concentrate => DEFAULT_CONCENTRATE_BASE_URL,
-        ProviderKind::Codewhale => DEFAULT_CODEWHALE_BASE_URL,
-        ProviderKind::ModelstudioTokenPlan => DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL,
-        ProviderKind::ModelstudioTokenPlanAnthropic => MODELSTUDIO_TOKEN_PLAN_ANTHROPIC_BASE_URL,
-        ProviderKind::ModelstudioCodingPlan => DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL,
-        ProviderKind::ModelstudioCodingPlanAnthropic => MODELSTUDIO_CODING_PLAN_ANTHROPIC_BASE_URL,
-        // No built-in default base URL; the registry placeholder keeps this total.
-        ProviderKind::Custom => provider.provider().default_base_url(),
-    }
+    provider.provider().default_base_url()
 }
 
 fn moonshot_base_url_uses_kimi_code(base_url: &str) -> bool {
@@ -6984,6 +6883,10 @@ pub fn migrate_config_if_needed() -> Result<Option<ConfigMigration>> {
         return Ok(None);
     }
     let primary = codewhale_home()?.join(CONFIG_FILE_NAME);
+    // `exists()` follows links, so a dangling link would read as "absent" and
+    // the copy below would create whatever it points at. A link at the primary
+    // name is refused instead, dangling or not.
+    reject_path_symlink(&primary)?;
     if primary.exists() {
         return Ok(None);
     }
@@ -6991,11 +6894,10 @@ pub fn migrate_config_if_needed() -> Result<Option<ConfigMigration>> {
     if !legacy.exists() {
         return Ok(None);
     }
-    // Copy the config to the new home.
-    if let Some(parent) = primary.parent() {
-        std::fs::create_dir_all(parent).context("failed to create codewhale config directory")?;
-    }
-    std::fs::copy(&legacy, &primary)
+    // Copy the config to the new home, owner-only, through a temporary file
+    // renamed into place (the primary name is replaced, never written through).
+    let contents = std::fs::read(&legacy).context("failed to read legacy deepseek config")?;
+    persistence::atomic_write(&primary, &contents)
         .context("failed to migrate config from deepseek to codewhale home")?;
     tracing::info!(
         "Migrated config from {} to {}",

@@ -1,22 +1,4 @@
-use std::path::PathBuf;
 use std::process::{Command, Output};
-
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
-}
 
 fn assert_terminal_stream_error(output: Output, expected_fragment: &str) {
     assert!(
@@ -50,7 +32,7 @@ fn assert_terminal_stream_error(output: Output, expected_fragment: &str) {
 
 #[test]
 fn invalid_workflow_input_is_terminal_ndjson() {
-    let output = Command::new(codewhale_tui_binary())
+    let output = Command::new(crate::binary::codewhale())
         .args([
             "workflow-tool",
             "--approval-source",
@@ -68,7 +50,7 @@ fn missing_profile_is_terminal_ndjson() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = dir.path().join("config.toml");
     std::fs::write(&config, "provider = \"vllm\"\n").expect("write config");
-    let output = Command::new(codewhale_tui_binary())
+    let output = Command::new(crate::binary::codewhale())
         .arg("--config")
         .arg(&config)
         .args([
@@ -103,7 +85,7 @@ provider = "anthropic"
 "#,
     )
     .expect("write profile config");
-    let output = Command::new(codewhale_tui_binary())
+    let output = Command::new(crate::binary::codewhale())
         .arg("--config")
         .arg(&config)
         .args([

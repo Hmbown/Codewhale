@@ -12,6 +12,7 @@ pub mod manifest;
 pub mod marketplace;
 pub mod matcher;
 pub mod mutation;
+pub(crate) mod native_presets;
 mod path_identity;
 pub mod recommend;
 pub mod registry;

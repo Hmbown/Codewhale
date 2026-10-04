@@ -1,5 +1,7 @@
 {
+  "ExtensionPromptUnavailable": "Extension instructions are unavailable; inspect /plugin show.",
   "ComposerOversizedSubmitHeld": "Not sent: this message is over {limit} characters and could not be saved as a paste file ({error}). The full text is still in the composer: shorten it, or make .codewhale/pastes writable, then press Enter again.",
+  "ComposerOversizedSubmitHeldShort": "Not sent: over {limit} characters; paste file not saved.",
   "CmdPluginOwnerReport": "Extension host:\n  State: {state}\n  Live tools ({count}): {tools}",
   "CmdPluginOwnerActivating": "Activating",
   "CmdPluginOwnerActive": "Active",
@@ -2439,5 +2441,11 @@
   "ModelPickerReadinessRefreshed": "Model readiness refreshed · catalog rows rebuilt",
   "ModelPickerOpenToRefresh": "Open /model to refresh readiness and catalog",
   "ModelPickerPinnedChip": "pinned",
+  "AuthSignedInAs": "Signed in to {provider} as {account}.",
+  "AuthSignedInWithoutEmail": "Signed in to {provider} (the issuer sent no account email).",
+  "AuthReplacedPreviousSignInAs": "Replaced the previous Codewhale {provider} sign-in ({account}).",
+  "AuthReplacedPreviousSignIn": "Replaced the previous Codewhale {provider} sign-in.",
+  "AuthSameAccountAsBefore": "This is the same account as before; to use another {provider} account, sign out of it in the browser (or use a private window) and sign in again.",
+  "AuthEnvTokenOutranksSignIn": "OPENAI_CODEX_ACCESS_TOKEN or CODEX_ACCESS_TOKEN is set in this environment and outranks this sign-in; requests keep using that token's account until you unset it.",
   "PinnedPromptJumpToMessage": "Jump to this message"
 }

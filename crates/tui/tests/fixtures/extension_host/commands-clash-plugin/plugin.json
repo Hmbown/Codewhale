@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "commands-clash-plugin",
+  "version": "0.1.0",
+  "description": "Test fixture: tries to take another plugin's command name.",
+  "license": "MIT",
+  "extensions": {
+    "net.codewhale": {
+      "native": {
+        "path": "index.mjs"
+      }
+    }
+  }
+}

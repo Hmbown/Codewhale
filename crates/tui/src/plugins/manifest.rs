@@ -355,6 +355,10 @@ pub struct ValidatedManifest {
     /// its lossless relative OS path. Runtime adapters use this to bind parsed
     /// representations to the same bytes that produced `content_hash`.
     pub(crate) file_hashes: BTreeMap<PathBuf, String>,
+    /// Plain SHA256 for declared regular Native entry files, captured from
+    /// the same anchored, bounded read as the domain-separated bundle hashes.
+    /// EntryRef binds these digests; the bundle file inventory keeps its domain.
+    pub(crate) native_entry_hashes: BTreeMap<PathBuf, String>,
     pub capability_hash: String,
     pub applicable: bool,
     pub warnings: Vec<String>,
@@ -536,7 +540,8 @@ impl PluginManifest {
         let components = manifest.resolve_components(&canonical_root)?;
         manifest.validate_mcp_servers(&canonical_root)?;
         let inventory = manifest.inventory(&components)?;
-        let (content_hash, file_hashes) = hash_bundle(&canonical_root, &manifest_bytes, label)?;
+        let (content_hash, bundle_hashes) =
+            hash_bundle(&canonical_root, &manifest_bytes, label, &components.native)?;
         let capability_hash = hash_inventory(&inventory);
         let applicable = manifest.check_when();
         if read_manifest_bytes(path, label)? != manifest_bytes {
@@ -563,7 +568,8 @@ impl PluginManifest {
             components,
             inventory,
             content_hash,
-            file_hashes,
+            file_hashes: bundle_hashes.file_hashes,
+            native_entry_hashes: bundle_hashes.native_entry_hashes,
             capability_hash,
             applicable,
             warnings,
@@ -680,7 +686,7 @@ impl PluginManifest {
         })
     }
 
-    fn validate_mcp_servers(&self, root: &Path) -> Result<(), String> {
+    pub(crate) fn validate_mcp_servers(&self, root: &Path) -> Result<(), String> {
         let Some(servers) = &self.mcp_servers else {
             return Ok(());
         };
@@ -1396,7 +1402,8 @@ fn hash_bundle(
     root: &Path,
     manifest_bytes: &[u8],
     manifest_label: &str,
-) -> Result<(String, BTreeMap<PathBuf, String>), String> {
+    native_entries: &[PathBuf],
+) -> Result<(String, HashBudget), String> {
     let mut hasher = Sha256::new();
     // v2 length-frames every variable-length field. The v1 delimiter-only
     // stream was structurally ambiguous across file-record boundaries.
@@ -1409,12 +1416,24 @@ fn hash_bundle(
     hasher.update(b"\0");
     hasher.update((manifest_bytes.len() as u64).to_le_bytes());
     hasher.update(manifest_bytes);
-    let mut budget = HashBudget::default();
+    let native_paths = native_entries
+        .iter()
+        .map(|entry| {
+            entry
+                .strip_prefix(root)
+                .map(Path::to_path_buf)
+                .map_err(|_| "Native entry escaped the reviewed bundle".to_string())
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let mut budget = HashBudget {
+        native_paths,
+        ..Default::default()
+    };
     // Hash the complete bundle, not only declared component roots. Local MCP
     // entrypoints and companion assets are security-relevant even when they do
     // not have a separate component table.
     hash_path(root, root, &mut hasher, &mut budget)?;
-    Ok((hex_digest(hasher.finalize()), budget.file_hashes))
+    Ok((hex_digest(hasher.finalize()), budget))
 }
 
 #[derive(Default)]
@@ -1422,6 +1441,8 @@ struct HashBudget {
     files: usize,
     bytes: u64,
     file_hashes: BTreeMap<PathBuf, String>,
+    native_paths: BTreeSet<PathBuf>,
+    native_entry_hashes: BTreeMap<PathBuf, String>,
 }
 
 fn hash_path(
@@ -1481,6 +1502,7 @@ fn hash_path(
         hasher.update(expected_len.to_le_bytes());
         let mut file_hasher = Sha256::new();
         file_hasher.update(b"codewhale-plugin-file-bytes-v1\0");
+        let mut native_entry_hasher = budget.native_paths.contains(relative).then(Sha256::new);
         // Keep the read buffer off the stack. `hash_path` is recursive and the
         // fixed-size array inflated every directory frame, which could exhaust
         // a Tokio worker stack while revalidating a nested plugin bundle.
@@ -1502,6 +1524,9 @@ fn hash_path(
             }
             hasher.update(&buffer[..read]);
             file_hasher.update(&buffer[..read]);
+            if let Some(entry_hasher) = &mut native_entry_hasher {
+                entry_hasher.update(&buffer[..read]);
+            }
         }
         if actual_len != expected_len {
             return Err(format!(
@@ -1512,6 +1537,11 @@ fn hash_path(
         budget
             .file_hashes
             .insert(relative.to_path_buf(), hex_digest(file_hasher.finalize()));
+        if let Some(entry_hasher) = native_entry_hasher {
+            budget
+                .native_entry_hashes
+                .insert(relative.to_path_buf(), hex_digest(entry_hasher.finalize()));
+        }
         #[cfg(windows)]
         ensure_windows_path_still_opened(path, &file)?;
     } else {
@@ -1556,11 +1586,26 @@ pub(crate) fn open_bundle_file(path: &Path) -> std::io::Result<fs::File> {
 
 #[cfg(windows)]
 pub(crate) fn open_bundle_file(path: &Path) -> std::io::Result<fs::File> {
+    open_bundle_file_with_access(
+        path,
+        windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ,
+    )
+}
+
+/// Same protected reader, retaining the right to move this exact opened object.
+#[cfg(windows)]
+pub(crate) fn open_bundle_file_for_retirement(path: &Path) -> std::io::Result<fs::File> {
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ};
+    open_bundle_file_with_access(path, FILE_GENERIC_READ | DELETE)
+}
+
+#[cfg(windows)]
+fn open_bundle_file_with_access(path: &Path, access: u32) -> std::io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt as _;
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     let file = fs::OpenOptions::new()
-        .read(true)
+        .access_mode(access)
         .share_mode(0x0000_0001) // deny concurrent writes and replacement
         .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT
         .open(path)?;
@@ -1841,6 +1886,90 @@ mod tests {
         let second = PluginManifest::validate_from_path(&path).unwrap();
         assert_ne!(first.content_hash, second.content_hash);
         assert_eq!(first.capability_hash, second.capability_hash);
+    }
+
+    #[test]
+    fn native_entry_receipt_is_plain_same_read_digest_without_changing_bundle_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("native")).unwrap();
+        let entry_bytes = b"export function apply() {}\n";
+        fs::write(tmp.path().join("native/index.mjs"), entry_bytes).unwrap();
+        fs::write(
+            tmp.path().join("native/undeclared.mjs"),
+            b"export const sidecar = 1",
+        )
+        .unwrap();
+        let manifest = write_manifest(tmp.path(), "[native]\npath = \"native/index.mjs\"\n");
+        let first = PluginManifest::validate_from_path(&manifest).unwrap();
+        let relative = PathBuf::from("native/index.mjs");
+        let plain = hex_digest(Sha256::digest(entry_bytes));
+        let mut domain = Sha256::new();
+        domain.update(b"codewhale-plugin-file-bytes-v1\0");
+        domain.update(entry_bytes);
+        assert_eq!(first.native_entry_hashes.len(), 1);
+        assert_eq!(first.native_entry_hashes[&relative], plain);
+        assert_eq!(first.file_hashes[&relative], hex_digest(domain.finalize()));
+        assert_ne!(
+            first.file_hashes[&relative],
+            first.native_entry_hashes[&relative]
+        );
+        assert!(
+            !first
+                .native_entry_hashes
+                .contains_key(Path::new("native/undeclared.mjs"))
+        );
+
+        // The purpose-specific capture adds no bytes to the established
+        // bundle domain or its complete regular-file inventory.
+        let manifest_bytes = fs::read(&manifest).unwrap();
+        let (without_entries, without_entry_hashes) =
+            hash_bundle(&first.canonical_root, &manifest_bytes, "plugin.toml", &[]).unwrap();
+        assert_eq!(first.content_hash, without_entries);
+        assert_eq!(first.file_hashes, without_entry_hashes.file_hashes);
+        assert!(without_entry_hashes.native_entry_hashes.is_empty());
+
+        // Undeclared companions remain whole-bundle authority even though
+        // they receive no Native EntryRef digest.
+        fs::write(
+            tmp.path().join("native/undeclared.mjs"),
+            b"export const sidecar = 2",
+        )
+        .unwrap();
+        let changed_sidecar = PluginManifest::validate_from_path(&manifest).unwrap();
+        assert_ne!(first.content_hash, changed_sidecar.content_hash);
+        assert_eq!(
+            first.native_entry_hashes,
+            changed_sidecar.native_entry_hashes
+        );
+        fs::write(
+            tmp.path().join("native/index.mjs"),
+            b"export function changed() {}\n",
+        )
+        .unwrap();
+        let changed_entry = PluginManifest::validate_from_path(&manifest).unwrap();
+        assert_ne!(changed_sidecar.content_hash, changed_entry.content_hash);
+        assert_ne!(
+            first.native_entry_hashes[&relative],
+            changed_entry.native_entry_hashes[&relative]
+        );
+    }
+
+    #[test]
+    fn ordinary_native_entry_receipt_keeps_bundle_limit_beyond_preset_metadata_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("native")).unwrap();
+        let bytes = format!(
+            "// {}\nexport function apply() {{}}\n",
+            "x".repeat(32 * 1024)
+        );
+        fs::write(tmp.path().join("native/index.mjs"), &bytes).unwrap();
+        let manifest = write_manifest(tmp.path(), "[native]\npath = \"native/index.mjs\"\n");
+        let validated = PluginManifest::validate_from_path(&manifest).unwrap();
+        assert_eq!(validated.inventory.native, 1);
+        assert_eq!(
+            validated.native_entry_hashes[Path::new("native/index.mjs")],
+            hex_digest(Sha256::digest(bytes.as_bytes()))
+        );
     }
 
     #[test]

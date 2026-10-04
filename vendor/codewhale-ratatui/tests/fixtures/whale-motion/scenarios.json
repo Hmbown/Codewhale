@@ -1,0 +1,598 @@
+{
+  "schemaVersion": 1,
+  "context": {
+    "freshness": "Live",
+    "turnId": "fixture-turn",
+    "status": "completed",
+    "nowMs": 1000,
+    "failedAtMs": 0
+  },
+  "scenarios": [
+    {
+      "id": "first-output",
+      "label": "First output pending",
+      "steps": [
+        {
+          "presence": "Thinking",
+          "expected": "think"
+        }
+      ]
+    },
+    {
+      "id": "reasoning",
+      "label": "Reasoning stream",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "thinking",
+            "observed": true
+          },
+          "expected": "think"
+        }
+      ]
+    },
+    {
+      "id": "tool-gap",
+      "label": "Between tool steps",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "reading",
+            "observed": true
+          },
+          "expected": "read"
+        },
+        {
+          "after": 24,
+          "presence": "Working",
+          "activity": {
+            "kind": "unknown",
+            "observed": false
+          },
+          "expected": "busy"
+        }
+      ]
+    },
+    {
+      "id": "desktop-browser",
+      "label": "Desktop → browser",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "computer",
+            "observed": true
+          },
+          "expected": "computer"
+        },
+        {
+          "after": 45,
+          "presence": "Working",
+          "activity": {
+            "kind": "browsing",
+            "observed": true
+          },
+          "expected": "browse"
+        }
+      ]
+    },
+    {
+      "id": "service-call",
+      "label": "Connected app request",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "network",
+            "observed": true
+          },
+          "expected": "connect"
+        }
+      ]
+    },
+    {
+      "id": "opaque-wrapper",
+      "label": "Opaque tool wrapper",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "tool",
+            "observed": true
+          },
+          "expected": "busy"
+        }
+      ]
+    },
+    {
+      "id": "future-tool",
+      "label": "Unknown future tool",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "future-kind",
+            "observed": true
+          },
+          "expected": "busy"
+        }
+      ]
+    },
+    {
+      "id": "unobserved",
+      "label": "No observed activity",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "editing",
+            "observed": false
+          },
+          "expected": "busy"
+        }
+      ]
+    },
+    {
+      "id": "stale-activity",
+      "label": "Stale activity",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "computer",
+            "observed": true
+          },
+          "context": {
+            "freshness": "Stale"
+          },
+          "expected": "busy"
+        }
+      ]
+    },
+    {
+      "id": "missing-freshness",
+      "label": "Missing freshness",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "reading",
+            "observed": true
+          },
+          "context": {
+            "freshness": null
+          },
+          "expected": "busy"
+        }
+      ]
+    },
+    {
+      "id": "passive-wait",
+      "label": "Tool waiting, no request for you",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "waiting",
+            "observed": true
+          },
+          "expected": "busy"
+        }
+      ]
+    },
+    {
+      "id": "error-cue",
+      "label": "Tool error, turn still running",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "error",
+            "observed": true
+          },
+          "expected": "busy"
+        }
+      ]
+    },
+    {
+      "id": "approval",
+      "label": "Approval needed → resumed work",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "computer",
+            "observed": true
+          },
+          "expected": "computer"
+        },
+        {
+          "after": 20,
+          "presence": "NeedsYou",
+          "expected": "needs"
+        },
+        {
+          "after": 50,
+          "presence": "Working",
+          "activity": {
+            "kind": "computer",
+            "observed": true
+          },
+          "expected": "computer"
+        }
+      ]
+    },
+    {
+      "id": "user-input",
+      "label": "Question or sign-in needs you",
+      "steps": [
+        {
+          "presence": "NeedsYou",
+          "expected": "needs"
+        }
+      ]
+    },
+    {
+      "id": "permission-denied",
+      "label": "Permission declined, turn canceled",
+      "steps": [
+        {
+          "presence": "NeedsYou",
+          "expected": "needs"
+        },
+        {
+          "after": 30,
+          "presence": "Idle",
+          "context": {
+            "status": "canceled"
+          },
+          "expected": "rest"
+        }
+      ]
+    },
+    {
+      "id": "interrupted",
+      "label": "User interrupts work",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "executing",
+            "observed": true
+          },
+          "expected": "run"
+        },
+        {
+          "after": 30,
+          "presence": "Idle",
+          "context": {
+            "status": "interrupted"
+          },
+          "expected": "rest"
+        }
+      ]
+    },
+    {
+      "id": "cancel-not-failure",
+      "label": "Cancellation is not Stuck",
+      "steps": [
+        {
+          "presence": "Stuck",
+          "context": {
+            "status": "canceled"
+          },
+          "expected": "rest"
+        }
+      ]
+    },
+    {
+      "id": "failed-turn",
+      "label": "Genuine failed turn · proposed",
+      "steps": [
+        {
+          "presence": "Stuck",
+          "context": {
+            "status": "failed",
+            "nowMs": 500,
+            "failedAtMs": 0
+          },
+          "expected": "hmm"
+        }
+      ]
+    },
+    {
+      "id": "failure-expires",
+      "label": "Failure cue expires",
+      "steps": [
+        {
+          "presence": "Stuck",
+          "context": {
+            "status": "failed",
+            "nowMs": 3000,
+            "failedAtMs": 0
+          },
+          "expected": "rest"
+        }
+      ]
+    },
+    {
+      "id": "retry",
+      "label": "Failed tool → retry",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "executing",
+            "observed": true
+          },
+          "expected": "run"
+        },
+        {
+          "after": 40,
+          "event": {
+            "type": "failed",
+            "kind": "executing",
+            "status": "failed"
+          },
+          "expected": "run"
+        },
+        {
+          "after": 12,
+          "presence": "Working",
+          "activity": {
+            "kind": "executing",
+            "observed": true,
+            "active": [
+              {
+                "kind": "executing",
+                "sinceMs": 2000
+              }
+            ]
+          },
+          "expected": "run"
+        }
+      ]
+    },
+    {
+      "id": "completion",
+      "label": "Completed turn",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "responding",
+            "observed": true
+          },
+          "expected": "talk"
+        },
+        {
+          "after": 35,
+          "presence": "Done",
+          "expected": "done"
+        },
+        {
+          "after": 80,
+          "presence": "Idle",
+          "expected": "rest"
+        }
+      ]
+    },
+    {
+      "id": "completion-once",
+      "label": "Listening interrupts Done",
+      "steps": [
+        {
+          "presence": "Done",
+          "expected": "done"
+        },
+        {
+          "after": 30,
+          "presence": "Listening",
+          "expected": "listen"
+        },
+        {
+          "after": 20,
+          "presence": "Done",
+          "expected": "done"
+        }
+      ],
+      "spouts": 1
+    },
+    {
+      "id": "completion-no-id",
+      "label": "No completion ID, no flourish",
+      "steps": [
+        {
+          "presence": "Done",
+          "context": {
+            "turnId": null
+          },
+          "expected": "done"
+        },
+        {
+          "after": 80,
+          "presence": "Done",
+          "context": {
+            "turnId": null
+          },
+          "expected": "done"
+        }
+      ],
+      "spouts": 0
+    },
+    {
+      "id": "disconnect",
+      "label": "Connection lost during work",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "editing",
+            "observed": true
+          },
+          "expected": "write"
+        },
+        {
+          "after": 24,
+          "presence": "Offline",
+          "expected": "sleep"
+        }
+      ]
+    },
+    {
+      "id": "reconnect",
+      "label": "Reconnect and resume",
+      "steps": [
+        {
+          "presence": "Offline",
+          "expected": "sleep"
+        },
+        {
+          "after": 90,
+          "presence": "Working",
+          "activity": {
+            "kind": "reading",
+            "observed": true
+          },
+          "expected": "read"
+        }
+      ]
+    },
+    {
+      "id": "computer-sleep",
+      "label": "Computer sleeping, Engine still ready",
+      "steps": [
+        {
+          "presence": "Idle",
+          "expected": "rest"
+        }
+      ]
+    },
+    {
+      "id": "no-agents",
+      "label": "Zero reported agents",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "delegating",
+            "observed": true,
+            "parallel": 0
+          },
+          "expected": "pod",
+          "calves": 0
+        }
+      ]
+    },
+    {
+      "id": "agents-join-leave",
+      "label": "Agents join, then leave",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "delegating",
+            "observed": true,
+            "parallel": 3
+          },
+          "expected": "pod",
+          "calves": 3
+        },
+        {
+          "after": 60,
+          "presence": "Working",
+          "activity": {
+            "kind": "delegating",
+            "observed": true,
+            "parallel": 1
+          },
+          "expected": "pod",
+          "calves": 1
+        },
+        {
+          "after": 60,
+          "presence": "Working",
+          "activity": {
+            "kind": "delegating",
+            "observed": true,
+            "parallel": 0
+          },
+          "expected": "pod",
+          "calves": 0
+        }
+      ]
+    },
+    {
+      "id": "agents-cap",
+      "label": "More than three agents",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "delegating",
+            "observed": true,
+            "parallel": 4
+          },
+          "expected": "pod",
+          "calves": 3
+        }
+      ]
+    },
+    {
+      "id": "foreground-priority",
+      "label": "Foreground tool with agents running",
+      "steps": [
+        {
+          "presence": "Working",
+          "activity": {
+            "kind": "reading",
+            "observed": true,
+            "parallel": 3
+          },
+          "expected": "read",
+          "calves": 0
+        }
+      ]
+    },
+    {
+      "id": "thinking-interrupted",
+      "label": "Thinking interrupted by Read",
+      "steps": [
+        {
+          "presence": "Thinking",
+          "expected": "think"
+        },
+        {
+          "after": 9,
+          "presence": "Working",
+          "activity": {
+            "kind": "reading",
+            "observed": true
+          },
+          "expected": "read"
+        }
+      ]
+    },
+    {
+      "id": "attention-interrupted",
+      "label": "Needs you answered immediately",
+      "steps": [
+        {
+          "presence": "NeedsYou",
+          "expected": "needs"
+        },
+        {
+          "after": 6,
+          "presence": "Working",
+          "activity": {
+            "kind": "editing",
+            "observed": true
+          },
+          "expected": "write"
+        }
+      ]
+    }
+  ]
+}

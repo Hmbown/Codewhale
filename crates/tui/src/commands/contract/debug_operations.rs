@@ -69,6 +69,12 @@ impl CommandDebugHistoryContext for DebugOperationsAdapter<'_> {
     }
     fn load_composer(&mut self, input: String) {
         let mut app = self.host.app.borrow_mut();
+        // A queued follow-up still open for editing would otherwise stay bound
+        // to the composer and be overwritten, or sent in place of this edit.
+        // Return it to the queue first — the same hand-back as Esc.
+        if app.cancel_queued_draft_edit() {
+            app.status_message = Some("Queued edit canceled; follow-up restored".to_string());
+        }
         app.input = input;
         app.cursor_position = app.input.chars().count();
         app.edit_in_progress = true;

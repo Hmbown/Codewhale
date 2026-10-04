@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 
 use super::{CodewhaleClient, api_url, responses_api_url};
 
@@ -64,21 +64,20 @@ impl ProviderNativeSearchClient {
     pub(crate) fn new(inner: CodewhaleClient) -> Option<Self> {
         matches!(
             inner.api_provider,
-            ApiProvider::Openai
-                | ApiProvider::Anthropic
-                | ApiProvider::Xai
-                | ApiProvider::XiaomiMimo
-                | ApiProvider::Zai
-                | ApiProvider::ModelstudioTokenPlan
-                | ApiProvider::Deepseek
-                | ApiProvider::DeepseekCN
-                | ApiProvider::Moonshot
+            ProviderKind::Openai
+                | ProviderKind::Anthropic
+                | ProviderKind::Xai
+                | ProviderKind::XiaomiMimo
+                | ProviderKind::Zai
+                | ProviderKind::ModelstudioTokenPlan
+                | ProviderKind::Deepseek
+                | ProviderKind::Moonshot
         )
         .then_some(Self { inner })
     }
 
     #[must_use]
-    pub(crate) fn provider(&self) -> ApiProvider {
+    pub(crate) fn provider(&self) -> ProviderKind {
         self.inner.api_provider
     }
 
@@ -115,10 +114,10 @@ impl ProviderNativeSearchClient {
     #[must_use]
     pub(crate) fn requested_answer_output_tokens(&self) -> Option<u32> {
         match self.inner.api_provider {
-            ApiProvider::Anthropic | ApiProvider::XiaomiMimo => {
+            ProviderKind::Anthropic | ProviderKind::XiaomiMimo => {
                 Some(self.answer_output_tokens(PRIOR_NATIVE_SEARCH_OUTPUT_TOKENS))
             }
-            ApiProvider::Moonshot => {
+            ProviderKind::Moonshot => {
                 Some(self.answer_output_tokens(kimi::PRIOR_NATIVE_SEARCH_MAX_COMPLETION_TOKENS))
             }
             _ => None,
@@ -150,9 +149,9 @@ impl ProviderNativeSearchClient {
     #[must_use]
     pub(crate) const fn maximum_domain_count(&self) -> Option<usize> {
         match self.inner.api_provider {
-            ApiProvider::Xai => Some(5),
-            ApiProvider::Openai => Some(100),
-            ApiProvider::Anthropic => None,
+            ProviderKind::Xai => Some(5),
+            ProviderKind::Openai => Some(100),
+            ProviderKind::Anthropic => None,
             _ => Some(0),
         }
     }
@@ -167,7 +166,7 @@ impl ProviderNativeSearchClient {
         // retained through response decode so a relay writer cannot start
         // while this result is still able to feed the interactive turn.
         let _inference = self.inner.acquire_remote_control_inference_permit().await;
-        if self.inner.api_provider == ApiProvider::Moonshot {
+        if self.inner.api_provider == ProviderKind::Moonshot {
             // Kimi/Moonshot runs a bounded multi-round agentic search with its
             // own request/reply loop, so it cannot share the single-shot body
             // dispatch below. It still runs under the inference permit above.
@@ -176,51 +175,51 @@ impl ProviderNativeSearchClient {
             return Ok(parsed);
         }
         let body = match self.inner.api_provider {
-            ApiProvider::Openai => build_responses_search_body(
+            ProviderKind::Openai => build_responses_search_body(
                 &self.inner.default_model,
                 request,
                 ResponsesSearchDialect::Openai,
             ),
-            ApiProvider::Xai => build_responses_search_body(
+            ProviderKind::Xai => build_responses_search_body(
                 &self.inner.default_model,
                 request,
                 ResponsesSearchDialect::Xai,
             ),
-            ApiProvider::ModelstudioTokenPlan => build_responses_search_body(
+            ProviderKind::ModelstudioTokenPlan => build_responses_search_body(
                 &self.inner.default_model,
                 request,
                 ResponsesSearchDialect::ModelStudio,
             ),
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN => build_responses_search_body(
+            ProviderKind::Deepseek => build_responses_search_body(
                 &self.inner.default_model,
                 request,
                 ResponsesSearchDialect::Deepseek,
             ),
-            ApiProvider::Anthropic => build_anthropic_search_body(
+            ProviderKind::Anthropic => build_anthropic_search_body(
                 &self.inner.default_model,
                 request,
                 self.requested_answer_output_tokens()
                     .unwrap_or(PRIOR_NATIVE_SEARCH_OUTPUT_TOKENS),
             ),
-            ApiProvider::XiaomiMimo => build_mimo_search_body(
+            ProviderKind::XiaomiMimo => build_mimo_search_body(
                 &self.inner.default_model,
                 request,
                 self.requested_answer_output_tokens()
                     .unwrap_or(PRIOR_NATIVE_SEARCH_OUTPUT_TOKENS),
             ),
-            ApiProvider::Zai => zai::build_body(request, &self.inner.base_url)?,
+            ProviderKind::Zai => zai::build_body(request, &self.inner.base_url)?,
             _ => bail!("active provider has no native web-search adapter"),
         };
         let url = match self.inner.api_provider {
-            ApiProvider::Openai | ApiProvider::Xai | ApiProvider::ModelstudioTokenPlan => {
+            ProviderKind::Openai | ProviderKind::Xai | ProviderKind::ModelstudioTokenPlan => {
                 api_url(&self.inner.base_url, "responses")
             }
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN => {
+            ProviderKind::Deepseek => {
                 responses_api_url(&self.inner.base_url, self.inner.api_provider)
             }
-            ApiProvider::Anthropic => anthropic_messages_url(&self.inner.base_url),
-            ApiProvider::XiaomiMimo => api_url(&self.inner.base_url, "chat/completions"),
-            ApiProvider::Zai => api_url(&self.inner.base_url, "web_search"),
+            ProviderKind::Anthropic => anthropic_messages_url(&self.inner.base_url),
+            ProviderKind::XiaomiMimo => api_url(&self.inner.base_url, "chat/completions"),
+            ProviderKind::Zai => api_url(&self.inner.base_url, "web_search"),
             _ => unreachable!("provider checked above"),
         };
         let body_bytes = serde_json::to_vec(&body)
@@ -241,14 +240,13 @@ impl ProviderNativeSearchClient {
             .await
             .context("provider-native web search returned invalid JSON")?;
         let mut parsed = match self.inner.api_provider {
-            ApiProvider::Openai
-            | ApiProvider::Xai
-            | ApiProvider::ModelstudioTokenPlan
-            | ApiProvider::Deepseek
-            | ApiProvider::DeepseekCN => parse_responses_search(&payload),
-            ApiProvider::Anthropic => parse_anthropic_search(&payload),
-            ApiProvider::XiaomiMimo => parse_mimo_search(&payload),
-            ApiProvider::Zai => zai::parse(&payload),
+            ProviderKind::Openai
+            | ProviderKind::Xai
+            | ProviderKind::ModelstudioTokenPlan
+            | ProviderKind::Deepseek => parse_responses_search(&payload),
+            ProviderKind::Anthropic => parse_anthropic_search(&payload),
+            ProviderKind::XiaomiMimo => parse_mimo_search(&payload),
+            ProviderKind::Zai => zai::parse(&payload),
             _ => unreachable!("provider checked above"),
         };
         parsed.citations.truncate(usize::from(request.max_results));

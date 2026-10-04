@@ -1,21 +1,63 @@
 {
-  "source": "crates/tui/tests/cucumber/launch_card_pty.rs::website_current_terminal_capture",
-  "command": "QA_LAUNCH_CAPTURE_DIR=<dir> scripts/dev-cargo.sh test -p codewhale-tui --features long-running-tests --test cucumber website_current_terminal_capture -- --ignored",
-  "binaryVersion": "0.10.0 (dev)",
-  "baseCommit": "5765d80278f7184d187fa6682ba96b403a006523",
-  "capturedAt": "2026-09-25",
+  "source": "Native Codewhale PTY via qa_harness; website_current_terminal_capture sequence and native workbar keys",
+  "command": "Capture an isolated offline session from the installed Codewhale binary with crates/tui/tests/support/qa_harness; follow website_current_terminal_capture and work_bar_keys_pty input sequences",
+  "binaryVersion": "0.10.1 (e9401490969d)",
+  "baseCommit": "e9401490969d58935b4544388d75dc7f276b81a4",
+  "capturedAt": "2026-10-02",
   "conditions": {
-    "theme": "underwater (default; no theme override)",
-    "motion": "NO_ANIMATIONS=1 (no reveal, fish or bubbles)",
+    "colorterm": "truecolor",
+    "fixtureHistory": false,
+    "motion": "NO_ANIMATIONS=1",
+    "provider": "none; offline Ctrl+O",
+    "submittedPrompts": 0,
     "workspace": "~/my-project inside a sealed HOME",
-    "provider": "none connected; explored offline via Ctrl+O; no network probes",
-    "colorterm": "truecolor"
+    "theme": "underwater (default; no theme override)"
   },
   "frames": [
-    { "file": "website-provider-picker-100x24.json", "state": "first-run provider picker" },
-    { "file": "website-home-100x24.json", "state": "home after first run, with the onboarding starter prompt" },
-    { "file": "website-composer-100x24.json", "state": "new session with a typed, unsent prompt" },
-    { "file": "website-help-100x24.json", "state": "/help overlay" }
+    {
+      "cols": 100,
+      "file": "website-provider-picker-100x24.json",
+      "rows": 24,
+      "state": "first-run provider picker",
+      "sha256": "2a81b1f8188622cfe68ee92973b12e7df6633a1f8bf29a841e21acbb884a2e10"
+    },
+    {
+      "cols": 100,
+      "file": "website-home-100x24.json",
+      "rows": 24,
+      "state": "home after offline first run, with the onboarding starter prompt",
+      "sha256": "7347431504bbe99a904d68ae0a3e2246fe89039063fe7ecd3ee761dc01604659"
+    },
+    {
+      "cols": 100,
+      "file": "website-composer-100x24.json",
+      "rows": 24,
+      "state": "typed unsent prompt; no provider request",
+      "sha256": "b7d85ec111e831b961d48838fe733dd6e21056d5fdf4093855b0e3b02a494208"
+    },
+    {
+      "cols": 100,
+      "file": "website-help-100x24.json",
+      "rows": 24,
+      "state": "actual /help overlay",
+      "sha256": "ac341c21bedcb44a5b89f4e60030c3525b49ff2e7c9313af5989020baffbd6fb"
+    },
+    {
+      "cols": 100,
+      "file": "website-workbar-fleet-100x32.json",
+      "rows": 32,
+      "state": "actual Fleet workbar in an empty offline session",
+      "sha256": "7dafe6351a48e316cd7cb840fd799eb2a028c648845ee87481a9dc046b97b0dc"
+    },
+    {
+      "cols": 100,
+      "file": "website-workbar-100x32.json",
+      "rows": 32,
+      "state": "actual Tasks workbar in an empty offline session",
+      "sha256": "0f40f3ad63c9ec105f813a41df46f3ff2d7f1ae6f12fcad35591f06a1a249f61"
+    }
   ],
-  "schema": "{rows, cols, cells: [row][col] -> {x, text, fg, bg, flags}}; fg/bg are null (terminal default), a 0-255 palette index, or [r,g,b]; flags are rio-vt style bits (see crates/tui/tests/support/qa_harness/frame.rs capture_cells)"
+  "schema": "{rows, cols, cells: [row][col] -> {x, text, fg, bg, flags}}; fg/bg are null (terminal default), a 0-255 palette index, or [r,g,b]; flags are rio-vt style bits (see crates/tui/tests/support/qa_harness/frame.rs capture_cells)",
+  "binarySha256": "e4efba787a4f07867ddf6268ef74c45637496d6ffea658e31bcc8edeb49828de",
+  "captureToolSha256": "1269ebcacb6b1dedb17746d4dedab55a410ef401aa6bd9a9bca42f9e232732dd"
 }

@@ -1,11 +1,11 @@
-<!-- source: README.md sha256:925619135f77 -->
+<!-- source: README.md sha256:a59c459aea4d -->
 # Codewhale
 
 Codewhale adalah agen sumber terbuka yang membaca proyek, mengedit berkas, menjalankan perintah, dan memeriksa hasil kerjanya dengan model yang dihosting atau model lokal pilihan Anda. Mulailah dengan satu tugas di terminal. Untuk pekerjaan yang lebih besar, bagikan sebagian pekerjaan kepada agen dengan model dan peran yang berbeda.
 
-![Codewhale berjalan di terminal](web/public/codewhale-tui-5765d80.png)
+![Codewhale berjalan di terminal](web/public/codewhale-tui-e940149.png)
 
-*Pratinjau terminal dari build pengembangan v0.10.0.*
+*Pratinjau terminal dari build pengembangan v0.10.1.*
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
@@ -51,7 +51,7 @@ Codewhale dapat membaca repositori Anda, mengedit berkas, menjalankan perintah, 
 
 ## Terminal, aplikasi, dan Computer Use
 
-Terminal dan klien grafis terhubung ke Codewhale Runtime, yang menjalankan agen beserta alatnya:
+Terminal dan klien grafis terhubung ke [Codewhale Engine](docs/ARCHITECTURE.md), yang menjalankan agen beserta alatnya:
 
 - **Terminal:** `codewhale` membuka antarmuka interaktif; `codewhale exec` menjalankan tugas dari skrip atau job CI.
 - **Browser lokal:** `codewhale web` membuka [klien web lokal](docs/WEB.md) bawaan untuk Runtime yang sama.

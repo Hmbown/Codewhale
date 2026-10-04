@@ -1,5 +1,4 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use unicode_width::UnicodeWidthChar;
 
 use crate::tui::app::{App, ComposerSubmitChord};
 
@@ -178,56 +177,18 @@ fn move_cursor_visual_row(app: &mut App, up: bool) -> bool {
     let width =
         crate::tui::widgets::composer_content_geometry(plane, app.is_history_search_active())
             .text_width();
-    let rows = crate::tui::widgets::wrap_input_lines_for_mouse(&app.input, width);
-    if rows.len() < 2 {
-        return false;
-    }
-    // Current visual row: the last row whose start is at or before the cursor,
-    // matching the caret convention in `cursor_row_col_in_lines`.
-    let cursor = app.cursor_position;
-    let mut row = 0;
-    for (index, (start, _)) in rows.iter().enumerate() {
-        if *start <= cursor {
-            row = index;
-        } else {
-            break;
-        }
-    }
-    let target = if up {
-        let Some(previous) = row.checked_sub(1) else {
-            return false;
-        };
-        previous
-    } else if row + 1 < rows.len() {
-        row + 1
-    } else {
+    let Some(cursor) = codewhale_ratatui::native_composer_step_row(
+        &app.input,
+        app.cursor_position,
+        width,
+        if up { -1 } else { 1 },
+        codewhale_ratatui::NativeComposerRowColumn::DisplayCells,
+    ) else {
         return false;
     };
-    let (start, text) = &rows[row];
-    let column: usize = text
-        .chars()
-        .take(cursor.saturating_sub(*start))
-        .map(char_display_width)
-        .sum();
-    let (target_start, target_text) = &rows[target];
-    let mut stepped = 0;
-    let mut stepped_width = 0;
-    for ch in target_text.chars() {
-        let w = char_display_width(ch);
-        if stepped_width + w > column {
-            break;
-        }
-        stepped_width += w;
-        stepped += 1;
-    }
-    app.cursor_position = target_start + stepped;
+    app.cursor_position = cursor;
     app.needs_redraw = true;
     true
-}
-
-/// Display columns occupied by one char; zero-width and control chars take none.
-fn char_display_width(ch: char) -> usize {
-    UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
 pub(crate) fn is_word_cursor_modifier(modifiers: KeyModifiers) -> bool {

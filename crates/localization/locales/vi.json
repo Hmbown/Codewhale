@@ -1,5 +1,7 @@
 {
+  "ExtensionPromptUnavailable": "Không thể tải hướng dẫn của tiện ích mở rộng; kiểm tra /plugin show.",
   "ComposerOversizedSubmitHeld": "Chưa gửi: tin nhắn vượt quá {limit} ký tự và không thể lưu thành tệp văn bản đã dán ({error}). Toàn bộ nội dung vẫn còn trong ô nhập: hãy rút ngắn hoặc cho phép ghi vào .codewhale/pastes, rồi nhấn Enter lần nữa.",
+  "ComposerOversizedSubmitHeldShort": "Chưa gửi: vượt quá {limit} ký tự; chưa lưu tệp dán.",
   "CmdPluginOwnerReport": "Máy chủ tiện ích mở rộng:\n  Trạng thái: {state}\n  Công cụ đang hoạt động ({count}): {tools}",
   "CmdPluginOwnerActivating": "Đang kích hoạt",
   "CmdPluginOwnerActive": "Đang hoạt động",
@@ -2439,5 +2441,11 @@
   "ModelPickerReadinessRefreshed": "Đã làm mới trạng thái sẵn sàng của mô hình · đã dựng lại các dòng danh mục",
   "ModelPickerOpenToRefresh": "Mở /model để làm mới trạng thái sẵn sàng và danh mục",
   "ModelPickerPinnedChip": "đã ghim",
+  "AuthSignedInAs": "Đã đăng nhập {provider} với tài khoản {account}.",
+  "AuthSignedInWithoutEmail": "Đã đăng nhập {provider} (bên cấp không gửi email tài khoản).",
+  "AuthReplacedPreviousSignInAs": "Đã thay thế lần đăng nhập {provider} trước đó của Codewhale ({account}).",
+  "AuthReplacedPreviousSignIn": "Đã thay thế lần đăng nhập {provider} trước đó của Codewhale.",
+  "AuthSameAccountAsBefore": "Đây vẫn là tài khoản cũ; để dùng tài khoản {provider} khác, hãy đăng xuất tài khoản này trong trình duyệt (hoặc dùng cửa sổ riêng tư) rồi đăng nhập lại.",
+  "AuthEnvTokenOutranksSignIn": "Môi trường này đã đặt OPENAI_CODEX_ACCESS_TOKEN hoặc CODEX_ACCESS_TOKEN, và biến đó được ưu tiên hơn lần đăng nhập này; các yêu cầu vẫn dùng tài khoản của token đó cho đến khi bạn bỏ đặt nó.",
   "PinnedPromptJumpToMessage": "Nhảy đến tin nhắn này"
 }

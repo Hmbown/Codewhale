@@ -249,9 +249,21 @@ pub enum HookCondition {
     Any { conditions: Vec<HookCondition> },
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct NativeShellHook {
+    pub owner: crate::extension_host::protocol::OwnerRef,
+    pub scope: Option<crate::extension_host::protocol::EntryRef>,
+    pub handle: u64,
+    pub dialect: String,
+    pub point: String,
+    pub matcher: Option<String>,
+}
+
 /// A single hook definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hook {
+    #[serde(skip)]
+    pub(crate) native_shell: Option<NativeShellHook>,
     /// The event that triggers this hook
     pub event: HookEvent,
 
@@ -310,6 +322,7 @@ impl Hook {
             name: None,
             plugin_authority: None,
             project_authority: None,
+            native_shell: None,
         }
     }
 

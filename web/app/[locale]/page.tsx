@@ -7,7 +7,7 @@ import { InstallCodeBlock } from "@/components/install-code-block";
 import { Section } from "@/components/page-header";
 import { Status, type StatusTone } from "@/components/status-badge";
 import { Strata } from "@/components/strata";
-import { TerminalCapture } from "@/components/terminal-capture";
+import { NativeTerminalGallery } from "@/components/native-terminal-gallery";
 import { WhalePose } from "@/components/whale-pose";
 import { getFacts } from "@/lib/facts";
 import { GETTING_STARTED_STEPS } from "@/lib/content/getting-started";
@@ -130,8 +130,9 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
               </div>
               <figure className="figure">
                 <div className="figure-frame">
-                  <TerminalCapture
-                    frame="home"
+                  <NativeTerminalGallery
+                    locale={locale}
+                    defaultFrame="home"
                     regionLabel={d.shotPreview}
                     label={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
                   />

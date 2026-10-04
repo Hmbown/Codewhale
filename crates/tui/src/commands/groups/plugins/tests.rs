@@ -58,6 +58,30 @@ fn extension_owner_report_escapes_every_plugin_controlled_field() {
     );
 }
 
+#[test]
+fn plugin_config_summary_lists_keys_never_values_and_escapes_them() {
+    let mut output = String::new();
+    append_plugin_config_summary(
+        &mut output,
+        "greeter",
+        &Ok(vec!["greeting".to_string(), "\u{1b}[31mkey".to_string()]),
+    );
+    assert!(output.contains("[plugins.\"greeter\".config]"), "{output}");
+    assert!(output.contains("values not shown"));
+    assert!(output.contains("greeting"));
+    assert!(output.contains(&escape_review_text("\u{1b}[31mkey")));
+    assert!(!output.contains('\u{1b}'));
+
+    let mut refused = String::new();
+    append_plugin_config_summary(
+        &mut refused,
+        "greeter",
+        &Err("config is 20000 bytes\n# approved".to_string()),
+    );
+    assert!(refused.contains("is refused: "), "{refused}");
+    assert!(!refused.contains("\n# approved"), "{refused}");
+}
+
 fn create_test_app(root: &Path) -> (App, TempDir) {
     let temp = TempDir::new().expect("tempdir");
     let config_path = temp.path().join("config.toml");

@@ -603,6 +603,7 @@ pub enum MessageId {
     ExtensionsInventoryMcp,
     ExtensionsInventoryNone,
     ExtensionsInventorySkills,
+    ExtensionPromptUnavailable,
     ExtensionsMarketplaceDetail,
     ExtensionsMarketplaceUnavailable,
     ExtensionsMcpEmpty,
@@ -1000,6 +1001,9 @@ pub enum MessageId {
     /// Paste found nothing: the clipboard read came back empty or failed.
     ClipboardNothingToPaste,
     ComposerOversizedSubmitHeld,
+    /// Short toast form of [`Self::ComposerOversizedSubmitHeld`]; the toast row
+    /// sheds clauses to fit, so the full text goes to the transcript instead.
+    ComposerOversizedSubmitHeldShort,
     KbContextMenu,
     KbPointerScroll,
     KbPointerClick,
@@ -2673,6 +2677,12 @@ pub enum MessageId {
     ModelPickerReadinessRefreshed,
     ModelPickerOpenToRefresh,
     ModelPickerPinnedChip,
+    AuthSignedInAs,
+    AuthSignedInWithoutEmail,
+    AuthReplacedPreviousSignInAs,
+    AuthReplacedPreviousSignIn,
+    AuthSameAccountAsBefore,
+    AuthEnvTokenOutranksSignIn,
     /// Hover label for the pinned user-prompt header above the transcript:
     /// clicking the header jumps to the user message it names.
     PinnedPromptJumpToMessage,
@@ -3157,6 +3167,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ExtensionsInventoryMcp,
     MessageId::ExtensionsInventoryNone,
     MessageId::ExtensionsInventorySkills,
+    MessageId::ExtensionPromptUnavailable,
     MessageId::ExtensionsMarketplaceDetail,
     MessageId::ExtensionsMarketplaceUnavailable,
     MessageId::ExtensionsMcpEmpty,
@@ -3548,6 +3559,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ClipboardCutKeptText,
     MessageId::ClipboardNothingToPaste,
     MessageId::ComposerOversizedSubmitHeld,
+    MessageId::ComposerOversizedSubmitHeldShort,
     MessageId::KbContextMenu,
     MessageId::KbPointerScroll,
     MessageId::KbPointerClick,
@@ -5121,6 +5133,12 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ModelPickerReadinessRefreshed,
     MessageId::ModelPickerOpenToRefresh,
     MessageId::ModelPickerPinnedChip,
+    MessageId::AuthSignedInAs,
+    MessageId::AuthSignedInWithoutEmail,
+    MessageId::AuthReplacedPreviousSignInAs,
+    MessageId::AuthReplacedPreviousSignIn,
+    MessageId::AuthSameAccountAsBefore,
+    MessageId::AuthEnvTokenOutranksSignIn,
     MessageId::PinnedPromptJumpToMessage,
 ];
 
@@ -5952,6 +5970,51 @@ mod tests {
                 "{} defines key(s) en.json lacks: {extra:?}",
                 locale.tag()
             );
+        }
+    }
+
+    /// #6715 review: the sign-in account summary is filled by `{provider}` and
+    /// `{account}` substitution, so a pack that drops a placeholder or ships the
+    /// English sentence would silently name no account or stay untranslated.
+    #[test]
+    fn auth_sign_in_copy_is_translated_and_keeps_its_placeholders() {
+        let english = raw_locale_messages(Locale::En);
+        let auth_keys = [
+            "AuthSignedInAs",
+            "AuthSignedInWithoutEmail",
+            "AuthReplacedPreviousSignInAs",
+            "AuthReplacedPreviousSignIn",
+            "AuthSameAccountAsBefore",
+            "AuthEnvTokenOutranksSignIn",
+        ];
+
+        for locale in Locale::shipped_complete() {
+            if *locale == Locale::En {
+                continue;
+            }
+            let pack = raw_locale_messages(*locale);
+            for key in auth_keys {
+                let english_value = english
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("English {key} must be a string"));
+                let translated = pack
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("{} is missing raw key {key}", locale.tag()));
+                assert_eq!(
+                    message_placeholders(translated),
+                    message_placeholders(english_value),
+                    "{} changed placeholders for {key}",
+                    locale.tag()
+                );
+                assert_ne!(
+                    translated,
+                    english_value,
+                    "{} ships English for {key}",
+                    locale.tag()
+                );
+            }
         }
     }
 

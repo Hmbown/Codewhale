@@ -82,7 +82,7 @@ Linux Rust gates run on Tencent-hosted runners instead of GitHub Actions:
 - `cargo check --workspace --all-targets --locked`
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
 - `cargo test --workspace --all-features --locked`
-- `cargo build --release --locked -p codewhale-cli -p codewhale-tui`
+- `cargo build --release --locked -p codewhale-cli --bin codewhale`
 - `node scripts/release/npm-wrapper-smoke.js`
 
 Release branches matching `work/v*` also run

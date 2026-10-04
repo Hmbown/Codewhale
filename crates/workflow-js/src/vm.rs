@@ -15,6 +15,7 @@
 
 use std::cell::Cell;
 use std::env;
+use std::future::Future;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -22,7 +23,9 @@ use std::sync::{Arc, OnceLock};
 use rquickjs::function::{Async, Func};
 use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Ctx, Promise, Value};
 use serde::Deserialize;
+use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
+use tokio::task::JoinSet;
 
 use crate::driver::{ProgressEvent, TaskCompletion, TaskRequest, WorkflowDriver};
 use crate::error::{TaskError, TaskErrorKind, WorkflowJsError};
@@ -224,6 +227,12 @@ impl WorkflowVm {
         let thread_driver = driver.clone();
         let thread_cancel = cancel.clone();
         let thread_invoker = invoker.clone();
+        // Native admission belongs to the originating host executor. The VM
+        // thread carries only Send requests/replies, never the Child Engine's
+        // Rust future on its bounded interpreter stack.
+        let host_runtime = Handle::try_current().map_err(|_| {
+            WorkflowJsError::VmInit("workflow host Tokio runtime is unavailable".to_string())
+        })?;
         let spawned = std::thread::Builder::new()
             .name("workflow-js-vm".to_string())
             .stack_size(vm_thread_stack_bytes())
@@ -236,6 +245,7 @@ impl WorkflowVm {
                     thread_cancel,
                     thread_invoker,
                     limits,
+                    host_runtime,
                 );
                 // Run teardown: this driver is scoped to one run, so any task
                 // still in flight is unreachable now — cancel the cascade.
@@ -346,13 +356,20 @@ fn vm_thread_main(
     cancel: CancelHandle,
     invoker: Option<Arc<dyn ToolInvoker>>,
     limits: VmLimits,
+    host_runtime: Handle,
 ) -> Result<serde_json::Value, WorkflowJsError> {
     let reactor = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|err| WorkflowJsError::VmInit(format!("failed to build VM reactor: {err}")))?;
     reactor.block_on(run_in_vm(
-        source, args_json, driver, cancel, invoker, limits,
+        source,
+        args_json,
+        driver,
+        cancel,
+        invoker,
+        limits,
+        host_runtime,
     ))
 }
 
@@ -363,6 +380,7 @@ async fn run_in_vm(
     cancel: CancelHandle,
     invoker: Option<Arc<dyn ToolInvoker>>,
     limits: VmLimits,
+    host_runtime: Handle,
 ) -> Result<serde_json::Value, WorkflowJsError> {
     let runtime = AsyncRuntime::new().map_err(|err| WorkflowJsError::VmInit(err.to_string()))?;
     runtime.set_memory_limit(limits.memory_limit_bytes).await;
@@ -378,7 +396,18 @@ async fn run_in_vm(
         .map_err(|err| WorkflowJsError::VmInit(err.to_string()))?;
 
     let result = context
-        .async_with(async |ctx| run_in_ctx(ctx, source, args_json, driver, invoker, cancel).await)
+        .async_with(async |ctx| {
+            run_in_ctx(
+                ctx,
+                source,
+                args_json,
+                driver,
+                invoker,
+                cancel,
+                host_runtime,
+            )
+            .await
+        })
         .await;
     drop(context);
     runtime.run_gc().await;
@@ -392,8 +421,16 @@ async fn run_in_ctx(
     driver: Arc<dyn WorkflowDriver>,
     invoker: Option<Arc<dyn ToolInvoker>>,
     cancel: CancelHandle,
+    host_runtime: Handle,
 ) -> Result<serde_json::Value, WorkflowJsError> {
-    install_host(&ctx, driver, invoker.clone(), cancel.clone(), &args_json)?;
+    install_host(
+        &ctx,
+        driver,
+        invoker.clone(),
+        cancel.clone(),
+        &args_json,
+        host_runtime,
+    )?;
     ctx.eval::<(), _>(prelude())
         .catch(&ctx)
         .map_err(|err| WorkflowJsError::VmInit(format!("prelude failed: {err}")))?;
@@ -589,6 +626,51 @@ const CODEMODE_PRELUDE: &str = r#"
 })();
 "#;
 
+// Construct and poll native host futures on the captured host executor.
+// JoinSet aborts on drop; explicit cancellation also joins that abort before
+// the VM receives its existing typed cancellation error.
+async fn call_on_host<T, F>(
+    runtime: &Handle,
+    cancel: &CancelHandle,
+    cancel_error: TaskError,
+    call: impl FnOnce() -> F + Send + 'static,
+) -> Result<T, TaskError>
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    let mut pending = JoinSet::new();
+    let host_cancel = cancel.clone();
+    let host_error = cancel_error.clone();
+    pending.spawn_on(
+        async move {
+            if host_cancel.is_cancelled() {
+                Err(host_error)
+            } else {
+                Ok(call().await)
+            }
+        },
+        runtime,
+    );
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            pending.shutdown().await;
+            Err(cancel_error)
+        }
+        outcome = pending.join_next() => match outcome {
+            Some(Ok(value)) => value,
+            Some(Err(error)) if error.is_panic() => {
+                std::panic::resume_unwind(error.into_panic())
+            }
+            _ => Err(TaskError::new(
+                TaskErrorKind::Driver,
+                "workflow host callback ended without a reply",
+            )),
+        },
+    }
+}
+
 /// The `tools.call()` host call. Infallible at the binding level, like
 /// `task_host`: outcomes return through the `{result}` /
 /// `{error, error_kind}` envelope so the prelude rethrows typed errors.
@@ -599,8 +681,9 @@ async fn tools_call_host(
     invoker: Arc<dyn ToolInvoker>,
     cancel: CancelHandle,
     invoked: Rc<Cell<u64>>,
+    host_runtime: Handle,
 ) -> String {
-    let outcome = tools_call_host_inner(call_json, invoker, cancel, invoked).await;
+    let outcome = tools_call_host_inner(call_json, invoker, cancel, invoked, host_runtime).await;
     let envelope = match outcome {
         Ok(result) => serde_json::json!({ "result": result }),
         Err(TaskError { kind, message }) => {
@@ -615,6 +698,7 @@ async fn tools_call_host_inner(
     invoker: Arc<dyn ToolInvoker>,
     cancel: CancelHandle,
     invoked: Rc<Cell<u64>>,
+    host_runtime: Handle,
 ) -> Result<serde_json::Value, TaskError> {
     let admission = |message: String| TaskError::new(TaskErrorKind::Admission, message);
     let request: ToolCallRequest = serde_json::from_str(&call_json).map_err(|err| {
@@ -644,20 +728,14 @@ async fn tools_call_host_inner(
         ));
     }
     invoked.set(invoked.get() + 1);
-    let response = tokio::select! {
-        _ = cancel.cancelled() => {
-            return Err(TaskError::new(
-                TaskErrorKind::Cancelled,
-                "tools.call(): run cancelled".to_string(),
-            ));
-        }
-        response = invoker.invoke(request) => response.map_err(|err| {
-            TaskError::new(
-                TaskErrorKind::from(&err),
-                format!("tools.call(): {err}"),
-            )
-        })?,
-    };
+    let response = call_on_host(
+        &host_runtime,
+        &cancel,
+        TaskError::new(TaskErrorKind::Cancelled, "tools.call(): run cancelled"),
+        move || async move { invoker.invoke(request).await },
+    )
+    .await?
+    .map_err(|err| TaskError::new(TaskErrorKind::from(&err), format!("tools.call(): {err}")))?;
     if response.ok {
         Ok(response.result)
     } else {
@@ -676,6 +754,7 @@ fn install_host(
     invoker: Option<Arc<dyn ToolInvoker>>,
     cancel: CancelHandle,
     args_json: &str,
+    host_runtime: Handle,
 ) -> Result<(), WorkflowJsError> {
     let globals = ctx.globals();
 
@@ -691,6 +770,7 @@ fn install_host(
 
     let task_driver = driver.clone();
     let task_cancel = cancel.clone();
+    let task_runtime = host_runtime.clone();
     globals
         .set(
             "__workflow_task",
@@ -698,7 +778,8 @@ fn install_host(
                 let driver = task_driver.clone();
                 let cancel = task_cancel.clone();
                 let spawned = spawned.clone();
-                async move { task_host(opts_json, driver, cancel, spawned).await }
+                let host_runtime = task_runtime.clone();
+                async move { task_host(opts_json, driver, cancel, spawned, host_runtime).await }
             })),
         )
         .map_err(init_err)?;
@@ -717,7 +798,10 @@ fn install_host(
                     let invoker = call_invoker.clone();
                     let cancel = call_cancel.clone();
                     let invoked = invoked.clone();
-                    async move { tools_call_host(call_json, invoker, cancel, invoked).await }
+                    let host_runtime = host_runtime.clone();
+                    async move {
+                        tools_call_host(call_json, invoker, cancel, invoked, host_runtime).await
+                    }
                 })),
             )
             .map_err(init_err)?;
@@ -831,8 +915,9 @@ async fn task_host(
     driver: Arc<dyn WorkflowDriver>,
     cancel: CancelHandle,
     spawned: Rc<Cell<u64>>,
+    host_runtime: Handle,
 ) -> String {
-    let outcome = task_host_inner(opts_json, driver, cancel, spawned).await;
+    let outcome = task_host_inner(opts_json, driver, cancel, spawned, host_runtime).await;
     let envelope = match outcome {
         Ok(value) => serde_json::json!({ "value": value }),
         Err(TaskError { kind, message }) => {
@@ -944,6 +1029,7 @@ async fn task_host_inner(
     driver: Arc<dyn WorkflowDriver>,
     cancel: CancelHandle,
     spawned: Rc<Cell<u64>>,
+    host_runtime: Handle,
 ) -> Result<serde_json::Value, TaskError> {
     let admission = |message: String| TaskError::new(TaskErrorKind::Admission, message);
     let workspace = driver.workspace_root();
@@ -1007,11 +1093,16 @@ async fn task_host_inner(
         // so it races the run's cancel exactly as the completion does below
         // and as `tools.call()` does: a cancel that only closed the driver's
         // gate used to be the one thing that could wake it.
-        let spawned_task = tokio::select! {
-            _ = cancel.cancelled() => return Err(cancelled_task()),
-            spawned = driver.spawn_task(current.clone()) => spawned
-                .map_err(|err| TaskError::new(TaskErrorKind::from(&err), err.to_string()))?,
-        };
+        let task_driver = driver.clone();
+        let task_request = current.clone();
+        let spawned_task = call_on_host(
+            &host_runtime,
+            &cancel,
+            cancelled_task(),
+            move || async move { task_driver.spawn_task(task_request).await },
+        )
+        .await?
+        .map_err(|err| TaskError::new(TaskErrorKind::from(&err), err.to_string()))?;
         let task_id = spawned_task.task_id;
         let completion_rx = spawned_task.completion;
         let completion = tokio::select! {

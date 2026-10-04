@@ -44,10 +44,11 @@ exec-persistent-service = { max-threads = 1 }
 # (a durable heartbeat and a `ps` sample on every scheduler tick) is now
 # bounded to once a second per worker.
 fleet-manager-lifecycle = { max-threads = 1 }
-# Extension fixtures launch real Node hosts with a five-second production
-# handshake deadline. Windows full-suite runs on #6776/#6780 reported ordinary
-# hosts missing that deadline. Bound contention across nextest processes;
-# keep production deadlines and the explicit hang-detection tests unchanged.
+# Extension fixtures launch real Node hosts, and the production handshake
+# deadline is 30 s (`HANDSHAKE_DEADLINE`, raised from 5 s: Windows full-suite
+# runs on #6776/#6780 reported ordinary hosts missing the old one). Bound
+# contention across nextest processes; keep production deadlines and the
+# explicit hang-detection tests unchanged.
 extension-host = { max-threads = 1 }
 
 # First matching test-group override wins. Keep these more-specific
@@ -99,3 +100,14 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 fail-fast = false
 final-status-level = "slow"
 failure-output = "immediate-final"
+
+# Exact compiled-image Native delivery receipt comes from this same full run.
+# Only the fixed containment and memory marker/output is retained on success; the rest
+# of the workspace keeps its existing output policy.
+[profile.ci.junit]
+path = "junit.xml"
+report-name = "codewhale-native-host"
+
+[[profile.ci.overrides]]
+filter = 'package(codewhale-tui) & kind(lib) & (test(/^extension_host::tests::compiled_native_host_cannot_read_secrets_or_write_outside_its_data_dir$/) | test(/^extension_host::tests::compiled_native_host_memory_cap_is_enforced$/))'
+junit.store-success-output = true

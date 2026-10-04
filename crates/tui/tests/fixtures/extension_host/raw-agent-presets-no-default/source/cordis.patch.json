@@ -1,0 +1,1 @@
+[{"insert":[{"id":"raw-roster","name":"@deepseek-ai/dsh-agent-presets","config":{"roots":[{"path":"presets","trust":"user"}],"includeShippedRoot":false,"includeUserRoot":false}}]}]

@@ -506,3 +506,181 @@ fn infoline_context_hover_brightens_only_the_context_reading() {
     let cost_x = u16::try_from(row.find("$0.42").unwrap()).unwrap();
     assert_eq!(plain[(cost_x, 0)], hovered[(cost_x, 0)]);
 }
+
+#[test]
+fn infoline_preserves_every_live_chrome_ink_and_untouched_host_style() {
+    use ratatui::style::{Color, Modifier, Style};
+    let theme = UiTheme {
+        status_working: Color::Rgb(1, 2, 3),
+        permission_ask: Color::Rgb(2, 3, 4),
+        permission_auto_review: Color::Rgb(3, 4, 5),
+        permission_full_access: Color::Rgb(4, 5, 6),
+        accent_action: Color::Rgb(5, 6, 7),
+        warning: Color::Rgb(6, 7, 8),
+        accent_primary: Color::Rgb(7, 8, 9),
+        text_soft: Color::Rgb(8, 9, 10),
+        text_muted: Color::Rgb(9, 10, 11),
+        text_hint: Color::Rgb(10, 11, 12),
+        text_dim: Color::Rgb(11, 12, 13),
+        error_fg: Color::Rgb(12, 13, 14),
+        ..UI_THEME
+    };
+    for ink in [
+        ChromeInk::Outcome,
+        ChromeInk::PermissionAsk,
+        ChromeInk::PermissionAutoReview,
+        ChromeInk::PermissionFullAccess,
+        ChromeInk::Waiting,
+        ChromeInk::Attention,
+        ChromeInk::Active,
+        ChromeInk::PolicyAct,
+        ChromeInk::PolicyPlan,
+        ChromeInk::PolicyOperate,
+        ChromeInk::Identity,
+        ChromeInk::Info,
+        ChromeInk::MetadataValue,
+        ChromeInk::Metadata,
+        ChromeInk::MetadataHint,
+        ChromeInk::MetadataDim,
+        ChromeInk::Failure,
+    ] {
+        let segments = [InfoSegment::new(
+            InfoSegmentId::Model,
+            "reading",
+            "value",
+            ink,
+        )];
+        let area = Rect::new(3, 2, 32, 2);
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 40, 5));
+        let existing = Style::default()
+            .fg(super::source_theme(false)
+                .color(codewhale_ratatui::Role::Primary)
+                .unwrap())
+            .bg(Color::Rgb(30, 40, 50))
+            .add_modifier(Modifier::ITALIC);
+        buf.set_style(buf.area, existing);
+        let before = buf.clone();
+        let info = InfoLine::new(&theme, "/help", &segments).hovered(Some(InfoSegmentId::Model));
+        ratatui::widgets::Widget::render(info, area, &mut buf);
+        let label_ink = if matches!(ink, ChromeInk::Failure | ChromeInk::Attention) {
+            ink
+        } else {
+            ChromeInk::Metadata
+        };
+        assert_eq!(buf[(3, 2)].fg, label_ink.color(&theme), "{ink:?}: label");
+        for x in 11..16 {
+            let cell = &buf[(x, 2)];
+            assert_eq!(cell.fg, ink.color(&theme), "{ink:?}: value");
+            assert_eq!(cell.bg, Color::Rgb(30, 40, 50), "host owns the ground");
+            assert!(
+                cell.modifier
+                    .contains(Modifier::ITALIC | Modifier::BOLD | Modifier::UNDERLINED)
+            );
+        }
+        assert_eq!(
+            buf[(30, 2)].fg,
+            theme.text_hint,
+            "help uses its own live slot"
+        );
+        for position in [(0, 2), (16, 2), (20, 2), (3, 3), (39, 4)] {
+            assert_eq!(
+                buf[position], before[position],
+                "{ink:?}: untouched {position:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn infoline_cjk_and_combining_text_keep_projected_pointer_geometry_when_clipped() {
+    use ratatui::style::{Color, Style};
+    let segments = [
+        InfoSegment::new(
+            InfoSegmentId::Model,
+            "",
+            "模型-e\u{301}↓",
+            ChromeInk::Identity,
+        ),
+        InfoSegment::new(InfoSegmentId::Context, "上下文", "61%", ChromeInk::Info),
+    ];
+    for ascii in [false, true] {
+        for width in 0..=40 {
+            let area = Rect::new(3, 2, width, 1);
+            let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 46, 4));
+            buf.set_style(buf.area, Style::default().bg(Color::Rgb(30, 40, 50)));
+            let before = buf.clone();
+            let info = InfoLine::new(&UI_THEME, "", &segments).ascii_safe(ascii);
+            let hitboxes = infoline_hitboxes(&info, area);
+            let context = context_meter_hitbox(&info, area);
+            ratatui::widgets::Widget::render(info, area, &mut buf);
+            assert_eq!(buf[(2, 2)], before[(2, 2)], "left clipping");
+            assert_eq!(
+                buf[(area.right(), 2)],
+                before[(area.right(), 2)],
+                "right clipping"
+            );
+            assert_eq!(buf[(3, 3)], before[(3, 3)], "the row never wraps");
+            for (index, hitbox) in hitboxes.iter().enumerate() {
+                assert!(hitbox.area.x >= area.x && hitbox.area.right() <= area.right());
+                assert_eq!(hitbox.area.y, area.y);
+                assert_eq!(hitbox.area.height, 1);
+                if index > 0 {
+                    assert!(hitboxes[index - 1].area.right() <= hitbox.area.x);
+                }
+            }
+            if width >= 7 {
+                assert_eq!(hitboxes[0].area, Rect::new(3, 2, 7, 1));
+                assert_eq!(buf[(3, 2)].symbol(), "模");
+                assert_eq!(buf[(5, 2)].symbol(), "型");
+                assert_eq!(buf[(8, 2)].symbol(), "e\u{301}");
+                assert_eq!(buf[(9, 2)].symbol(), if ascii { "v" } else { "↓" });
+            }
+            if width >= 20 {
+                assert_eq!(context, Some(Rect::new(13, 2, 10, 1)));
+                assert_eq!(buf[(13, 2)].symbol(), "上");
+                assert_eq!(buf[(15, 2)].symbol(), "下");
+                assert_eq!(buf[(17, 2)].symbol(), "文");
+                assert_eq!(buf[(20, 2)].symbol(), "6");
+            }
+        }
+    }
+}
+
+#[test]
+fn infoline_sanitizes_hidden_controls_before_painting_and_pointer_measurement() {
+    let segments = [
+        InfoSegment::new(
+            InfoSegmentId::Model,
+            "",
+            "model\u{202e}",
+            ChromeInk::Identity,
+        ),
+        InfoSegment::new(
+            InfoSegmentId::Context,
+            "ct\0x",
+            "6\u{1b}1%",
+            ChromeInk::Info,
+        ),
+        InfoSegment::new(
+            InfoSegmentId::OutputTokens,
+            "↓",
+            "1.2K",
+            ChromeInk::MetadataValue,
+        ),
+    ];
+    let area = Rect::new(0, 0, 60, 1);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    let info = InfoLine::new(&UI_THEME, "", &segments).ascii_safe(true);
+    let hitboxes = infoline_hitboxes(&info, area);
+    ratatui::widgets::Widget::render(info, area, &mut buf);
+    let row: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+    assert_eq!(row.trim_end(), "model   ctx 61%   v 1.2K");
+    assert_eq!(
+        hitboxes.iter().map(|hit| hit.area).collect::<Vec<_>>(),
+        [
+            Rect::new(0, 0, 5, 1),
+            Rect::new(8, 0, 7, 1),
+            Rect::new(18, 0, 6, 1),
+        ]
+    );
+}

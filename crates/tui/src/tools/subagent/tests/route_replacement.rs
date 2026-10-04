@@ -101,7 +101,7 @@ async fn reviewer_tool_with(
     Arc<AtomicUsize>,
     Arc<AtomicUsize>,
 ) {
-    let (backup, backup_calls, _) = delayed_chat_client(Duration::ZERO, "review done").await;
+    let (backup, backup_calls, _, _) = delayed_chat_client(Duration::ZERO, "review done").await;
     let (pin_url, pin_calls) = refusing_chat_server().await;
     let config_path = root.join("config.toml");
     let parent_url = if parent_refuses {
@@ -219,7 +219,15 @@ model = "PinRoute/fixture-pin-model"
     let SubAgentStatus::Failed(error) = &result.status else {
         panic!("an exact refused pin fails: {:?}", result.status);
     };
-    assert!(error.contains("run out of credits"), "{error}");
+    for fact in [
+        "Authorization failed",
+        "[redacted]",
+        "requested model `fixture-pin-model`",
+        "config.toml role pin for \"reviewer\" routes PinRoute/fixture-pin-model",
+    ] {
+        assert!(error.contains(fact), "{fact} missing from {error}");
+    }
+    assert!(!error.contains("fixture-pin-key") && !error.contains("fixture-backup-key"));
     assert_eq!(result.child_route.unwrap().provider_id, "PinRoute");
 }
 
@@ -562,7 +570,7 @@ fn a_resumed_child_names_its_saved_route_source() {
     let message = annotate_child_model_error_with_origin(
         &subagent_failure_message(&refusal),
         "fixture-pin-model",
-        crate::config::ApiProvider::Deepseek,
+        crate::config::ProviderKind::Deepseek,
         &ModelRoute::Fixed("fixture-pin-model".into()),
         Some(&origin),
     );
@@ -579,7 +587,7 @@ fn a_resumed_child_names_its_saved_route_source() {
     let message = annotate_child_model_error(
         &subagent_failure_message(&refusal),
         "fixture-pin-model",
-        crate::config::ApiProvider::Deepseek,
+        crate::config::ProviderKind::Deepseek,
         &ModelRoute::Fixed("fixture-pin-model".into()),
     );
     assert!(
@@ -723,3 +731,6 @@ replacements = ["BackupRoute/fixture-backup-model"]
     assert_eq!(route.provider_id, "BackupRoute");
     assert_eq!(route.route_source, "role.replacement");
 }
+
+#[path = "persona_receipt.rs"]
+mod persona_receipt;

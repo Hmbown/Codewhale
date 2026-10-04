@@ -73,35 +73,34 @@ impl LineLink {
 /// rendered viewport. Metadata outside `area` is clipped rather than allowed
 /// to hyperlink adjacent chrome (for example the transcript scrollbar).
 #[must_use]
+#[cfg(test)]
 pub fn link_regions_for_lines(
     area: ratatui::layout::Rect,
     links: &[Vec<LineLink>],
 ) -> Vec<LinkRegion> {
-    if area.width == 0 || area.height == 0 {
-        return Vec::new();
-    }
-    let width = usize::from(area.width);
+    link_regions_for_plan(
+        &codewhale_ratatui::TranscriptViewport::new(&[]).plan(area),
+        links,
+    )
+}
+
+/// Project targets through the final painted geometry; no target enters kit data.
+#[must_use]
+pub fn link_regions_for_plan(
+    plan: &codewhale_ratatui::TranscriptViewportPlan,
+    links: &[Vec<LineLink>],
+) -> Vec<LinkRegion> {
     let mut regions = Vec::new();
-    for (line_index, line_links) in links.iter().take(usize::from(area.height)).enumerate() {
-        let row = area
-            .y
-            .saturating_add(u16::try_from(line_index).unwrap_or(u16::MAX));
-        for link in line_links {
-            if link.col_start >= width || link.col_end < link.col_start {
-                continue;
+    for (row, links) in links.iter().take(usize::from(plan.area.height)).enumerate() {
+        for link in links {
+            for rect in plan.link_rects(row, link.col_start, link.col_end) {
+                regions.push(LinkRegion {
+                    row: rect.y,
+                    col_start: rect.x,
+                    col_end: rect.right().saturating_sub(1),
+                    target: link.target.clone(),
+                });
             }
-            let start = link.col_start;
-            let end = link.col_end.min(width.saturating_sub(1));
-            regions.push(LinkRegion {
-                row,
-                col_start: area
-                    .x
-                    .saturating_add(u16::try_from(start).unwrap_or(u16::MAX)),
-                col_end: area
-                    .x
-                    .saturating_add(u16::try_from(end).unwrap_or(u16::MAX)),
-                target: link.target.clone(),
-            });
         }
     }
     regions

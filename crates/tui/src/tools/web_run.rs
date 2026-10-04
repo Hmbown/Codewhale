@@ -624,7 +624,7 @@ impl ToolSpec for WebRunTool {
                     .unwrap_or_default();
 
                 let (mut entries, warning) =
-                    run_image_search(&query, max_results, timeout_ms, &domains).await?;
+                    run_image_search(&query, max_results, timeout_ms, &domains, context).await?;
                 entries.retain_mut(|entry| {
                     let canonical_url = entry.url.as_deref().unwrap_or(&entry.image);
                     let Some(citation) = super::web::citations::register(
@@ -1030,13 +1030,13 @@ fn looks_like_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DuckDuckGoImageResponse {
     #[serde(default)]
     results: Vec<DuckDuckGoImageResult>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DuckDuckGoImageResult {
     image: String,
     #[serde(default)]
@@ -1095,7 +1095,9 @@ async fn run_image_search(
     max_results: usize,
     timeout_ms: u64,
     domains: &[String],
+    context: &ToolContext,
 ) -> Result<(Vec<ImageResultEntry>, Option<String>), ToolError> {
+    super::web_search::check_policy(context.network_policy.as_ref(), "duckduckgo.com")?;
     let client = crate::tls::reqwest_client_builder()
         .timeout(Duration::from_millis(timeout_ms))
         .user_agent(USER_AGENT)
@@ -1119,9 +1121,15 @@ async fn run_image_search(
         })?;
 
     let seed_status = seed_resp.status();
-    let seed_body = seed_resp.text().await.map_err(|e| {
-        ToolError::execution_failed(format!("Failed to read image seed response: {e}"))
-    })?;
+    let seed_body = if super::web::adapter::search_selected(context) {
+        super::web::adapter::read_response_with_limit(seed_resp, context, HARD_MAX_BYTES)
+            .await
+            .map_err(ToolError::from)?
+    } else {
+        seed_resp.text().await.map_err(|e| {
+            ToolError::execution_failed(format!("Failed to read image seed response: {e}"))
+        })?
+    };
 
     if !seed_status.is_success() {
         return Err(ToolError::execution_failed(format!(
@@ -1136,6 +1144,7 @@ async fn run_image_search(
 
     // Step 2: query the DuckDuckGo images JSON endpoint.
     let api_url = format!("https://duckduckgo.com/i.js?l=us-en&o=json&q={encoded}&vqd={vqd}&p=1");
+    super::web_search::check_policy(context.network_policy.as_ref(), "duckduckgo.com")?;
     let api_resp = client
         .get(&api_url)
         .header("Accept", "application/json")
@@ -1145,10 +1154,15 @@ async fn run_image_search(
         .map_err(|e| ToolError::execution_failed(format!("Image search request failed: {e}")))?;
 
     let api_status = api_resp.status();
-    let api_body = api_resp
-        .text()
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("Failed to read image response: {e}")))?;
+    let api_body = if super::web::adapter::search_selected(context) {
+        super::web::adapter::read_response(api_resp, context)
+            .await
+            .map_err(ToolError::from)?
+    } else {
+        api_resp.text().await.map_err(|e| {
+            ToolError::execution_failed(format!("Failed to read image response: {e}"))
+        })?
+    };
 
     if !api_status.is_success() {
         return Err(ToolError::execution_failed(format!(
@@ -1157,9 +1171,56 @@ async fn run_image_search(
         )));
     }
 
-    let parsed: DuckDuckGoImageResponse = serde_json::from_str(&api_body).map_err(|e| {
+    let mut parsed: DuckDuckGoImageResponse = serde_json::from_str(&api_body).map_err(|e| {
         ToolError::execution_failed(format!("Failed to parse image search JSON: {e}"))
     })?;
+
+    if super::web::adapter::search_selected(context) {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Proposal {
+            kind: String,
+            entries: Vec<DuckDuckGoImageResult>,
+            max_results: usize,
+        }
+        let mut urls = super::web_search::OpaqueUrls::default();
+        let mut captured = parsed.clone();
+        for entry in &mut captured.results {
+            entry.image = urls.capture(&entry.image);
+            if let Some(value) = entry.thumbnail.as_mut() {
+                *value = urls.capture(value);
+            }
+            if let Some(value) = entry.url.as_mut() {
+                *value = urls.capture(value);
+            }
+        }
+        let proposal: Proposal = super::web::adapter::transform(
+            crate::extension_host::StockOperation::WebImages,
+            json!({"max_results":max_results,"parsed":captured}),
+            context,
+            Duration::from_millis(timeout_ms),
+        )
+        .await
+        .map_err(ToolError::from)?;
+        if proposal.kind != "web_images"
+            || proposal.max_results != max_results
+            || proposal.entries.len() > parsed.results.len()
+        {
+            return Err(ToolError::execution_failed(
+                "Web Host returned inconsistent image candidates; no fallback was attempted",
+            ));
+        }
+        parsed.results = proposal.entries;
+        for entry in &mut parsed.results {
+            entry.image = urls.restore(&entry.image).map_err(ToolError::from)?;
+            if let Some(value) = entry.thumbnail.as_mut() {
+                *value = urls.restore(value).map_err(ToolError::from)?;
+            }
+            if let Some(value) = entry.url.as_mut() {
+                *value = urls.restore(value).map_err(ToolError::from)?;
+            }
+        }
+    }
 
     let mut results = parsed
         .results
@@ -1292,18 +1353,19 @@ async fn fetch_page_with_initial_pin(
 async fn document_from_fetched(
     payload: &super::web::fetch::FetchedPayload,
     context: &ToolContext,
-) -> Result<ExtractedDocument, ToolError> {
+) -> super::web::adapter::AdapterResult<ExtractedDocument> {
     if !(200..300).contains(&payload.status) {
-        return Err(ToolError::execution_failed(format!(
+        return Err((ToolError::execution_failed(format!(
             "Web request to {} failed: HTTP {}",
             payload.url, payload.status
-        )));
+        )))
+        .into());
     }
     extract_document(
         &payload.url,
         Some(&payload.content_type),
         &payload.bytes,
-        context.cancel_token.as_ref(),
+        Some(context),
     )
     .await
 }

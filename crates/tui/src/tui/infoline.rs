@@ -47,102 +47,17 @@
 //!
 //! Color: semantic ink only ([`ChromeInk`]); no hex, per the status-bar color
 //! grammar. ASCII-safe mode substitutes every glyph through
-//! [`glyphs::ascii_fallback`].
+//! the shared kit. Engine facts and action dispatch remain with the callers.
 
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Modifier, Style},
-    text::Span,
-    widgets::Widget,
-};
-use unicode_width::UnicodeWidthStr;
-
-use crate::tui::glyphs;
 use codewhale_palette::{ChromeInk, UiTheme};
+use codewhale_ratatui::{
+    Caps, MetricSegment, MetricsLine, Paint, Role, Theme, color::ColorDepth, detect::Appearance,
+};
+use ratatui::{buffer::Buffer, layout::Rect, style::Color, widgets::Widget};
 
-/// Separator between items — the row's one piece of punctuation.
-const ITEM_JOIN: &str = "   ";
-/// Minimum gap between the last left item and the pinned help hint.
-const HELP_GAP: usize = 2;
-
-/// Identity of a metrics-line segment. The live shell registers an action
-/// for [`Self::Model`] (the provider picker) and [`Self::Context`] (the
-/// context inspector); the rest are readings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InfoSegmentId {
-    /// Effective model / route — click opens the provider picker.
-    Model,
-    /// Context window reading `ctx NN%` — click opens the inspector.
-    Context,
-    /// Session cost, the one price number (`$0.14`).
-    Cost,
-    /// The clock-dependent billing tier of the active route (`peak` /
-    /// `off-peak`), painted beside the cost only for routes whose rates move
-    /// with the clock (DeepSeek V4 Pro/Flash and Flash).
-    BillingTier,
-    /// Output tokens of the live or last turn (`↓ 1.2K`).
-    OutputTokens,
-    /// Time to first token (`ttft 400ms`).
-    Ttft,
-    /// Output rate (`38 tok/s`).
-    Rate,
-    /// Prompt cache hit percent (`cache 85%`).
-    Cache,
-    /// Prepaid credit left on the active route (`balance $4.32`). Opt-in:
-    /// only painted when `/statusline` has the balance item on, which is
-    /// also what authorises the fetch behind it.
-    Balance,
-    /// Active goal with elapsed time and the model's reported progress
-    /// (`Goal (9m) 12% ▓▓░░░░░░`). Painted only while a goal is active.
-    Goal,
-    /// Session workspace leaf directory, left-truncated (`…atch/codewhale`).
-    /// Opt-in via `/statusline` (#6112).
-    Workspace,
-    /// Current git branch from the cached workspace context, or the short
-    /// SHA when HEAD is detached. Absent outside a repository. Opt-in via
-    /// `/statusline` (#6112).
-    GitBranch,
-}
-
-impl InfoSegmentId {
-    /// Shed priority: higher sheds first as width drops. `0` never sheds.
-    /// Segments at or above [`Self::SHED_BEFORE_HELP`] go before the help
-    /// hint; the cost outlives the hint because it is the one number that
-    /// must keep matching `/cost`, the roster and the price widget.
-    #[must_use]
-    pub fn shed_priority(self) -> u8 {
-        match self {
-            // Compact drops priorities at or above SHED_BEFORE_HELP (7).
-            // Cache is a performance reading, so it stays on the compact
-            // row and is the first of those readings to shed when the row
-            // is narrow (#6565).
-            Self::Cache => 6,
-            // Performance readings outlive help and secondary counts.
-            Self::Rate | Self::Ttft => 5,
-            Self::OutputTokens => 7,
-            // The tier is a reading about the cost, not the cost: it sheds
-            // with the telemetry, ahead of the number it annotates.
-            Self::BillingTier => 7,
-            Self::Cost => 5,
-            // The balance outlives the cost: it is off by default, so a row
-            // that shows one is a row whose owner asked for it by name.
-            Self::Balance => 4,
-            // An active goal is the session's deliberate long-running mode:
-            // its reading outlives every telemetry segment and sheds only
-            // ahead of the route and context readings.
-            Self::Goal => 3,
-            // Workspace and branch are opt-in like the balance: a row that
-            // shows them is a row whose owner asked by name, so they shed
-            // with it, ahead of telemetry but behind the goal.
-            Self::Workspace | Self::GitBranch => 4,
-            Self::Model | Self::Context => 0,
-        }
-    }
-
-    /// Priorities at or above this shed before the help hint does.
-    const SHED_BEFORE_HELP: u8 = 7;
-}
+/// The kit owns segment identities and their one shared shed priority.
+/// Existing callers retain the same model/context action identities.
+pub use codewhale_ratatui::MetricKind as InfoSegmentId;
 
 /// One metrics-line segment.
 #[derive(Debug, Clone)]
@@ -163,18 +78,6 @@ impl InfoSegment {
             ink,
         }
     }
-
-    fn rendered_width(&self, ascii_safe: bool) -> usize {
-        segment_text(self, ascii_safe).width()
-    }
-}
-
-fn segment_text(segment: &InfoSegment, ascii_safe: bool) -> String {
-    if segment.label.is_empty() {
-        segment.value.clone()
-    } else {
-        format!("{} {}", sym(&segment.label, ascii_safe), segment.value)
-    }
 }
 
 /// What the caller owes the metrics line. Everything is injected so renders
@@ -192,11 +95,10 @@ pub struct InfoLine<'a> {
     /// shell; both own a click action (picker / inspector).
     pub hovered: Option<InfoSegmentId>,
     /// ASCII-safe / NO_COLOR mode: every glyph goes through
-    /// [`glyphs::ascii_fallback`].
+    /// the kit's native punctuation projection; language text stays intact.
     pub ascii_safe: bool,
     /// `tui.metrics_line = "compact"` (#5950): the shed pass starts with
-    /// secondary counts (everything at or above
-    /// [`InfoSegmentId::SHED_BEFORE_HELP`]) and the help hint already gone.
+    /// secondary counts and the help hint already gone.
     /// Selected TTFT and rate readings remain; width sheds the rest.
     pub compact: bool,
 }
@@ -233,220 +135,146 @@ impl<'a> InfoLine<'a> {
     }
 }
 
-fn ascii_of(glyph: &str) -> String {
-    if let Some(fb) = glyphs::ascii_fallback(glyph) {
-        return fb.to_string();
+// A full-color role theme supplies distinct identities, not product colors.
+// Named native palettes can collapse Hint/Dim or permission inks; use the
+// uncollapsed role table so custom UiTheme slots remain independent. The
+// existing backend applies terminal color capabilities after this adapter.
+pub(super) fn source_theme(ascii: bool) -> Theme {
+    Theme::new(Caps {
+        depth: ColorDepth::TrueColor,
+        ascii,
+        appearance: Appearance::Dark,
+    })
+}
+
+pub(super) fn ink_role(ink: ChromeInk) -> Role {
+    match ink {
+        ChromeInk::Outcome | ChromeInk::Active => Role::Live,
+        // These three roles are private style identities in this adapter;
+        // they do not paint grounds or change permission authority.
+        ChromeInk::PermissionAsk => Role::Surface,
+        ChromeInk::PermissionAutoReview => Role::Hover,
+        ChromeInk::PermissionFullAccess => Role::Selected,
+        ChromeInk::Waiting => Role::BorderStrong,
+        ChromeInk::Attention => Role::Attention,
+        ChromeInk::PolicyAct
+        | ChromeInk::PolicyPlan
+        | ChromeInk::PolicyOperate
+        | ChromeInk::Identity
+        | ChromeInk::Info => Role::Primary,
+        ChromeInk::MetadataValue => Role::Foreground,
+        ChromeInk::Metadata => Role::Muted,
+        ChromeInk::MetadataHint => Role::Hint,
+        ChromeInk::MetadataDim => Role::Dim,
+        ChromeInk::Failure => Role::Danger,
     }
-    glyph
-        .chars()
-        .map(|c| {
-            glyphs::ascii_fallback(&c.to_string())
-                .map(str::to_string)
-                .unwrap_or_else(|| c.to_string())
-        })
-        .collect()
 }
 
-fn sym(glyph: &str, ascii_safe: bool) -> String {
-    if ascii_safe {
-        ascii_of(glyph)
-    } else {
-        glyph.to_string()
-    }
-}
+const STYLE_INKS: [ChromeInk; 12] = [
+    ChromeInk::Active,
+    ChromeInk::PermissionAsk,
+    ChromeInk::PermissionAutoReview,
+    ChromeInk::PermissionFullAccess,
+    ChromeInk::Waiting,
+    ChromeInk::Attention,
+    ChromeInk::Info,
+    ChromeInk::MetadataValue,
+    ChromeInk::Metadata,
+    ChromeInk::MetadataHint,
+    ChromeInk::MetadataDim,
+    ChromeInk::Failure,
+];
 
-/// The shed pass's answer: which segments survive at this row width and
-/// whether the help hint survived. Shared by the render and the hitbox
-/// computation so the two can never disagree about the cells a segment
-/// painted.
-struct ShedRow<'t> {
-    kept: Vec<&'t InfoSegment>,
-    show_help: bool,
-}
-
-fn shed_pass<'t>(info: &'t InfoLine<'_>, area: Rect) -> ShedRow<'t> {
-    let ascii = info.ascii_safe;
-    let help = sym(info.help_hint, ascii);
-    let join_w = sym(ITEM_JOIN, ascii).width();
-    // A compact row is the full row after its first shed rungs: the
-    // secondary counts and the help hint go before width is consulted.
-    let mut kept: Vec<&InfoSegment> = info
-        .segments
-        .iter()
-        .filter(|segment| {
-            !info.compact || segment.id.shed_priority() < InfoSegmentId::SHED_BEFORE_HELP
-        })
-        .collect();
-    let left_width = |segs: &[&InfoSegment]| -> usize {
-        segs.iter().map(|s| s.rendered_width(ascii)).sum::<usize>()
-            + join_w * segs.len().saturating_sub(1)
-    };
-    let total_needed = |left: usize, show_help: bool| -> usize {
-        left + if show_help && !help.is_empty() {
-            HELP_GAP + help.width()
-        } else {
-            0
+impl InfoLine<'_> {
+    fn kit(&self) -> MetricsLine<'_> {
+        let mut line = MetricsLine::new(
+            self.segments
+                .iter()
+                .map(|segment| {
+                    MetricSegment::new(segment.id, segment.label.as_str(), segment.value.as_str())
+                        .role(ink_role(segment.ink))
+                })
+                .collect(),
+        )
+        .help_hint(self.help_hint)
+        .compact(self.compact);
+        if let Some(hovered) = self.hovered {
+            line = line.hovered(hovered);
         }
-    };
-    // The highest-priority shedding segment, restricted to `min_priority`
-    // and above, if any.
-    let sheddable = |kept: &[&InfoSegment], min_priority: u8| -> Option<usize> {
-        kept.iter()
-            .enumerate()
-            .filter(|(_, s)| s.id.shed_priority() >= min_priority.max(1))
-            .max_by_key(|(_, s)| s.id.shed_priority())
-            .map(|(i, _)| i)
-    };
-
-    let mut show_help = !help.is_empty() && !info.compact;
-    while total_needed(left_width(&kept), show_help) > area.width as usize {
-        if let Some(pos) = sheddable(&kept, InfoSegmentId::SHED_BEFORE_HELP) {
-            kept.remove(pos);
-        } else if show_help {
-            show_help = false;
-        } else if let Some(pos) = sheddable(&kept, 1) {
-            kept.remove(pos);
-        } else {
-            break;
-        }
+        line
     }
-
-    ShedRow { kept, show_help }
 }
 
-/// The context reading's hitbox (spec §6: the reading is the chrome row's one
-/// always-present inspector target — `/context`'s mouse route).
+/// The kit computes the visible context reading's exact pointer target.
 #[must_use]
 pub fn context_meter_hitbox(info: &InfoLine<'_>, area: Rect) -> Option<Rect> {
-    infoline_hitboxes(info, area)
-        .into_iter()
-        .find(|hitbox| hitbox.id == InfoSegmentId::Context)
-        .map(|hitbox| hitbox.area)
+    info.kit()
+        .context_hitbox(area, &source_theme(info.ascii_safe))
 }
 
 impl Widget for InfoLine<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.height < 1 || area.width < 1 {
-            return;
-        }
-        let theme = self.theme;
-        let ascii = self.ascii_safe;
-        let ShedRow { kept, show_help } = shed_pass(&self, area);
-
-        let right_edge = usize::from(area.x) + usize::from(area.width);
-        let mut x = usize::from(area.x);
-        let y = area.y;
-        let join = sym(ITEM_JOIN, ascii);
-        // Every write clips at the row's right edge, so a row below the
-        // floor (model + context) truncates rather than wraps or panics.
-        let set = |buf: &mut Buffer, cx: usize, span: &Span<'_>| {
-            let budget = right_edge.saturating_sub(cx);
-            if budget > 0 {
-                buf.set_span(cx as u16, y, span, budget as u16);
-            }
-        };
-
-        for (index, segment) in kept.iter().enumerate() {
-            if index > 0 {
-                set(
-                    buf,
-                    x,
-                    &Span::styled(&join, chrome(theme, ChromeInk::MetadataDim)),
-                );
-                x += join.width();
-            }
-            // Slice G global rule: every actionable segment brightens on
-            // hover. Model and Context own click actions; status-only
-            // facts never do.
-            let hovered = matches!(segment.id, InfoSegmentId::Model | InfoSegmentId::Context)
-                && self.hovered == Some(segment.id);
-            let mut style = chrome(theme, segment.ink);
-            if hovered {
-                style = style
-                    .add_modifier(Modifier::BOLD)
-                    .add_modifier(Modifier::UNDERLINED);
-            }
-            // label dim, value in the segment's ink (two spans, one hitbox).
-            // The label may be a glyph (`↓`); ascii-safe projects it, and
-            // every projection is single-width so the shed arithmetic above
-            // stays exact.
-            if !segment.label.is_empty() {
-                // A reading that has become a problem reads as one warning,
-                // not a gray word beside a red number.
-                let label_ink = match segment.ink {
-                    ChromeInk::Failure | ChromeInk::Attention => segment.ink,
-                    _ => ChromeInk::Metadata,
-                };
-                let label = sym(&segment.label, ascii);
-                set(
-                    buf,
-                    x,
-                    &Span::styled(label.clone(), chrome(theme, label_ink)),
-                );
-                x += label.width() + 1;
-            }
-            set(buf, x, &Span::styled(&segment.value, style));
-            x += segment.value.width();
-        }
-
-        // The help hint is pinned to the row's right edge.
-        if show_help {
-            let hint = sym(self.help_hint, ascii);
-            let sx = right_edge.saturating_sub(hint.width());
-            set(
-                buf,
-                sx,
-                &Span::styled(hint, chrome(theme, ChromeInk::MetadataHint)),
-            );
-        }
+        paint_native_row(&self.kit(), area, buf, self.theme, self.ascii_safe);
     }
 }
 
-fn chrome(theme: &UiTheme, ink: ChromeInk) -> Style {
-    codewhale_palette::grammar::chrome_style(theme, ink)
+/// Adapt the kit's two native chrome rows to the live host ink slots.
+pub(super) fn paint_native_row(
+    component: &impl Paint,
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &UiTheme,
+    ascii: bool,
+) {
+    let area = area.intersection(buf.area);
+    if area.is_empty() {
+        return;
+    }
+    let area = Rect { height: 1, ..area };
+    let source = source_theme(ascii);
+    let inks = STYLE_INKS.map(|ink| (source.color(ink_role(ink)), ink.color(theme)));
+    // Render one borrowed row with a foreground sentinel. Only cells the
+    // kit writes are copied back, preserving untouched content and all
+    // host-owned backgrounds/modifiers. Wide-character continuation cells
+    // reset exactly as they do in a direct Ratatui render.
+    let untouched = Color::Indexed(0);
+    let mut row = Buffer::empty(area);
+    for x in area.left()..area.right() {
+        row[(x, area.y)].clone_from(&buf[(x, area.y)]);
+        row[(x, area.y)].fg = untouched;
+    }
+    component.paint(area, &mut row, &source);
+    for x in area.left()..area.right() {
+        let cell = &mut row[(x, area.y)];
+        if cell.fg == untouched {
+            continue;
+        }
+        if let Some((_, color)) = inks.iter().find(|(identity, _)| *identity == Some(cell.fg)) {
+            cell.fg = *color;
+        }
+        buf[(x, area.y)].clone_from(cell);
+    }
 }
 
-/// Recorded hitboxes for one rendered row. Mirrors the
-/// `viewport.last_workbar_area` storage pattern: render computes the
-/// rects, the caller stores them, `mouse_ui` hit-tests against them.
+/// Host-owned action routing keeps its existing typed facade.
 #[derive(Debug, Clone)]
 pub struct InfoLineHitbox {
     pub id: InfoSegmentId,
     pub area: Rect,
 }
 
-/// Compute the hitbox `Rect` for each kept segment. Must be called with the
-/// same inputs as the render so the rects match the painted cells exactly.
+/// Geometry comes from the same kit layout as painting, with no caller
+/// width calculation, shedding pass or punctuation projection.
 #[must_use]
 pub fn infoline_hitboxes(info: &InfoLine<'_>, area: Rect) -> Vec<InfoLineHitbox> {
-    let mut out = Vec::new();
-    if area.height < 1 || area.width < 1 {
-        return out;
-    }
-    let shed = shed_pass(info, area);
-    let clip_right = usize::from(area.x) + usize::from(area.width);
-    let join_width = sym(ITEM_JOIN, info.ascii_safe).width();
-    let mut x = usize::from(area.x);
-    for (index, segment) in shed.kept.iter().enumerate() {
-        if index > 0 {
-            x += join_width;
-        }
-        let w = segment.rendered_width(info.ascii_safe);
-        let end = (x + w).min(clip_right);
-        if x < end {
-            out.push(InfoLineHitbox {
-                id: segment.id,
-                area: Rect {
-                    x: x as u16,
-                    y: area.y,
-                    width: (end - x) as u16,
-                    height: 1,
-                },
-            });
-        }
-        x += w;
-    }
-    out
+    info.kit()
+        .hitboxes(area, &source_theme(info.ascii_safe))
+        .into_iter()
+        .map(|hit| InfoLineHitbox {
+            id: hit.kind,
+            area: hit.area,
+        })
+        .collect()
 }
 
 #[cfg(test)]

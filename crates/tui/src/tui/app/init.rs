@@ -143,7 +143,10 @@ impl App {
             || crate::config::explicit_launch_provider_override().is_some()
             || crate::config::explicit_launch_model_override().is_some()
             || config
-                .provider_config_for(config.api_provider())
+                .active_provider_identity()
+                .ok()
+                .as_ref()
+                .and_then(|identity| config.provider_config_for(identity))
                 .is_some_and(|entry| entry.model.is_some())
             || config.active_route_endpoint_configured();
         // Provider and model come from the same resolved config, even on the
@@ -175,24 +178,15 @@ impl App {
                 None
             }
         });
-        let provider = config.api_provider();
-        let provider_identity_record =
-            config
-                .active_provider_identity(provider)
-                .unwrap_or_else(|_| {
-                    let key = config.provider_identity_for(provider);
-                    let exact_id = Some(key.clone());
-                    crate::config::ProviderIdentity {
-                        provider,
-                        key,
-                        exact_id,
-                        migrated_legacy_ollama_cloud_route: false,
-                    }
-                });
+        let admission = config.active_provider_identity();
+        let admission_error = admission.as_ref().err().cloned();
+        let provider_identity = admission.ok();
+        // An unadmitted selection remains visible as a refusal; this inert
+        // display kind cannot be used as request/config authority.
+        let provider = provider_identity
+            .as_ref()
+            .map_or(ProviderKind::Custom, |identity| identity.provider);
         let mut effective_auth_config = config.clone();
-        effective_auth_config.scope_to_provider_identity(&provider_identity_record);
-        let provider_identity = provider_identity_record.key;
-        let provider_exact_id = provider_identity_record.exact_id;
 
         // #5032: a stale `[providers.xai] oauth_credential_generation` pointer
         // whose owned credential file is gone makes `credentials_valid` return
@@ -209,9 +203,10 @@ impl App {
         // pointer, an expired/revoked token, or a never-completed login), repair
         // a stale pointer once, surface a truthful xAI message, and suppress the
         // picker-recovery path below.
-        let xai_oauth_needs_reauth = provider == ApiProvider::Xai
-            && effective_auth_config
-                .provider_config_for(ApiProvider::Xai)
+        let xai_oauth_needs_reauth = provider == ProviderKind::Xai
+            && provider_identity
+                .as_ref()
+                .and_then(|identity| effective_auth_config.provider_config_for(identity))
                 .and_then(|entry| entry.auth_mode.as_deref())
                 .is_some_and(crate::oauth::auth_mode_uses_xai_oauth)
             && !crate::oauth::credentials_present(
@@ -231,9 +226,12 @@ impl App {
                         // Keep the in-memory route consistent with the repaired
                         // persisted file so the running app never reaches for
                         // the missing generation.
-                        effective_auth_config
-                            .provider_config_for_mut(ApiProvider::Xai)
-                            .oauth_credential_generation = None;
+                        if let Some(identity) = provider_identity.as_ref()
+                            && let Ok(entry) =
+                                effective_auth_config.provider_config_for_mut(identity)
+                        {
+                            entry.oauth_credential_generation = None;
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -253,24 +251,24 @@ impl App {
             None
         };
         let model_ids_passthrough = effective_auth_config.model_ids_pass_through();
-        let provider_chain = provider
-            .kind()
-            .map(|kind| ProviderChain::new(kind, &config.fallback_providers))
+        let provider_chain = provider_identity
+            .as_ref()
+            .filter(|identity| {
+                identity.key.as_str() == identity.provider.as_str()
+                    && identity.provider != ProviderKind::Antigravity
+            })
+            .map(|identity| ProviderChain::new(identity.provider, &config.fallback_providers))
             .filter(|chain| chain.providers().len() > 1);
-
-        // Snapshot per-provider readiness for the fallback chain (#2574). Uses
-        // the same `has_api_key_for` helper the provider picker uses, so hosted
-        // providers require a key and self-hosted ones (Ollama/vLLM/SGLang) are
-        // reported ready without one. Empty when there is no fallback chain.
         let provider_readiness = provider_chain
             .as_ref()
             .map(|chain| {
                 chain
                     .providers()
                     .iter()
-                    .map(|kind| {
-                        let provider = ApiProvider::from_kind(*kind);
-                        (provider, has_api_key_for(config, provider))
+                    .filter_map(|kind| config.builtin_provider_identity(*kind).ok())
+                    .map(|identity| {
+                        let ready = has_api_key_for(config, &identity);
+                        (identity, ready)
                     })
                     .collect()
             })
@@ -362,30 +360,28 @@ impl App {
         // Remembered route choices were resolved once into Config. The
         // chooser and hotbar must not revive archived Settings values.
         let mut provider_models = HashMap::new();
-        for &candidate in ApiProvider::all() {
-            if candidate != ApiProvider::Custom
-                && let Some(model) = config
-                    .provider_config_for(candidate)
-                    .and_then(|entry| entry.model.as_ref())
+        for identity in config.provider_identities() {
+            if let Some(model) = config
+                .provider_config_for(&identity)
+                .and_then(|entry| entry.model.as_ref())
             {
-                provider_models.insert(config.provider_identity_for(candidate), model.clone());
+                provider_models.insert(identity.key.to_string(), model.clone());
             }
         }
-        if let Some(providers) = config.providers.as_ref() {
-            for (identity, entry) in &providers.custom {
-                if let Some(model) = entry.model.as_ref() {
-                    provider_models.insert(identity.clone(), model.clone());
-                }
-            }
+        if let Some(identity) = &provider_identity {
+            provider_models.insert(identity.key.to_string(), model.clone());
         }
-        provider_models.insert(provider_identity.clone(), model.clone());
         let auto_model = model.trim().eq_ignore_ascii_case("auto");
         // `settings.toml [enabled_models]` is no longer read (#6533): the
         // picker ranks by use, which this index derives from saved sessions.
         let route_usage = crate::model_relevance::SharedRouteUsage::default();
         crate::model_relevance::spawn_build(route_usage.clone());
-        let active_context_window_override = config.context_window_for_provider_config(provider);
-        let active_model_context_windows = config.model_context_windows_for(provider).cloned();
+        let active_context_window_override = provider_identity
+            .as_ref()
+            .and_then(|identity| config.context_window_for_provider_config(identity));
+        let active_model_context_windows = provider_identity
+            .as_ref()
+            .and_then(|identity| config.model_context_windows_for(identity).cloned());
         let configured_route_base_url = effective_auth_config.active_route_base_url();
         let (active_route_limits, active_route_base_url, active_context_window_source) =
             if auto_model {
@@ -402,23 +398,28 @@ impl App {
                     },
                 )
             } else {
-                crate::route_runtime::resolve_runtime_route(
-                    &effective_auth_config,
-                    provider,
-                    Some(&model),
-                )
-                .map(|resolution| {
-                    (
-                        crate::route_budget::known_route_limits(resolution.candidate.limits()),
-                        resolution.candidate.endpoint().base_url.clone(),
-                        resolution.context_window.source,
-                    )
-                })
-                .unwrap_or((
-                    None,
-                    configured_route_base_url,
-                    crate::route_runtime::ContextWindowSource::Fallback,
-                ))
+                provider_identity
+                    .as_ref()
+                    .ok_or_else(|| "provider identity unavailable".to_string())
+                    .and_then(|identity| {
+                        crate::route_runtime::resolve_runtime_route_for_identity(
+                            &effective_auth_config,
+                            identity,
+                            Some(&model),
+                        )
+                    })
+                    .map(|resolution| {
+                        (
+                            crate::route_budget::known_route_limits(resolution.candidate.limits()),
+                            resolution.candidate.endpoint().base_url.clone(),
+                            resolution.context_window.source,
+                        )
+                    })
+                    .unwrap_or((
+                        None,
+                        configured_route_base_url,
+                        crate::route_runtime::ContextWindowSource::Fallback,
+                    ))
             };
         let reasoning_effort_explicit = config.fleet_operator_reasoning_applied
             || settings.reasoning_effort.is_some()
@@ -723,7 +724,7 @@ impl App {
             .unwrap_or((0, Vec::new()));
         let mut hotbar_actions = HotbarActionRegistry::with_configured_routes(
             config,
-            provider,
+            provider_identity.as_ref(),
             &model,
             &provider_models,
         );
@@ -809,8 +810,10 @@ impl App {
             remote_control: crate::remote_control::RemoteControlController::default(),
             start_remote_control_on_launch: start_remote_control,
             is_loading: false,
+            feedback_dispatch: None,
             dispatch_completion_tx: None,
             dispatch_in_flight: false,
+            dispatch_cancel: None,
             last_enter_instant: None,
             provider_wait_incident_logged: false,
             prompt_suggestion: None,
@@ -821,7 +824,8 @@ impl App {
             turn_error_notice: None,
             // Surface parse warnings so the user knows their config file is
             // broken instead of silently losing all settings.
-            status_message: xai_dangling_repair_message
+            status_message: admission_error
+                .or(xai_dangling_repair_message)
                 .or(settings_parse_warning)
                 .or(tui_prefs_migration_notice)
                 .or(theme_warning),
@@ -847,8 +851,7 @@ impl App {
             pending_auto_route_receipt: None,
             active_turn: None,
             api_provider: provider,
-            provider_identity,
-            provider_exact_id,
+            provider_identity: provider_identity.clone(),
             provider_chain,
             provider_readiness,
             provider_health: crate::provider_readiness::ProviderReadinessSnapshot::default(),
@@ -932,7 +935,10 @@ impl App {
             inline_diff_mode,
             ui_locale,
             cost_currency,
-            billing_presentation: crate::route_billing::for_route(config, provider),
+            billing_presentation: provider_identity.as_ref().map_or(
+                crate::route_billing::BillingPresentation::Unknown,
+                |identity| crate::route_billing::for_route(config, identity),
+            ),
             composer_density,
             composer_border,
             composer_multiline_mode,

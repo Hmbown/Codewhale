@@ -904,7 +904,7 @@ mod tests {
             for forbidden in [
                 "reqwest",
                 "llm_client",
-                "ApiProvider",
+                "ProviderKind",
                 "http://",
                 "https://",
             ] {

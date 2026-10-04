@@ -102,6 +102,12 @@ pub(crate) fn artifact_sessions_root() -> Option<PathBuf> {
     {
         return Some(root);
     }
+    // Artifacts live beside saved sessions, so an unsealed test gets the same
+    // private directory `default_sessions_dir` hands it.
+    #[cfg(test)]
+    if let Some(root) = crate::test_support::unsealed_state_dir("sessions") {
+        return Some(root);
+    }
 
     // Use the same state-root authority as saved sessions, including an explicit
     // CODEWHALE_HOME and legacy read fallback.

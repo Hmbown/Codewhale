@@ -2,6 +2,7 @@
 
 > 英文原文：[PROVIDERS.md](../PROVIDERS.md)。
 > 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> ChatGPT 登录相关内容于 2026-10-02 按当前实现更新。
 
 本注册表描述已接入当前 Codewhale 代码库的提供商行为。它刻意保持保守：随附条目仅限于代码已知的提供商 ID、配置键、认证路径、base URL、模型解析和能力元数据。
 
@@ -53,15 +54,33 @@ codewhale models --provider openai --json
 
 `models --update`（也可写作 `--refresh`）会更新共享的 Models.dev 元数据，并用每个已配置提供商各自的凭据调用其现有的 `/models` 端点。`--provider ID` 把刷新限定在该提供商，包括具名的自定义端点。它不发起任何推理请求，也不会更改已保存的提供商或模型。命令行传入的 API 密钥只限于当前提供商；本次调用中其他路由会被报告为已跳过。
 
-不带 `--update` 的 `models` 会列出当前提供商已保存的目录，不发起提供商请求，也不检查认证。刷新成功后，结果保存在 Codewhale 的目录文件夹下，供模型/提供商选择器使用。缓存文件按提供商身份和端点划分；刷新失败时会保留原有行。文本输出报告来源、最近一次成功获取的时间（Unix 秒）和新鲜度。`--update --json` 会额外给出每个来源的回执和汇总计数；部分失败时，会在写完这些回执后返回非零退出码。普通的 `models --json` 仍保持模型数组格式。随附的或已配置的回退项并不能证明账户可以使用列出的每个模型。
+不带 `--update` 的 `models` 会列出当前提供商已保存的目录，不发起提供商请求。ChatGPT 路由会先在本地验证所选注册，再读取该账户的缓存目录。刷新成功后，结果保存在 Codewhale 的目录文件夹下，供模型/提供商选择器使用。缓存文件按提供商身份和端点划分；刷新失败时会保留原有行。文本输出报告来源、最近一次成功获取的时间（Unix 秒）和新鲜度。`--update --json` 会额外给出每个来源的回执和汇总计数；部分失败时，会在写完这些回执后返回非零退出码。普通的 `models --json` 仍保持模型数组格式。随附的或已配置的回退项并不能证明账户可以使用列出的每个模型。
 
-`codewhale models --update --provider openai-codex` 会通过有文档记载的 [app-server stdio API](https://learn.chatgpt.com/docs/app-server)，向已安装的 Codex CLI 询问其已登录 ChatGPT 账户的模型列表。分页和受支持的思考强度都会保留。这要求 Codex 版本支持 `account/read` 和 `model/list`。它不会开启任何对话，不导入任何令牌，也不会把 Codewhale 的提供商密钥发送给 Codex。可能选中另一个账户的独立凭据覆盖或自定义端点会被跳过。
+### 使用 ChatGPT 登录
 
-Codex 自己控制其上游缓存策略；`model/list` 不提供强制刷新选项。因此回执把结果计为 `loaded`，附带 `observed_at` 查询时间，而不声称有上游的 `fetched_at`。观察到的名单会与现有的 Codex 缓存回退一起保存下来，供离线列表和选择器使用。只有当该账户的名单给出确切的 ID 时，新模型（例如 GPT-6 Astra）才会出现。Codewhale 从不猜测可用性，也不会改用另一条计费路由。名单缺失/过期、CLI 失败以及不受支持的 OAuth 目录都会被明确报告。
+`openai-codex` 现在使用 OpenAI 官方的[开源应用登录流程](https://developers.openai.com/siwc/token-sharing-open-source)。先登录，再刷新当前账户的模型目录：
 
-Codewhale 观察到的 Codex 名单绑定到确切的文件系统 home 和其 `auth.json` 的元数据版本；为该缓存绑定从不读取令牌。更换该登录会使此次观察失效。在观察到登录文件变化之前获取的 Codex 原生缓存同样视为过期。没有可观察登录文件的、仅存于系统密钥环的账户仍可加载实时名单，但回执会报告 `codex_observation_not_persisted`，并且不会保留 Codewhale 的观察记录。当无法观察到登录文件版本时，单独归属的、由 Codex 拥有的原生缓存保持其原有的新鲜度策略；这并不能证明外部密钥环中的账户身份。
+```sh
+codewhale auth chatgpt
+codewhale models --update --provider openai-codex
+codewhale --provider openai-codex
+```
 
-规范的提供商 ID 是 `ProviderKind::ALL`（`crates/config/src/provider_kind.rs`）的 46 个条目，按该顺序排列：
+登录通过系统浏览器、回环回调和 PKCE 完成。Codewhale 验证返回的身份与套餐使用权限，把注册信息和可续期令牌保存在自己的受保护凭据存储中。身份登录不等于套餐授权；未授予 `chatgpt.tokens.use.direct` 权限时，推理会停止。使用 `codewhale auth chatgpt-revoke` 退出 Codewhale 的登录会话。当前实验版只保留一个活动账户注册，尚未提供已保存账户的切换界面。
+
+在 Codewhale 内运行 `/auth chatgpt` 会重新授权当前账户和工作区，并更新正在运行的会话；普通重新登录会沿用已签发的客户端 ID，验证返回的仍是同一账户。要更换账户或工作区，请在终端运行 `CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt`，刷新新账户的模型目录，再重启已打开的 Codewhale 会话。只有通过完整验证的新授权才会替换现有登录。浏览器若登录了错误的账户，可先退出该账户，或用隐私窗口打开打印出的登录链接。
+
+`codewhale auth status --provider openai-codex` 和 `codewhale auth list` 会在 ID 令牌含有邮箱时显示账户标签；套餐和工作区信息只在相应字段存在时显示。标签用于识别账户，不能证明套餐权限；没有邮箱标签也不代表已经退出登录。状态检查只读取本地凭据，不向签发方发起请求：访问令牌已过期但仍存有刷新令牌时，会被视为结构上可用，这不保证续期一定成功。登录成功后，会显示已知的账户标签，并说明是否替换了先前的登录。
+
+模型目录使用已获授权的令牌请求 `GET https://api.openai.com/v1/models`；推理使用公共端点 `POST https://api.openai.com/v1/responses`。选择器保留官方显示名称和顺序，仅列出 `visibility: list` 的模型。目录不含凭据，并按已验证的签发方、签发的客户端 ID 和账户主体隔离；模型列表不能证明上下文窗口或思考档位。目录缺失、无效或超过 24 小时时，选择器不会列出任何账户模型。Codex CLI 导入令牌和旧版进程令牌变量不能授权这条官方路由。
+
+符合条件的请求消耗 ChatGPT 套餐额度或点数。Plus 的五小时额度在各应用之间共享，不会为每个应用单独分配；这项五小时限制不适用于 Pro。应用还可能有各自的使用上限。可在 [ChatGPT 设置 → 使用情况](https://chatgpt.com/settings/usage) 查看额度和授权。额度耗尽时，Codewhale 不会自动换用 API 密钥或其他提供商。
+
+这是面向本地开源应用的预览集成，不读取 ChatGPT 对话历史。请求使用 `store: false` 和 `stream: true`，会话历史由 Codewhale 保存。此路由不支持 OpenAI 托管的图像生成、文件搜索、Code Interpreter、原生电脑操作、MCP/连接器或 Responses `tool_search`；Codewhale 自己的工具使用受支持的函数调用。参见[预览限制](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)。付费或远程托管应用需要走[商业合作申请流程](https://openai.com/form/sign-in-with-chatgpt-interest/)；完成本地集成不代表已获得商业批准。
+
+ChatGPT 预览版一次只请求一个函数调用。
+
+规范的提供商 ID 是 `ProviderKind::ALL`（`crates/config/src/provider_kind.rs`）的全部条目，按该顺序排列：
 
 `deepseek`, `nvidia-nim`, `openai`, `atlascloud`, `wanjie-ark`, `volcengine`,
 `openrouter`, `orcarouter`, `xiaomi-mimo`, `novita`, `fireworks`, `siliconflow`, `arcee`,
@@ -125,7 +144,7 @@ Antigravity 不是 Codewhale 的提供商，无法被选择或运行。已有的
 | `modelscope` | `[providers.modelscope]` | OpenAI Chat Completions | `MODELSCOPE_API_KEY` |
 | `together` | `[providers.together]` | OpenAI Chat Completions | `TOGETHER_API_KEY` |
 | `qianfan` | `[providers.qianfan]` | OpenAI Chat Completions | `QIANFAN_API_KEY`, `BAIDU_QIANFAN_API_KEY` |
-| `openai-codex` | `[providers.openai_codex]` | OpenAI Responses | 原生 ChatGPT PKCE（`codewhale auth chatgpt`）、`OPENAI_CODEX_ACCESS_TOKEN`、`CODEX_ACCESS_TOKEN`，或显式的 Codex CLI 授权 |
+| `openai-codex` | `[providers.openai_codex]` | OpenAI Responses | 官方“使用 ChatGPT 登录”（`codewhale auth chatgpt`），需要已验证的 Codewhale 自有套餐授权 |
 | `anthropic` | `[providers.anthropic]` | Anthropic Messages | `ANTHROPIC_API_KEY` |
 | `openmodel` | `[providers.openmodel]` | Anthropic Messages | `OPENMODEL_API_KEY` |
 | `zai` | `[providers.zai]` | OpenAI Chat Completions | `ZAI_API_KEY`, `Z_AI_API_KEY` |
@@ -381,7 +400,7 @@ model = "qwen3:8b"        # 默认是 deepseek-v4-flash
 | `qianfan` | [百度云访问密钥](https://console.bce.baidu.com/iam/#/iam/accesslist) |
 | `anthropic` | [Anthropic API 密钥](https://console.anthropic.com/settings/keys) |
 | `openmodel` | [OpenModel 控制台](https://console.openmodel.ai/)（[认证指南](https://docs.openmodel.ai/en/docs/getting-started/authentication)） |
-| `openai-codex` | 通过 `codewhale auth chatgpt` 使用 ChatGPT 登录（按订阅计费，令牌由 Codewhale 自己保管）。`openai` API 密钥路由属于另一个计费主体。在执行 `codex login` 加 `codewhale auth external-consent` 之后，仍可显式改用导入 Codex CLI 凭据的方式。 |
+| `openai-codex` | 通过 `codewhale auth chatgpt` 使用官方 ChatGPT 登录，消耗符合条件的套餐额度或点数，令牌由 Codewhale 自己保管。`openai` API 密钥路由单独计费；旧版 Codex 导入凭据不能授权此路由。 |
 | `sglang`, `vllm` | 本地 OpenAI 兼容端点默认无密钥；仅当服务器需要时才配置密钥。 |
 | `ollama` | 本地 Ollama 默认无密钥；仅当本地服务器需要时才配置密钥。 |
 | `ollama-cloud` | 创建[Ollama API 密钥](https://ollama.com/settings/keys)，用 `codewhale auth set --provider ollama-cloud` 保存，或按该优先级顺序设置 `OLLAMA_CLOUD_API_KEY` / `OLLAMA_API_KEY`。 |
@@ -408,9 +427,10 @@ model = "qwen3:8b"        # 默认是 deepseek-v4-flash
 
 归另一 CLI 所有的凭据文件默认禁用。没有显式授权，提供商发现、设置、路由、`auth status` 和 doctor 不会 stat、读取、刷新、联系身份提供商或重写 Codex、Grok、Kimi 或未来的外部凭据文件。
 
-Codewhale 目前为 Codex CLI 和 Grok CLI 支持精确路径、提供商范围的**只读**授权：
+Codewhale 目前为 Codex CLI 和 Grok CLI 保留按精确路径、提供商隔离的**只读**授权。Codex 授权仅用于检查旧版凭据，不能授权官方 ChatGPT 套餐路由；该路由必须通过 `codewhale auth chatgpt` 登录。
 
 ```bash
+# 仅检查旧版 Codex 凭据，不授权 ChatGPT 套餐请求。
 codex login
 codewhale auth external-consent --provider openai-codex --mode read-only
 
@@ -421,7 +441,7 @@ codewhale auth status --provider openai-codex
 codewhale auth external-revoke --provider openai-codex
 ```
 
-当外部 CLI 使用自定义位置时，传入 `--path /absolute/path/to/auth.json`。授权会持久化提供商、外部所有者、精确绝对路径和授权模式版本。之后的环境变量更改不会把该权威重定向到另一个文件。只读授权从不刷新、联系身份/发现服务或重写外部文件；对显式所选提供商的正常请求可以使用其 token。过期的 token 会带着登录指引失败。Doctor 在不打开凭据文件的情况下报告结构性的授权/配置状态，并且始终不执行变更。
+当外部 CLI 使用自定义位置时，传入 `--path /absolute/path/to/auth.json`。授权会持久化提供商、外部所有者、精确绝对路径和授权模式版本。之后的环境变量更改不会把该权威重定向到另一个文件。只读授权不会刷新令牌、联系身份或发现服务，也不会重写外部文件。xAI 等受支持路由在显式选中后可以使用外部令牌；官方 ChatGPT 套餐路由忽略 Codex 导入令牌，只接受自己的已验证授权。外部令牌过期时，请求会停止并提示重新登录。Doctor 在不打开凭据文件的情况下报告结构性的授权/配置状态，并且始终不执行变更。
 
 `managed` 保留给未来的提供商特定保留适配器。v0.9.1 在文件或网络 I/O 之前拒绝它，因为还没有经过审查的适配器能够安全地保留每一个未知的外部模式字段。Codewhale 启动的 xAI 设备登录改为原子地激活一个 Codewhale 自有的、名为 `$CODEWHALE_HOME/credentials/xai-auth-<generation>.json` 的 generation，只把该已验证的基本名存入配置，并撤销任何 Grok 文件授权。被取代的 generation 只在新配置指针提交之后清理。
 Kimi 仍然仅支持 API 密钥；对 Kimi 的外部授权被拒绝。
@@ -462,7 +482,7 @@ Kimi 仍然仅支持 API 密钥；对 Kimi 的外部授权被拒绝。
 | `deepinfra` | `[providers.deepinfra]` | `DEEPINFRA_API_KEY`, `DEEPINFRA_TOKEN` | `DEEPINFRA_BASE_URL`；默认 `https://api.deepinfra.com/v1/openai` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | DeepInfra OpenAI 兼容路由。OpenAI SDK 的直接替代品。 |
 | `together` | `[providers.together]` | `TOGETHER_API_KEY` | `TOGETHER_BASE_URL`；默认 `https://api.together.xyz/v1` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash`, `thinkingmachines/inkling` | Together AI OpenAI 兼容路由。接受 `TOGETHER_MODEL`。模型别名 `deepseek-v4-pro` 和 `deepseek-v4-flash` 规范化为 Together 的 org 前缀 ID；`inkling` 和 `together-inkling` 规范化为 Together 发布的小写 Inkling 线协议 ID。Inkling 使用 Thinking Machines 的[官方模型仓库](https://huggingface.co/thinkingmachines/Inkling)中精确的 `none`/`minimal`/`low`/`medium`/`high`/`max` 推理词汇。Together 的[发布帖](https://www.together.ai/blog/together-ai-brings-thinking-machines-labs-new-model-inkling-on-day-0)目前称 Inkling 以 1M 上下文上线，而其[模型详情页](https://www.together.ai/models/inkling)称即将推出 256K 上下文且不公布价格。在 Together 活跃的 `/models` 端点和 Models.dev 目录解决该冲突之前，Inkling 不会种入 Codewhale 的离线选择器，也不会推断路由特定的上下文或成本。 |
 | `qianfan` | `[providers.qianfan]` | `QIANFAN_API_KEY`, `BAIDU_QIANFAN_API_KEY` | `QIANFAN_BASE_URL`, `BAIDU_QIANFAN_BASE_URL`；默认 `https://api.baiduqianfan.ai/v1` | `ernie-4.0-turbo-8k`；提供商范围的定制 Qianfan 服务/模型 ID 直通 | 百度千帆 OpenAI 兼容路由。请求使用 Bearer 认证和 Chat Completions 负载。接受 `QIANFAN_MODEL` 和 `BAIDU_QIANFAN_MODEL`；别名 `baidu-qianfan`, `baidu_qianfan` 和 `baidu` 解析到该提供商。千帆文档中工具/函数调用按模型范围限定，因此 Codewhale 保留所选线协议模型，把实时能力证明留给后续的路由/能力工作。 |
-| `openai-codex` | `[providers.openai_codex]` | 原生 ChatGPT PKCE（`codewhale auth chatgpt` / `/provider setup openai-codex`）、通过 `OPENAI_CODEX_ACCESS_TOKEN`/`CODEX_ACCESS_TOKEN` 提供的进程令牌，或在 `codex login` 之后的精确路径只读授权 | `OPENAI_CODEX_BASE_URL`/`CODEX_BASE_URL`；默认 `https://chatgpt.com/backend-api` | `gpt-5.6`（默认） | **实验性。** 与 `/codex/responses` 上的 OpenAI Responses API 通信。原生的“使用 ChatGPT 登录”会把可刷新的令牌存放在 Codewhale 自己的存储中，并按 ChatGPT 订阅计费；`openai` API 密钥路由属于另一个计费主体。Codex CLI 文件默认仍处于禁用状态；`codewhale auth external-consent --provider openai-codex --mode read-only` 是显式的导入备选方式。Codewhale 从不刷新或重写那个外部文件，过期的外部令牌会失败关闭。使用 `codewhale auth chatgpt-revoke` 撤销 Codewhale 自己保管的令牌。接受 `OPENAI_CODEX_MODEL`/`CODEX_MODEL` 和 `OPENAI_CODEX_ACCOUNT_ID`/`CODEX_ACCOUNT_ID`。即使公开 API 模型表为原生 `gpt-5.5` 列出了更大的窗口，Codewhale 也按 400K 的 Codex 系列有效上下文窗口为该路由做预算。OpenAI 尚未为这个公开的 Codex OAuth 客户端发布第三方客户端注册；该适配器使用已公布的 issuer 和 PKCE S256，如实设置 `originator=codewhale`，并且不调用未公开的设备认证端点。 |
+| `openai-codex` | `[providers.openai_codex]` | 官方“使用 ChatGPT 登录”（`codewhale auth chatgpt` / `/provider setup openai-codex`） | 官方端点 `https://api.openai.com/v1` | 当前账户目录；手动配置的模型 ID 仍属于显式选择 | **实验性。** 使用公共 Responses 端点（`/v1/responses`），要求已验证的 `chatgpt.tokens.use.direct` 授权。开源应用动态注册会为所选账户/工作区签发客户端 ID，Codewhale 保护并续期自己的令牌。可选模型由账户目录提供；公开模型表和旧版 Codex 令牌不能证明套餐使用权限。不会自动切换计费路径。设置、额度和预览限制见[使用 ChatGPT 登录](#使用-chatgpt-登录)。 |
 | `anthropic` | `[providers.anthropic]` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL`；默认 `https://api.anthropic.com` | `claude-opus-4-8`, `claude-sonnet-4-6`（默认）, `claude-haiku-4-5` | 原生 Anthropic Messages API 路由（`/v1/messages`、`x-api-key` + `anthropic-version: 2023-06-01`）——不是 OpenAI 兼容。通过 `cache_control` 断点提示缓存、自适应思考 + `output_config.effort`、按原样重放带签名的思考块、按 #2961 规范化的缓存遥测。接受 `ANTHROPIC_MODEL`。 |
 | `openmodel` | `[providers.openmodel]` | `OPENMODEL_API_KEY` | `OPENMODEL_BASE_URL`；默认 `https://api.openmodel.ai` | `deepseek-v4-flash`；提供商范围的定制模型 ID 直通 | OpenModel Anthropic 兼容 Messages 路由。使用 `/v1/messages`、Bearer 认证和 `anthropic-version: 2023-06-01`；OpenModel 按模型 id 选择 DeepSeek、DashScope、Xiaomi、Claude 和其他路由。接受 `OPENMODEL_MODEL`。 |
 | `sakana` | `[providers.sakana]` | `FUGU_API_KEY`, `SAKANA_API_KEY` | `SAKANA_BASE_URL`；默认 `https://api.sakana.ai/v1` | `fugu`（默认）, `fugu-ultra-20260615` | Sakana AI Fugu OpenAI 兼容路由。标准 Chat Completions 线协议；支持流式。`fugu-ultra-20260615` 是重型/推理变体。环境变量别名：`FUGU_API_KEY`（主）, `SAKANA_API_KEY`；提供商别名：`sakana-ai`, `sakana_ai`, `fugu`。 |
@@ -654,7 +674,7 @@ AtlasCloud 与配置层保持相同的默认模型，并为 Pro 和 Flash 行添
 | Anthropic API `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-fable-5` | 1,000,000 | 128,000 | 是 | 是 | 代码中未记录 |
 | Google Gemini API `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro-preview`, `gemini-2.5-pro`, `gemini-2.5-flash` | 1,048,576 | 65,536 | 取决于模型 | 否 | 代码中未记录 |
 | Meta Model API `muse-spark-1.2` | 1,000,000 | 32,000 | 是 | 否 | 代码中未记录 |
-| OpenAI Codex / ChatGPT 路由（`openai-codex`） | 生效 400,000 | 128,000 | 是 | 否 | 路由在 `/codex/responses` 使用 Responses 负载 |
+| ChatGPT 套餐路由（`openai-codex`） | 保守预算；账户列表不提供窗口大小 | 预览请求不发送输出上限 | 取决于模型 | 否 | 公共 `/v1/responses`；不从账户访问权限推断上下文上限 |
 | OpenModel 默认/自定义模型 ID | 回退 200,000，除非模型元数据或配置覆盖 | 回退 64,000 | 取决于模型 | 否 | 路由在 `/v1/messages` 使用 Messages 负载 |
 | Wanjie Ark `reasoner` / `r1` 模型 ID | 128,000 | 未知（无文档化上限） | 是 | 否 | 代码中未记录 |
 | 直接 Arcee API `trinity-large-thinking` | 262,144 | 262,144 | 是 | 否 | 代码中未记录 |

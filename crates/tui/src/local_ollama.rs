@@ -13,7 +13,7 @@ use codewhale_config::catalog::{
 };
 use serde::Deserialize;
 
-use crate::config::{ApiProvider, Config, DEFAULT_OLLAMA_BASE_URL};
+use crate::config::{Config, ProviderKind};
 
 const TAGS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -139,7 +139,7 @@ pub(crate) fn should_adopt_live_local_ollama(app: &mut crate::tui::app::App) -> 
     if app.startup_route_configured {
         return false;
     }
-    if app.api_provider == ApiProvider::Ollama {
+    if app.api_provider == ProviderKind::Ollama {
         // Already on Ollama — route_runtime + #5795 own the tag; don't fight it.
         return false;
     }
@@ -152,10 +152,11 @@ pub(crate) fn should_adopt_live_local_ollama(app: &mut crate::tui::app::App) -> 
 /// Resolve the OpenAI-compat Ollama base URL (`…/v1`) from config defaults.
 pub(crate) fn ollama_v1_base_url(config: &Config) -> String {
     config
-        .provider_config_for(ApiProvider::Ollama)
-        .and_then(|entry| entry.base_url.clone())
-        .filter(|url| !url.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string())
+        .resolve_provider_pin_identity("ollama")
+        .ok()
+        .filter(|identity| identity.provider == ProviderKind::Ollama)
+        .map(|identity| config.base_url_for_route(&identity))
+        .unwrap_or_default()
 }
 
 /// Strip a trailing `/v1` (with optional slash) so we can hit native `/api/tags`.
@@ -228,7 +229,7 @@ fn record_ollama_tags_into_lake(endpoint_v1: &str, tags: &[String]) {
         })
         .collect();
     let ticket = crate::provider_catalog_live::begin_refresh_for_identity(
-        ApiProvider::Ollama,
+        ProviderKind::Ollama,
         "ollama",
         endpoint_v1,
     );
@@ -566,7 +567,10 @@ mod tests {
 
         let endpoint = format!("http://{addr}/v1");
         let mut config = Config::default();
-        config.provider_config_for_mut(ApiProvider::Ollama).base_url = Some(endpoint.clone());
+        config
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Ollama))
+            .unwrap()
+            .base_url = Some(endpoint.clone());
 
         let catalog = probe_live_local_ollama_catalog(&config)
             .await

@@ -1,7 +1,7 @@
 import { getConstitution, pickText } from "@/lib/i18n/dictionaries";
 import { Icon } from "./icon";
 /**
- * "See how it decides" — a terminal-styled pane that illustrates how the
+ * "See how it decides" — explanatory prose that illustrates how the
  * constitution's rank shows up in a model's reasoning, paired with the
  * decision each line of reasoning led to.
  *
@@ -79,7 +79,7 @@ export function ThinkingTrace({ locale = "en" }: { locale?: string }) {
             </span>
             <span className="trace-context">{pickText(s.context, locale)}</span>
           </figcaption>
-          <pre className="trace-body">{s.trace}</pre>
+          <p className="trace-body">{s.trace}</p>
           <p className="trace-cites">
             {s.cites.map((c) => (
               <span key={c} className="pill">{c}</span>

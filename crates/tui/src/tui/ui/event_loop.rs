@@ -10,14 +10,19 @@ use super::observer_hooks::{
     execute_turn_end_observer_hook, surface_observer_hook_submission_failure,
 };
 use super::task_projection::{
-    refresh_active_task_panel, refresh_automation_panel, refresh_automation_panel_blocking,
-    refresh_shell_exec_live_output,
+    AUTOMATION_SCAN_BUSY_INTERVAL, automation_scan_is_due, refresh_active_task_panel,
+    refresh_automation_panel, refresh_automation_panel_blocking, refresh_shell_exec_live_output,
 };
 use super::*;
 use crate::tui::shell_key_routing::ShellBindingId;
 use codewhale_models::Role;
 
 use crate::tui::control_socket::SessionControl;
+
+type SkillCacheRefresh = (
+    crate::tui::app::SkillCacheScope,
+    tokio::task::JoinHandle<Vec<(String, String)>>,
+);
 
 pub(super) fn event_owner_is_active(
     current_session_id: Option<&str>,
@@ -314,7 +319,7 @@ fn exact_translation_client(
     .map_err(anyhow::Error::msg)?
     .validate()
     .map_err(anyhow::Error::msg)?;
-    if validated.identity.key != route.provider_identity
+    if validated.identity.key.as_str() != route.provider_identity
         || validated.model != route.model
         || validated.candidate.endpoint().base_url != route.base_url
     {
@@ -323,10 +328,7 @@ fn exact_translation_client(
         );
     }
     if let Some(receipt) = route.receipt.as_ref()
-        && &validated
-            .client
-            .turn_route_receipt(&route.provider_identity)
-            != receipt
+        && &validated.client.turn_route_receipt() != receipt
     {
         anyhow::bail!(
             "translation credential or endpoint changed after turn dispatch; refusing stale completion ownership"
@@ -1230,7 +1232,14 @@ pub async fn run_tui(
     // Fire session end hook
     {
         let context = app.base_hook_context();
-        let _ = app.execute_hooks(HookEvent::SessionEnd, &context);
+        let hooks = app.hooks.clone();
+        let hook_context = context.clone();
+        if tokio::task::spawn_blocking(move || hooks.execute(HookEvent::SessionEnd, &hook_context))
+            .await
+            .is_err()
+        {
+            tracing::warn!(target:"hooks","session_end hook executor task was lost");
+        }
         // Lifecycle outbox (`[lifecycle_outbox]`): fires alongside the
         // session_end hook, with the same session identity. No-op when
         // the feature is disabled.
@@ -1641,6 +1650,7 @@ pub(super) fn edit_replacement_result(
         action: Some(AppAction::ConversationUndo {
             sync,
             retry_input: Some(input.to_string()),
+            edit_replacement: true,
         }),
         is_error: false,
     })
@@ -1653,10 +1663,25 @@ pub(super) fn edit_replacement_result(
 /// takes no optional locks, so running it mid-turn cannot block the user's
 /// own git.
 pub(crate) fn git_probe_allowed(app: &App, workspace_context_refresh_allowed: bool) -> bool {
-    workspace_context_refresh_allowed
-        || (app.work_surface.panel == crate::tui::work_surface::RailPanel::Git
-            && app.work_surface.effective_placement()
-                != crate::tui::work_surface::WorkSurfacePlacement::Off)
+    workspace_context_refresh_allowed || git_panel_visible(app)
+}
+
+/// The quiet time the git probe schedule sees: none at all while the Git
+/// panel is showing, so that live view keeps the fast cadence (#6728).
+pub(crate) fn git_probe_quiet_for(app: &App, quiet_for: Duration) -> Duration {
+    if git_panel_visible(app) {
+        Duration::ZERO
+    } else {
+        quiet_for
+    }
+}
+
+/// The Git rail panel is showing: it is the live repository state, so the
+/// probe keeps its fast cadence however quiet the session is (#6728).
+pub(crate) fn git_panel_visible(app: &App) -> bool {
+    app.work_surface.panel == crate::tui::work_surface::RailPanel::Git
+        && app.work_surface.effective_placement()
+            != crate::tui::work_surface::WorkSurfacePlacement::Off
 }
 
 pub(crate) async fn run_event_loop(
@@ -1694,6 +1719,20 @@ pub(crate) async fn run_event_loop(
         .unwrap_or_else(Instant::now);
     let mut last_status_frame = Instant::now()
         .checked_sub(Duration::from_millis(UI_STATUS_ANIMATION_MS))
+        .unwrap_or_else(Instant::now);
+    // #6728: the last moment anything happened that wanted a prompt reaction:
+    // a terminal event, an engine event, or any non-quiescent UI state. The
+    // idle poll, the automation scan and the git probe all back off from it,
+    // and all return to full cadence the moment it moves.
+    let mut last_ui_activity = Instant::now();
+    let mut skill_registry_epoch = None;
+    let mut skill_cache_refresh: Option<SkillCacheRefresh> = None;
+    // Whether the previous iteration found the UI quiescent and quiet (see
+    // `ui_state_is_quiescent`). The 2.5 s task block runs before this
+    // iteration's facts exist, so it reads the previous one.
+    let mut ui_quiet = false;
+    let mut last_automation_scan = Instant::now()
+        .checked_sub(AUTOMATION_SCAN_BUSY_INTERVAL)
         .unwrap_or_else(Instant::now);
     // 120 FPS draw cap. Without this we redraw on every SSE chunk during a
     // long stream — wasted work the user can't perceive. See
@@ -1913,6 +1952,8 @@ pub(crate) async fn run_event_loop(
         // closure receives `&mut App` and applies success state or rollback.
         while let Ok(apply) = dispatch_completion_rx.try_recv() {
             let _ = apply(app, &engine_handle, &*config);
+            // Drain this completion immediately: a later completion cannot replace an edit.
+            super::feedback_host::dispatch_ready(app, config, &engine_handle).await?;
         }
 
         // Drain the version-check handle once; re-assign None so we
@@ -2089,8 +2130,19 @@ pub(crate) async fn run_event_loop(
             // held for finite work or a busy parent turn goes out once that
             // work settles (#6565).
             flush_background_finished(app, config, false);
-            if refresh_automation_panel(app).await {
+            // A finished scan is folded on every tick; the next one starts
+            // only when due. A quiet UI with nothing scheduled or live
+            // rescans on the long cadence (#6728).
+            let automation_scan_due = automation_scan_is_due(
+                app,
+                ui_quiet,
+                Instant::now().saturating_duration_since(last_automation_scan),
+            );
+            if refresh_automation_panel(app, automation_scan_due).await {
                 app.needs_redraw = true;
+            }
+            if automation_scan_due {
+                last_automation_scan = Instant::now();
             }
             if refresh_shell_exec_live_output(app) {
                 app.needs_redraw = true;
@@ -2179,6 +2231,9 @@ pub(crate) async fn run_event_loop(
 
         // First, poll for engine events (non-blocking)
         let mut received_engine_event = false;
+        // Any engine event at all, including ones that asked for no redraw:
+        // it is activity for the idle backoff (#6728).
+        let mut engine_event_seen = false;
         let mut transcript_batch_updated = false;
         // #freeze: coalesce per-event `Op::ListSubAgents` sends into a single
         // trailing-edge refresh per drain. At high fanout, many spawn/complete/
@@ -2216,6 +2271,7 @@ pub(crate) async fn run_event_loop(
                 // producer flooding them never tripped the drain budget and
                 // the loop never returned to render or read the cancel key.
                 events_drained = events_drained.saturating_add(1);
+                engine_event_seen = true;
                 // #3033: remember whether an EARLIER event in this drain batch
                 // already requested a redraw. The AgentProgress throttle below
                 // may opt the current event out of repainting, but it must not
@@ -2582,6 +2638,8 @@ pub(crate) async fn run_event_loop(
                     }
                     // Liveness only. `record_turn_activity` above consumes the
                     // pulse; it must not alter transcript or status copy.
+                    EngineEvent::ToolExecutionStarted { .. }
+                    | EngineEvent::ToolResultContent { .. } => {}
                     EngineEvent::ToolCallHeartbeat => {}
                     // Typed owner activity is a pet-facing projection;
                     // `pet_watch::observe` above already consumed it, and the
@@ -3044,10 +3102,22 @@ pub(crate) async fn run_event_loop(
                         {
                             app.last_auto_route_receipt = None;
                         }
-                        if status == crate::core::events::TurnOutcomeStatus::Completed {
+                        if status == crate::core::events::TurnOutcomeStatus::Completed
+                            && let Some(receipt) = completed_turn
+                                .as_ref()
+                                .and_then(|turn| turn.route.as_ref())
+                                .and_then(|route| route.receipt.as_ref())
+                            && config
+                                .verify_provider_identity(receipt.admitted_identity())
+                                .is_ok()
+                            && receipt.endpoint_identity()
+                                == crate::route_receipt::endpoint_identity(
+                                    &config.base_url_for_route(receipt.admitted_identity()),
+                                )
+                        {
                             app.provider_health.record_success(
                                 config,
-                                effective_turn_provider,
+                                receipt,
                                 &effective_turn_model,
                             );
                         }
@@ -3395,33 +3465,43 @@ pub(crate) async fn run_event_loop(
                         recoverable: _,
                     } => {
                         let provider_before_error = app.api_provider;
-                        let identity_before_error = config
-                            .resolve_persisted_provider_identity(
-                                Some(provider_before_error.as_str()),
-                                app.provider_id_for_persistence(),
-                            )
-                            .unwrap_or_else(|_| ProviderIdentity {
-                                provider: provider_before_error,
-                                key: app.provider_identity_for_persistence().to_string(),
-                                exact_id: app.provider_id_for_persistence().map(str::to_string),
-                                migrated_legacy_ollama_cloud_route: false,
-                            });
+                        let identity_before_error = app.admitted_provider_identity().ok().cloned();
                         let fallback_chain_before_error = app.provider_chain.clone();
-                        let (health_provider, health_model) =
-                            error_health_route(app, provider_before_error);
-                        app.provider_health.record_failure(
-                            config,
-                            health_provider,
-                            &health_model,
-                            &envelope,
-                        );
+                        if let Some((identity, health_model)) = error_health_route(app)
+                            && config.verify_provider_identity(&identity).is_ok()
+                            && app
+                                .active_turn
+                                .as_ref()
+                                .and_then(|turn| turn.route.as_ref())
+                                .and_then(|route| route.receipt.as_ref())
+                                .is_some_and(|receipt| {
+                                    receipt.endpoint_identity()
+                                        == crate::route_receipt::endpoint_identity(
+                                            &config.base_url_for_route(&identity),
+                                        )
+                                })
+                        {
+                            app.provider_health.record_failure(
+                                config,
+                                app.active_turn
+                                    .as_ref()
+                                    .and_then(|turn| turn.route.as_ref())
+                                    .and_then(|route| route.receipt.as_ref())
+                                    .expect("health route has captured receipt"),
+                                &health_model,
+                                &envelope,
+                            );
+                        }
                         let rollback_after_auth_failure =
                             matches!(
                                 envelope.category,
                                 crate::error_taxonomy::ErrorCategory::Authentication
                             ) && app.pending_provider_switch.is_some();
                         apply_engine_error_to_app(app, envelope);
-                        if app.api_provider != provider_before_error && app.is_fallback_active() {
+                        if app.api_provider != provider_before_error
+                            && app.is_fallback_active()
+                            && let Some(identity_before_error) = identity_before_error
+                        {
                             // Several queued errors can be drained together.
                             // The first route remains the rollback authority;
                             // later chain advances must not overwrite it with
@@ -3439,7 +3519,7 @@ pub(crate) async fn run_event_loop(
                         }
                     }
                     EngineEvent::Status { message } => {
-                        app.status_message = Some(message);
+                        transcript_batch_updated |= apply_engine_status(app, message);
                     }
                     EngineEvent::ToolProjectionWarning {
                         provider,
@@ -4082,6 +4162,8 @@ pub(crate) async fn run_event_loop(
                         )
                         .await;
                     }
+                    // Retired by pending_requests before session/idle filters.
+                    EngineEvent::ApprovalWithdrawn { .. } => {}
                     EngineEvent::UserInputRequired { id, request } => {
                         app.pending_user_input_prompt = Some((id.clone(), request.clone()));
                         app.view_stack.push(UserInputView::new(id.clone(), request));
@@ -4347,6 +4429,42 @@ pub(crate) async fn run_event_loop(
                 .await;
             app.status_message = Some(rollback_warning);
         }
+        let current_skill_epoch = crate::extension_host::command::epoch();
+        if skill_cache_refresh
+            .as_ref()
+            .is_some_and(|(_, job)| job.is_finished())
+        {
+            let (scope, job) = skill_cache_refresh.take().expect("finished skill refresh");
+            if let Ok(skills) = job.await
+                && app.install_skill_cache_if_current(&scope, current_skill_epoch, skills)
+            {
+                skill_registry_epoch = Some(scope.epoch);
+            }
+        }
+        if skill_cache_refresh.is_none() && skill_registry_epoch != Some(current_skill_epoch) {
+            let scope = app.skill_cache_scope(current_skill_epoch);
+            let scan = scope.clone();
+            let policy = crate::plugins::activation::extension_host_policy_enabled();
+            #[cfg(test)]
+            let env_scope = crate::test_support::env_scope_ticket();
+            #[cfg(test)]
+            let manager = crate::extension_host::manager();
+            let job = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _env_scope = crate::test_support::join_env_scope(env_scope);
+                #[cfg(test)]
+                let _manager = crate::extension_host::TestManagerGuard::install(manager);
+                let _policy = crate::plugins::activation::PolicyScope::propagate(policy);
+                crate::skills::clear_skill_discovery_cache();
+                App::discover_cached_skills(
+                    &scan.workspace,
+                    &scan.skills_dir,
+                    scan.mode,
+                    &scan.plugins,
+                )
+            });
+            skill_cache_refresh = Some((scope, job));
+        }
         if commit_streaming_display_tick(app, &mut stream_display_clock, Instant::now()) {
             transcript_batch_updated = true;
         }
@@ -4550,6 +4668,31 @@ pub(crate) async fn run_event_loop(
         let underwater_motion =
             underwater_ambient_motion || underwater_completion_motion || launch_motion;
         let animation_active = status_motion || underwater_motion;
+        // #6728: what the loop knows about its own quiet. Anything that
+        // wants a prompt reaction moves `last_ui_activity`; the idle poll,
+        // the automation scan and the git probe all back off from it.
+        let idle_facts = IdleFacts {
+            has_running_agents,
+            animation_active,
+            durable_tasks_active,
+            input_pending: !pending_terminal_events.is_empty(),
+            pending_engine_op: pending_subagent_list_refresh,
+        };
+        {
+            let tick_now = Instant::now();
+            if engine_event_seen || !ui_state_is_quiescent(app, &idle_facts, tick_now) {
+                last_ui_activity = tick_now;
+            }
+            let quiet_for = tick_now.saturating_duration_since(last_ui_activity);
+            ui_quiet = quiet_for >= UI_QUIESCENT_AFTER
+                && ui_state_is_quiescent(app, &idle_facts, tick_now);
+            // The git cache TTL follows the same quiet clock, set every
+            // iteration so a stale back-off can never outlive the activity
+            // that ended it (a turn does not reach the probe block below).
+            crate::tui::git_status::set_probe_backoff(crate::tui::git_status::probe_is_backed_off(
+                git_probe_quiet_for(app, quiet_for),
+            ));
+        }
         let animation_interval = Duration::from_millis(animation_interval_ms(
             app,
             status_motion,
@@ -4680,17 +4823,23 @@ pub(crate) async fn run_event_loop(
         let allow_workspace_context_refresh =
             !app.is_loading && !has_running_agents && !app.is_compacting && !app.is_purging;
         workspace_context::refresh_if_needed(app, now, allow_workspace_context_refresh);
-        // Native git chrome: at most one background probe per cache TTL, never
+        // Native git chrome: at most one background probe per interval, never
         // on the render path. While a turn is live it waits, unless the Git
         // view is showing: that view is the live repository state (#6565).
+        // Every probe is about a dozen `git` processes, so an untouched
+        // session backs off to a slow cadence and the next input or engine
+        // event (a tool finishing, say) brings the fast one back (#6728).
         if git_probe_allowed(app, allow_workspace_context_refresh) {
             static GIT_PROBE_LOCK: std::sync::OnceLock<std::sync::Mutex<Option<Instant>>> =
                 std::sync::OnceLock::new();
             let slot = GIT_PROBE_LOCK.get_or_init(|| std::sync::Mutex::new(None));
+            let quiet_for =
+                git_probe_quiet_for(app, now.saturating_duration_since(last_ui_activity));
             let should_probe = slot
                 .lock()
                 .map(|mut last| {
-                    let due = last.is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
+                    let due =
+                        crate::tui::git_status::probe_due(last.map(|t| t.elapsed()), quiet_for);
                     if due {
                         *last = Some(Instant::now());
                     }
@@ -4756,7 +4905,15 @@ pub(crate) async fn run_event_loop(
             if app.is_loading || has_running_agents || app.is_compacting || app.is_purging {
                 Duration::from_millis(active_poll_ms(app))
             } else {
-                Duration::from_millis(idle_poll_ms(app))
+                // Relaxes only once the UI has been quiescent and quiet for
+                // `UI_QUIESCENT_AFTER` (#6728); every deadline below still
+                // shortens it, and input returns the loop at once.
+                idle_poll_duration(
+                    app,
+                    &idle_facts,
+                    now,
+                    now.saturating_duration_since(last_ui_activity),
+                )
             };
         if let Some(until_flush) = app.paste_burst_next_flush_delay_if_enabled(now) {
             poll_timeout = poll_timeout.min(until_flush);
@@ -4792,6 +4949,9 @@ pub(crate) async fn run_event_loop(
 
         let maybe_terminal_event =
             next_terminal_event(&terminal_input, &mut pending_terminal_events, poll_timeout)?;
+        if maybe_terminal_event.is_some() {
+            last_ui_activity = Instant::now();
+        }
         if maybe_terminal_event.is_none() {
             let now = Instant::now();
             let input_stalled_for = terminal_input.stalled_for(now);
@@ -5736,7 +5896,7 @@ pub(crate) async fn run_event_loop(
                         &app.workspace,
                         &app.mcp_config_path,
                         app.mcp_snapshot.as_ref(),
-                        app.plugin_registry.as_ref(),
+                        app.extension_plugin_view().as_ref(),
                     ),
                 ));
                 continue;
@@ -7070,7 +7230,7 @@ pub(crate) async fn run_cache_warmup(app: &App, config: &Config) -> Result<Cache
             .await??;
     Ok(CacheWarmupOutcome {
         usage: response.usage,
-        provider_identity: route.identity.key,
+        provider_identity: route.identity.key.to_string(),
         model: route.model,
         base_url,
         inspection,
@@ -7109,14 +7269,14 @@ pub(super) async fn adopt_live_local_ollama_catalog(
         return;
     };
     // switch_provider resolves against the lake we just refreshed.
-    let switched = switch_provider(
-        app,
-        engine_handle,
-        config,
-        ApiProvider::Ollama,
-        Some(tag.clone()),
-    )
-    .await;
+    let identity = match config.builtin_provider_identity(ProviderKind::Ollama) {
+        Ok(identity) => identity,
+        Err(error) => {
+            app.push_status_toast(error, StatusToastLevel::Error, None);
+            return;
+        }
+    };
+    let switched = switch_provider(app, engine_handle, config, identity, Some(tag.clone())).await;
     if !switched {
         return;
     }
@@ -7219,7 +7379,8 @@ pub(crate) async fn run_chatgpt_pkce_login_from_tui(
         app.use_mouse_capture,
         app.use_bracketed_paste,
     )?;
-    let login_result = crate::oauth::login(crate::oauth::OAuthProvider::Chatgpt).await;
+    let login_result =
+        crate::oauth::login_with_config(crate::oauth::OAuthProvider::Chatgpt, config).await;
     resume_terminal(
         terminal,
         app.use_alt_screen(),
@@ -7405,12 +7566,12 @@ mod session_boot_event_tests {
 
     fn translation_test_route() -> crate::cost_status::EffectiveRouteEnvelope {
         crate::cost_status::EffectiveRouteEnvelope {
-            provider: crate::config::ApiProvider::Deepseek,
+            provider: crate::config::ProviderKind::Deepseek,
             provider_identity: "deepseek".to_string(),
             model: "deepseek-chat".to_string(),
             openrouter_vendor: None,
             billing_surface: crate::pricing::billing_surface_for_route(
-                crate::config::ApiProvider::Deepseek,
+                crate::config::ProviderKind::Deepseek,
                 Some("https://api.deepseek.com/v1"),
             )
             .map(str::to_string),
@@ -7938,4 +8099,17 @@ pub(super) fn route_key_to_view_stack(
         return None;
     }
     Some(app.view_stack.handle_key(key))
+}
+
+/// Keep only the Engine's retry receipts in the existing transcript. Ordinary
+/// status/footer behavior and internal/model-only status projection stay intact.
+pub(super) fn apply_engine_status(app: &mut App, message: String) -> bool {
+    let retain = crate::core::events::is_retry_status_receipt(&message);
+    if retain {
+        app.add_message(HistoryCell::System {
+            content: message.clone(),
+        });
+    }
+    app.status_message = Some(message);
+    retain
 }

@@ -6,6 +6,9 @@
 //! tool_lifecycle` etc. filtering via the module path while cutting six link
 //! jobs to one. See `crates/tui/tests/README.md`.
 
+#[path = "../support/binary.rs"]
+mod binary;
+
 #[cfg(all(unix, feature = "long-running-tests"))]
 #[path = "../support/qa_harness/mod.rs"]
 mod qa_harness;

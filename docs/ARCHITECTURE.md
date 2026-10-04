@@ -2,7 +2,9 @@
 
 > 阅读简体中文版：[zh_hans/ARCHITECTURE.md](zh_hans/ARCHITECTURE.md)。
 
-This document provides an overview of the codewhale architecture for developers and contributors.
+Codewhale Engine is the existing Rust execution runtime. The
+[Runtime API](RUNTIME_API.md) is its client interface, and
+[TypeScript mods](EXTENSIONS.md) contribute reviewed extensions.
 
 Current boundary note (read the workspace version from `Cargo.toml`; this
 boundary has held since v0.9.1):
@@ -78,13 +80,21 @@ boundary has held since v0.9.1):
 
 ### Entry Point
 
-- **`main.rs`** - CLI argument parsing (clap), configuration loading, entry point routing
+- **`crates/cli/src/main.rs`** - The canonical executable entry point. `crates/cli/src/lib.rs` owns its command interface; terminal and headless runtime startup runs in process through the `codewhale_tui` library in `crates/tui/src/lib.rs`.
 
 ### Core Components
 
 - **`core/`** - Main engine components
   - `engine.rs` - Engine state, operation handling, message processing
-  - `engine/turn_loop.rs` - Streaming turn loop and tool execution orchestration
+  - `engine/turn_loop.rs` - The existing Engine outer turn loop, shared tool
+    planner/executor/result handling, and stream decoder. Its private
+    `turn_loop/` phases contain request preparation (`preparation.rs`), model
+    dispatch and admission (`model_step.rs`), the ordered continuation ladder
+    (`continuation.rs`), inline REPL orchestration (`inline_repl.rs`), and the
+    direct model tool batch (`tool_batch.rs`). They borrow the same Engine and
+    TurnContext; they introduce no runtime, session, prompt, approval, event,
+    or persistence authority. Retry, loop termination, and immediate return
+    stay distinct, and only the existing productive paths advance the step.
   - `session.rs` - Session state management
   - `turn.rs` - Turn-based conversation handling
   - `events.rs` - Event system for UI updates
@@ -97,15 +107,17 @@ boundary has held since v0.9.1):
 
 ### Workspace Crates
 
-- **`crates/cli`** - The `codewhale` binary: a command-line facade that owns
-  commands such as `auth`, `metrics` and `update` itself and passes the rest
-  (`run`, `exec`, `doctor`, `sessions`, ...) through to the `codewhale-tui`
-  binary built from `crates/tui`.
+- **`crates/cli`** - The canonical `codewhale` executable and command interface.
+  It owns commands such as `auth`, `metrics` and `update`, and invokes terminal
+  and headless modes (`run`, `exec`, `doctor`, `sessions`, ...) in process via
+  `codewhale_tui::run(RuntimeOptions, args)`. `crates/tui` is a library; the
+  `codew` and legacy release filename aliases contain the same executable.
 - **`crates/tools`** - Shared tool invocation primitives, including tool result/error/capability types used by the TUI runtime.
 - **`crates/agent`** - Model/provider registry (ModelRegistry) for resolving model IDs to provider endpoints.
 - **`crates/app-server`** - HTTP/SSE + JSON-RPC app server transport for
-  headless agent workflows. Note that `app-server --http`/`--mobile` delegate
-  to the TUI binary, which is where the runtime API actually lives.
+  headless agent workflows. The canonical executable dispatches
+  `app-server --http`/`--mobile` in process to the runtime API hosted by the
+  `codewhale_tui` library.
 - **`crates/config`** - Config loading, profiles, environment variable precedence, CLI runtime overrides.
 - **`crates/cloud-facts`** - Fetches the signed Codewhale cloud facts channel
   (`facts/v1`), verifies its Ed25519 envelope, and keeps a verified disk cache;
@@ -120,7 +132,18 @@ boundary has held since v0.9.1):
   `crates/tui/src/core/` is a module inside the TUI crate, not this crate. A
   placeholder `engine/` tree here once suggested otherwise — it had no callers
   and emitted `TurnComplete` without contacting a model — and was removed in
-  v0.9.11 so there is exactly one turn loop in the workspace.
+  v0.9.11. The source guard follows resolved local phase calls and still
+  rejects unlisted loop owners. ACP stdio now projects the existing Runtime
+  manager and Engine; it keeps no provider/tool round loop or separate history.
+  Recursive RLM and mounted Python RPCs now project captured caller authority
+  onto the same Engine producer and Session; no RLM loop exception remains.
+  Python retains its context and variables, while each round borrows the
+  captured route, Native selection, original code gate, cancellation and
+  deadline. Task guidance is bounded and additive to Core policy. Recursive
+  history is retained whole; overflow refuses rather than compacting it.
+  Persistent `rlm` contexts remain caller-session scoped and `share_session=true`
+  explicitly refuses. Child workers also use their captured admission in the
+  same Engine; neither nested host retains a turn-loop exception.
 - **`crates/execpolicy`** - Approval/sandbox policy engine for tool execution decisions.
 - **`crates/hooks`** - Event sinks (stdout, JSONL file, webhook, Unix socket)
   for response, tool, job and approval lifecycle events, plus the opt-in

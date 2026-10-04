@@ -4,7 +4,7 @@ use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::config::{
-    ApiProvider, DEFAULT_KIMI_CODE_BASE_URL, KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL,
+    DEFAULT_KIMI_CODE_BASE_URL, KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL, ProviderKind,
     normalize_custom_model_id, normalize_model_name_for_provider,
 };
 #[cfg(test)]
@@ -19,10 +19,8 @@ use super::CommandResult;
 /// Show help information
 pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
     if let Some(topic) = topic {
-        let user_commands = crate::commands::user_registry::with_registry_for_workspace(
-            Some(&app.workspace),
-            Clone::clone,
-        );
+        let user_commands =
+            crate::commands::user_registry::with_registry_for_app(app, Clone::clone);
         if let Some(command) = user_commands.get(topic) {
             return CommandResult::message(user_command_help(app.ui_locale, command));
         }
@@ -74,8 +72,7 @@ pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
 
     // Show help overlay
     if app.view_stack.top_kind() != Some(ModalKind::Help) {
-        let help = HelpView::new_for_workspace(app.ui_locale, &app.workspace, &app.cached_skills)
-            .with_groups_expanded(app.help_expand_groups);
+        let help = HelpView::new_for_app(app, false).with_groups_expanded(app.help_expand_groups);
         app.view_stack.push(help);
     }
     CommandResult::ok()
@@ -315,7 +312,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
                 AppAction::UpdateCompaction(app.compaction_config()),
             );
         }
-        let declared = app.api_provider != ApiProvider::OpenaiCodex
+        let declared = app.api_provider != ProviderKind::OpenaiCodex
             && codewhale_config::catalog::configured::validate_configured_models(
                 &app.configured_models,
             )
@@ -346,10 +343,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             model_id
         };
         let strict_direct_custom_endpoint = app.accepts_custom_model_ids()
-            && matches!(
-                app.api_provider,
-                ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::Zai
-            );
+            && matches!(app.api_provider, ProviderKind::Deepseek | ProviderKind::Zai);
         let route_resolution = if declared {
             match crate::route_runtime::resolve_declared_model_candidate(
                 app.api_provider,
@@ -867,7 +861,7 @@ mod tests {
         };
         let mut app = App::new(options, &Config::default());
         app.ui_locale = codewhale_localization::Locale::En;
-        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.api_provider = crate::config::ProviderKind::Deepseek;
         app.model = "deepseek-v4-pro".to_string();
         app.auto_model = false;
         app.model_ids_passthrough = false;
@@ -1210,7 +1204,7 @@ mod tests {
     fn model_command_preserves_active_kimi_code_endpoint_for_bare_k3() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.set_provider_identity(crate::config::ApiProvider::Moonshot, "moonshot");
+        app.set_provider_identity(crate::config::ProviderKind::Moonshot, "moonshot");
         app.model_ids_passthrough = true;
         app.active_route_base_url = crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string();
         app.active_context_window_override = None;
@@ -1308,7 +1302,11 @@ mod tests {
             seed.save().expect("seed settings");
         }
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Zai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(crate::config::ProviderKind::Zai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.model_ids_passthrough = false;
         app.model = crate::config::DEFAULT_ZAI_MODEL.to_string();
         app.auto_model = false;
@@ -1339,7 +1337,11 @@ mod tests {
     fn model_command_keeps_glm_53_as_its_own_wire_id() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Zai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(crate::config::ProviderKind::Zai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.model_ids_passthrough = false;
         app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
         app.auto_model = false;
@@ -1371,18 +1373,18 @@ mod tests {
 
         // Terminal A: Z.ai / GLM.
         let mut app_a = create_test_app();
-        app_a.api_provider = crate::config::ApiProvider::Zai;
+        app_a.api_provider = crate::config::ProviderKind::Zai;
         app_a.model_ids_passthrough = false;
         app_a.model = crate::config::DEFAULT_ZAI_MODEL.to_string();
         app_a.auto_model = false;
         let result_a = model(&mut app_a, Some("GLM-5.2"));
         assert!(!result_a.is_error, "GLM-5.2 is valid on Z.ai");
-        assert_eq!(app_a.api_provider, crate::config::ApiProvider::Zai);
+        assert_eq!(app_a.api_provider, crate::config::ProviderKind::Zai);
         assert_eq!(app_a.model, "GLM-5.2");
 
         // Terminal B: DeepSeek / deepseek-v4-flash.
         let mut app_b = create_test_app();
-        app_b.api_provider = crate::config::ApiProvider::Deepseek;
+        app_b.api_provider = crate::config::ProviderKind::Deepseek;
         app_b.model_ids_passthrough = false;
         app_b.model = "deepseek-v4-pro".to_string();
         app_b.auto_model = false;
@@ -1390,11 +1392,11 @@ mod tests {
         assert!(!result_b.is_error, "deepseek-v4-flash is valid on DeepSeek");
 
         // B's route is a coherent DeepSeek route — never Z.ai + a DeepSeek model.
-        assert_eq!(app_b.api_provider, crate::config::ApiProvider::Deepseek);
+        assert_eq!(app_b.api_provider, crate::config::ProviderKind::Deepseek);
         assert_eq!(app_b.model, "deepseek-v4-flash");
 
         // A is untouched by B's selection — still Z.ai / GLM.
-        assert_eq!(app_a.api_provider, crate::config::ApiProvider::Zai);
+        assert_eq!(app_a.api_provider, crate::config::ProviderKind::Zai);
         assert_eq!(app_a.model, "GLM-5.2");
 
         // Shared settings: NOTHING was written by either `/model` — both
@@ -1420,7 +1422,7 @@ mod tests {
         // rejected locally with a precise diagnostic, before any network call.
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Zai;
+        app.api_provider = crate::config::ProviderKind::Zai;
         app.model_ids_passthrough = false;
         app.model = crate::config::DEFAULT_ZAI_MODEL.to_string();
         app.auto_model = false;
@@ -1433,7 +1435,7 @@ mod tests {
         assert!(msg.contains("deepseek-v4-pro"), "names the model: {msg}");
         assert!(msg.contains("zai"), "names the provider: {msg}");
         // The session route is unchanged — still Z.ai / GLM.
-        assert_eq!(app.api_provider, crate::config::ApiProvider::Zai);
+        assert_eq!(app.api_provider, crate::config::ProviderKind::Zai);
         assert_eq!(app.model, crate::config::DEFAULT_ZAI_MODEL);
     }
 
@@ -1515,7 +1517,7 @@ mod tests {
     fn test_model_auto_preserves_raw_explicit_thinking() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.api_provider = ApiProvider::OpenaiCodex;
+        app.api_provider = ProviderKind::OpenaiCodex;
         app.auto_model = false;
         app.reasoning_effort = ReasoningEffort::Low;
         app.reasoning_effort_preference = Some(ReasoningEffort::Off);
@@ -1548,7 +1550,7 @@ mod tests {
     fn test_model_change_accepts_custom_id_for_openai_compatible_provider() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Openai;
+        app.api_provider = crate::config::ProviderKind::Openai;
         app.model_ids_passthrough = true;
 
         let result = model(&mut app, Some("opencode-go/glm-5.1"));
@@ -1594,7 +1596,7 @@ mod tests {
     #[test]
     fn model_command_rejects_saved_model_from_other_provider() {
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.api_provider = crate::config::ProviderKind::Deepseek;
         app.provider_models
             .insert("moonshot".to_string(), "kimi-k2.6".to_string());
 
@@ -1604,7 +1606,7 @@ mod tests {
         assert!(message.contains("Invalid model"));
         assert!(message.contains("active provider"));
         assert!(result.action.is_none());
-        assert_eq!(app.api_provider, crate::config::ApiProvider::Deepseek);
+        assert_eq!(app.api_provider, crate::config::ProviderKind::Deepseek);
         assert_eq!(app.model, "deepseek-v4-pro");
     }
 
@@ -1680,7 +1682,10 @@ mod tests {
         assert!(msg.contains("https://cloud.baidu.com/doc/qianfan/index.html"));
         assert!(msg.contains("Local Ollama is keyless by default"));
         assert!(msg.contains("codewhale auth chatgpt"));
-        assert!(msg.contains("codex login"));
+        assert!(
+            !msg.contains("codex login"),
+            "official sign-in must not direct users to external CLI credentials"
+        );
         assert!(msg.contains("no canonical vendor credential page exists"));
         assert!(msg.contains("OPENAI_API_KEY"));
         assert!(msg.contains("XIAOMI_MIMO_TOKEN_PLAN_API_KEY"));

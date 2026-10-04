@@ -15,7 +15,7 @@
 //!
 //! This is a **design port into idiomatic Rust, not a line-for-line copy**.
 //! pi's module is async TypeScript over a `Provider` record with a single
-//! `auth.json`; CodeWhale's is synchronous Rust over `ApiProvider` and the
+//! `auth.json`; CodeWhale's is synchronous Rust over `ProviderKind` and the
 //! several pre-existing on-disk stores (secret store, config file, ambient
 //! environment, externally consented CLI credential files). The four ideas
 //! taken verbatim in spirit are: one type-tagged credential per provider,

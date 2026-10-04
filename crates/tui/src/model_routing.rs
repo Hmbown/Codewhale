@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::CodewhaleClient;
 use crate::client::system_one::{DecisionRouterRoute, SystemOneAnswer, SystemOneResponse};
-use crate::config::{ApiProvider, AutoRouterKind, Config, normalize_model_name_for_provider};
+use crate::config::{
+    AutoRouterKind, Config, ProviderIdentity, ProviderKind, normalize_model_name_for_provider,
+};
 use crate::cost_status::{
     EffectiveRouteEnvelope, EffectiveRouteUsage, RuntimeUsageDropRecord, RuntimeUsageRecord,
 };
@@ -47,7 +49,7 @@ impl RouterCandidates {
 /// model name alone is not evidence that another provider can serve its
 /// sibling, so unknown providers and unknown families remain single-tier.
 fn catalog_family_candidates(
-    provider: ApiProvider,
+    provider: ProviderKind,
     current_model: &str,
 ) -> Option<RouterCandidates> {
     let normalized = normalize_model_name_for_provider(provider, current_model)
@@ -55,12 +57,12 @@ fn catalog_family_candidates(
     let lower = normalized.to_ascii_lowercase();
 
     let cheap = match provider {
-        ApiProvider::Openai | ApiProvider::OpenaiCodex
+        ProviderKind::Openai | ProviderKind::OpenaiCodex
             if matches!(lower.as_str(), "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra") =>
         {
             Some("gpt-5.6-luna".to_string())
         }
-        ApiProvider::Anthropic
+        ProviderKind::Anthropic
             if matches!(
                 lower.as_str(),
                 "claude-opus-4-8" | "claude-sonnet-4-6" | "claude-sonnet-5"
@@ -68,8 +70,8 @@ fn catalog_family_candidates(
         {
             Some("claude-haiku-4-5".to_string())
         }
-        ApiProvider::XiaomiMimo if lower == "mimo-v2.5-pro" => Some("mimo-v2.5".to_string()),
-        ApiProvider::Arcee
+        ProviderKind::XiaomiMimo if lower == "mimo-v2.5-pro" => Some("mimo-v2.5".to_string()),
+        ProviderKind::Arcee
             if matches!(
                 lower.as_str(),
                 "trinity-large-thinking" | "trinity-large-preview"
@@ -77,12 +79,12 @@ fn catalog_family_candidates(
         {
             Some("trinity-mini".to_string())
         }
-        ApiProvider::Moonshot if lower == "kimi-k2.7-code" => Some("kimi-k2.6".to_string()),
-        ApiProvider::Minimax | ApiProvider::MinimaxAnthropic if lower == "minimax-m2.7" => {
+        ProviderKind::Moonshot if lower == "kimi-k2.7-code" => Some("kimi-k2.6".to_string()),
+        ProviderKind::Minimax | ProviderKind::MinimaxAnthropic if lower == "minimax-m2.7" => {
             Some("MiniMax-M2.7-highspeed".to_string())
         }
-        ApiProvider::OpencodeGo if lower == "kimi-k3" => Some("kimi-k2.7-code".to_string()),
-        ApiProvider::Openrouter
+        ProviderKind::OpencodeGo if lower == "kimi-k3" => Some("kimi-k2.7-code".to_string()),
+        ProviderKind::Openrouter
             if lower == "qwen/qwen3.6-max-preview"
                 || lower == "qwen/qwen3.6-plus"
                 || lower == "qwen/qwen3.6-27b"
@@ -90,10 +92,10 @@ fn catalog_family_candidates(
         {
             Some("qwen/qwen3.6-flash".to_string())
         }
-        ApiProvider::Openrouter if lower == "xiaomi/mimo-v2.5-pro" => {
+        ProviderKind::Openrouter if lower == "xiaomi/mimo-v2.5-pro" => {
             Some("xiaomi/mimo-v2.5".to_string())
         }
-        ApiProvider::Openrouter
+        ProviderKind::Openrouter
             if matches!(
                 lower.as_str(),
                 "arcee-ai/trinity-large-thinking" | "arcee-ai/trinity-large-preview"
@@ -101,10 +103,10 @@ fn catalog_family_candidates(
         {
             Some("arcee-ai/trinity-mini".to_string())
         }
-        ApiProvider::Openrouter if lower == "moonshotai/kimi-k2.7-code" => {
+        ProviderKind::Openrouter if lower == "moonshotai/kimi-k2.7-code" => {
             Some("moonshotai/kimi-k2.6".to_string())
         }
-        ApiProvider::Openrouter
+        ProviderKind::Openrouter
             if lower == "anthropic/claude-opus-4-8"
                 || lower == "anthropic/claude-sonnet-4-6"
                 || lower == "anthropic/claude-sonnet-5" =>
@@ -129,15 +131,15 @@ fn catalog_family_candidates(
 /// session model and `cheap` is `None`, so auto mode never fabricates a
 /// DeepSeek id for a provider that cannot serve it.
 pub(crate) fn provider_router_candidates(
-    provider: crate::config::ApiProvider,
+    provider: crate::config::ProviderKind,
     current_model: &str,
 ) -> RouterCandidates {
-    use crate::config::ApiProvider;
+    use crate::config::ProviderKind;
     if let Some(candidates) = catalog_family_candidates(provider, current_model) {
         return candidates;
     }
 
-    if provider == ApiProvider::Zai {
+    if provider == ProviderKind::Zai {
         let normalized = crate::config::normalize_model_name_for_provider(provider, current_model)
             .unwrap_or_else(|| current_model.to_string());
         return RouterCandidates {
@@ -155,7 +157,7 @@ pub(crate) fn provider_router_candidates(
         };
     }
 
-    if provider == ApiProvider::Openrouter
+    if provider == ProviderKind::Openrouter
         && let Some(normalized) =
             crate::config::normalize_model_name_for_provider(provider, current_model)
         && matches!(
@@ -183,15 +185,15 @@ pub(crate) fn provider_router_candidates(
     }
 
     match provider {
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN => RouterCandidates::deepseek(),
-        ApiProvider::NvidiaNim
-        | ApiProvider::Openrouter
-        | ApiProvider::Novita
-        | ApiProvider::Siliconflow
-        | ApiProvider::SiliconflowCn
-        | ApiProvider::Sglang
-        | ApiProvider::Vllm
-        | ApiProvider::WanjieArk
+        ProviderKind::Deepseek => RouterCandidates::deepseek(),
+        ProviderKind::NvidiaNim
+        | ProviderKind::Openrouter
+        | ProviderKind::Novita
+        | ProviderKind::Siliconflow
+        | ProviderKind::SiliconflowCN
+        | ProviderKind::Sglang
+        | ProviderKind::Vllm
+        | ProviderKind::WanjieArk
             if current_model.to_ascii_lowercase().contains("deepseek") =>
         {
             RouterCandidates {
@@ -202,7 +204,7 @@ pub(crate) fn provider_router_candidates(
                 )),
             }
         }
-        ApiProvider::Volcengine if current_model.to_ascii_lowercase().contains("deepseek") => {
+        ProviderKind::Volcengine if current_model.to_ascii_lowercase().contains("deepseek") => {
             RouterCandidates {
                 big: crate::config::DEFAULT_VOLCENGINE_MODEL.to_string(),
                 cheap: Some(crate::config::DEFAULT_VOLCENGINE_FLASH_MODEL.to_string()),
@@ -223,7 +225,7 @@ pub(crate) fn provider_router_candidates(
 /// asked for a fast lane attaches this where the route is shown, so
 /// `Faster`/`Auto` never resolves to full price without saying so.
 #[must_use]
-pub(crate) fn missing_fast_sibling_note(provider: ApiProvider, model: &str) -> String {
+pub(crate) fn missing_fast_sibling_note(provider: ProviderKind, model: &str) -> String {
     // The model id is bounded so an absurd route cannot crowd the receipt it
     // travels on (`ChildRouteReceipt::fallback_note`, 1 KiB gate).
     let model: String = model.trim().chars().take(64).collect();
@@ -303,12 +305,12 @@ impl AutoRouteScope {
 }
 
 /// Non-secret data path used to make an Auto decision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AutoRouteDataPath {
     LocalHeuristic,
     Classifier {
-        provider: ApiProvider,
+        provider: codewhale_config::route::ProviderId,
+        provider_kind: ProviderKind,
         model: String,
     },
     /// A System One decision model (#6525). Additive: older binaries cannot
@@ -319,14 +321,97 @@ pub(crate) enum AutoRouteDataPath {
     },
 }
 
+// Persistence/source facts only. Deserializing this projection never admits a route.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AutoRouteDataPathWire {
+    LocalHeuristic,
+    Classifier {
+        provider: String,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+    },
+    Decision {
+        route: DecisionRouterRoute,
+        model: String,
+    },
+}
+impl Serialize for AutoRouteDataPath {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let wire = match self {
+            Self::LocalHeuristic => AutoRouteDataPathWire::LocalHeuristic,
+            Self::Decision { route, model } => AutoRouteDataPathWire::Decision {
+                route: *route,
+                model: model.clone(),
+            },
+            Self::Classifier {
+                provider,
+                provider_kind,
+                model,
+            } => {
+                let tag = codewhale_config::descriptors::tui_wire_tag_for_route(
+                    *provider_kind,
+                    provider.as_str(),
+                )
+                .ok_or_else(|| {
+                    serde::ser::Error::custom("contradictory classifier source identity")
+                })?;
+                AutoRouteDataPathWire::Classifier {
+                    provider: tag.into(),
+                    model: model.clone(),
+                    provider_id: (*provider_kind == ProviderKind::Custom
+                        && provider.as_str() != "custom")
+                        .then(|| provider.to_string()),
+                }
+            }
+        };
+        wire.serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for AutoRouteDataPath {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match AutoRouteDataPathWire::deserialize(deserializer)? {
+            AutoRouteDataPathWire::LocalHeuristic => Self::LocalHeuristic,
+            AutoRouteDataPathWire::Decision { route, model } => Self::Decision { route, model },
+            AutoRouteDataPathWire::Classifier {
+                provider,
+                model,
+                provider_id,
+            } => {
+                let row = codewhale_config::descriptors::compatibility_from_wire_tag(&provider)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("unknown classifier source identity")
+                    })?;
+                let id = provider_id.as_deref().unwrap_or(row.id);
+                let kind = codewhale_config::descriptors::kind_from_tui_wire_tag(&provider, id)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("contradictory classifier source identity")
+                    })?;
+                Self::Classifier {
+                    provider: id.into(),
+                    provider_kind: kind,
+                    model,
+                }
+            }
+        })
+    }
+}
+
 impl AutoRouteDataPath {
     #[must_use]
     pub(crate) fn label(&self) -> String {
         match self {
             Self::LocalHeuristic => "local only (no router request)".to_string(),
-            Self::Classifier { provider, model } => format!(
+            Self::Classifier {
+                provider,
+                provider_kind,
+                model,
+            } => format!(
                 "latest request + bounded recent context -> {} / {model}",
-                provider.display_name()
+                codewhale_config::descriptors::compatibility_for_id(provider.as_str())
+                    .filter(|row| row.kind == *provider_kind)
+                    .map_or(provider.as_str(), |row| row.label)
             ),
             Self::Decision { route, model } => format!(
                 "latest request + bounded recent context -> {} / {model} (decision model)",
@@ -505,7 +590,7 @@ impl AutoRouterFailure {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AutoRouteSelection {
-    pub(crate) provider: ApiProvider,
+    pub(crate) provider: ProviderIdentity,
     pub(crate) model: String,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) source: AutoRouteSource,
@@ -547,7 +632,7 @@ fn parse_auto_route_reasoning_effort(effort: &str) -> Option<ReasoningEffort> {
 /// the historic `low | medium -> high` provider collapse (Slice 4, D2).
 #[must_use]
 pub(crate) fn normalize_auto_route_effort_for_provider(
-    provider: ApiProvider,
+    provider: ProviderKind,
     effort: ReasoningEffort,
 ) -> ReasoningEffort {
     effort.normalize_for_route(provider, "", "")
@@ -585,15 +670,19 @@ pub(crate) fn resolve_auto_model_reasoning(
 #[must_use]
 pub(crate) fn normalize_auto_route_effort_for_configured_route(
     config: &Config,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
     model: &str,
     effort: ReasoningEffort,
 ) -> ReasoningEffort {
-    crate::route_runtime::resolve_runtime_route(config, provider, Some(model))
+    crate::route_runtime::resolve_runtime_route_for_identity(config, identity, Some(model))
         .map(|route| {
-            effort.normalize_for_route(provider, &route.candidate.endpoint().base_url, &route.model)
+            effort.normalize_for_route(
+                identity.provider,
+                &route.candidate.endpoint().base_url,
+                &route.model,
+            )
         })
-        .unwrap_or_else(|_| normalize_auto_route_effort_for_provider(provider, effort))
+        .unwrap_or_else(|_| normalize_auto_route_effort_for_provider(identity.provider, effort))
 }
 
 fn normalize_auto_route_selection_for_config(
@@ -603,7 +692,7 @@ fn normalize_auto_route_selection_for_config(
     selection.reasoning_effort = selection.reasoning_effort.map(|effort| {
         normalize_auto_route_effort_for_configured_route(
             config,
-            selection.provider,
+            &selection.provider,
             &selection.model,
             effort,
         )
@@ -613,7 +702,7 @@ fn normalize_auto_route_selection_for_config(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InventoryAutoRouteRecommendation {
-    provider: ApiProvider,
+    provider: ProviderIdentity,
     model: String,
     reasoning_effort: Option<ReasoningEffort>,
 }
@@ -697,7 +786,7 @@ pub(crate) async fn resolve_auto_route_with_inventory_for_session_and_cache_poli
     selected_thinking_mode: &str,
     allow_response_cache: bool,
 ) -> Result<AutoRouteSelection> {
-    let inventory = ModelInventory::from_config(config);
+    let inventory = ModelInventory::from_config(config).map_err(anyhow::Error::msg)?;
     if !inventory.router_available {
         // Declared-default auto routing when no router is available. A router
         // that was declared but cannot run is marked failing on the receipt.
@@ -817,7 +906,7 @@ pub(crate) const ROUTER_TEST_REQUEST: &str = "Rename the variable foo to bar in 
 pub(crate) async fn test_auto_router(
     config: &Config,
 ) -> std::result::Result<(AutoRouteSelection, u64), String> {
-    let inventory = ModelInventory::from_config(config);
+    let inventory = ModelInventory::from_config(config)?;
     if !inventory.router_available {
         return Err(inventory
             .router_setup_issue
@@ -868,20 +957,20 @@ pub(crate) fn resolve_explicit_route_with_inventory(
         return None;
     }
 
-    let inventory = ModelInventory::from_config(config);
-    let active_provider = config.api_provider();
+    let inventory = ModelInventory::from_config(config).ok()?;
+    let active_identity = &inventory.active_identity;
 
     if let Some(candidate) = inventory.candidates.iter().find(|candidate| {
-        candidate.provider == active_provider
+        &candidate.identity == active_identity
             && explicit_model_matches_candidate(candidate, requested_model)
     }) {
         return Some(AutoRouteSelection {
-            provider: candidate.provider,
+            provider: candidate.identity.clone(),
             model: candidate.model.clone(),
             reasoning_effort: config.reasoning_effort().map(|setting| {
                 normalize_auto_route_effort_for_configured_route(
                     config,
-                    candidate.provider,
+                    &candidate.identity,
                     &candidate.model,
                     ReasoningEffort::from_setting(setting),
                 )
@@ -904,12 +993,12 @@ pub(crate) fn resolve_explicit_route_with_inventory(
     }
 
     Some(AutoRouteSelection {
-        provider: candidate.provider,
+        provider: candidate.identity.clone(),
         model: candidate.model.clone(),
         reasoning_effort: config.reasoning_effort().map(|setting| {
             normalize_auto_route_effort_for_configured_route(
                 config,
-                candidate.provider,
+                &candidate.identity,
                 &candidate.model,
                 ReasoningEffort::from_setting(setting),
             )
@@ -925,21 +1014,23 @@ pub(crate) fn resolve_explicit_route_with_inventory(
 pub(crate) fn explicit_route_candidate_providers(
     config: &Config,
     requested_model: &str,
-) -> Vec<ApiProvider> {
+) -> Vec<ProviderIdentity> {
     let requested_model = requested_model.trim();
     if requested_model.is_empty() || requested_model.eq_ignore_ascii_case("auto") {
         return Vec::new();
     }
 
-    let inventory = ModelInventory::from_config(config);
+    let Ok(inventory) = ModelInventory::from_config(config) else {
+        return Vec::new();
+    };
     let mut providers = Vec::new();
     for candidate in inventory
         .candidates
         .iter()
         .filter(|candidate| explicit_model_matches_candidate(candidate, requested_model))
     {
-        if !providers.contains(&candidate.provider) {
-            providers.push(candidate.provider);
+        if !providers.contains(&candidate.identity) {
+            providers.push(candidate.identity.clone());
         }
     }
     providers
@@ -967,10 +1058,10 @@ fn auto_route_declared_fallback(config: &Config, inventory: &ModelInventory) -> 
     let Some(active) = inventory.active_default() else {
         let model = config.default_model();
         return AutoRouteSelection {
-            provider: config.api_provider(),
+            provider: inventory.active_identity.clone(),
             receipt: Some(auto_route_receipt(
                 inventory,
-                config.api_provider(),
+                &inventory.active_identity,
                 &model,
                 AutoRouteScope::ResolvedProvider,
                 AutoRouteDataPath::LocalHeuristic,
@@ -987,7 +1078,7 @@ fn auto_route_declared_fallback(config: &Config, inventory: &ModelInventory) -> 
     let router_candidates = provider_router_candidates(active.provider, &active.model);
     let runnable_fast = router_candidates.cheap.as_deref().filter(|model| {
         inventory
-            .candidate(active.provider, model)
+            .candidate(active.identity.key.as_str(), model)
             .is_some_and(|candidate| candidate.readiness.can_attempt())
     });
     let (model, reason) = if config.auto_cost_saving() {
@@ -1008,10 +1099,10 @@ fn auto_route_declared_fallback(config: &Config, inventory: &ModelInventory) -> 
         )
     };
     AutoRouteSelection {
-        provider: active.provider,
+        provider: active.identity.clone(),
         receipt: Some(auto_route_receipt(
             inventory,
-            active.provider,
+            &active.identity,
             &model,
             AutoRouteScope::ResolvedProvider,
             AutoRouteDataPath::LocalHeuristic,
@@ -1040,10 +1131,10 @@ fn auto_route_from_classifier(
         AutoRouteScope::ActiveProvider
     };
     AutoRouteSelection {
-        provider: recommendation.provider,
+        provider: recommendation.provider.clone(),
         receipt: Some(auto_route_receipt(
             inventory,
-            recommendation.provider,
+            &recommendation.provider,
             &recommendation.model,
             scope,
             data_path,
@@ -1115,7 +1206,11 @@ fn router_data_path(inventory: &ModelInventory) -> AutoRouteDataPath {
             model: inventory.router_model.to_string(),
         },
         None => AutoRouteDataPath::Classifier {
-            provider: inventory.router_provider,
+            provider: inventory.router_identity.as_ref().map_or_else(
+                || inventory.router_provider.as_str().into(),
+                |identity| identity.key.clone(),
+            ),
+            provider_kind: inventory.router_provider,
             model: inventory.router_model.to_string(),
         },
     }
@@ -1123,13 +1218,13 @@ fn router_data_path(inventory: &ModelInventory) -> AutoRouteDataPath {
 
 fn auto_route_receipt(
     inventory: &ModelInventory,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
     selected_model: &str,
     scope: AutoRouteScope,
     data_path: AutoRouteDataPath,
     reason: AutoRouteReason,
 ) -> AutoRouteReceipt {
-    let pair = auto_route_pair(inventory, provider, selected_model);
+    let pair = auto_route_pair(inventory, identity, selected_model);
     let tier = if pair
         .fast
         .as_deref()
@@ -1158,7 +1253,7 @@ fn auto_route_receipt(
 
 fn auto_route_pair(
     inventory: &ModelInventory,
-    provider: ApiProvider,
+    identity: &ProviderIdentity,
     selected_model: &str,
 ) -> AutoRoutePair {
     // A provider can expose several unrelated model families. Derive the pair
@@ -1169,8 +1264,8 @@ fn auto_route_pair(
     let matching_pair = inventory
         .candidates
         .iter()
-        .filter(|candidate| candidate.provider == provider && candidate.readiness.can_attempt())
-        .map(|candidate| provider_router_candidates(provider, &candidate.model))
+        .filter(|candidate| candidate.identity == *identity && candidate.readiness.can_attempt())
+        .map(|candidate| provider_router_candidates(identity.provider, &candidate.model))
         .find(|pair| {
             pair.cheap
                 .as_deref()
@@ -1181,9 +1276,9 @@ fn auto_route_pair(
                 .candidates
                 .iter()
                 .filter(|candidate| {
-                    candidate.provider == provider && candidate.readiness.can_attempt()
+                    candidate.identity == *identity && candidate.readiness.can_attempt()
                 })
-                .map(|candidate| provider_router_candidates(provider, &candidate.model))
+                .map(|candidate| provider_router_candidates(identity.provider, &candidate.model))
                 .find(|pair| pair.big.eq_ignore_ascii_case(selected_model))
         });
     let Some(candidates) = matching_pair else {
@@ -1193,7 +1288,7 @@ fn auto_route_pair(
         };
     };
     let Some(strong) = inventory
-        .candidate(provider, &candidates.big)
+        .candidate(identity.key.as_str(), &candidates.big)
         .filter(|candidate| candidate.readiness.can_attempt())
         .map(|candidate| candidate.model.clone())
     else {
@@ -1204,7 +1299,7 @@ fn auto_route_pair(
     };
     let fast = candidates.cheap.as_deref().and_then(|model| {
         inventory
-            .candidate(provider, model)
+            .candidate(identity.key.as_str(), model)
             .filter(|candidate| candidate.readiness.can_attempt())
             .map(|candidate| candidate.model.clone())
     });
@@ -1309,6 +1404,7 @@ fn auto_route_attempt_from_provider_response(
     // policy boolean as cache-hit provenance.
     if attempt.routed_usage.is_empty() {
         attempt.routed_usage_drop_records = vec![RuntimeUsageDropRecord {
+            reason: crate::cost_status::RuntimeUsageMissingReason::default(),
             source_id: auto_route_usage_source_id(
                 &drop_route,
                 &format!("missing-usage:{}", response.id),
@@ -1327,6 +1423,7 @@ fn auto_route_attempt_with_dropped_response(
     let request_route = request_route.sanitized_for_persistence();
     InventoryAutoRouteAttempt {
         routed_usage_drop_records: vec![RuntimeUsageDropRecord {
+            reason: crate::cost_status::RuntimeUsageMissingReason::default(),
             source_id: auto_route_usage_source_id(&request_route, "transport-error"),
             route: request_route,
         }],
@@ -1356,7 +1453,13 @@ async fn auto_route_inventory_recommendation(
     let mut router_config = config.clone();
     // The classifier runs on the inventory's router route: the explicit
     // [auto.router] route when configured, else the DeepSeek flash default.
-    router_config.provider = Some(inventory.router_provider.as_str().to_string());
+    let identity = inventory
+        .router_identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("router identity was not admitted"))?;
+    router_config
+        .scope_to_provider_identity(identity)
+        .map_err(anyhow::Error::msg)?;
     router_config.default_text_model = Some(inventory.router_model.clone());
 
     let client = CodewhaleClient::new(&router_config)?;
@@ -1448,7 +1551,7 @@ async fn auto_route_inventory_recommendation(
 /// The active provider's runnable strong/fast pair, when both tiers can run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveTierPair {
-    provider: ApiProvider,
+    provider: ProviderIdentity,
     strong: String,
     fast: String,
 }
@@ -1458,12 +1561,12 @@ fn runnable_active_pair(inventory: &ModelInventory) -> Option<ActiveTierPair> {
     let candidates = provider_router_candidates(active.provider, &active.model);
     let runnable = |model: &str| {
         inventory
-            .candidate(active.provider, model)
+            .candidate(active.identity.key.as_str(), model)
             .filter(|candidate| candidate.readiness.can_attempt())
             .map(|candidate| candidate.model.clone())
     };
     Some(ActiveTierPair {
-        provider: active.provider,
+        provider: active.identity.clone(),
         strong: runnable(&candidates.big)?,
         fast: runnable(candidates.cheap.as_deref()?)?,
     })
@@ -1691,7 +1794,11 @@ pub(crate) fn decision_usage_batch(
     } else {
         crate::cost_status::RuntimeUsageBatch {
             decisions: Vec::new(),
-            drop_records: vec![RuntimeUsageDropRecord { source_id, route }],
+            drop_records: vec![RuntimeUsageDropRecord {
+                source_id,
+                route,
+                reason: crate::cost_status::RuntimeUsageMissingReason::default(),
+            }],
             dropped_records: 1,
             ..Default::default()
         }
@@ -1787,7 +1894,7 @@ fn decision_attempt_from_response(
         pair.fast.clone()
     };
     attempt.recommendation = Some(InventoryAutoRouteRecommendation {
-        provider: pair.provider,
+        provider: pair.provider.clone(),
         model,
         reasoning_effort: thinking
             .as_deref()
@@ -1806,7 +1913,7 @@ fn inventory_auto_router_system_prompt(inventory: &ModelInventory, cost_saving: 
         format!(
             "Auto routing is scoped to the active provider `{}`. Every model in the inventory \
 below belongs to it; never select another provider.\n\n",
-            inventory.active_provider.as_str()
+            inventory.active_identity.key.as_str()
         )
     };
     prompt.push_str(&format!(
@@ -1831,8 +1938,8 @@ and `{strong}` is the strong tier. Prefer `{fast}` for ambiguous, routine, or si
 Select `{strong}` only when the request is unmistakably agentic, multi-step, architecture/design, \
 security review, debugging, or otherwise clearly beyond the fast tier. Keep the selected model paired \
 with provider `{}`.",
-                provider.as_str(),
-                provider.as_str()
+                provider.key.as_str(),
+                provider.key.as_str()
             ));
         } else {
             prompt.push_str(
@@ -1851,28 +1958,37 @@ fn parse_inventory_auto_route_recommendation(
 ) -> Option<InventoryAutoRouteRecommendation> {
     let json = extract_first_json_object(raw)?;
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
-    let provider = value
-        .get("provider")
-        .and_then(serde_json::Value::as_str)
-        .and_then(ApiProvider::parse)?;
-    // Defense in depth for #4411: the payload already hides other providers,
-    // but a hallucinated (or stale) provider must not become a route either.
-    if !inventory.auto_scope_allows(provider) {
+    let name = value.get("provider").and_then(serde_json::Value::as_str)?;
+    let model = value.get("model").and_then(serde_json::Value::as_str)?;
+    // Match only identities offered in this captured inventory. A name cannot
+    // create a route, borrow a brand's authority, or broaden the Auto scope.
+    let mut matches = inventory.candidates.iter().filter(|candidate| {
+        let offered = candidate.identity.key.as_str() == name
+            || candidate.identity.compatibility().is_some_and(|row| {
+                row.tui_wire_tag == name
+                    || row
+                        .selector_aliases
+                        .iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(name))
+            });
+        offered
+            && inventory.auto_scope_allows(candidate.identity.key.as_str())
+            && candidate.readiness.can_attempt()
+            && (candidate.model == model
+                || (!candidate.user_declared && candidate.model.eq_ignore_ascii_case(model)))
+    });
+    let candidate = matches.next()?;
+    if matches.next().is_some() {
         return None;
     }
-    let model = value.get("model").and_then(serde_json::Value::as_str)?;
-    let candidate = inventory
-        .candidate(provider, model)
-        .filter(|candidate| candidate.readiness.can_attempt())?;
     let reasoning_effort = value
         .get("thinking")
         .or_else(|| value.get("reasoning_effort"))
         .or_else(|| value.get("effort"))
         .and_then(serde_json::Value::as_str)
         .and_then(parse_auto_route_reasoning_effort);
-
     Some(InventoryAutoRouteRecommendation {
-        provider,
+        provider: candidate.identity.clone(),
         model: candidate.model.clone(),
         reasoning_effort,
     })
@@ -1975,11 +2091,11 @@ mod tests {
         use codewhale_config::catalog::{CatalogOffering, CatalogSource, ProviderCatalogDelta};
 
         ProviderCatalogDelta {
-            provider: ApiProvider::Openrouter.as_str().to_string(),
+            provider: ProviderKind::Openrouter.as_str().to_string(),
             base_url_fingerprint: fingerprint.to_string(),
             fetched_at,
             offerings: vec![CatalogOffering {
-                provider: ApiProvider::Openrouter.as_str().to_string(),
+                provider: ProviderKind::Openrouter.as_str().to_string(),
                 wire_model_id: model.to_string(),
                 endpoint_key: "chat".to_string(),
                 source: CatalogSource::Live {
@@ -2054,10 +2170,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         assert!(
             inventory
-                .candidate(ApiProvider::Openrouter, model)
+                .candidate(ProviderKind::Openrouter.as_str(), model)
                 .is_some()
         );
         let client = CodewhaleClient::new(&config).expect("OpenRouter classifier client");
@@ -2322,7 +2438,7 @@ mod tests {
             provider: Some("zai".to_string()),
             ..Default::default()
         };
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
 
         let balanced = inventory_auto_router_system_prompt(&inventory, false);
         let cost_saving = inventory_auto_router_system_prompt(&inventory, true);
@@ -2346,20 +2462,20 @@ mod tests {
         // normalizer with an unresolved route. Two providers where the deleted
         // local copy disagreed with the authority are pinned explicitly.
         assert_eq!(
-            normalize_auto_route_effort_for_provider(ApiProvider::Deepseek, ReasoningEffort::Low),
+            normalize_auto_route_effort_for_provider(ProviderKind::Deepseek, ReasoningEffort::Low),
             ReasoningEffort::Low,
             "first-party DeepSeek documents low|high|max, so the canonical normalizer keeps low"
         );
         assert_eq!(
             normalize_auto_route_effort_for_provider(
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 ReasoningEffort::Medium
             ),
             ReasoningEffort::High
         );
         assert_eq!(
             normalize_auto_route_effort_for_provider(
-                ApiProvider::OllamaCloud,
+                ProviderKind::OllamaCloud,
                 ReasoningEffort::Minimal
             ),
             ReasoningEffort::Low,
@@ -2367,42 +2483,42 @@ mod tests {
         );
         assert_eq!(
             normalize_auto_route_effort_for_provider(
-                ApiProvider::OllamaCloud,
+                ProviderKind::OllamaCloud,
                 ReasoningEffort::Ultra
             ),
             ReasoningEffort::Max
         );
         // A provider with no exact-route rule keeps the historic collapse.
         assert_eq!(
-            normalize_auto_route_effort_for_provider(ApiProvider::Moonshot, ReasoningEffort::Low),
+            normalize_auto_route_effort_for_provider(ProviderKind::Moonshot, ReasoningEffort::Low),
             ReasoningEffort::High
         );
         assert_eq!(
-            normalize_auto_route_effort_for_provider(ApiProvider::Moonshot, ReasoningEffort::Auto),
+            normalize_auto_route_effort_for_provider(ProviderKind::Moonshot, ReasoningEffort::Auto),
             ReasoningEffort::Auto
         );
         assert_eq!(
-            normalize_auto_route_effort_for_provider(ApiProvider::Moonshot, ReasoningEffort::Max),
+            normalize_auto_route_effort_for_provider(ProviderKind::Moonshot, ReasoningEffort::Max),
             ReasoningEffort::Max
         );
         // Codex keeps its provider-level mapping (off -> low, auto -> medium).
         assert_eq!(
             normalize_auto_route_effort_for_provider(
-                ApiProvider::OpenaiCodex,
+                ProviderKind::OpenaiCodex,
                 ReasoningEffort::Low
             ),
             ReasoningEffort::Low
         );
         assert_eq!(
             normalize_auto_route_effort_for_provider(
-                ApiProvider::OpenaiCodex,
+                ProviderKind::OpenaiCodex,
                 ReasoningEffort::Medium
             ),
             ReasoningEffort::Medium
         );
         assert_eq!(
             normalize_auto_route_effort_for_provider(
-                ApiProvider::OpenaiCodex,
+                ProviderKind::OpenaiCodex,
                 ReasoningEffort::Off
             ),
             ReasoningEffort::Low
@@ -2426,7 +2542,7 @@ mod tests {
         assert_eq!(
             normalize_auto_route_effort_for_configured_route(
                 &config,
-                ApiProvider::Moonshot,
+                &(config).test_identity_for_kind(ProviderKind::Moonshot),
                 "k3",
                 ReasoningEffort::Low,
             ),
@@ -2435,7 +2551,7 @@ mod tests {
         assert_eq!(
             normalize_auto_route_effort_for_configured_route(
                 &config,
-                ApiProvider::Moonshot,
+                &(config).test_identity_for_kind(ProviderKind::Moonshot),
                 "k3",
                 ReasoningEffort::Medium,
             ),
@@ -2451,7 +2567,7 @@ mod tests {
         assert_eq!(
             normalize_auto_route_effort_for_configured_route(
                 &config,
-                ApiProvider::Moonshot,
+                &(config).test_identity_for_kind(ProviderKind::Moonshot),
                 "k3",
                 ReasoningEffort::Low,
             ),
@@ -2469,14 +2585,14 @@ mod tests {
             default_text_model: Some(crate::config::DEFAULT_TEXT_MODEL.to_string()),
             ..Default::default()
         };
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
 
         let route = parse_inventory_auto_route_recommendation(
             r#"{"provider":"zai","model":"GLM-5.2","thinking":"max"}"#,
             &inventory,
         )
         .expect("valid inventory route should parse");
-        assert_eq!(route.provider, ApiProvider::Zai);
+        assert_eq!(route.provider.provider, ProviderKind::Zai);
         assert_eq!(route.model, crate::config::ZAI_GLM_5_2_MODEL);
         assert_eq!(route.reasoning_effort, Some(ReasoningEffort::Max));
 
@@ -2494,7 +2610,7 @@ mod tests {
             &inventory,
         )
         .expect("wrapped inventory route should parse");
-        assert_eq!(wrapped.provider, ApiProvider::Zai);
+        assert_eq!(wrapped.provider.provider, ProviderKind::Zai);
         assert_eq!(wrapped.model, crate::config::ZAI_GLM_5_TURBO_MODEL);
         // Parsing is strict and literal; the historic Medium->High coercion
         // is applied downstream by normalize_auto_route_selection_for_config
@@ -2510,12 +2626,12 @@ mod tests {
             provider: Some("zai".to_string()),
             ..Default::default()
         };
-        let mut inventory = ModelInventory::from_config(&config);
+        let mut inventory = ModelInventory::from_config(&config).unwrap();
         let candidate = inventory
             .candidates
             .iter_mut()
             .find(|candidate| {
-                candidate.provider == ApiProvider::Zai
+                candidate.provider == ProviderKind::Zai
                     && candidate.model == crate::config::ZAI_GLM_5_2_MODEL
             })
             .expect("Z.ai strong candidate");
@@ -2540,14 +2656,14 @@ mod tests {
             provider: Some("wanjie-ark".to_string()),
             ..Default::default()
         };
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
 
         let route = parse_inventory_auto_route_recommendation(
             r#"{"provider":"wanjie-ark","model":"deepseek-v4-pro","thinking":"max"}"#,
             &inventory,
         )
         .expect("Wanjie V4 Pro inventory route should parse");
-        assert_eq!(route.provider, ApiProvider::WanjieArk);
+        assert_eq!(route.provider.provider, ProviderKind::WanjieArk);
         assert_eq!(route.model, "deepseek-v4-pro");
         assert_eq!(route.reasoning_effort, Some(ReasoningEffort::Max));
 
@@ -2556,7 +2672,7 @@ mod tests {
             &inventory,
         )
         .expect("Wanjie V4 Flash inventory route should parse");
-        assert_eq!(route.provider, ApiProvider::WanjieArk);
+        assert_eq!(route.provider.provider, ProviderKind::WanjieArk);
         assert_eq!(route.model, "deepseek-v4-flash");
         assert_eq!(route.reasoning_effort, Some(ReasoningEffort::Off));
     }
@@ -2579,8 +2695,8 @@ mod tests {
             .expect("explicit GLM route should resolve to its provider");
 
         assert_eq!(
-            route.provider,
-            ApiProvider::Zai,
+            route.provider.provider,
+            ProviderKind::Zai,
             "GLM-5.2 must route to Z.ai, not the active DeepSeek provider"
         );
         assert_eq!(
@@ -2594,8 +2710,8 @@ mod tests {
         let route_53 = resolve_explicit_route_with_inventory(&config, "GLM-5.3")
             .expect("explicit GLM-5.3 route should resolve to its provider");
         assert_eq!(
-            route_53.provider,
-            ApiProvider::Zai,
+            route_53.provider.provider,
+            ProviderKind::Zai,
             "GLM-5.3 must route to Z.ai, not the active DeepSeek provider"
         );
         assert_eq!(
@@ -2630,7 +2746,7 @@ mod tests {
                 .await
                 .expect("inventory route should resolve with authenticated active provider");
 
-            assert_eq!(route.provider, ApiProvider::Zai);
+            assert_eq!(route.provider.provider, ProviderKind::Zai);
             assert_eq!(route.model, crate::config::DEFAULT_ZAI_MODEL);
             assert_eq!(route.source, AutoRouteSource::Heuristic);
             let receipt = route.receipt.expect("Auto route receipt");
@@ -2659,7 +2775,7 @@ mod tests {
             provider: Some("zai".to_string()),
             ..Default::default()
         };
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         let recommendation = parse_inventory_auto_route_recommendation(
             r#"{"provider":"zai","model":"GLM-5-Turbo","thinking":"off"}"#,
             &inventory,
@@ -2668,7 +2784,7 @@ mod tests {
 
         let route = auto_route_from_classifier(&inventory, recommendation);
 
-        assert_eq!(route.provider, ApiProvider::Zai);
+        assert_eq!(route.provider.provider, ProviderKind::Zai);
         assert_eq!(route.model, crate::config::ZAI_GLM_5_TURBO_MODEL);
         assert_eq!(route.source, AutoRouteSource::FlashRouter);
         let receipt = route.receipt.expect("classifier receipt");
@@ -2679,7 +2795,8 @@ mod tests {
         assert_eq!(
             receipt.data_path,
             AutoRouteDataPath::Classifier {
-                provider: ApiProvider::Deepseek,
+                provider: "deepseek".into(),
+                provider_kind: ProviderKind::Deepseek,
                 model: "deepseek-v4-flash".to_string(),
             }
         );
@@ -2698,7 +2815,7 @@ mod tests {
             provider: Some("zai".to_string()),
             ..Default::default()
         };
-        let scoped_inventory = ModelInventory::from_config(&scoped);
+        let scoped_inventory = ModelInventory::from_config(&scoped).unwrap();
         let raw = r#"{"provider":"deepseek","model":"deepseek-v4-flash","thinking":"off"}"#;
 
         assert!(
@@ -2722,10 +2839,12 @@ mod tests {
             }),
             ..scoped.clone()
         };
-        let opted_in_route =
-            parse_inventory_auto_route_recommendation(raw, &ModelInventory::from_config(&opted_in))
-                .expect("opt-in admits the cross-provider recommendation");
-        assert_eq!(opted_in_route.provider, ApiProvider::Deepseek);
+        let opted_in_route = parse_inventory_auto_route_recommendation(
+            raw,
+            &ModelInventory::from_config(&opted_in).unwrap(),
+        )
+        .expect("opt-in admits the cross-provider recommendation");
+        assert_eq!(opted_in_route.provider.provider, ProviderKind::Deepseek);
     }
 
     #[test]
@@ -2738,8 +2857,10 @@ mod tests {
             ..Default::default()
         };
 
-        let prompt =
-            inventory_auto_router_system_prompt(&ModelInventory::from_config(&config), false);
+        let prompt = inventory_auto_router_system_prompt(
+            &ModelInventory::from_config(&config).unwrap(),
+            false,
+        );
 
         assert!(
             prompt.contains("Auto routing is scoped to the active provider `zai`"),
@@ -2769,7 +2890,7 @@ mod tests {
             let route = resolve_auto_route_with_inventory(&config, prompt, "", "auto", "auto")
                 .await
                 .expect("scoped Auto route");
-            assert_eq!(route.provider, ApiProvider::Zai);
+            assert_eq!(route.provider.provider, ProviderKind::Zai);
             assert_eq!(route.model, crate::config::DEFAULT_ZAI_MODEL);
             let receipt = route.receipt.expect("scoped receipt");
             assert_eq!(receipt.tier, AutoRouteTier::Strong);
@@ -2805,7 +2926,7 @@ mod tests {
             provider: Some("openrouter".to_string()),
             ..Default::default()
         };
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         let recommendation = parse_inventory_auto_route_recommendation(
             r#"{"provider":"openrouter","model":"z-ai/glm-5.2","thinking":"max"}"#,
             &inventory,
@@ -2837,7 +2958,7 @@ mod tests {
             provider: Some("zai".to_string()),
             ..Default::default()
         };
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         let fallback = auto_route_declared_fallback(&config, &inventory);
 
         let route = auto_route_classifier_fallback(fallback, &inventory);
@@ -2848,9 +2969,10 @@ mod tests {
         assert!(matches!(
             receipt.data_path,
             AutoRouteDataPath::Classifier {
-                provider: ApiProvider::Deepseek,
+                ref provider,
                 ref model,
-            } if model == "deepseek-v4-flash"
+                ..
+            } if provider.as_str() == "deepseek" && model == "deepseek-v4-flash"
         ));
         assert_eq!(
             receipt.reason,
@@ -2899,8 +3021,8 @@ mod tests {
                 .await
                 .expect("inventory route should resolve without leaving the active provider");
 
-        assert_eq!(route.provider, ApiProvider::Zai);
-        assert_ne!(route.provider, ApiProvider::Deepseek);
+        assert_eq!(route.provider.provider, ProviderKind::Zai);
+        assert_ne!(route.provider.provider, ProviderKind::Deepseek);
         assert_eq!(route.source, AutoRouteSource::Heuristic);
         let receipt = route.receipt.expect("Auto route receipt");
         assert_eq!(receipt.scope, AutoRouteScope::ResolvedProvider);
@@ -2933,7 +3055,7 @@ mod tests {
                 .await
                 .expect("opted-in route should fall back to an authenticated provider");
 
-        assert_eq!(route.provider, ApiProvider::Deepseek);
+        assert_eq!(route.provider.provider, ProviderKind::Deepseek);
         assert_eq!(route.model, "deepseek-flash");
         assert_eq!(route.source, AutoRouteSource::Heuristic);
     }
@@ -2976,9 +3098,9 @@ mod tests {
         .await
         .expect("cost-saving Auto route should resolve");
 
-        assert_eq!(balanced_route.provider, ApiProvider::Zai);
+        assert_eq!(balanced_route.provider.provider, ProviderKind::Zai);
         assert_eq!(balanced_route.model, crate::config::DEFAULT_ZAI_MODEL);
-        assert_eq!(cost_saving_route.provider, ApiProvider::Zai);
+        assert_eq!(cost_saving_route.provider.provider, ProviderKind::Zai);
         assert_eq!(
             cost_saving_route.model,
             crate::config::ZAI_GLM_5_3_FLASH_MODEL
@@ -3024,7 +3146,7 @@ mod tests {
             let route = resolve_auto_route_with_inventory(&config, prompt, "", "auto", "auto")
                 .await
                 .expect("declared-default Wanjie route should resolve");
-            assert_eq!(route.provider, ApiProvider::WanjieArk);
+            assert_eq!(route.provider.provider, ProviderKind::WanjieArk);
             assert_eq!(route.model, "deepseek-reasoner");
             assert_eq!(route.source, AutoRouteSource::Heuristic);
         }
@@ -3049,7 +3171,7 @@ mod tests {
             let route = resolve_auto_route_with_inventory(&config, prompt, "", "auto", "auto")
                 .await
                 .expect("declared-default Volcengine route should resolve");
-            assert_eq!(route.provider, ApiProvider::Volcengine);
+            assert_eq!(route.provider.provider, ProviderKind::Volcengine);
             assert_eq!(route.model, "deepseek-v4-pro");
             assert_eq!(route.source, AutoRouteSource::Heuristic);
         }
@@ -3057,101 +3179,106 @@ mod tests {
 
     #[test]
     fn provider_router_candidates_cover_known_provider_classes() {
-        use crate::config::ApiProvider;
+        use crate::config::ProviderKind;
 
-        let deepseek = provider_router_candidates(ApiProvider::Deepseek, "deepseek-v4-pro");
+        let deepseek = provider_router_candidates(ProviderKind::Deepseek, "deepseek-v4-pro");
         assert_eq!(deepseek.big, "deepseek-v4-pro");
         assert_eq!(deepseek.cheap.as_deref(), Some("deepseek-v4-flash"));
 
         let openrouter =
-            provider_router_candidates(ApiProvider::Openrouter, "deepseek/deepseek-v4-pro");
+            provider_router_candidates(ProviderKind::Openrouter, "deepseek/deepseek-v4-pro");
         assert_eq!(openrouter.big, "deepseek/deepseek-v4-pro");
         assert_eq!(
             openrouter.cheap.as_deref(),
             Some("deepseek/deepseek-v4-flash")
         );
 
-        let wanjie = provider_router_candidates(ApiProvider::WanjieArk, "deepseek-reasoner");
+        let wanjie = provider_router_candidates(ProviderKind::WanjieArk, "deepseek-reasoner");
         assert_eq!(wanjie.big, "deepseek-v4-pro");
         assert_eq!(wanjie.cheap.as_deref(), Some("deepseek-v4-flash"));
 
-        let volcengine = provider_router_candidates(ApiProvider::Volcengine, "DeepSeek-V4-Pro");
+        let volcengine = provider_router_candidates(ProviderKind::Volcengine, "DeepSeek-V4-Pro");
         assert_eq!(volcengine.big, "DeepSeek-V4-Pro");
         assert_eq!(volcengine.cheap.as_deref(), Some("DeepSeek-V4-Flash"));
 
-        let zai = provider_router_candidates(ApiProvider::Zai, "GLM-5.2");
+        let zai = provider_router_candidates(ProviderKind::Zai, "GLM-5.2");
         assert_eq!(zai.big, "GLM-5.2");
         // GLM-5.2 faster/explore children route to GLM-5-Turbo (same-family fast
         // sibling), not back down to GLM-5.1.
         assert_eq!(zai.cheap.as_deref(), Some("GLM-5-Turbo"));
 
-        let openrouter_glm = provider_router_candidates(ApiProvider::Openrouter, "z-ai/glm-5.2");
+        let openrouter_glm = provider_router_candidates(ProviderKind::Openrouter, "z-ai/glm-5.2");
         assert_eq!(openrouter_glm.big, "z-ai/glm-5.2");
         assert_eq!(openrouter_glm.cheap.as_deref(), Some("z-ai/glm-5-turbo"));
 
         // GLM-5.3's fast sibling is Flash; GLM-5.2 still uses Turbo.
-        let zai_53 = provider_router_candidates(ApiProvider::Zai, "GLM-5.3");
+        let zai_53 = provider_router_candidates(ProviderKind::Zai, "GLM-5.3");
         assert_eq!(zai_53.big, "GLM-5.3");
         assert_eq!(zai_53.cheap.as_deref(), Some("GLM-5.3-Flash"));
 
-        let openrouter_glm_53 = provider_router_candidates(ApiProvider::Openrouter, "z-ai/glm-5.3");
+        let openrouter_glm_53 =
+            provider_router_candidates(ProviderKind::Openrouter, "z-ai/glm-5.3");
         assert_eq!(openrouter_glm_53.big, "z-ai/glm-5.3");
         assert_eq!(
             openrouter_glm_53.cheap.as_deref(),
             Some("z-ai/glm-5.3-flash")
         );
 
-        let zai_flash = provider_router_candidates(ApiProvider::Zai, "GLM-5.3-Flash");
+        let zai_flash = provider_router_candidates(ProviderKind::Zai, "GLM-5.3-Flash");
         assert_eq!(zai_flash.big, "GLM-5.3-Flash");
         assert_eq!(zai_flash.cheap, None);
 
         // GLM-5.1 has no cheaper tier; faster children stay on the parent.
-        let zai_51 = provider_router_candidates(ApiProvider::Zai, "GLM-5.1");
+        let zai_51 = provider_router_candidates(ProviderKind::Zai, "GLM-5.1");
         assert_eq!(zai_51.big, "GLM-5.1");
         assert_eq!(zai_51.cheap, None);
 
         // GLM-5-Turbo is itself the cheap tier; no further downgrade.
-        let zai_turbo = provider_router_candidates(ApiProvider::Zai, "GLM-5-Turbo");
+        let zai_turbo = provider_router_candidates(ProviderKind::Zai, "GLM-5-Turbo");
         assert_eq!(zai_turbo.big, "GLM-5-Turbo");
         assert_eq!(zai_turbo.cheap, None);
 
         // Providers without a known cheap tier: big = session model, no cheap.
-        let ollama = provider_router_candidates(ApiProvider::Ollama, "qwen3:32b");
+        let ollama = provider_router_candidates(ProviderKind::Ollama, "qwen3:32b");
         assert_eq!(ollama.big, "qwen3:32b");
         assert_eq!(ollama.cheap, None);
 
-        let moonshot = provider_router_candidates(ApiProvider::Moonshot, "kimi-k2.6");
+        let moonshot = provider_router_candidates(ProviderKind::Moonshot, "kimi-k2.6");
         assert_eq!(moonshot.big, "kimi-k2.6");
         assert_eq!(moonshot.cheap, None);
     }
 
     #[test]
     fn provider_router_candidates_cover_catalog_fast_siblings() {
-        use crate::config::ApiProvider;
+        use crate::config::ProviderKind;
 
         let cases = [
-            (ApiProvider::OpenaiCodex, "gpt-5.6-sol", "gpt-5.6-luna"),
+            (ProviderKind::OpenaiCodex, "gpt-5.6-sol", "gpt-5.6-luna"),
             (
-                ApiProvider::Anthropic,
+                ProviderKind::Anthropic,
                 "claude-sonnet-4-6",
                 "claude-haiku-4-5",
             ),
-            (ApiProvider::XiaomiMimo, "mimo-v2.5-pro", "mimo-v2.5"),
-            (ApiProvider::Arcee, "trinity-large-thinking", "trinity-mini"),
-            (ApiProvider::Moonshot, "kimi-k2.7-code", "kimi-k2.6"),
+            (ProviderKind::XiaomiMimo, "mimo-v2.5-pro", "mimo-v2.5"),
             (
-                ApiProvider::Minimax,
+                ProviderKind::Arcee,
+                "trinity-large-thinking",
+                "trinity-mini",
+            ),
+            (ProviderKind::Moonshot, "kimi-k2.7-code", "kimi-k2.6"),
+            (
+                ProviderKind::Minimax,
                 "MiniMax-M2.7",
                 "MiniMax-M2.7-highspeed",
             ),
-            (ApiProvider::OpencodeGo, "kimi-k3", "kimi-k2.7-code"),
+            (ProviderKind::OpencodeGo, "kimi-k3", "kimi-k2.7-code"),
             (
-                ApiProvider::Openrouter,
+                ProviderKind::Openrouter,
                 "qwen/qwen3.6-max-preview",
                 "qwen/qwen3.6-flash",
             ),
             (
-                ApiProvider::Openrouter,
+                ProviderKind::Openrouter,
                 "anthropic/claude-sonnet-4-6",
                 "anthropic/claude-haiku-4-5",
             ),
@@ -3169,9 +3296,9 @@ mod tests {
         }
 
         for (provider, model) in [
-            (ApiProvider::Ollama, "qwen3:32b"),
-            (ApiProvider::Custom, "gpt-5.6-sol"),
-            (ApiProvider::OpenaiCodex, "gpt-5.6-luna"),
+            (ProviderKind::Ollama, "qwen3:32b"),
+            (ProviderKind::Custom, "gpt-5.6-sol"),
+            (ProviderKind::OpenaiCodex, "gpt-5.6-luna"),
         ] {
             assert_eq!(provider_router_candidates(provider, model).cheap, None);
         }
@@ -3192,7 +3319,7 @@ mod tests {
             let route = resolve_auto_route_with_inventory(&config, prompt, "", "auto", "auto")
                 .await
                 .expect("ollama Auto route should resolve");
-            assert_eq!(route.provider, ApiProvider::Ollama);
+            assert_eq!(route.provider.provider, ProviderKind::Ollama);
             assert_eq!(route.model, config.default_model());
             assert!(
                 !route.model.to_ascii_lowercase().contains("deepseek"),
@@ -3316,7 +3443,7 @@ mod decision_router_tests {
     }
 
     async fn route(config: &Config, latest: &str, context: &str) -> AutoRouteSelection {
-        let inventory = ModelInventory::from_config(config);
+        let inventory = ModelInventory::from_config(config).unwrap();
         assert!(
             inventory.router_available,
             "decision router must be available"
@@ -3426,7 +3553,7 @@ mod decision_router_tests {
         let config = decision_config(&format!("{}/api/v1", server.uri()), false, 2);
         let selection = route(&config, "Debug the release pipeline", "").await;
 
-        assert_eq!(selection.provider, ApiProvider::Deepseek);
+        assert_eq!(selection.provider.provider, ProviderKind::Deepseek);
         assert_eq!(selection.model, "deepseek-v4-pro");
         assert_eq!(selection.source, AutoRouteSource::FlashRouter);
         assert_eq!(selection.reasoning_effort, Some(ReasoningEffort::Max));
@@ -3649,7 +3776,7 @@ mod decision_router_tests {
         // A decision endpoint never inherits the active DeepSeek billing identity.
         assert_eq!(selection.routed_usage.len(), 1);
         let usage = &selection.routed_usage[0];
-        assert_eq!(usage.usage.route.provider, ApiProvider::Custom);
+        assert_eq!(usage.usage.route.provider, ProviderKind::Custom);
         assert_eq!(usage.usage.route.provider_identity, "typesafe");
         assert_eq!(
             usage.usage.route.billing_mode,
@@ -3670,7 +3797,7 @@ mod decision_router_tests {
             .expect("providers")
             .openrouter
             .api_key = None;
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         assert!(!inventory.router_available);
         let selection = auto_route_without_router(&config, &inventory);
         assert_eq!(
@@ -3685,7 +3812,7 @@ mod decision_router_tests {
 
     fn pair() -> ActiveTierPair {
         ActiveTierPair {
-            provider: ApiProvider::Deepseek,
+            provider: Config::default().test_identity_for_kind(ProviderKind::Deepseek),
             strong: "deepseek-v4-pro".to_string(),
             fast: "deepseek-v4-flash".to_string(),
         }
@@ -3694,7 +3821,7 @@ mod decision_router_tests {
     fn policy(cost_saving: bool, response: &SystemOneResponse) -> InventoryAutoRouteAttempt {
         let _env = hermetic_env();
         let config = decision_config("https://openrouter.invalid/api/v1", cost_saving, 2);
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         decision_attempt_from_response(cost_saving, &inventory, &pair(), None, response, 120)
     }
 
@@ -3784,7 +3911,7 @@ mod decision_router_tests {
                 .await;
             let config = decision_config(&format!("{}/api/v1", server.uri()), false, 2);
             let fallback =
-                auto_route_without_router(&config, &ModelInventory::from_config(&config));
+                auto_route_without_router(&config, &ModelInventory::from_config(&config).unwrap());
             let selection = route(&config, "Explain a variable name", "").await;
             assert_eq!(selection.source, AutoRouteSource::Heuristic);
             assert_eq!(selection.provider, fallback.provider);

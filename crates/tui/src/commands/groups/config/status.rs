@@ -367,19 +367,15 @@ fn fleet_drift_summary(
 ) -> Option<String> {
     let selected = crate::fleet::store::selected_fleet(&app.workspace)?;
     let (fleet, _scope) = crate::fleet::store::load_fleet_at(&selected.path).ok()?;
-    let active = config
-        .provider
-        .as_deref()
-        .and_then(crate::config::ApiProvider::parse)
-        .unwrap_or(crate::config::ApiProvider::Deepseek);
+    let active = config.active_provider_identity().ok();
     let health = crate::provider_readiness::ProviderReadinessSnapshot::default();
-    let routes =
-        crate::tui::views::fleet_setup::cross_provider_model_routes(config, active, &health);
-    let offered = |provider: &str, model: &str| {
-        routes
-            .iter()
-            .any(|(p, m, _)| p.eq_ignore_ascii_case(provider) && m.eq_ignore_ascii_case(model))
-    };
+    let routes = crate::tui::views::fleet_setup::cross_provider_model_routes(
+        config,
+        active.as_ref(),
+        &health,
+    );
+    let offered =
+        |provider: &str, model: &str| routes.iter().any(|(p, m, _)| p == provider && m == model);
     let mut drifted: Vec<String> = Vec::new();
     if let Some(operator) = &fleet.operator
         && !offered(&operator.provider, &operator.model)
@@ -568,9 +564,9 @@ fn context_window_override_key(app: &App, locale: Locale) -> Option<String> {
         return None;
     }
     let table = app
-        .api_provider
-        .metadata()
-        .map(|metadata| metadata.provider_config_key());
+        .provider_identity
+        .as_ref()
+        .and_then(|identity| identity.config_table_key().ok());
     Some(match table {
         Some(table) => localized(
             locale,
@@ -619,7 +615,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::config::{ApiProvider, Config};
+    use crate::config::{Config, ProviderKind};
     use crate::tui::app::TuiOptions;
     use crate::tui::history::HistoryCell;
     use codewhale_config::AppMode;
@@ -702,7 +698,11 @@ mod tests {
 
         let config = Config::load(app.config_path.clone(), app.config_profile.as_deref())
             .unwrap_or_default();
-        let base_url = config.base_url_for_route_identity(ApiProvider::Deepseek, "deepseek");
+        let base_url = config.base_url_for_route(
+            &config
+                .resolve_provider_selection_identity("deepseek")
+                .unwrap(),
+        );
         let fingerprint = codewhale_config::catalog::base_url_fingerprint(&base_url);
         let fetched_at = codewhale_config::catalog::now_unix();
         crate::provider_catalog_live::record_success(
@@ -742,7 +742,7 @@ mod tests {
             ..crate::test_support::test_tui_options(workspace)
         };
         let mut app = App::new(options, &Config::default());
-        app.api_provider = ApiProvider::Deepseek;
+        app.api_provider = ProviderKind::Deepseek;
         app
     }
 
@@ -910,7 +910,11 @@ mod tests {
     fn status_report_names_context_window_source_and_override_key() {
         let tmpdir = TempDir::new().expect("temp dir");
         let mut app = create_test_app(tmpdir.path().to_path_buf());
-        app.api_provider = ApiProvider::Moonshot;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Moonshot.as_str())
+                .expect("captured fixture provider"),
+        );
 
         let msg = status(&mut app).message.expect("status message");
 
@@ -951,7 +955,7 @@ mod tests {
     fn status_report_keeps_exact_named_custom_provider() {
         let tmpdir = TempDir::new().expect("temp dir");
         let mut app = create_test_app(tmpdir.path().to_path_buf());
-        app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+        app.set_provider_identity(ProviderKind::Custom, "lm-studio");
 
         let msg = status(&mut app).message.expect("status message");
 
@@ -967,7 +971,7 @@ mod tests {
     fn status_report_interpolation_preserves_braces_in_runtime_values() {
         let tmpdir = TempDir::new().expect("temp dir");
         let mut app = create_test_app(tmpdir.path().to_path_buf());
-        app.set_provider_identity(ApiProvider::Custom, "acme-{model}");
+        app.set_provider_identity(ProviderKind::Custom, "acme-{model}");
         app.model = "vision-{reasoning}".to_string();
         app.current_session_id = Some("session-{cells}-{messages}".to_string());
 

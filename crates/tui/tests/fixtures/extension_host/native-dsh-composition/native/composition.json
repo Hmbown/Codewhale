@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "layers": [
+    {
+      "path": "base.yml",
+      "sha256": "c31370d3f7bf2bf493803e07230d69410a435dcdbede6555bcbadc528a99c570",
+      "source": "- insert:\n  - id: author-row\n    name: ./modules/author.mjs\n    config:\n      text: initial text\n"
+    },
+    {
+      "path": "overlay.yml",
+      "sha256": "f74c84f0db856d9406a499ef5220031ef6df994e98c973665212b9e49634c502",
+      "source": "- id: author-row\n  name: ./modules/author.mjs\n  config:\n    text: !!js '\"hello\" + \" from upstream\"'\n"
+    }
+  ],
+  "modules": [
+    {
+      "name": "./modules/author.mjs",
+      "path": "modules/author.mjs",
+      "sha256": "ffdc9a2d89a958b3d5405b9299f76ff140ed8df6d34eee8c439349b175e6b668"
+    }
+  ],
+  "files": {
+    "base.yml": "c31370d3f7bf2bf493803e07230d69410a435dcdbede6555bcbadc528a99c570",
+    "modules/author.mjs": "ffdc9a2d89a958b3d5405b9299f76ff140ed8df6d34eee8c439349b175e6b668",
+    "overlay.yml": "f74c84f0db856d9406a499ef5220031ef6df994e98c973665212b9e49634c502",
+    "skills/receipt-check/SKILL.md": "fcb4876d5914587a6870814c6f47490b1a52c79afd9628c45ec71aea0a0aca50"
+  }
+}

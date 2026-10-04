@@ -24,7 +24,7 @@ fn cold_process() {
     crate::provider_lake::clear_live_snapshot();
 }
 
-fn persist_catalog(kind: ApiProvider, identity: &str, endpoint: &str, images: bool) {
+fn persist_catalog(kind: ProviderKind, identity: &str, endpoint: &str, images: bool) {
     let fingerprint = base_url_fingerprint(endpoint);
     let fetched_at = now_unix();
     let ticket = crate::provider_catalog_live::begin_refresh_for_identity(kind, identity, endpoint);
@@ -86,7 +86,7 @@ fn config_for(identity: &str, endpoint: &str) -> Config {
 }
 
 fn image_capability(config: &Config) -> CapabilityState {
-    provider_model_image_input_for_api(config, config.api_provider(), MODEL)
+    provider_model_image_input_for_api(config, &config.active_provider_identity().unwrap(), MODEL)
 }
 
 fn open_server_manager(config: &Config, root: &Path) -> Result<SharedRuntimeThreadManager> {
@@ -98,6 +98,7 @@ fn open_server_manager(config: &Config, root: &Path) -> Result<SharedRuntimeThre
         RuntimeThreadManagerConfig {
             data_dir: root.join("runtime"),
             task_data_dir: root.join("tasks"),
+            sessions_dir: None,
             max_active_threads: 2,
         },
         Arc::new(crate::plugins::PluginRegistry::empty(&workspace)),
@@ -118,13 +119,16 @@ fn headless_startup_publishes_cold_endpoint_catalog_capabilities() -> Result<()>
     let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
     let _reset = CatalogReset;
     cold_process();
-    persist_catalog(ApiProvider::Openrouter, "openrouter", FIRST_ENDPOINT, true);
+    persist_catalog(ProviderKind::Openrouter, "openrouter", FIRST_ENDPOINT, true);
     cold_process();
 
     let config = config_for("openrouter", FIRST_ENDPOINT);
     assert!(
-        provider_models_for_api(&config, ApiProvider::Openrouter, ApiProvider::Openrouter)
-            .contains(&MODEL.to_string())
+        provider_models_for_api(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Openrouter)
+        )
+        .contains(&MODEL.to_string())
     );
     assert_eq!(image_capability(&config), CapabilityState::Unknown);
     let _manager = open_server_manager(&config, home.path())?;
@@ -148,9 +152,9 @@ async fn headless_reload_publishes_only_the_accepted_identity_and_endpoint() -> 
     let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
     let _reset = CatalogReset;
     cold_process();
-    persist_catalog(ApiProvider::Custom, "vision-one", FIRST_ENDPOINT, true);
-    persist_catalog(ApiProvider::Custom, "vision-two", FIRST_ENDPOINT, false);
-    persist_catalog(ApiProvider::Custom, "vision-one", SECOND_ENDPOINT, false);
+    persist_catalog(ProviderKind::Custom, "vision-one", FIRST_ENDPOINT, true);
+    persist_catalog(ProviderKind::Custom, "vision-two", FIRST_ENDPOINT, false);
+    persist_catalog(ProviderKind::Custom, "vision-one", SECOND_ENDPOINT, false);
     cold_process();
 
     let first = config_for("vision-one", FIRST_ENDPOINT);

@@ -11,6 +11,21 @@ on:
         description: Workspace version without a v prefix
         required: true
         type: string
+      compiled_host_delivery:
+        description: Explicitly include qualified optional companions; Node stays default
+        required: false
+        default: false
+        type: boolean
+      compiled_host_run_id:
+        description: Green official CI run at this exact SHA containing Native image proof
+        required: false
+        default: ''
+        type: string
+      compiled_host_targets:
+        description: Comma-separated matching-native targets with qualified CI receipts
+        required: false
+        default: linux-x64,macos-arm64,windows-x64
+        type: string
       retention_days:
         description: Retention for Actions-only intermediate and assembled artifacts
         required: false
@@ -19,6 +34,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,6 +65,22 @@ jobs:
             echo "::error::Reusable workflow SHA ${actual} does not match source_sha ${SOURCE_SHA}." >&2
             exit 1
           fi
+      - name: Require explicit matching-native qualification selection
+        if: inputs.compiled_host_delivery
+        env:
+          QUALIFICATION_RUN: ${{ inputs.compiled_host_run_id }}
+          HOST_TARGETS: ${{ inputs.compiled_host_targets }}
+        run: |
+          set -euo pipefail
+          [[ "${QUALIFICATION_RUN}" =~ ^[0-9]+$ ]] || { echo 'Enabled host delivery needs an exact green CI run id' >&2; exit 1; }
+          [[ -n "${HOST_TARGETS}" ]] || { echo 'No compiled host targets selected' >&2; exit 1; }
+          declare -A seen
+          IFS=',' read -ra selected <<< "${HOST_TARGETS}"
+          for target in "${selected[@]}"; do
+            case "${target}" in linux-x64|linux-arm64|macos-x64|macos-arm64|windows-x64|windows-arm64) ;; *) echo "Unsupported compiled host target ${target}" >&2; exit 1 ;; esac
+            [[ -z "${seen[${target}]:-}" ]] || { echo "Duplicate compiled host target ${target}" >&2; exit 1; }
+            seen["${target}"]=1
+          done
 
   build:
     name: Build ${{ matrix.platform }}
@@ -257,6 +289,38 @@ jobs:
           # completeness/updater contract. This is the same runtime, not a
           # separately compiled or installed TUI command.
           stage_binary "${{ matrix.cli_binary }}" "${{ matrix.compat_tui_artifact }}"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2
+        if: inputs.compiled_host_delivery && contains(format(',{0},', inputs.compiled_host_targets), format(',{0},', matrix.platform))
+        with:
+          bun-version: 1.4.0
+      - name: Stage exact qualified optional host image
+        if: inputs.compiled_host_delivery && contains(format(',{0},', inputs.compiled_host_targets), format(',{0},', matrix.platform))
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUALIFICATION_RUN: ${{ inputs.compiled_host_run_id }}
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RUNTIME_CLOSURE_DIR: ${{ vars.CODEWHALE_COMPILED_HOST_CLOSURE_DIR }}
+        run: |
+          set -euo pipefail
+          proof_dir="${RUNNER_TEMP}/compiled-host-proof-${TARGET_PLATFORM}"
+          node scripts/release/fetch-compiled-host-proof.js --repo "${GITHUB_REPOSITORY}" --run-id "${QUALIFICATION_RUN}" --source-sha "${GITHUB_SHA}" --target "${TARGET_PLATFORM}" --output "${proof_dir}"
+          test -n "${RUNTIME_CLOSURE_DIR}" || { echo 'Enabled compiled-host delivery requires reviewed complete local runtime notices/relink-source closure' >&2; exit 1; }
+          bun_binary="$(bun -p 'process.execPath')"
+          extension=""
+          if [[ "${TARGET_PLATFORM}" == windows-* ]]; then extension=.exe; fi
+          node scripts/release/stage-compiled-host.mjs --bun "${bun_binary}" --compiled-image "${proof_dir}/codewhale-extension-host${extension}" --native-receipt "${proof_dir}/native-receipt.json" --runtime-closure "${RUNTIME_CLOSURE_DIR}/${TARGET_PLATFORM}.json" --target "${TARGET_PLATFORM}" --version "${RELEASE_VERSION}" --source-sha "${GITHUB_SHA}" --output-dir "compiled-host-${TARGET_PLATFORM}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: inputs.compiled_host_delivery && contains(format(',{0},', inputs.compiled_host_targets), format(',{0},', matrix.platform))
+        with:
+          name: codewhale-compiled-host-${{ matrix.platform }}
+          path: |
+            compiled-host-${{ matrix.platform }}/codewhale-extension-host-*
+            compiled-host-${{ matrix.platform }}/codewhale-extension-hosts.json
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention_days }}
+          overwrite: true
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.cli_artifact }}
@@ -290,6 +354,10 @@ jobs:
         with:
           path: artifacts
           pattern: '*'
+      - name: Collect only qualified requested compiled hosts
+        if: inputs.compiled_host_delivery
+        shell: bash
+        run: node scripts/release/stage-compiled-host.mjs --collect artifacts --output-dir artifacts/codewhale-compiled-hosts
       - name: Create and checksum platform archives
         shell: bash
         env:
@@ -313,6 +381,14 @@ jobs:
           if-no-files-found: error
           retention-days: ${{ inputs.retention_days }}
           overwrite: true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: inputs.compiled_host_delivery
+        with:
+          name: codewhale-compiled-hosts
+          path: artifacts/codewhale-compiled-hosts/*
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention_days }}
+          overwrite: true
 
   windows-installer:
     timeout-minutes: 15
@@ -324,7 +400,7 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
-          pattern: '*windows-x64.exe'
+          pattern: '*windows-x64*'
       - name: Install NSIS
         shell: pwsh
         run: choco install nsis -y --no-progress
@@ -341,8 +417,23 @@ jobs:
           if (!(Test-Path $makensis)) {
             throw "makensis.exe not found after NSIS install"
           }
+          $hostDefine = @()
+          $hostCatalog = "artifacts\codewhale-compiled-host-windows-x64\codewhale-extension-hosts.json"
+          if (Test-Path $hostCatalog) {
+            node -e "const h=require('./npm/codewhale/scripts/compiled-hosts'); const fs=require('fs'); const p=require('path'); const f=process.argv[1]; h.verifyDirectory(p.dirname(f), h.parseCatalog(fs.readFileSync(f),'${{ inputs.version }}'));" $hostCatalog
+            if ($LASTEXITCODE -ne 0) { throw 'Compiled host payload/catalog verification failed' }
+            $catalog = Get-Content -Raw $hostCatalog | ConvertFrom-Json
+            $hostEntry = @($catalog.hosts | Where-Object { $_.target -eq 'windows-x64' })
+            if ($hostEntry.Count -ne 1) { throw 'No unique qualified Windows host' }
+            $hostDir = Split-Path $hostCatalog
+            Copy-Item "$hostDir\$($hostEntry[0].asset)" "scripts\installer\codewhale-extension-host.exe"
+            Copy-Item "$hostDir\$($hostEntry[0].notices_asset)" "scripts\installer\codewhale-extension-host.LICENSES.txt"
+            Copy-Item "$hostDir\$($hostEntry[0].source_asset)" "scripts\installer\codewhale-extension-host.relink-source.tar.gz"
+            Copy-Item $hostCatalog "scripts\installer\codewhale-extension-host.release.json"
+            $hostDefine = @('/DCOMPILED_HOST=1')
+          }
           Push-Location scripts\installer
-          & $makensis "/DVERSION=${{ inputs.version }}" "codewhale.nsi"
+          & $makensis "/DVERSION=${{ inputs.version }}" @hostDefine "codewhale.nsi"
           Pop-Location
           if (!(Test-Path "scripts\installer\CodeWhaleSetup.exe")) {
             throw "CodeWhaleSetup.exe was not produced"

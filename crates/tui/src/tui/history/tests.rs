@@ -39,6 +39,25 @@ use codewhale_models::{ContentBlock, Message, Role};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+#[test]
+fn extension_prompt_snapshots_and_withdrawal_show_the_complete_model_input() {
+    let instructions = format!("{}\nLast instruction.", "x".repeat(12_000));
+    for block in [Some(instructions.as_str()), None] {
+        let message = crate::runtime_handoff::extension_prompt_contributions_runtime_message(block);
+        let cells = super::history_cells_from_message(&message);
+        let [HistoryCell::System { content }] = cells.as_slice() else {
+            panic!("runtime instructions must be shown as a system receipt");
+        };
+        match block {
+            Some(text) => assert!(
+                content.contains(text),
+                "the full model-visible text stays auditable"
+            ),
+            None => assert!(content.contains("withdrawn")),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

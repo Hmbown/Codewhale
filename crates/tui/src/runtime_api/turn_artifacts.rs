@@ -82,7 +82,11 @@ pub(super) async fn read_turn_artifact(
     let artifact = select_reference(&view, &artifact_id, query.revision.as_deref())?;
     let workspace = view.workspace.clone();
     let thread_workspace = view.thread_workspace.clone();
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
     tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
         let (source, current, read) = match artifact.kind {
             TurnArtifactKind::File => {
                 read_file_artifact(&thread_workspace, workspace.as_ref(), &artifact)?

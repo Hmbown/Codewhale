@@ -1,0 +1,108 @@
+{
+  "description": "A bearer-token server (token from bearer_token_env_var, secret supplied by the harness and required by the server). Pins Rust McpHttpAuth::resolved_headers / StreamableHttpTransport::send / bounded_body_excerpt: the token authenticates every request (the call succeeds only because the server saw it), a server that echoes the credential back in an error body has it redacted, and a 401 mid-session surfaces the needs-auth transition (success=false, mcp_catalog_changed) with the bearer-token recovery hint. The harness fails if the secret appears in any recorded byte; requests record only the Authorization header's shape.",
+  "server_name": "conformance",
+  "bearer_secret": "conformance-secret-token-7f3a91c4e2",
+  "server_options": {
+    "require_bearer": true
+  },
+  "record_requests": "summary",
+  "server": {
+    "initialize": {
+      "result": {
+        "protocolVersion": "2025-06-18",
+        "serverInfo": {
+          "name": "bearer-fixture",
+          "version": "1.0.0"
+        },
+        "capabilities": {
+          "tools": {}
+        }
+      }
+    },
+    "tools/list": {
+      "result": {
+        "tools": [
+          {
+            "name": "echo",
+            "inputSchema": {
+              "type": "object"
+            }
+          },
+          {
+            "name": "echo_credential",
+            "description": "A buggy server: answers 500 and repeats the Authorization header.",
+            "inputSchema": {
+              "type": "object"
+            }
+          },
+          {
+            "name": "revoked",
+            "description": "The token stops being accepted mid-session.",
+            "inputSchema": {
+              "type": "object"
+            }
+          }
+        ]
+      }
+    },
+    "tools/call": [
+      {
+        "match": {
+          "name": "echo"
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "authenticated"
+            }
+          ]
+        }
+      },
+      {
+        "match": {
+          "name": "echo_credential"
+        },
+        "http": {
+          "status": 500,
+          "body": "upstream failure while handling Authorization: {{authorization}}"
+        }
+      },
+      {
+        "match": {
+          "name": "revoked"
+        },
+        "http": {
+          "status": 401,
+          "headers": {
+            "WWW-Authenticate": "Bearer error=\"invalid_token\""
+          },
+          "body": "{\"error\":\"invalid_token\"}"
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_echo",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_echo_credential",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_revoked",
+      "input": {}
+    },
+    {
+      "op": "catalog"
+    }
+  ]
+}

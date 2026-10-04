@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 use crate::commands::groups::session::MAX_TITLE_LEN;
 use crate::commands::{CommandResult, execute};
-use crate::config::{ApiProvider, Config};
+use crate::config::{Config, ProviderKind};
 use crate::session_manager::{SessionManager, create_saved_session_with_mode};
 use crate::test_support::{EnvVarGuard, TestEnvLock};
 use crate::tui::app::{App, AppAction, TuiOptions};
@@ -130,7 +130,7 @@ fn rename_persists_all_live_metadata_through_public_dispatch() {
         .set_model_selection("local-code-model".to_string());
     harness
         .app
-        .set_provider_identity(ApiProvider::Custom, "lm-studio");
+        .set_provider_identity(ProviderKind::Custom, "lm-studio");
     harness.app.mode = AppMode::Operate;
     harness.app.system_prompt = None;
     harness.app.todos.try_lock().expect("todos lock").add(

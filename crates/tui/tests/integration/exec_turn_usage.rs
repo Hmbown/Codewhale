@@ -14,7 +14,6 @@
 #![cfg(unix)]
 
 use std::io::Read;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -162,17 +161,17 @@ fn run_exec_stream_json(server: &MockServer) -> Vec<Value> {
         .collect()
 }
 
-/// Run `codewhale-tui exec <exec_args>` against `server` and return stdout.
+/// Run `codewhale exec <exec_args>` against `server` and return stdout.
 fn run_exec(server: &MockServer, exec_args: &[&str]) -> String {
     let (success, stdout, stderr) = run_exec_unchecked(server, exec_args);
     assert!(
         success,
-        "codewhale-tui exec failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "codewhale exec failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     stdout
 }
 
-/// Run `codewhale-tui exec <exec_args>` and return whether it exited
+/// Run `codewhale exec <exec_args>` and return whether it exited
 /// successfully, its stdout and its stderr.
 fn run_exec_unchecked(server: &MockServer, exec_args: &[&str]) -> (bool, String, String) {
     run_exec_in_home(server, exec_args, |_| {})
@@ -198,7 +197,7 @@ fn run_exec_with_stdin(
     let workspace = TempDir::new().expect("workspace tempdir");
     let home = TempDir::new().expect("home tempdir");
 
-    let mut command = Command::new(codewhale_tui_binary());
+    let mut command = Command::new(crate::binary::codewhale());
     preserve_host_env(&mut command);
     command
         .current_dir(workspace.path())
@@ -236,7 +235,7 @@ fn run_exec_with_stdin(
     if stdin.is_some() {
         command.stdin(Stdio::piped());
     }
-    let mut child = command.spawn().expect("spawn codewhale-tui exec");
+    let mut child = command.spawn().expect("spawn codewhale exec");
     let stdin_writer = stdin.map(|bytes| {
         let mut pipe = child.stdin.take().expect("stdin pipe");
         std::thread::spawn(move || {
@@ -248,10 +247,7 @@ fn run_exec_with_stdin(
     let stdout_reader = read_pipe_in_background(child.stdout.take().expect("stdout pipe"));
     let stderr_reader = read_pipe_in_background(child.stderr.take().expect("stderr pipe"));
 
-    let status = match child
-        .wait_timeout(RUN_TIMEOUT)
-        .expect("wait for codewhale-tui")
-    {
+    let status = match child.wait_timeout(RUN_TIMEOUT).expect("wait for codewhale") {
         Some(status) => status,
         None => {
             let _ = child.kill();
@@ -259,7 +255,7 @@ fn run_exec_with_stdin(
             let stdout = join_pipe_reader(stdout_reader, "stdout");
             let stderr = join_pipe_reader(stderr_reader, "stderr");
             panic!(
-                "codewhale-tui exec timed out after {RUN_TIMEOUT:?}\nstdout:\n{}\nstderr:\n{}",
+                "codewhale exec timed out after {RUN_TIMEOUT:?}\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&stdout),
                 String::from_utf8_lossy(&stderr)
             );
@@ -296,23 +292,6 @@ fn join_pipe_reader(
         .join()
         .unwrap_or_else(|_| panic!("{stream_name} reader thread panicked"))
         .unwrap_or_else(|err| panic!("failed to read {stream_name}: {err}"))
-}
-
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
 }
 
 fn events_of_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> {

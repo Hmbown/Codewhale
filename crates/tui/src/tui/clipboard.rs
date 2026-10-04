@@ -901,6 +901,25 @@ fn clipboard_images_dir_for_home(workspace: &Path, home: Option<&Path>) -> PathB
     workspace.join("clipboard-images")
 }
 
+/// Pinned, no-follow writer for `dir`, which is `<root>/<name>`: `root` may be a
+/// user-selected link (a relocated `~/.codewhale`), but nothing below it may be.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
+fn clipboard_image_target(
+    dir: &Path,
+    file_name: &str,
+) -> Result<crate::fleet::files::WorkspaceFile> {
+    let root = dir.parent().context("clipboard-images dir has no parent")?;
+    let name = dir
+        .file_name()
+        .context("clipboard-images dir has no name")?;
+    crate::fleet::files::WorkspaceFile::open(root, &Path::new(name).join(file_name), true)
+        .context("open clipboard-images destination (links are not followed)")
+}
+
 /// Encode an RGBA `ImageData` from arboard as PNG and persist it. Returns
 /// the resulting path along with metadata used to render the paste hint.
 #[cfg(any(
@@ -920,14 +939,10 @@ fn save_image_as_png(workspace: &Path, image: &ImageData) -> Result<PastedImage>
     all(target_os = "linux", not(target_env = "ohos"))
 ))]
 fn save_image_as_png_in(dir: &Path, image: &ImageData) -> Result<PastedImage> {
-    std::fs::create_dir_all(dir).context("create clipboard-images dir")?;
-
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let path = dir.join(format!("clipboard-{timestamp}.png"));
-
     let width = u32::try_from(image.width).context("clipboard image width too large")?;
     let height = u32::try_from(image.height).context("clipboard image height too large")?;
 
@@ -945,13 +960,23 @@ fn save_image_as_png_in(dir: &Path, image: &ImageData) -> Result<PastedImage> {
 
     let buffer: ImageBuffer<Rgba<u8>, _> = ImageBuffer::from_raw(width, height, rgba)
         .context("clipboard image dimensions did not match buffer length")?;
+    // Encode in memory and publish through the pinned no-follow writer: the
+    // destination is created exclusively and owner-only, and a linked
+    // directory or file name is refused rather than written through.
+    let mut encoded = Vec::new();
     buffer
-        .save_with_format(&path, image::ImageFormat::Png)
+        .write_to(
+            &mut std::io::Cursor::new(&mut encoded),
+            image::ImageFormat::Png,
+        )
+        .context("encode clipboard PNG")?;
+    let file_name = format!("clipboard-{timestamp}.png");
+    clipboard_image_target(dir, &file_name)?
+        .publish(&encoded)
         .context("write clipboard PNG")?;
+    let path = dir.join(file_name);
 
-    let byte_len = std::fs::metadata(&path)
-        .map(|m| m.len() as usize)
-        .unwrap_or(0);
+    let byte_len = encoded.len();
     Ok(PastedImage {
         path,
         width,
@@ -1168,6 +1193,35 @@ mod tests {
         // we ever regress to PPM or another format this will catch it.
         let header = std::fs::read(&pasted.path).unwrap();
         assert_eq!(&header[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "macos",
+            all(target_os = "linux", not(target_env = "ohos"))
+        )
+    ))]
+    fn pasted_images_are_private_and_never_written_through_a_link() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let img = solid_rgba(2, 2, [0, 255, 0, 255]);
+
+        let real = root.path().join("clipboard-images");
+        let pasted = save_image_as_png_in(&real, &img).expect("a plain directory works");
+        let mode = std::fs::metadata(&pasted.path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "pasted images are owner-only");
+
+        // A linked destination directory is refused and nothing lands behind it.
+        let linked = root.path().join("linked-images");
+        symlink(outside.path(), &linked).unwrap();
+        assert!(save_image_as_png_in(&linked, &img).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 
     #[test]

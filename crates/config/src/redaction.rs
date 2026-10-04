@@ -228,6 +228,12 @@ fn config_binding(config_path: &Path) -> io::Result<ConfigBinding> {
 }
 
 fn read_state(path: &std::path::Path) -> StateFile {
+    // A receipt is something this process wrote. A link in its place is never
+    // read through, so it cannot vouch for an opt-out; unconfirmed is the
+    // safe answer.
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return StateFile::default();
+    }
     fs::read_to_string(path)
         .ok()
         .and_then(|body| serde_json::from_str(&body).ok())
@@ -235,11 +241,6 @@ fn read_state(path: &std::path::Path) -> StateFile {
 }
 
 fn write_state(path: &Path, config_path: &Path, confirmed: bool) -> io::Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
     let body = serde_json::to_string_pretty(&StateFile {
         model_bound_disabled_confirmed: confirmed,
         config_binding: if confirmed {
@@ -249,7 +250,11 @@ fn write_state(path: &Path, config_path: &Path, confirmed: bool) -> io::Result<(
         },
     })
     .map_err(io::Error::other)?;
-    fs::write(path, body)
+    // Owner-only (0600 on Unix) through a temporary file renamed into place:
+    // the receipt's own name is replaced, never written through, so a link
+    // planted there cannot redirect the write.
+    crate::persistence::atomic_write(path, body.as_bytes())
+        .map_err(|error| io::Error::other(format!("{error:#}")))
 }
 
 #[cfg(test)]
@@ -265,6 +270,55 @@ mod tests {
     fn absent_state_is_not_confirmed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         assert!(!read_state(&state_path(tmp.path())).model_bound_disabled_confirmed);
+    }
+
+    /// The receipt is written owner-only, never through a link planted at its
+    /// name, and carries a path, a digest and a timestamp, not config text.
+    #[test]
+    fn receipt_is_private_never_written_through_a_link_and_holds_no_config_text() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join(crate::CONFIG_FILE_NAME);
+        let secret = "sk-redaction-receipt-marker-0123456789abcdef";
+        fs::write(
+            &config_path,
+            format!("api_key = \"{secret}\"\n[redaction]\nmodel_bound = \"disabled\"\n"),
+        )
+        .expect("write config");
+
+        // Plant a link where the receipt will go.
+        #[cfg(unix)]
+        let victim = {
+            let victim = tmp.path().join("victim.txt");
+            fs::write(&victim, "keep me").expect("victim");
+            std::os::unix::fs::symlink(&victim, model_bound_state_path(&config_path))
+                .expect("plant link");
+            assert!(
+                !read_state(&model_bound_state_path(&config_path)).model_bound_disabled_confirmed
+            );
+            victim
+        };
+
+        let receipt = record_model_bound_disabled_confirmation(&config_path).expect("record");
+        let body = fs::read_to_string(&receipt).expect("receipt");
+        assert!(body.contains("\"sha256\""), "{body}");
+        assert!(
+            !body.contains(secret),
+            "a receipt never carries config text"
+        );
+        assert!(
+            !body.contains("api_key"),
+            "a receipt never carries config text"
+        );
+        assert!(read_state(&receipt).model_bound_disabled_confirmed);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me");
+            let metadata = fs::symlink_metadata(&receipt).unwrap();
+            assert!(!metadata.file_type().is_symlink(), "the link was replaced");
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
     }
 
     #[test]

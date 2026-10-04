@@ -128,7 +128,7 @@ pub fn active_component_sources(
     (sources, errors)
 }
 
-fn staged_component_path(
+pub(super) fn staged_component_path(
     canonical_root: &Path,
     staged_root: &Path,
     source_path: &Path,

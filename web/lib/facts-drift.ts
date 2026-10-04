@@ -12,12 +12,12 @@
  * fixes itself within one cron tick — no redeploy. Semantic drift (a new
  * feature should be advertised on the homepage) is still left to humans.
  */
+import { parseModelCatalog } from "./model-catalog.mjs";
+import { parseProviderDescriptors } from "./provider-descriptors.mjs";
 import { fetchBoundedText } from "./bounded-body";
 import type {
   PublishedReleaseFact,
   RepoFacts,
-  ProviderFact,
-  ModelFact,
 } from "./facts.generated";
 import { FACTS as BUILD_FACTS } from "./facts.generated";
 import { isRepoFacts } from "./facts";
@@ -98,98 +98,6 @@ function deriveCrates(cargo: string): string[] {
   return [...block[1].matchAll(/"crates\/([^"]+)"/g)].map((m) => m[1]).sort();
 }
 
-// Match what the published CLI binary's `--provider` flag accepts
-// (ProviderArg in crates/cli/src/lib.rs). DeepseekCN exists in the
-// legacy tui ApiProvider enum but is not wired through ProviderKind,
-// so the binary rejects it — keep it out of the docs. Issue #1104.
-//
-// Must equal PROVIDER_LABEL_MAP in web/scripts/facts-lib.mjs; a variant missing
-// here is dropped from the cron-written KV snapshot while the build facts keep
-// it (facts-drift.test.ts compares the two).
-export const PROVIDER_LABELS: Readonly<Record<string, ProviderFact>> = {
-  Deepseek: { id: "deepseek", label: "DeepSeek", env: "DEEPSEEK_API_KEY" },
-  DeepseekAnthropic: { id: "deepseek-anthropic", label: "DeepSeek Anthropic", env: "DEEPSEEK_API_KEY / ANTHROPIC_API_KEY" },
-  NvidiaNim: { id: "nvidia-nim", label: "NVIDIA NIM", env: "NVIDIA_API_KEY / NVIDIA_NIM_API_KEY" },
-  Openai: { id: "openai", label: "OpenAI-compatible", env: "OPENAI_API_KEY" },
-  Atlascloud: { id: "atlascloud", label: "AtlasCloud", env: "ATLASCLOUD_API_KEY" },
-  WanjieArk: { id: "wanjie-ark", label: "Wanjie Ark", env: "WANJIE_ARK_API_KEY / WANJIE_API_KEY / WANJIE_MAAS_API_KEY" },
-  Volcengine: { id: "volcengine", label: "Volcengine Ark", env: "VOLCENGINE_API_KEY / VOLCENGINE_ARK_API_KEY / ARK_API_KEY" },
-  Openrouter: { id: "openrouter", label: "OpenRouter", env: "OPENROUTER_API_KEY" },
-  Orcarouter: { id: "orcarouter", label: "OrcaRouter", env: "ORCAROUTER_API_KEY" },
-  XiaomiMimo: { id: "xiaomi-mimo", label: "Xiaomi MiMo", env: "XIAOMI_MIMO_TOKEN_PLAN_API_KEY / MIMO_TOKEN_PLAN_API_KEY / XIAOMI_MIMO_API_KEY / XIAOMI_API_KEY / MIMO_API_KEY" },
-  Novita: { id: "novita", label: "Novita AI", env: "NOVITA_API_KEY" },
-  Fireworks: { id: "fireworks", label: "Fireworks AI", env: "FIREWORKS_API_KEY" },
-  Siliconflow: { id: "siliconflow", label: "SiliconFlow", env: "SILICONFLOW_API_KEY" },
-  SiliconflowCn: { id: "siliconflow-CN", label: "SiliconFlow CN", env: "SILICONFLOW_API_KEY" },
-  Arcee: { id: "arcee", label: "Arcee AI", env: "ARCEE_API_KEY" },
-  Moonshot: { id: "moonshot", label: "Moonshot/Kimi", env: "MOONSHOT_API_KEY / KIMI_API_KEY" },
-  Sglang: { id: "sglang", label: "SGLang", env: "SGLANG_API_KEY" },
-  Vllm: { id: "vllm", label: "vLLM", env: "VLLM_API_KEY" },
-  Ollama: { id: "ollama", label: "Ollama", env: "OLLAMA_API_KEY" },
-  OllamaCloud: { id: "ollama-cloud", label: "Ollama Cloud", env: "OLLAMA_CLOUD_API_KEY / OLLAMA_API_KEY" },
-  Huggingface: { id: "huggingface", label: "Hugging Face", env: "HUGGINGFACE_API_KEY / HF_TOKEN" },
-  Modelscope: { id: "modelscope", label: "ModelScope", env: "MODELSCOPE_API_KEY" },
-  Deepinfra: { id: "deepinfra", label: "DeepInfra", env: "DEEPINFRA_API_KEY / DEEPINFRA_TOKEN" },
-  Together: { id: "together", label: "Together AI", env: "TOGETHER_API_KEY" },
-  Qianfan: { id: "qianfan", label: "Baidu Qianfan", env: "QIANFAN_API_KEY / BAIDU_QIANFAN_API_KEY" },
-  OpenaiCodex: { id: "openai-codex", label: "OpenAI Codex", env: "ChatGPT OAuth via `codewhale auth chatgpt`; optional consented Codex CLI credentials (OPENAI_CODEX_ACCESS_TOKEN / CODEX_ACCESS_TOKEN override)" },
-  OpencodeGo: { id: "opencode-go", label: "OpenCode Go", env: "OPENCODE_GO_API_KEY" },
-  OpencodeZen: { id: "opencode-zen", label: "OpenCode Zen", env: "OPENCODE_ZEN_API_KEY / OPENCODE_API_KEY" },
-  Anthropic: { id: "anthropic", label: "Anthropic", env: "ANTHROPIC_API_KEY" },
-  Zai: { id: "zai", label: "Z.ai", env: "ZAI_API_KEY / Z_AI_API_KEY" },
-  Stepfun: { id: "stepfun", label: "StepFun", env: "STEPFUN_API_KEY / STEP_API_KEY" },
-  Minimax: { id: "minimax", label: "MiniMax", env: "MINIMAX_API_KEY" },
-  MinimaxAnthropic: { id: "minimax-anthropic", label: "MiniMax (Anthropic-compatible)", env: "MINIMAX_API_KEY" },
-  Openmodel: { id: "openmodel", label: "OpenModel", env: "OPENMODEL_API_KEY" },
-  Sakana: { id: "sakana", label: "Sakana AI", env: "FUGU_API_KEY / SAKANA_API_KEY" },
-  LongCat: { id: "longcat", label: "Meituan LongCat", env: "LONGCAT_API_KEY" },
-  Meta: { id: "meta", label: "Meta Model API", env: "META_MODEL_API_KEY / MODEL_API_KEY" },
-  Telecomjs: { id: "telecomjs", label: "TelecomJS TokenHub", env: "TELECOMJS_API_KEY" },
-  Xai: { id: "xai", label: "xAI", env: "XAI_API_KEY" },
-  Mistral: { id: "mistral", label: "Mistral AI", env: "MISTRAL_API_KEY" },
-  Google: { id: "google", label: "Google Gemini", env: "GOOGLE_API_KEY / GEMINI_API_KEY" },
-  Edenai: { id: "edenai", label: "Eden AI", env: "EDENAI_API_KEY" },
-  Concentrate: { id: "concentrate", label: "Concentrate", env: "CONCENTRATE_API_KEY" },
-  Codewhale: { id: "codewhale", label: "Codewhale", env: "CODEWHALE_API_KEY" },
-  ModelstudioTokenPlan: { id: "modelstudio-token-plan", label: "Model Studio Token Plan", env: "MODELSTUDIO_API_KEY" },
-  ModelstudioTokenPlanAnthropic: { id: "modelstudio-token-plan-anthropic", label: "Model Studio Token Plan (Anthropic-compatible)", env: "MODELSTUDIO_API_KEY" },
-  ModelstudioCodingPlan: { id: "modelstudio-coding-plan", label: "Model Studio Coding Plan", env: "MODELSTUDIO_API_KEY" },
-  ModelstudioCodingPlanAnthropic: { id: "modelstudio-coding-plan-anthropic", label: "Model Studio Coding Plan (Anthropic-compatible)", env: "MODELSTUDIO_API_KEY" },
-  Zenmux: { id: "zenmux", label: "ZenMux", env: "ZENMUX_API_KEY" },
-  Csdn: { id: "csdn", label: "CSDN 星图 (Starmap)", env: "CSDN_API_KEY" },
-};
-
-function deriveProvidersFromConfig(cfg: string): ProviderFact[] {
-  const enumBlock = cfg.match(/pub enum ApiProvider \{([\s\S]*?)\}/);
-  if (!enumBlock) return [];
-  const variants = [...enumBlock[1].matchAll(/^\s*(\w+)\s*,\s*$/gm)].map((m) => m[1]);
-  const labelMap = PROVIDER_LABELS;
-  // Log loudly on unmapped variants so a new provider can never be silently
-  // dropped from the drift-derived facts again. DeepseekCN (#1104), the
-  // dynamic Custom meta-provider (#1519, user-defined endpoints), and
-  // Antigravity (a non-runnable legacy config tombstone, never a website
-  // provider) are the deliberate exclusions.
-  const EXCLUDED = new Set(["DeepseekCN", "Custom", "Antigravity"]);
-  const unmapped = variants.filter((v) => !EXCLUDED.has(v) && !labelMap[v]);
-  if (unmapped.length > 0) {
-    console.warn(
-      `[facts-drift] ApiProvider variants missing from labelMap: ${unmapped.join(", ")}. ` +
-        "Add them to PROVIDER_LABELS here AND PROVIDER_LABEL_MAP in web/scripts/facts-lib.mjs (or to EXCLUDED if intentionally hidden).",
-    );
-  }
-  return variants
-    .filter((v) => !EXCLUDED.has(v))
-    .map((v) => labelMap[v])
-    .filter(Boolean);
-}
-
-function deriveDefaultModel(cfg: string): string | null {
-  // Match the const *definition* (`= "..."`); the definition moved to
-  // config/models.rs in the #3311 split, so callers pass config.rs + models.rs.
-  const m = cfg.match(/DEFAULT_TEXT_MODEL\s*(?::\s*&str\s*)?=\s*"([^"]+)"/);
-  return m ? m[1] : null;
-}
-
 function deriveSandboxBackends(source: string): string[] {
   const marker = source.match(
     /pub const PUBLIC_SANDBOX_BACKENDS\s*:\s*&\[&str\]\s*=\s*&\[([\s\S]*?)\];/,
@@ -268,54 +176,31 @@ function deriveToolCountFromGeneratedFacts(source: string): number | null {
 }
 
 /**
- * Model rows come through the checked-in generated file, same as toolCount:
- * the remote path cannot run `git log` pickaxe passes for `addedAt`, and the
- * checked-in snapshot is guarded by the exact revision's CI drift check.
+ * Model presentation comes from the exact revision's reviewed catalog;
+ * tool counts retain the existing generated-source boundary.
  */
-function deriveModelsFromGeneratedFacts(source: string): ModelFact[] | null {
-  const models = parseGeneratedFacts(source)?.models;
-  if (!Array.isArray(models)) return null;
-  const valid = models.every(
-    (m) =>
-      m &&
-      typeof m === "object" &&
-      !Array.isArray(m) &&
-      typeof (m as ModelFact).id === "string" &&
-      ((m as ModelFact).provider === null ||
-        typeof (m as ModelFact).provider === "string") &&
-      ((m as ModelFact).contextWindow === null ||
-        typeof (m as ModelFact).contextWindow === "number") &&
-      ((m as ModelFact).maxOutput === null ||
-        typeof (m as ModelFact).maxOutput === "number") &&
-      typeof (m as ModelFact).reasoning === "boolean" &&
-      ((m as ModelFact).addedAt === null ||
-        typeof (m as ModelFact).addedAt === "string"),
-  );
-  return valid ? (models as ModelFact[]) : null;
-}
-
 export async function deriveFactsFromRemote(ghToken?: string): Promise<RepoFacts | null> {
   const source = await fetchSourceMarker(ghToken);
   if (!source) return null;
 
-  const [cargo, configRs, configModels, sandboxSource, npmPkg, licText, generatedFacts, latestPublishedRelease] = await Promise.all([
+  const [cargo, providerMetadata, sandboxSource, npmPkg, licText, generatedFacts, modelCatalog, latestPublishedRelease] = await Promise.all([
     fetchText("Cargo.toml", source.revision, ghToken),
-    fetchText("crates/tui/src/config.rs", source.revision, ghToken),
-    fetchText("crates/tui/src/config/models.rs", source.revision, ghToken),
+    fetchText("crates/config/assets/provider_descriptors.json", source.revision, ghToken),
     fetchText("crates/tui/src/sandbox/mod.rs", source.revision, ghToken),
     fetchText("npm/codewhale/package.json", source.revision, ghToken),
     fetchText("LICENSE", source.revision, ghToken),
     fetchText("web/lib/facts.generated.ts", source.revision, ghToken),
+    fetchText("crates/config/assets/models_dev.bundled.json", source.revision, ghToken),
     fetchLatestPublishedRelease(ghToken),
   ]);
 
-  if (!cargo || !configRs) return null;
+  if (!cargo) return null;
+  const providerData = parseProviderDescriptors(providerMetadata);
+  if (!providerData) return null;
   const toolCount = generatedFacts
     ? deriveToolCountFromGeneratedFacts(generatedFacts)
     : null;
-  const models = generatedFacts
-    ? deriveModelsFromGeneratedFacts(generatedFacts)
-    : null;
+  const models = parseModelCatalog(modelCatalog);
   // Never attach current-main provenance to build-time tool/model facts. The
   // checked-in generated snapshot is guarded by the exact revision's CI drift
   // check, so an absent or malformed value makes the whole derivation fail.
@@ -330,9 +215,9 @@ export async function deriveFactsFromRemote(ghToken?: string): Promise<RepoFacts
     sandboxBackends: sandboxSource
       ? deriveSandboxBackends(sandboxSource)
       : BUILD_FACTS.sandboxBackends,
-    providers: deriveProvidersFromConfig(configRs),
+    providers: providerData.providers,
     models,
-    defaultModel: deriveDefaultModel(`${configRs}\n${configModels ?? ""}`),
+    defaultModel: providerData.defaultModel,
     nodeEngines: (() => {
       try { return npmPkg ? JSON.parse(npmPkg).engines?.node ?? null : null; } catch { return null; }
     })(),

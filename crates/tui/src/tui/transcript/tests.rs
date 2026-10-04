@@ -2209,3 +2209,494 @@ fn calm1_reasoning_header_hint_keeps_the_entire_live_tail_copyable() {
         assert!(cache.line_meta()[index].copy_prefix_width() < cache.lines()[index].width());
     }
 }
+
+// ── Steady-state frames do no transcript work (#6652) ───────────────────────
+
+fn settled_transcript(turns: usize) -> (Vec<HistoryCell>, Vec<u64>) {
+    let cells = (0..turns)
+        .flat_map(|turn| {
+            [
+                user_cell(&format!("question {turn}")),
+                reasoning_cell(false),
+                assistant_cell(&format!("answer {turn}\n\n- one\n- two"), false),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let revisions = (1..=cells.len() as u64).collect();
+    (cells, revisions)
+}
+
+#[test]
+fn an_unchanged_frame_renders_and_moves_nothing() {
+    let (cells, revisions) = settled_transcript(400);
+    let options = TranscriptRenderOptions::default();
+    let ensure = |cache: &mut TranscriptViewCache| {
+        cache.ensure_split(
+            &[&cells],
+            &revisions,
+            80,
+            options,
+            &HashMap::new(),
+            None,
+            Some(reasoning_owner(1)),
+        );
+    };
+    let mut cache = TranscriptViewCache::new();
+    ensure(&mut cache);
+    let rendered = cache.cells_rendered;
+    let reflattened = cache.streaming_lines_reflattened();
+    let storage = cache.per_cell.as_ptr();
+    let line_arcs: Vec<_> = cache
+        .per_cell
+        .iter()
+        .map(|cell| Arc::as_ptr(&cell.lines))
+        .collect();
+
+    for _ in 0..5 {
+        ensure(&mut cache);
+    }
+
+    assert_eq!(cache.cells_rendered, rendered, "a settled frame rendered");
+    assert_eq!(cache.streaming_lines_reflattened(), reflattened);
+    assert_eq!(cache.per_cell.as_ptr(), storage, "cached cells were moved");
+    for (index, cell) in cache.per_cell.iter().enumerate() {
+        assert_eq!(Arc::as_ptr(&cell.lines), line_arcs[index], "cell {index}");
+    }
+}
+
+#[test]
+fn a_tail_only_change_renders_only_the_tail_in_place() {
+    let (mut cells, mut revisions) = settled_transcript(400);
+    cells.push(assistant_cell("streaming", true));
+    revisions.push(10_000);
+    let options = TranscriptRenderOptions {
+        low_motion: true,
+        ..TranscriptRenderOptions::default()
+    };
+    let ensure = |cache: &mut TranscriptViewCache, cells: &[HistoryCell], revisions: &[u64]| {
+        cache.ensure_split(
+            &[cells],
+            revisions,
+            80,
+            options,
+            &HashMap::new(),
+            None,
+            None,
+        );
+    };
+    let mut cache = TranscriptViewCache::new();
+    ensure(&mut cache, &cells, &revisions);
+    let storage = cache.per_cell.as_ptr();
+    let line_arcs: Vec<_> = cache
+        .per_cell
+        .iter()
+        .map(|cell| Arc::as_ptr(&cell.lines))
+        .collect();
+
+    for delta in 0..20u64 {
+        let before = cache.cells_rendered;
+        if let Some(HistoryCell::Assistant { content, .. }) = cells.last_mut() {
+            content.push_str(&format!(" delta {delta}"));
+        }
+        *revisions.last_mut().unwrap() += 1;
+        ensure(&mut cache, &cells, &revisions);
+        assert_eq!(cache.cells_rendered - before, 1, "delta {delta}");
+    }
+    assert_eq!(cache.per_cell.as_ptr(), storage, "cached cells were moved");
+    let settled = line_arcs.len() - 1;
+    for (index, cell) in cache.per_cell[..settled].iter().enumerate() {
+        assert_eq!(Arc::as_ptr(&cell.lines), line_arcs[index], "cell {index}");
+    }
+    let mut cold = TranscriptViewCache::new();
+    ensure(&mut cold, &cells, &revisions);
+    assert_same_flat_output(&cache, &cold);
+
+    // A change in the middle renders that cell and nothing after it.
+    let before = cache.cells_rendered;
+    cells[600] = assistant_cell("rewritten in place", false);
+    revisions[600] = 20_000;
+    ensure(&mut cache, &cells, &revisions);
+    assert_eq!(cache.cells_rendered - before, 1);
+    let mut cold = TranscriptViewCache::new();
+    ensure(&mut cold, &cells, &revisions);
+    assert_same_flat_output(&cache, &cold);
+}
+
+/// A filter can shift rows so that a tool cell's slot is taken by a streaming
+/// answer at an unchanged cell count. The answer takes the tail-only update,
+/// but the group rail and spacer between it and its neighbour belong to the
+/// neighbour's rows and must be rebuilt (found by the cold-render property
+/// test below).
+#[test]
+fn a_tool_slot_taken_by_a_streaming_answer_refreshes_its_neighbour() {
+    let options = TranscriptRenderOptions {
+        low_motion: true,
+        ..TranscriptRenderOptions::default()
+    };
+    let mut cells = vec![
+        user_cell("run it"),
+        exec_tool_cell("cargo check"),
+        exec_tool_cell("cargo test"),
+    ];
+    let mut revisions = vec![1u64, 2, 3];
+    let ensure = |cache: &mut TranscriptViewCache, cells: &[HistoryCell], revisions: &[u64]| {
+        cache.ensure_split(
+            &[cells],
+            revisions,
+            60,
+            options,
+            &HashMap::new(),
+            None,
+            None,
+        );
+    };
+    let mut cache = TranscriptViewCache::new();
+    ensure(&mut cache, &cells, &revisions);
+
+    cells[2] = assistant_cell("opening", true);
+    revisions[2] = 4;
+    ensure(&mut cache, &cells, &revisions);
+
+    let mut cold = TranscriptViewCache::new();
+    ensure(&mut cold, &cells, &revisions);
+    assert_same_flat_output(&cache, &cold);
+    assert!(
+        !plain_lines(&cache)
+            .iter()
+            .any(|line| line.starts_with('╭') || line.starts_with('╰')),
+        "{:?}",
+        plain_lines(&cache)
+    );
+}
+
+/// xorshift64*: a failing case prints its seed and step, so it replays.
+struct Xorshift(u64);
+
+impl Xorshift {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound as u64) as usize
+    }
+}
+
+/// What a live caller hands the cache, advanced the way `App` advances it:
+/// every mutation takes a fresh revision from one monotonic counter, active
+/// entries share the active revision, and a destructive edit moves the
+/// identity epoch.
+struct TranscriptModel {
+    cells: Vec<HistoryCell>,
+    revisions: Vec<u64>,
+    next_revision: u64,
+    active: Vec<HistoryCell>,
+    active_revision: u64,
+    folds: HashMap<usize, ThinkingFold>,
+    hidden: std::collections::HashSet<usize>,
+    width: u16,
+    options: TranscriptRenderOptions,
+    owner: Option<usize>,
+    epoch: u64,
+    serial: u64,
+}
+
+impl TranscriptModel {
+    fn new() -> Self {
+        Self {
+            cells: Vec::new(),
+            revisions: Vec::new(),
+            next_revision: 1,
+            active: Vec::new(),
+            active_revision: 0,
+            folds: HashMap::new(),
+            hidden: Default::default(),
+            width: 80,
+            // Motion is wall-clock driven; the comparison is between two
+            // renders taken at different instants.
+            options: TranscriptRenderOptions {
+                low_motion: true,
+                ..TranscriptRenderOptions::default()
+            },
+            owner: None,
+            epoch: 0,
+            serial: 0,
+        }
+    }
+
+    fn fresh_revision(&mut self) -> u64 {
+        self.next_revision += 1;
+        self.next_revision
+    }
+
+    fn random_cell(&mut self, rng: &mut Xorshift) -> HistoryCell {
+        self.serial += 1;
+        let serial = self.serial;
+        let prose = format!(
+            "{serial} {}",
+            "words that wrap at narrow widths and keep going ".repeat(1 + rng.below(4))
+        );
+        match rng.below(9) {
+            0 | 1 => user_cell(&prose),
+            2 => assistant_cell(&format!("{prose}\n\n- item {serial}\n- item"), false),
+            3 => assistant_cell(&prose, true),
+            4 => reasoning_cell(false),
+            5 => reasoning_cell(true),
+            6 => exec_tool_cell(&format!("cargo test {serial}")),
+            7 => exec_tool_cell_with_output(&format!("ls {serial}"), prose),
+            _ => durable_work_cell(),
+        }
+    }
+
+    fn mutate(&mut self, rng: &mut Xorshift) -> &'static str {
+        match rng.below(16) {
+            0..=3 => {
+                let cell = self.random_cell(rng);
+                let revision = self.fresh_revision();
+                self.cells.push(cell);
+                self.revisions.push(revision);
+                "append"
+            }
+            4 | 5 if !self.cells.is_empty() => {
+                let index = rng.below(self.cells.len());
+                self.cells[index] = self.random_cell(rng);
+                self.revisions[index] = self.fresh_revision();
+                "replace"
+            }
+            6 => {
+                // Stream into the newest cell the way the reply path does.
+                let revision = self.fresh_revision();
+                let streaming_tail = matches!(
+                    self.cells.last(),
+                    Some(HistoryCell::Assistant {
+                        streaming: true,
+                        ..
+                    })
+                );
+                if streaming_tail {
+                    if let Some(HistoryCell::Assistant { content, .. }) = self.cells.last_mut() {
+                        content.push_str(" more streamed words\n");
+                    }
+                    *self.revisions.last_mut().unwrap() = revision;
+                } else {
+                    self.cells.push(assistant_cell("opening ", true));
+                    self.revisions.push(revision);
+                }
+                "stream"
+            }
+            7 if !self.cells.is_empty() => {
+                let index = self.cells.len() - 1;
+                if let HistoryCell::Assistant { streaming, .. } = &mut self.cells[index] {
+                    *streaming = false;
+                    self.revisions[index] = self.fresh_revision();
+                }
+                "finish stream"
+            }
+            8 => {
+                self.active = (0..rng.below(4)).map(|_| self.random_cell(rng)).collect();
+                self.active_revision += 1;
+                "replace active"
+            }
+            9 if !self.cells.is_empty() => {
+                let index = rng.below(self.cells.len() + self.active.len());
+                match rng.below(3) {
+                    0 => self.folds.insert(index, ThinkingFold::Expanded),
+                    1 => self.folds.insert(index, ThinkingFold::Collapsed),
+                    _ => self.folds.remove(&index),
+                };
+                "fold"
+            }
+            10 => {
+                self.width = [24, 40, 80, 120][rng.below(4)];
+                "width"
+            }
+            11 => {
+                self.options.spacing = [
+                    TranscriptSpacing::Compact,
+                    TranscriptSpacing::Comfortable,
+                    TranscriptSpacing::Spacious,
+                ][rng.below(3)];
+                self.options.show_thinking = rng.below(4) != 0;
+                "options"
+            }
+            12 if rng.below(4) == 0 => {
+                self.cells.clear();
+                self.revisions.clear();
+                self.folds.clear();
+                self.hidden.clear();
+                self.epoch += 1;
+                "clear"
+            }
+            13 if !self.cells.is_empty() => {
+                // Edit/undo: roll back to an earlier prefix.
+                let keep = rng.below(self.cells.len());
+                self.cells.truncate(keep);
+                self.revisions.truncate(keep);
+                self.folds.retain(|index, _| *index < keep);
+                self.hidden.retain(|index| *index < keep);
+                self.epoch += 1;
+                "truncate"
+            }
+            14 => {
+                let total = self.cells.len() + self.active.len();
+                if total > 0 {
+                    let index = rng.below(total);
+                    if !self.hidden.remove(&index) {
+                        self.hidden.insert(index);
+                    }
+                }
+                "hide"
+            }
+            15 => {
+                let total = self.cells.len() + self.active.len();
+                self.owner = (total > 0 && rng.below(3) != 0).then(|| rng.below(total));
+                "owner"
+            }
+            _ => "no-op",
+        }
+    }
+
+    /// One live frame: committed history plus the active tail, filtered when
+    /// the user has hidden cells, exactly as the chat widget assembles it.
+    fn frame(&self, cache: &mut TranscriptViewCache, owner: Option<usize>) {
+        let total = self.cells.len() + self.active.len();
+        let owner = owner
+            .filter(|index| *index < total)
+            .map(|cell_index| TranscriptActionOwner {
+                cell_index,
+                identity_epoch: self.epoch,
+            });
+        let active_revisions = (0..self.active.len()).map(|i| {
+            crate::tui::widgets::active_entry_revision(self.active_revision, i as u64 + 1)
+        });
+        if self.hidden.is_empty() {
+            let revisions: Vec<u64> = self
+                .revisions
+                .iter()
+                .copied()
+                .chain(active_revisions)
+                .collect();
+            cache.ensure_split(
+                &[&self.cells, &self.active],
+                &revisions,
+                self.width,
+                self.options,
+                &self.folds,
+                None,
+                owner,
+            );
+            return;
+        }
+        let revisions: Vec<u64> = self
+            .revisions
+            .iter()
+            .copied()
+            .chain(active_revisions)
+            .collect();
+        let mut kept = Vec::new();
+        let mut kept_revisions = Vec::new();
+        let mut map = Vec::new();
+        for (index, cell) in self.cells.iter().chain(&self.active).enumerate() {
+            if !self.hidden.contains(&index) {
+                kept.push(cell);
+                kept_revisions.push(revisions[index]);
+                map.push(index);
+            }
+        }
+        cache.ensure_filtered(
+            &kept,
+            &kept_revisions,
+            self.width,
+            self.options,
+            &self.folds,
+            Some(&map),
+            owner,
+        );
+    }
+}
+
+/// After every mutation, the incrementally maintained cache must equal one
+/// built from scratch from the same state: the early-out and in-place update
+/// may change how much work a frame does, never what it shows.
+#[test]
+fn cached_transcript_matches_a_cold_render_after_every_mutation() {
+    for seed in 1..=8u64 {
+        let mut rng = Xorshift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut model = TranscriptModel::new();
+        let mut warm = TranscriptViewCache::new();
+        let mut log = Vec::new();
+        for step in 0..150 {
+            let op = model.mutate(&mut rng);
+            log.push(op);
+            let context = || format!("seed {seed} step {step}: {}", log.join(", "));
+
+            let owner = model.owner;
+            model.frame(&mut warm, owner);
+            let mut cold = TranscriptViewCache::new();
+            model.frame(&mut cold, owner);
+            assert_eq!(warm.lines(), cold.lines(), "{}", context());
+            assert_eq!(warm.line_links(), cold.line_links(), "{}", context());
+            assert_eq!(warm.line_meta(), cold.line_meta(), "{}", context());
+            assert_eq!(
+                warm.rail_prefix_widths,
+                cold.rail_prefix_widths,
+                "{}",
+                context()
+            );
+            assert_eq!(
+                warm.cell_line_starts,
+                cold.cell_line_starts,
+                "{}",
+                context()
+            );
+            assert_eq!(
+                warm.reasoning_action_target(),
+                cold.reasoning_action_target(),
+                "{}",
+                context()
+            );
+
+            // The same inputs again are a settled frame: no render, no rows
+            // re-flattened, identical output.
+            let rendered = warm.cells_rendered;
+            let reflattened = warm.streaming_lines_reflattened();
+            model.frame(&mut warm, owner);
+            assert_eq!(warm.cells_rendered, rendered, "{}", context());
+            assert_eq!(
+                warm.streaming_lines_reflattened(),
+                reflattened,
+                "{}",
+                context()
+            );
+            assert_eq!(warm.lines(), cold.lines(), "{}", context());
+
+            // A scroll frame retargets the hint after layout.
+            if rng.below(3) == 0 {
+                let total = model.cells.len() + model.active.len();
+                let retarget = (total > 0).then(|| rng.below(total));
+                let map: Vec<usize> = (0..total).filter(|i| !model.hidden.contains(i)).collect();
+                let index_map = (!model.hidden.is_empty()).then_some(map.as_slice());
+                let epoch = model.epoch;
+                warm.retarget(
+                    retarget.map(|cell_index| TranscriptActionOwner {
+                        cell_index,
+                        identity_epoch: epoch,
+                    }),
+                    index_map,
+                );
+                let mut cold = TranscriptViewCache::new();
+                model.frame(&mut cold, retarget);
+                assert_eq!(warm.lines(), cold.lines(), "retarget; {}", context());
+                assert_eq!(
+                    warm.line_meta(),
+                    cold.line_meta(),
+                    "retarget; {}",
+                    context()
+                );
+            }
+        }
+    }
+}

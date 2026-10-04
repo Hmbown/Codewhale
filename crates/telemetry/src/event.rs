@@ -758,8 +758,8 @@ pub fn is_reduced_panic_site(value: &str) -> bool {
 /// Whether `value` is a provider id this build knows.
 ///
 /// Checked against the **full** provider registry, not
-/// `ProviderKind::all()`: that constant is the 36-row *catalog* subset, and
-/// `ApiProvider::kind()` legitimately yields dialect kinds
+/// `ProviderKind::all()`: that list is the selectable catalog subset, while
+/// captured intrinsic kinds legitimately include dialect kinds
 /// (`deepseek-anthropic`, the Model Studio plan variants) that are absent from
 /// it. Narrowing to the catalog would silently drop a real user's route.
 #[must_use]

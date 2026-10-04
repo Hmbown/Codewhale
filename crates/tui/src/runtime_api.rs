@@ -1,6 +1,6 @@
 //! Runtime HTTP/SSE API for local Codewhale automation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
@@ -54,7 +54,7 @@ use crate::automation_manager::{
 };
 #[cfg(test)]
 use crate::config::DEFAULT_TEXT_MODEL;
-use crate::config::{ApiProvider, Config, normalize_model_name_for_provider, validate_route};
+use crate::config::{Config, ProviderKind, normalize_model_name_for_provider, validate_route};
 use crate::fleet::executor::{FleetExecutor, configured_codewhale_binary};
 use crate::fleet::ledger::{
     FleetEventReplayError, FleetLedgerState, FleetTaskLedgerStatus, fleet_ledger_path,
@@ -87,7 +87,7 @@ use crate::task_manager::{
 };
 use crate::tools::subagent::{
     AgentWorkerRecord, AgentWorkerStatus, SharedSubAgentManager, SubAgentStatus,
-    load_persisted_agent_worker_records, new_shared_subagent_manager_with_timeout,
+    new_shared_subagent_manager_with_timeout,
 };
 #[cfg(test)]
 pub(super) use codewhale_models::{ContentBlock, Message};
@@ -110,9 +110,10 @@ mod mobile;
 mod plans;
 mod plugins;
 mod secrets;
-mod sessions;
+pub(crate) mod sessions;
 mod targets;
 mod terminal;
+pub(crate) mod thread_history;
 mod turn_artifacts;
 mod voice;
 mod web;
@@ -207,17 +208,9 @@ pub struct RuntimeApiState {
     /// Executable used by Runtime API-owned Fleet manager loops. Stored on
     /// state so tests and embedded callers can provide a hermetic worker.
     fleet_codewhale_binary: String,
-    /// Shared McpPool reused for explicit live MCP discovery. Passive API
-    /// calls do not initialize this pool so dashboards cannot accidentally
-    /// become a second stdio-process owner. The outer mutex guards only the
-    /// lazily-initialized slot; slow per-pool work (connect_all) runs under
-    /// the inner handle so it cannot block slot reads.
-    mcp_pool: Arc<Mutex<Option<Arc<Mutex<McpPool>>>>>,
-    /// Workspace-level LSP client for the HTTP surface (APPS-93): diagnostics
-    /// and semantic queries on files a client views. Engines keep their own
-    /// per-thread managers; this one serves the file view and is built lazily
-    /// so a server without LSP use never spawns a language server.
-    lsp_manager: Arc<std::sync::OnceLock<Arc<crate::lsp::LspManager>>>,
+    /// Held by the actual owner, shared by all matching listener scopes.
+    workspace_scopes: Arc<RuntimeWorkspaceScopes>,
+    workspace_scope: Arc<RuntimeWorkspaceScope>,
     /// The computer this Engine runs on: display socket, human control
     /// lease, device client tokens and `computer.*` events (§3.3).
     computer: computer_display::ComputerState,
@@ -233,6 +226,158 @@ pub struct RuntimeApiState {
     provider_switches: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     compat_stream_test_hook: Option<tokio::sync::mpsc::UnboundedSender<CompatStreamTestPoint>>,
+}
+
+// This is a cache bound inside the existing owner, matching the daemon's
+// maximum of 64 live frontend connections. Scopes remain retained until owner
+// retirement; opening another listener never creates a parallel cache.
+const MAX_RUNTIME_WORKSPACE_SCOPES: usize = 64;
+
+struct RuntimeWorkspaceScope {
+    lexical: PathBuf,
+    canonical: PathBuf,
+    directory: Arc<std::fs::File>,
+    mcp: Mutex<Option<(u64, Arc<Mutex<McpPool>>)>>,
+    lsp: std::sync::OnceLock<Arc<crate::lsp::LspManager>>,
+    owner: SharedRuntimeThreadManager,
+    cleanup_runtime: tokio::runtime::Handle,
+}
+
+pub(crate) fn open_workspace_directory(workspace: &FsPath) -> Result<(PathBuf, std::fs::File)> {
+    let canonical = workspace
+        .canonicalize()
+        .context("workspace is unavailable")?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(0x0200_0000 | 0x0020_0000); // BACKUP_SEMANTICS, OPEN_REPARSE_POINT
+    }
+    let directory = options.open(&canonical)?;
+    let metadata = directory.metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir() && !crate::plugins::metadata_is_link_or_reparse(&metadata),
+        "workspace is not an ordinary directory"
+    );
+    anyhow::ensure!(
+        workspace.canonicalize()? == canonical,
+        "selected workspace changed"
+    );
+    Ok((canonical, directory))
+}
+
+impl RuntimeWorkspaceScope {
+    fn validate_sync(&self) -> Result<()> {
+        let (canonical, directory) = open_workspace_directory(&self.lexical)?;
+        anyhow::ensure!(
+            canonical == self.canonical
+                && crate::fleet::files::same_file(&self.directory, &directory)?,
+            "selected workspace identity changed"
+        );
+        Ok(())
+    }
+    async fn validate(self: &Arc<Self>) -> Result<()> {
+        let scope = self.clone();
+        codewhale_app_server::daemon_socket::owner_work(move || scope.validate_sync()).await
+    }
+}
+
+impl Drop for RuntimeWorkspaceScope {
+    fn drop(&mut self) {
+        let mcp = self.mcp.get_mut().take().map(|(_, pool)| pool);
+        let lsp = self.lsp.take();
+        // The canonical writer lease and held directory survive the actual
+        // transport cleanup, including waiter cancellation and guest detach.
+        let owner = self.owner.clone();
+        let directory = self.directory.clone();
+        self.cleanup_runtime.spawn(async move {
+            let _owner = owner;
+            let _directory = directory;
+            if let Some(pool) = mcp {
+                pool.lock().await.shutdown_all().await;
+            }
+            if let Some(manager) = lsp {
+                manager.shutdown_all().await;
+            }
+        });
+    }
+}
+
+struct RuntimeWorkspaceScopes {
+    scopes: parking_lot::Mutex<BTreeMap<PathBuf, Arc<RuntimeWorkspaceScope>>>,
+    mcp_generation: std::sync::atomic::AtomicU64,
+    dynamic_servers: Arc<parking_lot::RwLock<HashMap<String, crate::mcp::McpServerConfig>>>,
+    owner: SharedRuntimeThreadManager,
+    workers: SharedSubAgentManager,
+    cleanup_runtime: tokio::runtime::Handle,
+}
+
+impl RuntimeWorkspaceScopes {
+    fn new(owner: SharedRuntimeThreadManager, workers: SharedSubAgentManager) -> Arc<Self> {
+        Arc::new(Self {
+            scopes: parking_lot::Mutex::new(BTreeMap::new()),
+            mcp_generation: std::sync::atomic::AtomicU64::new(0),
+            dynamic_servers: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            owner,
+            workers,
+            cleanup_runtime: tokio::runtime::Handle::current(),
+        })
+    }
+
+    async fn admit(self: &Arc<Self>, lexical: PathBuf) -> Result<Arc<RuntimeWorkspaceScope>> {
+        let owner = self.clone();
+        codewhale_app_server::daemon_socket::owner_work(move || {
+            let (canonical, directory) = open_workspace_directory(&lexical)?;
+            let directory = Arc::new(directory);
+            let mut scopes = owner.scopes.lock();
+            if let Some(scope) = scopes.get(&lexical) {
+                anyhow::ensure!(
+                    canonical == scope.canonical
+                        && crate::fleet::files::same_file(&scope.directory, &directory)?,
+                    "selected workspace identity changed"
+                );
+                return Ok(scope.clone());
+            }
+            anyhow::ensure!(
+                scopes.len() < MAX_RUNTIME_WORKSPACE_SCOPES,
+                "Runtime workspace scope limit reached; restart the owner to retire unused scopes"
+            );
+            owner
+                .workers
+                .blocking_write()
+                .admit_coordination_workspace(lexical.clone(), canonical.clone(), directory.clone())
+                .map_err(anyhow::Error::msg)?;
+            let scope = Arc::new(RuntimeWorkspaceScope {
+                lexical: lexical.clone(),
+                canonical,
+                directory,
+                mcp: Mutex::new(None),
+                lsp: std::sync::OnceLock::new(),
+                owner: owner.owner.clone(),
+                cleanup_runtime: owner.cleanup_runtime.clone(),
+            });
+            scopes.insert(lexical, scope.clone());
+            Ok(scope)
+        })
+        .await
+    }
+}
+
+async fn require_workspace_scope(
+    State(state): State<RuntimeApiState>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    if state.workspace_scope.validate().await.is_err() {
+        return ApiError::conflict("selected workspace identity changed").into_response();
+    }
+    next.run(request).await
 }
 
 /// How the Runtime API server stops on purpose.
@@ -274,6 +419,381 @@ async fn serve_runtime_api(
     .await;
     shutdown.stopped.cancel();
     result
+}
+
+/// Listener state is local to the selected authenticated frontend. All service
+/// handles remain the original owner's captured handles.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeFrontendReady {
+    endpoint: SocketAddr,
+    auth_required: bool,
+    generated_auth: bool,
+    reused_owner_listener: bool,
+    mobile_bootstrap_url: Option<String>,
+    web_bootstrap_url: Option<String>,
+}
+fn canonical_runtime_config_source(source: Option<PathBuf>) -> Result<Option<PathBuf>> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        source.as_os_str().len() <= 32768,
+        "operator config source exceeds its bounds"
+    );
+    let source = std::path::absolute(source)?;
+    if source.try_exists()? {
+        anyhow::ensure!(
+            source.is_file(),
+            "operator config source is not a regular file"
+        );
+        return Ok(Some(source.canonicalize()?));
+    }
+    // The captured loader permits a missing config document and missing
+    // parents. Anchor its exact uncreated suffix under the nearest existing
+    // directory without resolving another default or creating those paths.
+    let mut ancestor = source.as_path();
+    while !ancestor.try_exists()? {
+        ancestor = ancestor
+            .parent()
+            .context("operator config source has no existing ancestor")?;
+    }
+    anyhow::ensure!(
+        ancestor.is_dir(),
+        "operator config source ancestor is not a directory"
+    );
+    let suffix = source.strip_prefix(ancestor)?;
+    Ok(Some(ancestor.canonicalize()?.join(suffix)))
+}
+
+struct CapturedRuntimeFrontend {
+    worker_setting: usize,
+    generated_auth: bool,
+    config_source: Option<PathBuf>,
+    state: RuntimeApiState,
+    default_model: String,
+}
+impl CapturedRuntimeFrontend {
+    async fn capture(
+        state: RuntimeApiState,
+        model: String,
+        worker_setting: usize,
+        generated_auth: bool,
+    ) -> Result<Arc<Self>> {
+        let source = state
+            .config
+            .read()
+            .loaded_config_path
+            .clone()
+            .or_else(|| state.config_path.clone());
+        let config_source = codewhale_app_server::daemon_socket::owner_work(move || {
+            canonical_runtime_config_source(source)
+        })
+        .await?;
+        Ok(Arc::new(Self {
+            state,
+            default_model: model,
+            worker_setting,
+            generated_auth,
+            config_source,
+        }))
+    }
+    async fn validate_scope(
+        &self,
+        scope: &codewhale_app_server::RuntimeFrontendScope,
+    ) -> Result<()> {
+        scope.validate_bounds()?;
+        anyhow::ensure!(
+            scope.workers == self.worker_setting,
+            "selected worker setting differs from the held scheduler"
+        );
+        anyhow::ensure!(
+            scope.config_profile == self.state.config_profile,
+            "selected config profile differs from the captured owner scope"
+        );
+        if let Some(source) = scope.config_source.clone() {
+            let source = codewhale_app_server::daemon_socket::owner_work(move || {
+                canonical_runtime_config_source(Some(source))
+            })
+            .await?;
+            anyhow::ensure!(
+                source == self.config_source,
+                "selected operator config differs from the captured owner source"
+            );
+        }
+        Ok(())
+    }
+}
+impl codewhale_app_server::RuntimeOwnerFrontend for CapturedRuntimeFrontend {
+    fn validate_selection<'a>(
+        &'a self,
+        selection: &'a codewhale_app_server::RuntimeOwnerFrontendSelection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            match selection {
+                codewhale_app_server::RuntimeOwnerFrontendSelection::Control(scope) => {
+                    self.validate_scope(scope).await?;
+                    anyhow::ensure!(
+                        !self.state.runtime_threads.is_acp_host(),
+                        "immutable ACP-base owner cannot admit ordinary control turns"
+                    );
+                }
+                codewhale_app_server::RuntimeOwnerFrontendSelection::Acp { scope, model } => {
+                    if let Some(scope) = scope {
+                        self.validate_scope(scope).await?;
+                    }
+                    anyhow::ensure!(
+                        model
+                            .as_ref()
+                            .is_none_or(|model| !model.trim().is_empty() && model.len() <= 1024),
+                        "invalid selected ACP model"
+                    );
+                }
+                codewhale_app_server::RuntimeOwnerFrontendSelection::Listener(selection) => {
+                    selection.validate_bounds()?;
+                    self.validate_scope(&codewhale_app_server::RuntimeFrontendScope {
+                        workers: selection.workers,
+                        workspace: selection.workspace.clone(),
+                        config_profile: selection.config_profile.clone(),
+                        config_source: selection.config_source.clone(),
+                    })
+                    .await?;
+                    anyhow::ensure!(
+                        !self.state.runtime_threads.is_acp_host(),
+                        "immutable ACP-base owner cannot admit ordinary listener turns"
+                    );
+                    validate_runtime_listener_security(&RuntimeApiOptions {
+                        host: selection.host.clone(),
+                        port: selection.port,
+                        cors_origins: selection.cors_origins.clone(),
+                        auth_token: selection.auth_token.clone(),
+                        insecure_no_auth: selection.insecure_no_auth,
+                        mobile: selection.mobile,
+                        web: selection.web,
+                        control_frontend: Some(
+                            codewhale_app_server::RuntimeControlFrontend::LegacyHttp,
+                        ),
+                        ..Default::default()
+                    })?;
+                }
+            }
+            Ok(())
+        })
+    }
+    fn serve(
+        &self,
+        selection: codewhale_app_server::RuntimeOwnerFrontendSelection,
+        compatibility: codewhale_app_server::AppState,
+        input: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
+        mut output: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            self.validate_selection(&selection).await?;
+            let selection = match selection {
+                codewhale_app_server::RuntimeOwnerFrontendSelection::Control(scope) => {
+                    self.validate_scope(&scope).await?;
+                    anyhow::ensure!(
+                        !self.state.runtime_threads.is_acp_host(),
+                        "immutable ACP-base owner cannot admit ordinary control turns"
+                    );
+                    return codewhale_app_server::run_guest_control(
+                        compatibility,
+                        scope.workspace,
+                        input,
+                        output,
+                    )
+                    .await;
+                }
+                codewhale_app_server::RuntimeOwnerFrontendSelection::Acp { scope, model } => {
+                    let workspace = if let Some(scope) = scope {
+                        self.validate_scope(&scope).await?;
+                        scope.workspace
+                    } else {
+                        self.state.workspace.clone()
+                    };
+                    let config = self.state.config.read().clone();
+                    let acp = crate::acp_server::capture_frontend(
+                        config,
+                        model.unwrap_or_else(|| self.default_model.clone()),
+                        workspace,
+                        self.state.runtime_threads.clone(),
+                        self.state.sessions_dir.clone(),
+                        self.state.config_path.clone(),
+                        self.state.config_profile.clone(),
+                    )?;
+                    return acp.serve(input, output).await;
+                }
+                codewhale_app_server::RuntimeOwnerFrontendSelection::Listener(selection) => {
+                    selection
+                }
+            };
+            selection.validate_bounds()?;
+            anyhow::ensure!(
+                selection.workers == self.worker_setting,
+                "selected worker setting differs from the held scheduler"
+            );
+            anyhow::ensure!(
+                selection.config_profile == self.state.config_profile,
+                "selected config profile differs from the captured owner scope"
+            );
+            anyhow::ensure!(
+                !self.state.runtime_threads.is_acp_host(),
+                "immutable ACP-base owner cannot admit ordinary listener turns"
+            );
+            let workspace = selection.workspace;
+            let options = RuntimeApiOptions {
+                host: selection.host,
+                port: selection.port,
+                cors_origins: selection.cors_origins,
+                auth_token: selection.auth_token,
+                insecure_no_auth: selection.insecure_no_auth,
+                mobile: selection.mobile,
+                web: selection.web,
+                control_frontend: Some(codewhale_app_server::RuntimeControlFrontend::LegacyHttp),
+                ..Default::default()
+            };
+            validate_runtime_listener_security(&options)?;
+            let selected_addr = runtime_bind_address(&options.host, options.port)?;
+            let original_addr = runtime_bind_address(&self.state.bind_host, self.state.bind_port)?;
+            let same_auth = match (
+                options
+                    .auth_token
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty()),
+                self.state.runtime_token.as_deref(),
+            ) {
+                (Some(selected), Some(original)) => codewhale_core::secret_eq::constant_time_eq(
+                    selected.as_bytes(),
+                    original.as_bytes(),
+                ),
+                (None, Some(_)) => self.generated_auth && !options.insecure_no_auth,
+                (None, None) => options.insecure_no_auth,
+                _ => false,
+            };
+            if selected_addr == original_addr
+                && !options.web
+                && !options.mobile
+                && self.state.web.is_none()
+                && self.state.mobile.is_none()
+                && options.cors_origins == self.state.cors_origins
+                && workspace == self.state.workspace
+                && same_auth
+            {
+                let ready = RuntimeFrontendReady {
+                    endpoint: original_addr,
+                    auth_required: self.state.auth_required,
+                    generated_auth: self.generated_auth,
+                    reused_owner_listener: true,
+                    mobile_bootstrap_url: None,
+                    web_bootstrap_url: None,
+                };
+                write_frontend_ready(&mut output, ready).await?;
+                return tokio::select! {
+                    result = wait_frontend_input_close(input) => result,
+                    _ = self.state.shutdown.requested.cancelled() => Ok(()),
+                };
+            }
+            let resolved =
+                resolve_runtime_auth(options.auth_token.clone(), None, options.insecure_no_auth);
+            let listener =
+                TcpListener::bind(runtime_bind_address(&options.host, options.port)?).await?;
+            let endpoint = listener.local_addr()?;
+            let workspace_scope = self.state.workspace_scopes.admit(workspace.clone()).await?;
+            let mut state = self.state.clone();
+            state.workspace = workspace.clone();
+            state.workspace_scope = workspace_scope;
+            state.runtime_token = resolved.token.clone();
+            state.auth_required = resolved.token.is_some();
+            state.bind_host = options.host;
+            state.bind_port = endpoint.port();
+            state.cors_origins = options.cors_origins.clone();
+            state.mobile_enabled = options.mobile;
+            let (web, web_bootstrap_url) = if options.web {
+                anyhow::ensure!(
+                    state.auth_required,
+                    "Codewhale web requires Runtime authentication"
+                );
+                let (web, nonce) = web::RuntimeWebState::new();
+                (Some(web), Some(web::bootstrap_url(endpoint, &nonce)))
+            } else {
+                (None, None)
+            };
+            let (mobile, mobile_bootstrap_url) = if options.mobile && state.auth_required {
+                let (mobile, nonce) = mobile::RuntimeMobileState::new();
+                (Some(mobile), Some(mobile::bootstrap_url(endpoint, &nonce)))
+            } else {
+                (None, None)
+            };
+            state.web = web;
+            state.mobile = mobile;
+            // The guest may drain its own streams/listener. It cannot replace
+            // the global signal registration or stop shared schedulers/managers.
+            let shutdown = RuntimeServerShutdown::default();
+            state.shutdown = shutdown.clone();
+            let app =
+                build_router(state).merge(codewhale_app_server::runtime_compatibility_router(
+                    compatibility,
+                    &options.cors_origins,
+                    resolved.token.clone(),
+                    Some(workspace),
+                ));
+            let ready = RuntimeFrontendReady {
+                endpoint,
+                auth_required: resolved.token.is_some(),
+                generated_auth: resolved.generated,
+                reused_owner_listener: false,
+                mobile_bootstrap_url,
+                web_bootstrap_url,
+            };
+            write_frontend_ready(&mut output, ready).await?;
+            let serving = serve_runtime_api(listener, app, shutdown.clone());
+            tokio::pin!(serving);
+            let input_result = tokio::select! {
+                result = &mut serving => { result?; return Ok(()); }
+                _ = self.state.shutdown.requested.cancelled() => Ok(()),
+                result = wait_frontend_input_close(input) => result,
+            };
+            shutdown.requested.cancel();
+            // Accepted turns live in the held manager, independently of this
+            // response or listener drain. Never retry their uncertain writes.
+            tokio::time::timeout(Duration::from_secs(5), &mut serving)
+                .await
+                .context("selected listener drain deadline expired")??;
+            input_result
+        })
+    }
+}
+
+async fn write_frontend_ready(
+    output: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
+    ready: RuntimeFrontendReady,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let frame = serde_json::to_vec(
+        &json!({"jsonrpc":"2.0","method":"daemon/frontend_ready","params":ready}),
+    )?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        output.write_all(&frame).await?;
+        output.write_all(b"\n").await?;
+        output.flush().await
+    })
+    .await
+    .context("selected listener readiness write timed out; outcome uncertain")??;
+    Ok(())
+}
+async fn wait_frontend_input_close(
+    input: Box<dyn tokio::io::AsyncBufRead + Send + Unpin>,
+) -> Result<()> {
+    let mut input = codewhale_app_server::BoundedLines::new(input);
+    if let Some(line) = input.next_line().await? {
+        let value: Value = serde_json::from_str(&line)?;
+        anyhow::ensure!(
+            codewhale_app_server::is_control_input_closed(&value),
+            "selected listener accepts only its logical input close"
+        );
+    }
+    Ok(())
 }
 
 /// The serving Runtime API, for the process signal handler (`lib.rs`), which
@@ -368,6 +888,7 @@ pub struct RuntimeApiOptions {
     pub config_path: Option<PathBuf>,
     /// Effective profile used to load the server's initial Config.
     pub config_profile: Option<String>,
+    pub control_frontend: Option<codewhale_app_server::RuntimeControlFrontend>,
 }
 
 impl Default for RuntimeApiOptions {
@@ -384,6 +905,7 @@ impl Default for RuntimeApiOptions {
             show_qr: false,
             config_path: None,
             config_profile: None,
+            control_frontend: None,
         }
     }
 }
@@ -1022,6 +1544,7 @@ fn install_runtime_server_workshop_budgets(
     crate::tools::large_output_router::WorkshopConfig::install_active(config.workshop.as_ref())
 }
 
+#[cfg(test)]
 fn open_runtime_threads_for_server(
     config: &Config,
     workspace: PathBuf,
@@ -1031,17 +1554,34 @@ fn open_runtime_threads_for_server(
     SharedRuntimeThreadManager,
     crate::tools::large_output_router::WorkshopConfig,
 )> {
+    open_runtime_threads_for_host(config, workspace, manager_config, plugin_registry, false)
+}
+
+pub(crate) fn open_runtime_threads_for_host(
+    config: &Config,
+    workspace: PathBuf,
+    manager_config: RuntimeThreadManagerConfig,
+    plugin_registry: Arc<crate::plugins::PluginRegistry>,
+    acp: bool,
+) -> Result<(
+    SharedRuntimeThreadManager,
+    crate::tools::large_output_router::WorkshopConfig,
+)> {
     // The Runtime API lazily creates engines after the HTTP/Web server starts.
     // Install the resolved process-wide read/tool byte limits before the
     // thread manager can spawn any of those engines, matching interactive and
     // headless exec startup.
     let workshop_activation = install_runtime_server_workshop_budgets(config);
-    let manager = Arc::new(RuntimeThreadManager::open_with_plugin_registry(
-        config.clone(),
-        workspace,
-        manager_config,
-        plugin_registry,
-    )?);
+    let manager = Arc::new(if acp {
+        RuntimeThreadManager::open_acp(config.clone(), workspace, manager_config, plugin_registry)
+    } else {
+        RuntimeThreadManager::open_with_plugin_registry(
+            config.clone(),
+            workspace,
+            manager_config,
+            plugin_registry,
+        )
+    }?);
     // Publish the same exact endpoint-scoped catalog as interactive startup
     // before the server admits turns. A cached model list alone does not make
     // its capabilities available to route resolution.
@@ -1060,10 +1600,116 @@ pub async fn run_http_server(
     options: RuntimeApiOptions,
 ) -> Result<()> {
     validate_runtime_listener_security(&options)?;
+    let acp_selected = matches!(
+        options.control_frontend.as_ref(),
+        Some(codewhale_app_server::RuntimeControlFrontend::Acp { .. })
+    );
 
-    // Own the endpoint before building anything that names it: with an
-    // ephemeral port (`--port 0`) the kernel picks the port, and the address
-    // this process reports is the one it actually holds.
+    let task_default_model = runtime_request_model(&config, None).unwrap_or_else(|_| "auto".into());
+    let task_cfg = TaskManagerConfig::from_runtime(
+        &config,
+        workspace.clone(),
+        Some(task_default_model.clone()),
+        Some(options.workers),
+    );
+    #[cfg(any(unix, windows))]
+    let published = codewhale_app_server::daemon_client::connect_if_published(
+        options.config_path.clone(),
+        selected_control_socket(&options),
+    )
+    .await?;
+    #[cfg(any(unix, windows))]
+    if let Some(control) = published {
+        let selected_store =
+            RuntimeThreadManagerConfig::from_task_data_dir(task_cfg.data_dir.clone()).data_dir;
+        validate_selected_owner(&control, selected_store).await?;
+        let observed_owner = control.receipt().clone();
+        let client = match options.control_frontend.as_ref() {
+            Some(codewhale_app_server::RuntimeControlFrontend::Acp { model }) => {
+                drop(control);
+                let client =
+                    codewhale_app_server::daemon_client::connect_selected_acp_if_published(
+                        options.config_path.clone(),
+                        selected_control_socket(&options),
+                        codewhale_app_server::RuntimeFrontendScope {
+                            workers: options.workers,
+                            workspace: workspace.clone(),
+                            config_profile: options.config_profile.clone(),
+                            config_source: config
+                                .loaded_config_path
+                                .clone()
+                                .or_else(|| options.config_path.clone()),
+                        },
+                        model.clone(),
+                        observed_owner.clone(),
+                    )
+                    .await?
+                    .context("authenticated owner disappeared before ACP attachment")?;
+                anyhow::ensure!(
+                    client.receipt() == &observed_owner,
+                    "selected owner changed before ACP attachment"
+                );
+                client
+            }
+            Some(
+                codewhale_app_server::RuntimeControlFrontend::Stdio
+                | codewhale_app_server::RuntimeControlFrontend::Socket { .. },
+            ) => {
+                drop(control);
+                codewhale_app_server::daemon_client::connect_scoped_control_if_published(
+                    options.config_path.clone(),
+                    selected_control_socket(&options),
+                    codewhale_app_server::RuntimeFrontendScope {
+                        workers: options.workers,
+                        workspace: workspace.clone(),
+                        config_profile: options.config_profile.clone(),
+                        config_source: config
+                            .loaded_config_path
+                            .clone()
+                            .or_else(|| options.config_path.clone()),
+                    },
+                    observed_owner,
+                )
+                .await?
+                .context("authenticated owner disappeared before control attachment")?
+            }
+            _ => {
+                let environment = runtime_token_environment(&|name| std::env::var(name).ok());
+                let selection = codewhale_app_server::RuntimeListenerSelection {
+                    workers: options.workers,
+                    workspace: workspace.clone(),
+                    config_profile: options.config_profile.clone(),
+                    config_source: config
+                        .loaded_config_path
+                        .clone()
+                        .or_else(|| options.config_path.clone()),
+                    host: options.host.clone(),
+                    port: options.port,
+                    cors_origins: options.cors_origins.clone(),
+                    auth_token: options
+                        .auth_token
+                        .clone()
+                        .filter(|token| !token.trim().is_empty())
+                        .or(environment.token),
+                    insecure_no_auth: options.insecure_no_auth,
+                    mobile: options.mobile,
+                    web: options.web,
+                };
+                drop(control);
+                codewhale_app_server::daemon_client::connect_listener_if_published(
+                    options.config_path.clone(),
+                    selected_control_socket(&options),
+                    selection,
+                    observed_owner,
+                )
+                .await?
+                .context("authenticated owner disappeared before listener attachment")?
+            }
+        };
+        return run_attached_frontend(client, &options).await;
+    }
+    // No publication permits guessing an owner or bypassing its lease. The
+    // real manager open below is still the exclusive bootstrap authority.
     let addr = runtime_bind_address(&options.host, options.port)?;
     let listener = TcpListener::bind(addr)
         .await
@@ -1071,22 +1717,18 @@ pub async fn run_http_server(
     let bound_addr = listener
         .local_addr()
         .context("Failed to read Runtime API listener address")?;
-
-    // Keep the server usable before a local catalog arrives. Omitted API
-    // requests are checked at admission; background tasks keep the auto sentinel.
-    let task_default_model = runtime_request_model(&config, None).unwrap_or_else(|_| "auto".into());
-    let task_cfg = TaskManagerConfig::from_runtime(
+    let sessions_dir = default_sessions_dir().unwrap_or_else(|_| fallback_sessions_dir());
+    let mut manager_config =
+        RuntimeThreadManagerConfig::from_task_data_dir(task_cfg.data_dir.clone());
+    manager_config.sessions_dir = Some(sessions_dir.clone());
+    let (runtime_threads, _workshop_activation) = open_runtime_threads_for_host(
         &config,
         workspace.clone(),
-        Some(task_default_model),
-        Some(options.workers),
-    );
-    let (runtime_threads, _workshop_activation) = open_runtime_threads_for_server(
-        &config,
-        workspace.clone(),
-        RuntimeThreadManagerConfig::from_task_data_dir(task_cfg.data_dir.clone()),
+        manager_config,
         plugin_discovery.registry_for_workspace(&workspace),
+        acp_selected,
     )?;
+    let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
     let task_manager =
         TaskManager::start_with_runtime_manager(task_cfg, config.clone(), runtime_threads.clone())
             .await?;
@@ -1103,7 +1745,6 @@ pub async fn run_http_server(
         AutomationSchedulerConfig::default(),
     );
 
-    let sessions_dir = default_sessions_dir().unwrap_or_else(|_| fallback_sessions_dir());
     // Repair the saved-session store once per server start (#6144); this
     // server's own store is open by now, so it reads as in use.
     crate::session_reconcile::spawn_background_reconcile(None);
@@ -1147,6 +1788,9 @@ pub async fn run_http_server(
             tracing::warn!(%error, "thread item index warm-up failed");
         }
     });
+    let workspace_scopes =
+        RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
+    let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
     let state = RuntimeApiState {
         config: Arc::new(parking_lot::RwLock::new(config.clone())),
         workspace,
@@ -1168,8 +1812,8 @@ pub async fn run_http_server(
         mobile,
         web,
         fleet_codewhale_binary: configured_codewhale_binary(),
-        mcp_pool: Arc::new(Mutex::new(None)),
-        lsp_manager: Arc::new(std::sync::OnceLock::new()),
+        workspace_scopes,
+        workspace_scope,
         computer: computer_display::ComputerState::from_env(),
         shutdown: shutdown.clone(),
         git_writes: Arc::new(tokio::sync::Mutex::new(())),
@@ -1177,59 +1821,130 @@ pub async fn run_http_server(
         #[cfg(test)]
         compat_stream_test_hook: None,
     };
+    #[cfg(any(unix, windows))]
+    let (owner_frontend, control_state) = bind_captured_runtime_frontends(
+        &state,
+        selected_control_socket(&options),
+        match options.control_frontend.as_ref() {
+            Some(codewhale_app_server::RuntimeControlFrontend::Acp { model }) => model.clone(),
+            _ => task_default_model.clone(),
+        },
+        options.workers,
+        resolved_auth.generated,
+    )
+    .await?;
+    let listener_workspace = state.workspace.clone();
     let app = build_router(state);
+    #[cfg(any(unix, windows))]
+    let app = app.merge(codewhale_app_server::runtime_compatibility_router(
+        control_state.clone(),
+        &options.cors_origins,
+        runtime_token.clone(),
+        Some(listener_workspace),
+    ));
+    let owned_stdio = matches!(
+        options.control_frontend.as_ref(),
+        Some(
+            codewhale_app_server::RuntimeControlFrontend::Stdio
+                | codewhale_app_server::RuntimeControlFrontend::Acp { .. }
+        )
+    );
 
-    // First stdout line, flushed: a supervising parent reads the endpoint
-    // from here instead of guessing a port (stdout is block-buffered on a pipe).
-    println!("{RUNTIME_LISTENING_PREFIX}{bound_addr}");
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-    for line in runtime_auth_status_lines(&resolved_auth) {
-        println!("{line}");
-    }
-    if let Some(warning) = runtime_token_alias_warning {
-        println!("{warning}");
-    }
-    if options.mobile {
-        print_mobile_urls(
-            bound_addr,
-            auth_enabled,
-            resolved_auth.generated,
-            options.show_qr,
-            mobile_bootstrap.as_deref(),
-        );
-    }
-    if let Some(bootstrap) = web_bootstrap {
-        println!("Codewhale web enabled at http://{bound_addr}/");
-        let bootstrap_url = web::bootstrap_url(bound_addr, &bootstrap);
-        println!(
-            "Codewhale web bootstrap (single-use, expires in {} min): {bootstrap_url}",
-            web::BOOTSTRAP_TTL.as_secs() / 60
-        );
-        if let Some(warning) = web_launcher_warning(crate::utils::open_url(&bootstrap_url)) {
+    if !owned_stdio {
+        // First stdout line, flushed: a supervising parent reads the endpoint
+        // from here instead of guessing a port (stdout is block-buffered on a pipe).
+        println!("{RUNTIME_LISTENING_PREFIX}{bound_addr}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        for line in runtime_auth_status_lines(&resolved_auth) {
+            println!("{line}");
+        }
+        if let Some(warning) = runtime_token_alias_warning {
             println!("{warning}");
         }
-    }
-    let is_loopback = is_loopback_bind_host(&options.host);
-    if is_loopback {
-        println!("Security: this server is local-first. Do not expose it to untrusted networks.");
-    } else {
-        println!(
-            "Security: bound to {host}; reachable from any peer that can route to this address.",
-            host = options.host
-        );
-        if !auth_enabled {
-            println!(
-                "  WARNING: auth is disabled. Anyone on the network can call /v1/* without authentication."
+        if options.mobile {
+            print_mobile_urls(
+                bound_addr,
+                auth_enabled,
+                resolved_auth.generated,
+                options.show_qr,
+                mobile_bootstrap.as_deref(),
             );
         }
-        println!(
-            "  /v1/runtime/info reports bind_host={host:?}, port={port}, auth_required={auth}.",
-            host = options.host,
-            port = bound_addr.port(),
-            auth = auth_enabled,
-        );
+        if let Some(bootstrap) = web_bootstrap {
+            println!("Codewhale web enabled at http://{bound_addr}/");
+            let bootstrap_url = web::bootstrap_url(bound_addr, &bootstrap);
+            println!(
+                "Codewhale web bootstrap (single-use, expires in {} min): {bootstrap_url}",
+                web::BOOTSTRAP_TTL.as_secs() / 60
+            );
+            if let Some(warning) = web_launcher_warning(crate::utils::open_url(&bootstrap_url)) {
+                println!("{warning}");
+            }
+        }
+        let is_loopback = is_loopback_bind_host(&options.host);
+        if is_loopback {
+            println!(
+                "Security: this server is local-first. Do not expose it to untrusted networks."
+            );
+        } else {
+            println!(
+                "Security: bound to {host}; reachable from any peer that can route to this address.",
+                host = options.host
+            );
+            if !auth_enabled {
+                println!(
+                    "  WARNING: auth is disabled. Anyone on the network can call /v1/* without authentication."
+                );
+            }
+            println!(
+                "  /v1/runtime/info reports bind_host={host:?}, port={port}, auth_required={auth}.",
+                host = options.host,
+                port = bound_addr.port(),
+                auth = auth_enabled,
+            );
+        }
     }
     let signal_registration = SignalShutdownRegistration::register(&shutdown);
+    #[cfg(any(unix, windows))]
+    let (serve_result, owner_result) = {
+        let owner_handle = owner_frontend.shutdown_handle();
+        let mut owner_task = tokio::spawn(owner_frontend.serve());
+        let stdio = async {
+            if acp_selected {
+                codewhale_app_server::run_owned_acp(control_state).await
+            } else if owned_stdio {
+                codewhale_app_server::run_owned_stdio(control_state).await
+            } else {
+                std::future::pending::<Result<()>>().await
+            }
+        };
+        tokio::pin!(stdio);
+        let serve = serve_runtime_api(listener, app, shutdown.clone());
+        tokio::pin!(serve);
+        tokio::select! {
+            result = &mut serve => {
+                owner_handle.trigger();
+                let owner = owner_task.await.context("owner control frontend task failed")
+                    .and_then(|result| result.map_err(Into::into));
+                (result.map_err(|e| anyhow!("Runtime API server error: {e}")), owner)
+            }
+            result = &mut stdio => {
+                shutdown.requested.cancel();
+                let served = serve.await.map_err(|error|anyhow!("Runtime API server error: {error}"));
+                owner_handle.trigger();
+                let owner=owner_task.await.context("owner control frontend task failed").and_then(|result|result.map_err(Into::into));
+                (result.and(served),owner)
+            }
+            owner = &mut owner_task => {
+                shutdown.requested.cancel();
+                let result = serve.await.map_err(|e| anyhow!("Runtime API server error: {e}"));
+                let owner = owner.context("owner control frontend task failed")
+                    .and_then(|result| result.map_err(Into::into));
+                (result, owner.and_then(|()| Err(anyhow!("owner control frontend stopped before its Runtime host"))))
+            }
+        }
+    };
+    #[cfg(not(any(unix, windows)))]
     let serve_result = serve_runtime_api(listener, app, shutdown)
         .await
         .map_err(|e| anyhow!("Runtime API server error: {e}"));
@@ -1237,13 +1952,196 @@ pub async fn run_http_server(
     scheduler_cancel.cancel();
     scheduler_handle.abort();
     task_manager.shutdown_and_wait().await?;
+    #[cfg(any(unix, windows))]
+    owner_result?;
     serve_result
+}
+
+fn selected_control_socket(options: &RuntimeApiOptions) -> Option<PathBuf> {
+    match options.control_frontend.as_ref() {
+        Some(codewhale_app_server::RuntimeControlFrontend::Socket { path }) => path.clone(),
+        _ => None,
+    }
+}
+
+#[cfg(any(unix, windows))]
+pub(crate) async fn validate_selected_owner(
+    client: &codewhale_app_server::daemon_client::OwnerClient,
+    selected_store: PathBuf,
+) -> Result<()> {
+    let receipt = client.receipt().clone();
+    codewhale_app_server::daemon_socket::owner_work(move || {
+        let selected = crate::runtime_threads::RuntimeStoreBinding::for_store_dir(&selected_store)?;
+        selected.validate_existing_store()?;
+        anyhow::ensure!(
+            selected.data_dir == receipt.data_dir
+                && !selected.execution_scope.is_empty()
+                && selected.execution_scope == receipt.execution_scope,
+            "authenticated Runtime owner belongs to another selected store; refusing attachment"
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[cfg(any(unix, windows))]
+async fn bind_captured_runtime_frontends(
+    state: &RuntimeApiState,
+    selected_socket: Option<PathBuf>,
+    model: String,
+    worker_setting: usize,
+    generated_auth: bool,
+) -> Result<(
+    codewhale_app_server::daemon_socket::DaemonSocket,
+    codewhale_app_server::AppState,
+)> {
+    let captured_manager = state.runtime_threads.clone();
+    let (binding, generation) = codewhale_app_server::daemon_socket::owner_work(move || {
+        captured_manager.capture_control_owner()
+    })
+    .await?;
+    let config_path = state.config_path.clone();
+    let socket_path =
+        codewhale_app_server::daemon_socket::owner_work(move || match selected_socket {
+            Some(path) => Ok(path),
+            None => codewhale_app_server::daemon_socket::default_socket_path().map_err(Into::into),
+        })
+        .await?;
+    let process_start =
+        codewhale_app_server::daemon_socket::capture_process_start(std::process::id()).await?;
+    #[cfg(unix)]
+    let principal =
+        codewhale_config::private_directory::PrivateDirectory::current_user_id().to_string();
+    #[cfg(windows)]
+    let principal = codewhale_app_server::daemon_socket::owner_work(|| {
+        codewhale_config::windows_identity::CurrentWindowsUser::open()?.sid_string()
+    })
+    .await?;
+    let owner = codewhale_protocol::RuntimeOwnerReceipt {
+        version: 1,
+        data_dir: binding.data_dir,
+        execution_scope: binding.execution_scope,
+        lease_generation: generation,
+        pid: std::process::id(),
+        process_start,
+        principal,
+        socket_path,
+        config_path: config_path.clone(),
+    };
+    codewhale_app_server::bind_runtime_frontends(
+        config_path,
+        state.runtime_token.clone(),
+        owner,
+        codewhale_app_server::RuntimeOwnerRouting {
+            workers: Some(worker_setting),
+            workspace: Some(state.workspace.clone()),
+            endpoint: runtime_bind_address(&state.bind_host, state.bind_port)?,
+            mobile: state.mobile.is_some(),
+            web: state.web.is_some(),
+            acp: true,
+            acp_only: state.runtime_threads.is_acp_host(),
+        },
+        Some(
+            CapturedRuntimeFrontend::capture(state.clone(), model, worker_setting, generated_auth)
+                .await?,
+        ),
+    )
+    .await
+}
+
+#[cfg(any(unix, windows))]
+async fn run_attached_frontend(
+    mut client: codewhale_app_server::daemon_client::OwnerClient,
+    options: &RuntimeApiOptions,
+) -> Result<()> {
+    let routing = client
+        .routing()
+        .context("authenticated owner has no selected frontend facts")?;
+    let acp_selected = matches!(
+        options.control_frontend.as_ref(),
+        Some(codewhale_app_server::RuntimeControlFrontend::Acp { .. })
+    );
+    anyhow::ensure!(
+        (!acp_selected || routing.acp) && (acp_selected || !routing.acp_only),
+        "selected owner cannot admit this frontend within its captured base profile"
+    );
+    if matches!(
+        options.control_frontend.as_ref(),
+        Some(
+            codewhale_app_server::RuntimeControlFrontend::Stdio
+                | codewhale_app_server::RuntimeControlFrontend::Acp { .. }
+        )
+    ) {
+        return client
+            .forward(tokio::io::stdin(), tokio::io::stdout())
+            .await;
+    }
+    if matches!(
+        options.control_frontend.as_ref(),
+        Some(codewhale_app_server::RuntimeControlFrontend::Socket { .. })
+    ) {
+        println!(
+            "Attached to the authenticated Runtime control owner at {}.",
+            routing.endpoint
+        );
+    } else {
+        let frame = tokio::time::timeout(Duration::from_secs(10), client.recv())
+            .await
+            .context("selected listener readiness deadline expired; attachment outcome uncertain")??
+            .context("owner closed before selected listener readiness")?;
+        anyhow::ensure!(
+            frame["jsonrpc"] == "2.0"
+                && frame["method"] == "daemon/frontend_ready"
+                && frame.get("id").is_none(),
+            "invalid selected listener readiness response"
+        );
+        let ready: RuntimeFrontendReady = serde_json::from_value(frame["params"].clone())?;
+        println!("{RUNTIME_LISTENING_PREFIX}{}", ready.endpoint);
+        if ready.generated_auth {
+            println!("Runtime authentication enabled; generated bearer is not printed.");
+        }
+        if let Some(url) = ready.web_bootstrap_url {
+            println!("Codewhale web: {url}");
+        }
+        if let Some(url) = ready.mobile_bootstrap_url {
+            println!("Codewhale mobile: {url}");
+        }
+    }
+
+    // This local guest owns its connection only. A signal detaches; it never
+    // sends the host shutdown request or replays an uncertain operation.
+    tokio::select! {
+        result=async {while client.recv().await?.is_some() {} Ok::<(), anyhow::Error>(())}=>result,
+        result=tokio::signal::ctrl_c()=>result.map_err(Into::into),
+    }
 }
 
 /// Mobile control uses plain HTTP only on loopback. It has no TLS or verified
 /// overlay transport, so a non-loopback listener would expose the Runtime API
 /// to peers that can observe or replay browser traffic.
 fn validate_runtime_listener_security(options: &RuntimeApiOptions) -> Result<()> {
+    if matches!(
+        options.control_frontend.as_ref(),
+        Some(codewhale_app_server::RuntimeControlFrontend::LegacyHttp)
+    ) && !is_loopback_bind_host(&options.host)
+        && options
+            .auth_token
+            .as_ref()
+            .is_none_or(|token| token.trim().is_empty())
+    {
+        bail!("refusing non-loopback compatibility bind without explicit auth token");
+    }
+    if matches!(
+        options.control_frontend.as_ref(),
+        Some(
+            codewhale_app_server::RuntimeControlFrontend::Stdio
+                | codewhale_app_server::RuntimeControlFrontend::Socket { .. }
+                | codewhale_app_server::RuntimeControlFrontend::Acp { .. }
+        )
+    ) && !is_loopback_bind_host(&options.host)
+    {
+        bail!("owned local control requires a loopback private Runtime listener");
+    }
     // Port 0 asks the kernel for an ephemeral port. Only a plain loopback
     // Runtime may use it: web and mobile clients are given a fixed endpoint.
     if options.port == 0 && (options.web || options.mobile || !is_loopback_bind_host(&options.host))
@@ -1423,6 +2321,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             delete(ack_thread_notice),
         )
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route(
+            "/v1/threads/{id}/history",
+            get(thread_history::snapshot_thread_history),
+        )
         .route(
             "/v1/threads/{id}/jobs",
             get(jobs::list_thread_jobs).post(jobs::create_thread_job),
@@ -1710,6 +2612,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .merge(memory_lens::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
+            require_workspace_scope,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
             require_runtime_token,
         ));
 
@@ -1738,6 +2644,22 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/health", get(health))
         .route("/mobile", get(mobile_page))
         .route("/mobile/", get(mobile_page))
+        .route(
+            "/v1/thread-history/operations/lookup",
+            post(thread_history::lookup_thread_history_operation),
+        )
+        .route(
+            "/v1/thread-history/operations/recover",
+            post(thread_history::recover_thread_history_operation),
+        )
+        .route(
+            "/v1/thread-history/mutate",
+            post(thread_history::mutate_thread_history),
+        )
+        .route(
+            "/v1/thread-history/import",
+            post(thread_history::import_thread_history),
+        )
         .route("/v1/runtime/info", get(runtime_info))
         // Authenticates per handler: the display WS also takes a single-use
         // ticket, and client-token minting is master-token only.
@@ -1965,8 +2887,10 @@ fn runtime_request_model(config: &Config, requested: Option<&str>) -> Result<Str
     if let Some(model) = requested {
         return Ok(model.to_string());
     }
-    let provider = config.api_provider();
-    let model = provider_default_model_for_api(config, provider, provider);
+    let identity = config
+        .active_provider_identity()
+        .map_err(ApiError::bad_request)?;
+    let model = provider_default_model_for_api(config, &identity);
     if model.is_empty() {
         return Err(ApiError::bad_request(
             "The active provider has no available default model; refresh its catalog or select an explicit model.",
@@ -2232,12 +3156,71 @@ async fn list_threads_summary(
     Ok(Json(summaries))
 }
 
+fn same_agent_worker_launch(current: &AgentWorkerRecord, expected: &AgentWorkerRecord) -> bool {
+    current.spec.worker_id == expected.spec.worker_id
+        && current.owner_session_id == expected.owner_session_id
+        && current.spec.run_id == expected.spec.run_id
+        && current.created_at_ms == expected.created_at_ms
+        && current
+            .spec
+            .launch_manifest
+            .as_ref()
+            .map(|manifest| manifest.generation)
+            == expected
+                .spec
+                .launch_manifest
+                .as_ref()
+                .map(|manifest| manifest.generation)
+}
+
+fn fleet_worker_has_selected_lease(
+    record: &AgentWorkerRecord,
+    fleet: &crate::fleet::ledger::FleetLedgerState,
+) -> bool {
+    fleet.tasks.values().any(|task| {
+        task.entry.run_id.0 == record.spec.run_id
+            && task.leased_to.as_deref() == Some(record.spec.worker_id.as_str())
+    })
+}
+
+async fn workspace_agent_runs(state: &RuntimeApiState) -> Result<Vec<AgentWorkerRecord>, ApiError> {
+    let manager = state.sub_agent_manager.clone().read_owned().await;
+    let selected_state = state.clone();
+    codewhale_app_server::daemon_socket::owner_work(move || {
+        let projected = manager
+            .worker_records_for_workspace(&selected_state.workspace)
+            .map_err(anyhow::Error::msg)?;
+        let fleet = if projected.iter().any(|(_, fleet)| *fleet) {
+            Some(
+                open_fleet_manager(&selected_state)
+                    .map_err(|error| anyhow::anyhow!(error.message))?
+                    .rebuild_state()?,
+            )
+        } else {
+            None
+        };
+        Ok(projected
+            .into_iter()
+            .filter_map(|(record, needs_lease)| {
+                if needs_lease
+                    && !fleet
+                        .as_ref()
+                        .is_some_and(|fleet| fleet_worker_has_selected_lease(&record, fleet))
+                {
+                    return None;
+                }
+                Some(record)
+            })
+            .collect())
+    })
+    .await
+    .map_err(|error| ApiError::conflict(format!("agent run origin could not be verified: {error}")))
+}
+
 async fn list_agent_runs(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<AgentRunsResponse>, ApiError> {
-    let runs = load_persisted_agent_worker_records(&state.workspace).map_err(|err| {
-        ApiError::internal(format!("Failed to load persisted agent run records: {err}"))
-    })?;
+    let runs = workspace_agent_runs(&state).await?;
     let snapshot = state
         .sub_agent_manager
         .read()
@@ -2260,9 +3243,7 @@ async fn get_agent_run(
     State(state): State<RuntimeApiState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<AgentWorkerRecord>, ApiError> {
-    let runs = load_persisted_agent_worker_records(&state.workspace).map_err(|err| {
-        ApiError::internal(format!("Failed to load persisted agent run records: {err}"))
-    })?;
+    let runs = workspace_agent_runs(&state).await?;
     let run = runs
         .into_iter()
         .find(|record| agent_run_matches(record, &run_id))
@@ -2302,23 +3283,36 @@ async fn cancel_agent_run(
     State(state): State<RuntimeApiState>,
     Path(run_id): Path<String>,
 ) -> Result<(StatusCode, Json<AgentWorkerRecord>), ApiError> {
+    let selected_record = workspace_agent_runs(&state)
+        .await?
+        .into_iter()
+        .find(|record| agent_run_matches(record, &run_id))
+        .ok_or_else(|| ApiError::not_found(format!("agent run '{run_id}' not found")))?;
     // Runs this runtime is executing itself (Fleet-launched children) stop
     // in place. Only a running child in this process qualifies for mutation;
     // a terminal receipt can be returned without mutating or consulting disk.
     // Other persisted runs still go through their owning session below.
     let owned = {
-        let manager = state.sub_agent_manager.read().await;
-        manager
-            .list_worker_records()
-            .into_iter()
-            .find(|record| agent_run_matches(record, &run_id))
-            .filter(|record| {
-                manager
-                    .get_result(&record.spec.worker_id)
-                    .is_ok_and(|agent| {
-                        agent.status == SubAgentStatus::Running || record.status.is_terminal()
-                    })
-            })
+        let manager = state.sub_agent_manager.clone().read_owned().await;
+        let selected_workspace = state.workspace.clone();
+        let expected = selected_record.clone();
+        codewhale_app_server::daemon_socket::owner_work(move || {
+            Ok(manager
+                .worker_records_for_workspace(&selected_workspace)
+                .map_err(anyhow::Error::msg)?
+                .into_iter()
+                .map(|(record, _)| record)
+                .find(|record| same_agent_worker_launch(record, &expected))
+                .filter(|record| {
+                    manager
+                        .get_result(&record.spec.worker_id)
+                        .is_ok_and(|agent| {
+                            agent.status == SubAgentStatus::Running || record.status.is_terminal()
+                        })
+                }))
+        })
+        .await
+        .map_err(|error| ApiError::conflict(error.to_string()))?
     };
     if let Some(record) = owned {
         // Persistence is asynchronous. A repeated stop must answer from the
@@ -2327,25 +3321,58 @@ async fn cancel_agent_run(
         if record.status.is_terminal() {
             return Ok((StatusCode::OK, Json(record)));
         }
-        let agent_id = record.spec.worker_id.clone();
-        let cancelled = {
-            let mut manager = state.sub_agent_manager.write().await;
-            if record.owner_session_id.is_empty() {
-                manager.cancel_agent(&agent_id)
-            } else {
-                manager.cancel_agent_for_session(&record.owner_session_id, &agent_id)
+        let mut manager = state.sub_agent_manager.clone().write_owned().await;
+        let selected_workspace = state.workspace.clone();
+        let selected_state = state.clone();
+        let expected_record = record.clone();
+        let cancelled = codewhale_app_server::daemon_socket::owner_work(move || {
+            let (current, needs_lease) = manager
+                .worker_records_for_workspace(&selected_workspace)
+                .map_err(anyhow::Error::msg)?
+                .into_iter()
+                .find(|(record, _)| same_agent_worker_launch(record, &expected_record))
+                .ok_or_else(|| anyhow::anyhow!("worker origin changed before cancellation"))?;
+            if needs_lease {
+                let fleet = open_fleet_manager(&selected_state)
+                    .map_err(|error| anyhow::anyhow!(error.message))?
+                    .rebuild_state()?;
+                anyhow::ensure!(
+                    fleet_worker_has_selected_lease(&current, &fleet),
+                    "selected Fleet lease changed before cancellation"
+                );
+                // Revalidate the held root after the bounded ledger read, before
+                // the actor mutation. No awaited operation follows this check.
+                anyhow::ensure!(
+                    manager
+                        .worker_records_for_workspace(&selected_workspace)
+                        .map_err(anyhow::Error::msg)?
+                        .iter()
+                        .any(|(record, _)| same_agent_worker_launch(record, &current)),
+                    "worker origin changed during selected Fleet lease validation"
+                );
             }
-        }
+            if current.owner_session_id.is_empty() {
+                manager.cancel_agent(&current.spec.worker_id)
+            } else {
+                manager.cancel_agent_for_session(&current.owner_session_id, &current.spec.worker_id)
+            }
+        })
+        .await
         .map_err(|err| {
             ApiError::conflict(format!("agent run '{run_id}' could not be stopped: {err}"))
         })?;
+        let cancelled =
+            crate::tools::subagent::settle_requested_child(&state.sub_agent_manager, cancelled)
+                .await;
         crate::tools::subagent::preserve_cancelled_work(&state.sub_agent_manager, cancelled).await;
         let manager = state.sub_agent_manager.read().await;
         let record = manager
             .list_worker_records()
             .into_iter()
-            .find(|record| record.spec.worker_id == agent_id)
-            .unwrap_or(record);
+            .find(|current| same_agent_worker_launch(current, &record))
+            .ok_or_else(|| {
+                ApiError::conflict("worker launch changed while cancellation settled")
+            })?;
         let status = if record.status.is_terminal() {
             StatusCode::OK
         } else {
@@ -2354,18 +3381,7 @@ async fn cancel_agent_run(
         return Ok((status, Json(record)));
     }
 
-    let find_persisted = |workspace: &FsPath| -> Result<Option<AgentWorkerRecord>, ApiError> {
-        load_persisted_agent_worker_records(workspace)
-            .map(|runs| {
-                runs.into_iter()
-                    .find(|record| agent_run_matches(record, &run_id))
-            })
-            .map_err(|err| {
-                ApiError::internal(format!("Failed to load persisted agent run records: {err}"))
-            })
-    };
-    let record = find_persisted(&state.workspace)?
-        .ok_or_else(|| ApiError::not_found(format!("agent run '{run_id}' not found")))?;
+    let record = selected_record;
 
     // A runtime thread's session id is its thread id: its live engine owns
     // the child and stops it through the session-scoped cancel path. The
@@ -2402,7 +3418,11 @@ async fn cancel_agent_run(
     };
     let deadline = tokio::time::Instant::now() + AGENT_RUN_CANCEL_SETTLE;
     loop {
-        let current = find_persisted(&state.workspace)?.unwrap_or_else(|| record.clone());
+        let current = workspace_agent_runs(&state)
+            .await?
+            .into_iter()
+            .find(|current| same_agent_worker_launch(current, &record))
+            .unwrap_or_else(|| record.clone());
         if settled(&current) {
             return Ok((StatusCode::OK, Json(current)));
         }
@@ -2707,7 +3727,9 @@ async fn start_fleet_run(
     let codewhale_binary = state.fleet_codewhale_binary.clone();
     let sessions_dir = state.sessions_dir.clone();
     let execution_run_id = run_id.clone();
+    let workspace_scope = state.workspace_scope.clone();
     tokio::spawn(async move {
+        let _workspace_scope = workspace_scope;
         let mut executor = FleetExecutor::new(&workspace).with_sessions_dir(sessions_dir);
         if let Err(error) = manager
             .run_to_completion(
@@ -3036,7 +4058,9 @@ async fn restart_fleet_worker(
     let workspace = state.workspace.clone();
     let codewhale_binary = state.fleet_codewhale_binary.clone();
     let sessions_dir = state.sessions_dir.clone();
+    let workspace_scope = state.workspace_scope.clone();
     tokio::spawn(async move {
+        let _workspace_scope = workspace_scope;
         let mut executor = FleetExecutor::new(&workspace).with_sessions_dir(sessions_dir);
         if let Err(err) = manager
             .run_to_completion(
@@ -3625,7 +4649,12 @@ fn command_catalog(
             shadowed_aliases,
         });
     }
-    for command in user_commands.iter() {
+    // Extension commands run in the extension host from the TUI's event loop;
+    // a Runtime API client cannot run them, so they are not advertised here.
+    for command in user_commands
+        .iter()
+        .filter(|command| command.extension.is_none())
+    {
         let takes_arguments = command.takes_arguments();
         commands.push(CommandCatalogEntry {
             name: command.name.clone(),
@@ -3821,6 +4850,7 @@ async fn list_skills(
                         plugin_id,
                         plugin_name,
                         authority,
+                        ..
                     } => (
                         None,
                         format!("reviewed-plugin-snapshot:{plugin_name}"),
@@ -4694,11 +5724,20 @@ async fn mutate_mcp_management<T: Send + 'static>(
     tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         let _membership = crate::test_support::join_env_scope(env_ticket);
+        state
+            .workspace_scope
+            .validate_sync()
+            .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
         let path = state.config.read().mcp_config_path();
-        crate::mcp::mutate_config(&path, Some(&expected), |config| {
+        let result = crate::mcp::mutate_config(&path, Some(&expected), |config| {
             mutate(&state, config).map_err(|error| anyhow::Error::new(McpManagementFailure(error)))
         })
-        .map_err(mcp_mutation_error)
+        .map_err(mcp_mutation_error)?;
+        state
+            .workspace_scopes
+            .mcp_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(result)
     })
     .await
     .map_err(|_| ApiError::internal("MCP configuration write failed"))?
@@ -4754,18 +5793,75 @@ async fn mcp_pool_handle(
     state: &RuntimeApiState,
     create: bool,
 ) -> Result<Option<Arc<Mutex<McpPool>>>, ApiError> {
-    let mut slot = state.mcp_pool.lock().await;
-    if slot.is_none() && create {
-        let path = state.config.read().mcp_config_path();
-        let plugins = state
-            .plugin_discovery
-            .registry_for_workspace(&state.workspace);
-        let pool =
-            McpPool::from_config_path_with_workspace_and_plugins(&path, &state.workspace, plugins)
-                .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
-        *slot = Some(Arc::new(Mutex::new(pool)));
+    state
+        .workspace_scope
+        .validate()
+        .await
+        .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
+    let mut slot = state.workspace_scope.mcp.lock().await;
+    state
+        .workspace_scope
+        .validate()
+        .await
+        .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
+    loop {
+        let generation = state
+            .workspace_scopes
+            .mcp_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if let Some((admitted, pool)) = slot.as_ref() {
+            if *admitted == generation {
+                return Ok(Some(pool.clone()));
+            }
+            let mut held = pool.clone().lock_owned().await;
+            let current = state.clone();
+            #[cfg(test)]
+            let env_ticket = crate::test_support::env_scope_ticket();
+            codewhale_app_server::daemon_socket::owner_work(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(env_ticket);
+                // Keep the exact scope/owner alive through synchronous disk
+                // reload even if this request is cancelled after admission.
+                current.workspace_scope.validate_sync()?;
+                let path = current.config.read().mcp_config_path();
+                let plugins = current
+                    .plugin_discovery
+                    .registry_for_workspace(&current.workspace);
+                held.switch_workspace_config_source(&path, &current.workspace, plugins)
+            })
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+            slot.as_mut().expect("retained pool").0 = generation;
+        } else if create {
+            let current = state.clone();
+            #[cfg(test)]
+            let env_ticket = crate::test_support::env_scope_ticket();
+            let pool = codewhale_app_server::daemon_socket::owner_work(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(env_ticket);
+                current.workspace_scope.validate_sync()?;
+                let path = current.config.read().mcp_config_path();
+                let plugins = current
+                    .plugin_discovery
+                    .registry_for_workspace(&current.workspace);
+                let mut pool = McpPool::from_config_path_with_workspace_and_plugins(
+                    &path,
+                    &current.workspace,
+                    plugins,
+                )?
+                .with_backend(crate::mcp::McpBackend::from_config(&current.config.read()));
+                pool.dynamic_servers = current.workspace_scopes.dynamic_servers.clone();
+                Ok(pool)
+            })
+            .await
+            .map_err(|error| ApiError::internal(format!("Failed to load MCP config: {error}")))?;
+            *slot = Some((generation, Arc::new(Mutex::new(pool))));
+        } else {
+            return Ok(None);
+        }
+        // A concurrent global mutation may have settled during disk work.
+        // Repeat validation under the same pool; no second connection owner.
     }
-    Ok(slot.clone())
 }
 
 fn mcp_connection_outcome(
@@ -4791,6 +5887,11 @@ async fn list_mcp_servers(
         Some(handle) => Some(handle.lock().await),
         None => None,
     };
+    state
+        .workspace_scope
+        .validate()
+        .await
+        .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
     let mut servers = Vec::new();
     for (name, server_cfg) in config.servers {
         let origin = origins.get(&name).copied().unwrap_or("unknown");
@@ -4834,6 +5935,11 @@ async fn list_mcp_tools(
         }));
     };
     let mut pool = pool_handle.lock().await;
+    state
+        .workspace_scope
+        .validate()
+        .await
+        .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
     if fresh_config
         .as_ref()
         .is_some_and(|config| !pool.config_matches(config))
@@ -4931,6 +6037,11 @@ async fn get_mcp_server(
         Some(handle) => Some(handle.lock().await),
         None => None,
     };
+    state
+        .workspace_scope
+        .validate()
+        .await
+        .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
     let connected = pool
         .as_ref()
         .is_some_and(|pool| pool.connected_servers().contains(&name.as_str()));
@@ -5001,10 +6112,6 @@ async fn create_mcp_server(
         .await?;
 
     // Invalidate the in-memory pool so the next tool call reloads from disk.
-    {
-        let mut pool_slot = state.mcp_pool.lock().await;
-        *pool_slot = None;
-    }
 
     Ok((
         StatusCode::CREATED,
@@ -5064,10 +6171,6 @@ async fn update_mcp_server(
     }).await?;
 
     // Invalidate the in-memory pool.
-    {
-        let mut pool_slot = state.mcp_pool.lock().await;
-        *pool_slot = None;
-    }
 
     Ok(Json(McpServerDetail::from_config(
         &name,
@@ -5094,10 +6197,6 @@ async fn delete_mcp_server(
     .await?;
 
     // Invalidate the in-memory pool.
-    {
-        let mut pool_slot = state.mcp_pool.lock().await;
-        *pool_slot = None;
-    }
 
     Ok(Json(McpServerActionReceipt {
         revision: Some(revision),
@@ -5128,10 +6227,6 @@ async fn enable_mcp_server(
     .await?;
 
     // Invalidate the in-memory pool so the enabled server participates next time.
-    {
-        let mut pool_slot = state.mcp_pool.lock().await;
-        *pool_slot = None;
-    }
 
     Ok(Json(McpServerActionReceipt {
         revision: Some(revision),
@@ -5162,10 +6257,6 @@ async fn disable_mcp_server(
     .await?;
 
     // Invalidate the in-memory pool so the disabled server is excluded next time.
-    {
-        let mut pool_slot = state.mcp_pool.lock().await;
-        *pool_slot = None;
-    }
 
     Ok(Json(McpServerActionReceipt {
         revision: Some(revision),
@@ -5192,6 +6283,11 @@ async fn reconnect_mcp_server(
         .await?
         .ok_or_else(|| ApiError::internal("MCP pool unavailable"))?;
     let mut pool = handle.lock().await;
+    state
+        .workspace_scope
+        .validate()
+        .await
+        .map_err(|_| ApiError::conflict("selected workspace identity changed"))?;
     let error = if !config.servers[&name].is_enabled() {
         Some(anyhow::anyhow!("MCP server '{name}' is disabled"))
     } else if !pool.config_matches(&config) {
@@ -5795,7 +6891,7 @@ async fn fork_thread(
 ) -> Result<(StatusCode, Json<ThreadRecord>), ApiError> {
     let thread = state
         .runtime_threads
-        .fork_thread(&id)
+        .fork_thread_in_sessions_dir(&id, &state.sessions_dir)
         .await
         .map_err(map_thread_err)?;
     Ok((StatusCode::CREATED, Json(thread)))
@@ -5827,7 +6923,7 @@ async fn undo_thread_turn(
     let depth = req.depth.unwrap_or(0);
     let (forked_thread, original_user_text, original_user_images, _) = state
         .runtime_threads
-        .fork_at_user_message(&id, depth)
+        .fork_at_user_message_in_sessions_dir(&id, depth, &state.sessions_dir)
         .await
         .map_err(map_thread_err)?;
     Ok((
@@ -5865,7 +6961,7 @@ async fn fork_thread_at_turn(
 ) -> Result<(StatusCode, Json<UndoTurnResponse>), ApiError> {
     let (forked_thread, original_user_text, original_user_images, _) = state
         .runtime_threads
-        .fork_at_user_turn(&id, &req.turn_id)
+        .fork_at_user_turn_in_sessions_dir(&id, &req.turn_id, &state.sessions_dir)
         .await
         .map_err(map_thread_err)?;
     Ok((
@@ -5924,13 +7020,15 @@ async fn patch_undo_thread_turn(
     // Once admitted, own the operation even when the HTTP caller disconnects:
     // the reservation must outlive both the file mutation and the fork
     // publication, so a dropped connection cannot release it mid-Git.
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
     tokio::spawn(async move {
         let reservation = reservation;
         // Validate depth/history before touching any file, so an invalid
         // undo request cannot leave a half-applied workspace.
         let prepared = state
             .runtime_threads
-            .prepare_fork_at_user_message(&id, depth)
+            .prepare_fork_at_user_message_in_sessions_dir(&id, depth, &state.sessions_dir)
             .await
             .map_err(map_thread_err)?;
         // File rollback is a workspace mutation, so it needs the trust the
@@ -5946,6 +7044,8 @@ async fn patch_undo_thread_turn(
         // refusal or a failed restore aborts *before* the conversation is
         // forked, so the turn never disappears while its file changes stay.
         let patch_result = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
             patch_undo_workspace_files(&workspace, &dropped_turns, trusted)
         })
         .await
@@ -6598,7 +7698,11 @@ async fn revert_thread_file(
     // The worker owns the reservation: a client disconnect cannot release it
     // while Git is still changing files. Snapshot listing, diffing and
     // checkout all shell out to git; keep that off the async workers.
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
     let response = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
         let _reservation = reservation;
         revert_file_from_snapshot(&workspace, &owned, &req)
     })
@@ -6757,7 +7861,7 @@ async fn retry_thread_turn(
     let depth = req.depth.unwrap_or(0);
     let (forked_thread, original_user_text, original_user_images, max_output_tokens) = state
         .runtime_threads
-        .fork_at_user_message(&id, depth)
+        .fork_at_user_message_in_sessions_dir(&id, depth, &state.sessions_dir)
         .await
         .map_err(map_thread_err)?;
 
@@ -6773,6 +7877,7 @@ async fn retry_thread_turn(
         .start_turn_from_stored_images(
             &forked_thread.id,
             StartTurnRequest {
+                expected_workspace: None,
                 max_output_tokens,
                 prompt: retry_prompt,
                 images: original_user_images,
@@ -7644,8 +8749,11 @@ async fn stream_turn(
     let model = runtime_request_model(&state.config.read(), req.model.as_deref())?;
     if req.max_output_tokens.is_some() {
         let config = state.config.read();
+        let identity = config
+            .active_provider_identity()
+            .map_err(ApiError::bad_request)?;
         if model.eq_ignore_ascii_case("auto")
-            || provider_model_output_token_limit_for_api(&config, config.api_provider(), &model)
+            || provider_model_output_token_limit_for_api(&config, &identity, &model)
                 != codewhale_config::route::CapabilityState::Supported
         {
             return Err(ApiError::bad_request(
@@ -8250,8 +9358,11 @@ fn discover_skills_for_runtime_api(
     plugins: Option<&crate::plugins::PluginRegistry>,
 ) -> (crate::skills::SkillRegistry, Vec<PathBuf>) {
     let directories = skills_search_directories(workspace, skills_dir, mode);
-    let registry =
-        crate::skills::discover_from_directories_with_plugins(directories.clone(), plugins);
+    let registry = crate::skills::discover_from_directories_in_workspace(
+        directories.clone(),
+        Some(workspace),
+        plugins,
+    );
     (registry, directories)
 }
 
@@ -8431,13 +9542,13 @@ fn snapshot_entries_for_workspace(
 /// provider picker instead of hard-coding `deepseek` only, plus one entry per
 /// user-defined `[providers.<name>]` route (#1519) — the same routes the TUI's
 /// own provider picker lists, so a route configured in one surface is not
-/// missing from the other. The `id` matches `ApiProvider::as_str()`; callers
+/// missing from the other. The `id` matches `ProviderKind::as_str()`; callers
 /// must also preserve `model_provider_id` when present. Both can be pinned to
 /// one new thread via `POST /v1/threads` without mutating the runtime's global
 /// provider configuration.
 #[derive(Debug, Clone, Serialize)]
 struct ProviderEntry {
-    /// Stable generic provider kind — matches `ApiProvider::as_str()` and is
+    /// Stable generic provider kind — matches `ProviderKind::as_str()` and is
     /// suitable for `CreateThreadRequest.model_provider`. This is not always
     /// the exact configured route id: named custom routes also require
     /// `model_provider_id` below.
@@ -8717,26 +9828,29 @@ fn push_unique_model(models: &mut Vec<String>, model: &str) {
 
 fn provider_models_for_api(
     config: &Config,
-    active_provider: ApiProvider,
-    provider: ApiProvider,
+    identity: &crate::config::ProviderIdentity,
 ) -> Vec<String> {
+    if config.verify_provider_identity(identity).is_err() {
+        return Vec::new();
+    }
+    let provider = identity.provider;
     let mut models = Vec::new();
     if let Some(model) = config
-        .provider_config_for(provider)
+        .provider_config_for(identity)
         .and_then(|entry| entry.model.as_deref())
     {
         push_unique_model(&mut models, model);
     }
-    if provider == active_provider {
-        let active_model = provider_default_model_for_api(config, active_provider, provider);
+    if config.active_provider_identity().ok().as_ref() == Some(identity) {
+        let active_model = provider_default_model_for_api(config, identity);
         if !active_model.trim().eq_ignore_ascii_case("auto") {
             push_unique_model(&mut models, &active_model);
         }
     }
     let exact_catalog = crate::provider_catalog_live::cached_entry_for_route(
         provider,
-        &config.provider_identity_for(provider),
-        &config.base_url_for_route(provider),
+        identity.key.as_str(),
+        &config.base_url_for_route(identity),
     )
     .ok()
     .flatten()
@@ -8744,11 +9858,11 @@ fn provider_models_for_api(
     // A pass-through provider normally lists only what its own live catalog
     // returned. When that catalog cannot exist (an OAuth route), the catalog
     // lake's next layers (Models.dev, then the bundled snapshot) answer.
-    if !config.model_ids_pass_through_for_provider(provider)
+    if !config.model_ids_pass_through_for_provider(identity)
         || exact_catalog
-        || crate::provider_lake::live_catalog_unavailable(config, provider)
+        || crate::provider_lake::live_catalog_unavailable(config, identity)
     {
-        for model in crate::provider_lake::models_for_provider(config, active_provider, provider) {
+        for model in crate::provider_lake::models_for_provider(config, identity) {
             push_unique_model(&mut models, &model);
         }
     }
@@ -8756,8 +9870,8 @@ fn provider_models_for_api(
         if crate::provider_lake::configured_model_for_route(
             config,
             provider,
-            &config.provider_identity_for(provider),
-            &config.base_url_for_route(provider),
+            identity.key.as_str(),
+            &config.base_url_for_route(identity),
             &model.id,
         )
         .is_some()
@@ -8766,7 +9880,7 @@ fn provider_models_for_api(
             models.push(model.id.clone());
         }
     }
-    if provider == ApiProvider::Ollama {
+    if provider == ProviderKind::Ollama {
         models.retain(|model| !crate::config::is_unresolved_local_ollama_model(model));
     }
     models
@@ -8774,21 +9888,21 @@ fn provider_models_for_api(
 
 fn provider_model_image_input_for_api(
     config: &Config,
-    provider: ApiProvider,
+    identity: &crate::config::ProviderIdentity,
     model: &str,
 ) -> codewhale_config::route::CapabilityState {
-    crate::route_runtime::resolve_runtime_route(config, provider, Some(model))
+    crate::route_runtime::resolve_runtime_route_for_identity(config, identity, Some(model))
         .map(|route| route.candidate.capabilities().image_input)
         .unwrap_or_default()
 }
 
 fn provider_model_output_token_limit_for_api(
     config: &Config,
-    provider: ApiProvider,
+    identity: &crate::config::ProviderIdentity,
     model: &str,
 ) -> codewhale_config::route::CapabilityState {
     use codewhale_config::route::CapabilityState;
-    crate::route_runtime::resolve_runtime_route(config, provider, Some(model))
+    crate::route_runtime::resolve_runtime_route_for_identity(config, identity, Some(model))
         .map(|route| {
             if crate::route_budget::route_supports_output_token_limit(
                 route.identity.provider,
@@ -8804,15 +9918,16 @@ fn provider_model_output_token_limit_for_api(
 
 fn provider_model_entry_for_api(
     config: &Config,
-    provider: ApiProvider,
+    identity: &crate::config::ProviderIdentity,
     model: String,
 ) -> ProviderModelEntry {
     use crate::reasoning_preference::ReasoningEffort;
     use codewhale_config::route::CapabilityState;
 
+    let provider = identity.provider;
     let mut entry = ProviderModelEntry {
-        image_input: provider_model_image_input_for_api(config, provider, &model),
-        output_token_limit: provider_model_output_token_limit_for_api(config, provider, &model),
+        image_input: provider_model_image_input_for_api(config, identity, &model),
+        output_token_limit: provider_model_output_token_limit_for_api(config, identity, &model),
         id: model,
         reasoning_effort: CapabilityState::Unknown,
         reasoning_effort_levels: Vec::new(),
@@ -8820,11 +9935,11 @@ fn provider_model_entry_for_api(
     };
     // A provider kind and a familiar model name do not establish the
     // capabilities of a different endpoint or named compatible route.
-    if provider == ApiProvider::Custom || config.provider_uses_custom_endpoint(provider) {
+    if provider == ProviderKind::Custom || config.provider_uses_custom_endpoint(identity) {
         return entry;
     }
-    if provider == ApiProvider::OpenaiCodex {
-        let roster = crate::codex_model_cache::model_roster();
+    if provider == ProviderKind::OpenaiCodex {
+        let roster = crate::codex_model_cache::model_roster_for(config);
         if roster.freshness != crate::codex_model_cache::CodexModelCacheFreshness::Fresh {
             return entry;
         }
@@ -8858,8 +9973,12 @@ fn provider_model_entry_for_api(
             .map(|effort| effort.as_setting().to_string())
             .collect();
         entry.reasoning_effort_source = Some("catalog");
-    } else if crate::route_runtime::resolve_runtime_route(config, provider, Some(&entry.id))
-        .is_ok_and(|route| route.candidate.capabilities().reasoning == CapabilityState::Unsupported)
+    } else if crate::route_runtime::resolve_runtime_route_for_identity(
+        config,
+        identity,
+        Some(&entry.id),
+    )
+    .is_ok_and(|route| route.candidate.capabilities().reasoning == CapabilityState::Unsupported)
     {
         entry.reasoning_effort = CapabilityState::Unsupported;
         entry.reasoning_effort_source = Some("catalog");
@@ -8872,11 +9991,11 @@ fn provider_model_entry_for_api(
 
 fn provider_default_model_for_api(
     config: &Config,
-    _active_provider: ApiProvider,
-    provider: ApiProvider,
+    identity: &crate::config::ProviderIdentity,
 ) -> String {
-    let model = crate::model_inventory::provider_default_model(config, provider);
-    if provider == ApiProvider::Ollama && crate::config::is_unresolved_local_ollama_model(&model) {
+    let provider = identity.provider;
+    let model = crate::model_inventory::provider_default_model(config, identity);
+    if provider == ProviderKind::Ollama && crate::config::is_unresolved_local_ollama_model(&model) {
         String::new()
     } else {
         model
@@ -8969,12 +10088,12 @@ pub(crate) fn runtime_chat_relay_catalog(
         return Err("Codewhale returned an invalid Runtime Chat relay challenge.".to_string());
     }
 
-    let provider = config.api_provider();
     let identity = config
-        .active_provider_identity(provider)
+        .active_provider_identity()
         .map_err(|_| "The active Runtime provider identity is invalid.".to_string())?;
+    let provider = identity.provider;
     let credential_state =
-        match crate::provider_readiness::credential_state_for_provider(config, provider) {
+        match crate::provider_readiness::credential_state_for_provider(config, &identity) {
             CredentialState::Saved | CredentialState::ImportedToken => "configured",
             CredentialState::Local => "local",
             CredentialState::NoAuth => "no_auth",
@@ -8986,9 +10105,9 @@ pub(crate) fn runtime_chat_relay_catalog(
             }
         };
 
-    let models = runtime_chat_safe_models(provider_models_for_api(config, provider, provider))?;
-    let requested_default = provider_default_model_for_api(config, provider, provider);
-    if provider == ApiProvider::Ollama && requested_default.is_empty() {
+    let models = runtime_chat_safe_models(provider_models_for_api(config, &identity))?;
+    let requested_default = provider_default_model_for_api(config, &identity);
+    if provider == ProviderKind::Ollama && requested_default.is_empty() {
         return Err("The active local provider has no fresh default model catalog.".to_string());
     }
     let default_model = models
@@ -9026,11 +10145,11 @@ pub(crate) fn runtime_chat_relay_catalog(
         "providers": [{
             "id": provider.as_str(),
             "modelProviderId": model_provider_id,
-            "displayName": provider.display_name(),
+            "displayName": identity.compatibility().map(|row| row.label).unwrap_or(identity.key.as_str()),
             "defaultModel": default_model,
             "credentialState": credential_state,
             "models": models.into_iter().map(|model| {
-                let entry = provider_model_entry_for_api(config, provider, model);
+                let entry = provider_model_entry_for_api(config, &identity, model);
                 json!({
                     "imageInput": entry.image_input,
                     "outputTokenLimit": entry.output_token_limit,
@@ -9074,52 +10193,20 @@ fn configured_custom_provider_routes(config: &Config) -> Vec<String> {
 /// the built-in provider as before.
 fn provider_entry_for_api(
     config: &Config,
-    active_provider: ApiProvider,
-    active_identity: &crate::config::ProviderIdentity,
-    api_provider: ApiProvider,
-    exact_route: Option<&str>,
+    identity: &crate::config::ProviderIdentity,
 ) -> ProviderEntry {
-    let (display_name, has_model_catalog) = match exact_route {
-        Some(route) => (
-            format!("{route} (custom)"),
-            // The same question this route's own model endpoint answers, so a
-            // client that trusts the flag and calls it is never wrong.
-            !provider_models_for_api(config, api_provider, api_provider).is_empty(),
-        ),
-        None => {
-            let identity = config.provider_identity_for(api_provider);
-            let base_url = config.base_url_for_route_identity(api_provider, &identity);
-            (
-                api_provider.display_name().to_string(),
-                !crate::provider_lake::configured_catalog_models_for_route(
-                    config,
-                    api_provider,
-                    &identity,
-                    &base_url,
-                )
-                .is_empty(),
-            )
-        }
-    };
-    let writeability = secrets::credential_writeability(config, api_provider);
+    let writeability = secrets::credential_writeability(config, identity);
     ProviderEntry {
-        id: api_provider.as_str().to_string(),
-        // An exact id belongs to one route: the one the caller named, or — for
-        // a built-in entry — the active route's own entry. Every other entry
-        // carries none, so a client cannot mistake it for the selected route.
-        model_provider_id: if let Some(route) = exact_route {
-            Some(route.to_string())
-        } else if api_provider == active_provider {
-            active_identity.persisted_id().map(str::to_string)
-        } else {
-            None
-        },
-        display_name,
-        default_model: provider_default_model_for_api(config, active_provider, api_provider),
-        has_model_catalog,
+        id: identity.persisted_kind().to_string(),
+        model_provider_id: identity.persisted_id().map(str::to_string),
+        display_name: identity
+            .compatibility()
+            .map(|row| row.label.to_string())
+            .unwrap_or_else(|| format!("{} (custom)", identity.key)),
+        default_model: provider_default_model_for_api(config, identity),
+        has_model_catalog: !provider_models_for_api(config, identity).is_empty(),
         credential_state: crate::provider_readiness::credential_state_for_provider(
-            config,
-            api_provider,
+            config, identity,
         )
         .into(),
         credential_source: writeability.source,
@@ -9138,76 +10225,17 @@ async fn list_providers(
         let _membership = crate::test_support::join_env_scope(env_ticket);
         let config = state.config.read().clone();
         secrets::invalidate_stale_account_catalog(&config);
-        let active_provider = config.api_provider();
-        let active_identity = config
-            .active_provider_identity(active_provider)
-            .map_err(ApiError::bad_request)?;
-        let current = active_provider.as_str().to_string();
-        let mut providers = Vec::new();
-        for api_provider in ApiProvider::sorted_for_display() {
-            // An active user-defined route is listed as that route rather than
-            // as the generic kind it routes through: the picker must go on
-            // naming what the user selected, with the catalog its own model
-            // endpoint serves — not the unconfigured `custom` placeholder.
-            let active_named_route = (api_provider == active_provider
-                && api_provider == ApiProvider::Custom)
-                .then(|| active_identity.persisted_id())
-                .flatten();
-            match active_named_route {
-                Some(route) => {
-                    let mut scoped = config.clone();
-                    scoped.scope_to_provider_identity(&active_identity);
-                    providers.push(provider_entry_for_api(
-                        &scoped,
-                        active_provider,
-                        &active_identity,
-                        api_provider,
-                        Some(route),
-                    ));
-                }
-                None => providers.push(provider_entry_for_api(
-                    &config,
-                    active_provider,
-                    &active_identity,
-                    api_provider,
-                    None,
-                )),
-            }
-        }
-        // User-defined `[providers.<name>]` routes (#1519) are first-class in
-        // the TUI picker, in saved thread records, and in this API's own model
-        // catalog (`?model_provider_id=`), but the registry loop above walks
-        // only the built-in enum — so a route a user configured in the TUI
-        // never reached a GUI picker driven by this endpoint. Each one is
-        // projected the way the additive route contract already describes:
-        // generic `custom` kind plus the exact configured id, which is exactly
-        // the pair `POST /v1/providers/custom/switch` and `POST /v1/threads`
-        // accept. The active route stays the single entry the loop above
-        // emitted, so no route is listed twice.
-        for route in configured_custom_provider_routes(&config) {
-            if active_provider == ApiProvider::Custom
-                && active_identity.persisted_id() == Some(route.as_str())
-            {
-                continue;
-            }
-            let Ok(identity) = config.resolve_persisted_provider_identity(None, Some(&route))
-            else {
-                // A route this runtime refuses to resolve is not offered: an
-                // entry the client cannot select is worse than an absent one.
-                continue;
-            };
-            let mut scoped = config.clone();
-            scoped.scope_to_provider_identity(&identity);
-            providers.push(provider_entry_for_api(
-                &scoped,
-                active_provider,
-                &active_identity,
-                ApiProvider::Custom,
-                Some(&route),
-            ));
-        }
+        let active_identity = config.active_provider_identity().ok();
+        let current = active_identity.as_ref().map_or_else(|| config.provider.clone().unwrap_or_else(|| "unavailable".into()), |identity| identity.persisted_kind().to_string());
+        let mut providers = config.provider_identities().iter().filter(|identity| identity.provider != ProviderKind::Antigravity).map(|identity| provider_entry_for_api(&config, identity)).collect::<Vec<_>>();
+        providers.extend(config.unadmitted_provider_keys().into_iter().map(|key| ProviderEntry {
+            id: key.to_string(), model_provider_id: Some(key.to_string()), display_name: format!("{key} (unavailable)"),
+            default_model: String::new(), has_model_catalog: false,
+            credential_state: ProviderCredentialState::Legacy, credential_source: secrets::ProviderCredentialSource::None,
+            credential_writable: false, credential_writable_reason: Some("This configured route is unavailable; repair its exact provider definition before using it."),
+        }));
         Ok(Json(ProvidersResponse {
-            current_provider_id: active_identity.persisted_id().map(str::to_string),
+            current_provider_id: active_identity.as_ref().and_then(|identity| identity.persisted_id()).map(str::to_string),
             current,
             providers,
         }))
@@ -9236,38 +10264,28 @@ fn provider_models_identity(
     config: &Config,
     id: &str,
     exact_id: Option<&str>,
-) -> Result<(ApiProvider, Option<crate::config::ProviderIdentity>), ApiError> {
-    let api_provider = ApiProvider::parse(id)
-        .ok_or_else(|| ApiError::bad_request(format!("Unknown provider id '{id}'")))?;
-    // Reject requests for the legacy deepseek-cn alias that has no
-    // ProviderKind metadata — the GUI should use `deepseek` instead.
-    if api_provider == ApiProvider::DeepseekCN {
+) -> Result<crate::config::ProviderIdentity, ApiError> {
+    if id.is_empty() || id != id.trim() || id.chars().any(char::is_control) {
+        return Err(ApiError::bad_request("provider must be an exact selection"));
+    }
+    if exact_id.is_some_and(|value| {
+        value.is_empty() || value != value.trim() || value.chars().any(char::is_control)
+    }) {
         return Err(ApiError::bad_request(
-            "provider 'deepseek-cn' is a legacy alias; use 'deepseek' instead",
+            "model_provider_id must be an exact configured identity",
         ));
     }
-    let identity = if let Some(exact_id) = exact_id {
-        if exact_id.is_empty()
-            || exact_id != exact_id.trim()
-            || exact_id.chars().any(char::is_control)
-        {
-            return Err(ApiError::bad_request(
-                "model_provider_id must be an exact configured identity",
-            ));
-        }
-        let identity = config
-            .resolve_persisted_provider_identity(Some(api_provider.as_str()), Some(exact_id))
-            .map_err(ApiError::bad_request)?;
-        if identity.provider != api_provider || identity.persisted_id() != Some(exact_id) {
-            return Err(ApiError::bad_request(
-                "model_provider_id does not match this provider route",
-            ));
-        }
-        Some(identity)
-    } else {
-        None
-    };
-    Ok((api_provider, identity))
+    // A supplied pair is re-admitted exactly. An omitted id denotes the named
+    // selection, with literal custom using only its parse-proven root origin.
+    let identity = match exact_id {
+        Some(exact_id) => config.resolve_persisted_provider_identity(Some(id), Some(exact_id)),
+        None => config.legacy_selection_identity(id),
+    }
+    .map_err(ApiError::bad_request)?;
+    config
+        .verify_provider_identity(&identity)
+        .map_err(ApiError::bad_request)?;
+    Ok(identity)
 }
 
 async fn list_provider_models(
@@ -9280,30 +10298,29 @@ async fn list_provider_models(
     tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         let _membership = crate::test_support::join_env_scope(env_ticket);
-        let mut config = state.config.read().clone();
+        let config = state.config.read().clone();
         secrets::invalidate_stale_account_catalog(&config);
-        let (api_provider, identity) =
-            provider_models_identity(&config, &id, params.model_provider_id.as_deref())?;
-        let route_fingerprint = if let Some(identity) = identity {
-            config.scope_to_provider_identity(&identity);
-            let route = serde_json::to_vec(&(
-                api_provider.as_str(),
-                params.model_provider_id.as_deref(),
-                config.base_url_for_route_identity(api_provider, &identity.key),
-            ))
-            .map_err(|error| {
-                ApiError::internal(format!("Could not fingerprint provider route: {error}"))
-            })?;
-            Some(crate::hashing::sha256_hex(route))
-        } else {
-            None
-        };
-        let models = provider_models_for_api(&config, config.api_provider(), api_provider)
+        let identity = provider_models_identity(&config, &id, params.model_provider_id.as_deref())?;
+        let route = serde_json::to_vec(&(
+            identity.persisted_kind(),
+            identity.persisted_id(),
+            config.base_url_for_route(&identity),
+        ))
+        .map_err(|error| {
+            ApiError::internal(format!("Could not fingerprint provider route: {error}"))
+        })?;
+        let route_fingerprint = Some(crate::hashing::sha256_hex(route));
+        let models = provider_models_for_api(&config, &identity)
             .into_iter()
-            .map(|id| provider_model_entry_for_api(&config, api_provider, id))
+            .map(|id| provider_model_entry_for_api(&config, &identity, id))
             .collect();
-        paginate_provider_models(api_provider.as_str(), models, &params, route_fingerprint)
-            .map(Json)
+        paginate_provider_models(
+            identity.persisted_kind(),
+            models,
+            &params,
+            route_fingerprint,
+        )
+        .map(Json)
     })
     .await
     .map_err(|_| ApiError::internal("Provider model listing failed"))?
@@ -9327,14 +10344,7 @@ async fn refresh_provider_models(
         #[cfg(test)]
         let _membership = crate::test_support::join_env_scope(env_ticket);
         let config = state.config.read().clone();
-        let (provider, exact) =
-            provider_models_identity(&config, &id, params.model_provider_id.as_deref())?;
-        let identity = match exact {
-            Some(identity) => identity,
-            None => config
-                .active_provider_identity(provider)
-                .map_err(ApiError::bad_request)?,
-        };
+        let identity = provider_models_identity(&config, &id, params.model_provider_id.as_deref())?;
         Ok(Json(runtime.block_on(
             crate::provider_lake::update_provider_catalog(&config, &identity),
         )))
@@ -9429,7 +10439,7 @@ async fn switch_provider(
     use crate::config_persistence;
 
     let trimmed_id = id.trim();
-    let target = ApiProvider::parse(trimmed_id).ok_or_else(|| {
+    let _target = ProviderKind::parse_config_identity(trimmed_id).ok_or_else(|| {
         // A configured `[providers.<name>]` route is a route this runtime can
         // and does switch to — but only through the generic kind, because the
         // same name is what `GET /v1/providers` reports as
@@ -9449,23 +10459,26 @@ async fn switch_provider(
         }
     })?;
     // Reject the legacy deepseek-cn alias — same guard as list_provider_models.
-    if target == ApiProvider::DeepseekCN {
+    if codewhale_config::descriptors::compatibility_for_selector(trimmed_id)
+        .is_some_and(|row| row.id == codewhale_config::descriptors::LEGACY_DEEPSEEK_CN.id)
+    {
         return Err(ApiError::bad_request(
             "provider 'deepseek-cn' is a legacy alias; use 'deepseek' instead",
         ));
     }
-    let exact_provider_id = req
-        .model_provider_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    let exact_provider_id = req.model_provider_id.as_deref();
+    if exact_provider_id.is_some_and(|value| value.trim().is_empty() || value != value.trim()) {
+        return Err(ApiError::bad_request(
+            "model_provider_id must be a nonempty exact id",
+        ));
+    }
 
     // Normalize the optional model override against the *target* provider.
     // Mirrors `set_config`'s `model` branch, which validates against the
     // active route — except here we validate against the target provider,
     // because the active route is about to change.
     // Read normalization and persistence identity from the same route snapshot.
-    let (target, model_override, provider_identity) = {
+    let (model_override, provider_identity) = {
         let config = state.config.read();
         // An additive exact id is the stronger selector: it names one
         // configured route, so it resolves through the same pinned-identity
@@ -9479,20 +10492,14 @@ async fn switch_provider(
                 .map_err(ApiError::bad_request)?,
         };
         let mut scoped = config.clone();
-        scoped.scope_to_provider_identity(&identity);
+        scoped
+            .scope_to_provider_identity(&identity)
+            .map_err(ApiError::bad_request)?;
         let model = match req.model.as_deref().map(str::trim) {
             None | Some("") => None,
-            Some(raw) => Some(normalize_runtime_config_model(
-                &scoped,
-                identity.provider,
-                raw,
-            )?),
+            Some(raw) => Some(normalize_runtime_config_model(&scoped, &identity, raw)?),
         };
-        (
-            identity.provider,
-            model,
-            identity.persisted_id().unwrap_or(&identity.key).to_string(),
-        )
+        (model, identity)
     };
 
     // Persist `provider` (always) + `model` (only when explicitly given).
@@ -9520,7 +10527,6 @@ async fn switch_provider(
             let _membership = crate::test_support::join_env_scope(env_ticket);
             let (config_toml, undo) = config_persistence::persist_provider_selection(
                 state.config_path.as_deref(),
-                target,
                 &task_identity,
                 task_model.as_deref(),
             )
@@ -9549,8 +10555,11 @@ async fn switch_provider(
                 // Report the route this switch applied, not whatever a later
                 // switch leaves in `state.config` by the time this reply is built.
                 Ok(reloaded) => {
-                    let provider = reloaded.api_provider();
-                    let model = provider_default_model_for_api(&reloaded, provider, provider);
+                    let applied_identity = reloaded.active_provider_identity().map_err(ApiError::bad_request)?;
+                    reloaded.verify_provider_identity(&task_identity).map_err(ApiError::conflict)?;
+                    if applied_identity != task_identity { return Err(ApiError::conflict("Persisted provider selection differs from the captured switch.")); }
+                    let provider = applied_identity.provider;
+                    let model = provider_default_model_for_api(&reloaded, &applied_identity);
                     *state.config.write() = reloaded;
                     Ok::<_, ApiError>((provider, model))
                 }
@@ -9588,8 +10597,8 @@ async fn switch_provider(
     // Name the route the user selected, not the kind it routes through: a
     // named custom route reports `custom` as its kind, which names nothing the
     // user ever typed. Every other route keeps reporting its canonical kind.
-    let active_label = if active_provider == ApiProvider::Custom {
-        provider_identity.clone()
+    let active_label = if active_provider == ProviderKind::Custom {
+        provider_identity.key.to_string()
     } else {
         active_provider.as_str().to_string()
     };
@@ -9704,7 +10713,10 @@ async fn get_config(
     let model_available = resolved_model.is_ok();
     let model = resolved_model.unwrap_or_default();
 
-    let provider = config.provider_identity_for(config.api_provider());
+    let active_identity = config
+        .active_provider_identity()
+        .map_err(ApiError::bad_request)?;
+    let provider = active_identity.key.to_string();
 
     let approval_mode = config
         .approval_policy
@@ -9718,16 +10730,18 @@ async fn get_config(
     // is active, and follows the CN slot while the CN route is active — the CN
     // route resolves `[providers.deepseek_cn].model`, not the primary slot.
     // The root field is a legacy fallback for unmigrated configs.
-    let default_provider = if config.api_provider() == ApiProvider::DeepseekCN {
-        ApiProvider::DeepseekCN
-    } else {
-        ApiProvider::Deepseek
-    };
-    let identity = config
-        .resolve_provider_pin_identity(default_provider.as_str())
-        .map_err(ApiError::bad_request)?;
+    let identity =
+        if active_identity.key.as_str() == codewhale_config::descriptors::LEGACY_DEEPSEEK_CN.id {
+            active_identity.clone()
+        } else {
+            config
+                .builtin_provider_identity(ProviderKind::Deepseek)
+                .map_err(ApiError::bad_request)?
+        };
     let mut deepseek_config = config.clone();
-    deepseek_config.scope_to_provider_identity(&identity);
+    deepseek_config
+        .scope_to_provider_identity(&identity)
+        .map_err(ApiError::bad_request)?;
     let default_model = deepseek_config.default_model();
     let base_url = config.active_route_base_url().to_string();
 
@@ -9828,31 +10842,36 @@ async fn set_config(
     // route that cannot execute after reload.
     let active_route = {
         let config = state.config.read();
-        let provider = config.api_provider();
         match key.as_str() {
-            "model" => {
-                value = normalize_runtime_config_model(&config, provider, &value)?;
-            }
+            "model" | "base_url" | "provider_url" | "provider_base_url" => Some(
+                config
+                    .active_provider_identity()
+                    .map_err(ApiError::bad_request)?,
+            ),
             "default_model" => {
-                let default_provider = if provider == ApiProvider::DeepseekCN {
-                    ApiProvider::DeepseekCN
-                } else {
-                    ApiProvider::Deepseek
-                };
-                value = normalize_runtime_config_model(&config, default_provider, &value)?;
+                let active = config.active_provider_identity().ok();
+                Some(
+                    match active.filter(|identity| {
+                        identity.key.as_str()
+                            == codewhale_config::descriptors::LEGACY_DEEPSEEK_CN.id
+                    }) {
+                        Some(identity) => identity,
+                        None => config
+                            .builtin_provider_identity(ProviderKind::Deepseek)
+                            .map_err(ApiError::bad_request)?,
+                    },
+                )
             }
-            _ => {}
+            _ => None,
         }
-        let identity = if key == "model" {
-            let identity = config
-                .active_provider_identity(provider)
-                .map_err(ApiError::bad_request)?;
-            identity.persisted_id().unwrap_or(&identity.key).to_string()
-        } else {
-            config.provider_identity_for(provider)
-        };
-        (provider, identity)
     };
+    if matches!(key.as_str(), "model" | "default_model") {
+        let config = state.config.read();
+        let identity = active_route
+            .as_ref()
+            .ok_or_else(|| ApiError::bad_request("No admitted model route"))?;
+        value = normalize_runtime_config_model(&config, identity, &value)?;
+    }
 
     // All persisted config keys require a reload to take effect in the
     // runtime (including syncing to active engines). The caller should
@@ -9865,28 +10884,13 @@ async fn set_config(
     if persist {
         let config_path = state.config_path.as_deref();
         let result: anyhow::Result<PathBuf> = match key.as_str() {
-            "model" => config_persistence::persist_provider_model_key(
+            "model" | "default_model" => config_persistence::persist_provider_model_key(
                 config_path,
-                active_route.0,
-                &active_route.1,
+                active_route
+                    .as_ref()
+                    .ok_or_else(|| ApiError::bad_request("No admitted model route"))?,
                 &value,
             ),
-            "default_model" => {
-                // The CN route reads its own `[providers.deepseek_cn]` slot;
-                // writing the primary `deepseek` slot there would be unread.
-                let (default_provider, default_identity) =
-                    if active_route.0 == ApiProvider::DeepseekCN {
-                        (ApiProvider::DeepseekCN, ApiProvider::DeepseekCN.as_str())
-                    } else {
-                        (ApiProvider::Deepseek, ApiProvider::Deepseek.as_str())
-                    };
-                config_persistence::persist_provider_model_key(
-                    config_path,
-                    default_provider,
-                    default_identity,
-                    &value,
-                )
-            }
             "reasoning_effort" => {
                 config_persistence::persist_root_string_key(config_path, "reasoning_effort", &value)
             }
@@ -9894,15 +10898,13 @@ async fn set_config(
                 config_persistence::persist_root_string_key(config_path, "approval_policy", &value)
             }
             "base_url" | "provider_url" | "provider_base_url" => {
-                // `GET /v1/config` reports the active route's endpoint as
-                // `base_url`, and writing it back has to land on the field that
-                // route actually reads. It used to write a root
-                // `active_route_base_url` key that no reader resolves, so the
-                // write reported success and the endpoint never moved.
-                let config = state.config.read();
-                let provider = config.api_provider();
-                let identity = config.provider_identity_for(provider);
-                config_persistence::persist_route_base_url(config_path, provider, &identity, &value)
+                config_persistence::persist_route_base_url(
+                    config_path,
+                    active_route
+                        .as_ref()
+                        .ok_or_else(|| ApiError::bad_request("No admitted endpoint route"))?,
+                    &value,
+                )
             }
             "provider" => {
                 // Validate the provider id against the static registry so the
@@ -9914,23 +10916,21 @@ async fn set_config(
                 // `Config::resolve_provider_identity` resolves it back to the
                 // route, so refusing it here would refuse a value the runtime
                 // honours. Anything else is still refused.
-                let configured_custom_route =
-                    configured_custom_provider_routes(&state.config.read())
-                        .iter()
-                        .any(|route| route == value.trim());
-                if ApiProvider::parse(&value).is_none() && !configured_custom_route {
-                    return Err(ApiError::bad_request(format!(
-                        "Unknown provider '{value}'. Call GET /v1/providers for the list of supported ids."
-                    )));
-                }
+                let identity = state
+                    .config
+                    .read()
+                    .resolve_provider_selection_identity(&value)
+                    .map_err(ApiError::bad_request)?;
                 let result =
-                    config_persistence::persist_root_string_key(config_path, "provider", &value);
+                    config_persistence::persist_provider_selection(config_path, &identity, None)
+                        .map(|(path, _undo)| path);
                 if result.is_ok() {
-                    // Keep the in-memory provider in step with the persisted
-                    // value so a following set_config(model) resolves the new
-                    // provider's table instead of clobbering the previous
-                    // provider's model slot (#4658 follow-up).
-                    state.config.write().provider = Some(value.clone());
+                    state.config.write().provider = Some(
+                        identity
+                            .persisted_id()
+                            .unwrap_or(identity.key.as_str())
+                            .to_string(),
+                    );
                 }
                 result
             }
@@ -10259,9 +11259,14 @@ async fn get_settings_schema(
         state.config_profile.as_deref(),
         &state.workspace,
     );
-    let base_url_row_key = match config.api_provider() {
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN => "base_url",
-        _ => "provider_url",
+    let base_url_row_key = if config
+        .active_provider_identity()
+        .ok()
+        .is_some_and(|identity| identity.key.as_str() == ProviderKind::Deepseek.as_str())
+    {
+        "base_url"
+    } else {
+        "provider_url"
     };
     let visible = |key: &str| -> bool {
         match key {
@@ -10500,7 +11505,10 @@ async fn get_settings_schema(
 /// omitted rather than approximated.
 fn config_schema_value(key: &str, config: &Config) -> Option<String> {
     match key {
-        "provider" => Some(config.provider_identity_for(config.api_provider())),
+        "provider" => config
+            .active_provider_identity()
+            .ok()
+            .map(|identity| identity.key.to_string()),
         "model" => runtime_request_model(config, None).ok(),
         "approval_policy" => config
             .approval_policy
@@ -10508,8 +11516,14 @@ fn config_schema_value(key: &str, config: &Config) -> Option<String> {
             .or_else(|| Some("suggest".to_string())),
         "telemetry" => Some(crate::telemetry_notice::saved_preference_enabled(config).to_string()),
         "allow_shell" => Some(config.allow_shell().to_string()),
-        "base_url" => Some(config.base_url_for_route(config.api_provider())),
-        "provider_url" => Some(config.base_url_for_route(config.api_provider())),
+        "base_url" => config
+            .active_provider_identity()
+            .ok()
+            .map(|identity| config.base_url_for_route(&identity)),
+        "provider_url" => config
+            .active_provider_identity()
+            .ok()
+            .map(|identity| config.base_url_for_route(&identity)),
         "mcp_config_path" => Some(config.mcp_config_path().display().to_string()),
         "sandbox_mode" => config.sandbox_mode.clone(),
         "fleet.exec.max_spawn_depth" => Some(config.subagent_max_spawn_depth().to_string()),
@@ -10520,24 +11534,32 @@ fn config_schema_value(key: &str, config: &Config) -> Option<String> {
 
 fn normalize_runtime_config_model(
     config: &Config,
-    provider: ApiProvider,
+    identity: &crate::config::ProviderIdentity,
     value: &str,
 ) -> Result<String, ApiError> {
+    config
+        .verify_provider_identity(identity)
+        .map_err(ApiError::bad_request)?;
+    let provider = identity.provider;
     let value = value.trim();
     if crate::provider_lake::configured_model_for_route(
         config,
         provider,
-        &config.provider_identity_for(provider),
-        &config.base_url_for_route(provider),
+        identity.key.as_str(),
+        &config.base_url_for_route(identity),
         value,
     )
     .is_some()
     {
         // The shared resolver preserves exact declarations only after its
         // protocol and provider allowlist guards. Metadata cannot bypass them.
-        return crate::route_runtime::resolve_runtime_route(config, provider, Some(value))
-            .map(|route| route.model)
-            .map_err(ApiError::bad_request);
+        return crate::route_runtime::resolve_runtime_route_for_identity(
+            config,
+            identity,
+            Some(value),
+        )
+        .map(|route| route.model)
+        .map_err(ApiError::bad_request);
     }
     validate_route(provider, value).map_err(ApiError::bad_request)?;
     if value.eq_ignore_ascii_case("auto") {
@@ -11024,9 +12046,9 @@ fn map_agent_mail_err(err: anyhow::Error) -> ApiError {
 }
 
 #[derive(Debug, Clone)]
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
-    message: String,
+    pub(crate) message: String,
     /// Stable machine-readable reason, serialized as `error.code` when set,
     /// for refusals a client must branch on rather than show.
     code: Option<&'static str>,
@@ -11192,12 +12214,17 @@ base_url = "http://127.0.0.1:9/v1"
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace)?;
         let config = Config::load(Some(config_path.clone()), None)?;
+        let sessions_dir = root.join("sessions");
+        let mut manager_config =
+            RuntimeThreadManagerConfig::from_task_data_dir(root.join("runtime"));
+        manager_config.sessions_dir = Some(sessions_dir.clone());
         let runtime_threads = Arc::new(RuntimeThreadManager::open_with_plugin_registry(
             config.clone(),
             workspace.clone(),
-            RuntimeThreadManagerConfig::from_task_data_dir(root.join("runtime")),
+            manager_config,
             Arc::new(crate::plugins::PluginRegistry::empty(&workspace)),
         )?);
+        let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
         let task_manager = TaskManager::start_with_runtime_manager(
             TaskManagerConfig {
                 data_dir: root.join("tasks"),
@@ -11215,6 +12242,10 @@ base_url = "http://127.0.0.1:9/v1"
         .await?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
+        let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, 2);
+        let workspace_scopes =
+            RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
+        let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
         let state = RuntimeApiState {
             config: Arc::new(parking_lot::RwLock::new(config)),
             workspace: workspace.clone(),
@@ -11222,13 +12253,13 @@ base_url = "http://127.0.0.1:9/v1"
             task_manager,
             runtime_threads,
             cors_origins: Vec::new(),
-            sessions_dir: root.join("sessions"),
+            sessions_dir,
             config_path: Some(config_path.clone()),
             config_profile: None,
             automations: Arc::new(Mutex::new(AutomationManager::open_for_test(
                 root.join("automations"),
             )?)),
-            sub_agent_manager: runtime_api_sub_agent_manager(&workspace, 2),
+            sub_agent_manager,
             runtime_token: None,
             skill_state: Arc::new(Mutex::new(SkillStateStore::load_from(
                 root.join("skills_state.toml"),
@@ -11240,8 +12271,8 @@ base_url = "http://127.0.0.1:9/v1"
             mobile: None,
             web: None,
             fleet_codewhale_binary: "unused-test-binary".to_string(),
-            mcp_pool: Arc::new(Mutex::new(None)),
-            lsp_manager: Arc::new(std::sync::OnceLock::new()),
+            workspace_scopes,
+            workspace_scope,
             computer: computer_display::ComputerState::from_env(),
             shutdown: RuntimeServerShutdown::default(),
             git_writes: Arc::new(tokio::sync::Mutex::new(())),
@@ -11272,13 +12303,14 @@ base_url = "http://127.0.0.1:9/v1"
         Ok(body)
     }
 
-    fn assert_declared_route(config_path: &FsPath, provider: ApiProvider, model: &str) {
+    fn assert_declared_route(config_path: &FsPath, provider: ProviderKind, model: &str) {
         let config = Config::load(Some(config_path.to_path_buf()), None).expect("reloaded config");
         let persisted = config
-            .provider_config_for(provider)
+            .provider_config_for(&config.test_identity_for_kind(provider))
             .and_then(|entry| entry.model.as_deref());
         assert_eq!(persisted, Some(model));
-        let selected = provider_default_model_for_api(&config, provider, provider);
+        let selected =
+            provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider));
         assert_eq!(selected, model);
         let route = crate::route_runtime::resolve_runtime_route(&config, provider, Some(&selected))
             .expect("saved declared route");
@@ -11580,7 +12612,7 @@ model = "GLM-5.2"
             post_json(addr, "/v1/config/reload", json!({})).await?;
             let config = state.config.read();
             let identity = config
-                .active_provider_identity(ApiProvider::OllamaCloud)
+                .active_provider_identity()
                 .map_err(anyhow::Error::msg)?;
             assert_eq!(identity.persisted_id(), Some(selector));
             assert_eq!(config.default_model(), model);
@@ -11661,9 +12693,9 @@ model = "GLM-5.2"
         crate::provider_catalog_live::reset_cache_for_test();
         crate::provider_lake::clear_live_snapshot();
         for (provider, model) in [
-            (ApiProvider::Deepseek, "deepseek-v4pro"),
-            (ApiProvider::Openrouter, "deepseek-v4-pro"),
-            (ApiProvider::Together, "deepseek-v4-pro"),
+            (ProviderKind::Deepseek, "deepseek-v4pro"),
+            (ProviderKind::Openrouter, "deepseek-v4-pro"),
+            (ProviderKind::Together, "deepseek-v4-pro"),
         ] {
             let root = tempfile::tempdir()?;
             let config_path = root.path().join("config.toml");
@@ -11678,7 +12710,7 @@ model = "GLM-5.2"
             .await?;
             assert_eq!(body["model"], model);
             assert_declared_route(&config_path, provider, model);
-            let keys = if provider == ApiProvider::Deepseek {
+            let keys = if provider == ProviderKind::Deepseek {
                 vec!["model", "default_model"]
             } else {
                 vec!["model"]
@@ -11694,7 +12726,10 @@ model = "GLM-5.2"
                 post_json(addr, "/v1/config/reload", json!({})).await?;
                 assert_declared_route(&config_path, provider, model);
                 let reloaded = state.config.read();
-                let selected = provider_default_model_for_api(&reloaded, provider, provider);
+                let selected = provider_default_model_for_api(
+                    &reloaded,
+                    &(reloaded).test_identity_for_kind(provider),
+                );
                 let route = crate::route_runtime::resolve_runtime_route(
                     &reloaded,
                     provider,
@@ -11745,15 +12780,17 @@ model = "GLM-5.2"
         let config = Config::load(Some(config_path), None)?;
         assert_eq!(
             config
-                .provider_config_for(ApiProvider::Deepseek)
+                .provider_config_for(&config.test_identity_for_kind(ProviderKind::Deepseek))
                 .and_then(|provider| provider.model.as_deref()),
             Some("deepseek-v4-pro")
         );
-        let selected =
-            provider_default_model_for_api(&config, ApiProvider::Deepseek, ApiProvider::Deepseek);
+        let selected = provider_default_model_for_api(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Deepseek),
+        );
         let route = crate::route_runtime::resolve_runtime_route(
             &config,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             Some(&selected),
         )
         .expect("ordinary saved route");
@@ -11781,15 +12818,24 @@ model = "GLM-5.2"
             toml::from_str(&fixture("deepseek", "deepseek-v4pro")).expect("fixture config");
         config.custom_models.as_mut().unwrap()[0].provider = "other".to_string();
         assert_eq!(
-            normalize_runtime_config_model(&config, ApiProvider::Deepseek, "deepseek-v4pro")
-                .expect("legacy alias remains accepted"),
+            normalize_runtime_config_model(
+                &config,
+                &(config).test_identity_for_kind(ProviderKind::Deepseek),
+                "deepseek-v4pro"
+            )
+            .expect("legacy alias remains accepted"),
             "deepseek-v4-pro"
         );
-        for provider in [ApiProvider::OpencodeGo, ApiProvider::OpencodeZen] {
+        for provider in [ProviderKind::OpencodeGo, ProviderKind::OpencodeZen] {
             let config: Config = toml::from_str(&fixture(provider.as_str(), "unlisted-model"))
                 .expect("fixture config");
             assert!(
-                normalize_runtime_config_model(&config, provider, "unlisted-model").is_err(),
+                normalize_runtime_config_model(
+                    &config,
+                    &(config).test_identity_for_kind(provider),
+                    "unlisted-model"
+                )
+                .is_err(),
                 "a declaration cannot expand the {provider:?} protocol roster"
             );
         }

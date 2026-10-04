@@ -4,6 +4,7 @@
 //! content block kind tracking, streamed tool-use buffers, transparent retry
 //! policy, and scrubbers for text that looks like a forged tool-call wrapper.
 
+use crate::core::events::TurnOutcomeStatus;
 use codewhale_models::ToolCaller;
 use std::time::Duration;
 
@@ -52,7 +53,90 @@ pub(super) async fn reserve_event_capacity(
     }
 }
 
+/// Selective quiet affects only attempt observations; completed summaries and
+/// counters survive. Admission and delivery use the same existing queue guard.
+async fn emit_retry_status(
+    tx: &tokio::sync::mpsc::Sender<super::Event>,
+    cancel: &tokio_util::sync::CancellationToken,
+    quiet: bool,
+    message: String,
+) -> Result<(), EventSendError> {
+    let attempt = message.starts_with("Retry attempt:");
+    if quiet && attempt {
+        return Ok(());
+    }
+    let policy = if attempt {
+        EventReservationPolicy::Strict
+    } else {
+        EventReservationPolicy::Receipt
+    };
+    let permit = reserve_event_capacity(tx, Some(cancel), policy).await?;
+    permit.send(super::Event::status(message));
+    Ok(())
+}
+
 impl super::Engine {
+    pub(super) fn request_retry_observation(&self) -> crate::llm_client::RequestRetryObservation {
+        let tx = self.tx_event.clone();
+        let cancel = self.cancel_token.clone();
+        let quiet = self.api_config.notifications_config().quiet;
+        crate::llm_client::RequestRetryObservation {
+            retries: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            emit: std::sync::Arc::new(move |message| {
+                let tx = tx.clone();
+                let cancel = cancel.clone();
+                Box::pin(async move {
+                    let _ = emit_retry_status(&tx, &cancel, quiet, message).await;
+                })
+            }),
+        }
+    }
+
+    // The existing turn owns these cumulative counters. Closing observations
+    // describe its actual outcome, without attributing a later tool failure
+    // to an earlier provider response or changing any recovery budget.
+    pub(super) async fn send_answer_retry_summary(
+        &self,
+        diagnostics: &crate::tool_inspection::TurnStopDiagnostics,
+        status: TurnOutcomeStatus,
+    ) {
+        let (prefix, outcome) = match status {
+            TurnOutcomeStatus::Completed => ("Retry recovery", "turn completed"),
+            TurnOutcomeStatus::Failed => ("Retry stopped", "turn failed"),
+            TurnOutcomeStatus::Interrupted => ("Retry interrupted", "turn interrupted"),
+        };
+        for (kind, retries, limit) in [
+            (
+                "reasoning-only",
+                diagnostics.reasoning_only_reprompts,
+                self.config.reasoning_only_max_reprompts,
+            ),
+            (
+                "empty-stop",
+                diagnostics.empty_stop_retries,
+                super::turn_loop::EMPTY_STOP_MAX_RETRIES,
+            ),
+        ] {
+            if retries > 0 {
+                let _ = self
+                    .send_retry_status(format!(
+                        "{prefix}: {kind} used {retries}/{limit} retries; {outcome}"
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    pub(super) async fn send_retry_status(&self, message: String) -> Result<(), EventSendError> {
+        emit_retry_status(
+            &self.tx_event,
+            &self.cancel_token,
+            self.api_config.notifications_config().quiet,
+            message,
+        )
+        .await
+    }
+
     /// Stream observations always belong to the decoder's current turn,
     /// including direct test/embedding calls that do not enqueue an Op.
     pub(super) async fn send_stream_event(&self, event: super::Event) -> bool {

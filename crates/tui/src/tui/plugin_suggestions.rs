@@ -7,9 +7,9 @@
 //! - The review row appears only when the model calls `request_plugin_install`
 //!   (once per session), and only while contextual tips are on and the shared
 //!   per-session guidance budget has room.
-//! - The row names the true next step (Install, Review trust, Enable). Only
-//!   that button acts, and it opens `/plugin show <name>`; it never runs
-//!   install, trust, or enable directly.
+//! - The row offers Review. Only that button opens the existing Extensions
+//!   inventory: installed bundles on Plugins, other suggestions on Marketplace.
+//!   Install, exact-content trust, and enable remain explicit row actions.
 //! - Esc hides the row for this session only. "Don't suggest again" is the
 //!   explicit, persisted dismissal.
 
@@ -31,39 +31,10 @@ use codewhale_localization::{MessageId, tr};
 
 const CATALOG_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// The step a plugin actually needs next, as named on the review button.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PluginCtaStep {
-    Install,
-    ReviewTrust,
-    Enable,
-}
-
-impl PluginCtaStep {
-    /// Derive the step from the review command the tool returned. Anything
-    /// that is not trust or enable is an install path.
-    fn from_command(command: &str) -> Self {
-        let mut words = command.split_whitespace();
-        match (words.next(), words.next()) {
-            (Some("/plugin"), Some("trust")) => Self::ReviewTrust,
-            (Some("/plugin"), Some("enable")) => Self::Enable,
-            _ => Self::Install,
-        }
-    }
-
-    fn label(self) -> MessageId {
-        match self {
-            Self::Install => MessageId::PluginCtaInstall,
-            Self::ReviewTrust => MessageId::PluginCtaReviewTrust,
-            Self::Enable => MessageId::PluginCtaEnable,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginCtaPhase {
     Hidden,
-    Matched { name: String, step: PluginCtaStep },
+    Matched { name: String },
 }
 
 impl PluginCtaPhase {
@@ -221,19 +192,26 @@ impl App {
         true
     }
 
-    /// Human-initiated review from the labelled button: open the plugin's
-    /// detail page, where install, trust, or enable is the person's own next
-    /// command. Never runs install, trust, or enable directly.
+    /// Human-initiated navigation to the existing inventory. Resolve the tab
+    /// from current installed facts, never from the model-returned command.
+    /// The inventory retains its own explicit install/review/enable actions.
     #[must_use]
-    pub fn accept_plugin_cta_command(&mut self) -> Option<String> {
+    pub fn accept_plugin_cta_review(
+        &mut self,
+    ) -> Option<crate::tui::views::extensions::ExtensionsTab> {
         let name = match &self.plugin_cta.phase {
-            PluginCtaPhase::Matched { name, .. } => name.clone(),
+            PluginCtaPhase::Matched { name } => name.clone(),
             PluginCtaPhase::Hidden => return None,
+        };
+        let tab = if self.plugin_registry.get(&name).is_some() {
+            crate::tui::views::extensions::ExtensionsTab::Plugins
+        } else {
+            crate::tui::views::extensions::ExtensionsTab::Marketplace
         };
         self.plugin_cta.dismissed.insert(name.to_ascii_lowercase());
         self.plugin_cta.phase = PluginCtaPhase::Hidden;
         self.needs_redraw = true;
-        Some(format!("/plugin show {name}"))
+        Some(tab)
     }
 
     /// Model-requested review: show the review row and a toast naming the
@@ -254,7 +232,6 @@ impl App {
         self.behavioral_tips.record_guidance_impression();
         self.plugin_cta.phase = PluginCtaPhase::Matched {
             name: name.to_string(),
-            step: PluginCtaStep::from_command(command),
         };
         let mut toast = StatusToast::new(command.to_string(), StatusToastLevel::Info, Some(8_000));
         toast.kind = StatusToastKind::PluginSuggestion;
@@ -268,15 +245,15 @@ pub fn draw_plugin_cta(app: &mut App, area: Rect, buf: &mut Buffer) {
     app.viewport.last_plugin_cta_area = None;
     app.viewport.last_plugin_cta_review_area = None;
     app.viewport.last_plugin_cta_dismiss_area = None;
-    let PluginCtaPhase::Matched { name, step } = &app.plugin_cta.phase else {
+    let PluginCtaPhase::Matched { name } = &app.plugin_cta.phase else {
         return;
     };
-    let (name, step) = (name.clone(), *step);
+    let name = name.clone();
     if area.height == 0 || area.width == 0 {
         return;
     }
     let prompt = tr(app.ui_locale, MessageId::PluginCtaInstallPrompt).replace("{name}", &name);
-    let review = tr(app.ui_locale, step.label());
+    let review = tr(app.ui_locale, MessageId::PluginCtaReview);
     let dismiss = tr(app.ui_locale, MessageId::PluginCtaDismiss);
     let review_label = format!("[{review}]");
     let dismiss_label = format!("[{dismiss}]");
@@ -451,28 +428,20 @@ mod tests {
     }
 
     #[test]
-    fn review_row_names_the_true_next_step_and_only_opens_plugin_show() {
+    fn review_row_opens_installed_inventory_without_running_suggested_commands() {
         let _lock = crate::test_support::lock_test_env();
-        for (command, step, label) in [
-            (
-                "/plugin trust supabase",
-                PluginCtaStep::ReviewTrust,
-                "[Review trust]",
-            ),
-            ("/plugin enable supabase", PluginCtaStep::Enable, "[Enable]"),
-            (
-                "/plugin marketplace install official supabase",
-                PluginCtaStep::Install,
-                "[Install]",
-            ),
+        for command in [
+            "/plugin trust supabase",
+            "/plugin enable supabase",
+            "/plugin marketplace install official supabase",
         ] {
             let (mut app, _root, _home) = app_with_supabase_plugin();
+            let before = app.plugin_registry.get("supabase").unwrap().clone();
             app.surface_plugin_review_request("supabase", command);
             assert_eq!(
                 app.plugin_cta.phase,
                 PluginCtaPhase::Matched {
                     name: "supabase".into(),
-                    step
                 }
             );
             let area = Rect::new(0, 0, 140, 1);
@@ -484,15 +453,36 @@ mod tests {
                 .map(|cell| cell.symbol())
                 .collect::<String>();
             assert!(row.contains("supabase"), "{row}");
-            assert!(row.contains(label), "{row}");
+            assert!(row.contains("[Review]"), "{row}");
             assert!(row.contains("[Don't suggest again]"), "{row}");
             assert_eq!(
-                app.accept_plugin_cta_command().as_deref(),
-                Some("/plugin show supabase"),
-                "accepting opens the detail page, never {command}"
+                app.accept_plugin_cta_review(),
+                Some(crate::tui::views::extensions::ExtensionsTab::Plugins),
+                "accepting opens the installed inventory, never {command}"
             );
+            let after = app.plugin_registry.get("supabase").unwrap();
+            assert_eq!(after.trust_status, before.trust_status);
+            assert_eq!(after.enabled, before.enabled);
+            assert_eq!(after.active(), before.active());
             assert!(!app.plugin_cta.phase.is_visible());
         }
+    }
+
+    #[test]
+    fn uninstalled_review_opens_marketplace_without_installing_or_running_commands() {
+        let _lock = crate::test_support::lock_test_env();
+        let (mut app, _root, _home) = app_with_supabase_plugin();
+        let before = app.plugin_registry.list().len();
+        app.surface_plugin_review_request("catalog-only", "/plugin enable supabase");
+        assert!(app.plugin_registry.get("catalog-only").is_none());
+        assert_eq!(
+            app.accept_plugin_cta_review(),
+            Some(crate::tui::views::extensions::ExtensionsTab::Marketplace)
+        );
+        assert!(app.plugin_registry.get("catalog-only").is_none());
+        assert_eq!(app.plugin_registry.list().len(), before);
+        assert!(!app.plugin_registry.get("supabase").unwrap().enabled);
+        assert_eq!(app.accept_plugin_cta_review(), None);
     }
 
     #[test]

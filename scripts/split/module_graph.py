@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import importlib.util
 import os
 import re
 import subprocess
@@ -290,6 +291,8 @@ class Crate:
     root_names: dict[str, str] = field(default_factory=dict)
     # modules whose every file is test code (e.g. `#[cfg(test)] mod test_support;`)
     test_only: set[str] = field(default_factory=set)
+    # Actual module/include production conflicts override path heuristics.
+    production_files: set[str] = field(default_factory=set)
 
 
 USE_RE = re.compile(r"\buse\s+crate::")
@@ -354,27 +357,31 @@ def resolve_root_names(crate: Crate, runtime_modules: set[str]) -> None:
 
 
 def test_file_set(crate: Crate) -> tuple[set[str], set[str]]:
-    exact, prefixes = set(), set()
+    """Reuse the blocking gate's conservative cfg/module/include graph."""
     for rel, (src, code, _) in list(crate.files.items()):
-        decls: list[str] = []
-        stripped = strip_cfg_test(code, decls)
-        crate.files[rel] = (src, code, stripped)
-        base_dir = os.path.dirname(rel)
-        stem = os.path.basename(rel)[:-3]
-        mod_dir = base_dir if stem in ("mod", "lib", "main") else os.path.join(base_dir, stem)
-        for d in decls:
-            exact.add(os.path.normpath(os.path.join(mod_dir, d + ".rs")))
-            exact.add(os.path.normpath(os.path.join(mod_dir, d, "mod.rs")))
-            prefixes.add(os.path.normpath(os.path.join(mod_dir, d)) + "/")
-    return exact, prefixes
+        crate.files[rel] = (src, code, strip_cfg_test(code, []))
+    path = Path(__file__).resolve().parents[1] / "check-blocking-calls-budget.py"
+    spec = importlib.util.spec_from_file_location("boundary_test_scope_graph", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load shared Rust test-scope reader: {path}")
+    graph = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(graph)
+    # Include the manifest and custom targets outside src when a real crate
+    # is supplied. Hermetic source trees do not consult a neighboring crate.
+    scan_root = crate.root.parent if (crate.root.parent / "Cargo.toml").is_file() else crate.root
+    test_only, production = graph.module_file_scopes(scan_root)
+    exact = {rel for rel in crate.files if (crate.root / rel).resolve() in test_only}
+    crate.production_files = {rel for rel in crate.files if (crate.root / rel).resolve() in production}
+    # No guessed directory-prefix exemption: classification is per actual file.
+    return exact, set()
 
 
-def file_is_test(rel: str, exact: set[str], prefixes: set[str]) -> bool:
-    return (
-        is_test_path(rel)
-        or rel in exact
-        or any(rel.startswith(p) for p in prefixes)
-    )
+def file_is_test(
+    rel: str, exact: set[str], prefixes: set[str], production: set[str] | None = None
+) -> bool:
+    if production is not None and rel in production:
+        return False
+    return is_test_path(rel) or rel in exact or any(rel.startswith(p) for p in prefixes)
 
 
 def file_depth(rel: str) -> int:
@@ -419,7 +426,7 @@ def collect_refs(crate: Crate, all_modules: set[str], prefix: str) -> list[Ref]:
     refs: list[Ref] = []
     by_module: dict[str, list[bool]] = collections.defaultdict(list)
     for rel in crate.files:
-        by_module[top_module(rel)].append(file_is_test(rel, exact, prefixes))
+        by_module[top_module(rel)].append(file_is_test(rel, exact, prefixes, crate.production_files))
     crate.test_only = {m for m, flags in by_module.items() if all(flags)}
 
     def target_of(name: str) -> str:
@@ -429,7 +436,7 @@ def collect_refs(crate: Crate, all_modules: set[str], prefix: str) -> list[Ref]:
 
     for rel, (src, code, stripped) in crate.files.items():
         mod = top_module(rel)
-        whole_test = file_is_test(rel, exact, prefixes)
+        whole_test = file_is_test(rel, exact, prefixes, crate.production_files)
         lines = src.split("\n")
 
         def kind_at(pos: int) -> str:

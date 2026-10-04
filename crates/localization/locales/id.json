@@ -1,5 +1,7 @@
 {
+  "ExtensionPromptUnavailable": "Instruksi ekstensi tidak tersedia; periksa /plugin show.",
   "ComposerOversizedSubmitHeld": "Belum terkirim: pesan ini melebihi {limit} karakter dan tidak dapat disimpan sebagai berkas teks tempelan ({error}). Teks lengkap masih ada di kolom input: persingkat teks atau izinkan penulisan ke .codewhale/pastes, lalu tekan Enter lagi.",
+  "ComposerOversizedSubmitHeldShort": "Belum terkirim: melebihi {limit} karakter; berkas tempelan tidak tersimpan.",
   "CmdPluginOwnerReport": "Host ekstensi:\n  Status: {state}\n  Alat aktif ({count}): {tools}",
   "CmdPluginOwnerActivating": "Sedang diaktifkan",
   "CmdPluginOwnerActive": "Aktif",
@@ -2439,5 +2441,11 @@
   "ModelPickerReadinessRefreshed": "Kesiapan model diperbarui · baris katalog dibangun ulang",
   "ModelPickerOpenToRefresh": "Buka /model untuk memperbarui kesiapan dan katalog",
   "ModelPickerPinnedChip": "disematkan",
+  "AuthSignedInAs": "Masuk ke {provider} sebagai {account}.",
+  "AuthSignedInWithoutEmail": "Masuk ke {provider} (penerbit tidak mengirim email akun).",
+  "AuthReplacedPreviousSignInAs": "Menggantikan login Codewhale {provider} sebelumnya ({account}).",
+  "AuthReplacedPreviousSignIn": "Menggantikan login Codewhale {provider} sebelumnya.",
+  "AuthSameAccountAsBefore": "Ini akun yang sama seperti sebelumnya; untuk memakai akun {provider} lain, keluar dari akun ini di browser (atau gunakan jendela pribadi) lalu masuk lagi.",
+  "AuthEnvTokenOutranksSignIn": "OPENAI_CODEX_ACCESS_TOKEN atau CODEX_ACCESS_TOKEN diatur di lingkungan ini dan lebih diutamakan daripada login ini; permintaan tetap memakai akun token tersebut sampai Anda menghapusnya.",
   "PinnedPromptJumpToMessage": "Lompat ke pesan ini"
 }

@@ -27,6 +27,12 @@ npm install -g codewhale
 pnpm add -g codewhale
 ```
 
+On Windows, the Node launcher stays alive while the native program runs.
+Killing Node by process name can also interrupt other Codewhale npm sessions
+and prevent normal terminal cleanup. Stop dev servers by their owned PID or
+port, or use Codewhale's task cancellation. The Windows native archive or
+installer avoids this launcher dependency. See the [Windows npm note](https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md#4-npm).
+
 For project-local usage:
 
 ```bash

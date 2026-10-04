@@ -23,6 +23,8 @@
  *   node scripts/render-terminal-capture.mjs --png out.png [--frame home]
  *        rasterize that page with Playwright (PLAYWRIGHT_MODULE may point at
  *        a local playwright install; launched with the "chrome" channel)
+ *   node scripts/render-terminal-capture.mjs --svg out.svg [--frame home]
+ *        export the same native cells without a browser or a screenshot tool
  */
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -232,7 +234,49 @@ pre{margin:0;padding:14px 16px;display:inline-block;font:15px/1.25 Menlo,"SF Mon
 const args = process.argv.slice(2);
 const frameArg = args.includes("--frame") ? args[args.indexOf("--frame") + 1] : "home";
 
-if (args.includes("--html")) {
+/** Native cell geometry, colours and glyphs, suitable for PNG rasterization. */
+function frameSvg(id) {
+  const frame = frames().find((item) => item.id === id);
+  if (!frame) throw new Error(`unknown frame ${id}`);
+  const capture = JSON.parse(readFileSync(path.join(captureDir, frame.file), "utf8"));
+  const { styles, rows } = compact(capture);
+  const shapes = [];
+  rows.forEach((runs, row) => {
+    let column = 0;
+    for (const [text, index] of runs) {
+      const style = styles[index];
+      const glyphs = [...text];
+      shapes.push(`<rect x="${column * 10}" y="${row * 20}" width="${glyphs.length * 10}" height="20" fill="${style.bg}"/>`);
+      for (const glyph of glyphs) {
+        const codepoint = glyph.codePointAt(0);
+        if (codepoint >= 0x2800 && codepoint <= 0x28ff) {
+          // Braille is a native eight-dot bitmap. Draw its actual set bits
+          // rather than depending on a rasterizer's missing-font fallback.
+          const dots = [[2.75, 3], [2.75, 7.5], [2.75, 12], [7.25, 3], [7.25, 7.5], [7.25, 12], [2.75, 16.5], [7.25, 16.5]];
+          dots.forEach(([x, y], bit) => {
+            if ((codepoint - 0x2800) & (1 << bit)) shapes.push(`<circle cx="${column * 10 + x}" cy="${row * 20 + y}" r="1.4" fill="${style.fg}"${style.dim ? ' opacity="0.6"' : ''}/>`);
+          });
+        } else if (glyph !== " ") {
+          const attributes = [
+            style.bold ? 'font-weight="700"' : '',
+            style.italic ? 'font-style="italic"' : '',
+            style.dim ? 'opacity="0.6"' : '',
+            style.underline || style.strike ? `text-decoration="${[style.underline ? 'underline' : '', style.strike ? 'line-through' : ''].filter(Boolean).join(' ')}"` : '',
+          ].filter(Boolean).join(' ');
+          shapes.push(`<text x="${column * 10 + 5}" y="${row * 20 + 15}" fill="${style.fg}" ${attributes}>${escapeHtml(glyph)}</text>`);
+        }
+        column += 1;
+      }
+    }
+  });
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${capture.cols * 10}" height="${capture.rows * 20}" viewBox="0 0 ${capture.cols * 10} ${capture.rows * 20}" font-family="Menlo,DejaVu Sans Mono,monospace" font-size="16" text-anchor="middle"><title>${escapeHtml(frame.state)}</title>${shapes.join('')}</svg>\n`;
+}
+
+if (args.includes("--svg")) {
+  const target = args[args.indexOf("--svg") + 1];
+  writeFileSync(target, frameSvg(frameArg));
+  console.log(`wrote ${target}`);
+} else if (args.includes("--html")) {
   const target = args[args.indexOf("--html") + 1];
   writeFileSync(target, frameHtml(frameArg));
   console.log(`wrote ${target}`);

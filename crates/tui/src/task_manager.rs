@@ -43,6 +43,11 @@ const EVENT_CATCHUP_POLL: Duration = Duration::from_millis(200);
 // ignore its eligibility or generation fence.
 const CURRENT_TASK_SCHEMA_VERSION: u32 = 4;
 const STORE_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
+/// How long a worker with nothing claimable naps between queue-fingerprint
+/// checks. An in-process notify still wakes it at once; this only bounds how
+/// soon it notices another process's queue write, so an idle session stats the
+/// queue about once a second per worker instead of five times (#6728, #6573).
+const STORE_SETTLED_NAP: Duration = Duration::from_secs(1);
 /// Retry an empty claim while queue metadata is missing or too recent to
 /// distinguish writes on a coarse-mtime filesystem. Once settled, idle workers
 /// wait for admission notifications or queue changes instead of reloading every
@@ -299,7 +304,9 @@ pub struct TaskRecord {
     pub mode: String,
     pub allow_shell: bool,
     pub trust_mode: bool,
-    #[serde(default = "default_auto_approve")]
+    /// A record without the field (written before it existed) is not
+    /// auto-approved: a missing grant never widens authority.
+    #[serde(default)]
     pub auto_approve: bool,
     /// Permission posture the task's own thread starts on (`ask`,
     /// `auto_review`, `full_access`). Absent on records written before the
@@ -1472,6 +1479,9 @@ pub struct TaskManager {
     /// Full store loads performed by this manager (tests only, #6573).
     #[cfg(test)]
     store_loads: std::sync::atomic::AtomicUsize,
+    /// Queue fingerprint reads performed by worker loops (tests only, #6728).
+    #[cfg(test)]
+    fingerprint_reads: std::sync::atomic::AtomicUsize,
 }
 
 /// Cheap stat-only view of the shared queue file. Everything that makes work
@@ -1561,6 +1571,18 @@ impl ClaimSchedule {
             || self.next_claim.is_some_and(|deadline| now >= deadline)
     }
 
+    /// How long the worker may sleep before its next pass. Nothing claimable
+    /// (a settled empty queue, no retry deadline) only needs to notice another
+    /// process's queue write; pending work or a retry deadline keeps the
+    /// short tick.
+    fn nap(&self) -> Duration {
+        if self.next_claim.is_none() {
+            STORE_SETTLED_NAP
+        } else {
+            STORE_REFRESH_INTERVAL
+        }
+    }
+
     fn claimed_task(&mut self, now: Instant) {
         self.seen = None;
         self.next_claim = Some(now);
@@ -1587,6 +1609,18 @@ impl ClaimSchedule {
         self.next_claim = Some(now + delay);
         self.failure_backoff = (delay * 2).min(STORE_BUSY_BACKOFF_MAX);
         delay
+    }
+}
+
+/// The "store is busy" error, naming the lock holder when its record can be
+/// read. Reading the record is best effort and never fails the caller (#6573).
+fn store_busy_error(lock_path: &Path) -> anyhow::Error {
+    match RuntimeProcessOwnerLock::read_holder(lock_path) {
+        Some((pid, held_for)) => anyhow!(
+            "Task store is busy; state is unavailable (lock held by pid {pid} for {}s)",
+            held_for.as_secs()
+        ),
+        None => anyhow!("Task store is busy; state is unavailable"),
     }
 }
 
@@ -1726,6 +1760,8 @@ impl TaskManager {
             shutdown_drain: Mutex::new(()),
             #[cfg(test)]
             store_loads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fingerprint_reads: std::sync::atomic::AtomicUsize::new(0),
         });
 
         {
@@ -2483,29 +2519,49 @@ impl TaskManager {
     async fn worker_loop(self: Arc<Self>) {
         let mut schedule = ClaimSchedule::new(Instant::now());
         let mut woken = true;
+        // True while consecutive claims are failing: the first failure of an
+        // episode is an error, repeats are debug until a claim succeeds (#6573).
+        let mut claim_failing = false;
         loop {
             if self.cancel_token.is_cancelled() {
                 break;
             }
             // Read before claiming so a write racing the claim changes the
             // fingerprint and is picked up on the next pass.
+            #[cfg(test)]
+            self.fingerprint_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let fingerprint = StoreFingerprint::read(&self.queue_path);
             if schedule.should_claim(&fingerprint, Instant::now(), woken) {
                 match self.claim_next_task().await {
                     Ok(Some((id, request, cancel))) => {
+                        claim_failing = false;
                         schedule.claimed_task(Instant::now());
                         self.run_task(id, request, cancel).await;
                         woken = true;
                         continue;
                     }
-                    Ok(None) => schedule.found_nothing(fingerprint, Instant::now()),
+                    Ok(None) => {
+                        claim_failing = false;
+                        schedule.found_nothing(fingerprint, Instant::now());
+                    }
                     Err(error) => {
                         let retry = schedule.claim_failed(fingerprint, Instant::now());
-                        tracing::error!(
-                            %error,
-                            retry_ms = retry.as_millis() as u64,
-                            "Task claim unavailable; executor was not polled"
-                        );
+                        let retry_ms = retry.as_millis() as u64;
+                        if claim_failing {
+                            tracing::debug!(
+                                %error,
+                                retry_ms,
+                                "Task claim still unavailable; executor was not polled"
+                            );
+                        } else {
+                            claim_failing = true;
+                            tracing::error!(
+                                %error,
+                                retry_ms,
+                                "Task claim unavailable; executor was not polled"
+                            );
+                        }
                     }
                 }
             }
@@ -2513,7 +2569,7 @@ impl TaskManager {
             tokio::select! {
                 _ = self.cancel_token.cancelled() => break,
                 _ = self.notify.notified() => woken = true,
-                _ = sleep(STORE_REFRESH_INTERVAL) => {},
+                _ = sleep(schedule.nap()) => {},
             }
         }
     }
@@ -3221,11 +3277,13 @@ impl TaskManager {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut wait = Duration::from_millis(5);
         loop {
-            if let Some(owner) = RuntimeProcessOwnerLock::try_acquire_file(&path, true)? {
+            if let Some(mut owner) = RuntimeProcessOwnerLock::try_acquire_file(&path, true)? {
+                // Lets a contender that times out name this process (#6573).
+                owner.record_holder();
                 return Ok(owner);
             }
             if Instant::now() >= deadline {
-                bail!("Task store is busy; state is unavailable");
+                return Err(store_busy_error(&path));
             }
             sleep(wait).await;
             wait = (wait * 2).min(Duration::from_millis(50));
@@ -3729,10 +3787,6 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .with_context(|| format!("Failed to write {}", path.display()))
 }
 
-fn default_auto_approve() -> bool {
-    true
-}
-
 /// Default task manager data location (`~/.codewhale/tasks`, or legacy
 /// `~/.deepseek/tasks` when only the legacy directory exists).
 #[must_use]
@@ -3960,6 +4014,32 @@ mod tests {
         config
     }
 
+    /// Wait until every idle worker of `managers` has stopped polling.
+    ///
+    /// A worker that saw a fresh queue stamp (another manager starting writes
+    /// one) re-reads it once, `STORE_IDLE_POLL_INTERVAL` later and on a
+    /// `STORE_REFRESH_INTERVAL` tick boundary, to confirm the stamp has settled.
+    /// A fixed `interval + 300ms` sleep leaves under one tick of margin, so a
+    /// slow runner (Windows CI) could land that confirming read inside the
+    /// caller's "no reloads" window. A window longer than the interval in which
+    /// no worker reloaded proves every worker has settled; a worker that polls
+    /// forever never produces one, so the caller's assertion still catches it.
+    async fn settle_idle_store_polling(managers: &[&TaskManager]) {
+        for _ in 0..5 {
+            for manager in managers {
+                manager.store_loads.store(0, Ordering::Relaxed);
+            }
+            sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
+            let loads: usize = managers
+                .iter()
+                .map(|manager| manager.store_loads.load(Ordering::Relaxed))
+                .sum();
+            if loads == 0 {
+                return;
+            }
+        }
+    }
+
     /// #6573: idle managers sharing one data dir must not reload the store
     /// (and take its cross-process lock) every 200ms per worker.
     #[tokio::test]
@@ -3975,7 +4055,7 @@ mod tests {
         let second =
             TaskManager::start_with_executor_in_scope(config(), Arc::new(MockExecutor), "second")
                 .await?;
-        sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
+        settle_idle_store_polling(&[&first, &second]).await;
         for manager in [&first, &second] {
             manager.store_loads.store(0, Ordering::Relaxed);
         }
@@ -4110,7 +4190,7 @@ mod tests {
             "idle",
         )
         .await?;
-        sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
+        settle_idle_store_polling(&[&idle]).await;
         idle.store_loads.store(0, Ordering::Relaxed);
         let record = root.path().join("tasks").join(format!("{}.json", task.id));
         let flushed_before = fs::metadata(&record)?.modified()?;
@@ -4215,11 +4295,99 @@ mod tests {
             manager.persist_queue_locked(&VecDeque::from([task.id.clone(), second.id.clone()]))?;
         }
         for id in [&task.id, &second.id] {
-            let done = wait_for_terminal_state(&manager, id, Duration::from_secs(2)).await?;
+            // Settled idle workers recheck the queue every STORE_SETTLED_NAP.
+            let done =
+                wait_for_terminal_state(&manager, id, STORE_SETTLED_NAP + Duration::from_secs(2))
+                    .await?;
             assert_eq!(done.status, TaskStatus::Completed);
         }
         assert_eq!(executions.load(Ordering::SeqCst), 2);
         manager.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    /// #6728: with nothing claimable, each worker rechecks the queue about once
+    /// per STORE_SETTLED_NAP rather than every STORE_REFRESH_INTERVAL. The
+    /// bound is an upper limit, so a slow machine only lowers the count.
+    #[tokio::test]
+    async fn settled_idle_workers_check_the_queue_at_the_settled_nap() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let workers = 2;
+        let manager = TaskManager::start_with_executor(
+            TaskManagerConfig {
+                worker_count: workers,
+                ..test_config(root.path().to_path_buf())
+            },
+            Arc::new(MockExecutor),
+        )
+        .await?;
+        sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
+        manager.fingerprint_reads.store(0, Ordering::Relaxed);
+        manager.store_loads.store(0, Ordering::Relaxed);
+
+        let window = Duration::from_secs(3);
+        sleep(window).await;
+        let reads = manager.fingerprint_reads.load(Ordering::Relaxed);
+        let loads = manager.store_loads.load(Ordering::Relaxed);
+        let ticks = (window.as_millis() / STORE_SETTLED_NAP.as_millis()) as usize + 1;
+        assert!(
+            reads <= workers * ticks,
+            "{workers} idle workers read the queue fingerprint {reads} times in {window:?}; \
+             expected at most {}",
+            workers * ticks
+        );
+        assert_eq!(loads, 0, "idle workers reloaded a settled store");
+        manager.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn claim_schedule_naps_long_only_when_nothing_is_claimable() {
+        let now = Instant::now();
+        let settled = StoreFingerprint(Some((std::time::SystemTime::UNIX_EPOCH, 1, 1)));
+        let mut schedule = ClaimSchedule::new(now);
+        // A fresh schedule has a claim pending.
+        assert_eq!(schedule.nap(), STORE_REFRESH_INTERVAL);
+        schedule.found_nothing(settled.clone(), now);
+        assert_eq!(schedule.nap(), STORE_SETTLED_NAP);
+        // A failed claim keeps the short tick so a queue change is seen early.
+        schedule.claim_failed(settled.clone(), now);
+        assert_eq!(schedule.nap(), STORE_REFRESH_INTERVAL);
+        // Recent or missing metadata retries on a deadline, so it stays short.
+        schedule.found_nothing(StoreFingerprint(None), now);
+        assert_eq!(schedule.nap(), STORE_REFRESH_INTERVAL);
+        schedule.claimed_task(now);
+        assert_eq!(schedule.nap(), STORE_REFRESH_INTERVAL);
+    }
+
+    /// #6573: a busy store names the holder; an unreadable record falls back
+    /// to the bare message without failing.
+    #[test]
+    fn busy_store_error_names_the_lock_holder_when_known() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("task-store.lock");
+        let mut holder =
+            RuntimeProcessOwnerLock::try_acquire_file(&path, true)?.context("first acquire")?;
+        holder.record_holder();
+        assert!(RuntimeProcessOwnerLock::try_acquire_file(&path, true)?.is_none());
+
+        let message = store_busy_error(&path).to_string();
+        assert!(
+            message.contains(&format!("held by pid {}", std::process::id())),
+            "{message}"
+        );
+
+        // Releasing clears the record, so a later error cannot name a stale pid.
+        drop(holder);
+        assert_eq!(
+            store_busy_error(&path).to_string(),
+            "Task store is busy; state is unavailable"
+        );
+        // Garbage and a missing file also fall back.
+        fs::write(&path, "pid=oops since_ms=\n")?;
+        assert!(RuntimeProcessOwnerLock::read_holder(&path).is_none());
+        fs::remove_file(&path)?;
+        assert!(RuntimeProcessOwnerLock::read_holder(&path).is_none());
         Ok(())
     }
 
@@ -5614,6 +5782,30 @@ mod tests {
             tool_calls: Vec::new(),
             timeline: Vec::new(),
         }
+    }
+
+    /// Records persisted before `auto_approve` existed must load as not
+    /// auto-approved, and the thread request they build must say so.
+    #[test]
+    fn task_record_missing_auto_approve_loads_fail_closed() {
+        let mut record = sample_task_record();
+        record.auto_approve = true;
+        let mut value = serde_json::to_value(&record).expect("serialize");
+        assert_eq!(value["auto_approve"], serde_json::json!(true));
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("auto_approve");
+        let loaded: TaskRecord = serde_json::from_value(value).expect("legacy record loads");
+        assert!(!loaded.auto_approve);
+        assert_eq!(
+            ExecutionTask::from(&loaded).thread_request().auto_approve,
+            Some(false)
+        );
+        assert_eq!(
+            ExecutionTask::from(&loaded).turn_request().auto_approve,
+            Some(false)
+        );
     }
 
     #[test]

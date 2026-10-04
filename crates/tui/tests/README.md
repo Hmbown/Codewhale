@@ -105,3 +105,20 @@ cat crates/tui/tests/fixtures/offline-tool-loop.jsonl | jq .
 
 The scenario name is sanitized to `[A-Za-z0-9_-]` before forming the filename,
 so unusual scenario strings stay portable across platforms.
+
+## Canonical executable
+
+The Engine crate is a library; its acceptance suites launch `codewhale` from
+`codewhale-cli`. Build it before direct acceptance invocations:
+
+```sh
+cargo build -p codewhale-cli --bin codewhale --locked
+cargo test -p codewhale-tui --test integration --locked
+```
+
+`scripts/dev-test.sh tui-integration` and `tui-cucumber` perform that build using
+the same cache and hermetic test boundary. Both harnesses use one resolver:
+`QA_TUI_BIN` selects an explicit QA binary, otherwise `CARGO_BIN_EXE_codewhale`
+or the canonical executable beside the test harness is required. A stale
+`codewhale-tui` executable is never an implicit fallback. Release aliases remain
+byte-identical copies of the canonical program.

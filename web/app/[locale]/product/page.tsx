@@ -2,10 +2,13 @@ import Link from "next/link";
 import { Icon, type IconName } from "@/components/icon";
 import { PageHeader, Section } from "@/components/page-header";
 import { Status, type StatusTone } from "@/components/status-badge";
+import { NativeTerminalGallery } from "@/components/native-terminal-gallery";
 import { getFacts } from "@/lib/facts";
 import { PRODUCT_COPY } from "@/lib/content/product";
 import { fill, getHome, pickText } from "@/lib/i18n/dictionaries";
 import { buildPageMetadata } from "@/lib/page-meta";
+import { getNativeTerminalCopy } from "@/lib/content/native-terminal";
+import { TERMINAL_SCREENSHOT } from "@/lib/media-manifest";
 
 export const revalidate = 300;
 
@@ -37,6 +40,7 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
   const t = (text: { en: string; zh: string }) => pickText(text, locale);
   const facts = await getFacts();
   const home = getHome(locale);
+  const terminal = getNativeTerminalCopy(locale);
   const providerCount = facts.providers.length;
 
   return (
@@ -58,6 +62,17 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
       />
 
       <div className="page-body">
+        <Section id="product-terminal" title={terminal.title} scope={terminal.description}>
+          <div className="figure-frame">
+            <NativeTerminalGallery
+              locale={locale}
+              defaultFrame="home"
+              regionLabel={home.shotPreview}
+              label={fill(home.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
+            />
+          </div>
+        </Section>
+
         <Section
           id="product-gain"
           title={t(PRODUCT_COPY.gainHeading)}

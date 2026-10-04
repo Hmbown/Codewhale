@@ -285,7 +285,7 @@ mod adapter_agreement_tests {
     use serde_json::{Value, json};
 
     use super::super::{anthropic, chat, responses};
-    use crate::config::ApiProvider;
+    use crate::config::ProviderKind;
     use codewhale_models::{
         ContentBlock, INTERRUPTED_ASSISTANT_CONTEXT_PREFIX, Message, MessageRequest, Role,
     };
@@ -340,7 +340,7 @@ mod adapter_agreement_tests {
     fn chat_completions_maps_every_role_the_table_says_it_can_carry() {
         let items = chat::build_chat_messages_for_request_and_provider(
             &request(transcript()),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         assert_eq!(
             roles(&items),
@@ -362,7 +362,7 @@ mod adapter_agreement_tests {
     fn chat_completions_marks_interrupted_assistant_history() {
         let items = chat::build_chat_messages_for_request_and_provider(
             &request(vec![message(Role::InterruptedAssistant, "half an answer")]),
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
         );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["role"], json!("assistant"));
@@ -376,7 +376,8 @@ mod adapter_agreement_tests {
     fn responses_preserves_positioned_instruction_history_and_marks_interrupted_history() {
         let items = responses::convert_messages_to_responses_input(
             &request(transcript()),
-            ApiProvider::Openai,
+            ProviderKind::Openai,
+            None,
         );
         assert_eq!(
             roles(&items),

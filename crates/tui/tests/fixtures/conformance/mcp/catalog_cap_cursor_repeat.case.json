@@ -1,0 +1,55 @@
+{
+  "description": "A tools/list whose nextCursor points back at itself. Pins Rust McpCatalogBudget::observe_page: a repeated pagination cursor aborts discovery instead of looping until the page cap.",
+  "server_name": "conformance",
+  "expect_boot": "error",
+  "server": {
+    "initialize": {
+      "result": {
+        "protocolVersion": "2025-06-18",
+        "serverInfo": {
+          "name": "catalog-fixture",
+          "version": "1.0.0"
+        },
+        "capabilities": {
+          "tools": {}
+        }
+      }
+    },
+    "tools/list": [
+      {
+        "match": {
+          "cursor": "loop"
+        },
+        "result": {
+          "tools": [
+            {
+              "name": "again",
+              "inputSchema": {
+                "type": "object"
+              }
+            }
+          ],
+          "nextCursor": "loop"
+        }
+      },
+      {
+        "result": {
+          "tools": [
+            {
+              "name": "first",
+              "inputSchema": {
+                "type": "object"
+              }
+            }
+          ],
+          "nextCursor": "loop"
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    }
+  ]
+}

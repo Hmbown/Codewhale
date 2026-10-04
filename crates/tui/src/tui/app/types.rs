@@ -90,7 +90,7 @@ impl AppModeUi for AppMode {
 /// intentionally do not persist raw endpoints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CacheReplayTarget {
-    pub(crate) provider: ApiProvider,
+    pub(crate) provider: ProviderKind,
     pub(crate) provider_identity: String,
     /// Additive exact provider id used by persisted-route resolution.
     /// `None` is meaningful for the legacy root-level `custom` route.
@@ -277,7 +277,7 @@ impl VimMode {}
 pub struct QueuedMessage {
     pub display: String,
     pub skill_instruction: Option<String>,
-    pub skill_provenance: Option<crate::plugins::types::PluginAuthority>,
+    pub skill_provenance: Option<crate::skills::SkillProvenance>,
     /// True once this turn has been painted into `history` as `HistoryCell::User`.
     /// Queue/offline submit echoes before the model runs; Immediate prepare skips
     /// a second paint when this is set so drained queued turns do not double.
@@ -409,7 +409,7 @@ impl QueuedMessage {
     #[must_use]
     pub fn with_skill_provenance(
         mut self,
-        provenance: Option<crate::plugins::types::PluginAuthority>,
+        provenance: Option<crate::skills::SkillProvenance>,
     ) -> Self {
         self.skill_provenance = provenance;
         self
@@ -553,7 +553,7 @@ pub enum AppAction {
     /// Open the `/provider` picker in setup/catalog mode, optionally focused on
     /// a built-in provider that needs credentials before first use.
     OpenProviderSetup {
-        provider: Option<ApiProvider>,
+        provider: Option<codewhale_config::ProviderId>,
     },
     /// Open the named, keyless DS4 local-runtime preset for review and save.
     OpenDs4Setup,
@@ -585,6 +585,11 @@ pub enum AppAction {
     OpenStatusPicker,
     /// Open the `/feedback` picker for GitHub issue/security destinations.
     OpenFeedbackPicker,
+    /// Read/review a scoped immutable issue draft without parking the UI.
+    ReviewIssueReport {
+        id: String,
+        change: Option<String>,
+    },
     /// Open the `/theme` picker modal with live preview of every preset.
     OpenThemePicker,
     /// Open the `/skills manage` manager — audit inventory + owned mutations.
@@ -641,6 +646,14 @@ pub enum AppAction {
         url: String,
         label: String,
     },
+    /// Run an extension command in the extension host (`/name input`). The UI
+    /// event loop awaits it, then shows its text and/or submits its prompt
+    /// as the user's next message.
+    RunExtensionCommand {
+        command: crate::extension_host::command::ExtensionCommandRef,
+        name: String,
+        input: String,
+    },
     /// Send a message to the AI (normal chat mode).
     SendMessage(String),
     /// Same-session rollback. A retry is admitted only after the Engine
@@ -648,6 +661,10 @@ pub enum AppAction {
     ConversationUndo {
         sync: codewhale_command_contract::facets::SessionSyncPayload,
         retry_input: Option<String>,
+        /// `retry_input` is the text of a pending `/edit`, already taken from
+        /// the composer. If the rollback is refused it must go back there, with
+        /// edit mode re-armed, or the user's revision is lost.
+        edit_replacement: bool,
     },
     /// Send a built-in Workflow planning turn with separate user-visible text
     /// and bounded runtime guidance. Draft instructions carry a typed marker
@@ -715,13 +732,13 @@ pub enum AppAction {
     /// the updated config. `model` overrides the post-switch model
     /// (already normalized but not yet provider-prefixed).
     SwitchProvider {
-        provider: ApiProvider,
+        provider: codewhale_config::ProviderId,
         model: Option<String>,
     },
     /// Switch provider+model through the same apply path as a `/model` route
     /// row. Used by Hotbar route slots so dispatch does not hand-mutate config.
     SwitchModelRoute {
-        provider: ApiProvider,
+        identity: crate::config::ProviderIdentity,
         model: String,
     },
     UpdateCompaction(CompactionConfig),

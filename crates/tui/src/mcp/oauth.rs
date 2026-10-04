@@ -657,6 +657,7 @@ impl McpOAuthRuntime {
         client: McpHttpClient,
     ) -> Result<Self> {
         refresh_expires_in_from_timestamp(&mut tokens);
+        let client = client.with_credential_transport()?;
         let http_client = Arc::new(RecordingOAuthHttpClient::new(client));
         let manager = manager_from_stored_tokens(url, &tokens, &http_client).await?;
 
@@ -987,6 +988,7 @@ fn oauth_http_client(
         Duration::from_secs(server.effective_connect_timeout(&timeouts)),
         Duration::from_secs(server.effective_read_timeout(&timeouts)),
     )
+    .and_then(McpHttpClient::with_credential_transport)
 }
 
 fn oauth_login_client(
@@ -2121,6 +2123,29 @@ impl McpServerConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_oauth_client_requires_https_or_explicit_loopback_without_header_guessing() {
+        crate::tls::ensure_rustls_crypto_provider();
+        let server: super::McpServerConfig = serde_json::from_value(serde_json::json!({
+            "url": "https://example.invalid/mcp"
+        }))
+        .unwrap();
+        let error = super::oauth_http_client(&server, "http://example.invalid/mcp", None)
+            .err()
+            .expect("OAuth form credentials must not use public HTTP");
+        assert!(error.to_string().contains("credentials require HTTPS"));
+        assert!(super::oauth_http_client(&server, "https://example.invalid/mcp", None).is_ok());
+        assert!(super::oauth_http_client(&server, "http://127.0.0.1/mcp", None).is_ok());
+        assert!(
+            super::oauth_http_client(
+                &server,
+                "https://fixture-user:fixture-password@example.invalid/mcp",
+                None
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn registration_rejection_drops_exactly_the_named_scopes() {
         let scopes: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();

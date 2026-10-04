@@ -9,8 +9,11 @@
 //! asset the user drops into the workspace without bouncing through
 //! `exec_shell`.
 
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::ffi::OsString;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -57,20 +60,14 @@ impl ToolSpec for ImageOcrTool {
         // OCR text is file content: the same read guards as `read` apply.
         let image_path =
             crate::tools::file::resolve_guarded_read_path(context, path_str, "image_ocr")?;
-        // OCR shells out to tesseract (or runs a Vision pass): the blocking
-        // subprocess call stays on the blocking pool (blocking-call
-        // convention, #6149).
-        let text = tokio::task::spawn_blocking(move || {
-            if !image_path.exists() {
-                return Err(ToolError::execution_failed(format!(
-                    "image_ocr: source path does not exist: {}",
-                    image_path.display()
-                )));
-            }
-            ocr_image_path(&image_path)
-        })
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("Image OCR task: {e}")))??;
+        let present = tokio::fs::try_exists(&image_path).await.unwrap_or(false);
+        if !present {
+            return Err(ToolError::execution_failed(format!(
+                "image_ocr: source path does not exist: {}",
+                image_path.display()
+            )));
+        }
+        let text = ocr_image_path(&image_path, context).await?;
         Ok(ToolResult::success(text))
     }
 }
@@ -80,58 +77,372 @@ pub(crate) fn ocr_available() -> bool {
         && (crate::dependencies::resolve_tesseract().is_some() || native_ocr_available())
 }
 
-pub(crate) fn ocr_image_path(image_path: &Path) -> Result<String, ToolError> {
-    // Prefer native OCR when the backend probe says it works. If native fails
-    // at runtime, fall through to tesseract rather than hard-failing — hosts
-    // can advertise Vision classes while still rejecting performRequests.
-    match try_native_ocr(image_path) {
-        Ok(Some(text)) => return Ok(text),
-        Ok(None) => {}
-        Err(err) => {
-            if crate::dependencies::resolve_tesseract().is_none() {
-                return Err(err);
+const OCR_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_OCR_TEXT: usize = 16 * 1024 * 1024;
+const MAX_OCR_DIAGNOSTIC: usize = 32 * 1024;
+const NO_BACKEND: &str = "image_ocr: no local OCR backend is available. On macOS, update to a version with the Vision framework; on Linux/Windows install tesseract and restart codewhale.";
+
+/// Private bounded image snapshot staged before Host startup. Paths, image bytes,
+/// full text and process diagnostics stay in Core. Native probing/resolution
+/// happens only in the captured Core worker.
+pub(crate) struct CapturedOcr {
+    path: PathBuf,
+    captured_sha256: String,
+    _staged: Option<tempfile::NamedTempFile>,
+    #[cfg(all(test, unix))]
+    overrides: Option<TestOverrides>,
+}
+impl CapturedOcr {
+    async fn capture(
+        path: &Path,
+        context: &ToolContext,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, ToolError> {
+        crate::tools::file::enforce_read_denylist(path, "image_ocr")?;
+        if crate::tools::file::is_codewhale_credential_path(path) {
+            return Err(ToolError::permission_denied(
+                "image_ocr cannot expose Codewhale configuration or credential-store files",
+            ));
+        }
+        if !path.is_absolute() {
+            return Err(ToolError::execution_failed(
+                "Image OCR capture requires an authorized absolute path",
+            ));
+        }
+        let path = path.to_path_buf();
+        let cancel = context.cancel_token.clone();
+        #[cfg(all(test, unix))]
+        let overrides = TEST_OVERRIDES.with(|slot| slot.borrow().clone());
+        let worker = tokio::task::spawn_blocking(move || {
+            if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                return Err(ToolError::cancelled("Image OCR was cancelled"));
             }
-            // Native probe-or-run failed; tesseract remains as fallback.
+            let root = path.ancestors().last().expect("absolute source has a root");
+            // Reuse the Fleet-anchored regular-file reader: no final or parent
+            // link can redirect the read after the path guards authorize it.
+            let mut source = crate::fs_confined::open_read(root, &path).map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "Failed to capture image {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let bytes = crate::tools::file::read_contract_source(&mut source, cancel.as_ref())?;
+            let captured_sha256 = crate::hashing::sha256_hex(&bytes);
+            // Reuse the fetched PDF staging contract. The temporary is private
+            // and retained by the input through Native and Tesseract work.
+            let mut staged = tempfile::NamedTempFile::new().map_err(|error| {
+                ToolError::execution_failed(format!("Failed to stage image OCR input: {error}"))
+            })?;
+            staged
+                .write_all(&bytes)
+                .and_then(|()| staged.flush())
+                .map_err(|error| {
+                    ToolError::execution_failed(format!("Failed to stage image OCR input: {error}"))
+                })?;
+            if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                return Err(ToolError::cancelled("Image OCR was cancelled"));
+            }
+            Ok(Self {
+                path: staged.path().to_path_buf(),
+                captured_sha256,
+                _staged: Some(staged),
+                #[cfg(all(test, unix))]
+                overrides,
+            })
+        });
+        tokio::select! {biased;
+            ()=wait_cancel(context.cancel_token.as_ref())=>Err(ToolError::cancelled("Image OCR was cancelled")),
+            ()=tokio::time::sleep_until(deadline)=>Err(ToolError::Timeout {seconds:OCR_TIMEOUT.as_secs()}),
+            result=worker=>result.map_err(|error|ToolError::execution_failed(format!("Image OCR capture task: {error}")))?,
         }
     }
-
-    if let Some(tesseract) = crate::dependencies::resolve_tesseract() {
-        return ocr_with_tesseract(&tesseract, image_path);
+    #[cfg(all(test, unix))]
+    pub(crate) fn for_test(
+        path: &Path,
+        native: TestNativeOcr,
+        tesseract: Option<OsString>,
+    ) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            captured_sha256: crate::hashing::sha256_hex(path.as_os_str().as_encoded_bytes()),
+            _staged: None, // private broker test port; production always stages bytes
+            overrides: Some(TestOverrides { native, tesseract }),
+        }
     }
-
-    Err(ToolError::execution_failed(
-        "image_ocr: no local OCR backend is available. On macOS, update to a version with the Vision framework; on Linux/Windows install tesseract and restart codewhale.",
-    ))
+    pub(crate) fn digest(&self) -> String {
+        self.captured_sha256.clone()
+    }
+    pub(crate) fn native_step(self) -> OcrNativeStep {
+        #[cfg(all(test, unix))]
+        let result = self
+            .overrides
+            .as_ref()
+            .map(|value| (value.native)(&self.path));
+        #[cfg(all(test, unix))]
+        let mut result = result.unwrap_or_else(|| try_native_ocr(&self.path));
+        #[cfg(not(all(test, unix)))]
+        let mut result = try_native_ocr(&self.path);
+        if result
+            .as_ref()
+            .is_ok_and(|text| text.as_ref().is_some_and(|text| text.len() > MAX_OCR_TEXT))
+        {
+            result = Err(ToolError::execution_failed(
+                "native OCR output exceeded the 16777216 byte safety limit",
+            ));
+        }
+        // Preserve the legacy native-first resolver order. A working native
+        // backend does not gain a new Tesseract probe or process launch.
+        let fallback = if matches!(result, Ok(Some(_))) {
+            None
+        } else {
+            #[cfg(all(test, unix))]
+            let supplied = self.overrides.as_ref().map(|value| value.tesseract.clone());
+            #[cfg(all(test, unix))]
+            {
+                supplied
+                    .unwrap_or_else(|| crate::dependencies::resolve_tesseract().map(OsString::from))
+            }
+            #[cfg(not(all(test, unix)))]
+            {
+                crate::dependencies::resolve_tesseract().map(OsString::from)
+            }
+        };
+        OcrNativeStep {
+            input: self,
+            fallback,
+            outcome: OcrOutcome::Native(result),
+        }
+    }
 }
 
-fn ocr_with_tesseract(tesseract: &str, image_path: &Path) -> Result<String, ToolError> {
-    // `tesseract <image> -` writes the recognised text to stdout. The trailing
-    // `-` is documented and produces text mode by default (no `.txt` file).
-    let mut cmd = Command::new(tesseract);
-    cmd.arg(image_path);
-    cmd.arg("-");
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = cmd
-        .output()
-        .map_err(|e| ToolError::execution_failed(format!("failed to launch tesseract: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(ToolError::execution_failed(format!(
-            "tesseract failed (exit {:?}): {stderr}",
-            output.status.code()
-        )));
-    }
-
-    // Tesseract appends a trailing form-feed on some platforms; trim trailing
-    // whitespace so the result reads cleanly inline.
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .trim_end()
-        .to_string())
+pub(crate) struct OcrNativeStep {
+    input: CapturedOcr,
+    fallback: Option<OsString>,
+    outcome: OcrOutcome,
 }
+impl OcrNativeStep {
+    pub(crate) fn needs_tesseract(&self) -> bool {
+        self.fallback.is_some()
+    }
+    pub(crate) fn digest(&self) -> String {
+        let mut value = self.input.captured_sha256.as_bytes().to_vec();
+        value.push(0);
+        if let Some(binary) = &self.fallback {
+            value.extend_from_slice(binary.as_encoded_bytes());
+        }
+        crate::hashing::sha256_hex(&value)
+    }
+    pub(crate) fn projection(&self) -> Value {
+        let status = match &self.outcome {
+            OcrOutcome::Native(Ok(Some(_))) => "success",
+            OcrOutcome::Native(Ok(None)) => "unavailable",
+            _ => "error",
+        };
+        json!({"kind":"ocr_process","state":"native","status":status,"can_fallback":self.needs_tesseract()})
+    }
+    pub(crate) fn finish(self) -> OcrOutcome {
+        self.outcome
+    }
+    pub(crate) async fn tesseract(
+        self,
+        cancel: Option<&CancellationToken>,
+        deadline: tokio::time::Instant,
+    ) -> OcrOutcome {
+        let result=async {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {return Err(ToolError::cancelled("Image OCR was cancelled"));}
+            if tokio::time::Instant::now()>=deadline {return Err(ToolError::Timeout {seconds:OCR_TIMEOUT.as_secs()});}
+            let binary=self.fallback.as_ref().ok_or_else(||ToolError::execution_failed("OCR fallback was not admitted"))?;
+            let mut command=tokio::process::Command::new(binary);
+            crate::utils::suppress_tokio_console_window(&mut command);
+            command.arg(&self.input.path).arg("-");
+            crate::child_env::apply_to_tokio_command(&mut command,std::iter::empty::<(&str,&str)>());
+            let stop=async { tokio::select! {biased;()=wait_cancel(cancel)=>{},()=tokio::time::sleep_until(deadline)=>{},} };
+            let run=crate::process_tree::contained_output_with_input_bounded(&mut command,Vec::new(),MAX_OCR_TEXT,MAX_OCR_DIAGNOSTIC,stop).await
+                .map_err(|error|ToolError::execution_failed(format!("failed to launch tesseract: {error}")))?;
+            if cancel.is_some_and(CancellationToken::is_cancelled) {return Err(ToolError::cancelled("Image OCR was cancelled"));}
+            if run.stopped || tokio::time::Instant::now()>=deadline {return Err(ToolError::Timeout {seconds:OCR_TIMEOUT.as_secs()});}
+            Ok(run.output)
+        }.await;
+        OcrOutcome::Tesseract(result)
+    }
+}
+
+/// Full OCR text/process output is retained privately, never copied to Host.
+pub(crate) enum OcrOutcome {
+    Native(Result<Option<String>, ToolError>),
+    Tesseract(Result<std::process::Output, ToolError>),
+}
+impl OcrOutcome {
+    pub(crate) fn projection(&self) -> Value {
+        match self {
+            Self::Native(_) => unreachable!("native projection is stage-bound"),
+            Self::Tesseract(Err(_)) => {
+                json!({"kind":"ocr_process","state":"tesseract","status":"fault"})
+            }
+            Self::Tesseract(Ok(output)) => {
+                json!({"kind":"ocr_process","state":"tesseract","status":"complete","success":output.status.success(),"exit_code":output.status.code()})
+            }
+        }
+    }
+    fn into_rust_text(self) -> Result<String, ToolError> {
+        match self {
+            Self::Native(Ok(Some(text))) => Ok(text),
+            Self::Native(Ok(None)) => Err(ToolError::execution_failed(NO_BACKEND)),
+            Self::Native(Err(error)) | Self::Tesseract(Err(error)) => Err(error),
+            Self::Tesseract(Ok(output)) if output.status.success() => {
+                Ok(String::from_utf8_lossy(&output.stdout)
+                    .trim_end()
+                    .to_string())
+            }
+            Self::Tesseract(Ok(output)) => Err(ToolError::execution_failed(format!(
+                "tesseract failed (exit {:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
+        }
+    }
+    fn into_host_text(self, result: ToolResult) -> Result<String, ToolError> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Decision {
+            kind: String,
+            code: String,
+            trim_end: bool,
+            message: Option<String>,
+        }
+        let invalid = || {
+            ToolError::execution_failed(
+                "OCR Host returned a malformed or inconsistent decision; no Rust fallback was attempted",
+            )
+        };
+        if !result.success {
+            return Err(invalid());
+        }
+        let decision: Decision =
+            serde_json::from_value(result.metadata.ok_or_else(invalid)?).map_err(|_| invalid())?;
+        if decision.kind != "ocr_decision" {
+            return Err(invalid());
+        }
+        match self {
+            Self::Native(Ok(Some(text)))
+                if decision.code == "native_success"
+                    && !decision.trim_end
+                    && decision.message.is_none() =>
+            {
+                Ok(text)
+            }
+            Self::Native(Ok(None))
+                if decision.code == "no_backend"
+                    && !decision.trim_end
+                    && decision.message.as_deref() == Some(NO_BACKEND) =>
+            {
+                Err(ToolError::execution_failed(NO_BACKEND))
+            }
+            Self::Native(Err(error))
+                if decision.code == "native_error"
+                    && !decision.trim_end
+                    && decision.message.is_none() =>
+            {
+                Err(error)
+            }
+            Self::Tesseract(Err(error))
+                if decision.code == "fault" && !decision.trim_end && decision.message.is_none() =>
+            {
+                Err(error)
+            }
+            Self::Tesseract(Ok(output))
+                if output.status.success()
+                    && decision.code == "tesseract_success"
+                    && decision.trim_end
+                    && decision.message.is_none() =>
+            {
+                Ok(String::from_utf8_lossy(&output.stdout)
+                    .trim_end()
+                    .to_string())
+            }
+            Self::Tesseract(Ok(output))
+                if !output.status.success()
+                    && decision.code == "execution"
+                    && !decision.trim_end =>
+            {
+                let prefix = format!("tesseract failed (exit {:?}): ", output.status.code());
+                if decision.message.as_deref() != Some(prefix.as_str()) {
+                    return Err(invalid());
+                }
+                Err(ToolError::execution_failed(format!(
+                    "{prefix}{}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )))
+            }
+            _ => Err(invalid()),
+        }
+    }
+}
+
+pub(crate) async fn ocr_image_path(
+    image_path: &Path,
+    context: &ToolContext,
+) -> Result<String, ToolError> {
+    let deadline = context
+        .turn_deadline
+        .unwrap_or_else(|| tokio::time::Instant::now() + OCR_TIMEOUT);
+    let input = CapturedOcr::capture(image_path, context, deadline).await?;
+    if context.features.enabled(crate::features::Feature::OcrHost) {
+        let mut captured_context = context.clone();
+        captured_context.turn_deadline = Some(deadline);
+        let (outcome, decision) = crate::extension_host::manager()
+            .execute_ocr(input, &captured_context)
+            .await?;
+        return outcome.into_host_text(decision);
+    }
+    // Native Vision remains on the existing blocking pool. Cancellation cannot
+    // preempt framework FFI; an abandoned worker keeps its own captured input.
+    #[cfg(test)]
+    let scope = crate::test_support::env_scope_ticket();
+    let native = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _scope = crate::test_support::join_env_scope(scope);
+        input.native_step()
+    });
+    let step = tokio::select! {biased;
+        ()=wait_cancel(context.cancel_token.as_ref())=>return Err(ToolError::cancelled("Image OCR was cancelled")),
+        ()=tokio::time::sleep_until(deadline)=>return Err(ToolError::Timeout {seconds:OCR_TIMEOUT.as_secs()}),
+        result=native=>result.map_err(|error|ToolError::execution_failed(format!("Image OCR task: {error}")))?,
+    };
+    let output = if step.needs_tesseract() {
+        step.tesseract(context.cancel_token.as_ref(), deadline)
+            .await
+    } else {
+        step.finish()
+    };
+    if context
+        .cancel_token
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return Err(ToolError::cancelled("Image OCR was cancelled"));
+    }
+    output.into_rust_text()
+}
+async fn wait_cancel(cancel: Option<&CancellationToken>) {
+    match cancel {
+        Some(cancel) => cancel.cancelled().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(all(test, unix))]
+type TestNativeOcr =
+    std::sync::Arc<dyn Fn(&Path) -> Result<Option<String>, ToolError> + Send + Sync>;
+
+#[cfg(all(test, unix))]
+#[derive(Clone)]
+struct TestOverrides {
+    native: TestNativeOcr,
+    tesseract: Option<OsString>,
+}
+#[cfg(all(test, unix))]
+thread_local! {static TEST_OVERRIDES:std::cell::RefCell<Option<TestOverrides>>=const {std::cell::RefCell::new(None)};}
 
 #[cfg(target_os = "macos")]
 fn native_ocr_available() -> bool {
@@ -433,3 +744,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "image_ocr/host_tests.rs"]
+mod host_tests;

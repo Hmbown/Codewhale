@@ -17,6 +17,24 @@ use serde_json::Value;
 
 use super::ops::UserInputProvenance;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOrigin {
+    Interactive,
+    Headless,
+    Background,
+}
+
+impl RunOrigin {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Headless => "headless",
+            Self::Background => "background",
+        }
+    }
+}
+
 /// Durable Agent-era permission baseline that Plan/YOLO restore to (#3386).
 ///
 /// Mode cycling used to be tangled with permission policy: each mode mutated
@@ -657,15 +675,19 @@ pub(crate) enum ApprovalRequestDisposition {
 /// `session_approved` / `session_denied` are the caller's lookups into the
 /// session approval caches (grouping key or tool name / exact approval key).
 /// The branch order: session denial, then the Auto-Review hold, then the
-/// full-access forced-hold denial, then the `Never` denial — the live posture
+/// full-access policy-hold denial, then the `Never` denial — the live posture
 /// wins over any remembered grant (approvals J) — then auto-approval (full
-/// access or a session grant), and only finally a modal.
+/// access or a session grant), and only finally a modal. Extension-origin
+/// forced calls reach that modal even under Full Access; no remembered grant
+/// can satisfy them. `extension_origin` comes from Rust-minted approval keys,
+/// never an extension label or a claim supplied by the host.
 #[must_use]
 pub(crate) fn resolve_approval_request_disposition(
     authority: &TurnAuthority,
     session_approved: bool,
     session_denied: bool,
     approval_force_prompt: bool,
+    extension_origin: bool,
 ) -> ApprovalRequestDisposition {
     if session_denied {
         return ApprovalRequestDisposition::AutoDenySessionDenied;
@@ -677,7 +699,7 @@ pub(crate) fn resolve_approval_request_disposition(
     // itself. What remains is the posture question: how does this authority
     // treat an ordinary promptable tool?
     let posture = resolve_tool_permission(authority, ApprovalRequirement::Suggest, false);
-    if approval_force_prompt && posture == ToolPermission::Allow {
+    if approval_force_prompt && !extension_origin && posture == ToolPermission::Allow {
         return ApprovalRequestDisposition::AutoDenyFullAccessPolicyHold;
     }
     // The live posture wins over any remembered grant: a conversation grant
@@ -1232,43 +1254,43 @@ mod tests {
 
         // Session denial wins over everything, including full access.
         assert_eq!(
-            resolve_approval_request_disposition(&full_access, true, true, false),
+            resolve_approval_request_disposition(&full_access, true, true, false, false),
             ApprovalRequestDisposition::AutoDenySessionDenied
         );
         // Forced hold under full access fails closed instead of auto-approving.
         assert_eq!(
-            resolve_approval_request_disposition(&full_access, true, false, true),
+            resolve_approval_request_disposition(&full_access, true, false, true, false),
             ApprovalRequestDisposition::AutoDenyFullAccessPolicyHold
         );
         // Full access and session grants auto-approve ordinary requests.
         assert_eq!(
-            resolve_approval_request_disposition(&full_access, false, false, false),
+            resolve_approval_request_disposition(&full_access, false, false, false, false),
             ApprovalRequestDisposition::AutoApprove
         );
         assert_eq!(
-            resolve_approval_request_disposition(&ask, true, false, false),
+            resolve_approval_request_disposition(&ask, true, false, false, false),
             ApprovalRequestDisposition::AutoApprove
         );
         // The live Never posture wins over a remembered session grant
         // (approvals J, CURRENT_DECISIONS §21), and denies everything else
         // promptable.
         assert_eq!(
-            resolve_approval_request_disposition(&never, true, false, false),
+            resolve_approval_request_disposition(&never, true, false, false, false),
             ApprovalRequestDisposition::AutoDenyNeverPosture
         );
         assert_eq!(
-            resolve_approval_request_disposition(&never, false, false, false),
+            resolve_approval_request_disposition(&never, false, false, false, false),
             ApprovalRequestDisposition::AutoDenyNeverPosture
         );
         for force_prompt in [false, true] {
             assert_eq!(
-                resolve_approval_request_disposition(&auto, false, false, force_prompt),
+                resolve_approval_request_disposition(&auto, false, false, force_prompt, false),
                 ApprovalRequestDisposition::AutoDenyAutoReview
             );
         }
         // Ask posture with no grant opens the modal.
         assert_eq!(
-            resolve_approval_request_disposition(&ask, false, false, false),
+            resolve_approval_request_disposition(&ask, false, false, false, false),
             ApprovalRequestDisposition::Prompt
         );
     }

@@ -17,7 +17,7 @@ mimalloc-allocator = ["dep:mimalloc"]
 # mimalloc v2.4.5 remake — no C compiler, no build script) instead of the
 # default mimalloc. Off by default; the default build is unchanged.
 # Build with: cargo build -p codewhale-cli --no-default-features --features rusty-alloc
-rusty-alloc = ["dep:rusty_alloc-api", "codewhale-tui/rusty-alloc"]
+rusty-alloc = ["dep:rusty_alloc-api"]
 
 [[bin]]
 name = "codewhale"

@@ -13,20 +13,38 @@ use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
 use crate::process_tree::ProcessTree;
-#[cfg(windows)]
-use crate::process_tree::windows_io_error;
-#[cfg(windows)]
-use windows::Win32::Foundation::CloseHandle;
-#[cfg(windows)]
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-};
-#[cfg(windows)]
-use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+/// Core-only caller receipt. Not exported as an environment value or accepted from JS.
+#[derive(Debug, Clone)]
+pub(crate) struct HookCaller {
+    pub workspace: PathBuf,
+    pub plugins: Option<Arc<crate::plugins::PluginRegistry>>,
+    pub session_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub origin_turn_id: Option<String>,
+    pub origin_call_id: Option<String>,
+}
+impl HookCaller {
+    pub(crate) fn from_tool(context: &crate::tools::spec::ToolContext) -> Self {
+        Self {
+            workspace: context.workspace.clone(),
+            plugins: context.plugin_registry.clone(),
+            session_id: context
+                .session_objects
+                .as_ref()
+                .map(|s| s.session_id.clone()),
+            agent_id: context.owner_agent_id.clone(),
+            origin_turn_id: context.origin_turn_id.clone(),
+            origin_call_id: context.origin_tool_call_id.clone(),
+        }
+    }
+}
 
 /// Context passed to hooks via environment variables
 #[derive(Debug, Clone, Default)]
 pub struct HookContext {
+    pub(crate) canonical_input: Option<serde_json::Value>,
+    pub(crate) caller: Option<HookCaller>,
     /// Tool name (for ToolCallBefore/After)
     pub tool_name: Option<String>,
     /// Engine-assigned tool call id, so a `tool_call_before` record and the
@@ -74,6 +92,70 @@ pub struct HookContext {
 }
 
 impl HookContext {
+    fn native_payload(
+        &self,
+        point: &str,
+        existing: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        let caller = self
+            .caller
+            .as_ref()
+            .ok_or("Native hook has no caller identity")?;
+        let mut payload = json!({"session_id":caller.session_id,"cwd":caller.workspace,"transcript_path":"","hook_event_name":point});
+        let object = payload.as_object_mut().expect("payload");
+        match point {
+            "PreToolUse" | "PostToolUse" => {
+                object.insert("tool_name".into(), json!(self.tool_name));
+                object.insert("tool_use_id".into(), json!(self.tool_call_id));
+                object.insert(
+                    "tool_input".into(),
+                    self.canonical_input
+                        .clone()
+                        .ok_or("Native hook tool input exceeds 32 KiB or is missing")?,
+                );
+                if point == "PostToolUse" {
+                    object.insert("tool_response".into(), json!(self.tool_result));
+                }
+            }
+            "UserPromptSubmit" => {
+                object.insert("prompt".into(), json!(self.message));
+            }
+            "SessionStart" => {
+                object.insert("source".into(), json!("startup"));
+            }
+            "Stop" => {
+                object.insert("stop_hook_active".into(), json!(false));
+            }
+            "SubagentStart" | "SubagentStop" => {
+                let id = existing
+                    .and_then(|v| v.get("agent_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("subagent hook has no actual child identity")?;
+                object.insert("agent_id".into(), json!(id));
+                object.insert("agent_type".into(), json!("general-purpose"));
+                if point == "SubagentStop" {
+                    object.insert("stop_hook_active".into(), json!(false));
+                }
+            }
+            _ => return Err("unknown Native dialect firepoint".into()),
+        }
+        if serde_json::to_vec(&payload)
+            .map_err(|_| "Native hook payload is not JSON")?
+            .len()
+            > 32 * 1024
+        {
+            return Err("Native hook payload exceeds 32 KiB".into());
+        }
+        Ok(payload)
+    }
+
+    pub(crate) fn with_caller(mut self, caller: HookCaller) -> Self {
+        self.caller = Some(caller);
+        self
+    }
+    pub(crate) fn with_tool_context(self, context: &crate::tools::spec::ToolContext) -> Self {
+        self.with_caller(HookCaller::from_tool(context))
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -89,6 +171,7 @@ impl HookContext {
     }
 
     pub fn with_tool_args(mut self, args: &serde_json::Value) -> Self {
+        self.canonical_input = (args.to_string().len() <= 32 * 1024).then(|| args.clone());
         self.tool_args = Some(truncate_env_value(
             &args.to_string(),
             HOOK_TOOL_ARGS_ENV_MAX_BYTES,
@@ -480,6 +563,7 @@ impl MessageSubmitOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MessageSubmitStdout {
+    Blocked(String),
     Unchanged,
     Replaced(String),
     Invalid(String),
@@ -1038,52 +1122,6 @@ fn terminate_tree(process_tree: &ProcessTree, child: &mut Child) {
 }
 
 #[cfg(windows)]
-fn resume_windows_process(child: &Child) -> std::io::Result<()> {
-    let snapshot =
-        // SAFETY: returned handle is owned here; closed before return.
-        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).map_err(windows_io_error)? };
-    let result = (|| {
-        let mut entry = THREADENTRY32 {
-            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-            ..Default::default()
-        };
-        // SAFETY: `entry` is live with dwSize initialized above.
-        let mut next = unsafe { Thread32First(snapshot, &mut entry) };
-        let mut resumed = 0usize;
-        while next.is_ok() {
-            if entry.th32OwnerProcessID == child.id() {
-                // SAFETY: returned handle is owned here; closed below.
-                let thread = unsafe {
-                    OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID)
-                        .map_err(windows_io_error)?
-                };
-                // SAFETY: `thread` is a live owned handle.
-                let resume_result = unsafe { ResumeThread(thread) };
-                // SAFETY: `thread` is owned here and not used after.
-                let close_result = unsafe { CloseHandle(thread).map_err(windows_io_error) };
-                if resume_result == u32::MAX {
-                    return Err(std::io::Error::last_os_error());
-                }
-                close_result?;
-                resumed += 1;
-            }
-            // SAFETY: `entry` is live with dwSize initialized above.
-            next = unsafe { Thread32Next(snapshot, &mut entry) };
-        }
-        if resumed == 0 {
-            return Err(std::io::Error::other(
-                "suspended hook process had no resumable thread",
-            ));
-        }
-        Ok(())
-    })();
-    // SAFETY: `snapshot` is owned here and not used after.
-    let close_result = unsafe { CloseHandle(snapshot).map_err(windows_io_error) };
-    result?;
-    close_result
-}
-
-#[cfg(windows)]
 fn kill_windows_process_tree(pid: u32) -> std::io::Result<()> {
     let mut command = Command::new("taskkill");
     crate::utils::suppress_console_window(&mut command);
@@ -1121,6 +1159,7 @@ fn wait_for_helper_status(
     }
 }
 
+#[cfg(any(windows, test))]
 fn kill_and_reap_immediate_child(child: &mut Child, timeout: Duration) -> bool {
     let _ = child.kill();
     matches!(child.wait_timeout(timeout), Ok(Some(_)))
@@ -1133,29 +1172,10 @@ fn kill_and_reap_immediate_child(child: &mut Child, timeout: Duration) -> bool {
 /// user-visible "hook could not answer" receipt, and on Windows a raw spawn
 /// error echoes the whole command line back. The detail is logged instead.
 fn spawn_hook_child(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
-    let mut child = command.spawn()?;
-    let process_tree = match ProcessTree::attach(&child) {
-        Ok(process_tree) => process_tree,
-        Err(error) => {
-            // Windows hooks are created suspended, so a containment failure
-            // cannot race with a descendant spawn. Fail closed without ever
-            // running the uncontained hook.
-            let _ = kill_and_reap_immediate_child(&mut child, HOOK_REAP_TIMEOUT);
-            tracing::warn!(target: "hooks", %error, "failed to contain hook process tree");
-            return Err(std::io::Error::other("failed to contain hook process tree"));
-        }
-    };
-
-    #[cfg(windows)]
-    if let Err(error) = resume_windows_process(&child) {
-        let _ = terminate_and_reap(None, &mut child, process_tree);
-        tracing::warn!(target: "hooks", %error, "failed to resume contained hook process");
-        return Err(std::io::Error::other(
-            "failed to resume contained hook process",
-        ));
-    }
-
-    Ok((child, process_tree))
+    crate::process_tree::spawn_contained_std(command).map_err(|error| {
+        tracing::warn!(target: "hooks", %error, "failed to start contained hook process");
+        std::io::Error::new(error.kind(), "failed to contain hook process tree")
+    })
 }
 
 /// A spawn failure rendered without the command, the path, or the OS message.
@@ -1281,6 +1301,10 @@ enum ObserverJob {
 
 impl ObserverJob {
     fn run(self) {
+        let policy = match &self {
+            Self::Environment { hooks, .. } | Self::Json { hooks, .. } => hooks.native_policy,
+        };
+        let _policy = crate::plugins::activation::PolicyScope::propagate(policy);
         match self {
             Self::Environment {
                 hooks,
@@ -1390,7 +1414,14 @@ impl BackgroundSupervisor {
     }
 }
 
+struct AdmittedBackground {
+    executor: HookExecutor,
+    hook: Hook,
+    env: HashMap<String, String>,
+    input: Option<serde_json::Value>,
+}
 struct BackgroundHookJob {
+    admitted: Option<AdmittedBackground>,
     command: String,
     env: HashMap<String, String>,
     working_dir: PathBuf,
@@ -1402,8 +1433,22 @@ struct BackgroundHookJob {
 }
 
 impl BackgroundHookJob {
-    fn run(self) {
+    fn run(mut self) {
+        if let Some(job) = self.admitted.take() {
+            let result = job
+                .executor
+                .execute_sync_inner(&job.hook, &job.env, job.input.as_ref());
+            if !result.success {
+                tracing::warn!(target:"hooks",hook=%self.label,"admitted background hook failed");
+            }
+            return;
+        }
+        if crate::plugins::activation::extension_host_policy_enabled() {
+            tracing::warn!(target:"hooks",hook=%self.label,"legacy background hook was withdrawn by enabled host policy");
+            return;
+        }
         let Self {
+            admitted: _,
             command: command_text,
             env,
             working_dir,
@@ -1517,18 +1562,73 @@ fn background_supervisor_worker_loop(receiver: Arc<Mutex<Receiver<BackgroundHook
 }
 
 /// Executor for running hooks
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HookExecutor {
     config: HooksConfig,
     default_working_dir: PathBuf,
     session_id: String,
     observer_dispatcher: ObserverDispatcher,
     background_supervisor: BackgroundSupervisor,
+    caller: Option<HookCaller>,
+    fire_context: Option<Arc<HookContext>>,
+    host_manager: Arc<crate::extension_host::ExtensionHostManager>,
+    engine_handle: Option<tokio::runtime::Handle>,
+    native_policy: bool,
     #[cfg(test)]
     lose_message_submit_executor: bool,
 }
 
+impl fmt::Debug for HookExecutor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HookExecutor")
+            .field("config", &self.config)
+            .field("default_working_dir", &self.default_working_dir)
+            .field("caller", &self.caller)
+            .finish_non_exhaustive()
+    }
+}
 impl HookExecutor {
+    /// One Engine scheduler, propagated through the existing std workers.
+    pub(crate) fn bind_caller(&self, caller: HookCaller) -> Self {
+        let mut bound = self.clone();
+        bound.caller = Some(caller);
+        bound.native_policy = crate::plugins::activation::extension_host_policy_enabled();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            bound.engine_handle = Some(handle);
+        }
+        bound
+    }
+    fn event_hooks(&self, event: HookEvent, context: &HookContext) -> Vec<Hook> {
+        let mut hooks: Vec<_> = self
+            .config
+            .hooks_for_event(event)
+            .into_iter()
+            .cloned()
+            .collect();
+        if self.native_policy
+            && let Some(caller) = context.caller.as_ref().or(self.caller.as_ref())
+        {
+            hooks.extend(self.host_manager.shell_hooks(caller, event));
+        }
+        hooks
+    }
+    fn for_context(&self, context: &HookContext) -> Self {
+        let mut bound = context
+            .caller
+            .clone()
+            .map_or_else(|| self.clone(), |caller| self.bind_caller(caller));
+        if let Some(caller) = bound.caller.as_mut() {
+            caller.origin_call_id = context
+                .tool_call_id
+                .clone()
+                .or(caller.origin_call_id.clone());
+        }
+        let mut fire = context.clone();
+        fire.caller = bound.caller.clone();
+        bound.fire_context = Some(Arc::new(fire));
+        bound
+    }
+
     fn build_shell_command(command: &str) -> Command {
         #[cfg(windows)]
         {
@@ -1578,6 +1678,11 @@ impl HookExecutor {
             session_id,
             observer_dispatcher: ObserverDispatcher::new(),
             background_supervisor: BackgroundSupervisor::new(),
+            caller: None,
+            fire_context: None,
+            host_manager: crate::extension_host::manager(),
+            engine_handle: tokio::runtime::Handle::try_current().ok(),
+            native_policy: crate::plugins::activation::extension_host_policy_enabled(),
             #[cfg(test)]
             lose_message_submit_executor: false,
         }
@@ -1592,10 +1697,18 @@ impl HookExecutor {
     pub fn rebind(&self, config: HooksConfig, default_working_dir: PathBuf) -> Self {
         Self {
             config,
-            default_working_dir,
+            default_working_dir: default_working_dir.clone(),
             session_id: self.session_id.clone(),
             observer_dispatcher: self.observer_dispatcher.clone(),
             background_supervisor: self.background_supervisor.clone(),
+            caller: self
+                .caller
+                .clone()
+                .filter(|c| c.workspace == default_working_dir),
+            fire_context: None,
+            host_manager: Arc::clone(&self.host_manager),
+            engine_handle: self.engine_handle.clone(),
+            native_policy: self.native_policy,
             #[cfg(test)]
             lose_message_submit_executor: self.lose_message_submit_executor,
         }
@@ -1613,6 +1726,11 @@ impl HookExecutor {
             session_id: String::new(),
             observer_dispatcher: ObserverDispatcher::new(),
             background_supervisor: BackgroundSupervisor::new(),
+            caller: None,
+            fire_context: None,
+            host_manager: crate::extension_host::manager(),
+            engine_handle: tokio::runtime::Handle::try_current().ok(),
+            native_policy: crate::plugins::activation::extension_host_policy_enabled(),
             #[cfg(test)]
             lose_message_submit_executor: false,
         }
@@ -1650,7 +1768,9 @@ impl HookExecutor {
     /// `tool_routing.rs` on every tool dispatch (#455).
     #[must_use]
     pub fn has_hooks_for_event(&self, event: HookEvent) -> bool {
-        self.config.enabled && self.config.hooks.iter().any(|h| h.event == event)
+        self.config.enabled
+            && (self.config.hooks.iter().any(|h| h.event == event)
+                || (self.native_policy && self.host_manager.has_shell_hooks(event)))
     }
 
     /// Check if there are any background hooks configured for a specific event.
@@ -1692,8 +1812,7 @@ impl HookExecutor {
         if !self.config.enabled {
             return Vec::new();
         }
-        self.config
-            .hooks_for_event(event)
+        self.event_hooks(event, context)
             .into_iter()
             .filter(|hook| {
                 // A background hook is never awaited, so it is not a gate no
@@ -1715,11 +1834,13 @@ impl HookExecutor {
         context: &HookContext,
         original_text: &str,
     ) -> MessageSubmitOutcome {
+        let bound = self.for_context(context);
+        let this = &bound;
         if !self.config.enabled {
             return MessageSubmitOutcome::unchanged();
         }
 
-        let hooks = self.config.hooks_for_event(HookEvent::MessageSubmit);
+        let hooks = this.event_hooks(HookEvent::MessageSubmit, context);
         if hooks.is_empty() {
             return MessageSubmitOutcome::unchanged();
         }
@@ -1727,7 +1848,7 @@ impl HookExecutor {
         let mut current_text = original_text.to_string();
         let mut warning = None;
 
-        for hook in hooks {
+        for hook in &hooks {
             let hook_context = context.clone().with_message(&current_text);
             if !self.matches_condition(hook, &hook_context) {
                 continue;
@@ -1739,7 +1860,7 @@ impl HookExecutor {
                 // A background `message_submit` hook cannot steer, but it must
                 // still receive the documented stdin payload — the contract is
                 // the same JSON, only the steering is dropped.
-                let submitted = self.execute_background_with_stdin(hook, &env_vars, &payload);
+                let submitted = this.execute_background_with_stdin(hook, &env_vars, &payload);
                 // Submission itself can fail (thread spawn refused, payload not
                 // encodable). Discarding that silently is the one outcome an
                 // operator cannot debug: the hook is configured, nothing runs,
@@ -1756,7 +1877,7 @@ impl HookExecutor {
                 continue;
             }
 
-            let result = self.execute_sync_with_stdin(hook, &env_vars, &payload);
+            let result = this.execute_sync_with_stdin(hook, &env_vars, &payload);
 
             if result.exit_code == Some(2) {
                 return MessageSubmitOutcome::Blocked {
@@ -1793,6 +1914,9 @@ impl HookExecutor {
             }
 
             match parse_message_submit_stdout(&result.stdout) {
+                MessageSubmitStdout::Blocked(reason) => {
+                    return MessageSubmitOutcome::Blocked { reason };
+                }
                 MessageSubmitStdout::Unchanged => {}
                 MessageSubmitStdout::Replaced(text) => {
                     current_text = text;
@@ -1872,21 +1996,23 @@ impl HookExecutor {
     /// log so a session can be reconciled later without leaking the
     /// secret material itself.
     pub fn collect_shell_env(&self, context: &HookContext) -> HashMap<String, String> {
+        let bound = self.for_context(context);
+        let this = &bound;
         let mut merged: HashMap<String, String> = HashMap::new();
         if !self.config.enabled {
             return merged;
         }
-        let hooks = self.config.hooks_for_event(HookEvent::ShellEnv);
+        let hooks = this.event_hooks(HookEvent::ShellEnv, context);
         if hooks.is_empty() {
             return merged;
         }
         let env_vars = context.to_env_vars();
-        for hook in hooks {
+        for hook in &hooks {
             if !self.matches_condition(hook, context) {
                 continue;
             }
             // ShellEnv hooks must be synchronous — their stdout is the contract.
-            let result = self.execute_sync(hook, &env_vars);
+            let result = this.execute_sync(hook, &env_vars);
             if !result.success {
                 tracing::warn!(
                     target: "hooks",
@@ -1922,11 +2048,13 @@ impl HookExecutor {
 
     /// Execute all hooks for an event
     pub fn execute(&self, event: HookEvent, context: &HookContext) -> Vec<HookResult> {
+        let bound = self.for_context(context);
+        let this = &bound;
         if !self.config.enabled {
             return Vec::new();
         }
 
-        let hooks = self.config.hooks_for_event(event);
+        let hooks = this.event_hooks(event, context);
         if hooks.is_empty() {
             // Fast path: no hooks for this event → skip the
             // `context.to_env_vars()` HashMap allocation. With
@@ -1943,15 +2071,15 @@ impl HookExecutor {
         let env_vars = context.to_env_vars();
         let mut results = Vec::new();
 
-        for hook in hooks {
+        for hook in &hooks {
             if !self.matches_condition(hook, context) {
                 continue;
             }
 
             let result = if hook.background {
-                self.execute_background(hook, &env_vars)
+                this.execute_background(hook, &env_vars)
             } else {
-                self.execute_sync(hook, &env_vars)
+                this.execute_sync(hook, &env_vars)
             };
 
             // Log failures via tracing so operators tailing
@@ -1993,26 +2121,28 @@ impl HookExecutor {
         context: &HookContext,
         payload: &serde_json::Value,
     ) -> Vec<HookResult> {
+        let bound = self.for_context(context);
+        let this = &bound;
         if !self.config.enabled {
             return Vec::new();
         }
 
-        let hooks = self.config.hooks_for_event(event);
+        let hooks = this.event_hooks(event, context);
         if hooks.is_empty() {
             return Vec::new();
         }
 
         let env_vars = context.to_env_vars();
         let mut results = Vec::new();
-        for hook in hooks {
+        for hook in &hooks {
             if !self.matches_condition(hook, context) {
                 continue;
             }
 
             let result = if hook.background {
-                self.execute_background_with_stdin(hook, &env_vars, payload)
+                this.execute_background_with_stdin(hook, &env_vars, payload)
             } else {
-                self.execute_sync_with_stdin(hook, &env_vars, payload)
+                this.execute_sync_with_stdin(hook, &env_vars, payload)
             };
 
             if !result.success {
@@ -2206,11 +2336,84 @@ impl HookExecutor {
         env_vars: &HashMap<String, String>,
         stdin_json: Option<&serde_json::Value>,
     ) -> HookResult {
-        let started = Instant::now();
-        if let Err(reason) = super::authority::verify_hook_authorities(
-            hook.plugin_authority.as_ref(),
-            hook.project_authority.as_ref(),
+        let _policy = crate::plugins::activation::PolicyScope::propagate(self.native_policy);
+        if !self.native_policy {
+            if hook.native_shell.is_some() {
+                return unavailable_hook(hook, "Native shell hook is disabled");
+            }
+            return self.execute_sync_legacy(hook, env_vars, stdin_json, None);
+        }
+        let Some(caller) = self.caller.clone() else {
+            return unavailable_hook(hook, "hook caller receipt is unavailable");
+        };
+        let Some(handle) = self.engine_handle.clone() else {
+            return unavailable_hook(hook, "hook Engine scheduler is unavailable");
+        };
+        let manager = Arc::clone(&self.host_manager);
+        manager.bind_engine_handle(handle.clone());
+        let executor = self.clone();
+        let owned_hook = hook.clone();
+        let env = env_vars.clone();
+        let input = if let Some(native) = hook.native_shell.as_ref() {
+            let Some(context) = self.fire_context.as_ref() else {
+                return unavailable_hook(hook, "Native hook firepoint context is missing");
+            };
+            match context.native_payload(&native.point, stdin_json) {
+                Ok(input) => Some(input),
+                Err(reason) => return unavailable_hook(hook, &reason),
+            }
+        } else {
+            stdin_json.cloned()
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let policy = self.native_policy;
+        #[cfg(test)]
+        let env_scope = crate::test_support::env_scope_ticket();
+        let query = if matches!(
+            hook.event,
+            HookEvent::SubagentSpawn | HookEvent::SubagentComplete
         ) {
+            "general-purpose".into()
+        } else if hook.event == HookEvent::SessionStart {
+            "startup".into()
+        } else {
+            env_vars
+                .get("DEEPSEEK_TOOL_NAME")
+                .cloned()
+                .unwrap_or_default()
+        };
+        let work = handle.spawn(async move {
+            let _policy = crate::plugins::activation::PolicyScope::propagate(policy);
+            #[cfg(test)]
+            let _env_scope = crate::test_support::join_env_scope(env_scope);
+            let timeout = Duration::from_secs(executor.effective_timeout_secs(&owned_hook));
+            let hook_for_run = owned_hook.clone();
+            let result = manager
+                .execute_hook(caller, owned_hook, timeout, query, move |cancel| {
+                    let _policy = crate::plugins::activation::PolicyScope::propagate(policy);
+                    executor.execute_sync_legacy(&hook_for_run, &env, input.as_ref(), Some(&cancel))
+                })
+                .await;
+            let _ = sender.send(result);
+        });
+        // Never block an Engine/UI runtime worker. Its synchronous callsites already use
+        // existing observer/blocking dispatch; ShellEnv's async caller is migrated below.
+        let _engine_task = work;
+        receiver
+            .recv()
+            .unwrap_or_else(|_| Err("hook Engine task was lost".into()))
+            .unwrap_or_else(|reason| unavailable_hook(hook, &reason))
+    }
+
+    fn execute_sync_legacy(
+        &self,
+        hook: &Hook,
+        env_vars: &HashMap<String, String>,
+        stdin_json: Option<&serde_json::Value>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> HookResult {
+        let started = Instant::now();
+        if let Err(reason) = super::authority::verify_hook(hook) {
             return HookResult {
                 name: hook.name.clone(),
                 background: false,
@@ -2254,6 +2457,13 @@ impl HookExecutor {
         };
 
         let mut command = Self::build_shell_command(&hook.command);
+        if hook
+            .native_shell
+            .as_ref()
+            .is_some_and(|n| n.dialect == "claude-code")
+        {
+            command.env("CLAUDE_PROJECT_DIR", &self.default_working_dir);
+        }
         command
             .current_dir(&working_dir)
             .envs(env_vars)
@@ -2265,6 +2475,22 @@ impl HookExecutor {
             // terminal still owns a live stdin handle.
             .stdin(Stdio::piped());
 
+        if self.native_policy {
+            crate::child_env::apply_to_command(
+                &mut command,
+                crate::child_env::string_map_env(env_vars),
+            );
+            if hook
+                .native_shell
+                .as_ref()
+                .is_some_and(|native| native.dialect == "claude-code")
+            {
+                command.env("CLAUDE_PROJECT_DIR", &self.default_working_dir);
+            }
+            if !env_vars.contains_key("DEEPSEEK_TOOL_EXECUTION_RECEIPT") {
+                command.env_remove("DEEPSEEK_TOOL_EXECUTION_RECEIPT");
+            }
+        }
         let (mut child, process_tree) = match spawn_hook_child(&mut command) {
             Ok(child) => child,
             Err(e) => {
@@ -2377,7 +2603,23 @@ impl HookExecutor {
             _ => None,
         };
 
-        match child.wait_timeout(timeout) {
+        let deadline = Instant::now().checked_add(timeout);
+        let waited = loop {
+            if cancel.is_some_and(|token| token.is_cancelled()) {
+                break Ok(None);
+            }
+            let remaining = deadline
+                .map(|d| d.saturating_duration_since(Instant::now()))
+                .unwrap_or(timeout);
+            if remaining.is_zero() {
+                break Ok(None);
+            }
+            match child.wait_timeout(remaining.min(Duration::from_millis(25))) {
+                Ok(None) => continue,
+                result => break result,
+            }
+        };
+        match waited {
             Ok(Some(status)) => {
                 drop(process_tree);
                 HookResult {
@@ -2462,10 +2704,7 @@ impl HookExecutor {
         stdin_json: Option<&serde_json::Value>,
     ) -> HookResult {
         let started = Instant::now();
-        if let Err(reason) = super::authority::verify_hook_authorities(
-            hook.plugin_authority.as_ref(),
-            hook.project_authority.as_ref(),
-        ) {
+        if let Err(reason) = super::authority::verify_hook(hook) {
             return HookResult {
                 name: hook.name.clone(),
                 background: true,
@@ -2501,6 +2740,12 @@ impl HookExecutor {
             }
         };
         let submission = self.background_supervisor.submit(BackgroundHookJob {
+            admitted: self.native_policy.then(|| AdmittedBackground {
+                executor: self.clone(),
+                hook: hook.clone(),
+                env: env_vars.clone(),
+                input: stdin_json.cloned(),
+            }),
             command: hook.command.clone(),
             env: env_vars.clone(),
             working_dir,
@@ -2540,6 +2785,20 @@ impl HookExecutor {
     /// `docs/HOOKS.md`.
     fn effective_timeout_secs(&self, hook: &Hook) -> u64 {
         self.config.effective_timeout_secs(hook)
+    }
+}
+
+fn unavailable_hook(hook: &Hook, reason: &str) -> HookResult {
+    HookResult {
+        name: hook.name.clone(),
+        success: false,
+        background: false,
+        strict: !hook.continue_on_error,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        duration: Duration::ZERO,
+        error: Some(reason.into()),
     }
 }
 
@@ -2959,6 +3218,13 @@ fn parse_message_submit_stdout(stdout: &str) -> MessageSubmitStdout {
         return MessageSubmitStdout::Invalid("stdout JSON must be an object".to_string());
     };
 
+    if object.get("block").and_then(serde_json::Value::as_bool) == Some(true) {
+        let reason = object
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("message_submit hook blocked submission");
+        return MessageSubmitStdout::Blocked(sanitize_hook_denial_reason(reason));
+    }
     match object.get("text") {
         Some(serde_json::Value::String(text)) if !text.is_empty() => {
             if text.chars().count() > HOOK_MESSAGE_REPLACEMENT_MAX_CHARS {
@@ -4820,6 +5086,7 @@ command = "echo project"
                 .success
         );
         let queued = BackgroundHookJob {
+            admitted: None,
             command: hook.command.clone(),
             env: HashMap::new(),
             working_dir: dir.path().to_path_buf(),
@@ -6551,5 +6818,72 @@ command = "echo project"
             "safe"
         );
         assert_eq!(tool_category_for("web.run", None), "other");
+    }
+}
+
+pub(crate) fn shell_env_keys(stdout: &str) -> Vec<String> {
+    parse_env_lines(stdout).into_keys().collect()
+}
+
+#[cfg(test)]
+mod admitted_hook_tests {
+    use super::*;
+    #[test]
+    fn native_payload_uses_actual_caller_and_bounded_canonical_input() {
+        let caller = HookCaller {
+            workspace: PathBuf::from("/actual"),
+            plugins: None,
+            session_id: Some("actual-session".into()),
+            agent_id: Some("child".into()),
+            origin_turn_id: Some("turn".into()),
+            origin_call_id: Some("call".into()),
+        };
+        let context = HookContext::new()
+            .with_session_id("legacy-alias")
+            .with_caller(caller)
+            .with_tool_name("write")
+            .with_tool_call_id("call")
+            .with_tool_args(&json!({"text":"你好"}));
+        let payload = context.native_payload("PreToolUse", None).unwrap();
+        assert_eq!(payload["session_id"], "actual-session");
+        assert_eq!(payload["cwd"], "/actual");
+        assert_eq!(payload["tool_input"], json!({"text":"你好"}));
+        let oversized = context.with_tool_args(&json!({"text":"x".repeat(32769)}));
+        assert!(oversized.native_payload("PreToolUse", None).is_err());
+    }
+    #[test]
+    fn native_submit_block_preserves_real_process_exit_semantics() {
+        assert_eq!(
+            parse_message_submit_stdout(r#"{"block":true,"reason":"stop"}"#),
+            MessageSubmitStdout::Blocked("stop".into())
+        );
+        assert_eq!(
+            parse_message_submit_stdout(r#"{"text":"new"}"#),
+            MessageSubmitStdout::Replaced("new".into())
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn admitted_std_driver_cancels_and_reaps_before_late_side_effect() {
+        let home = tempfile::tempdir().unwrap();
+        let marker = home.path().join("late");
+        let executor = HookExecutor::new(HooksConfig::default(), home.path().to_path_buf());
+        let hook = Hook::new(
+            HookEvent::SessionStart,
+            &format!("sleep 2; touch '{}'", marker.display()),
+        )
+        .with_timeout(5);
+        let token = tokio_util::sync::CancellationToken::new();
+        let to_cancel = token.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            to_cancel.cancel();
+        });
+        let started = Instant::now();
+        let result = executor.execute_sync_legacy(&hook, &HashMap::new(), None, Some(&token));
+        worker.join().unwrap();
+        assert!(!result.success);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!marker.exists());
     }
 }

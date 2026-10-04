@@ -75,8 +75,7 @@ pub(crate) fn toggle_help_view(app: &mut App) {
     if app.view_stack.top_kind() == Some(ModalKind::Help) {
         app.view_stack.pop();
     } else {
-        let help = HelpView::new_for_shortcuts(app.ui_locale, &app.workspace, &app.cached_skills)
-            .with_groups_expanded(app.help_expand_groups);
+        let help = HelpView::new_for_app(app, true).with_groups_expanded(app.help_expand_groups);
         app.view_stack.push(help);
     }
     app.needs_redraw = true;
@@ -246,7 +245,7 @@ pub(crate) async fn open_onboarding_provider_picker(
     app.view_stack.push(
         crate::tui::provider_picker::ProviderPickerView::new_for_onboarding(
             app.api_provider,
-            recover_configured_route.then_some(app.onboarding_provider),
+            recover_configured_route.then(|| app.onboarding_provider.as_str().into()),
             config,
             runtime_status,
         )
@@ -395,13 +394,17 @@ pub(crate) fn toggle_live_transcript_overlay(app: &mut App) {
 pub(crate) fn open_model_picker_for_provider(
     app: &mut App,
     config: &Config,
-    provider: crate::config::ApiProvider,
+    identity: &crate::config::ProviderIdentity,
 ) {
+    if let Err(reason) = config.verify_provider_identity(identity) {
+        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+        return;
+    }
     if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
         app.view_stack
             .push(crate::tui::model_picker::ModelPickerView::new(app, config));
     }
-    for ch in provider.display_name().chars() {
+    for ch in identity.key.as_str().chars() {
         // Char input updates the query and never emits a ViewEvent, so the
         // returned (empty) event list is safe to drop.
         let _ = app.view_stack.handle_key(crossterm::event::KeyEvent::new(

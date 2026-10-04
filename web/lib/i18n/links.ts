@@ -48,6 +48,7 @@ export function secondaryNavLinks(locale: string, chrome: ChromeDict): ChromeLin
   return [
     { href: `/${locale}/docs/guide`, label: chrome.navStart },
     { href: `/${locale}/install`, label: chrome.navInstall },
+    { href: `/${locale}/ratatui`, label: "Ratatui" },
     { href: `/${locale}/faq`, label: chrome.navFaq },
     { href: `/${locale}/community`, label: chrome.navCommunity },
     { href: `/${locale}/contribute`, label: chrome.navContribute },
@@ -63,6 +64,7 @@ export function footerProductLinks(locale: string, chrome: ChromeDict): ChromeLi
     { href: `/${locale}/install`, label: chrome.footerInstall },
     { href: `/${locale}/models`, label: chrome.footerModels },
     { href: `/${locale}/plugins`, label: chrome.navPlugins },
+    { href: `/${locale}/ratatui`, label: "Ratatui" },
     { href: `/${locale}/runtime`, label: chrome.footerRuntime },
     { href: `/${locale}/faq`, label: chrome.footerFaq },
     { href: `/${locale}/changelog`, label: chrome.footerChangelog },

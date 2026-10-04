@@ -1,5 +1,7 @@
 {
+  "ExtensionPromptUnavailable": "एक्सटेंशन के निर्देश उपलब्ध नहीं हैं; /plugin show से जाँचें।",
   "ComposerOversizedSubmitHeld": "नहीं भेजा गया: इस संदेश में {limit} से अधिक वर्ण हैं और इसे पेस्ट फ़ाइल के रूप में सहेजा नहीं जा सका ({error})। पूरा पाठ अभी भी इनपुट बॉक्स में है: इसे छोटा करें या .codewhale/pastes में लिखने की अनुमति दें, फिर Enter दबाएँ।",
+  "ComposerOversizedSubmitHeldShort": "नहीं भेजा गया: {limit} से अधिक वर्ण; पेस्ट फ़ाइल सहेजी नहीं गई।",
   "CmdPluginOwnerReport": "एक्सटेंशन होस्ट:\n  स्थिति: {state}\n  सक्रिय टूल ({count}): {tools}",
   "CmdPluginOwnerActivating": "सक्रिय किया जा रहा है",
   "CmdPluginOwnerActive": "सक्रिय",
@@ -2439,5 +2441,11 @@
   "ModelPickerReadinessRefreshed": "मॉडल की तैयारी रीफ़्रेश हुई · कैटलॉग पंक्तियाँ फिर से बनीं",
   "ModelPickerOpenToRefresh": "तैयारी और कैटलॉग रीफ़्रेश करने के लिए /model खोलें",
   "ModelPickerPinnedChip": "पिन किया",
+  "AuthSignedInAs": "{provider} में {account} के रूप में साइन इन किया गया।",
+  "AuthSignedInWithoutEmail": "{provider} में साइन इन किया गया (जारीकर्ता ने खाते का ईमेल नहीं भेजा)।",
+  "AuthReplacedPreviousSignInAs": "पिछला Codewhale {provider} साइन-इन ({account}) बदल दिया गया।",
+  "AuthReplacedPreviousSignIn": "पिछला Codewhale {provider} साइन-इन बदल दिया गया।",
+  "AuthSameAccountAsBefore": "यह पहले वाला ही खाता है; किसी दूसरे {provider} खाते का उपयोग करने के लिए ब्राउज़र में इससे साइन आउट करें (या निजी विंडो खोलें) और फिर से साइन इन करें।",
+  "AuthEnvTokenOutranksSignIn": "इस परिवेश में OPENAI_CODEX_ACCESS_TOKEN या CODEX_ACCESS_TOKEN सेट है और यह इस साइन-इन पर प्राथमिकता रखता है; जब तक आप इसे हटा नहीं देते, अनुरोध उसी टोकन के खाते का उपयोग करते रहेंगे।",
   "PinnedPromptJumpToMessage": "इस संदेश पर जाएँ"
 }

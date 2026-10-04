@@ -1,11 +1,11 @@
-<!-- source: README.md sha256:925619135f77 -->
+<!-- source: README.md sha256:a59c459aea4d -->
 # Codewhale
 
 Codewhale एक ओपन सोर्स एजेंट है जो आपकी पसंद के होस्ट किए गए या लोकल मॉडल से आपका प्रोजेक्ट पढ़ता है, फ़ाइलें संपादित करता है, कमांड चलाता है और अपने काम की जाँच करता है। टर्मिनल में एक काम से शुरुआत करें। बड़े काम के हिस्से अलग-अलग मॉडल और भूमिकाओं वाले एजेंटों को सौंपें।
 
-![टर्मिनल में चलता Codewhale](web/public/codewhale-tui-5765d80.png)
+![टर्मिनल में चलता Codewhale](web/public/codewhale-tui-e940149.png)
 
-*v0.10.0 के विकासाधीन बिल्ड से टर्मिनल का पूर्वावलोकन।*
+*v0.10.1 के विकासाधीन बिल्ड से टर्मिनल का पूर्वावलोकन।*
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
@@ -51,7 +51,7 @@ Codewhale आपकी रिपॉज़िटरी पढ़ सकता ह
 
 ## टर्मिनल, ऐप और Computer Use
 
-टर्मिनल और ग्राफ़िकल क्लाइंट Codewhale Runtime से जुड़ते हैं, जो एजेंट और उसके टूल चलाता है:
+टर्मिनल और ग्राफ़िकल क्लाइंट [Codewhale Engine](docs/ARCHITECTURE.md) से जुड़ते हैं, जो एजेंट और उसके टूल चलाता है:
 
 - **टर्मिनल:** `codewhale` इंटरैक्टिव इंटरफ़ेस खोलता है; `codewhale exec` किसी स्क्रिप्ट या CI जॉब से काम चलाता है।
 - **लोकल ब्राउज़र:** `codewhale web` उसी रनटाइम के लिए पैकेज में शामिल [लोकल वेब क्लाइंट](docs/WEB.md) खोलता है।

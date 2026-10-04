@@ -17,11 +17,8 @@
 //! (#5914): a bare duration cannot say whether the session is producing
 //! tokens or parked waiting on a tool, a sub-agent, or you.
 
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Modifier, Style},
-};
+use codewhale_ratatui::{PostureBar, PostureFact};
+use ratatui::{buffer::Buffer, layout::Rect};
 use unicode_width::UnicodeWidthStr;
 
 use crate::tui::{
@@ -267,9 +264,7 @@ fn selected_notice(
         })
 }
 
-/// Separate footer groups with breathing room; provider/model fields keep
-/// their internal middle dots in the identity row.
-const ITEM_SEPARATOR: &str = "   ";
+/// Provider/model fields retain their internal separator width when shed.
 const ITEM_SEPARATOR_WIDTH: usize = 3;
 
 #[cfg(test)]
@@ -507,7 +502,7 @@ mod tests {
     #[test]
     fn unproven_effort_keeps_named_provider_when_the_route_fits() {
         let mut app = test_app();
-        app.set_provider_identity(crate::config::ApiProvider::Custom, "lab-gateway");
+        app.set_provider_identity(crate::config::ProviderKind::Custom, "lab-gateway");
         app.model = "unlisted-model".to_string();
         assert!(app.provable_reasoning_effort_label().is_none());
         let fields = route_identity_fields(&app, ShellTier::for_chrome_width(160), 100).unwrap();
@@ -531,7 +526,7 @@ mod tests {
         let mut app = test_app();
         app.ui_locale = codewhale_localization::Locale::En;
         app.set_provider_identity(
-            crate::config::ApiProvider::Custom,
+            crate::config::ProviderKind::Custom,
             "acme-research-gateway-eu-central",
         );
         app.model = model.to_string();
@@ -605,9 +600,6 @@ mod tests {
 /// in the metrics line; this bar still says what to do about it.
 const DEPTH_WARN: &str = "surface soon — /compact";
 
-/// Inside the counts group (`2 agents, 1 task`).
-const COUNT_SEPARATOR: &str = ", ";
-
 /// What the caller owes the posture bar. All injected, deterministic.
 pub struct TidelineFooter<'a> {
     pub theme: &'a codewhale_palette::UiTheme,
@@ -645,7 +637,7 @@ pub struct TidelineFooter<'a> {
     pub right: Option<(&'a str, codewhale_palette::ChromeInk)>,
     pub ascii_safe: bool,
     /// `tui.posture_bar = "compact"` (#5950): start the shed ladder at
-    /// [`COMPACT_SHED`] instead of rung 0, so the row states its posture —
+    /// the kit's compact rung instead of rung 0, so the row states its posture —
     /// the permission and mode chips, and the cap warning when it is owed —
     /// and nothing live. Width sheds the rest exactly as it always did.
     pub compact: bool,
@@ -740,351 +732,58 @@ impl<'a> TidelineFooter<'a> {
         self
     }
 
-    /// The rung the shed ladder starts from: 0 for a full row, past the
-    /// clocks, hint and counts for a compact one.
-    fn first_shed_rung(&self) -> u8 {
-        if self.compact { COMPACT_SHED } else { 0 }
-    }
-
-    fn sym(&self, glyph: &str) -> String {
-        if !self.ascii_safe {
-            return glyph.to_string();
-        }
-        if let Some(fb) = crate::tui::glyphs::ascii_fallback(glyph) {
-            return fb.to_string();
-        }
-        glyph
-            .chars()
-            .map(|c| {
-                crate::tui::glyphs::ascii_fallback(&c.to_string())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| c.to_string())
-            })
-            .collect()
-    }
-
-    /// Whether the context window is full enough that the bar owes the cap
-    /// warning. It replaces the hint and, unlike a hint, outranks the clock
-    /// and the counts on the shed ladder.
-    fn at_context_cap(&self) -> bool {
-        self.context_percent.clamp(0, 100) >= 80
-    }
-
-    /// The hint the left run ends on: the cap warning outranks whatever the
-    /// caller passed, because a full context is the one thing that stops the
-    /// next turn.
-    fn effective_hint(&self) -> Option<(String, ChromeInk)> {
-        if self.at_context_cap() {
-            return Some((
-                format!("{} {}", self.sym("▲"), self.sym(DEPTH_WARN)),
-                ChromeInk::Attention,
-            ));
-        }
-        self.hint.map(|(text, ink)| (self.sym(text), ink))
+    fn kit(&self) -> PostureBar<'_> {
+        use crate::tui::infoline::ink_role;
+        // Preserve every host ink in a distinct role, including the right
+        // fact: the current kit does not retain right.ink through layout.
+        // The shared adapter maps these identities to the live UiTheme.
+        let mut bar = PostureBar::new(self.permission_chip.0)
+            .permission_role(ink_role(self.permission_chip.1))
+            .context_percent(self.context_percent)
+            .cap_warning(DEPTH_WARN)
+            .compact(self.compact);
+        bar.permission_key = self.permission_key.map(Into::into);
+        bar.mode = self.mode_chip.map(posture_fact);
+        bar.mode_key = self.mode_key.map(Into::into);
+        bar.turn_clock = self.turn_clock.map(posture_fact);
+        bar.counts = self
+            .counts
+            .iter()
+            .map(|(text, ink)| PostureFact::new(text.as_str(), ink_role(*ink)))
+            .collect();
+        bar.session_clock = self.session_clock.map(posture_fact);
+        bar.hint = self.hint.map(posture_fact);
+        bar.right = self.right.map(posture_fact);
+        bar
     }
 }
 
-fn tchrome(theme: &codewhale_palette::UiTheme, ink: codewhale_palette::ChromeInk) -> Style {
+fn posture_fact((text, ink): (&str, ChromeInk)) -> PostureFact<'_> {
+    PostureFact::new(text, crate::tui::infoline::ink_role(ink))
+}
+
+#[cfg(test)]
+fn tchrome(
+    theme: &codewhale_palette::UiTheme,
+    ink: codewhale_palette::ChromeInk,
+) -> ratatui::style::Style {
     codewhale_palette::grammar::chrome_style(theme, ink)
 }
 
-fn tput(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
-    buf.set_stringn(x, y, text, text.width(), style);
-}
-
-/// One painted item of the left run: text, ink, and whether it is a chip
-/// (bold) or a hint.
-struct PostureItem {
-    text: String,
-    /// The taught key painted after `text` in hint ink (`  Shift+Tab to
-    /// change`, ` (Tab)`), separator included. Sheds before the chip does.
-    key: Option<String>,
-    ink: ChromeInk,
-    bold: bool,
-    /// Painted after `, ` rather than ` · `: the counts are one group.
-    joined: bool,
-    /// Which of `footer.counts` this item is, when it is one.
-    count_index: Option<usize>,
-}
-
-/// Shed rungs for the left run, most expendable first. The permission chip
-/// itself has no rung: it never sheds (#5796), because a silently missing
-/// `full access` is the bar under-reporting the authority the session
-/// actually holds.
-///
-/// The two halves of the working clock shed apart, and both go first
-/// (#5914). The clock is what a *glance* wants; at the narrowest widths the
-/// row's other facts are what a *keystroke* wants — the counts name work you
-/// can open, the hint names a chord you can press right now (`Esc to
-/// interrupt`, `Enter again to send now`). An 80-column row carrying the
-/// filesystem-scope notice cannot hold all of it, and losing the affordance
-/// to keep the stopwatch is the wrong trade. When both halves would paint,
-/// the turn half goes before the session half: the transcript's active row
-/// and the spinner also show the turn is alive, while the session total is
-/// stated nowhere else. When the session half is suppressed (#6041) or
-/// otherwise absent, the turn half sheds at the session-clock rung instead
-/// so the ladder does not abandon the only clock at the turn-only rung
-/// while a both-clocks row would still be stating a stopwatch (#6084).
-/// The hint and counts still outrank it (#5914). Above them the
-/// context-cap warning, which is not a hint but the reason the next turn
-/// will not start at all.
-///
-/// The permission key ("Shift+Tab to change", mark 8) is a reminder of a
-/// binding, not live state, and is the widest optional item on the row, so
-/// it sheds right after the clocks: a live hint ("Enter again to send
-/// now") or the agent count must never be dropped to keep it. The
-/// permission chip itself, marked `●`, never sheds.
-const SHED_TURN_CLOCK: u8 = 1;
-const SHED_SESSION_CLOCK: u8 = 2;
-const SHED_PERMISSION_KEY: u8 = 3;
-const SHED_HINT: u8 = 4;
-const SHED_COUNTS: u8 = 5;
-const SHED_CAP_WARNING: u8 = 6;
-const SHED_MODE_KEY: u8 = 7;
-const SHED_MODE: u8 = 8;
-/// The most-shed rung: everything gone but the permission chip.
-const MAX_SHED: u8 = SHED_MODE;
-/// Where a compact posture bar (`tui.posture_bar = "compact"`, #5950)
-/// starts on the ladder: the clocks, the hint and the counts are gone
-/// before width is consulted; the cap warning, the mode chip and the
-/// permission chip — the row's posture — stay and shed only by width.
-const COMPACT_SHED: u8 = SHED_COUNTS;
-
-fn posture_items(footer: &TidelineFooter<'_>, shed: u8) -> Vec<PostureItem> {
-    // Experience mark 8: the current permission is marked, not only
-    // colored, so a monochrome terminal still tells it apart from the mode
-    // chip beside it; its key says what it does rather than sitting in
-    // parentheses like one more option.
-    let mut items = vec![PostureItem {
-        text: format!(
-            "{} {}",
-            footer.sym(crate::tui::glyphs::CURRENT),
-            footer.sym(footer.permission_chip.0)
-        ),
-        key: footer
-            .permission_key
-            .filter(|_| shed < SHED_PERMISSION_KEY)
-            .map(|key| format!("  {}", footer.sym(key))),
-        ink: footer.permission_chip.1,
-        bold: true,
-        joined: false,
-        count_index: None,
-    }];
-    if let Some((mode, ink)) = footer.mode_chip.filter(|_| shed < SHED_MODE) {
-        items.push(PostureItem {
-            text: footer.sym(mode),
-            key: footer
-                .mode_key
-                .filter(|_| shed < SHED_MODE_KEY)
-                .map(|key| format!(" ({key})")),
-            ink,
-            bold: false,
-            joined: false,
-            count_index: None,
-        });
-    }
-    // When no session half will paint, shed the turn clock at the session
-    // rung so a width that would keep the session half (and drop the turn)
-    // still keeps the only informative clock (#6084). Hint and counts still
-    // outrank it (#5914). With both halves present the turn half still goes
-    // first.
-    let turn_shed = if footer.session_clock.is_none() {
-        SHED_SESSION_CLOCK
-    } else {
-        SHED_TURN_CLOCK
-    };
-    if let Some((clock, ink)) = footer.turn_clock.filter(|_| shed < turn_shed) {
-        items.push(PostureItem {
-            text: footer.sym(clock),
-            key: None,
-            ink,
-            bold: false,
-            joined: false,
-            count_index: None,
-        });
-    }
-    if shed < SHED_COUNTS {
-        for (index, (count, ink)) in footer.counts.iter().enumerate() {
-            // The idle dock affordance carries its chord as `(Ctrl+])`; keep
-            // the word legible while the chord recedes into hint ink.
-            let count = footer.sym(count);
-            let (text, key) = match count.strip_suffix(" (Ctrl+])") {
-                Some(label) => (label.to_string(), Some(" (Ctrl+])".to_string())),
-                None => (count, None),
-            };
-            items.push(PostureItem {
-                text,
-                key,
-                ink: *ink,
-                bold: false,
-                joined: index > 0,
-                count_index: Some(index),
-            });
-        }
-    }
-    if let Some((clock, ink)) = footer.session_clock.filter(|_| shed < SHED_SESSION_CLOCK) {
-        items.push(PostureItem {
-            text: footer.sym(clock),
-            key: None,
-            ink,
-            bold: false,
-            joined: false,
-            count_index: None,
-        });
-    }
-    // The cap warning is not a hint: it sheds after the counts and both
-    // clock halves, because a full context is the one thing that stops the
-    // next turn from starting at all.
-    let hint_rung = if footer.at_context_cap() {
-        SHED_CAP_WARNING
-    } else {
-        SHED_HINT
-    };
-    if shed < hint_rung
-        && let Some((text, ink)) = footer.effective_hint()
-    {
-        items.push(PostureItem {
-            text,
-            key: None,
-            ink,
-            bold: false,
-            joined: false,
-            count_index: None,
-        });
-    }
-    items
-}
-
-/// The separator painted before an item: `, ` inside the counts group,
-/// ` · ` between groups.
-fn separator_before(item: &PostureItem) -> &'static str {
-    if item.joined {
-        COUNT_SEPARATOR
-    } else {
-        ITEM_SEPARATOR
-    }
-}
-
-impl PostureItem {
-    fn width(&self) -> usize {
-        self.text.width() + self.key.as_deref().map_or(0, UnicodeWidthStr::width)
-    }
-}
-
-fn left_run_width(items: &[PostureItem]) -> usize {
-    items.iter().map(PostureItem::width).sum::<usize>()
-        + items
-            .iter()
-            .skip(1)
-            .map(|item| separator_before(item).width())
-            .sum::<usize>()
-}
-
-/// Paint the posture bar (spec §5b: `Constraint::Length(1)`).
-///
-/// Left: the mark, the permission chip, the mode, the counts, the hint —
-/// shed from the right until the run fits beside the pinned right slot.
-/// Right: the notice or remote-control state, clause-shed by the caller and
-/// truncated here as the last resort; it never covers the permission chip.
-/// Paint the posture bar. Returns the painted rect of each live count, by
-/// its index into `footer.counts`, so the caller can make the counts the
-/// bottom-of-screen affordance that opens the matching dock view.
+/// Paint the posture bar and return each live count's exact visible cells.
+/// The kit owns the one shared shedding, projection, clipping and pointer
+/// layout. Engine facts, localized text, clock lifecycle, live theme and
+/// action routing remain with the callers.
 pub fn render_tideline_footer(
     area: Rect,
     buf: &mut Buffer,
     footer: &TidelineFooter<'_>,
 ) -> Vec<(usize, Rect)> {
-    let mut count_rects = Vec::new();
-    if area.width < 8 || area.height < 1 {
-        return count_rects;
-    }
-    let area = area.inner(ratatui::layout::Margin::new(1, 0));
-    let theme = footer.theme;
-    let width = usize::from(area.width);
-
-    // The permission chip alone is the floor; the right slot takes what is
-    // left after it, and the rest of the left run sheds against the slot.
-    let floor = left_run_width(&posture_items(footer, MAX_SHED));
-    let right = footer.right.map(|(text, ink)| {
-        let budget = width.saturating_sub(floor + 1);
-        (
-            crate::tui::ui_text::truncate_line_to_width(&footer.sym(text), budget),
-            ink,
-        )
-    });
-    let right_width = right
-        .as_ref()
-        .map(|(text, _)| text.width() + 1)
-        .unwrap_or(0);
-    let left_budget = width.saturating_sub(right_width);
-    let items = (footer.first_shed_rung()..=MAX_SHED)
-        .map(|shed| posture_items(footer, shed))
-        .find(|items| left_run_width(items) <= left_budget)
-        .unwrap_or_else(|| posture_items(footer, MAX_SHED));
-
-    let mut x = usize::from(area.x);
-    let clip = |x: usize, text: &str| -> String {
-        crate::tui::ui_text::truncate_line_to_width(
-            text,
-            (usize::from(area.x) + left_budget).saturating_sub(x),
-        )
-    };
-    for (index, item) in items.iter().enumerate() {
-        if index > 0 {
-            // Projected like every other glyph on the row: an ascii-safe
-            // terminal that cannot draw `·` must not get one here either,
-            // least of all next to a clock reading whose own separator was
-            // projected.
-            let separator = footer.sym(separator_before(item));
-            tput(
-                buf,
-                x as u16,
-                area.y,
-                &clip(x, &separator),
-                tchrome(theme, ChromeInk::MetadataDim),
-            );
-            x += separator.width();
-        }
-        let mut style = tchrome(theme, item.ink);
-        if item.bold {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        // Keep the state legible while its taught keyboard hint recedes:
-        // the chip keeps its semantic ink, the key paints in hint ink.
-        let text = clip(x, &item.text);
-        tput(buf, x as u16, area.y, &text, style);
-        let key_x = x + item.text.width();
-        let key = item
-            .key
-            .as_deref()
-            .map(|key| clip(key_x, key))
-            .unwrap_or_default();
-        if !key.is_empty() {
-            tput(
-                buf,
-                key_x as u16,
-                area.y,
-                &key,
-                tchrome(theme, ChromeInk::MetadataHint),
-            );
-        }
-        if let Some(count_index) = item.count_index
-            && !text.is_empty()
-        {
-            count_rects.push((
-                count_index,
-                Rect::new(x as u16, area.y, (text.width() + key.width()) as u16, 1),
-            ));
-        }
-        x += item.width();
-    }
-
-    if let Some((text, ink)) = right
-        && !text.is_empty()
-    {
-        let sx = (usize::from(area.x) + width).saturating_sub(text.width());
-        tput(buf, sx as u16, area.y, &text, tchrome(theme, ink));
-    }
+    use crate::tui::infoline::{paint_native_row, source_theme};
+    let area = area.intersection(buf.area);
+    let bar = footer.kit();
+    let count_rects = bar.count_hitboxes(area, &source_theme(footer.ascii_safe));
+    paint_native_row(&bar, area, buf, footer.theme, footer.ascii_safe);
     count_rects
 }
 
@@ -1467,6 +1166,9 @@ pub(crate) fn tideline_footer_from_app(app: &mut App, width: u16) -> TidelineFoo
 
 #[cfg(test)]
 mod tideline_tests;
+
+#[cfg(test)]
+mod posture_tests;
 
 #[cfg(test)]
 mod neutrality_tests {

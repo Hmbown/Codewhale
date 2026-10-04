@@ -36,7 +36,7 @@ release_crates=(
   # Depends on config, core, memory and models; the published tui depends on
   # it, so it publishes after those and before tui.
   codewhale-runtime
-  codewhale-tui
   codewhale-app-server
+  codewhale-tui
   codewhale-cli
 )

@@ -23,7 +23,7 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph, Widget},
 };
 
-use crate::config::{ApiProvider, StatusItem};
+use crate::config::{ProviderKind, StatusItem};
 use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
@@ -52,7 +52,7 @@ pub struct StatusPickerView {
 
 impl StatusPickerView {
     #[must_use]
-    pub fn new(active: &[StatusItem], provider: ApiProvider, locale: Locale) -> Self {
+    pub fn new(active: &[StatusItem], provider: ProviderKind, locale: Locale) -> Self {
         let rows: Vec<StatusItem> = StatusItem::all()
             .iter()
             .filter(|item| item.is_available_for(provider))
@@ -347,14 +347,14 @@ mod tests {
     #[test]
     fn opens_with_active_items_pre_selected() {
         let active = StatusItem::default_footer();
-        let view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
+        let view = StatusPickerView::new(&active, ProviderKind::Deepseek, Locale::En);
         assert_eq!(view.current_selection(), active);
     }
 
     #[test]
     fn legacy_metrics_can_be_split_and_cancel_restores_the_saved_pair() {
         let original = vec![StatusItem::SessionMetrics];
-        let mut view = StatusPickerView::new(&original, ApiProvider::Stepfun, Locale::En);
+        let mut view = StatusPickerView::new(&original, ProviderKind::Stepfun, Locale::En);
         assert_eq!(
             view.current_selection(),
             vec![StatusItem::Ttft, StatusItem::OutputRate]
@@ -379,7 +379,7 @@ mod tests {
     fn mouse_toggles_the_painted_row_after_scrolling_a_short_picker() {
         let mut view = StatusPickerView::new(
             &StatusItem::default_footer(),
-            ApiProvider::Stepfun,
+            ProviderKind::Stepfun,
             Locale::En,
         );
         view.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn space_toggles_current_row_and_emits_live_preview() {
         let active = StatusItem::default_footer();
-        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
+        let mut view = StatusPickerView::new(&active, ProviderKind::Deepseek, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         match action {
             ViewAction::Emit(ViewEvent::StatusItemsUpdated { items, final_save }) => {
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn enter_emits_final_save() {
         let active = StatusItem::default_footer();
-        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
+        let mut view = StatusPickerView::new(&active, ProviderKind::Deepseek, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match action {
             ViewAction::EmitAndClose(ViewEvent::StatusItemsUpdated { final_save, .. }) => {
@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn esc_reverts_to_snapshot() {
         let active = StatusItem::default_footer();
-        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
+        let mut view = StatusPickerView::new(&active, ProviderKind::Deepseek, Locale::En);
         view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         // Move through the shared vocabulary, the same path a key takes.
         view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn select_all_and_select_none_keys_work() {
         let active: Vec<StatusItem> = Vec::new();
-        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
+        let mut view = StatusPickerView::new(&active, ProviderKind::Deepseek, Locale::En);
         let action = view.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         match action {
             ViewAction::Emit(ViewEvent::StatusItemsUpdated { items, .. }) => {
@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn arrow_keys_wrap_cursor_at_edges() {
         let active = StatusItem::default_footer();
-        let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
+        let mut view = StatusPickerView::new(&active, ProviderKind::Deepseek, Locale::En);
         assert_eq!(view.cursor, 0);
         view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(view.cursor, StatusItem::all().len() - 1);
@@ -511,9 +511,9 @@ mod tests {
     #[test]
     fn balance_offered_for_prepaid_providers_and_hidden_for_local() {
         let active = StatusItem::default_footer();
-        let openrouter = StatusPickerView::new(&active, ApiProvider::Openrouter, Locale::En);
+        let openrouter = StatusPickerView::new(&active, ProviderKind::Openrouter, Locale::En);
         assert!(openrouter.rows.contains(&StatusItem::Balance));
-        let ollama = StatusPickerView::new(&active, ApiProvider::Ollama, Locale::En);
+        let ollama = StatusPickerView::new(&active, ProviderKind::Ollama, Locale::En);
         assert!(!ollama.rows.contains(&StatusItem::Balance));
         assert!(ollama.rows.contains(&StatusItem::Mode));
     }
@@ -542,7 +542,7 @@ mod tests {
             let mut stack = ViewStack::new();
             stack.push(StatusPickerView::new(
                 &active,
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 Locale::En,
             ));
             stack.render(area, &mut buf);

@@ -1,42 +1,9 @@
-//! Native import of DeepSeek Harness (DSH) bundle packages.
-//!
-//! A DSH bundle package is a directory whose `package.json` names one or more
-//! ordered patch layers under `dsh.bundle.patch`. This module evaluates those
-//! layers over one empty profile (DSH `applyEntryPatches` parity), converts
-//! the portable rows — `@deepseek-ai/dsh-mcp-client` servers and
-//! `@deepseek-ai/dsh-skill-filesystem` skills — into an ordinary native plugin
-//! bundle, and records every other row as a skipped outcome. The bundle then
-//! goes through the existing installer ([`super::stage`], exact-hash review,
-//! atomic placement) and lands disabled and untrusted like any other.
-//!
-//! It replaces the bundle mode of the repository's `scripts/convert-plugin.py`
-//! (converter 0.10.1) for product use; the script keeps its OpenCode and
-//! single-file DSH config dialects as an authoring aid.
-//!
-//! # Guarantees
-//!
-//! * Nothing from the package runs: no package manager, install hook, network
-//!   request, credential lookup or environment read. `!!js` scalars are data;
-//!   only literal idioms that need no ambient state are lowered, and every
-//!   other expression refuses its row.
-//! * Every file read is inside the selected package, a regular non-linked
-//!   file, and bounded; links anywhere below the package root are refused.
-//! * An unresolved `disabled` gate on a group or a convertible row refuses the
-//!   whole import rather than assuming the row is enabled; disabled ancestry
-//!   propagates to descendants.
-//!
-//! # Known limitations
-//!
-//! * One selected bundle over an empty profile: no multi-bundle profile,
-//!   deployment or user overlays.
-//! * Only MCP-client and skill-filesystem rows convert. Runtime `inject`,
-//!   `intercept`, isolation, policy plugins, prompts, commands and UI modules
-//!   are skipped outcomes that need a manual port; arbitrary DSH TypeScript
-//!   execution is outside this compatibility scope.
-//! * A stdio server whose entry lies outside the package is skipped; host
-//!   paths are never copied.
-//! * Plain YAML scalars follow the YAML 1.2 core schema (DSH's own parser),
-//!   not PyYAML's 1.1 booleans such as `yes`/`on`.
+//! DSH import through the pinned upstream nonexecuting reviewer. All product
+//! preview/install callers share this preparation and existing atomic installer.
+//! Portable Rust MCP/skills remain core-owned. Closed relative Native modules
+//! mount through the one host Loader. Bare exports come only from exact
+//! admitted package manifests; mixed missing/unbridged rows refuse explicitly,
+//! never a partial compatibility claim. Native install still lands disabled/untrusted and requires review.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -47,6 +14,8 @@ use anyhow::Result;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{Value as Json, json};
+
+mod presets;
 
 pub(crate) const CONVERTER_VERSION: &str = "0.10.1";
 const MAX_FILES: usize = 4096;
@@ -507,6 +476,9 @@ pub(crate) struct DshConversion {
     pub(crate) local_servers: Vec<String>,
     pub(crate) network_hosts: Vec<String>,
     pub(crate) requires_node: bool,
+    /// Ordinary reviewed Native entry; remains experimental and disabled at install.
+    pub(crate) requires_native: bool,
+    pub(crate) native_rows: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -514,6 +486,7 @@ pub(crate) struct DshConversion {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct LoadedBundle {
+    composition: Json,
     manifest: Value,
     manifest_sha256: String,
     entries: Vec<Value>,
@@ -560,8 +533,7 @@ fn load_bundle(package: &Package) -> Result<LoadedBundle> {
         "At most 64 `dsh.bundle.patch` files are supported.",
     )?;
     let mut layers = Vec::new();
-    let mut patches = Vec::new();
-    let mut locations = Vec::new();
+    let mut raw_layers = Vec::new();
     let mut seen = Vec::<PathBuf>::new();
     let mut total = 0usize;
     for entry in declared {
@@ -590,21 +562,73 @@ fn load_bundle(package: &Package) -> Result<LoadedBundle> {
         total += content.len();
         let sha256 = sha256_hex(&content);
         let bytes = content.len();
-        let Value::Seq(layer) = parse_yaml(&utf8(content)?, true)? else {
-            return refuse("A DSH bundle patch must be a patch list.");
-        };
+        let source = utf8(content)?;
+        raw_layers.push(json!({"path": relative_slash(&path, &package.root), "sha256": sha256, "source": source}));
         layers.push(DshLayer {
             path: relative.to_string(),
             sha256,
             bytes,
         });
-        for order in 0..layer.len() {
-            locations.push((relative.to_string(), order + 1));
-        }
-        patches.extend(layer);
     }
-    let (entries, outcomes) = evaluate_patches(patches, &mut notes, &locations)?;
+    let composition = json!({"version":1,"layers":raw_layers,"modules":[],"files":{}});
+    let reviewed = crate::extension_host::composition_review::review(&composition)
+        .map_err(anyhow::Error::msg)?;
+    let entries = reviewed
+        .get("entries")
+        .and_then(Json::as_array)
+        .ok_or_else(|| anyhow::Error::msg("composition reviewer omitted its effective entries"))?
+        .iter()
+        .map(reviewed_value)
+        .collect::<Result<Vec<_>>>()?;
+    // Upstream warnings contain row identities only, never configuration values.
+    notes.extend(
+        reviewed
+            .get("warnings")
+            .and_then(Json::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Json::as_str)
+            .map(str::to_string),
+    );
+    let outcomes = reviewed
+        .get("skipped")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .map(|row| {
+            let review_path = row
+                .get("layer")
+                .and_then(Json::as_str)
+                .ok_or_else(|| anyhow::Error::msg("reviewer omitted patch layer"))?;
+            let layer = layers
+                .iter()
+                .find(|layer| layer.path.trim_start_matches("./") == review_path)
+                .ok_or_else(|| anyhow::Error::msg("reviewer returned unknown patch layer"))?;
+            Ok(DshOutcome {
+                row: row.get("row").and_then(Json::as_str).map(str::to_string),
+                package: row
+                    .get("package")
+                    .and_then(Json::as_str)
+                    .map(str::to_string),
+                kind: "patch".into(),
+                outcome: "skipped".into(),
+                reason: row
+                    .get("reason")
+                    .and_then(Json::as_str)
+                    .ok_or_else(|| anyhow::Error::msg("reviewer omitted patch reason"))?
+                    .into(),
+                layer: Some(layer.path.clone()),
+                patch: Some(usize::try_from(
+                    row.get("patch")
+                        .and_then(Json::as_u64)
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| anyhow::Error::msg("reviewer omitted patch number"))?,
+                )?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(LoadedBundle {
+        composition,
         manifest,
         manifest_sha256,
         entries,
@@ -614,8 +638,48 @@ fn load_bundle(package: &Package) -> Result<LoadedBundle> {
     })
 }
 
+/// Upstream expression markers remain expressions, including nested values.
+fn reviewed_value(value: &Json) -> Result<Value> {
+    Ok(match value {
+        Json::Null => Value::Null,
+        Json::Bool(value) => Value::Bool(*value),
+        Json::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Value::Int(value)
+            } else {
+                Value::Float(
+                    value
+                        .as_f64()
+                        .ok_or_else(|| anyhow::Error::msg("nonfinite reviewed value"))?,
+                )
+            }
+        }
+        Json::String(value) => Value::Str(value.clone()),
+        Json::Array(values) => {
+            Value::Seq(values.iter().map(reviewed_value).collect::<Result<_>>()?)
+        }
+        Json::Object(values)
+            if values.len() == 1 && values.get("__jsExpr").is_some_and(Json::is_string) =>
+        {
+            Value::Js(
+                values["__jsExpr"]
+                    .as_str()
+                    .expect("checked marker")
+                    .to_string(),
+            )
+        }
+        Json::Object(values) => Value::Map(
+            values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), reviewed_value(value)?)))
+                .collect::<Result<_>>()?,
+        ),
+    })
+}
+
 /// Rows are addressed by index path: `[i]` is a top-level entry, `[i, j]` the
 /// `j`th child in entry `i`'s group `config`.
+#[cfg(test)]
 fn row_at<'a>(entries: &'a mut [Value], path: &[usize]) -> &'a mut Value {
     let (first, rest) = path.split_first().expect("non-empty row path");
     let mut row = &mut entries[*first];
@@ -631,6 +695,7 @@ fn row_at<'a>(entries: &'a mut [Value], path: &[usize]) -> &'a mut Value {
 /// `applyEntryPatches` parity over an empty entry list: `insert` appends rows
 /// (or appends into a group entry's config); keyed patches replace fields on
 /// an earlier inserted row. Skipped patches are recorded with their layer.
+#[cfg(test)]
 fn evaluate_patches(
     patches: Vec<Value>,
     notes: &mut Vec<String>,
@@ -648,7 +713,10 @@ fn evaluate_patches(
             if let Some(identifier) = row.get("id").and_then(Value::str) {
                 index.insert(identifier.to_string(), path.clone());
             }
-            if row.get("group").is_some_and(Value::is_true)
+            if (row.get("group").is_some_and(Value::is_true)
+                || row.get("name").and_then(Value::str).is_some_and(|name| {
+                    matches!(name, "cordis:group" | "@deepseek-ai/cordis-plugin-group")
+                }))
                 && let Some(Value::Seq(children)) = row.get("config")
             {
                 index_rows(children, &path, 0, index);
@@ -1534,6 +1602,143 @@ fn stdio_files(root: &Path, name: &str, output: &mut OutputFiles) -> Result<()> 
 
 /// A native plugin name from the package name: its last path segment,
 /// lowercased, with other characters replaced by single hyphens.
+fn host_hook_bridge(name: &str) -> bool {
+    matches!(
+        name,
+        "@deepseek-ai/dsh-hooks-claude-code"
+            | "@deepseek-ai/dsh-hooks-codex"
+            | "@deepseek-ai/dsh-persona"
+            | DSH_MCP_CLIENT
+            | DSH_SKILL_FILESYSTEM
+    )
+}
+
+/// Closed relative modules and exact contained ESM package exports. Missing
+/// foreign rows remain manual ports for a portable-only import; a live Native
+/// graph refuses unresolved rows and never uses an ambient Node parent-walk.
+fn native_composition_files(
+    package: &Package,
+    entries: &[Value],
+    mut document: Json,
+    output: &mut OutputFiles,
+) -> Result<Vec<String>> {
+    fn modules(rows: &[Value], names: &mut Vec<String>) -> Result<()> {
+        for row in rows {
+            if row.get("group").is_some_and(Value::is_true)
+                || row.get("name").and_then(Value::str).is_some_and(|name| {
+                    matches!(name, "cordis:group" | "@deepseek-ai/cordis-plugin-group")
+                })
+            {
+                if let Some(Value::Seq(children)) = row.get("config") {
+                    modules(children, names)?;
+                }
+                continue;
+            }
+            let name = row
+                .get("name")
+                .and_then(Value::str)
+                .ok_or_else(|| anyhow::Error::msg("reviewed row has no module name"))?;
+            if !names.iter().any(|old| old == name) {
+                names.push(name.into());
+            }
+        }
+        Ok(())
+    }
+    let mut names = Vec::new();
+    modules(entries, &mut names)?;
+    if names.is_empty() {
+        return Ok(names);
+    }
+    // Portable-only import keeps absent foreign rows visible as manual ports.
+    // Once one real Native closure is present, every row must be admitted:
+    // refusing a mixed partial graph is stronger than silently pruning it.
+    let mut paths = BTreeMap::new();
+    let mut unresolved = Vec::new();
+    for name in &names {
+        if name == presets::AGENT_PRESETS || host_hook_bridge(name) {
+            continue;
+        }
+        match presets::contained_module(package, name) {
+            Ok(path)
+                if crate::plugins::runtime::native_entry_problem(&path, path.is_file())
+                    .is_none() =>
+            {
+                paths.insert(name.clone(), path);
+            }
+            _ => unresolved.push(name),
+        }
+    }
+    if paths.is_empty()
+        && !names.iter().any(|name| {
+            name == presets::AGENT_PRESETS
+                || (host_hook_bridge(name)
+                    && !matches!(name.as_str(), DSH_MCP_CLIENT | DSH_SKILL_FILESYSTEM))
+        })
+    {
+        return Ok(Vec::new());
+    }
+    require(
+        unresolved.is_empty(),
+        "Native composition contains an unsupported or missing row with no exact admitted module; no partial graph was installed.",
+    )?;
+    let mut files = serde_json::Map::new();
+    walk_files(&package.root, |path, is_dir| {
+        let lower = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        let suffix = path
+            .extension()
+            .map(|ext| ext.to_string_lossy().to_ascii_lowercase());
+        require(
+            (!lower.starts_with('.') || lower == ".agent-presets")
+                && !matches!(
+                    lower.as_str(),
+                    "credentials" | "credentials.json" | "secrets.json" | "id_rsa" | "id_ed25519"
+                )
+                && !matches!(suffix.as_deref(), Some("pem" | "key" | "p12" | "pfx")),
+            "Package a closed Native source without hidden files, repository metadata or credential files.",
+        )?;
+        if is_dir {
+            return Ok(());
+        }
+        let relative = relative_slash(path, &package.root);
+        let bytes = read_file(
+            &package.contained(Path::new(&relative))?,
+            output.remaining(),
+        )?;
+        files.insert(relative.clone(), json!(sha256_hex(&bytes)));
+        output.add(format!("source/{relative}"), bytes)
+    })?;
+    let mut selected = Vec::new();
+    for name in &names {
+        if name == presets::AGENT_PRESETS || host_hook_bridge(name) {
+            continue;
+        }
+        let path = paths
+            .get(name)
+            .ok_or_else(|| anyhow::Error::msg("Native module lost its admitted path"))?;
+        let relative = relative_slash(path, &package.root);
+        let digest = files
+            .get(&relative)
+            .ok_or_else(|| anyhow::Error::msg("Native module was absent from source closure"))?;
+        selected.push(json!({"name":name,"path":relative,"sha256":digest}));
+    }
+    document["modules"] = json!(selected);
+    document["files"] = json!(files);
+    if presets::has_roster(entries) {
+        presets::prepare(package, &document, output)?;
+        return Ok(names);
+    }
+    output.add(
+        "native/composition.json".into(),
+        format!("{}\n", serde_json::to_string_pretty(&document)?).into_bytes(),
+    )?;
+    output.add("native/index.mjs".into(),b"import { mountReviewedComposition } from '@codewhale/dsh-composition';\nimport spec from './composition.json' with { type: 'json' };\nexport async function apply(ctx) { await mountReviewedComposition(ctx, new URL('../source/', import.meta.url).href, spec); }\n".to_vec())?;
+    Ok(names)
+}
+
 pub(crate) fn derived_plugin_name(package_name: &str) -> Option<String> {
     let segment = package_name
         .rsplit('/')
@@ -1570,6 +1775,10 @@ fn valid_plugin_name(name: &str) -> bool {
 /// `output`. `output` must not exist; nothing is written unless every
 /// component validated, and a failed write removes what it created.
 pub(crate) fn convert_package(package: &Path, output: &Path) -> Result<DshConversion> {
+    static CONVERSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _conversion = CONVERSION
+        .lock()
+        .map_err(|_| anyhow::Error::msg("DSH preparation is unavailable"))?;
     let package = Package::open(package)?;
     require(
         !output.exists(),
@@ -1582,9 +1791,19 @@ pub(crate) fn convert_package(package: &Path, output: &Path) -> Result<DshConver
         )?;
     }
     let loaded = load_bundle(&package)?;
+    let mut output_files = OutputFiles::default();
+    let native_rows = native_composition_files(
+        &package,
+        &loaded.entries,
+        loaded.composition,
+        &mut output_files,
+    )?;
+    let requires_native = !native_rows.is_empty();
     let mut notes = loaded.notes;
     let mut components = Components::default();
-    components.walk(&package, &loaded.entries, None)?;
+    if !requires_native {
+        components.walk(&package, &loaded.entries, None)?;
+    }
     require(
         components.servers.len() <= MAX_SERVERS,
         "At most 64 MCP servers can be converted at once.",
@@ -1610,7 +1829,6 @@ pub(crate) fn convert_package(package: &Path, output: &Path) -> Result<DshConver
         );
     };
 
-    let mut output_files = OutputFiles::default();
     let mut skill_sources = Vec::new();
     for directory in &components.skill_dirs {
         let mut children: Vec<_> = fs::read_dir(directory)?.collect::<std::io::Result<_>>()?;
@@ -1626,7 +1844,7 @@ pub(crate) fn convert_package(package: &Path, output: &Path) -> Result<DshConver
         }
     }
     let mut skills = Vec::new();
-    for source in &skill_sources {
+    for source in skill_sources.iter().filter(|_| !requires_native) {
         let name = skill_files(source, &mut output_files)?;
         require(
             !skills.contains(&name),
@@ -1634,8 +1852,51 @@ pub(crate) fn convert_package(package: &Path, output: &Path) -> Result<DshConver
         )?;
         skills.push(name);
     }
-    for (name, root) in &components.roots {
-        stdio_files(root, name, &mut output_files)?;
+    if !requires_native {
+        for (name, root) in &components.roots {
+            stdio_files(root, name, &mut output_files)?;
+        }
+    } else {
+        // Live rows register only under their selected Native entry. The
+        // declarative copy would otherwise leak across all caller presets.
+        components.servers.clear();
+    }
+
+    if let Some(bytes) = output_files.files.get("native/presets.json") {
+        let catalog: Json = serde_json::from_slice(bytes)?;
+        for row in catalog
+            .get("presets")
+            .and_then(Json::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(reason) = row.get("broken").and_then(Json::as_str) {
+                outcomes.push(DshOutcome {
+                    row: row.get("id").and_then(Json::as_str).map(str::to_string),
+                    package: Some(presets::AGENT_PRESETS.into()),
+                    kind: "native-preset".into(),
+                    outcome: "skipped".into(),
+                    reason: reason.into(),
+                    layer: None,
+                    patch: None,
+                });
+            }
+        }
+    }
+
+    for outcome in &mut outcomes {
+        if outcome.kind == "foreign"
+            && outcome
+                .package
+                .as_ref()
+                .is_some_and(|name| native_rows.contains(name))
+        {
+            outcome.kind = "native".to_string();
+            outcome.outcome = "converted".to_string();
+            outcome.reason =
+                "reviewed Native composition; core authority and experimental host required"
+                    .to_string();
+        }
     }
     require(
         !output_files.files.is_empty() || !components.servers.is_empty(),
@@ -1645,6 +1906,10 @@ pub(crate) fn convert_package(package: &Path, output: &Path) -> Result<DshConver
     let mut hosts = components.hosts.clone();
     hosts.sort();
     hosts.dedup();
+    // Only portable stdio roots copied for a Node command require Node. Native
+    // composition runs on the selected host runtime and must remain usable on
+    // a reviewed Bun-only installation; individual MCP launches keep their own
+    // exact command/dependency admission.
     let requires_node = !components.roots.is_empty();
     let mut manifest = json!({
         "$schema": "https://agent-plugins.org/schemas/plugin.json",
@@ -1661,6 +1926,22 @@ pub(crate) fn convert_package(package: &Path, output: &Path) -> Result<DshConver
         }
     }
     let mut extension = serde_json::Map::new();
+    if requires_native {
+        let paths: Vec<_> = output_files
+            .files
+            .keys()
+            .filter(|p| p.starts_with("native/presets/") && p.ends_with(".mjs"))
+            .cloned()
+            .collect();
+        extension.insert(
+            "native".into(),
+            if paths.is_empty() {
+                json!({"path":"native/index.mjs"})
+            } else {
+                json!({"paths":paths})
+            },
+        );
+    }
     if !hosts.is_empty() {
         extension.insert("capabilities".into(), json!({"network_hosts": hosts}));
     }
@@ -1714,6 +1995,8 @@ pub(crate) fn convert_package(package: &Path, output: &Path) -> Result<DshConver
         local_servers: local.iter().map(|(name, _)| name.clone()).collect(),
         network_hosts: hosts,
         requires_node,
+        requires_native,
+        native_rows,
     };
     output_files.add(
         "CONVERSION.md".into(),
@@ -1730,7 +2013,8 @@ pub(crate) fn convert_package(package: &Path, output: &Path) -> Result<DshConver
             "manifest_sha256": conversion.manifest_sha256,
             "patch_layers": conversion.layers,
         },
-        "counts": {"skills": conversion.skills.len(), "mcp_servers": components.servers.len()},
+        "counts": {"skills": conversion.skills.len(), "mcp_servers": components.servers.len(), "native_rows": conversion.native_rows.len()},
+        "requires_native": conversion.requires_native,
         "outcomes": conversion.outcomes,
         "diagnostics": conversion.diagnostics,
         "required_manual_ports": conversion.outcomes.iter().filter(|o| o.needs_manual_port()).collect::<Vec<_>>(),
@@ -1771,17 +2055,17 @@ fn conversion_markdown(conversion: &DshConversion) -> String {
     }));
     lines.push(String::new());
     lines.push(format!(
-        "Converted {} Skills, {} remote and {} local MCP declarations.",
+        "Converted {} Skills, {} remote and {} local MCP declarations; {} reviewed Native composition rows.",
         conversion.skills.len(),
         conversion.remote_servers.len(),
-        conversion.local_servers.len()
+        conversion.local_servers.len(),conversion.native_rows.len()
     ));
     lines.push(String::new());
     if !conversion.outcomes.is_empty() {
         lines.push("## Component outcomes".to_string());
         lines.push(String::new());
         lines.push(
-            "Skipped rows and patch operations need a manual port; skipped-disabled skills are intentionally omitted."
+            "Unsupported rows need a manual port; disabled rows remain intentionally inactive."
                 .to_string(),
         );
         lines.push(String::new());
@@ -1813,7 +2097,7 @@ fn conversion_markdown(conversion: &DshConversion) -> String {
     }
     lines.extend(
         [
-            "No source code, package manager, install hook, network request or credential lookup ran.",
+            "No selected-package code, package manager, install hook, network request or credential lookup ran; the pinned pure review evaluator parsed configuration.",
             "No environment variable values were resolved. Only files inside the selected package were read;",
             "host paths are never inferred from expressions or copied.",
             "Companion skill files and packaged Node source were copied as data.",
@@ -1890,6 +2174,126 @@ pub(crate) fn is_dsh_package(path: &Path) -> bool {
                 .and_then(|dsh| dsh.get("bundle"))
                 .is_some()
         })
+}
+
+#[cfg(test)]
+mod shell_hook_import_tests {
+    use super::*;
+    #[test]
+    fn raw_mixed_preset_import_keeps_mcp_and_skills_selected_without_global_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("presets/a")).unwrap();
+        fs::create_dir_all(source.join("skills/check")).unwrap();
+        fs::write(source.join("package.json"), r#"{"name":"@demo/mixed-preset","version":"1.0.0","dsh":{"bundle":{"patch":"./cordis.patch.json"}}}"#).unwrap();
+        fs::write(source.join("cordis.patch.json"), json!([{"insert":[{"id":"roster","name":"@deepseek-ai/dsh-agent-presets","config":{"default":"a","roots":[{"path":"presets","trust":"user"}],"includeShippedRoot":false,"includeUserRoot":false}}]}]).to_string()).unwrap();
+        fs::write(
+            source.join("presets/a/preset.yml"),
+            "name: Mixed\ndescription: Five selected component categories\n",
+        )
+        .unwrap();
+        fs::write(source.join("presets/a/agent.cordis.yml"), "- name: '@deepseek-ai/dsh-mcp-client'\n  config: {serverName: scoped, transport: stdio, command: node, args: [peer.mjs]}\n- name: '@deepseek-ai/dsh-skill-filesystem'\n  config: {includeDefaultRoots: false, watch: false, customSkillDirs: [skills]}\n- name: ../../authored.mjs\n").unwrap();
+        fs::write(source.join("authored.mjs"), "export const inject=['tools','commands'];export function apply(ctx){ctx.tools.register({name:'echo',description:'mixed',parameters:{type:'object'},execute:()=>''});ctx.commands.register({name:'echo-mod',description:'mixed',handler:()=>''});ctx.on('tools/pre-execute',()=>undefined)}").unwrap();
+        fs::write(
+            source.join("peer.mjs"),
+            "throw new Error('import must not execute this MCP process')",
+        )
+        .unwrap();
+        fs::write(
+            source.join("skills/check/SKILL.md"),
+            "---\nname: check\ndescription: mixed skill\n---\nInspect the selected source.\n",
+        )
+        .unwrap();
+        let output = temp.path().join("out");
+        let converted = convert_package(&source, &output).unwrap();
+        assert!(converted.requires_native);
+        assert!(
+            !converted.requires_node,
+            "Native composition uses the selected host runtime"
+        );
+        assert!(
+            !output.join("mcp.json").exists(),
+            "no global duplicate MCP adapter"
+        );
+        assert!(
+            !output.join("skills").exists(),
+            "no global duplicate Skill adapter"
+        );
+        assert!(output.join("source/skills/check/SKILL.md").is_file());
+        assert!(output.join("source/peer.mjs").is_file());
+        assert!(output.join("native/presets/a.mjs").is_file());
+        let manifest: Json =
+            serde_json::from_slice(&fs::read(output.join("plugin.json")).unwrap()).unwrap();
+        assert_eq!(
+            manifest["extensions"]["net.codewhale"]["native"]["paths"],
+            json!(["native/presets/a.mjs"])
+        );
+        assert!(manifest.get("skills").is_none());
+        let admitted =
+            crate::plugins::manifest::PluginManifest::from_path(&output.join("plugin.json"))
+                .unwrap();
+        assert!(
+            admitted.when.is_none(),
+            "no fabricated Node binary condition"
+        );
+        assert!(
+            admitted.check_when(),
+            "Native-only applicability is runtime-neutral"
+        );
+    }
+
+    #[test]
+    fn native_shell_bridge_import_seals_assets_without_executing_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("bundle");
+        fs::create_dir(&bundle).unwrap();
+        fs::write(bundle.join("package.json"), r#"{"name":"@demo/hook-bundle","version":"1.0.0","dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}"#).unwrap();
+        fs::write(bundle.join("cordis.patch.yml"), "- insert:\n  - id: hooks\n    name: '@deepseek-ai/dsh-hooks-claude-code'\n    config: {configPath: hooks.json}\n").unwrap();
+        let sentinel = temp.path().join("must-not-execute");
+        let config = json!({"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":format!("touch {}",sentinel.display())}]}]}}).to_string();
+        fs::write(bundle.join("hooks.json"), &config).unwrap();
+        let output = temp.path().join("output");
+        let converted = convert_package(&bundle, &output).unwrap();
+        assert!(converted.requires_native);
+        assert!(
+            !converted.requires_node,
+            "Native composition uses the selected host runtime"
+        );
+        assert_eq!(
+            converted.native_rows,
+            ["@deepseek-ai/dsh-hooks-claude-code"]
+        );
+        let spec: Json =
+            serde_json::from_slice(&fs::read(output.join("native/composition.json")).unwrap())
+                .unwrap();
+        assert_eq!(spec["modules"], json!([]));
+        assert_eq!(spec["files"]["hooks.json"], sha256_hex(config.as_bytes()));
+        assert_eq!(
+            fs::read(output.join("source/hooks.json")).unwrap(),
+            config.as_bytes()
+        );
+        let manifest: Json =
+            serde_json::from_slice(&fs::read(output.join("plugin.json")).unwrap()).unwrap();
+        assert_eq!(
+            manifest["extensions"]["net.codewhale"]["native"]["path"],
+            "native/index.mjs"
+        );
+        let admitted =
+            crate::plugins::manifest::PluginManifest::from_path(&output.join("plugin.json"))
+                .unwrap();
+        assert!(
+            admitted.when.is_none(),
+            "no fabricated Node binary condition"
+        );
+        assert!(
+            admitted.check_when(),
+            "Native-only applicability is runtime-neutral"
+        );
+        assert!(
+            !sentinel.exists(),
+            "import and preview must never run a shell command"
+        );
+    }
 }
 
 #[cfg(test)]

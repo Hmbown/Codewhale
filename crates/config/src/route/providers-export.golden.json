@@ -805,7 +805,7 @@
       "id": "openai-codex",
       "family": "openai-codex",
       "label": "OpenAI Codex (ChatGPT)",
-      "endpoint": "https://chatgpt.com/backend-api",
+      "endpoint": "https://api.openai.com/v1",
       "wire": "responses",
       "defaultModel": "gpt-5.6",
       "envVars": [

@@ -20,11 +20,11 @@ use crate::artifacts::ArtifactRecord;
 use crate::client::{CacheWarmupKey, PromptInspection};
 use crate::compaction::CompactionConfig;
 use crate::config::{
-    ApiProvider, ApprovalPolicyControl, Config, DEFAULT_TEXT_MODEL, has_api_key, has_api_key_for,
+    ApprovalPolicyControl, Config, DEFAULT_TEXT_MODEL, ProviderKind, has_api_key, has_api_key_for,
 };
 use crate::core::authority::{ModeSessionPrefs, base_policy_for_mode};
 use crate::core::events::TurnRoute;
-use crate::hooks::{HookContext, HookEvent, HookExecutor, HookResult};
+use crate::hooks::{HookContext, HookEvent, HookExecutor};
 use crate::pricing::{CostCurrency, CostEstimate};
 use crate::reasoning_preference::{EffectiveReasoningEffort, ReasoningEffort};
 use crate::session_manager::{SessionContextReference, SessionMetadata, SessionWorkState};
@@ -359,9 +359,9 @@ fn launch_onboarding_decision(
 pub struct TurnCacheRecord {
     /// API provider used for the turn. This is recorded so cache misses can be
     /// correlated with provider/model route changes.
-    pub provider: Option<ApiProvider>,
+    pub provider: Option<ProviderKind>,
     /// Exact non-secret configured route key. This distinguishes named custom
-    /// providers which all share [`ApiProvider::Custom`].
+    /// providers which all share [`ProviderKind::Custom`].
     pub provider_identity: Option<String>,
     /// Concrete model used for the turn. For auto-model turns this is the
     /// routed model, not the literal `auto` setting.
@@ -978,6 +978,12 @@ impl Default for ComposerState {
 
 /// Viewport/scroll state — fields related to transcript scrolling and caching.
 pub struct ViewportState {
+    /// Per-draw copy of the owning backend's negotiated capability facts.
+    /// Unavailable outside a backend draw; never redetect or infer depth.
+    pub(crate) ocean_caps: Option<codewhale_ratatui::Caps>,
+    /// Explicit semantic grounds projected by the current transcript painter.
+    /// Like hitboxes, cleared/rebuilt each frame, never persisted authority.
+    pub(crate) ocean_semantic_surfaces: Vec<Rect>,
     pub transcript_scroll: TranscriptScroll,
     pub pending_scroll_delta: i32,
     /// Applied inside the next synchronized frame, including resize clears.
@@ -1047,6 +1053,8 @@ pub struct ViewportState {
 impl Default for ViewportState {
     fn default() -> Self {
         Self {
+            ocean_caps: None,
+            ocean_semantic_surfaces: Vec::new(),
             transcript_scroll: TranscriptScroll::to_bottom(),
             pending_scroll_delta: 0,
             pending_terminal_size: None,
@@ -1130,6 +1138,9 @@ pub struct SessionState {
     /// Redacted provider-response identities already accrued. The same
     /// fingerprints are persisted by the session and worker projections.
     pub subagent_usage_sources: HashSet<String>,
+    pub missing_usage_sources:
+        std::collections::BTreeMap<String, crate::cost_status::MissingUsageCoverage>,
+    pub missing_usage_overflowed: bool,
     pub displayed_cost_high_water: f64,
     pub displayed_cost_high_water_cny: f64,
     pub last_prompt_tokens: Option<u32>,
@@ -1306,6 +1317,8 @@ impl Default for SessionState {
             subagent_cost: 0.0,
             subagent_cost_cny: 0.0,
             subagent_usage_sources: HashSet::new(),
+            missing_usage_sources: std::collections::BTreeMap::new(),
+            missing_usage_overflowed: false,
             displayed_cost_high_water: 0.0,
             displayed_cost_high_water_cny: 0.0,
             last_prompt_tokens: None,
@@ -1445,7 +1458,7 @@ pub struct ToolEvidence {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingProviderSwitch {
-    pub previous_provider: ApiProvider,
+    pub previous_provider: ProviderKind,
     pub previous_model: String,
     pub previous_model_ids_passthrough: bool,
     pub previous_route_limits: Option<RouteLimits>,
@@ -1488,31 +1501,35 @@ pub struct PendingRouteSave {
 /// Write `provider_identity`/`model` to the user-global config as the route the next
 /// launch should open with, and return the line to show the operator.
 fn persist_route_as_startup_default(
-    provider: ApiProvider,
-    provider_identity: &str,
+    identity: &crate::config::ProviderIdentity,
     model: &str,
 ) -> String {
-    let route = format!("{provider_identity}/{model}");
-    match try_persist_route_as_startup_default(provider, provider_identity, model) {
+    let route = format!("{}/{model}", identity.key);
+    match try_persist_route_as_startup_default(identity, model) {
         Ok(()) => format!("Remembered {route} as the startup default (config.toml)."),
         Err(err) => format!("Save failed: {err}"),
     }
 }
 
 fn try_persist_route_as_startup_default(
-    provider: ApiProvider,
-    provider_identity: &str,
+    identity: &crate::config::ProviderIdentity,
     model: &str,
 ) -> anyhow::Result<()> {
     let path = crate::config::home_config_path()
         .ok_or_else(|| anyhow::anyhow!("Cannot resolve the user-global model configuration."))?;
-    crate::config_persistence::persist_provider_selection(
-        Some(&path),
-        provider,
-        provider_identity,
-        Some(model),
-    )
-    .map(|_| ())
+    crate::config_persistence::persist_provider_selection(Some(&path), identity, Some(model))
+        .map(|_| ())
+}
+
+/// Caller scope captured by a background catalog scan; results never install
+/// into a different workspace, plugin snapshot or extension lifetime.
+#[derive(Clone)]
+pub(crate) struct SkillCacheScope {
+    pub(crate) epoch: u64,
+    pub(crate) workspace: std::path::PathBuf,
+    pub(crate) skills_dir: std::path::PathBuf,
+    pub(crate) mode: crate::skills::SkillDiscoveryMode,
+    pub(crate) plugins: std::sync::Arc<crate::plugins::PluginRegistry>,
 }
 
 pub struct App {
@@ -1582,6 +1599,8 @@ pub struct App {
     pub remote_control: crate::remote_control::RemoteControlController,
     pub start_remote_control_on_launch: bool,
     pub is_loading: bool,
+    /// One local report edit awaiting the ordinary composer dispatch.
+    pub(crate) feedback_dispatch: Option<crate::tui::ui::feedback_host::EditReady>,
     /// Sender for spawned dispatch tasks to report completion back to the
     /// event loop. The closure is called with `&mut App` so the async phase
     /// never needs `&mut App` while awaiting network I/O (#4605).
@@ -1591,6 +1610,10 @@ pub struct App {
     /// submit after an Esc-cancel (which clears `is_loading`) still queues
     /// instead of spawning a second dispatch that could reorder ops.
     pub dispatch_in_flight: bool,
+    /// Cancels the in-flight dispatch task (#6800). Tripped by a local turn
+    /// cancel or stall recovery so the dispatch fails back to the composer
+    /// instead of holding `dispatch_in_flight` for its whole bound.
+    pub dispatch_cancel: Option<tokio_util::sync::CancellationToken>,
     /// Timestamp of the most recent Enter while the engine was busy.
     /// Used by `enter_with_double_tap()` / `double_tap_window_open()` to
     /// detect a second Enter inside [`Self::DOUBLE_TAP_WINDOW`].
@@ -1662,16 +1685,16 @@ pub struct App {
     /// Last concrete model chosen while `auto_model` is active.
     pub last_effective_model: Option<String>,
     /// Provider that actually served the latest auto-routed turn.
-    pub last_effective_provider: Option<ApiProvider>,
+    pub last_effective_provider: Option<ProviderKind>,
     /// Exact non-secret identity for the provider that served the latest Auto
     /// turn. This matters for named custom providers, which all share the
-    /// `ApiProvider::Custom` enum variant.
+    /// `ProviderKind::Custom` enum variant.
     pub(crate) last_effective_provider_identity: Option<String>,
     /// Auto decision metadata for the most recently resolved Auto turn.
     pub(crate) last_auto_route_receipt: Option<crate::model_routing::AutoRouteReceipt>,
     /// Route selected for the next turn, retained for in-flight UI details
     /// until the engine confirms the authoritative `TurnStarted` route.
-    pub pending_turn_route: Option<(ApiProvider, String, bool)>,
+    pub pending_turn_route: Option<(ProviderKind, String, bool)>,
     /// Auto decision metadata waiting to be paired with `pending_turn_route`.
     pub(crate) pending_auto_route_receipt: Option<crate::model_routing::AutoRouteReceipt>,
     /// Authoritative lifecycle metadata attached to the most recent
@@ -1681,7 +1704,7 @@ pub struct App {
     /// Current API provider (mirrors `Config::api_provider`).
     /// Updated by `/provider` switches so the UI/commands can read the
     /// active backend without re-deriving it from the live config.
-    pub api_provider: ApiProvider,
+    pub api_provider: ProviderKind,
     /// The resolved startup config named a provider or model. Capture this
     /// before runtime synchronization writes even the built-in route to Config;
     /// missing credentials must not make that choice eligible for discovery.
@@ -1689,10 +1712,7 @@ pub struct App {
     /// Exact configured provider key for persistence and route restoration.
     /// Built-ins use their canonical slug; named custom providers retain the
     /// user-owned key instead of collapsing to `custom`.
-    pub(crate) provider_identity: String,
-    /// Additive exact configured id for persistence. An id-less `custom`
-    /// record resolves to the literal `[providers.custom]` table (#6394).
-    pub(crate) provider_exact_id: Option<String>,
+    pub(crate) provider_identity: Option<crate::config::ProviderIdentity>,
     /// Primary provider plus configured fallback providers for this session.
     pub provider_chain: Option<ProviderChain>,
     /// Per-provider auth/local readiness snapshot for the fallback chain (#2574).
@@ -1703,7 +1723,7 @@ pub struct App {
     /// providers (Ollama/vLLM/SGLang) are always ready. Stored as `(provider,
     /// ready)` pairs; lookups fall back to "ready" for providers not present so
     /// an unknown entry is tried rather than silently skipped.
-    provider_readiness: Vec<(ApiProvider, bool)>,
+    provider_readiness: Vec<(crate::config::ProviderIdentity, bool)>,
     /// Session-local evidence from real provider requests and verification
     /// probes. Unlike `provider_readiness` above, this never treats a saved key
     /// as proof that the endpoint is healthy.
@@ -2076,7 +2096,7 @@ pub struct App {
     /// Viewport position for the consent text; clamped by the gate renderer.
     pub redaction_gate_scroll: std::cell::Cell<usize>,
     pub onboarding_needs_api_key: bool,
-    pub onboarding_provider: ApiProvider,
+    pub onboarding_provider: ProviderKind,
     pub onboarding_workspace_trust_gate: bool,
     /// True when onboarding opened only because a returning user's configured
     /// provider is missing its key. Esc then exits to the offline composer
@@ -2257,7 +2277,7 @@ pub struct App {
     pub active_skill: Option<String>,
     /// Content-bound plugin authority carried with `active_skill`, when the
     /// selected skill came from a reviewed plugin bundle.
-    pub active_skill_provenance: Option<crate::plugins::types::PluginAuthority>,
+    pub active_skill_provenance: Option<crate::skills::SkillProvenance>,
     /// Cached (name, description) pairs from the skill registry.
     /// Populated once at startup and refreshed on install/uninstall so
     /// the slash menu can show skills without filesystem I/O on every keystroke.
@@ -2635,6 +2655,11 @@ pub struct App {
 }
 
 pub(crate) struct ToolRunCache {
+    /// Bumped each time the projection below is rebuilt, so anything derived
+    /// from it (the collapsed-row mapping) can tell it is stale without
+    /// re-deriving the key.
+    pub(crate) generation: u64,
+    pub(crate) filtered: FilteredProjection,
     pub(crate) history_version: u64,
     pub(crate) active_cell_revision: u64,
     pub(crate) active_len: usize,
@@ -2650,9 +2675,59 @@ pub(crate) struct ToolRunCache {
     pub(crate) superseded_todos: HashSet<usize>,
 }
 
+/// The collapsed transcript path's rendered-row -> original-index mapping.
+///
+/// Which rows survive filtering depends only on the tool-run projection and
+/// the user's hidden cells, never on cell revisions, so it is computed once
+/// per change of either instead of once per frame with a hash lookup per
+/// history cell (#6652). Revisions are still read fresh every frame.
+#[derive(Default)]
+pub(crate) struct FilteredProjection {
+    /// `ToolRunCache::generation` this mapping was built for.
+    built_for: Option<u64>,
+    collapsed_cells: HashSet<usize>,
+    /// Rendered position -> original virtual index.
+    pub(crate) original: Vec<usize>,
+    /// Rendered positions that show a collapsed-run summary instead of the
+    /// cell at their original index.
+    pub(crate) summary_slots: Vec<usize>,
+}
+
+impl ToolRunCache {
+    /// Refresh [`FilteredProjection`] unless it already matches the current
+    /// projection and `collapsed_cells`. `rows` is committed plus active.
+    pub(crate) fn refresh_filtered(&mut self, rows: usize, collapsed_cells: &HashSet<usize>) {
+        if self.filtered.built_for == Some(self.generation)
+            && self.filtered.collapsed_cells == *collapsed_cells
+        {
+            return;
+        }
+        self.filtered.original.clear();
+        self.filtered.summary_slots.clear();
+        for index in 0..rows {
+            if self.superseded_todos.contains(&index)
+                || collapsed_cells.contains(&index)
+                || self.hidden_indices.contains(&index)
+            {
+                continue;
+            }
+            if self.summaries.contains_key(&index) {
+                self.filtered
+                    .summary_slots
+                    .push(self.filtered.original.len());
+            }
+            self.filtered.original.push(index);
+        }
+        self.filtered.collapsed_cells.clone_from(collapsed_cells);
+        self.filtered.built_for = Some(self.generation);
+    }
+}
+
 impl Default for ToolRunCache {
     fn default() -> Self {
         Self {
+            generation: 0,
+            filtered: FilteredProjection::default(),
             history_version: u64::MAX,
             active_cell_revision: u64::MAX,
             active_len: usize::MAX,
@@ -2794,8 +2869,8 @@ impl App {
             RouteSaveChoice::SaveAsNewFleet => {
                 let display = format!(
                     "{} {}",
-                    crate::config::ApiProvider::parse(&pending.provider_identity)
-                        .map(|p| p.display_name().to_string())
+                    crate::config::ProviderKind::parse(&pending.provider_identity)
+                        .map(|p| p.provider().display_name().to_string())
                         .unwrap_or_else(|| pending.provider_identity.clone()),
                     pending.model
                 );
@@ -2846,11 +2921,11 @@ impl App {
                     return "Save failed: the pending provider/model route is no longer active."
                         .to_string();
                 }
-                let provider_id = match self.provider_selector_for_config_persistence() {
-                    Ok(provider_id) => provider_id,
+                let identity = match self.admitted_provider_identity() {
+                    Ok(identity) => identity,
                     Err(error) => return format!("Save failed: {error}"),
                 };
-                persist_route_as_startup_default(self.api_provider, provider_id, &pending.model)
+                persist_route_as_startup_default(identity, &pending.model)
             }
             RouteSaveChoice::SessionOnly => {
                 format!("Model {route} kept for this session only — nothing was written.")
@@ -2887,8 +2962,8 @@ impl App {
             self.model.clone()
         };
         try_persist_route_as_startup_default(
-            self.api_provider,
-            self.provider_selector_for_config_persistence()?,
+            self.admitted_provider_identity()
+                .map_err(anyhow::Error::msg)?,
             &model,
         )?;
         // Resolve the prompt only after the write lands. If persistence fails,
@@ -3063,7 +3138,7 @@ impl App {
         tr(self.ui_locale, id)
     }
 
-    fn discover_cached_skills(
+    pub(crate) fn discover_cached_skills(
         workspace: &std::path::Path,
         skills_dir: &std::path::Path,
         discovery_mode: crate::skills::SkillDiscoveryMode,
@@ -3083,6 +3158,17 @@ impl App {
         .collect()
     }
 
+    pub(crate) fn extension_plugin_view(&self) -> std::sync::Arc<crate::plugins::PluginRegistry> {
+        crate::extension_host::caller_view(
+            &self.workspace,
+            self.current_session_id.as_deref(),
+            self.agent_focus
+                .as_ref()
+                .map(|focus| focus.agent_id.as_str()),
+        )
+        .unwrap_or_else(|| std::sync::Arc::clone(&self.plugin_registry))
+    }
+
     pub fn refresh_skill_cache(&mut self) {
         crate::skills::clear_skill_discovery_cache();
         let skills_dir = self.skills_dir.clone();
@@ -3090,8 +3176,41 @@ impl App {
             &self.workspace,
             &skills_dir,
             self.skills_discovery_mode,
-            self.plugin_registry.as_ref(),
+            self.extension_plugin_view().as_ref(),
         );
+        self.install_skill_cache(cached_skills);
+    }
+
+    pub(crate) fn skill_cache_scope(&self, epoch: u64) -> SkillCacheScope {
+        SkillCacheScope {
+            epoch,
+            workspace: self.workspace.clone(),
+            skills_dir: self.skills_dir.clone(),
+            mode: self.skills_discovery_mode,
+            plugins: self.extension_plugin_view(),
+        }
+    }
+
+    pub(crate) fn install_skill_cache_if_current(
+        &mut self,
+        scope: &SkillCacheScope,
+        epoch: u64,
+        cached_skills: Vec<(String, String)>,
+    ) -> bool {
+        if scope.epoch != epoch
+            || scope.workspace != self.workspace
+            || scope.skills_dir != self.skills_dir
+            || scope.mode != self.skills_discovery_mode
+            || !std::sync::Arc::ptr_eq(&scope.plugins, &self.extension_plugin_view())
+        {
+            return false;
+        }
+        self.install_skill_cache(cached_skills);
+        self.needs_redraw = true;
+        true
+    }
+
+    pub(crate) fn install_skill_cache(&mut self, cached_skills: Vec<(String, String)>) {
         self.hotbar_actions.replace_skills(&cached_skills);
         self.cached_skills = cached_skills;
     }
@@ -3905,6 +4024,16 @@ impl App {
                 .any(|task| matches!(task.status.as_str(), "queued" | "running"))
     }
 
+    /// Abandon a dispatch still resolving its route or waiting on engine
+    /// admission (#6800). Its completion closure then arrives promptly, retires
+    /// `dispatch_in_flight` and restores the unsent message through the normal
+    /// dispatch-error path. A no-op when no dispatch is outstanding.
+    pub fn cancel_in_flight_dispatch(&mut self) {
+        if let Some(cancel) = self.dispatch_cancel.take() {
+            cancel.cancel();
+        }
+    }
+
     /// Whether the interface is asking the user to make a decision. Ambient
     /// motion yields across the whole frame while this is true; freezing one
     /// task marker still leaves distracting movement in peripheral vision.
@@ -3930,11 +4059,6 @@ impl App {
         }
     }
 
-    /// Execute hooks for a specific event with the given context
-    pub fn execute_hooks(&self, event: HookEvent, context: &HookContext) -> Vec<HookResult> {
-        self.hooks.execute(event, context)
-    }
-
     /// Submit observer hooks off the terminal event loop. Foreground in hook
     /// configuration still means ordered/awaited within the worker; it no
     /// longer means the UI waits on the child process.
@@ -3955,6 +4079,17 @@ impl App {
     /// Create a hook context with common fields pre-populated
     pub fn base_hook_context(&self) -> HookContext {
         HookContext::new()
+            .with_caller(crate::hooks::HookCaller {
+                workspace: self.workspace.clone(),
+                plugins: Some(self.extension_plugin_view()),
+                session_id: self.current_session_id.clone(),
+                agent_id: self
+                    .agent_focus
+                    .as_ref()
+                    .map(|focus| focus.agent_id.clone()),
+                origin_turn_id: self.runtime_turn_id.clone(),
+                origin_call_id: None,
+            })
             .with_mode(self.mode.label())
             .with_workspace(self.workspace.clone())
             .with_model(&self.model)
@@ -4166,7 +4301,15 @@ impl App {
         &mut self,
         pool: &crate::cost_status::PendingBackgroundCost,
     ) -> bool {
-        let runtime_usage_arrived = !pool.usage_source_fingerprints.is_empty();
+        let pool = crate::cost_status::project_missing_usage_ledger(
+            &mut self.session.missing_usage_sources,
+            &mut self.session.missing_usage_overflowed,
+            &mut self.session.cost_unpriced_turns,
+            &mut self.session.cost_cny_unpriced_turns,
+            pool,
+        );
+        let runtime_usage_arrived =
+            !pool.usage_source_fingerprints.is_empty() || pool.missing_usage_overflowed;
         self.session
             .subagent_usage_sources
             .extend(pool.usage_source_fingerprints.iter().cloned());
@@ -4190,7 +4333,7 @@ impl App {
             &mut self.session.subagent_cache_write_tokens,
             pool.cache_write_tokens,
         );
-        self.absorb_background_cost_coverage(pool);
+        self.absorb_background_cost_coverage(&pool);
         runtime_usage_arrived
     }
 
@@ -4200,6 +4343,8 @@ impl App {
     /// leave the previous session's priced/unpriced turns attached to a total
     /// that no longer contains them (#4318).
     pub fn reset_cost_coverage(&mut self) {
+        self.session.missing_usage_sources.clear();
+        self.session.missing_usage_overflowed = false;
         self.session.cost_priced_turns = 0;
         self.session.cost_unpriced_turns = 0;
         self.session.cost_cny_priced_turns = 0;
@@ -4304,6 +4449,8 @@ impl App {
         // A session restored as legacy-unknown stays unknown when re-saved:
         // re-writing it as "recorded" would launder the missing evidence into an
         // apparently complete zero.
+        metadata.cost.missing_usage_sources = self.session.missing_usage_sources.clone();
+        metadata.cost.missing_usage_overflowed = self.session.missing_usage_overflowed;
         metadata.cost.coverage_recorded = !self.session.cost_coverage_unknown_legacy;
         // Persist cumulative turn duration so the footer "worked" chip
         // survives session save/restore (#2038).
@@ -6556,10 +6703,10 @@ impl App {
     pub fn set_active_context_window_override(
         &mut self,
         config: &crate::config::Config,
-        provider: ApiProvider,
+        identity: &crate::config::ProviderIdentity,
     ) {
-        self.active_context_window_override = config.context_window_for_provider_config(provider);
-        self.active_model_context_windows = config.model_context_windows_for(provider).cloned();
+        self.active_context_window_override = config.context_window_for_provider_config(identity);
+        self.active_model_context_windows = config.model_context_windows_for(identity).cloned();
         if let Some(resolution) = self.configured_context_window_for(&self.model.clone()) {
             self.active_context_window_source = resolution.source;
         }
@@ -6660,7 +6807,7 @@ impl App {
             .last_effective_provider_identity
             .clone()
             .unwrap_or_else(|| {
-                if provider == ApiProvider::Custom {
+                if provider == ProviderKind::Custom {
                     self.provider_identity_for_persistence().to_string()
                 } else {
                     provider.as_str().to_string()
@@ -6677,45 +6824,35 @@ impl App {
 
     #[must_use]
     pub(crate) fn provider_identity_for_persistence(&self) -> &str {
-        if self.api_provider == ApiProvider::Custom {
-            &self.provider_identity
-        } else {
-            self.api_provider.as_str()
-        }
+        self.provider_identity
+            .as_ref()
+            .map_or("unavailable", |identity| identity.key.as_str())
     }
 
     #[must_use]
     pub(crate) fn provider_id_for_persistence(&self) -> Option<&str> {
-        self.provider_exact_id.as_deref()
+        self.provider_identity
+            .as_ref()
+            .and_then(crate::config::ProviderIdentity::persisted_id)
     }
 
-    /// Config selectors retain the exact saved slot, including legacy hosted
-    /// Ollama's `ollama` slot. Session receipts keep their canonical identity.
-    pub(crate) fn provider_selector_for_config_persistence(&self) -> anyhow::Result<&str> {
-        self.provider_id_for_persistence()
-            .or_else(|| {
-                (self.api_provider == ApiProvider::Custom
-                    && self
-                        .provider_identity
-                        .eq_ignore_ascii_case(ApiProvider::Custom.as_str()))
-                .then(|| self.provider_identity_for_persistence())
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!("The active route has no exact provider config identity.")
-            })
-    }
-
+    #[cfg(test)]
     pub(crate) fn set_provider_identity(
         &mut self,
-        provider: ApiProvider,
+        provider: ProviderKind,
         identity: impl Into<String>,
     ) {
-        let identity = identity.into();
-        self.api_provider = provider;
-        self.provider_exact_id = (!(provider == ApiProvider::Custom
-            && identity.eq_ignore_ascii_case(ApiProvider::Custom.as_str())))
-        .then(|| identity.clone());
-        self.provider_identity = identity;
+        let key: String = identity.into();
+        // This fixture helper has no parsed Config proof for an absent ID.
+        // Legacy-root tests must install their actually captured record instead.
+        let exact_id = Some(key.clone().into());
+        self.set_provider_identity_record(crate::config::ProviderIdentity {
+            provider,
+            key: key.into(),
+            exact_id,
+            migrated_legacy_ollama_cloud_route: false,
+            legacy_root_custom_generation: None,
+        });
     }
 
     pub(crate) fn set_provider_identity_record(
@@ -6723,8 +6860,14 @@ impl App {
         identity: crate::config::ProviderIdentity,
     ) {
         self.api_provider = identity.provider;
-        self.provider_identity = identity.key;
-        self.provider_exact_id = identity.exact_id;
+        self.provider_identity = Some(identity);
+    }
+
+    pub(crate) fn admitted_provider_identity(
+        &self,
+    ) -> Result<&crate::config::ProviderIdentity, String> {
+        self.provider_identity.as_ref().filter(|identity| identity.provider == self.api_provider)
+            .ok_or_else(|| "The active provider route was not admitted; repair its configuration before running a request.".to_string())
     }
 
     pub fn accepts_custom_model_ids(&self) -> bool {
@@ -6734,7 +6877,7 @@ impl App {
 
     pub(crate) fn apply_provider_switch_reasoning_effort(
         &mut self,
-        provider: ApiProvider,
+        provider: ProviderKind,
         base_url: &str,
         model_override: Option<&str>,
     ) {
@@ -6782,7 +6925,7 @@ impl App {
     /// Provider/model identity used by the in-flight or most recent request.
     /// This is the display contract for auto routing and must match billing.
     #[must_use]
-    pub fn effective_route_display(&self) -> (ApiProvider, String) {
+    pub fn effective_route_display(&self) -> (ProviderKind, String) {
         if let Some((provider, model, _)) = self.pending_turn_route.as_ref() {
             return (*provider, model.clone());
         }
@@ -6801,7 +6944,7 @@ impl App {
     #[must_use]
     pub fn effective_route_identity_display(&self) -> (String, String) {
         let (provider, model) = self.effective_route_display();
-        let identity = if provider == ApiProvider::Custom {
+        let identity = if provider == ProviderKind::Custom {
             if self.pending_turn_route.is_none() && self.auto_model {
                 self.last_effective_provider_identity
                     .as_deref()
@@ -6810,7 +6953,7 @@ impl App {
                 self.provider_identity_for_persistence()
             }
         } else {
-            provider.display_name()
+            provider.provider().display_name()
         };
         (identity.to_string(), model)
     }
@@ -6878,10 +7021,10 @@ impl App {
             turn.route.as_ref().is_some_and(|route| {
                 matches!(
                     route.provider,
-                    ApiProvider::Zai
-                        | ApiProvider::Minimax
-                        | ApiProvider::MinimaxAnthropic
-                        | ApiProvider::Custom
+                    ProviderKind::Zai
+                        | ProviderKind::Minimax
+                        | ProviderKind::MinimaxAnthropic
+                        | ProviderKind::Custom
                 ) && route.receipt.is_none()
             })
         }) || self
@@ -6890,10 +7033,10 @@ impl App {
             .is_some_and(|(provider, _, _)| {
                 matches!(
                     provider,
-                    ApiProvider::Zai
-                        | ApiProvider::Minimax
-                        | ApiProvider::MinimaxAnthropic
-                        | ApiProvider::Custom
+                    ProviderKind::Zai
+                        | ProviderKind::Minimax
+                        | ProviderKind::MinimaxAnthropic
+                        | ProviderKind::Custom
                 )
             })
         {
@@ -6904,7 +7047,7 @@ impl App {
         EffectiveReasoningEffort::Tier(effective)
     }
 
-    fn active_reasoning_route_truth(&self) -> Option<(ApiProvider, &str, &str, &str)> {
+    fn active_reasoning_route_truth(&self) -> Option<(ProviderKind, &str, &str, &str)> {
         if let Some(route) = self
             .active_turn
             .as_ref()
@@ -6933,7 +7076,7 @@ impl App {
     fn reasoning_effort_resolution_label(
         requested: ReasoningEffort,
         effective: EffectiveReasoningEffort,
-        provider: ApiProvider,
+        provider: ProviderKind,
     ) -> String {
         match effective {
             EffectiveReasoningEffort::Tier(effective) => {
@@ -7016,12 +7159,14 @@ impl App {
             .map(str::trim)
             .filter(|identity| !identity.is_empty())
             .map(str::to_string)
-            .or_else(|| (provider != ApiProvider::Custom).then(|| provider.as_str().to_string()))?;
-        let provider_id = if provider != ApiProvider::Custom {
+            .or_else(|| {
+                (provider != ProviderKind::Custom).then(|| provider.as_str().to_string())
+            })?;
+        let provider_id = if provider != ProviderKind::Custom {
             Some(provider.as_str().to_string())
-        } else if !provider_identity.eq_ignore_ascii_case(ApiProvider::Custom.as_str()) {
+        } else if !provider_identity.eq_ignore_ascii_case(ProviderKind::Custom.as_str()) {
             Some(provider_identity.clone())
-        } else if self.api_provider == ApiProvider::Custom
+        } else if self.api_provider == ProviderKind::Custom
             && self
                 .provider_identity_for_persistence()
                 .eq_ignore_ascii_case(&provider_identity)
@@ -7047,7 +7192,7 @@ impl App {
                         .as_deref()
                         .map(str::trim)
                         .filter(|identity| !identity.is_empty())
-                        .map_or(provider != ApiProvider::Custom, |identity| {
+                        .map_or(provider != ProviderKind::Custom, |identity| {
                             identity == provider_identity
                         })
             });
@@ -7081,7 +7226,7 @@ impl App {
     #[must_use]
     pub(crate) fn reasoning_effort_api_value_for_replay(
         &self,
-        provider: ApiProvider,
+        provider: ProviderKind,
         base_url: &str,
         model: &str,
     ) -> Option<&'static str> {
@@ -7116,7 +7261,7 @@ impl App {
     /// not from the previous route cached in `App`.
     pub(crate) fn compaction_config_for_route(
         &self,
-        provider: ApiProvider,
+        provider: ProviderKind,
         model: &str,
         route_limits: Option<RouteLimits>,
     ) -> CompactionConfig {
@@ -7144,7 +7289,7 @@ impl App {
         }
     }
 
-    pub fn fallback_chain_entries(&self) -> Vec<(usize, ApiProvider, bool)> {
+    pub fn fallback_chain_entries(&self) -> Vec<(usize, ProviderKind, bool)> {
         let Some(chain) = &self.provider_chain else {
             return Vec::new();
         };
@@ -7153,7 +7298,7 @@ impl App {
             .providers()
             .iter()
             .enumerate()
-            .map(|(index, provider)| (index, ApiProvider::from_kind(*provider), index == position))
+            .map(|(index, provider)| (index, *provider, index == position))
             .collect()
     }
 
@@ -7172,13 +7317,16 @@ impl App {
     /// Mirrors the provider picker's eligibility: hosted providers need a key
     /// (`has_api_key_for`, captured into `provider_readiness` at startup) while
     /// self-hosted providers (Ollama/vLLM/SGLang) are always ready. Providers
-    /// absent from the snapshot default to ready so an unknown entry is tried
-    /// rather than silently skipped.
-    fn fallback_provider_is_ready(&self, provider: ApiProvider) -> bool {
+    /// absent from the captured identity snapshot remain unready; a display
+    /// kind cannot establish credentials for a missing or custom route.
+    fn fallback_provider_is_ready(&self, provider: ProviderKind) -> bool {
         self.provider_readiness
             .iter()
-            .find_map(|(candidate, ready)| (*candidate == provider).then_some(*ready))
-            .unwrap_or(true)
+            .find_map(|(candidate, ready)| {
+                (candidate.provider == provider && candidate.key.as_str() == provider.as_str())
+                    .then_some(*ready)
+            })
+            .unwrap_or(false)
     }
 
     /// Advance to the next *eligible* provider in the fallback chain (#2574).
@@ -7200,7 +7348,7 @@ impl App {
     /// provider. Self-hosted siblings remain eligible. The policy is anchored
     /// to the original primary; a cloud primary may still hop through a local
     /// runtime and then back to another cloud fallback.
-    pub fn advance_fallback(&mut self, reason: impl Into<String>) -> Option<ApiProvider> {
+    pub fn advance_fallback(&mut self, reason: impl Into<String>) -> Option<ProviderKind> {
         let reason = reason.into();
         self.provider_chain.as_ref()?;
 
@@ -7208,18 +7356,23 @@ impl App {
             .provider_chain
             .as_ref()
             .and_then(|chain| chain.providers().first().copied())
-            .map(ApiProvider::from_kind)
-            .is_some_and(ApiProvider::is_self_hosted);
+            .is_some_and(|kind| {
+                kind.provider().credential_help().acquisition
+                    == codewhale_config::provider::CredentialAcquisition::LocalOptional
+            });
 
         let mut skip_notes: Vec<String> = Vec::new();
-        let mut chosen: Option<ApiProvider> = None;
+        let mut chosen: Option<ProviderKind> = None;
         while let Some(next_kind) = self
             .provider_chain
             .as_mut()
             .and_then(ProviderChain::advance)
         {
-            let candidate = ApiProvider::from_kind(next_kind);
-            if origin_is_local && !candidate.is_self_hosted() {
+            let candidate = next_kind;
+            if origin_is_local
+                && candidate.provider().credential_help().acquisition
+                    != codewhale_config::provider::CredentialAcquisition::LocalOptional
+            {
                 skip_notes.push(format!(
                     "skipped {}: local/private policy (no local->cloud fallback)",
                     candidate.as_str()
@@ -7250,7 +7403,17 @@ impl App {
             return None;
         };
 
-        self.set_provider_identity(next_provider, next_provider.as_str());
+        let identity = self
+            .provider_readiness
+            .iter()
+            .find(|(identity, ready)| {
+                *ready
+                    && identity.provider == next_provider
+                    && identity.key.as_str() == next_provider.as_str()
+            })?
+            .0
+            .clone();
+        self.set_provider_identity_record(identity);
         self.last_fallback_reason = Some(format!(
             "Fell back to {} after recoverable provider error: {reason}{skipped}",
             next_provider.as_str()

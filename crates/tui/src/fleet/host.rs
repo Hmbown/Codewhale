@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -233,7 +233,7 @@ impl LocalProcessFleetHostAdapter {
 
         let env = worker_env(&request.env, &request.env_allowlist)?;
         let log_path = self.log_path_for(&request.worker_id, host_kind);
-        let log = open_worker_log(&log_path)?;
+        let log = open_worker_log(&self.workspace, &log_path)?;
         let stderr = log
             .try_clone()
             .map_err(|err| FleetHostError::retryable(format!("cloning worker log: {err}")))?;
@@ -425,7 +425,7 @@ impl FleetHostAdapter for LocalProcessFleetHostAdapter {
             .get(worker_id)
             .ok_or_else(|| FleetHostError::terminal(format!("unknown worker {worker_id}")))?;
         let max_bytes = max_bytes.min(process.request.log_limit_bytes.max(1));
-        read_bounded_log(&process.log_path, max_bytes)
+        read_bounded_log(&self.workspace, &process.log_path, max_bytes)
     }
 
     fn interrupt_worker(&mut self, worker_id: &str) -> FleetHostResult<FleetHostWorkerStatus> {
@@ -808,25 +808,27 @@ fn restart_after_confirmed_stop<A: FleetHostAdapter>(
     replace(adapter)
 }
 
-fn open_worker_log(path: &Path) -> FleetHostResult<File> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            FleetHostError::retryable(format!(
-                "creating worker log dir {}: {err}",
-                parent.display()
-            ))
-        })?;
-    }
-    OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|err| FleetHostError::retryable(format!("opening worker log: {err}")))
+fn open_worker_log(workspace: &Path, path: &Path) -> FleetHostResult<File> {
+    // Pinned, no-follow open under the workspace: a link in `.codewhale` or at
+    // the log's name is refused instead of redirecting the worker's output.
+    let relative = path.strip_prefix(workspace).map_err(|_| {
+        FleetHostError::retryable(format!(
+            "worker log {} is outside the workspace",
+            path.display()
+        ))
+    })?;
+    let file = super::files::WorkspaceFile::open(workspace, relative, true)
+        .and_then(|target| target.open_write(false))
+        .map_err(|err| FleetHostError::retryable(format!("opening worker log: {err}")))?;
+    // Validated handle first, truncation second.
+    file.set_len(0)
+        .map_err(|err| FleetHostError::retryable(format!("truncating worker log: {err}")))?;
+    Ok(file)
 }
 
-fn read_bounded_log(path: &Path, max_bytes: usize) -> FleetHostResult<String> {
-    let mut file = File::open(path).map_err(|err| {
+fn read_bounded_log(workspace: &Path, path: &Path, max_bytes: usize) -> FleetHostResult<String> {
+    // The worker may still hold its log open for writing.
+    let mut file = crate::fs_confined::open_read_shared(workspace, path).map_err(|err| {
         FleetHostError::retryable(format!("opening worker log {}: {err}", path.display()))
     })?;
     let len = file
@@ -1608,6 +1610,58 @@ fn safe_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Worker output is opened through the pinned no-follow writer: a link in
+    /// `.codewhale` or at the log's name is refused, and a plain log is
+    /// truncated and readable back through the same confinement.
+    #[cfg(unix)]
+    #[test]
+    fn worker_logs_are_never_opened_through_links() {
+        use std::io::Write as _;
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let log = workspace
+            .path()
+            .join(".codewhale")
+            .join("fleet-host")
+            .join("local")
+            .join("w1.log");
+
+        let mut file = open_worker_log(workspace.path(), &log).expect("plain log opens");
+        file.write_all(b"first run output").unwrap();
+        drop(file);
+        assert_eq!(
+            read_bounded_log(workspace.path(), &log, 1024).unwrap(),
+            "first run output"
+        );
+        drop(open_worker_log(workspace.path(), &log).expect("reopen truncates"));
+        assert_eq!(read_bounded_log(workspace.path(), &log, 1024).unwrap(), "");
+
+        // A linked directory and a linked file are both refused.
+        let linked_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(linked_root.path().join(".codewhale")).unwrap();
+        symlink(
+            outside.path(),
+            linked_root.path().join(".codewhale").join("fleet-host"),
+        )
+        .unwrap();
+        let linked_dir_log = linked_root
+            .path()
+            .join(".codewhale")
+            .join("fleet-host")
+            .join("local")
+            .join("w1.log");
+        assert!(open_worker_log(linked_root.path(), &linked_dir_log).is_err());
+
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "do not read").unwrap();
+        let parent = log.parent().unwrap();
+        symlink(&secret, parent.join("w2.log")).unwrap();
+        assert!(open_worker_log(workspace.path(), &parent.join("w2.log")).is_err());
+        assert!(read_bounded_log(workspace.path(), &parent.join("w2.log"), 1024).is_err());
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "do not read");
+    }
     use tempfile::TempDir;
 
     #[cfg(unix)]

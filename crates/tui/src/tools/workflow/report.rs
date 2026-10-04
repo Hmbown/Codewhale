@@ -18,17 +18,12 @@ pub(super) fn write_run_report_artifact(workspace: &Path, record: &WorkflowRunRe
         return;
     };
     let path = workspace.join(&relative);
-    let Some(dir) = path.parent() else {
-        return;
-    };
-    if let Err(err) = std::fs::create_dir_all(dir) {
-        crate::logging::warn(format!(
-            "workflow report dir {} not created: {err}",
-            dir.display()
-        ));
-        return;
-    }
-    if let Err(err) = std::fs::write(&path, render_run_report(record)) {
+    // Written through the confined helper: a link in `.codewhale` (or at the
+    // report's own name) is refused instead of redirecting the write out of
+    // the workspace, and missing parents are created without following links.
+    if let Err(err) =
+        crate::fs_confined::write(workspace, &path, render_run_report(record).as_bytes())
+    {
         crate::logging::warn(format!(
             "workflow report {} not written: {err}",
             path.display()
@@ -97,18 +92,12 @@ pub(super) fn write_schema_raw_artifact(
     if safe_run.is_empty() || safe_task.is_empty() {
         return None;
     }
-    let dir = workspace.join(".codewhale").join("reports");
-    if let Err(err) = std::fs::create_dir_all(&dir) {
-        crate::logging::warn(format!(
-            "workflow schema artifact dir {} not created: {err}",
-            dir.display()
-        ));
-        return None;
-    }
-    let path = dir.join(format!(
+    let path = workspace.join(".codewhale").join("reports").join(format!(
         "{safe_run}.schema.{safe_task}.attempt{attempt}.txt"
     ));
-    match std::fs::write(&path, raw) {
+    // Confined write: no link below the workspace is followed, and the missing
+    // `.codewhale/reports` parents are created without following one.
+    match crate::fs_confined::write(workspace, &path, raw.as_bytes()) {
         Ok(()) => Some(path.display().to_string()),
         Err(err) => {
             crate::logging::warn(format!(

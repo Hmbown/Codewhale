@@ -7,7 +7,7 @@ use super::*;
 pub(crate) trait ProviderKeyVerifier {
     fn verify<'a>(
         &'a self,
-        provider: ApiProvider,
+        provider: ProviderKind,
         api_key: &'a str,
         base_url: &'a str,
     ) -> ProviderKeyVerification<'a>;
@@ -18,7 +18,7 @@ pub(crate) struct LiveProviderKeyVerifier;
 impl ProviderKeyVerifier for LiveProviderKeyVerifier {
     fn verify<'a>(
         &'a self,
-        provider: ApiProvider,
+        provider: ProviderKind,
         api_key: &'a str,
         base_url: &'a str,
     ) -> ProviderKeyVerification<'a> {

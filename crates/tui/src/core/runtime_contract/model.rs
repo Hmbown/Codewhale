@@ -38,10 +38,9 @@ pub trait ModelClient: Send + Sync {
         requested_model: &str,
         dispatched_at: chrono::DateTime<chrono::Utc>,
     ) -> crate::cost_status::EffectiveRouteEnvelope {
-        let provider = crate::config::ApiProvider::parse(self.provider_name())
-            .unwrap_or(crate::config::ApiProvider::Custom);
-        crate::cost_status::EffectiveRouteEnvelope::capture(
-            None,
+        let provider = crate::config::ProviderKind::parse(self.provider_name())
+            .unwrap_or(crate::config::ProviderKind::Custom);
+        crate::cost_status::EffectiveRouteEnvelope::capture_observed(
             provider,
             self.provider_name(),
             requested_model,

@@ -210,7 +210,7 @@ fn start_in(
         std::fs::write(path, contents).unwrap();
     }
 
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())
