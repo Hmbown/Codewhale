@@ -16047,24 +16047,43 @@ impl RuntimeThreadManager {
                         return Err(err);
                     }
                     drop(projection);
+                    // What ended the decision wait. A bounded wait can also
+                    // time out; an unbounded wait (the default, #6003) has no
+                    // timer at all, so its only remaining exits are the owner
+                    // going away — engine death, runtime shutdown, or turn
+                    // interrupt — which the poll arm below observes.
+                    enum ExternalApprovalWakeup {
+                        Decision(
+                            Result<
+                                ExternalApprovalDecision,
+                                tokio::sync::oneshot::error::RecvError,
+                            >,
+                        ),
+                        TimedOut,
+                        Interrupted,
+                    }
                     let approval_timeout = self.approval_decision_timeout();
-                    let wait_for_decision = async {
+                    let mut rx = rx;
+                    let mut wait_timeout = std::pin::pin!(async {
                         match approval_timeout {
-                            Some(wait) => tokio::time::timeout(wait, rx).await,
-                            None => Ok(rx.await),
+                            Some(wait) => tokio::time::sleep(wait).await,
+                            None => std::future::pending::<()>().await,
                         }
-                    };
-                    let mut wait_for_decision = std::pin::pin!(wait_for_decision);
-                    // Keep draining engine status while the card is open. The
-                    // engine's approval-wait heartbeat fires during this wait;
-                    // parking the pump here used to sequence it after
-                    // `approval.decided`, where it read as a live claim that
-                    // the answered call was still waiting (DESKTOP-QA-20260923).
-                    // Anything else is held for the main loop, in order.
+                    });
+                    let mut owner_poll = tokio::time::interval(Duration::from_millis(500));
+                    owner_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     let decision = loop {
                         tokio::select! {
                             biased;
-                            decision = &mut wait_for_decision => break decision,
+                            decision = &mut rx => break ExternalApprovalWakeup::Decision(decision),
+                            _ = &mut wait_timeout => break ExternalApprovalWakeup::TimedOut,
+                            // Keep draining engine status while the card is
+                            // open. The engine's approval-wait heartbeat fires
+                            // during this wait; parking the pump here used to
+                            // sequence it after `approval.decided`, where it
+                            // read as a live claim that the answered call was
+                            // still waiting (DESKTOP-QA-20260923). Anything
+                            // else is held for the main loop, in order.
                             event = async { engine.rx_event.write().await.recv().await },
                                 if pending_event.is_none() && !event_channel_closed =>
                             {
@@ -16088,6 +16107,36 @@ impl RuntimeThreadManager {
                                     }
                                     Some(other) => pending_event = Some(other),
                                     None => event_channel_closed = true,
+                                }
+                            }
+                            _ = owner_poll.tick() => {
+                                // `tx_op.is_closed()` is a non-consuming
+                                // probe: the engine dropping its op receiver
+                                // means the engine task is gone and nothing
+                                // will ever consume a decision. A cancelled
+                                // runtime token (`shutdown_and_wait` cancels
+                                // it through `close_execution_admission`) or
+                                // an interrupted turn abandons the wait the
+                                // same way. Without this poll, a crashed
+                                // engine or a shutdown left the pending
+                                // approval — and this monitor — suspended
+                                // forever.
+                                if engine.tx_op.is_closed()
+                                    || self.cancel_token.is_cancelled()
+                                    || self
+                                        .is_interrupt_requested(&thread_id, &turn_id)
+                                        .await
+                                        .unwrap_or(false)
+                                {
+                                    // A decision already queued when the
+                                    // owner went away is a choice the user
+                                    // actually made — it resolves the
+                                    // approval instead of being discarded.
+                                    break if let Ok(decision) = rx.try_recv() {
+                                        ExternalApprovalWakeup::Decision(Ok(decision))
+                                    } else {
+                                        ExternalApprovalWakeup::Interrupted
+                                    };
                                 }
                             }
                         }
@@ -16129,7 +16178,9 @@ impl RuntimeThreadManager {
                         continue;
                     }
                     match decision {
-                        Ok(Ok(ExternalApprovalDecision::Allow { remember })) => {
+                        ExternalApprovalWakeup::Decision(Ok(ExternalApprovalDecision::Allow {
+                            remember,
+                        })) => {
                             // "Allow for this conversation" records a grant
                             // for this tool and argument class. It must not
                             // change posture: a posture change mid-turn used
@@ -16163,7 +16214,9 @@ impl RuntimeThreadManager {
                             .ok();
                             let _ = engine.approve_tool_call(id).await;
                         }
-                        Ok(Ok(ExternalApprovalDecision::Deny { remember })) => {
+                        ExternalApprovalWakeup::Decision(Ok(ExternalApprovalDecision::Deny {
+                            remember,
+                        })) => {
                             self.emit_event(
                                 &thread_id,
                                 Some(&turn_id),
@@ -16180,13 +16233,13 @@ impl RuntimeThreadManager {
                             .ok();
                             let _ = engine.deny_tool_call(id).await;
                         }
-                        Ok(Err(_recv_err)) => {
+                        ExternalApprovalWakeup::Decision(Err(_recv_err)) => {
                             // The decision channel closed with no answer:
                             // nobody refused the call, it was unavailable.
                             self.cancel_pending_approval(&approval_id);
                             let _ = engine.deny_tool_call_unavailable(id).await;
                         }
-                        Err(_timeout) => {
+                        ExternalApprovalWakeup::TimedOut => {
                             self.cancel_pending_approval(&approval_id);
                             self.emit_event(
                                 &thread_id,
@@ -16220,6 +16273,36 @@ impl RuntimeThreadManager {
                             // operator's denial; the engine refunds the call's
                             // tool-call budget slot.
                             let _ = engine.deny_tool_call_timed_out(id).await;
+                        }
+                        ExternalApprovalWakeup::Interrupted => {
+                            // The owner of this approval went away: the engine
+                            // task died (its op receiver is gone) or the
+                            // runtime is shutting down (the shared token is
+                            // cancelled). No decision can ever arrive now —
+                            // resolve the pending card definitively instead of
+                            // suspending it (and this monitor) forever. A turn
+                            // interrupt instead falls through to the cancelled
+                            // settlement below, which classifies it for the
+                            // clients that expect that flag.
+                            self.cancel_pending_approval(&approval_id);
+                            self.emit_event(
+                                &thread_id,
+                                Some(&turn_id),
+                                None,
+                                "approval.decided",
+                                json!({
+                                    "approval_id": approval_id,
+                                    "tool_call_id": id,
+                                    "decision": "deny",
+                                    "remember": false,
+                                    "interrupted": true,
+                                }),
+                            )
+                            .await
+                            .ok();
+                            // Nobody refused the call; the host forced the
+                            // resolution because the wait is unservable.
+                            let _ = engine.deny_tool_call_unavailable(id).await;
                         }
                     }
                 }

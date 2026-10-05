@@ -1147,6 +1147,17 @@ ID that has already been settled all return `404` and reach no engine. A `404`
 means the capability is not pending — it is not evidence about how the approval
 was resolved; read `approval.decided` for that.
 
+Approvals wait unbounded for a human by default (`timeout_seconds: 0` or an
+absent value never expires a prompt). A wait can also be ended by its owner
+going away: a turn interrupt, runtime shutdown, or the engine dying. An
+interrupt settles the prompt as `approval.decided` with `"cancelled": true`;
+engine death settles it with `"interrupted": true`; shutdown may read either
+flag depending on whether the turn interrupt or the shutdown poll lands
+first — both flags deny the gated call without recording an operator denial,
+and a decision the user actually chose never carries either flag. A prompt bounded by a positive
+`timeout_seconds` instead ends as `approval.timeout` followed by
+`approval.decided` with `"timeout": true`.
+
 The raw provider call ID travels separately as `tool_call_id` on
 `pending_approvals[]` and on the approval events. It is a correlator for
 attaching a prompt to the tool row it gates, and never accepted as a decision.

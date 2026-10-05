@@ -12652,6 +12652,164 @@ async fn approval_required_awaits_external_decision_allow() -> Result<()> {
     Ok(())
 }
 
+/// The unbounded decision wait must observe its owner going away. A closed
+/// engine op receiver means the engine task is gone and no decision can ever
+/// arrive; the wait must resolve the pending approval as interrupted (denied
+/// by the host, unavailable to the engine) instead of suspending the turn
+/// monitor forever. Without the owner poll this test times out: nothing else
+/// ever resolves the card.
+#[tokio::test]
+async fn approval_wait_resolves_as_interrupted_when_the_engine_goes_away() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "needs approval".to_string(),
+                ..StartTurnRequest::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
+
+    harness
+        .tx_event
+        .send(EngineEvent::ApprovalRequired {
+            approval_key: "key1".to_string(),
+            approval_grouping_key: "key1".to_string(),
+            id: "tool_engine_death".to_string(),
+            tool_name: "exec_command".to_string(),
+            description: "engine death".to_string(),
+            input: serde_json::json!({}),
+            intent_summary: None,
+            approval_force_prompt: false,
+        })
+        .await?;
+
+    let deadline = Instant::now() + APPROVAL_READINESS_TIMEOUT;
+    while Instant::now() < deadline && manager.pending_approvals_count() == 0 {
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(manager.pending_approvals_count(), 1);
+    let approval_id = await_approval_identity(&manager, &thread.id, "tool_engine_death").await?;
+
+    // Close the op receiver exactly as a dead engine task would; the wait's
+    // non-consuming `tx_op.is_closed()` probe must notice within one poll.
+    harness.rx_op.close();
+
+    let deadline = Instant::now() + APPROVAL_READINESS_TIMEOUT;
+    while Instant::now() < deadline && manager.pending_approvals_count() != 0 {
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        manager.pending_approvals_count(),
+        0,
+        "a dead engine must resolve the pending approval, not suspend it"
+    );
+    assert_eq!(
+        harness.recv_approval_event().await,
+        Some(MockApprovalEvent::Unavailable {
+            id: "tool_engine_death".to_string(),
+        }),
+        "the forced resolution denies the call as unavailable, not as an operator denial"
+    );
+    assert!(
+        manager.events_since(&thread.id, None)?.iter().any(|event| {
+            event.event == "approval.decided"
+                && event.payload.get("approval_id").and_then(Value::as_str)
+                    == Some(approval_id.as_str())
+                && event.payload.get("decision").and_then(Value::as_str) == Some("deny")
+                && event.payload.get("interrupted").and_then(Value::as_bool) == Some(true)
+        }),
+        "the forced resolution must be published with interrupted: true so clients clear the card"
+    );
+    Ok(())
+}
+
+/// Runtime shutdown must reach a pending approval: `shutdown_and_wait`
+/// cancels the shared cancellation token through `close_execution_admission`,
+/// and the unbounded decision wait polls that token, so a manager being torn
+/// down resolves the card instead of leaving it (and the turn monitor)
+/// pending forever.
+#[tokio::test]
+async fn approval_wait_resolves_as_interrupted_when_the_runtime_shuts_down() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "needs approval".to_string(),
+                ..StartTurnRequest::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
+
+    harness
+        .tx_event
+        .send(EngineEvent::ApprovalRequired {
+            approval_key: "key1".to_string(),
+            approval_grouping_key: "key1".to_string(),
+            id: "tool_shutdown".to_string(),
+            tool_name: "exec_command".to_string(),
+            description: "runtime shutdown".to_string(),
+            input: serde_json::json!({}),
+            intent_summary: None,
+            approval_force_prompt: false,
+        })
+        .await?;
+
+    let deadline = Instant::now() + APPROVAL_READINESS_TIMEOUT;
+    while Instant::now() < deadline && manager.pending_approvals_count() == 0 {
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(manager.pending_approvals_count(), 1);
+    let approval_id = await_approval_identity(&manager, &thread.id, "tool_shutdown").await?;
+
+    manager.close_execution_admission().await;
+
+    let deadline = Instant::now() + APPROVAL_READINESS_TIMEOUT;
+    while Instant::now() < deadline && manager.pending_approvals_count() != 0 {
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        manager.pending_approvals_count(),
+        0,
+        "runtime shutdown must resolve the pending approval, not suspend it"
+    );
+    assert_eq!(
+        harness.recv_approval_event().await,
+        Some(MockApprovalEvent::Unavailable {
+            id: "tool_shutdown".to_string(),
+        })
+    );
+    assert!(
+        manager.events_since(&thread.id, None)?.iter().any(|event| {
+            event.event == "approval.decided"
+                && event.payload.get("approval_id").and_then(Value::as_str)
+                    == Some(approval_id.as_str())
+                && event.payload.get("decision").and_then(Value::as_str) == Some("deny")
+                && event.payload.get("interrupted").and_then(Value::as_bool) == Some(true)
+        }),
+        "the shutdown resolution must be published with interrupted: true"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn user_input_snapshot_survives_reload_and_clears_after_submission() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;

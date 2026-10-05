@@ -8073,6 +8073,7 @@ fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -
                     "remember": payload.get("remember"),
                     "auto": payload.get("auto"),
                     "timeout": payload.get("timeout"),
+                    "interrupted": payload.get("interrupted"),
                 }),
             ))
         }
