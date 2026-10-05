@@ -144,6 +144,7 @@ pub(crate) fn run_rlm_turn_inner(
         max_depth,
         RlmUsageAccumulator::new(),
         tokio::time::Instant::now() + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME,
+        Duration::from_secs(crate::rlm::session::DEFAULT_SUB_QUERY_TIMEOUT_SECS),
         Some(crate::tools::codemode::NestedCallGate::admitting_for_test()),
     )
 }
@@ -160,6 +161,7 @@ pub(crate) fn run_rlm_turn_inner_with_usage(
     max_depth: u32,
     usage: RlmUsageAccumulator,
     deadline: tokio::time::Instant,
+    sub_query_timeout: Duration,
     gate: Option<crate::tools::codemode::NestedCallGate>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RlmTurnResult> + Send>> {
     Box::pin(async move {
@@ -173,6 +175,7 @@ pub(crate) fn run_rlm_turn_inner_with_usage(
             max_depth,
             usage.clone(),
             deadline,
+            sub_query_timeout,
             gate,
         )
         .await;
@@ -262,6 +265,7 @@ async fn run_rlm_turn_impl(
     max_depth: u32,
     routed_usage: RlmUsageAccumulator,
     deadline: tokio::time::Instant,
+    sub_query_timeout: Duration,
     gate: Option<crate::tools::codemode::NestedCallGate>,
 ) -> RlmTurnResult {
     let start = Instant::now();
@@ -323,7 +327,10 @@ async fn run_rlm_turn_impl(
             }
         };
 
-        // 3. Build the bridge that services llm_query / rlm_query RPCs.
+        // 3. Build the bridge that services llm_query / rlm_query RPCs. The
+        //    sub-query budget follows the recursion: a nested bridge inherits
+        //    what the outer bridge was configured with, so the session's
+        //    `sub_query_timeout_secs` governs llm_query at every depth.
         let bridge = RlmBridge::with_usage_accumulator(
             Arc::clone(&client),
             child_model.clone(),
@@ -332,6 +339,7 @@ async fn run_rlm_turn_impl(
         )
         .with_events(tx_event.sender.clone())
         .with_deadline(Some(deadline))
+        .with_sub_query_timeout_secs(sub_query_timeout.as_secs())
         .with_gate(gate.clone());
 
         tx_event
@@ -1146,6 +1154,7 @@ mod tests {
             0,
             RlmUsageAccumulator::new(),
             tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(crate::rlm::session::DEFAULT_SUB_QUERY_TIMEOUT_SECS),
             gate,
         )
         .await;
@@ -1440,6 +1449,7 @@ mod tests {
                     0,
                     usage.clone(),
                     tokio::time::Instant::now() + Duration::from_secs(1),
+                    Duration::from_secs(crate::rlm::session::DEFAULT_SUB_QUERY_TIMEOUT_SECS),
                     Some(crate::tools::codemode::NestedCallGate::admitting_for_test()),
                 ),
             )
@@ -1498,6 +1508,7 @@ mod tests {
                 0,
                 RlmUsageAccumulator::new(),
                 tokio::time::Instant::now() + Duration::from_secs(1),
+                Duration::from_secs(crate::rlm::session::DEFAULT_SUB_QUERY_TIMEOUT_SECS),
                 Some(crate::tools::codemode::NestedCallGate::admitting_for_test()),
             ),
         )

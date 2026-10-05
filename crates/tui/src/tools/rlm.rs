@@ -509,6 +509,7 @@ impl RlmTool {
                 config.sub_rlm_max_depth.min(HARD_SUB_RLM_DEPTH_CAP),
             )
             .with_deadline(Some(deadline))
+            .with_sub_query_timeout_secs(config.sub_query_timeout_secs)
             .with_gate(context.execution.nested_call_gate.clone());
             let round_result =
                 tokio::time::timeout_at(bridge.deadline(), kernel.run(code, Some(&bridge)))

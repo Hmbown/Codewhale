@@ -245,8 +245,8 @@ impl ModelClientRlmAdapter {
     }
 }
 
-/// Per-child completion timeout — same as the previous sidecar default.
-const CHILD_TIMEOUT_SECS: u64 = 120;
+/// Default per-child completion timeout — same as the previous sidecar
+/// default. The RLM session's `sub_query_timeout_secs` overrides it.
 /// Hard cap on prompts per batch RPC.
 pub const MAX_BATCH: usize = 16;
 
@@ -330,6 +330,11 @@ pub struct RlmBridge {
     /// best-effort stream (#6511).
     events: Option<tokio::sync::mpsc::Sender<crate::core::events::Event>>,
     deadline: tokio::time::Instant,
+    /// Wall-clock budget for one child completion. Configurable via the RLM
+    /// session's `sub_query_timeout_secs` so callers can size it for
+    /// big-context child generations; the parent turn's deadline still caps
+    /// everything.
+    sub_query_timeout: Duration,
     /// The serving turn's permission gate. A nested RLM turn runs each round
     /// of model-written Python only after this gate admits that exact code;
     /// without one the nested turn runs no code at all.
@@ -363,6 +368,7 @@ impl RlmBridge {
             usage,
             events: None,
             deadline: tokio::time::Instant::now() + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME,
+            sub_query_timeout: Duration::from_secs(super::session::DEFAULT_SUB_QUERY_TIMEOUT_SECS),
             gate: None,
         }
     }
@@ -383,6 +389,16 @@ impl RlmBridge {
         if let Some(deadline) = deadline {
             self.deadline = self.deadline.min(deadline);
         }
+        self
+    }
+
+    /// Override the per-child-completion wall-clock budget (seconds). The RLM
+    /// session's `sub_query_timeout_secs` lands here so the advertised knob
+    /// governs each `llm_query` instead of the hardcoded default; nested
+    /// bridges inherit it so the knob holds at every recursion depth.
+    #[must_use]
+    pub(crate) fn with_sub_query_timeout_secs(mut self, secs: u64) -> Self {
+        self.sub_query_timeout = Duration::from_secs(secs);
         self
     }
 
@@ -464,7 +480,7 @@ impl RlmBridge {
         let fut = self.client.create_message_boxed(request);
         let response = match tokio::time::timeout_at(
             self.deadline
-                .min(tokio::time::Instant::now() + Duration::from_secs(CHILD_TIMEOUT_SECS)),
+                .min(tokio::time::Instant::now() + self.sub_query_timeout),
             fut,
         )
         .await
@@ -479,9 +495,20 @@ impl RlmBridge {
             }
             Err(_) => {
                 self.usage.cancel(reservation, true).await;
+                // Name the budget only when it is the one that fired; when
+                // the parent turn deadline cut the call short first, the
+                // per-call figure would misattribute the cutoff.
+                let error = if tokio::time::Instant::now() >= self.deadline {
+                    "llm_query timed out at the parent turn deadline".to_string()
+                } else {
+                    format!(
+                        "llm_query timed out after {}s (per-call deadline)",
+                        self.sub_query_timeout.as_secs()
+                    )
+                };
                 return SingleResp {
                     text: String::new(),
-                    error: Some("llm_query timed out at its parent or per-call deadline".into()),
+                    error: Some(error),
                 };
             }
         };
@@ -601,6 +628,7 @@ impl RlmBridge {
             self.depth_remaining.saturating_sub(1),
             self.usage.clone(),
             self.deadline,
+            self.sub_query_timeout,
             self.gate.clone(),
         )
         .await;
@@ -849,6 +877,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A child that accepts the request and never answers: the configured
+    /// per-call budget must cut it off even though the parent deadline is
+    /// still far away. The session's `sub_query_timeout_secs` was
+    /// historically stored but never read (the bridge always used its 120s
+    /// const), so this pins the configured budget actually governing the
+    /// per-call deadline, including the timeout message naming it.
+    #[tokio::test]
+    async fn configured_sub_query_budget_governs_the_per_call_deadline() {
+        let bridge = RlmBridge::new(
+            Arc::new(PendingClient(MockLlmClient::new(Vec::new()))),
+            "child-model".into(),
+            0,
+        )
+        .with_sub_query_timeout_secs(1);
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            bridge.dispatch_rlm("bounded nested context".into(), None),
+        )
+        .await
+        .expect("the configured per-call budget must cut off a hanging child");
+
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out after 1s")),
+            "timeout must reflect the configured budget; got {:?}",
+            response.error
+        );
+        assert_eq!(
+            bridge.usage_snapshot().await.dropped_records,
+            1,
+            "canceled provider work has unknown usage, never priced zero"
+        );
     }
 
     #[test]
