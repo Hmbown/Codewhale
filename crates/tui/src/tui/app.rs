@@ -1486,8 +1486,7 @@ pub type DispatchApplyFn = Box<
 #[allow(clippy::struct_excessive_bools)]
 /// A route change made in-session that the user has not yet decided how to
 /// save. Route changes are temporary by default; persisting them requires an
-/// explicit choice (Update this Fleet / Save as a new Fleet / Remember as my
-/// default / Keep for this session only).
+/// explicit command (`/fleet save`, `/fleet save-as` or `/model save-default`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingRouteSave {
     /// Provider identity the session is now on.
@@ -2932,9 +2931,6 @@ impl App {
                     Err(error) => return format!("Save failed: {error}"),
                 };
                 persist_route_as_startup_default(identity, &pending.model)
-            }
-            RouteSaveChoice::SessionOnly => {
-                format!("Model {route} kept for this session only — nothing was written.")
             }
         }
     }
