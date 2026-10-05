@@ -1112,16 +1112,11 @@ impl ToolSpec for ReadFileTool {
             return Ok(result);
         }
         if is_image_for_ocr(&file_path) {
-            // OCR shells out to tesseract (or runs a Vision pass): the blocking
-            // subprocess call stays on the blocking pool (blocking-call
-            // convention, #6149).
-            let file_path = file_path.clone();
-            let requested_path = path_str.to_string();
-            return tokio::task::spawn_blocking(move || {
-                read_image_via_ocr(&file_path, &requested_path)
-            })
-            .await
-            .map_err(|e| ToolError::execution_failed(format!("Image OCR task: {e}")))?;
+            // OCR shells out to tesseract (or runs a Vision pass): the shared
+            // bounded wrapper keeps that blocking work off the executor
+            // (blocking-call convention, #6149) and bounds it so a wedged
+            // backend cannot stall the turn.
+            return read_image_via_ocr(&file_path, path_str).await;
         }
 
         // Open before parameter parsing so a missing file keeps the
@@ -1487,8 +1482,8 @@ fn render_line_window(
     }))
 }
 
-fn read_image_via_ocr(path: &Path, requested_path: &str) -> Result<ToolResult, ToolError> {
-    let text = crate::tools::image_ocr::ocr_image_path(path)?;
+async fn read_image_via_ocr(path: &Path, requested_path: &str) -> Result<ToolResult, ToolError> {
+    let text = crate::tools::image_ocr::ocr_image_path_bounded(path.to_path_buf()).await?;
     Ok(ToolResult::success(format!(
         "<image_ocr path=\"{requested_path}\">\n{text}\n</image_ocr>"
     )))

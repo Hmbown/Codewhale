@@ -9,8 +9,9 @@
 //! asset the user drops into the workspace without bouncing through
 //! `exec_shell`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -57,10 +58,35 @@ impl ToolSpec for ImageOcrTool {
         // OCR text is file content: the same read guards as `read` apply.
         let image_path =
             crate::tools::file::resolve_guarded_read_path(context, path_str, "image_ocr")?;
-        // OCR shells out to tesseract (or runs a Vision pass): the blocking
-        // subprocess call stays on the blocking pool (blocking-call
-        // convention, #6149).
-        let text = tokio::task::spawn_blocking(move || {
+        let text = ocr_image_path_bounded(image_path).await?;
+        Ok(ToolResult::success(text))
+    }
+}
+
+/// Wall-clock bound for one OCR call. Tesseract on a large scan can run
+/// for minutes and native Vision OCR is blocking FFI; without a bound the
+/// tool occupied an executor thread (and the turn) for as long as the
+/// backend felt like taking. The bounded wrapper runs the sync work on the
+/// blocking pool (blocking-call convention, #6149) and hands control back
+/// to the caller when the deadline fires; a wedged backend keeps its
+/// blocking thread (and any tesseract child it spawned) running until it
+/// returns on its own, but the tool call itself is bounded. Known,
+/// disclosed trade-off: neither the FFI call nor the orphaned child can be
+/// killed mid-flight.
+const OCR_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Run one OCR pass for the `image_ocr` tool and `read`'s image path.
+pub(crate) async fn ocr_image_path_bounded(image_path: PathBuf) -> Result<String, ToolError> {
+    ocr_image_path_bounded_within(OCR_TIMEOUT, image_path).await
+}
+
+async fn ocr_image_path_bounded_within(
+    budget: Duration,
+    image_path: PathBuf,
+) -> Result<String, ToolError> {
+    tokio::time::timeout(
+        budget,
+        tokio::task::spawn_blocking(move || {
             if !image_path.exists() {
                 return Err(ToolError::execution_failed(format!(
                     "image_ocr: source path does not exist: {}",
@@ -68,11 +94,13 @@ impl ToolSpec for ImageOcrTool {
                 )));
             }
             ocr_image_path(&image_path)
-        })
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("Image OCR task: {e}")))??;
-        Ok(ToolResult::success(text))
-    }
+        }),
+    )
+    .await
+    .map_err(|_| ToolError::Timeout {
+        seconds: budget.as_secs(),
+    })?
+    .map_err(|e| ToolError::execution_failed(format!("Image OCR task: {e}")))?
 }
 
 pub(crate) fn ocr_available() -> bool {
@@ -359,6 +387,24 @@ mod tests {
             msg.contains("does not exist"),
             "error must call out missing path; got {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn exhausted_ocr_budget_surfaces_a_timeout_instead_of_stalling() {
+        // An already-spent budget must hand control straight back as a
+        // `ToolError::Timeout`: the bounded wrapper may not wait on a backend
+        // that never returns. A genuinely wedged backend cannot be injected
+        // (tesseract resolution is PATH-probed and cached), so the zero
+        // budget stands in for the deadline firing. The file must exist so
+        // the wrapper reaches the OCR leg: a missing path would let the
+        // fast in-closure validation race (and beat) the zero budget.
+        let tmp = tempdir().expect("tempdir");
+        let image = tmp.path().join("real.png");
+        std::fs::write(&image, b"not really a png").expect("write fixture");
+        let err = ocr_image_path_bounded_within(Duration::ZERO, image)
+            .await
+            .expect_err("an exhausted budget must time out");
+        assert!(matches!(err, ToolError::Timeout { .. }), "{err:?}");
     }
 
     #[tokio::test]
