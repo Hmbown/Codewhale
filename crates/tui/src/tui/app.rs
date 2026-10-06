@@ -1501,13 +1501,14 @@ pub struct PendingRouteSave {
 /// Write `provider_identity`/`model` to the user-global config as the route the next
 /// launch should open with, and return the line to show the operator.
 fn persist_route_as_startup_default(
+    locale: Locale,
     identity: &crate::config::ProviderIdentity,
     model: &str,
 ) -> String {
     let route = format!("{}/{model}", identity.key);
     match try_persist_route_as_startup_default(identity, model) {
-        Ok(()) => format!("Remembered {route} as the startup default (config.toml)."),
-        Err(err) => format!("Save failed: {err}"),
+        Ok(()) => tr(locale, MessageId::RouteSaveRememberedDefault).replace("{route}", &route),
+        Err(err) => tr(locale, MessageId::RouteSaveFailed).replace("{error}", &err.to_string()),
     }
 }
 
@@ -2839,16 +2840,15 @@ impl App {
     ) -> String {
         use crate::fleet::store::{FleetFile, FleetOperator, save_fleet, set_selected};
         use crate::tui::views::route_save_prompt::RouteSaveChoice;
+        let locale = self.ui_locale;
         let Some(pending) = self.pending_route_save.take() else {
-            return "No pending route change to save.".to_string();
+            return tr(locale, MessageId::RouteSaveNothingPending).into_owned();
         };
         let route = format!("{}/{}", pending.provider_identity, pending.model);
         match choice {
             RouteSaveChoice::UpdateFleet => {
                 let Some((name, scope)) = pending.fleet.clone() else {
-                    return "Nothing to update — no team is selected. Use /fleet save-as to \
-                             save this route as a new team."
-                        .to_string();
+                    return tr(locale, MessageId::RouteSaveNoTeamSelected).into_owned();
                 };
                 match crate::fleet::store::load_fleet_in_scope(&name, scope, &self.workspace) {
                     Ok((mut fleet, _source_path)) => {
@@ -2858,18 +2858,16 @@ impl App {
                             reasoning: fleet.operator.as_ref().and_then(|op| op.reasoning.clone()),
                         });
                         match save_fleet(&fleet, scope, &self.workspace) {
-                            Ok(path) => format!(
-                                "Team `{}` now runs on {route} — wrote {}",
-                                fleet.name,
-                                path.display()
-                            ),
-                            Err(err) => format!("Team update failed: {err}"),
+                            Ok(path) => tr(locale, MessageId::RouteSaveTeamUpdated)
+                                .replace("{name}", &fleet.name)
+                                .replace("{route}", &route)
+                                .replace("{path}", &path.display().to_string()),
+                            Err(err) => tr(locale, MessageId::RouteSaveTeamUpdateFailed)
+                                .replace("{error}", &err.to_string()),
                         }
                     }
-                    Err(err) => format!(
-                        "Team update failed: {err} — the saved team may have moved. Use \
-                         /fleet save-as to persist the route."
-                    ),
+                    Err(err) => tr(locale, MessageId::RouteSaveTeamUpdateFailedMoved)
+                        .replace("{error}", &err.to_string()),
                 }
             }
             RouteSaveChoice::SaveAsNewFleet => {
@@ -2884,7 +2882,7 @@ impl App {
                     display.clone(),
                     Some("Saved from a session route choice.".to_string()),
                 ) else {
-                    return "Could not create the team.".to_string();
+                    return tr(locale, MessageId::RouteSaveTeamCreateFailed).into_owned();
                 };
                 fleet.operator = Some(FleetOperator {
                     provider: pending.provider_identity.clone(),
@@ -2902,19 +2900,20 @@ impl App {
                             crate::fleet::store::FleetScope::Personal,
                             &self.workspace,
                         ) {
-                            Ok(sel_path) => format!(
-                                " — selected as your user-global default; wrote {}",
-                                sel_path.display()
-                            ),
-                            Err(err) => format!(" — selection failed: {err}"),
+                            Ok(sel_path) => tr(locale, MessageId::RouteSaveSelectedNote)
+                                .replace("{path}", &sel_path.display().to_string()),
+                            Err(err) => tr(locale, MessageId::RouteSaveSelectionFailedNote)
+                                .replace("{error}", &err.to_string()),
                         };
-                        format!(
-                            "Saved route {route} as new team `{}` — wrote {}{selected_note}",
-                            display,
-                            path.display()
-                        )
+                        tr(locale, MessageId::RouteSaveSavedAsNewTeam)
+                            .replace("{route}", &route)
+                            .replace("{name}", &display)
+                            .replace("{path}", &path.display().to_string())
+                            .replace("{note}", &selected_note)
                     }
-                    Err(err) => format!("Save failed: {err}"),
+                    Err(err) => {
+                        tr(locale, MessageId::RouteSaveFailed).replace("{error}", &err.to_string())
+                    }
                 }
             }
             RouteSaveChoice::SaveAsDefault => {
@@ -2924,14 +2923,16 @@ impl App {
                         != self.provider_id_for_persistence())
                     || pending.model != active_model
                 {
-                    return "Save failed: the pending provider/model route is no longer active."
-                        .to_string();
+                    return tr(locale, MessageId::RouteSaveRouteNoLongerActive).into_owned();
                 }
                 let identity = match self.admitted_provider_identity() {
                     Ok(identity) => identity,
-                    Err(error) => return format!("Save failed: {error}"),
+                    Err(error) => {
+                        return tr(locale, MessageId::RouteSaveFailed)
+                            .replace("{error}", &error.to_string());
+                    }
                 };
-                persist_route_as_startup_default(identity, &pending.model)
+                persist_route_as_startup_default(locale, identity, &pending.model)
             }
             RouteSaveChoice::SessionOnly => {
                 format!("Model {route} kept for this session only — nothing was written.")
@@ -2954,7 +2955,9 @@ impl App {
     pub fn save_live_route_as_startup_default(&mut self) -> String {
         match self.try_save_live_route_as_startup_default() {
             Ok(receipt) => receipt,
-            Err(err) => format!("Save failed: {err}"),
+            Err(err) => self
+                .tr(MessageId::RouteSaveFailed)
+                .replace("{error}", &err.to_string()),
         }
     }
 
@@ -2975,9 +2978,9 @@ impl App {
         // Resolve the prompt only after the write lands. If persistence fails,
         // keep the retry available instead of discarding the operator's route.
         self.pending_route_save = None;
-        Ok(format!(
-            "Remembered {provider_identity}/{model} as the startup default (config.toml)."
-        ))
+        Ok(self
+            .tr(MessageId::RouteSaveRememberedDefault)
+            .replace("{route}", &format!("{provider_identity}/{model}")))
     }
 
     /// Record that the live session route changed to `provider_identity` /
