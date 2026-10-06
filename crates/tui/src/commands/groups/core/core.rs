@@ -471,11 +471,15 @@ pub fn profile_switch(_app: &mut App, arg: Option<&str>) -> CommandResult {
 }
 
 pub fn workspace_switch(app: &mut App, arg: Option<&str>) -> CommandResult {
+    let locale = app.ui_locale;
     let Some(raw_path) = arg.map(str::trim).filter(|path| !path.is_empty()) else {
-        return CommandResult::message(format!("Current workspace: {}", app.workspace.display()));
+        return CommandResult::message(
+            tr(locale, MessageId::WorkspaceCurrent)
+                .replace("{path}", &app.workspace.display().to_string()),
+        );
     };
 
-    let expanded = match expand_workspace_path(raw_path) {
+    let expanded = match expand_workspace_path(locale, raw_path) {
         Ok(path) => path,
         Err(message) => return CommandResult::error(message),
     };
@@ -486,30 +490,33 @@ pub fn workspace_switch(app: &mut App, arg: Option<&str>) -> CommandResult {
     };
 
     if !candidate.exists() {
-        return CommandResult::error(format!("Workspace does not exist: {}", candidate.display()));
+        return CommandResult::error(
+            tr(locale, MessageId::WorkspaceNotFound)
+                .replace("{path}", &candidate.display().to_string()),
+        );
     }
     if !candidate.is_dir() {
-        return CommandResult::error(format!(
-            "Workspace is not a directory: {}",
-            candidate.display()
-        ));
+        return CommandResult::error(
+            tr(locale, MessageId::WorkspaceNotDirectory)
+                .replace("{path}", &candidate.display().to_string()),
+        );
     }
 
     let workspace = candidate.canonicalize().unwrap_or(candidate);
     CommandResult::with_message_and_action(
-        format!("Switching workspace to {}...", workspace.display()),
+        tr(locale, MessageId::WorkspaceSwitching)
+            .replace("{path}", &workspace.display().to_string()),
         AppAction::SwitchWorkspace { workspace },
     )
 }
 
-fn expand_workspace_path(path: &str) -> Result<PathBuf, String> {
+fn expand_workspace_path(locale: Locale, path: &str) -> Result<PathBuf, String> {
+    let unresolved = || tr(locale, MessageId::WorkspaceHomeUnresolved).into_owned();
     if path == "~" {
-        return crate::config::effective_home_dir()
-            .ok_or_else(|| "Could not resolve home directory".to_string());
+        return crate::config::effective_home_dir().ok_or_else(unresolved);
     }
     if let Some(rest) = path.strip_prefix("~/") {
-        let home = crate::config::effective_home_dir()
-            .ok_or_else(|| "Could not resolve home directory".to_string())?;
+        let home = crate::config::effective_home_dir().ok_or_else(unresolved)?;
         return Ok(home.join(rest));
     }
     Ok(PathBuf::from(path))

@@ -896,16 +896,18 @@ pub(crate) async fn switch_workspace(
     workspace: PathBuf,
 ) {
     if app.is_loading {
-        app.status_message =
-            Some("Cannot switch workspace while a request is running.".to_string());
-        app.add_message(HistoryCell::System {
-            content: "Cannot switch workspace while a request is running.".to_string(),
-        });
+        let busy = app.tr(MessageId::WorkspaceSwitchBusy).into_owned();
+        app.status_message = Some(busy.clone());
+        app.add_message(HistoryCell::System { content: busy });
         return;
     }
 
+    let shown = workspace.display().to_string();
     if app.workspace == workspace {
-        app.status_message = Some(format!("Workspace unchanged: {}", workspace.display()));
+        app.status_message = Some(
+            app.tr(MessageId::WorkspaceUnchanged)
+                .replace("{path}", &shown),
+        );
         return;
     }
 
@@ -929,10 +931,11 @@ pub(crate) async fn switch_workspace(
             .await;
     }
 
-    app.add_message(HistoryCell::System {
-        content: format!("Switched workspace to {}", workspace.display()),
-    });
-    app.status_message = Some(format!("Workspace: {}", workspace.display()));
+    let switched = app
+        .tr(MessageId::WorkspaceSwitched)
+        .replace("{path}", &shown);
+    app.add_message(HistoryCell::System { content: switched });
+    app.status_message = Some(app.tr(MessageId::WorkspaceStatus).replace("{path}", &shown));
 }
 
 /// A message submitted with no usable key (#6566). Nothing reached a model:
