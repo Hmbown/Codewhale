@@ -4876,6 +4876,9 @@ async fn run_doctor(
             onboarded: crate::tui::onboarding::is_onboarded(),
             env_key_source: env_key_source.clone(),
             live_probe: live_probe.as_ref().map(Result::is_ok),
+            live_probe_timed_out: live_probe
+                .as_ref()
+                .is_some_and(|result| result.as_ref().is_err_and(doctor_probe_timed_out)),
         },
     );
     println!("{}", verdict.truecolor(aqua_r, aqua_g, aqua_b).bold());
@@ -5138,6 +5141,11 @@ async fn run_doctor(
             "  {} active provider credential: accepted by the live API check",
             "✓".truecolor(aqua_r, aqua_g, aqua_b)
         ),
+        // #6889: no answer in time says nothing about the credential.
+        Some(Err(error)) if doctor_probe_timed_out(error) => println!(
+            "  {} active provider credential: not confirmed, the live API check got no answer in time (see API Connectivity)",
+            "·".dimmed()
+        ),
         Some(Err(_)) => println!(
             "  {} active provider credential: live API check failed (see API Connectivity)",
             "✗".truecolor(red_r, red_g, red_b)
@@ -5219,9 +5227,15 @@ async fn run_doctor(
             }
             Err(e) => {
                 let error_msg = e.to_string();
+                let timed_out = doctor_probe_timed_out(e);
                 println!(
-                    "  {} API connection failed",
-                    "✗".truecolor(red_r, red_g, red_b)
+                    "  {} {}",
+                    "✗".truecolor(red_r, red_g, red_b),
+                    if timed_out {
+                        "API check got no answer in time"
+                    } else {
+                        "API connection failed"
+                    }
                 );
                 let names_status =
                     |status| crate::mcp::oauth::text_names_http_status(&error_msg, status);
@@ -5239,7 +5253,10 @@ async fn run_doctor(
                         "    API key lacks permissions. Verify the {} key is active.",
                         provider.provider().display_name()
                     );
-                } else if error_msg.contains("timeout") || error_msg.contains("Timeout") {
+                } else if timed_out
+                    || error_msg.contains("timeout")
+                    || error_msg.contains("Timeout")
+                {
                     for line in doctor_timeout_recovery_lines(config) {
                         println!("    {line}");
                     }
@@ -5997,6 +6014,9 @@ struct DoctorVerdictFacts {
     env_key_source: Option<String>,
     /// Outcome of the opt-in live API check; `None` when it did not run.
     live_probe: Option<bool>,
+    /// The live check failed by running out of time, not by being refused
+    /// (#6889). A model the provider is still loading looks exactly like this.
+    live_probe_timed_out: bool,
 }
 
 /// `set via <VAR> (value not shown; not checked offline)`.
@@ -6029,6 +6049,11 @@ fn doctor_verdict(
     use codewhale_config::StepStatus;
     const PROBE_HINT: &str = "run `codewhale doctor --probe-api` to verify";
     match facts.live_probe {
+        Some(false) if facts.live_probe_timed_out => {
+            return format!(
+                "Not confirmed: the live {provider} API check got no answer in time → the model may still be loading, so wait a minute and run `codewhale doctor --probe-api` again; see API Connectivity below."
+            );
+        }
         Some(false) => {
             return format!(
                 "Not ready: the live {provider} API check failed → see API Connectivity below; `codewhale auth set --provider {provider}` replaces a rejected key."
@@ -6153,6 +6178,7 @@ mod doctor_verdict_tests {
             onboarded,
             env_key_source: env_key_source.map(str::to_string),
             live_probe,
+            live_probe_timed_out: false,
         }
     }
 
@@ -6239,6 +6265,40 @@ mod doctor_verdict_tests {
         );
         assert!(verdict.starts_with("Not ready"), "{verdict}");
         assert!(verdict.contains("API Connectivity"), "{verdict}");
+    }
+
+    /// #6889: a live check that ran out of time has not shown the key or the
+    /// route to be wrong, so the verdict does not say "Not ready" or point at
+    /// replacing the key.
+    #[test]
+    fn a_live_probe_that_timed_out_is_not_reported_as_a_rejected_key() {
+        let state = codewhale_config::SetupState::default();
+        let verdict = super::doctor_verdict(
+            &state,
+            "openai",
+            &super::DoctorVerdictFacts {
+                live_probe_timed_out: true,
+                ..facts(true, Some("OPENAI_API_KEY"), Some(false))
+            },
+        );
+        assert!(verdict.starts_with("Not confirmed"), "{verdict}");
+        assert!(verdict.contains("may still be loading"), "{verdict}");
+        assert!(verdict.contains("--probe-api"), "{verdict}");
+        assert!(!verdict.contains("auth set"), "{verdict}");
+
+        let timed_out = anyhow::Error::new(crate::llm_client::LlmError::Timeout(
+            super::DOCTOR_PROBE_TIMEOUT,
+        ))
+        .context("live check");
+        assert!(super::doctor_probe_timed_out(&timed_out));
+        let refused = anyhow::Error::new(crate::llm_client::LlmError::ServerError {
+            status: 502,
+            message: "resources busy".to_string(),
+        });
+        assert!(!super::doctor_probe_timed_out(&refused));
+        assert!(!super::doctor_probe_timed_out(&anyhow::anyhow!(
+            "connect timeout"
+        )));
     }
 
     #[test]
@@ -8691,10 +8751,16 @@ fn recommended_strict_base_url(_config: &Config, _base_url: &str) -> &'static st
 
 fn doctor_timeout_recovery_lines(config: &Config) -> Vec<String> {
     let target = doctor_api_target(config);
-    let mut lines = vec![format!(
-        "Connection timed out while reaching {}.",
-        crate::doctor::structural_url_authority(&target.base_url)
-    )];
+    let mut lines = vec![
+        format!(
+            "Connection timed out while reaching {}.",
+            crate::doctor::structural_url_authority(&target.base_url)
+        ),
+        // #6889: some providers load a model on its first call, which can
+        // take longer than this check waits.
+        "If the key and endpoint are right, the model may still be loading: a first call to a model that has not been used recently can take a minute or two. Wait and run the check again."
+            .to_string(),
+    ];
 
     match config
         .active_provider_identity()
@@ -8968,13 +9034,31 @@ async fn test_api_connectivity(config: &Config) -> Result<()> {
         top_p: None,
     };
 
-    // Use tokio timeout to catch hanging requests
-    let timeout_duration = std::time::Duration::from_secs(15);
-    match tokio::time::timeout(timeout_duration, client.create_message(request)).await {
+    // Use tokio timeout to catch hanging requests. The timeout is typed so
+    // the report can tell "no answer yet" from a refusal (#6889).
+    match tokio::time::timeout(DOCTOR_PROBE_TIMEOUT, client.create_message(request)).await {
         Ok(Ok(_response)) => Ok(()),
         Ok(Err(e)) => Err(e),
-        Err(_) => anyhow::bail!("Request timeout after 15 seconds"),
+        Err(_) => Err(anyhow::Error::new(crate::llm_client::LlmError::Timeout(
+            DOCTOR_PROBE_TIMEOUT,
+        ))),
     }
+}
+
+/// How long the opt-in live check waits for its one-token answer.
+const DOCTOR_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whether the live check ran out of time instead of being refused (#6889).
+/// A provider that loads a model on its first call can take longer than the
+/// check waits, so this means "no answer yet", not a rejected key or a route
+/// that does not work.
+fn doctor_probe_timed_out(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<crate::llm_client::LlmError>(),
+            Some(crate::llm_client::LlmError::Timeout(_))
+        )
+    })
 }
 
 fn rustc_version() -> String {
@@ -16866,6 +16950,8 @@ mod doctor_endpoint_tests {
         assert!(text.contains("/v1/models"));
         assert!(text.contains("/v1/chat/completions"));
         assert!(!text.contains("api.deepseeki.com"));
+        // #6889: a timeout may be a model that is still loading.
+        assert!(text.contains("the model may still be loading"), "{text}");
     }
 }
 

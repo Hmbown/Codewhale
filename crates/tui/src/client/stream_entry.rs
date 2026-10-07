@@ -373,6 +373,13 @@ fn is_protocol_or_tls_failure(detail: &str) -> bool {
             .any(|needle| lower.contains(needle))
 }
 
+/// Added to a response-header timeout (#6889). A provider that loads a model
+/// on its first call can hold the headers back longer than this wait, and the
+/// transport advice alone makes that read as a broken connection.
+const COLD_MODEL_HINT: &str = "If this model has not been used recently, the provider may \
+     still be loading it: wait a minute and send the message again, or allow a longer wait with \
+     `codewhale config set stream.open_timeout_secs 180` (up to 300).";
+
 /// Open an SSE response through the shared transport policy.
 ///
 /// `attempt` builds and sends one wire-specific request on the client
@@ -411,7 +418,8 @@ where
                 return Err(anyhow::Error::new(LlmError::NetworkError(format!(
                     "SSE stream request did not receive response headers after {}s. \
                          `codewhale doctor` can still pass when non-streaming requests work; \
-                         on Windows or proxy networks, try `CODEWHALE_FORCE_HTTP1=1` and rerun `codewhale`.",
+                         on Windows or proxy networks, try `CODEWHALE_FORCE_HTTP1=1` and rerun `codewhale`. \
+                         {COLD_MODEL_HINT}",
                     open_req.open_timeout.as_secs()
                 ))));
             }
@@ -439,7 +447,7 @@ where
             "SSE stream request did not receive response headers after {}s \
              (HTTP/2 and HTTP/1.1). `codewhale doctor` can still pass when \
              non-streaming requests work; try `CODEWHALE_FORCE_HTTP1=1` and \
-             rerun `codewhale`.",
+             rerun `codewhale`. {COLD_MODEL_HINT}",
             open_req.open_timeout.as_secs()
         )))),
     }
@@ -670,6 +678,8 @@ force_http1 = {pinned}
             "header stall must be retryable: {classified:?}"
         );
         assert!(text.contains("CODEWHALE_FORCE_HTTP1=1"), "{text}");
+        // #6889: a header wait that ran out may be a model still loading.
+        assert!(text.contains("may still be loading it"), "{text}");
         assert!(
             !text.contains("HTTP/2 and HTTP/1.1"),
             "single-protocol stall must not claim a dual-protocol attempt: {text}"
@@ -865,6 +875,9 @@ force_http1 = {pinned}
         assert_eq!(attempts.load(Ordering::SeqCst), 2, "one fallback, no more");
         let text = err.to_string();
         assert!(text.contains("HTTP/2 and HTTP/1.1"), "{text}");
+        // #6889: a header wait that ran out may be a model still loading.
+        assert!(text.contains("may still be loading it"), "{text}");
+        assert!(text.contains("stream.open_timeout_secs"), "{text}");
     }
 
     #[test]
