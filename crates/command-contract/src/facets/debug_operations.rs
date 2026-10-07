@@ -48,7 +48,17 @@ pub struct DebugConversationUndo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DebugDiffObservation {
     GitUnavailable,
-    Output { names: String, stat: String },
+    /// Nothing to compare against: the session has saved no restore point
+    /// for this workspace and the workspace is not a git repository.
+    NoBaseline,
+    Output {
+        names: String,
+        stat: String,
+        /// The unified patch behind `names` and `stat`, bounded by the host.
+        patch: String,
+        /// The host cut `patch` at its bound; `names` and `stat` are whole.
+        patch_truncated: bool,
+    },
     Failed(String),
 }
 

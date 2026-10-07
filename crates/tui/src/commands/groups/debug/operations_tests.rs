@@ -17,40 +17,62 @@ fn diff_formats_observations_without_host_state_or_actions() {
             self.0.clone()
         }
     }
-    for (observation, message, error) in [
+    let output =
+        |names: &str, stat: &str, patch: &str, patch_truncated| DebugDiffObservation::Output {
+            names: names.into(),
+            stat: stat.into(),
+            patch: patch.into(),
+            patch_truncated,
+        };
+    let patch = "diff --git a/c.rs b/c.rs\n@@ -1 +1 @@\n-old\n+new\n";
+    for (observation, message, error, diff) in [
         (
             DebugDiffObservation::GitUnavailable,
             "Error: git not found on PATH",
             true,
+            None,
+        ),
+        (
+            DebugDiffObservation::NoBaseline,
+            "Nothing to compare yet: this session has not saved a restore point here, and this folder is not a git repository.",
+            false,
+            None,
         ),
         (
             DebugDiffObservation::Failed("fixture I/O".into()),
             "Git diff failed — is this a git repository?\nfixture I/O",
             false,
+            None,
         ),
         (
-            DebugDiffObservation::Output {
-                names: " \n".into(),
-                stat: "ignored".into(),
-            },
+            output(" \n", "ignored", "ignored", false),
             "No changes since session start",
             false,
+            None,
         ),
         (
-            DebugDiffObservation::Output {
-                names: "a.rs\n\nb.rs\n".into(),
-                stat: "".into(),
-            },
+            output("a.rs\n\nb.rs\n", "", "", false),
             "Changed files (2):\na.rs\nb.rs",
             false,
+            None,
         ),
         (
-            DebugDiffObservation::Output {
-                names: "a -> b\nc.rs\n".into(),
-                stat: " 2 files changed\n".into(),
-            },
+            output("a -> b\nc.rs\n", " 2 files changed\n", patch, false),
             "Changed files (2, 1 renamed):\na -> b\nc.rs\n\n── Stat ──\n2 files changed",
             false,
+            Some(patch),
+        ),
+        (
+            output("c.rs\n", "", patch, true),
+            "Changed files (1):\nc.rs\n\nThe diff is too long to show in full. The file list above is complete.",
+            false,
+            Some(patch),
+        ),
+        (
+            output("c.rs\n", "", "", true),
+            "Changed files (1):\nc.rs\n\nThe diff is too long to show in full. The file list above is complete.",
+            false,
+            None,
         ),
     ] {
         let result = undo::diff(
@@ -59,7 +81,16 @@ fn diff_formats_observations_without_host_state_or_actions() {
         );
         assert_eq!(result.message.as_deref(), Some(message));
         assert_eq!(result.is_error, error);
-        assert!(result.action.is_none());
+        // The changed lines travel as a pager request, never as transcript
+        // text: a patch is not Markdown.
+        match (result.action, diff) {
+            (None, None) => {}
+            (Some(DebugAction::OpenDiffPager { title, diff }), Some(expected)) => {
+                assert_eq!(title, "Changes since session start");
+                assert_eq!(diff, expected);
+            }
+            (action, expected) => panic!("{message}: {action:?} vs {expected:?}"),
+        }
     }
 }
 

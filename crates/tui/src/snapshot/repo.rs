@@ -97,6 +97,26 @@ pub struct SnapshotPathChange {
     pub removed: Option<u64>,
 }
 
+/// What the work tree holds now that a snapshot did not
+/// ([`SnapshotRepo::work_tree_changes_since`]), as `git diff` writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkTreeChanges {
+    /// One changed path per line, as `git diff --name-only` writes them.
+    pub names: String,
+    /// `git diff --stat`.
+    pub stat: String,
+    /// The unified patch, cut at the caller's bound on a char boundary; empty
+    /// when more than [`WORK_TREE_PATCH_MAX_LINES`] lines changed.
+    pub patch: String,
+    /// Whether the patch was cut or left out.
+    pub patch_truncated: bool,
+}
+
+/// Changed lines past which [`SnapshotRepo::work_tree_changes_since`] does
+/// not read the patch at all: git's whole output is buffered before it can be
+/// cut, so a generated multi-gigabyte file must not be diffed into memory.
+pub const WORK_TREE_PATCH_MAX_LINES: u64 = 200_000;
+
 /// What a file-scoped restore did to one path, relative to the working tree
 /// it was applied to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1420,6 +1440,96 @@ impl SnapshotRepo {
         git_diff_matches(diff)
     }
 
+    /// Everything in the work tree that differs from snapshot `from`: files
+    /// changed, deleted, and created since, including ones no snapshot has
+    /// recorded yet. New ignored paths stay out, as they stay out of a
+    /// snapshot; a path `from` holds is compared even if it is ignored now,
+    /// as the next snapshot would still record it.
+    ///
+    /// Read-only for the user and for the snapshot history: the work tree is
+    /// compared through a throwaway index, seeded with `from`'s paths and
+    /// then given every other path as "intent to add" (name and stat data, no
+    /// content), so the side repo's index is not written, no file content is
+    /// stored, and no snapshot is taken. (Git stores the empty blob those
+    /// entries name.) Renames are not detected, matching
+    /// [`Self::patch_between`]. The patch is cut at `max_patch_bytes`, and
+    /// left out past [`WORK_TREE_PATCH_MAX_LINES`] changed lines.
+    pub fn work_tree_changes_since(
+        &self,
+        from: &SnapshotId,
+        max_patch_bytes: usize,
+    ) -> io::Result<WorkTreeChanges> {
+        let scratch = tempfile::tempdir()?;
+        let index = scratch.path().join("index");
+        let run = |args: &[&str]| -> io::Result<String> {
+            let subcommand = args.first().copied().unwrap_or("git");
+            let mut cmd = crate::dependencies::Git::command()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "git not found on PATH"))?;
+            cmd.env("GIT_INDEX_FILE", &index)
+                .arg("--git-dir")
+                .arg(&self.git_dir)
+                .arg("--work-tree")
+                .arg(&self.work_tree)
+                .args(args);
+            let output = run_bounded_git(&mut cmd, subcommand)?;
+            if !output.status.success() {
+                return Err(io_other(format!(
+                    "git {subcommand} failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        };
+        // Seed with `from` first: on an empty index a file the snapshot holds
+        // but a later `.gitignore` covers would be skipped by `add` and read
+        // as deleted while it is still on disk.
+        run(&["read-tree", from.as_str()])?;
+        run(&["add", "--intent-to-add", "--", ":/"])?;
+        let diff = |format: &str| {
+            run(&[
+                "diff",
+                "--no-renames",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                format,
+                "--end-of-options",
+                from.as_str(),
+                "--",
+                ":/",
+            ])
+        };
+        // `--numstat`: `added\tremoved\tpath` per line, `-` for a binary side.
+        let numstat = diff("--numstat")?;
+        let mut names = String::new();
+        let mut changed_lines = 0_u64;
+        for record in numstat.lines() {
+            let mut fields = record.splitn(3, '\t');
+            let (Some(added), Some(removed), Some(path)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            for count in [added, removed] {
+                changed_lines = changed_lines.saturating_add(count.parse().unwrap_or(0));
+            }
+            names.push_str(path);
+            names.push('\n');
+        }
+        let stat = diff("--stat")?;
+        let (patch, patch_truncated) = if changed_lines > WORK_TREE_PATCH_MAX_LINES {
+            (String::new(), true)
+        } else {
+            truncate_at_char_boundary(&diff("--unified=3")?, max_patch_bytes)
+        };
+        Ok(WorkTreeChanges {
+            names,
+            stat,
+            patch,
+            patch_truncated,
+        })
+    }
+
     /// Paths that differ between snapshots `from` and `to`, in git's order,
     /// one [`SnapshotPathChange`] each: its `status` is git's `A`/`M`/`D`/`T`
     /// letter and its line counts are `None` for a binary file. Paths come
@@ -2441,7 +2551,7 @@ fn io_other(msg: impl Into<String>) -> io::Error {
 
 /// `text` whole, or the longest prefix that fits in `max_bytes` and ends on a
 /// char boundary; the flag says which of the two the caller got.
-fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> (String, bool) {
+pub(crate) fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> (String, bool) {
     if text.len() <= max_bytes {
         return (text.to_string(), false);
     }
@@ -4819,6 +4929,69 @@ mod tests {
             .expect("patch");
         assert!(unchanged.0.is_empty(), "{unchanged:?}");
         assert!(!unchanged.1);
+    }
+
+    /// The work tree is compared as it is now, not as the newest snapshot
+    /// left it: a file created since, which no snapshot or index holds, is in
+    /// the diff with its content, and reading it moves neither the repo's
+    /// HEAD nor its index.
+    #[test]
+    fn work_tree_changes_since_sees_edits_deletions_and_unrecorded_new_files() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        let ws = repo.work_tree().to_path_buf();
+        std::fs::write(ws.join(".gitignore"), b"ignored/\n").unwrap();
+        std::fs::write(ws.join("keep.txt"), b"same\n").unwrap();
+        std::fs::write(ws.join("edit.txt"), b"one\ntwo\n").unwrap();
+        std::fs::write(ws.join("gone.txt"), b"bye\n").unwrap();
+        std::fs::write(ws.join("late.txt"), b"still here\n").unwrap();
+        let before = repo.snapshot("pre-turn:1").expect("snapshot");
+        let head = git_output(&repo, &["rev-parse", "HEAD"]);
+        let index = git_output(&repo, &["ls-files", "--stage"]);
+
+        std::fs::write(ws.join("edit.txt"), b"one\nTWO\n").unwrap();
+        std::fs::remove_file(ws.join("gone.txt")).unwrap();
+        std::fs::write(ws.join("new file.txt"), b"fresh\n").unwrap();
+        std::fs::create_dir_all(ws.join("ignored")).unwrap();
+        std::fs::write(ws.join("ignored/skip.txt"), b"skip\n").unwrap();
+        // Ignored only after the snapshot recorded it, and untouched: it is
+        // not a deletion.
+        std::fs::write(ws.join(".gitignore"), b"ignored/\nlate.txt\n").unwrap();
+
+        let changes = repo
+            .work_tree_changes_since(&before, 1 << 20)
+            .expect("changes");
+        let mut names: Vec<&str> = changes.names.lines().collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [".gitignore", "edit.txt", "gone.txt", "new file.txt"]
+        );
+        assert!(!changes.patch.contains("still here"), "{}", changes.patch);
+        assert!(changes.stat.contains("edit.txt"), "{}", changes.stat);
+        assert!(!changes.patch_truncated);
+        for expected in ["-two", "+TWO", "-bye", "+fresh"] {
+            assert!(changes.patch.contains(expected), "{}", changes.patch);
+        }
+        assert!(!changes.patch.contains("skip"), "{}", changes.patch);
+        assert_eq!(git_output(&repo, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git_output(&repo, &["ls-files", "--stage"]), index);
+
+        let cut = repo.work_tree_changes_since(&before, 40).expect("changes");
+        assert!(cut.patch_truncated);
+        assert!(cut.patch.len() <= 40);
+        assert_eq!(cut.names, changes.names);
+
+        // Back at the snapshot: nothing differs, and nothing is invented.
+        std::fs::write(ws.join(".gitignore"), b"ignored/\n").unwrap();
+        std::fs::write(ws.join("edit.txt"), b"one\ntwo\n").unwrap();
+        std::fs::write(ws.join("gone.txt"), b"bye\n").unwrap();
+        std::fs::remove_file(ws.join("new file.txt")).unwrap();
+        let none = repo
+            .work_tree_changes_since(&before, 1 << 20)
+            .expect("changes");
+        assert_eq!(none.names, "");
+        assert_eq!(none.patch, "");
     }
 
     /// A tree the repo no longer holds — the receipt outlived the object —

@@ -124,10 +124,18 @@ pub(super) fn diff(contexts: CommandContexts<'_>, _: Option<&str>) -> CommandRes
     };
     match diff.diff() {
         DebugDiffObservation::GitUnavailable => CommandResult::error("git not found on PATH"),
+        DebugDiffObservation::NoBaseline => CommandResult::message(
+            "Nothing to compare yet: this session has not saved a restore point here, and this folder is not a git repository.",
+        ),
         DebugDiffObservation::Failed(error) => CommandResult::message(format!(
             "Git diff failed — is this a git repository?\n{error}"
         )),
-        DebugDiffObservation::Output { names, stat } => {
+        DebugDiffObservation::Output {
+            names,
+            stat,
+            patch,
+            patch_truncated,
+        } => {
             if names.trim().is_empty() {
                 return CommandResult::message("No changes since session start");
             }
@@ -152,7 +160,21 @@ pub(super) fn diff(contexts: CommandContexts<'_>, _: Option<&str>) -> CommandRes
                 message.push_str("\n\n── Stat ──\n");
                 message.push_str(stat_str);
             }
-            CommandResult::message(message)
+            if patch_truncated {
+                message.push_str(
+                    "\n\nThe diff is too long to show in full. The file list above is complete.",
+                );
+            }
+            if patch.trim().is_empty() {
+                return CommandResult::message(message);
+            }
+            CommandResult::with_message_and_action(
+                message,
+                DebugAction::OpenDiffPager {
+                    title: "Changes since session start".to_string(),
+                    diff: patch,
+                },
+            )
         }
     }
 }

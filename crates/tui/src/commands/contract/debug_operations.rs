@@ -91,36 +91,86 @@ impl CommandDebugUndoContext for DebugOperationsAdapter<'_> {
 
 impl CommandDebugDiffContext for DebugOperationsAdapter<'_> {
     fn diff(&self) -> DebugDiffObservation {
-        let workspace = self.host.app.borrow().workspace.clone();
-        let Some(mut name_only_cmd) = Git::command() else {
+        let app = self.host.app.borrow();
+        if !Git::available() {
             return DebugDiffObservation::GitUnavailable;
-        };
-        let Some(mut stat_cmd) = Git::command() else {
-            return DebugDiffObservation::GitUnavailable;
-        };
-        let names = name_only_cmd
-            .args(["diff", "--name-only"])
-            .current_dir(&workspace)
-            .output();
-        let stat = stat_cmd
-            .args(["diff", "--stat"])
-            .current_dir(&workspace)
-            .output();
-        match (names, stat) {
-            // Outside a git repository `git diff` prints nothing to stdout
-            // and exits non-zero: a failure to report, not "no changes".
-            (Ok(names), Ok(_)) if !names.status.success() => DebugDiffObservation::Failed(
-                String::from_utf8_lossy(&names.stderr)
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_string(),
-            ),
-            (Ok(names), Ok(stat)) => DebugDiffObservation::Output {
+        }
+        match session_diff(&app) {
+            Ok(Some(observation)) => observation,
+            Ok(None) => workspace_git_diff(&app.workspace),
+            Err(error) => DebugDiffObservation::Failed(error.to_string()),
+        }
+    }
+}
+
+/// Most patch text `/diff` hands to the pager. The file list and the stat
+/// are never cut.
+const MAX_DIFF_PATCH_BYTES: usize = 256 * 1024;
+
+/// What changed in the workspace since this session's first restore point,
+/// or `None` when the session has none here (no turn has run yet, or
+/// snapshots are off for this workspace).
+///
+/// The restore points are the session's own record of where it started, so
+/// this works the same in a folder that is not a git repository, and it
+/// includes files created since. Reads only: no snapshot is taken and the
+/// side repo is not created.
+fn session_diff(app: &App) -> std::io::Result<Option<DebugDiffObservation>> {
+    let Some(session_id) = app.current_session_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(repo) = crate::snapshot::SnapshotRepo::open_existing(&app.workspace)? else {
+        return Ok(None);
+    };
+    // Newest first, so the session's first restore point is the last match.
+    let Some(start) = repo
+        .list(usize::MAX)?
+        .into_iter()
+        .rev()
+        .find(|snapshot| snapshot.session_id.as_deref() == Some(session_id))
+    else {
+        return Ok(None);
+    };
+    let changes = repo.work_tree_changes_since(&start.tree, MAX_DIFF_PATCH_BYTES)?;
+    Ok(Some(DebugDiffObservation::Output {
+        names: changes.names,
+        stat: changes.stat,
+        patch: changes.patch,
+        patch_truncated: changes.patch_truncated,
+    }))
+}
+
+/// The workspace repository's own uncommitted changes: what `/diff` shows
+/// before the session has a restore point to compare against.
+fn workspace_git_diff(workspace: &std::path::Path) -> DebugDiffObservation {
+    let git = |args: &[&str]| Git::output(args, workspace);
+    // Outside a repository `git diff` prints nothing on stdout, which would
+    // read as "no changes".
+    match git(&["rev-parse", "--is-inside-work-tree"]) {
+        Ok(probe)
+            if probe.status.success()
+                && String::from_utf8_lossy(&probe.stdout).trim() == "true" => {}
+        Ok(_) => return DebugDiffObservation::NoBaseline,
+        Err(error) => return DebugDiffObservation::Failed(error.to_string()),
+    }
+    let names = git(&["diff", "--name-only"]);
+    let stat = git(&["diff", "--stat"]);
+    let patch = git(&["diff", "--no-color", "--no-ext-diff", "--no-textconv"]);
+    match (names, stat, patch) {
+        (Ok(names), Ok(stat), Ok(patch)) => {
+            let (patch, patch_truncated) = crate::snapshot::repo::truncate_at_char_boundary(
+                &String::from_utf8_lossy(&patch.stdout),
+                MAX_DIFF_PATCH_BYTES,
+            );
+            DebugDiffObservation::Output {
                 names: String::from_utf8_lossy(&names.stdout).into_owned(),
                 stat: String::from_utf8_lossy(&stat.stdout).into_owned(),
-            },
-            (Err(error), _) | (_, Err(error)) => DebugDiffObservation::Failed(error.to_string()),
+                patch,
+                patch_truncated,
+            }
+        }
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+            DebugDiffObservation::Failed(error.to_string())
         }
     }
 }

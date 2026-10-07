@@ -131,7 +131,11 @@ fn diff_dispatch_reads_only_the_apps_workspace_without_changing_files() {
         ))
     );
     assert!(!result.is_error);
-    assert!(result.action.is_none());
+    // The changed lines themselves, not only the names and counts.
+    let Some(AppAction::OpenDiffPager { diff, .. }) = result.action else {
+        panic!("expected the diff pager: {:?}", result.action);
+    };
+    assert!(diff.contains("-before\n+after\n"), "{diff}");
     assert_eq!(
         std::fs::read_to_string(workspace.path().join("tracked.txt")).unwrap(),
         "after\n"
@@ -160,9 +164,11 @@ fn diff_outside_a_git_repository_says_so_instead_of_no_changes() {
         .message
         .unwrap_or_default();
 
-    assert!(
-        message.starts_with("Git diff failed — is this a git repository?"),
-        "{message}"
+    // No restore point and no repository: nothing to compare against, which
+    // is said plainly rather than reported as "no changes" or as a failure.
+    assert_eq!(
+        message,
+        "Nothing to compare yet: this session has not saved a restore point here, and this folder is not a git repository."
     );
 }
 
@@ -639,6 +645,59 @@ fn push_exchange(app: &mut App, prompt: &str) {
             cache_control: None,
         }],
     });
+}
+
+/// `/diff` in a folder that is not a git repository compares against the
+/// session's first restore point, so real edits are shown, including a file
+/// created after the newest snapshot. It said "No changes since session
+/// start" there, because `git diff` prints nothing outside a repository.
+#[test]
+fn diff_in_a_folder_without_git_shows_the_changes_since_the_sessions_first_restore_point() {
+    let fx = UndoFixture::new();
+    fx.write("duration.mjs", "export const unit = 'ms';\n");
+    // Another session's older restore point is not this session's start.
+    fx.snapshot("pre-turn:1", "other");
+    fx.write("duration.mjs", "export const unit = 's';\n");
+    fx.snapshot("pre-turn:1", "s1");
+    fx.write("duration.mjs", "export const unit = 'min';\n");
+    fx.snapshot("post-turn:1", "s1");
+    fx.write("notes.txt", "written after the turn\n");
+    let snapshots = fx.repo.list(usize::MAX).unwrap().len();
+
+    let mut app = fx.app("s1");
+    let result = super::execute("/diff", &mut app);
+
+    assert!(!result.is_error, "{:?}", result.message);
+    let message = result.message.clone().unwrap_or_default();
+    assert!(
+        message.starts_with("Changed files (2):\nduration.mjs\nnotes.txt"),
+        "{message}"
+    );
+    let Some(AppAction::OpenDiffPager { title, diff }) = result.action else {
+        panic!("expected the diff pager: {:?}", result.action);
+    };
+    assert_eq!(title, "Changes since session start");
+    assert!(
+        diff.contains("-export const unit = 's';\n+export const unit = 'min';\n"),
+        "{diff}"
+    );
+    assert!(diff.contains("+written after the turn"), "{diff}");
+    assert!(!diff.contains("'ms'"), "another session's edit: {diff}");
+    // Reading the diff takes no snapshot and changes no file.
+    assert_eq!(fx.repo.list(usize::MAX).unwrap().len(), snapshots);
+    assert_eq!(fx.read("notes.txt"), "written after the turn\n");
+
+    // A session with no restore point here has nothing to compare against,
+    // and says so instead of reporting no changes.
+    let mut fresh = fx.app("s2");
+    let result = super::execute("/diff", &mut fresh);
+    assert_eq!(
+        result.message.as_deref(),
+        Some(
+            "Nothing to compare yet: this session has not saved a restore point here, and this folder is not a git repository."
+        )
+    );
+    assert!(result.action.is_none());
 }
 
 /// `/undo` restores only the paths the undone turn changed: an edit the user

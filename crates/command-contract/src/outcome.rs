@@ -63,6 +63,12 @@ pub enum DebugAction {
         title: String,
         content: String,
     },
+    /// Show a unified diff in a pager, rendered as the transcript renders an
+    /// edit, without copying it into transcript history.
+    OpenDiffPager {
+        title: String,
+        diff: String,
+    },
     OpenContextInspector,
     SendMessage(String),
     SyncSession(SessionSyncPayload),

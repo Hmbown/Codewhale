@@ -314,6 +314,22 @@ pub(crate) fn open_text_pager(app: &mut App, title: String, content: String) {
     ));
 }
 
+/// Open a unified diff in a pager, rendered like an edit in the transcript.
+pub(crate) fn open_diff_pager(app: &mut App, title: String, diff: &str) {
+    let width = app
+        .viewport
+        .last_transcript_area
+        .map(|area| area.width)
+        .unwrap_or(80);
+    // A patch is file content. Keep the terminal-injection boundary
+    // `PagerView::from_text` applies to every other pager body.
+    let mut sanitized = String::with_capacity(diff.len());
+    crate::tui::osc8::strip_ansi_into(diff, &mut sanitized);
+    let lines = crate::tui::diff_render::render_diff(&sanitized, width.saturating_sub(2));
+    app.view_stack
+        .push(PagerView::new(title, lines).with_copy_text(sanitized));
+}
+
 pub(crate) fn open_context_inspector(app: &mut App) {
     app.view_stack.push(ContextInspectorView::new(app));
 }

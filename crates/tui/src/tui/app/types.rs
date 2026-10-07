@@ -716,6 +716,12 @@ pub enum AppAction {
         title: String,
         content: String,
     },
+    /// Show a unified diff in a pager with the transcript's diff rendering,
+    /// without copying it into transcript history (`/diff`).
+    OpenDiffPager {
+        title: String,
+        diff: String,
+    },
     /// Review a host-generated command; the pager carries its exact token
     /// through explicit confirmation and the normal command dispatcher.
     OpenCommandReview {

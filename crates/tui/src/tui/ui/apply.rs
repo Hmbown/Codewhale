@@ -1988,6 +1988,10 @@ async fn apply_command_result_inner(
             AppAction::OpenTextPager { title, content } => {
                 open_text_pager(app, title, content);
             }
+            AppAction::OpenDiffPager { title, diff } => {
+                open_diff_pager(app, title, &diff);
+                app.needs_redraw = true;
+            }
             AppAction::OpenCommandReview {
                 title,
                 content,
