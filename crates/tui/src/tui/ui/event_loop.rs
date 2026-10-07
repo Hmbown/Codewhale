@@ -355,6 +355,28 @@ pub(crate) fn ensure_runtime_session_id(app: &mut App) -> String {
     session_id
 }
 
+/// How long a startup-screen submit waits for the engine to install the
+/// session it just began before dispatching the input anyway.
+const LAUNCH_SESSION_SYNC_WAIT: Duration = Duration::from_secs(2);
+
+/// Wait until the engine has processed every operation queued so far.
+///
+/// The App mints a session id and tells the engine with `Op::SyncSession`,
+/// which the engine installs later, on its own task. Until then the two
+/// disagree, and anything the App resolves by session id against engine-owned
+/// state misses: the extension host identifies this caller by the engine's
+/// session id, so a plugin command selected for the caller read as unknown.
+/// The operation channel is FIFO, so the snapshot reply proves the sync ahead
+/// of it was applied. Bounded: an engine that does not answer in time costs
+/// only the old behaviour, never a stuck composer.
+pub(crate) async fn await_engine_session_sync(engine_handle: &EngineHandle) {
+    let _ = tokio::time::timeout(
+        LAUNCH_SESSION_SYNC_WAIT,
+        engine_handle.get_session_snapshot(),
+    )
+    .await;
+}
+
 fn persist_current_session_goal(app: &App) -> Result<(), String> {
     let session_id = app
         .current_session_id
@@ -1497,6 +1519,10 @@ async fn dispatch_launch_composer_submit(
     if apply_command_result(terminal, app, engine_handle, task_manager, config, result).await? {
         return Ok(true);
     }
+    // The input below is dispatched in this same keypress. Let the engine
+    // install the new session first, so a plugin command or skill typed on the
+    // startup screen resolves for this session instead of reading as unknown.
+    await_engine_session_sync(engine_handle).await;
     // The transition is applied; only now consume the draft it carries.
     let Some(input) = app.handle_composer_enter() else {
         return Ok(false);
@@ -7879,6 +7905,78 @@ mod session_boot_event_tests {
             !translation_origin_is_current(&app, long_session.as_deref(), long_turn.as_deref()),
             "fixed fingerprints must distinguish ids with the same long prefix"
         );
+    }
+}
+
+#[cfg(test)]
+mod launch_session_sync_tests {
+    use super::await_engine_session_sync;
+    use crate::config::Config;
+    use crate::core::engine::{Engine, EngineConfig};
+    use crate::core::ops::Op;
+    use crate::extension_host::{
+        ExtensionHostManager, ExtensionHostOptions, TestManagerGuard, caller_view,
+    };
+    use crate::features::Feature;
+    use crate::plugins::PluginRegistry;
+    use crate::plugins::activation::TestPolicyGuard;
+    use codewhale_config::AppMode;
+    use std::sync::Arc;
+
+    /// A submit on the startup screen begins a session and runs its input in
+    /// one keypress. The extension host knows this caller by the engine's
+    /// session id, which only moves when the engine processes the sync: before
+    /// the wait the App's new id finds no caller (the 0.10.1 "Unknown command"
+    /// on a plugin command's first use), after it the caller is found.
+    #[tokio::test]
+    async fn launch_submit_waits_for_the_engine_to_install_the_new_session() {
+        // No native code runs here: the caller identity is all this needs.
+        let _policy = TestPolicyGuard::extension_host(false);
+        let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions::default()));
+        let _manager = TestManagerGuard::install(Arc::clone(&manager));
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let mut engine_config = EngineConfig {
+            workspace: workspace.path().to_path_buf(),
+            session_id: Some("startup-session".to_string()),
+            plugin_registry: Some(Arc::new(PluginRegistry::empty(workspace.path()))),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            ..EngineConfig::default()
+        };
+        engine_config.features.enable(Feature::ExtensionHost);
+        let model = engine_config.model.clone();
+        let (engine, handle) = Engine::new(engine_config, &Config::default());
+        let run = tokio::spawn(engine.run());
+        assert!(
+            caller_view(workspace.path(), Some("startup-session"), None).is_some(),
+            "the engine attaches under the session it was started with"
+        );
+
+        handle
+            .send(Op::SyncSession {
+                session_id: Some("launch-session".to_string()),
+                messages: Vec::new(),
+                system_prompt: None,
+                system_prompt_override: false,
+                model,
+                workspace: workspace.path().to_path_buf(),
+                mode: AppMode::Agent,
+            })
+            .await
+            .expect("sync session");
+        assert!(
+            caller_view(workspace.path(), Some("launch-session"), None).is_none(),
+            "queued is not installed: the engine has not run the sync yet"
+        );
+
+        await_engine_session_sync(&handle).await;
+        assert!(
+            caller_view(workspace.path(), Some("launch-session"), None).is_some(),
+            "after the wait the new session resolves to this engine's caller"
+        );
+        assert!(caller_view(workspace.path(), Some("startup-session"), None).is_none());
+
+        run.abort();
     }
 }
 
