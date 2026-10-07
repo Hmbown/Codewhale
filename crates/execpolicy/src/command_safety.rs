@@ -2074,6 +2074,10 @@ pub fn is_literal_rm_invocation(command: &str) -> bool {
 /// Deliberately over-inclusive (`echo rm -rf /etc` yields an `rm` argv too):
 /// callers use it to *hold* catastrophic commands, never to allow anything.
 /// `None` when words nest deeper than `MAX_WRAPPER_DEPTH`: fail closed.
+///
+/// A descriptor redirect (`2>&1`) is not a command line: its `&` is part of
+/// the redirect. Descending into it re-read the same word until the depth
+/// limit, so every `npm test 2>&1` failed closed as a catastrophic command.
 pub fn command_invocations(command: &str) -> Option<Vec<Vec<String>>> {
     fn collect(command: &str, depth: usize, out: &mut Vec<Vec<String>>) -> bool {
         if depth > MAX_WRAPPER_DEPTH {
@@ -2086,6 +2090,7 @@ pub fn command_invocations(command: &str) -> Option<Vec<Vec<String>>> {
                 argv[0] = command_word(word);
                 out.push(argv);
                 if word.contains(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '&' | '|'))
+                    && !is_descriptor_duplication(word)
                     && !collect(word, depth + 1, out)
                 {
                     return false;
@@ -2096,6 +2101,18 @@ pub fn command_invocations(command: &str) -> Option<Vec<Vec<String>>> {
     }
     let mut out = Vec::new();
     collect(command, 0, &mut out).then_some(out)
+}
+
+/// A whole word that only duplicates or closes a file descriptor: `2>&1`,
+/// `>&2`, `1>&-`, `0<&3`. Nothing else qualifies: `&>file`, a trailing `&` and
+/// `a&b` still fail closed in [`command_invocations`].
+fn is_descriptor_duplication(word: &str) -> bool {
+    let rest = word.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    rest.strip_prefix(">&")
+        .or_else(|| rest.strip_prefix("<&"))
+        .is_some_and(|target| {
+            target == "-" || (!target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()))
+        })
 }
 
 /// How many wrappers (`sudo env nice sh -c ...`) the classifier will peel
@@ -2934,6 +2951,49 @@ mod tests {
             command_invocations(&nested).is_none(),
             "too deep fails closed"
         );
+    }
+
+    #[test]
+    fn command_invocations_read_past_a_descriptor_redirect() {
+        // `2>&1` is a redirect, not a nested command line. It used to recurse
+        // on itself to the depth limit and fail closed for every test run.
+        for command in [
+            "npm test 2>&1",
+            "npm test 2>&1 | tail -20",
+            "cargo build > /dev/null 2>&1",
+            "echo failed >&2",
+            "make check 2>&-",
+        ] {
+            let argvs = command_invocations(command).expect(command);
+            assert!(argvs.iter().all(|argv| argv[0] != "rm"), "{command}");
+        }
+        // The redirect hides nothing: the command beside it is still found,
+        // including inside a shell payload.
+        for command in [
+            "rm -rf /etc 2>&1",
+            "sudo rm -rf /etc > /dev/null 2>&1",
+            "bash -c 'rm -rf /etc 2>&1'",
+            "npm test 2>&1; rm -rf /etc",
+        ] {
+            assert!(
+                command_invocations(command)
+                    .expect(command)
+                    .iter()
+                    .any(|argv| argv[0] == "rm" && argv.iter().any(|arg| arg == "/etc")),
+                "{command}"
+            );
+        }
+        // Only a whole descriptor-duplication word is exempt. Other `&`
+        // spellings keep failing closed.
+        for command in [
+            "npm test &",
+            "true&rm -rf /etc",
+            "npm test &>/dev/null",
+            "npm test 2>&1&rm -rf /etc",
+            "npm test 2>&file",
+        ] {
+            assert!(command_invocations(command).is_none(), "{command}");
+        }
     }
     use super::*;
 

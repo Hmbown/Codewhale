@@ -2189,6 +2189,7 @@ reasoning contract, and all four membership ids omit generic sampling fields.
 - `[approval] default_selection` (string, optional): which option an approval
   card highlights when it first appears — `deny` (default) or `allow_once`.
   `deny` means a reflexive Enter on a card you have not read refuses the call.
+  The highlighted row is tagged `(Enter)`; press `y` to allow once.
   Set `allow_once` to restore the pre-v0.9.6 Enter-to-approve muscle memory
   (#5293). It moves the highlight only: which calls are prompted for is still
   `approval_policy` plus the rules in `permissions.toml`.

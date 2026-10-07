@@ -1957,6 +1957,74 @@ fn stakes_split_routine_elevated_critical() {
 }
 
 #[test]
+fn stderr_redirect_does_not_change_the_effect_badge() {
+    // The same test run must read the same however the model spells it.
+    let run = |command: &str| {
+        ApprovalRequest::new(
+            "test-id",
+            "exec_shell",
+            "Run a shell command",
+            &json!({ "command": command }),
+            "tool:exec_shell",
+        )
+    };
+    for command in [
+        "npm test",
+        "npm test 2>&1",
+        "npm test 2>&1 | tail -20",
+        "cargo build > /dev/null 2>&1",
+    ] {
+        let request = run(command);
+        assert_eq!(request.stakes(), ApprovalStakes::Elevated, "{command}");
+        let joined = render_lines(&ApprovalView::new(request), 100, 40).join("\n");
+        assert!(joined.contains("Runs a command"), "{command}:\n{joined}");
+        assert!(!joined.contains("Can't be undone"), "{command}:\n{joined}");
+    }
+    // A redirect does not hide a destructive command either.
+    assert_eq!(run("rm -rf /etc 2>&1").stakes(), ApprovalStakes::Critical);
+}
+
+#[test]
+fn highlighted_option_row_names_enter() {
+    // Deny is highlighted by default (#5293). The row says so, so a newcomer
+    // sees that Enter refuses and `y` allows.
+    let tagged = |view: &ApprovalView| {
+        render_lines(view, 100, 40)
+            .into_iter()
+            .filter(|line| line.contains("(Enter)"))
+            .collect::<Vec<_>>()
+    };
+    let rows = tagged(&ApprovalView::new(shell_request()));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(
+        rows[0].contains("[3 / d / n] Don't allow (Enter)"),
+        "{rows:?}"
+    );
+
+    // The tag follows the highlight; it is not a claim about Deny.
+    let rows = tagged(&ApprovalView::new_with_default_selection(
+        shell_request(),
+        Locale::En,
+        ApprovalDefaultSelection::AllowOnce,
+    ));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].contains("[1 / y] Allow once (Enter)"), "{rows:?}");
+
+    // The default Deny row still fits one 40-column row in every language,
+    // so the tag never pushes a control off a narrow band.
+    for &locale in Locale::shipped() {
+        let view = ApprovalView::new_for_locale(shell_request(), locale);
+        let rows = tagged(&view);
+        assert_eq!(rows.len(), 1, "{locale:?}: {rows:?}");
+        let narrow = render_lines(&view, 40, 40)
+            .into_iter()
+            .filter(|line| line.contains("(Enter)"))
+            .count();
+        assert_eq!(narrow, 1, "{locale:?}: the tag wrapped at 40 columns");
+    }
+}
+
+#[test]
 fn agent_tool_is_classified_and_renders_calm() {
     assert_eq!(get_tool_category("agent"), ToolCategory::Agent);
 

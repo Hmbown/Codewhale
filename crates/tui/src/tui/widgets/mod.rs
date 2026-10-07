@@ -1888,16 +1888,22 @@ fn approval_control_facts(
         } else {
             Span::raw("  ")
         };
+        let mut spans = vec![
+            lead,
+            Span::styled(
+                format!("[{}] ", opt.key_hint),
+                shortcut_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(opt.label.to_string(), option_style),
+        ];
+        // Deny is highlighted by default (#5293), so say on the row itself
+        // what Enter will do: a reflexive Enter is otherwise a silent refusal.
+        if is_selected {
+            spans.push(Span::styled(APPROVAL_ENTER_TAG, shortcut_style));
+        }
         actions.push(DecisionBandAction {
             persistent: opt.persistent,
-            line: Line::from(vec![
-                lead,
-                Span::styled(
-                    format!("[{}] ", opt.key_hint),
-                    shortcut_style.add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(opt.label.to_string(), option_style),
-            ]),
+            line: Line::from(spans),
         });
     }
     let footer = Line::from(vec![
@@ -1916,6 +1922,9 @@ fn approval_control_facts(
         .then(|| Span::styled(save_ask_rule_hint(locale), Style::default().fg(shortcut)));
     (question, actions, footer, save_hint)
 }
+/// Key name appended to the highlighted option row, like `Esc` on its own row.
+const APPROVAL_ENTER_TAG: &str = " (Enter)";
+
 fn approval_proceed_question(locale: Locale) -> &'static str {
     match locale {
         Locale::ZhHans => "是否继续？",

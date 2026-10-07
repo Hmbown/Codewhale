@@ -2909,6 +2909,35 @@ mod tests {
     }
 
     #[test]
+    fn shell_stderr_redirect_does_not_change_the_action_kind() {
+        // `2>&1` only joins two output streams. It must not turn a test run
+        // into a destructive action, and it must not hide a real one.
+        for command in [
+            "npm test",
+            "npm test 2>&1",
+            "npm test 2>&1 | tail -20",
+            "cargo build > /dev/null 2>&1",
+        ] {
+            let ctx = ctx_for(
+                "exec_shell",
+                json!({ "command": command }),
+                RunOrigin::Interactive,
+                ApprovalMode::Suggest,
+            );
+            assert_eq!(ctx.action_kind, ToolActionKind::Shell, "{command}");
+        }
+        for command in ["rm -rf /etc 2>&1", "bash -c 'rm -rf /etc 2>&1'"] {
+            let ctx = ctx_for(
+                "exec_shell",
+                json!({ "command": command }),
+                RunOrigin::Interactive,
+                ApprovalMode::Suggest,
+            );
+            assert_eq!(ctx.action_kind, ToolActionKind::Destructive, "{command}");
+        }
+    }
+
+    #[test]
     fn shell_git_tag_list_does_not_match_publish_review() {
         let ctx = ctx_for(
             "exec_shell",

@@ -1214,7 +1214,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 
 - `approval_policy`(字符串，可选)：`on-request`、`untrusted` 或 `never`。`/config` 中的运行时 `approval_mode` 编辑也接受 `on-request` 和 `untrusted` 别名。
 
-- `[approval] default_selection`(字符串，可选)：审批卡片首次出现时高亮哪个选项——`deny`(默认)或 `allow_once`。`deny` 意味着在没读过的卡片上反射性按 Enter 会拒绝调用。设置 `allow_once` 恢复 v0.9.6 之前的 Enter 即批准肌肉记忆(#5293)。它只移动高亮：哪些调用会被提示仍由 `approval_policy` 加 `permissions.toml` 中的规则决定。
+- `[approval] default_selection`(字符串，可选)：审批卡片首次出现时高亮哪个选项——`deny`(默认)或 `allow_once`。`deny` 意味着在没读过的卡片上反射性按 Enter 会拒绝调用。高亮的那一行会标注 `(Enter)`；按 `y` 可仅允许本次。设置 `allow_once` 恢复 v0.9.6 之前的 Enter 即批准肌肉记忆(#5293)。它只移动高亮：哪些调用会被提示仍由 `approval_policy` 加 `permissions.toml` 中的规则决定。
 
   ```toml
   [approval]
