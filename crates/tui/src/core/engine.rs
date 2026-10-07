@@ -8417,7 +8417,7 @@ impl Engine {
     /// recorded once, a changed one supersedes it, and one a compaction
     /// dropped is recorded again. Child and RLM hosts get none: their tool
     /// surface is fixed by their parent.
-    pub(super) async fn record_mcp_configured_servers(
+    async fn record_mcp_configured_servers(
         &mut self,
         policy: &ToolSurfacePolicy,
         catalog: &[Tool],
