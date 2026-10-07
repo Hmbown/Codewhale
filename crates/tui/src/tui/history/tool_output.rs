@@ -1114,7 +1114,7 @@ mod ansi_colour_tests {
                     );
                     assert_eq!(
                         wrap_text(line, width),
-                        [line.clone()],
+                        std::slice::from_ref(line),
                         "a wrapped row must not wrap again at width {width}"
                     );
                 }
