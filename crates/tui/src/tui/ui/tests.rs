@@ -59,6 +59,7 @@ use tempfile::TempDir;
 
 mod conversation_undo;
 mod model_picker_actions;
+mod plan_handoff;
 mod runtime_store_binding;
 
 #[test]

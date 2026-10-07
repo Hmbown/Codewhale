@@ -33,8 +33,9 @@ mod tool_run;
 
 use archived_context::{parse_archived_context, render_archived_context};
 pub use automation::{AutomationCell, AutomationCellKind};
+pub(crate) use checklist::is_checklist_tool_name;
 use checklist::{
-    is_checklist_tool_name, parse_checklist_snapshot, parse_update_prefix, render_checklist_card,
+    parse_checklist_snapshot, parse_update_prefix, render_checklist_card,
     render_checklist_change_card,
 };
 

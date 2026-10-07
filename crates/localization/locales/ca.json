@@ -2475,5 +2475,14 @@
   "AuthReplacedPreviousSignIn": "S'ha substituït l'inici de sessió anterior de Codewhale a {provider}.",
   "AuthSameAccountAsBefore": "És el mateix compte que abans; per fer servir un altre compte de {provider}, tanca'n la sessió al navegador (o fes servir una finestra privada) i torna a iniciar la sessió.",
   "AuthEnvTokenOutranksSignIn": "OPENAI_CODEX_ACCESS_TOKEN o CODEX_ACCESS_TOKEN està definit en aquest entorn i té prioritat sobre aquest inici de sessió; les sol·licituds continuaran fent servir el compte d'aquest testimoni fins que el suprimeixis.",
-  "PinnedPromptJumpToMessage": "Ves a aquest missatge"
+  "PinnedPromptJumpToMessage": "Ves a aquest missatge",
+  "PlanHandoffHeader": "Pla a punt",
+  "PlanHandoffQuestion": "Com vols continuar?",
+  "PlanHandoffWorkAsk": "Work (Pregunta)",
+  "PlanHandoffWorkAskDetail": "Comença amb el pla. Les edicions i les ordres et demanen permís abans.",
+  "PlanHandoffWorkAuto": "Work (Revisió automàtica)",
+  "PlanHandoffWorkAutoDetail": "Comença amb el pla. Les accions de risc es revisen automàticament i encara et poden preguntar.",
+  "PlanHandoffKeepPlanning": "Continua planificant",
+  "PlanHandoffKeepPlanningDetail": "Segueix a Plan. No es canvia res.",
+  "PlanHandoffProceed": "Endavant amb el pla."
 }

@@ -2475,5 +2475,14 @@
   "AuthReplacedPreviousSignIn": "이전 Codewhale {provider} 로그인을 대체했습니다.",
   "AuthSameAccountAsBefore": "이전과 같은 계정입니다. 다른 {provider} 계정을 사용하려면 브라우저에서 이 계정에서 로그아웃하거나 시크릿 창을 연 뒤 다시 로그인하세요.",
   "AuthEnvTokenOutranksSignIn": "이 환경에 OPENAI_CODEX_ACCESS_TOKEN 또는 CODEX_ACCESS_TOKEN이 설정되어 있어 이 로그인보다 우선합니다. 설정을 해제할 때까지 요청은 해당 토큰의 계정을 계속 사용합니다.",
-  "PinnedPromptJumpToMessage": "이 메시지로 이동"
+  "PinnedPromptJumpToMessage": "이 메시지로 이동",
+  "PlanHandoffHeader": "계획 준비 완료",
+  "PlanHandoffQuestion": "어떻게 진행할까요?",
+  "PlanHandoffWorkAsk": "Work (확인)",
+  "PlanHandoffWorkAskDetail": "계획을 시작합니다. 편집과 명령은 먼저 확인을 요청합니다.",
+  "PlanHandoffWorkAuto": "Work (자동 검토)",
+  "PlanHandoffWorkAutoDetail": "계획을 시작합니다. 위험한 작업은 자동으로 검토되며 확인을 요청할 수도 있습니다.",
+  "PlanHandoffKeepPlanning": "계속 계획하기",
+  "PlanHandoffKeepPlanningDetail": "Plan 에 머뭅니다. 아무것도 변경되지 않습니다.",
+  "PlanHandoffProceed": "계획대로 진행해 주세요."
 }

@@ -2475,5 +2475,14 @@
   "AuthEnvTokenOutranksSignIn": "此環境已設定 OPENAI_CODEX_ACCESS_TOKEN 或 CODEX_ACCESS_TOKEN，其優先順序高於本次登入；在取消設定之前，請求會繼續使用該權杖的帳戶。",
   "TranscriptThought": "思考完畢",
   "TranscriptThoughtFor": "思考耗時 {duration}",
-  "PinnedPromptJumpToMessage": "跳轉到這則訊息"
+  "PinnedPromptJumpToMessage": "跳轉到這則訊息",
+  "PlanHandoffHeader": "計畫已就緒",
+  "PlanHandoffQuestion": "你想如何繼續？",
+  "PlanHandoffWorkAsk": "Work（詢問）",
+  "PlanHandoffWorkAskDetail": "開始執行計畫。編輯與指令會先徵求你的同意。",
+  "PlanHandoffWorkAuto": "Work（自動審核）",
+  "PlanHandoffWorkAutoDetail": "開始執行計畫。有風險的操作會自動審核，仍可能向你確認。",
+  "PlanHandoffKeepPlanning": "繼續規劃",
+  "PlanHandoffKeepPlanningDetail": "留在 Plan。不做任何變更。",
+  "PlanHandoffProceed": "依計畫開始執行。"
 }

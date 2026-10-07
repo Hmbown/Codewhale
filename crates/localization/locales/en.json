@@ -2475,5 +2475,14 @@
   "AuthReplacedPreviousSignIn": "Replaced the previous Codewhale {provider} sign-in.",
   "AuthSameAccountAsBefore": "This is the same account as before; to use another {provider} account, sign out of it in the browser (or use a private window) and sign in again.",
   "AuthEnvTokenOutranksSignIn": "OPENAI_CODEX_ACCESS_TOKEN or CODEX_ACCESS_TOKEN is set in this environment and outranks this sign-in; requests keep using that token's account until you unset it.",
-  "PinnedPromptJumpToMessage": "Jump to this message"
+  "PinnedPromptJumpToMessage": "Jump to this message",
+  "PlanHandoffHeader": "Plan ready",
+  "PlanHandoffQuestion": "How do you want to continue?",
+  "PlanHandoffWorkAsk": "Work (Ask)",
+  "PlanHandoffWorkAskDetail": "Start on the plan. Edits and commands ask you first.",
+  "PlanHandoffWorkAuto": "Work (Auto-Review)",
+  "PlanHandoffWorkAutoDetail": "Start on the plan. Risky actions are reviewed automatically and may still ask you.",
+  "PlanHandoffKeepPlanning": "Keep planning",
+  "PlanHandoffKeepPlanningDetail": "Stay in Plan. Nothing is changed.",
+  "PlanHandoffProceed": "Go ahead with the plan."
 }

@@ -2475,5 +2475,14 @@
   "AuthReplacedPreviousSignIn": "La connexion Codewhale précédente à {provider} a été remplacée.",
   "AuthSameAccountAsBefore": "C'est le même compte qu'avant ; pour utiliser un autre compte {provider}, déconnectez-vous-en dans le navigateur (ou utilisez une fenêtre privée), puis reconnectez-vous.",
   "AuthEnvTokenOutranksSignIn": "OPENAI_CODEX_ACCESS_TOKEN ou CODEX_ACCESS_TOKEN est défini dans cet environnement et prime sur cette connexion ; les requêtes continuent d'utiliser le compte de ce jeton tant que vous ne l'avez pas supprimé.",
-  "PinnedPromptJumpToMessage": "Aller à ce message"
+  "PinnedPromptJumpToMessage": "Aller à ce message",
+  "PlanHandoffHeader": "Plan prêt",
+  "PlanHandoffQuestion": "Comment voulez-vous continuer ?",
+  "PlanHandoffWorkAsk": "Work (Demander)",
+  "PlanHandoffWorkAskDetail": "Commencer le plan. Les modifications et les commandes demandent votre accord avant.",
+  "PlanHandoffWorkAuto": "Work (Revue auto)",
+  "PlanHandoffWorkAutoDetail": "Commencer le plan. Les actions risquées sont examinées automatiquement et peuvent encore demander votre accord.",
+  "PlanHandoffKeepPlanning": "Continuer à planifier",
+  "PlanHandoffKeepPlanningDetail": "Rester en Plan. Rien n'est modifié.",
+  "PlanHandoffProceed": "Allez-y, appliquez le plan."
 }

@@ -2475,5 +2475,14 @@
   "AuthReplacedPreviousSignIn": "Предыдущий вход Codewhale в {provider} заменён.",
   "AuthSameAccountAsBefore": "Это тот же аккаунт, что и раньше; чтобы использовать другой аккаунт {provider}, выйдите из него в браузере (или откройте приватное окно) и войдите снова.",
   "AuthEnvTokenOutranksSignIn": "В этой среде задана переменная OPENAI_CODEX_ACCESS_TOKEN или CODEX_ACCESS_TOKEN, и она важнее этого входа; запросы будут использовать аккаунт этого токена, пока вы её не удалите.",
-  "PinnedPromptJumpToMessage": "Перейти к этому сообщению"
+  "PinnedPromptJumpToMessage": "Перейти к этому сообщению",
+  "PlanHandoffHeader": "План готов",
+  "PlanHandoffQuestion": "Как вы хотите продолжить?",
+  "PlanHandoffWorkAsk": "Work (Спрашивать)",
+  "PlanHandoffWorkAskDetail": "Начать работу по плану. Правки и команды сначала спрашивают вас.",
+  "PlanHandoffWorkAuto": "Work (Авто-проверка)",
+  "PlanHandoffWorkAutoDetail": "Начать работу по плану. Рискованные действия проверяются автоматически и всё же могут спросить вас.",
+  "PlanHandoffKeepPlanning": "Продолжить планирование",
+  "PlanHandoffKeepPlanningDetail": "Остаться в Plan. Ничего не меняется.",
+  "PlanHandoffProceed": "Приступайте к плану."
 }

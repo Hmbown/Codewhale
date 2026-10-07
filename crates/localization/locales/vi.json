@@ -2475,5 +2475,14 @@
   "AuthReplacedPreviousSignIn": "Đã thay thế lần đăng nhập {provider} trước đó của Codewhale.",
   "AuthSameAccountAsBefore": "Đây vẫn là tài khoản cũ; để dùng tài khoản {provider} khác, hãy đăng xuất tài khoản này trong trình duyệt (hoặc dùng cửa sổ riêng tư) rồi đăng nhập lại.",
   "AuthEnvTokenOutranksSignIn": "Môi trường này đã đặt OPENAI_CODEX_ACCESS_TOKEN hoặc CODEX_ACCESS_TOKEN, và biến đó được ưu tiên hơn lần đăng nhập này; các yêu cầu vẫn dùng tài khoản của token đó cho đến khi bạn bỏ đặt nó.",
-  "PinnedPromptJumpToMessage": "Nhảy đến tin nhắn này"
+  "PinnedPromptJumpToMessage": "Nhảy đến tin nhắn này",
+  "PlanHandoffHeader": "Kế hoạch đã sẵn sàng",
+  "PlanHandoffQuestion": "Bạn muốn tiếp tục thế nào?",
+  "PlanHandoffWorkAsk": "Work (Hỏi)",
+  "PlanHandoffWorkAskDetail": "Bắt đầu làm theo kế hoạch. Chỉnh sửa và lệnh sẽ hỏi bạn trước.",
+  "PlanHandoffWorkAuto": "Work (Tự động xem lại)",
+  "PlanHandoffWorkAutoDetail": "Bắt đầu làm theo kế hoạch. Thao tác rủi ro được tự động xem lại và vẫn có thể hỏi bạn.",
+  "PlanHandoffKeepPlanning": "Tiếp tục lập kế hoạch",
+  "PlanHandoffKeepPlanningDetail": "Ở lại Plan. Không có gì thay đổi.",
+  "PlanHandoffProceed": "Hãy làm theo kế hoạch."
 }

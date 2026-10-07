@@ -2475,5 +2475,14 @@
   "AuthReplacedPreviousSignIn": "以前の Codewhale の {provider} サインインを置き換えました。",
   "AuthSameAccountAsBefore": "以前と同じアカウントです。別の {provider} アカウントを使うには、ブラウザーでこのアカウントからサインアウトして（またはプライベートウィンドウを使って）、もう一度サインインしてください。",
   "AuthEnvTokenOutranksSignIn": "この環境には OPENAI_CODEX_ACCESS_TOKEN または CODEX_ACCESS_TOKEN が設定されており、このサインインより優先されます。設定を解除するまで、リクエストはそのトークンのアカウントを使い続けます。",
-  "PinnedPromptJumpToMessage": "このメッセージへジャンプ"
+  "PinnedPromptJumpToMessage": "このメッセージへジャンプ",
+  "PlanHandoffHeader": "計画ができました",
+  "PlanHandoffQuestion": "どのように進めますか？",
+  "PlanHandoffWorkAsk": "Work（確認）",
+  "PlanHandoffWorkAskDetail": "計画に着手します。編集やコマンドは事前に確認します。",
+  "PlanHandoffWorkAuto": "Work（自動レビュー）",
+  "PlanHandoffWorkAutoDetail": "計画に着手します。リスクのある操作は自動でレビューされ、確認を求めることもあります。",
+  "PlanHandoffKeepPlanning": "計画を続ける",
+  "PlanHandoffKeepPlanningDetail": "Plan のままにします。何も変更されません。",
+  "PlanHandoffProceed": "計画どおりに進めてください。"
 }

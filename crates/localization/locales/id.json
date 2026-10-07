@@ -2475,5 +2475,14 @@
   "AuthReplacedPreviousSignIn": "Menggantikan login Codewhale {provider} sebelumnya.",
   "AuthSameAccountAsBefore": "Ini akun yang sama seperti sebelumnya; untuk memakai akun {provider} lain, keluar dari akun ini di browser (atau gunakan jendela pribadi) lalu masuk lagi.",
   "AuthEnvTokenOutranksSignIn": "OPENAI_CODEX_ACCESS_TOKEN atau CODEX_ACCESS_TOKEN diatur di lingkungan ini dan lebih diutamakan daripada login ini; permintaan tetap memakai akun token tersebut sampai Anda menghapusnya.",
-  "PinnedPromptJumpToMessage": "Lompat ke pesan ini"
+  "PinnedPromptJumpToMessage": "Lompat ke pesan ini",
+  "PlanHandoffHeader": "Rencana siap",
+  "PlanHandoffQuestion": "Bagaimana Anda ingin melanjutkan?",
+  "PlanHandoffWorkAsk": "Work (Tanya)",
+  "PlanHandoffWorkAskDetail": "Mulai kerjakan rencana. Suntingan dan perintah meminta izin Anda dulu.",
+  "PlanHandoffWorkAuto": "Work (Tinjauan otomatis)",
+  "PlanHandoffWorkAutoDetail": "Mulai kerjakan rencana. Tindakan berisiko ditinjau otomatis dan masih bisa bertanya kepada Anda.",
+  "PlanHandoffKeepPlanning": "Lanjutkan merencanakan",
+  "PlanHandoffKeepPlanningDetail": "Tetap di Plan. Tidak ada yang diubah.",
+  "PlanHandoffProceed": "Silakan jalankan rencananya."
 }

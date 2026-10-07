@@ -2714,6 +2714,17 @@ pub enum MessageId {
     /// Hover label for the pinned user-prompt header above the transcript:
     /// clicking the header jumps to the user message it names.
     PinnedPromptJumpToMessage,
+    /// Plan hand-off: the question asked when a Plan turn ends with open
+    /// To-do steps, its three choices, and the message sent on "Work".
+    PlanHandoffHeader,
+    PlanHandoffQuestion,
+    PlanHandoffWorkAsk,
+    PlanHandoffWorkAskDetail,
+    PlanHandoffWorkAuto,
+    PlanHandoffWorkAutoDetail,
+    PlanHandoffKeepPlanning,
+    PlanHandoffKeepPlanningDetail,
+    PlanHandoffProceed,
 }
 
 #[allow(dead_code)]
@@ -5196,6 +5207,15 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::AuthSameAccountAsBefore,
     MessageId::AuthEnvTokenOutranksSignIn,
     MessageId::PinnedPromptJumpToMessage,
+    MessageId::PlanHandoffHeader,
+    MessageId::PlanHandoffQuestion,
+    MessageId::PlanHandoffWorkAsk,
+    MessageId::PlanHandoffWorkAskDetail,
+    MessageId::PlanHandoffWorkAuto,
+    MessageId::PlanHandoffWorkAutoDetail,
+    MessageId::PlanHandoffKeepPlanning,
+    MessageId::PlanHandoffKeepPlanningDetail,
+    MessageId::PlanHandoffProceed,
 ];
 
 pub fn tr(locale: Locale, id: MessageId) -> Cow<'static, str> {

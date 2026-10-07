@@ -13,7 +13,7 @@ use super::{
     wrap_text,
 };
 
-pub(super) fn is_checklist_tool_name(name: &str) -> bool {
+pub(crate) fn is_checklist_tool_name(name: &str) -> bool {
     matches!(
         name,
         "work_update"

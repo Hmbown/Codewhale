@@ -3520,6 +3520,35 @@ pub(crate) async fn run_event_loop(
                             });
                         }
 
+                        // Plan hand-off: a Plan turn that left open To-do
+                        // steps asks how to go on instead of just ending.
+                        // Only on an idle screen — a modal that takes digit
+                        // keys must never land on a draft, a queued follow-up
+                        // or another open view, and the answer goes to this
+                        // session, not to a focused agent.
+                        if queued_to_send.is_none()
+                            && !newer_dispatch_owns_turn_state
+                            && app.queued_message_count() == 0
+                            && app.queued_draft.is_none()
+                            && app.input.is_empty()
+                            && app.view_stack.is_empty()
+                            && app.agent_focus.is_none()
+                        {
+                            let todos = app.todos.lock().await.snapshot();
+                            if crate::tui::plan_handoff::plan_ready(
+                                app.mode,
+                                status,
+                                &app.tool_evidence,
+                                &todos,
+                            ) {
+                                app.view_stack.push(UserInputView::new(
+                                    crate::tui::plan_handoff::REQUEST_ID,
+                                    crate::tui::plan_handoff::request(app.ui_locale),
+                                ));
+                                app.needs_redraw = true;
+                            }
+                        }
+
                         if queued_to_send.is_none() && !newer_dispatch_owns_turn_state {
                             queued_to_send = app.pop_queued_message();
                         }

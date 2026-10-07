@@ -89,6 +89,7 @@ pub(crate) mod pending_requests;
 pub mod persistence_actor;
 pub mod pet_watch;
 pub mod phase_strip;
+pub(crate) mod plan_handoff;
 pub(crate) mod plugin_suggestions;
 pub mod prompt_suggestion;
 pub mod provider_picker;

@@ -1481,6 +1481,70 @@ async fn handle_theme_selection_updated(
     Ok(false)
 }
 
+/// Whether a settled question is the host's own Plan hand-off rather than an
+/// engine `request_user_input` call. The engine's request is recorded in
+/// `pending_user_input_prompt` before its view opens, so a provider-chosen
+/// tool-call id equal to the hand-off id still reaches the engine.
+pub(crate) fn is_plan_handoff_request(app: &App, tool_id: &str) -> bool {
+    tool_id == crate::tui::plan_handoff::REQUEST_ID
+        && app
+            .pending_user_input_prompt
+            .as_ref()
+            .is_none_or(|(id, _)| id != tool_id)
+}
+
+/// Carry out the answer to the Plan hand-off question.
+pub(crate) async fn apply_plan_handoff(
+    app: &mut App,
+    config: &Config,
+    engine_handle: &EngineHandle,
+    choice: crate::tui::plan_handoff::PlanHandoffChoice,
+) -> Result<()> {
+    use crate::tui::plan_handoff::PlanHandoffChoice;
+
+    let message = match choice {
+        PlanHandoffChoice::KeepPlanning => return Ok(()),
+        PlanHandoffChoice::Revise(feedback) => QueuedMessage::new(feedback, None),
+        PlanHandoffChoice::Work(posture) => {
+            if !enter_work_for_plan(app, config, engine_handle, posture).await {
+                return Ok(());
+            }
+            QueuedMessage::new(app.tr(MessageId::PlanHandoffProceed).into_owned(), None)
+        }
+    };
+    // Sent the way a composer submit is: offline or mid-dispatch it queues,
+    // and a failed send puts the text back instead of ending the session.
+    let action = ComposerSubmitAction::Submit(app.decide_submit_disposition());
+    dispatch_composer_message(
+        app,
+        config,
+        engine_handle,
+        message,
+        DispatchRecovery::Immediate,
+        action,
+    )
+    .await
+}
+
+/// Leave Plan for Work with the chosen permission. Returns `false`, with the
+/// reason on screen, when the permission or the mode could not be applied;
+/// the session then stays where it was and nothing is sent.
+pub(crate) async fn enter_work_for_plan(
+    app: &mut App,
+    config: &Config,
+    engine_handle: &EngineHandle,
+    posture: ApprovalMode,
+) -> bool {
+    if app.agent_approval_baseline() != posture
+        && let Err(reason) = app.apply_agent_posture(posture)
+    {
+        app.push_status_toast(reason, StatusToastLevel::Warning, Some(8_000));
+        return false;
+    }
+    apply_mode_update(app, engine_handle, config, AppMode::Agent).await;
+    app.mode == AppMode::Agent
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_view_events(
     terminal: &mut AppTerminal,
@@ -1658,6 +1722,15 @@ pub(crate) async fn handle_view_events(
                     note_human_decision_delivered(app, &tool_id);
                     app.retire_action_notices(Some(&tool_id));
                 }
+            }
+            ViewEvent::UserInputSubmitted { tool_id, response }
+                if is_plan_handoff_request(app, &tool_id) =>
+            {
+                let choice = crate::tui::plan_handoff::choice(app.ui_locale, &response);
+                apply_plan_handoff(app, config, engine_handle, choice).await?;
+            }
+            // Esc keeps planning: nothing was pending in the engine.
+            ViewEvent::UserInputCancelled { tool_id } if is_plan_handoff_request(app, &tool_id) => {
             }
             ViewEvent::UserInputSubmitted { tool_id, response } => {
                 let result = engine_handle

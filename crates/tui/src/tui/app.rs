@@ -3964,21 +3964,32 @@ impl App {
     }
 
     /// Host path for `/auto`: persist Auto-Review as the TUI permission
-    /// posture without inventing a second runtime. Same write as Shift+Tab
-    /// landing on Auto-Review; Plan stays read-only and only the Act baseline
-    /// moves.
+    /// posture without inventing a second runtime.
     pub fn apply_auto_review_posture(&mut self) -> Result<(), String> {
+        self.apply_agent_posture(ApprovalMode::Auto)
+    }
+
+    /// Persist `next` as the TUI permission posture. Same write as Shift+Tab
+    /// landing on it; Plan stays read-only and only the Act baseline moves.
+    /// Shared by `/auto` and the Plan hand-off.
+    pub fn apply_agent_posture(&mut self, next: ApprovalMode) -> Result<(), String> {
         if self.reject_setting_change_while_busy(MessageId::SettingSubjectPermissions) {
             return Err(self.setting_locked_message(MessageId::SettingSubjectPermissions));
         }
         if self.approval_policy_locked() {
             return Err("Permissions are controlled by config or managed requirements".to_string());
         }
-        Self::persist_permission_posture(ApprovalMode::Auto)
+        Self::persist_permission_posture(next)
             .map_err(|err| format!("could not save TUI posture ({err})"))?;
-        self.set_agent_approval_posture(ApprovalMode::Auto);
+        self.set_agent_approval_posture(next);
         self.needs_redraw = true;
         Ok(())
+    }
+
+    /// The durable Act permission posture, whichever mode is live.
+    #[must_use]
+    pub(crate) fn agent_approval_baseline(&self) -> ApprovalMode {
+        self.mode_prefs.agent_approval_mode
     }
 
     /// Update the durable Act approval choice. Entering Full Access enables

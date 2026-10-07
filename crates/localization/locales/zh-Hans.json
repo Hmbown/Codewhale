@@ -2475,5 +2475,14 @@
   "AuthReplacedPreviousSignIn": "已替换之前的 Codewhale {provider} 登录。",
   "AuthSameAccountAsBefore": "这与之前是同一个账户；如需使用其他 {provider} 账户，请先在浏览器中退出该账户（或使用无痕窗口），然后重新登录。",
   "AuthEnvTokenOutranksSignIn": "此环境中设置了 OPENAI_CODEX_ACCESS_TOKEN 或 CODEX_ACCESS_TOKEN，其优先级高于本次登录；在取消设置之前，请求将继续使用该令牌对应的账户。",
-  "PinnedPromptJumpToMessage": "跳转到这条消息"
+  "PinnedPromptJumpToMessage": "跳转到这条消息",
+  "PlanHandoffHeader": "计划已就绪",
+  "PlanHandoffQuestion": "你想如何继续？",
+  "PlanHandoffWorkAsk": "Work（询问）",
+  "PlanHandoffWorkAskDetail": "开始执行计划。编辑和命令会先征求你的同意。",
+  "PlanHandoffWorkAuto": "Work（自动审核）",
+  "PlanHandoffWorkAutoDetail": "开始执行计划。有风险的操作会自动审核，仍可能向你确认。",
+  "PlanHandoffKeepPlanning": "继续规划",
+  "PlanHandoffKeepPlanningDetail": "留在 Plan。不做任何更改。",
+  "PlanHandoffProceed": "按计划开始执行。"
 }
