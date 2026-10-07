@@ -6,6 +6,15 @@ Usage:
     python3 scripts/check-persistence-backlog-budget.py --receipt receipt.json
     python3 scripts/check-persistence-backlog-budget.py --update
 
+A fresh measurement takes ``TIMING_SAMPLES`` samples. Every sample must hold
+every structural and RSS ceiling on its own; only ``enqueue_elapsed_ns`` is
+judged on the fastest sample. Scheduling noise on a shared runner only ever
+adds wall-clock time, so the fastest sample is the closest one to what the
+code costs, and extra work on the send path slows every sample, the fastest
+included. One sample decided this before, and on hosted macOS the same
+commit landed on both sides of the ceiling (ab4fdcb1: 21.8 ms and 27.2 ms;
+b1313572: 11.5 ms and 33.3 ms).
+
 ``--update`` is the receipt command a failing PR runs to land an intended
 increase in the same PR: it raises only the exceeded ceilings to the measured
 values and never lowers one, because the ceilings carry deliberate measurement
@@ -86,6 +95,8 @@ CEILING_FIELDS = (
 )
 RSS_SAMPLE_FIELDS = ("rss_before_bytes", "rss_during_bytes", "rss_after_bytes")
 RSS_DELTA_FIELDS = ("rss_during_delta_bytes", "rss_after_delta_bytes")
+TIMING_FIELD = "enqueue_elapsed_ns"
+TIMING_SAMPLES = 5
 SUPPORTED_PLATFORMS = {"linux", "macos", "windows"}
 SOURCE_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 
@@ -380,6 +391,55 @@ def compare(
     return increases, decreases
 
 
+def compare_samples(
+    receipts: list[dict[str, Any]],
+    budget: dict[str, Any],
+    *,
+    expected_source: dict[str, Any] | None = None,
+    require_clean_source: bool = False,
+) -> tuple[list[tuple[str, int, int]], list[tuple[str, int, int]]]:
+    """Judge several receipts of one source as a single measurement.
+
+    Each receipt is validated in full. The timing field is the fastest sample;
+    every other ceiling field is the worst sample, so no sample may exceed it.
+    With one receipt this is exactly ``compare``.
+    """
+    if not receipts:
+        raise PersistenceBacklogError("no measurement receipts to compare")
+    for receipt in receipts:
+        compare(
+            receipt,
+            budget,
+            expected_source=expected_source,
+            require_clean_source=require_clean_source,
+        )
+    increases: list[tuple[str, int, int]] = []
+    decreases: list[tuple[str, int, int]] = []
+    for field in CEILING_FIELDS:
+        values = [
+            receipt[field]
+            for receipt in receipts
+            if not (field in RSS_DELTA_FIELDS and not receipt["rss_supported"])
+        ]
+        if not values:
+            continue
+        current = min(values) if field == TIMING_FIELD else max(values)
+        ceiling = budget["ceilings"][field]
+        if current > ceiling:
+            increases.append((field, current, ceiling))
+        elif current < ceiling:
+            decreases.append((field, current, ceiling))
+    return increases, decreases
+
+
+def measure_samples(count: int = TIMING_SAMPLES) -> list[dict[str, Any]]:
+    """Take ``count`` fresh receipts; the test binary is built by the first."""
+    receipts = [measure() for _ in range(count)]
+    timings = [receipt.get(TIMING_FIELD) for receipt in receipts]
+    print(f"[persistence-backlog-budget] {TIMING_FIELD} samples: {timings}")
+    return receipts
+
+
 def measure() -> dict[str, Any]:
     env = os.environ.copy()
     env["CARGO_NET_OFFLINE"] = "true"
@@ -437,12 +497,14 @@ def main() -> int:
     args = parser.parse_args()
     try:
         expected_source = current_source_identity()
-        receipt = load_json(args.receipt, "receipt") if args.receipt else measure()
+        receipts = (
+            [load_json(args.receipt, "receipt")] if args.receipt else measure_samples()
+        )
         budget = load_json(args.budget, "budget")
         baseline_receipt = load_json(BASELINE_RECEIPT_PATH, "baseline receipt")
         validate_baseline_receipt(budget, baseline_receipt)
-        increases, decreases = compare(
-            receipt,
+        increases, decreases = compare_samples(
+            receipts,
             budget,
             expected_source=expected_source,
             # An update runs while the author is mid-change; the measurement
