@@ -3317,6 +3317,7 @@ async fn test_exec_shell_foreground_can_move_to_background() {
         result.content
     );
     assert!(result.content.contains("task_id="), "{}", result.content);
+    assert!(result.content.contains("cancel=true"), "{}", result.content);
     assert!(!result.content.contains("exec_shell"), "{}", result.content);
 
     let meta = result.metadata.expect("metadata");
@@ -3432,6 +3433,9 @@ async fn lowercase_bash_foreground_detach_is_a_successful_running_receipt() {
         "{}",
         result.content
     );
+    // A model that owns a stuck command learns here how to stop it; no other
+    // tool in its catalog can.
+    assert!(result.content.contains("cancel=true"), "{}", result.content);
     assert!(!result.content.contains("code -1"), "{}", result.content);
     let metadata = result.metadata.expect("metadata");
     assert_eq!(metadata["status"], "Running");

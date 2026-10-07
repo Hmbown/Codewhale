@@ -5311,7 +5311,7 @@ fn finish_contract_bash_result(
             tail_lines(output.trim(), 20)
         };
         return Ok(ToolResult::success(format!(
-            "Still running after {}s; moved to the background as {task_id} (not killed).\n\nOutput so far:\n{so_far}\n\nCompletion will appear as a runtime event. To see more output or block until it finishes, call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id}\". It stops when the session ends.",
+            "Still running after {}s; moved to the background as {task_id} (not killed).\n\nOutput so far:\n{so_far}\n\nCompletion will appear as a runtime event. To see more output or block until it finishes, call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id}\". To stop it, send the same call with cancel=true. It also stops when the session ends.",
             result.duration_ms / 1_000
         )).with_metadata(metadata));
     }
@@ -6419,7 +6419,7 @@ impl ToolSpec for BashTool {
                             ),
                         };
                         format!(
-                            "Still running after {seconds}s; moved to the background as {task_id_str} (not killed).\n\nOutput so far:\n{so_far}\n\n{completion_contract} Keep working if you can. To decide: call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id_str}\" for more output or completion. It stops when the session ends."
+                            "Still running after {seconds}s; moved to the background as {task_id_str} (not killed).\n\nOutput so far:\n{so_far}\n\n{completion_contract} Keep working if you can. To decide: call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id_str}\" for more output or completion, or with cancel=true to stop it. It also stops when the session ends."
                         )
                     } else {
                         format!(

@@ -402,7 +402,7 @@ pub(crate) fn reconcile_turn_liveness_with(
         );
         recover_stalled_runtime_turn(
             app,
-            "Tool stalled with no progress for 10m — recovered; the command may still be running in the background. Use exec_shell_cancel or retry.",
+            "Tool stalled with no progress for 10m — recovered; the command may still be running in the background. Run /jobs to see it and /jobs cancel <id> to stop it.",
             StatusToastLevel::Error,
         );
         return true;

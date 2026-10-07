@@ -16105,6 +16105,10 @@ fn turn_liveness_recovers_running_tool_without_heartbeat() {
     let toast = app.status_toasts.back().expect("tool hang toast");
     assert_eq!(toast.level, StatusToastLevel::Error);
     assert!(toast.text.contains("Tool stalled with no progress"));
+    // The toast is read by a person: it names the command they can type, not
+    // a tool name only the model ever had.
+    assert!(toast.text.contains("/jobs cancel"), "{}", toast.text);
+    assert!(!toast.text.contains("exec_shell"), "{}", toast.text);
 }
 
 #[test]
