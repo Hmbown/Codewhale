@@ -2712,6 +2712,7 @@ impl TaskManager {
         let mut dirty = false;
         let mut accumulated_result_text = String::new();
         let persist_debounce = self.cfg.execution_limits.persist_debounce;
+        let mut persist_deadline = None;
 
         let mut next_store_poll = Instant::now();
         let mut execution_started = false;
@@ -2806,10 +2807,33 @@ impl TaskManager {
                 }
                 GuardAction::Run { wait } => {
                     execution_started = true;
+                    // Keep the first dirty event's deadline across heartbeat
+                    // and ownership-poll wakes. An urgent persisted event
+                    // clears dirty and starts a fresh window for later deltas.
+                    let persist_at = if dirty {
+                        *persist_deadline.get_or_insert_with(|| Instant::now() + persist_debounce)
+                    } else {
+                        persist_deadline = None;
+                        Instant::now()
+                    };
                     tokio::select! {
                         biased;
                         exec_result = &mut exec_fut => {
                             break (guard.preserve_timeout_reason(exec_result), false);
+                        }
+                        // A ready event channel must not starve a due write.
+                        _ = tokio::time::sleep_until(persist_at.into()), if dirty => {
+                            match self.flush_task(&task_id).await {
+                                Ok(()) => {
+                                    dirty = false;
+                                    persist_deadline = None;
+                                }
+                                Err(err) => {
+                                    tracing::error!("Failed to debounce-persist task {task_id}: {err}");
+                                    cancel.cancel();
+                                    persist_deadline = Some(Instant::now() + persist_debounce);
+                                }
+                            }
                         }
                         maybe_event = event_rx.recv(), if blocked_event.is_none() => {
                             if let Some(event) = maybe_event
@@ -2823,15 +2847,6 @@ impl TaskManager {
                         }
                         _ = self.cancel_token.cancelled(), if !self.cancel_token.is_cancelled() => {
                             cancel.cancel();
-                        }
-                        _ = sleep(persist_debounce), if dirty => {
-                            match self.flush_task(&task_id).await {
-                                Ok(()) => dirty = false,
-                                Err(err) => {
-                                    tracing::error!("Failed to debounce-persist task {task_id}: {err}");
-                                    cancel.cancel();
-                                }
-                            }
                         }
                         _ = sleep(wait.min(STORE_REFRESH_INTERVAL)) => {}
                     }
@@ -2895,6 +2910,13 @@ impl TaskManager {
         accumulated_result_text: &mut String,
         dirty: &mut bool,
     ) -> Result<()> {
+        if matches!(event, TaskExecutionEvent::ToolHeartbeat) {
+            // Liveness is in-memory only. In particular, leave any real event's
+            // pending persistence intact; the supervisor still checks execution
+            // ownership and cancellation on its regular store-poll deadline.
+            guard.note_progress(Instant::now());
+            return Ok(());
+        }
         match self.apply_execution_event(task_id, event.clone()).await {
             Ok(outcome) => {
                 if execution_event_is_progress(&event) {
@@ -7308,73 +7330,154 @@ mod tests {
         Ok(())
     }
 
+    struct ExposedTaskEventsExecutor {
+        ready: mpsc::UnboundedSender<mpsc::Sender<TaskExecutionEvent>>,
+    }
+
+    #[async_trait]
+    impl TaskExecutor for ExposedTaskEventsExecutor {
+        async fn execute(
+            &self,
+            _task: ExecutionTask,
+            events: mpsc::Sender<TaskExecutionEvent>,
+            cancel: CancellationToken,
+        ) -> TaskExecutionResult {
+            let _ = self.ready.send(events);
+            cancel.cancelled().await;
+            TaskExecutionResult::from_reason(TaskTerminalReason::Canceled, None)
+        }
+    }
+
     #[tokio::test]
     async fn tool_heartbeat_is_liveness_only_and_never_persists() -> Result<()> {
-        // The heartbeat arrives up to ~5x/s during a silent build; if it
-        // counted as persist-urgent it would rewrite the whole task record
-        // on every tick while holding the manager-wide state lock. The
-        // exclusion list must keep treating it as transient state.
-        assert!(!execution_event_persist_urgent(
-            &TaskExecutionEvent::ToolHeartbeat
-        ));
-        assert!(execution_event_persist_urgent(
-            &TaskExecutionEvent::ToolStarted {
-                id: "item-1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({}),
-            }
-        ));
-
-        // Wiring-level pin: applying a heartbeat to a running task leaves the
-        // record unpersisted, while a real lifecycle edge still flushes. The
-        // executor hangs so the task stays Running (default limits keep the
-        // supervisor idle watchdog far away) while the events are applied.
+        // Drive the actual supervisor beyond both persistence triggers: more
+        // heartbeats than the pending-event cap, then an idle debounce window.
         let root = tempfile::tempdir()?;
-        let manager = TaskManager::start_with_executor(
-            test_config(root.path().to_path_buf()),
-            Arc::new(DeafHangExecutor),
-        )
-        .await?;
+        let config = test_config(root.path().to_path_buf());
+        let debounce = config.execution_limits.persist_debounce;
+        assert!(EVENT_CATCHUP_POLL < debounce);
+        let (ready, mut receiver) = mpsc::unbounded_channel();
+        let manager =
+            TaskManager::start_with_executor(config, Arc::new(ExposedTaskEventsExecutor { ready }))
+                .await?;
         let task = manager
             .add_task(NewTaskRequest::from_prompt("heartbeat persistence pin"))
             .await?;
-        let running = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match manager.get_task(&task.id).await {
-                    Ok(record) if record.status == TaskStatus::Running => break Some(record),
-                    Ok(_) => {}
-                    Err(_) => break None,
-                }
-                sleep(Duration::from_millis(10)).await;
+        let events = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .context("task never reached its executor")?
+            .context("executor did not expose its event channel")?;
+        let path = manager.tasks_dir.join(format!("{}.json", task.id));
+        let before_bytes = fs::read(&path)?;
+        let before_fingerprint = StoreFingerprint::read(&path);
+        let before_loads = manager.store_loads.load(Ordering::Relaxed);
+        let running: TaskRecord = serde_json::from_slice(&before_bytes)?;
+        assert_eq!(running.status, TaskStatus::Running);
+
+        for _ in 0..TASK_EVENT_CHANNEL_CAPACITY + 8 {
+            events.send(TaskExecutionEvent::ToolHeartbeat).await?;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events.capacity() != TASK_EVENT_CHANNEL_CAPACITY {
+                sleep(Duration::from_millis(1)).await;
             }
         })
         .await
-        .context("task never reached Running for the persistence pin")?
-        .context("task lookup failed before the persistence pin")?;
-        assert_eq!(running.status, TaskStatus::Running);
-
-        let outcome = manager
-            .apply_execution_event(&task.id, TaskExecutionEvent::ToolHeartbeat)
-            .await?;
+        .context("supervisor did not consume the heartbeat burst")?;
+        sleep(debounce * 3).await;
+        assert_eq!(
+            manager.store_loads.load(Ordering::Relaxed),
+            before_loads,
+            "heartbeats must not even reload the persistent task store"
+        );
         assert!(
-            !outcome.persisted,
-            "a liveness-only heartbeat must not trigger a task-record write"
+            !manager
+                .state
+                .lock()
+                .await
+                .pending_events
+                .contains_key(&task.id),
+            "heartbeats must not enter the pending persistence queue"
+        );
+        assert_eq!(fs::read(&path)?, before_bytes);
+        assert_eq!(
+            StoreFingerprint::read(&path),
+            before_fingerprint,
+            "heartbeat traffic must not rewrite even byte-identical task records"
         );
 
-        let outcome = manager
-            .apply_execution_event(
-                &task.id,
-                TaskExecutionEvent::ToolStarted {
-                    id: "item-1".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                },
-            )
-            .await?;
-        assert!(
-            outcome.persisted,
-            "a real tool lifecycle edge must still flush the record"
+        // Keep the production heartbeat cadence faster than the default 250ms
+        // debounce until a real delta is saved. Neither the beats nor the
+        // supervisor's ownership-poll wakes may restart its persistence window.
+        events.try_send(TaskExecutionEvent::MessageDelta {
+            content: "real progress survives".to_string(),
+        })?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut heartbeat = tokio::time::interval(EVENT_CATCHUP_POLL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                heartbeat.tick().await;
+                events.send(TaskExecutionEvent::ToolHeartbeat).await?;
+                let saved: TaskRecord = serde_json::from_slice(&fs::read(&path)?)?;
+                if saved.timeline.iter().any(|entry| {
+                    entry.kind == "message" && entry.summary == "real progress survives"
+                }) {
+                    break Ok::<_, anyhow::Error>(());
+                }
+            }
+        })
+        .await
+        .context("continuous heartbeats starved the real delta's persistence deadline")??;
+
+        // An urgent edge flushes a newly dirty delta as well as its own data,
+        // then clears that delta's outstanding deadline.
+        events.try_send(TaskExecutionEvent::MessageDelta {
+            content: "urgent progress survives".to_string(),
+        })?;
+        events.try_send(TaskExecutionEvent::ToolStarted {
+            id: "item-1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({}),
+        })?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let saved: TaskRecord = serde_json::from_slice(&fs::read(&path)?)?;
+                if saved
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.id == "item-1" && call.status == TaskToolStatus::Running)
+                {
+                    assert!(
+                        saved
+                            .timeline
+                            .iter()
+                            .any(|entry| entry.kind == "tool_started")
+                    );
+                    assert!(saved.timeline.iter().any(|entry| {
+                        entry.kind == "message" && entry.summary == "urgent progress survives"
+                    }));
+                    assert!(
+                        !saved
+                            .timeline
+                            .iter()
+                            .any(|entry| entry.summary.contains("heartbeat"))
+                    );
+                    break Ok::<_, anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .context("real tool lifecycle edge was not persisted")??;
+        assert_ne!(StoreFingerprint::read(&path), before_fingerprint);
+        let after_urgent = StoreFingerprint::read(&path);
+        sleep(debounce * 2).await;
+        assert_eq!(
+            StoreFingerprint::read(&path),
+            after_urgent,
+            "successful urgent persistence must not leave a pending write deadline"
         );
+        manager.shutdown_and_wait().await?;
         Ok(())
     }
 
