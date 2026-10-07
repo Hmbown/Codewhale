@@ -456,7 +456,7 @@
   "FeedbackReviewNotice": "Borrador local para revisión. La publicación y la búsqueda de reportes duplicados no están disponibles. Revisa el contenido antes de compartirlo; ocultar datos sensibles no garantiza la privacidad.",
   "FeedbackHelp": "Pídele al agente actual que prepare un borrador de reporte de problema de Codewhale, revisa un borrador guardado o solicita una modificación. Los borradores de reportes de errores se quedan en el dispositivo; la publicación no está disponible.",
   "FeedbackDraftRequested": "Se le está pidiendo al agente actual que prepare o modifique un borrador local de reporte de problema. El borrador solo existe después de guardarse correctamente. La publicación no está disponible.",
-  "CmdHfDescription": "Inspeccionar configuracion y conceptos de Hugging Face MCP",
+  "CmdHfDescription": "Inspeccionar configuración y conceptos de Hugging Face MCP",
   "CmdHelpDescription": "Comandos, habilidades y atajos",
   "CmdProfileDescription": "Cambiar a un perfil de configuración con nombre",
   "CmdHomeDescription": "Abrir el inicio sin salir de la conversación actual",

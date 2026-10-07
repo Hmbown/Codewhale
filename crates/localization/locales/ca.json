@@ -982,7 +982,7 @@
   "SetupCheckpointDoneGuided": "Constitució ratificada — la teva llei permanent s'ha desat. Esmena-la en qualsevol moment amb /constitution.",
   "SetupCheckpointDoneKept": "Constitució conservada — la teva llei existent continua vigent, sense canvis. Esmena-la en qualsevol moment amb /constitution.",
   "SetupCheckpointDeferred": "Punt de control de la constitució ajornat: s'aplica la llei inclosa/per defecte fins que tornis a /setup.",
-  "SetupStepSkipped": "Pas de Setup omes i desat.",
+  "SetupStepSkipped": "Pas de Setup omès i desat.",
   "SetupStepRetryRecorded": "Pas de Setup marcat per reintentar.",
   "SetupLanguageReviewed": "Idioma de Setup registrat.",
   "SetupConstitutionChoiceLabel": "Elecció:",
