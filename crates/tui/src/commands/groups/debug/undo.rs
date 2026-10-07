@@ -9,14 +9,14 @@ use codewhale_command_contract::handler::{
 use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
 
 macro_rules! registration {
-    ($ty:ident, $name:literal, $aliases:expr, $key:literal, $caps:expr, $handler:ident) => {
+    ($ty:ident, $name:literal, $usage:literal, $aliases:expr, $key:literal, $caps:expr, $handler:ident) => {
         pub(in crate::commands) struct $ty;
         impl RegisterCommand<CommandResult> for $ty {
             fn info() -> &'static CommandInfo {
                 &CommandInfo {
                     name: $name,
                     aliases: $aliases,
-                    usage: concat!("/", $name),
+                    usage: $usage,
                     description_key: $key,
                 }
             }
@@ -32,6 +32,7 @@ macro_rules! registration {
 registration!(
     EditCmd,
     "edit",
+    "/edit",
     &[],
     "cmd_edit_description",
     Caps::DEBUG_HISTORY,
@@ -40,6 +41,7 @@ registration!(
 registration!(
     DiffCmd,
     "diff",
+    "/diff",
     &[],
     "cmd_diff_description",
     Caps::DEBUG_DIFF,
@@ -48,6 +50,7 @@ registration!(
 registration!(
     UndoCmd,
     "undo",
+    "/undo [force]",
     &[],
     "cmd_undo_description",
     Caps::DEBUG_UNDO.union(Caps::DEBUG_HISTORY),
@@ -56,6 +59,7 @@ registration!(
 registration!(
     RetryCmd,
     "retry",
+    "/retry",
     &["chongshi"],
     "cmd_retry_description",
     Caps::DEBUG_HISTORY,
@@ -65,6 +69,7 @@ registration!(
 pub(in crate::commands) const SNAPSHOT_REPO_UNAVAILABLE_PREFIX: &str = "Snapshot repo unavailable";
 pub(in crate::commands) const FILES_NOT_REVERTED_NOTE: &str =
     "Workspace files were NOT reverted — only the conversation was rolled back.";
+pub(in crate::commands) const NO_FILE_CHANGES_NOTE: &str = "No file changes to undo.";
 
 pub(super) fn edit(contexts: CommandContexts<'_>, _: Option<&str>) -> CommandResult {
     let mut parts = contexts.into_parts();
@@ -168,7 +173,18 @@ pub(in crate::commands) fn conversation_result(undone: DebugConversationUndo) ->
     }
 }
 
-pub(super) fn undo(contexts: CommandContexts<'_>, _: Option<&str>) -> CommandResult {
+pub(super) fn undo(contexts: CommandContexts<'_>, arg: Option<&str>) -> CommandResult {
+    // `force` accepts a request whose end was never recorded. Anything else
+    // is a mistake to report, not a request to undo.
+    let force = match arg.map(str::trim).filter(|arg| !arg.is_empty()) {
+        None => false,
+        Some(arg) if arg.eq_ignore_ascii_case("force") => true,
+        Some(other) => {
+            return CommandResult::error(format!(
+                "Unknown /undo option `{other}`. Use `/undo`, or `/undo force` to undo a request whose end was not recorded."
+            ));
+        }
+    };
     let mut parts = contexts.into_parts();
     let Some(undo) = parts.debug_undo.as_deref_mut() else {
         return CommandResult::error("Command capability unavailable: debug_undo");
@@ -176,11 +192,17 @@ pub(super) fn undo(contexts: CommandContexts<'_>, _: Option<&str>) -> CommandRes
     let Some(history) = parts.debug_history.as_deref_mut() else {
         return CommandResult::error("Command capability unavailable: debug_history");
     };
-    match undo.undo_files() {
+    match undo.undo_files(force) {
+        // No restore point of this conversation covers the request: say that
+        // its files stayed as they are.
         DebugUndoOutcome::NoSnapshots
         | DebugUndoOutcome::NoSession
-        | DebugUndoOutcome::NoOwnedSteps
-        | DebugUndoOutcome::NoDifference => conversation_result(history.undo_conversation()),
+        | DebugUndoOutcome::NoOwnedSteps => {
+            conversation_only(history.undo_conversation(), FILES_NOT_REVERTED_NOTE)
+        }
+        DebugUndoOutcome::NoDifference => {
+            conversation_only(history.undo_conversation(), NO_FILE_CHANGES_NOTE)
+        }
         DebugUndoOutcome::RepoUnavailable { workspace, error } => {
             let mut result = conversation_result(history.undo_conversation());
             let note = format!(
@@ -195,6 +217,19 @@ pub(super) fn undo(contexts: CommandContexts<'_>, _: Option<&str>) -> CommandRes
         }
         outcome => patch_result(outcome),
     }
+}
+
+/// A conversation-only undo, with what happened to the files stated under it.
+fn conversation_only(undone: DebugConversationUndo, files_note: &str) -> CommandResult {
+    let removed = undone.removed;
+    let mut result = conversation_result(undone);
+    if removed > 0 {
+        result.message = result
+            .message
+            .take()
+            .map(|message| format!("{message}\n{files_note}"));
+    }
+    result
 }
 
 /// Format snapshot outcomes without invoking host operations. Host tests also
@@ -220,8 +255,8 @@ pub(in crate::commands) fn patch_result(outcome: DebugUndoOutcome) -> CommandRes
         DebugUndoOutcome::NoDifference => CommandResult::message(
             "No undoable snapshot differs from the current workspace — nothing to revert.",
         ),
-        DebugUndoOutcome::Untrusted => CommandResult::message(
-            "Refusing to undo workspace files outside trusted mode.\nRun `/trust on` or select Full Access with Shift+Tab, then re-run `/undo`.",
+        DebugUndoOutcome::OpenEnded => CommandResult::message(
+            "Nothing was undone. There is no record of where your last request's changes end, so undoing it would also put back edits made since. To do that anyway, run `/undo force`.",
         ),
         DebugUndoOutcome::CompareFailed(error) => {
             CommandResult::error(format!("Failed to compare snapshot: {error}"))
@@ -236,32 +271,42 @@ pub(in crate::commands) fn patch_result(outcome: DebugUndoOutcome) -> CommandRes
         DebugUndoOutcome::RestoreFailed(error) => {
             CommandResult::error(format!("Restore failed: {error}"))
         }
-        DebugUndoOutcome::ChangedSince { label, paths } => CommandResult::message(format!(
-            "Refusing to undo snapshot '{}': {} changed after it, and undoing would overwrite that change. Nothing was changed; revert those files yourself, or use /restore for a whole-workspace rollback.",
-            label,
+        DebugUndoOutcome::ChangedSince { paths } => CommandResult::message(format!(
+            "Nothing was undone. {} changed after the request, and undoing would overwrite that change. Put it back yourself, or use `/restore` to roll the whole folder back.",
             paths.join(", ")
         )),
         DebugUndoOutcome::Restored(restored) => {
-            let short = &restored.snapshot_id[..restored.snapshot_id.len().min(8)];
             let lines: Vec<String> = restored
                 .files
                 .iter()
                 .map(|file| {
-                    let action = match file.action {
-                        DebugRestoreAction::Modified => "modified",
-                        DebugRestoreAction::Recreated => "recreated",
+                    let verb = match file.action {
+                        DebugRestoreAction::Modified => "restored",
+                        // The request deleted it.
+                        DebugRestoreAction::Recreated => "brought back",
+                        // The request created it.
                         DebugRestoreAction::Removed => "removed",
                     };
-                    format!("{action} {}", file.path.display())
+                    format!("  {verb} {}", file.path.display())
                 })
                 .collect();
-            let mut summary = format!(
-                "Restored {} file(s) to snapshot '{}' ({}):\n{}",
-                restored.files.len(),
-                restored.label,
-                short,
-                lines.join("\n")
-            );
+            let request = match &restored.request {
+                Some(prompt) => format!("your request \"{prompt}\""),
+                None => "your last request".to_string(),
+            };
+            let count = match restored.files.len() {
+                1 => "1 file is back as it was".to_string(),
+                files => format!("{files} files are back as they were"),
+            };
+            let mut summary = format!("Undid {request}. {count} before it:\n{}", lines.join("\n"));
+            if restored.forced {
+                summary.push_str("\nThe end of this request was not recorded, so edits made to these files since it started were also put back.");
+            }
+            summary.push_str(if restored.conversation_removed {
+                "\nThe request and its reply were removed from the conversation."
+            } else {
+                "\nThe conversation was not changed."
+            });
             if !restored.skipped.is_empty() {
                 let skipped: Vec<String> = restored
                     .skipped

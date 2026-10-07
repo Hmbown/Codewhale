@@ -59,7 +59,7 @@ mod session_lifecycle_regression_tests;
 
 use std::sync::OnceLock;
 
-pub(crate) use groups::config::config::set_workspace_trust;
+pub(crate) use groups::config::config::{set_workspace_trust, trust_change_note};
 
 /// Stage a rollback of the last exchange for the UI to apply, or `None` when
 /// there is no user message to roll back. Nothing is mutated here.

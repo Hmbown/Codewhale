@@ -681,7 +681,7 @@
   "TranslationFailed": "翻訳に失敗しました",
   "CmdTrustDescription": "このセッションのファイルへの信頼を変更。--save はプロジェクトのスキル、コマンド、フック、MCP サーバー、コンテキストへの信頼も保存します",
   "CmdWorkspaceDescription": "ワークスペースの表示・切替 — worktrees で管理画面を開く",
-  "CmdUndoDescription": "最後のメッセージ対を削除",
+  "CmdUndoDescription": "直前のリクエストとそのファイル変更を取り消す",
   "CmdVerboseDescription": "ライブ思考表示の詳細モードを切り替え",
   "CmdCacheAdvice": "3 ターン目以降にヒット率が ~70% 以上で安定していれば、プレフィックスキャッシュは健全。\n長いセッションでこれを下回る場合はプレフィックスのドリフトの可能性あり (#263)。",
   "CmdCacheFootnote": "* プロバイダがミスを単独で報告しない場合は「入力 − ヒット」から推定。\n",

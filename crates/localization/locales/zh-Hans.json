@@ -681,7 +681,7 @@
   "TranslationFailed": "翻译失败",
   "CmdTrustDescription": "更改本会话的文件信任；--save 还会持久保存对项目技能、命令、钩子、MCP 服务器和上下文的信任",
   "CmdWorkspaceDescription": "显示或切换工作区；worktrees 打开管理器",
-  "CmdUndoDescription": "移除最后一组消息对",
+  "CmdUndoDescription": "撤销上一次请求及其文件改动",
   "CmdVerboseDescription": "切换实时思考内容的完整显示",
   "CmdCacheAdvice": "第 3 回合起命中率稳定在 ~70% 以上即表示前缀缓存稳定；\n长会话中明显偏低则意味着前缀有抖动，值得排查（#263）。",
   "CmdCacheFootnote": "* 当提供商未单独上报未命中时，由「输入 − 命中」推算。\n",

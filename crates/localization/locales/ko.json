@@ -681,7 +681,7 @@
   "TranslationFailed": "번역 실패",
   "CmdTrustDescription": "이 세션의 파일 신뢰를 변경합니다. --save는 프로젝트 스킬, 명령, 훅, MCP 서버 및 컨텍스트에 대한 신뢰도 저장합니다",
   "CmdWorkspaceDescription": "작업 공간 표시·전환 — worktrees 는 관리자를 엽니다",
-  "CmdUndoDescription": "마지막 메시지 쌍을 제거합니다",
+  "CmdUndoDescription": "마지막 요청과 그 파일 변경을 되돌립니다",
   "CmdVerboseDescription": "대화 기록에 전체 실시간 사고 과정 표시를 전환합니다",
   "CmdCacheAdvice": "세 번째 턴 이후 적중률이 약 70%를 넘으면 캐시 프리픽스가 안정적이라는 뜻입니다. \n 긴 세션에서 그보다 낮으면 프리픽스가 자주 바뀌는 것이므로 조사해볼 가치가 있습니다 (#263).",
   "CmdCacheFootnote": "* 프로바이더가 명시적으로 보고하지 않은 경우, 실패 횟수는 입력 − 적중으로 추정한 값입니다.\n",

@@ -677,7 +677,7 @@
   "TranslationFailed": "Échec de la traduction",
   "CmdTrustDescription": "Modifier la confiance des fichiers pour cette session ; --save enregistre aussi la confiance accordée aux compétences, commandes, hooks, serveurs MCP et contexte du projet",
   "CmdWorkspaceDescription": "Voir ou changer le workspace ; worktrees gère les worktrees",
-  "CmdUndoDescription": "Supprimer la dernière paire de messages",
+  "CmdUndoDescription": "Annuler votre dernière requête et ses modifications de fichiers",
   "CmdVerboseDescription": "Basculer le raisonnement en direct complet dans la transcription",
   "CmdCacheAdvice": "Des taux de hit/miss supérieurs à ~70 % après le troisième tour indiquent un préfixe de cache stable ; \n en dessous, sur les longues sessions, cela suggère une instabilité du préfixe à investiguer (#263).",
   "CmdCacheFootnote": "* miss déduit de entrée − hit quand le fournisseur ne le rapporte pas explicitement.\n",

@@ -679,7 +679,7 @@
   "TranslationFailed": "翻譯失敗",
   "CmdTrustDescription": "變更本工作階段的檔案信任；--save 也會持久儲存對專案技能、指令、掛鉤、MCP 伺服器和上下文的信任",
   "CmdWorkspaceDescription": "顯示或切換工作區；worktrees 開啟管理器",
-  "CmdUndoDescription": "移除最後一組訊息對",
+  "CmdUndoDescription": "復原上一次請求及其檔案變更",
   "CmdVerboseDescription": "切換實時思考內容的完整顯示",
   "CmdCacheAdvice": "第 3 回合起命中率穩定在 ~70% 以上即表示前綴快取穩定；\n長工作階段中明顯偏低則意味著前綴有抖動，值得排查（#263）。",
   "CmdCacheFootnote": "* 當供應商未單獨上報未命中時，由「輸入 − 命中」推算。\n",

@@ -306,10 +306,126 @@ struct UndoFacet {
     outcome: DebugUndoOutcome,
 }
 impl CommandDebugUndoContext for UndoFacet {
-    fn undo_files(&mut self) -> DebugUndoOutcome {
-        self.events.borrow_mut().push("undo_files");
+    fn undo_files(&mut self, force: bool) -> DebugUndoOutcome {
+        self.events.borrow_mut().push(if force {
+            "undo_files_forced"
+        } else {
+            "undo_files"
+        });
         self.outcome.clone()
     }
+}
+
+/// `force` is the only option `/undo` takes: it reaches the host as a typed
+/// flag, and anything else is reported before a file or message is touched.
+#[test]
+fn undo_passes_force_to_the_host_and_rejects_any_other_option() {
+    let events = Rc::new(RefCell::new(vec![]));
+    let mut history = HistoryFacet {
+        events: events.clone(),
+        removed: 2,
+        ..Default::default()
+    };
+    let mut facet = UndoFacet {
+        events: events.clone(),
+        outcome: DebugUndoOutcome::OpenEnded,
+    };
+    for (arg, expected) in [
+        (None, "undo_files"),
+        (Some("  "), "undo_files"),
+        (Some("force"), "undo_files_forced"),
+        (Some(" FORCE "), "undo_files_forced"),
+    ] {
+        events.borrow_mut().clear();
+        let result = undo::undo(
+            CommandContexts::empty()
+                .with_debug_undo(&mut facet)
+                .with_debug_history(&mut history),
+            arg,
+        );
+        assert_eq!(&*events.borrow(), &[expected], "{arg:?}");
+        assert_eq!(
+            result.message.as_deref(),
+            Some(
+                "Nothing was undone. There is no record of where your last request's changes end, so undoing it would also put back edits made since. To do that anyway, run `/undo force`."
+            )
+        );
+        assert!(result.action.is_none());
+    }
+
+    events.borrow_mut().clear();
+    let result = undo::undo(
+        CommandContexts::empty()
+            .with_debug_undo(&mut facet)
+            .with_debug_history(&mut history),
+        Some("everything"),
+    );
+    assert!(result.is_error);
+    assert!(
+        result.message.as_deref().is_some_and(
+            |message| message.contains("`everything`") && message.contains("/undo force")
+        ),
+        "{:?}",
+        result.message
+    );
+    assert!(events.borrow().is_empty(), "nothing ran");
+}
+
+/// What the user reads after an undo: the request, each file and what
+/// happened to it, and what happened to the conversation. No restore-point
+/// label or id.
+#[test]
+fn undo_reports_the_request_each_file_and_the_conversation() {
+    let restored = |forced, conversation_removed| DebugUndoRestored {
+        request: Some("Whole hours should read 2h".to_string()),
+        conversation_removed,
+        forced,
+        files: vec![
+            DebugRestoredFile {
+                action: DebugRestoreAction::Modified,
+                path: "duration.mjs".into(),
+            },
+            DebugRestoredFile {
+                action: DebugRestoreAction::Recreated,
+                path: "old.mjs".into(),
+            },
+            DebugRestoredFile {
+                action: DebugRestoreAction::Removed,
+                path: "new.mjs".into(),
+            },
+        ],
+        skipped: Vec::new(),
+        sync: synced_conversation(),
+    };
+    let result = undo::patch_result(DebugUndoOutcome::Restored(restored(false, true)));
+    assert_eq!(
+        result.message.as_deref(),
+        Some(
+            "Undid your request \"Whole hours should read 2h\". 3 files are back as they were before it:\n  restored duration.mjs\n  brought back old.mjs\n  removed new.mjs\nThe request and its reply were removed from the conversation."
+        )
+    );
+    assert!(matches!(result.action, Some(DebugAction::SyncSession(_))));
+
+    let forced = undo::patch_result(DebugUndoOutcome::Restored(restored(true, false)));
+    assert!(
+        forced.message.as_deref().is_some_and(|message| message.ends_with(
+            "\nThe end of this request was not recorded, so edits made to these files since it started were also put back.\nThe conversation was not changed."
+        )),
+        "{:?}",
+        forced.message
+    );
+
+    let mut one = restored(false, true);
+    one.request = None;
+    one.files.truncate(1);
+    let result = undo::patch_result(DebugUndoOutcome::Restored(one));
+    assert!(
+        result.message.as_deref().is_some_and(|message| message.starts_with(
+            "Undid your last request. 1 file is back as it was before it:\n  restored duration.mjs\n"
+        )),
+        "{:?}",
+        result.message
+    );
 }
 
 #[test]
@@ -321,10 +437,9 @@ fn undo_refusals_never_fall_back_to_history_or_parse_backend_text() {
         ..Default::default()
     };
     for outcome in [
-        DebugUndoOutcome::Untrusted,
+        DebugUndoOutcome::OpenEnded,
         DebugUndoOutcome::SnapshotPending,
         DebugUndoOutcome::ChangedSince {
-            label: "tool:1".into(),
             paths: vec!["a.txt".into()],
         },
         // Deliberately resembles the old English fallback prefixes. Its typed
@@ -383,11 +498,15 @@ fn undo_fallback_requires_both_facets_and_keeps_file_warning() {
         )
     );
     assert_eq!(&*events.borrow(), &["undo_files", "undo_chat"]);
-    for outcome in [
-        DebugUndoOutcome::NoSnapshots,
-        DebugUndoOutcome::NoSession,
-        DebugUndoOutcome::NoOwnedSteps,
-        DebugUndoOutcome::NoDifference,
+    // A conversation-only undo always says what happened to the files.
+    for (outcome, files_note) in [
+        (DebugUndoOutcome::NoSnapshots, undo::FILES_NOT_REVERTED_NOTE),
+        (DebugUndoOutcome::NoSession, undo::FILES_NOT_REVERTED_NOTE),
+        (
+            DebugUndoOutcome::NoOwnedSteps,
+            undo::FILES_NOT_REVERTED_NOTE,
+        ),
+        (DebugUndoOutcome::NoDifference, undo::NO_FILE_CHANGES_NOTE),
     ] {
         facet.outcome = outcome;
         events.borrow_mut().clear();
@@ -397,7 +516,10 @@ fn undo_fallback_requires_both_facets_and_keeps_file_warning() {
                 .with_debug_history(&mut history),
             None,
         );
-        assert_eq!(result.message.as_deref(), Some("Removed 2 message(s)"));
+        assert_eq!(
+            result.message,
+            Some(format!("Removed 2 message(s)\n{files_note}"))
+        );
         assert_eq!(&*events.borrow(), &["undo_files", "undo_chat"]);
     }
 }

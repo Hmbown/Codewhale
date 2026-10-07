@@ -3159,6 +3159,27 @@ pub(crate) async fn set_workspace_trust(app: &mut App, trusted: bool, save: bool
     Ok(())
 }
 
+/// What `/trust on|off [--save]` just did, for the transcript. The toast
+/// alone fades, and the footer does not show trust mode, so without this
+/// line the command appeared to do nothing.
+pub(crate) fn trust_change_note(trusted: bool, save: bool) -> String {
+    let session = if trusted {
+        "Trust mode is on for this session: file tools may now reach files outside this folder. `/trust off` turns it off."
+    } else {
+        "Trust mode is off for this session: it no longer lets file tools reach files outside this folder."
+    };
+    let saved = match (save, trusted) {
+        (false, _) => return session.to_string(),
+        (true, true) => {
+            "Saved for this folder: its project skills, commands, hooks, MCP servers and context are trusted in later sessions too."
+        }
+        (true, false) => {
+            "Saved for this folder: its project skills, commands, hooks, MCP servers and context are no longer trusted."
+        }
+    };
+    format!("{session}\n{saved}")
+}
+
 fn trust_status(workspace: &Path, app: &App, force_paths: bool) -> CommandResult {
     let trust = crate::workspace_trust::WorkspaceTrust::load_for(workspace);
     let mut lines = Vec::new();
@@ -6370,6 +6391,34 @@ context_window = 262144
         assert!(!result.is_error, "{:?}", result.message);
         assert!(app.composer_multiline_mode);
         assert!(app.needs_redraw);
+    }
+
+    /// `/trust on` and `/trust off` printed nothing (0.10.1 tutorial, lesson
+    /// 3). Each change now has a line that says what it did and how to undo
+    /// it, and only `--save` claims anything was saved.
+    #[test]
+    fn trust_change_note_says_what_changed() {
+        let on = trust_change_note(true, false);
+        assert!(on.starts_with("Trust mode is on for this session"), "{on}");
+        assert!(on.contains("/trust off"), "{on}");
+        let off = trust_change_note(false, false);
+        assert!(
+            off.starts_with("Trust mode is off for this session"),
+            "{off}"
+        );
+        for note in [&on, &off] {
+            assert!(!note.contains("Saved"), "{note}");
+        }
+        let saved_on = trust_change_note(true, true);
+        assert!(
+            saved_on.starts_with(&on) && saved_on.contains("are trusted in later sessions"),
+            "{saved_on}"
+        );
+        let saved_off = trust_change_note(false, true);
+        assert!(
+            saved_off.starts_with(&off) && saved_off.contains("are no longer trusted"),
+            "{saved_off}"
+        );
     }
 
     #[tokio::test]

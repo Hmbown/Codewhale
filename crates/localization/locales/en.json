@@ -681,7 +681,7 @@
   "TranslationFailed": "Couldn't translate.",
   "CmdTrustDescription": "Change file trust for this session; --save also persists trust for project skills, commands, hooks, MCP servers, and context",
   "CmdWorkspaceDescription": "Show or switch the workspace; worktrees opens the manager",
-  "CmdUndoDescription": "Drop the last exchange",
+  "CmdUndoDescription": "Undo your last request and its file changes",
   "CmdVerboseDescription": "Toggle live thinking in the transcript",
   "CmdCacheAdvice": "Hit/miss ratios over ~70% after the third turn indicate a stable cache prefix; \n lower than that on long sessions suggests prefix churn worth investigating (#263).",
   "CmdCacheFootnote": "* miss inferred from input − hit when the provider did not report it explicitly.\n",

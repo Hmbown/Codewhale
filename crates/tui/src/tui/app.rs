@@ -5212,28 +5212,6 @@ impl App {
         self.api_messages = Arc::new(messages);
     }
 
-    /// Append a message with the stamp it earned earlier — used when an
-    /// undo prune re-inserts preserved tool results that were already in the
-    /// log.
-    pub fn push_api_message_stamped(&mut self, message: Message, stamp: DateTime<Utc>) {
-        self.api_message_stamps
-            .resize_with(self.api_messages.len(), Utc::now);
-        self.api_messages_mut().push(message);
-        self.api_message_stamps.push(stamp);
-    }
-
-    /// `created_at` of each `api_messages` entry, paired positionally.
-    /// Preserve messages even if older state lacks a stamp; missing times
-    /// fall back to observation time, as they do when restoring a session.
-    pub fn api_messages_stamped(&self) -> impl Iterator<Item = (&Message, DateTime<Utc>)> {
-        self.api_messages.iter().zip(
-            self.api_message_stamps
-                .iter()
-                .copied()
-                .chain(std::iter::repeat_with(Utc::now)),
-        )
-    }
-
     pub fn truncate_api_messages(&mut self, new_len: usize) {
         self.api_messages_mut().truncate(new_len);
         self.api_message_stamps

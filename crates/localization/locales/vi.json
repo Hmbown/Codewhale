@@ -681,7 +681,7 @@
   "TranslationFailed": "Dịch thất bại",
   "CmdTrustDescription": "Thay đổi mức tin cậy tệp cho phiên này; --save cũng lưu mức tin cậy cho kỹ năng, lệnh, hook, máy chủ MCP và ngữ cảnh dự án",
   "CmdWorkspaceDescription": "Xem hoặc đổi không gian làm việc; worktrees mở trình quản lý",
-  "CmdUndoDescription": "Xóa cặp tin nhắn gần nhất",
+  "CmdUndoDescription": "Hoàn tác yêu cầu gần nhất và các thay đổi tệp của nó",
   "CmdVerboseDescription": "Bật/Tắt chế độ hiển thị đầy đủ quá trình suy nghĩ trực tiếp",
   "CmdCacheAdvice": "Tỷ lệ hit/miss trên ~70% sau lượt thứ ba cho thấy tiền tố bộ nhớ đệm ổn định; \nthấp hơn mức đó trong các phiên dài cho thấy có sự biến động tiền tố cần kiểm tra (#263).",
   "CmdCacheFootnote": "* miss được suy ra từ đầu vào − hit khi nhà cung cấp không báo cáo rõ ràng.\n",

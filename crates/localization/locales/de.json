@@ -677,7 +677,7 @@
   "TranslationFailed": "Übersetzung fehlgeschlagen",
   "CmdTrustDescription": "Dateivertrauen für diese Sitzung ändern; --save speichert auch das Vertrauen in Projekt-Skills, Befehle, Hooks, MCP-Server und Kontext",
   "CmdWorkspaceDescription": "Workspace zeigen oder wechseln; worktrees öffnet den Manager",
-  "CmdUndoDescription": "Letztes Nachrichtenpaar entfernen",
+  "CmdUndoDescription": "Letzte Anfrage und ihre Dateiänderungen rückgängig machen",
   "CmdVerboseDescription": "Vollständiges Live-Thinking im Transkript umschalten",
   "CmdCacheAdvice": "Trefferquoten über ~70 % nach dem dritten Zug deuten auf einen stabilen Cache-Präfix hin; \n niedrigere Werte in langen Sitzungen deuten auf Präfix-Wechsel hin, der geprüft werden sollte (#263).",
   "CmdCacheFootnote": "* Miss aus Eingabe − Treffer abgeleitet, wenn der Provider ihn nicht explizit meldete.\n",

@@ -23,7 +23,7 @@ fn test_options(yolo: bool) -> TuiOptions {
 }
 
 #[test]
-fn missing_api_stamps_never_drop_messages_or_shift_preserved_times() {
+fn truncating_api_messages_keeps_preserved_stamps_in_place() {
     let mut app = App::new(test_options(false), &Config::default());
     let message = |text: &str| Message {
         role: codewhale_models::Role::User,
@@ -34,19 +34,9 @@ fn missing_api_stamps_never_drop_messages_or_shift_preserved_times() {
     };
     let first = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
     let third = first + chrono::Duration::minutes(2);
-    // Reproduce partial legacy/test state without going through restoration,
-    // which already fills missing stamps. Reading it must preserve both rows.
-    app.api_messages = std::sync::Arc::new(vec![message("first"), message("unstamped")]);
-    app.api_message_stamps = vec![first];
-    let observed = app.api_messages_stamped().collect::<Vec<_>>();
-    assert_eq!(observed.len(), 2);
-    assert_eq!(observed[0].1, first);
-    assert_eq!(observed[1].0, &message("unstamped"));
-
-    app.push_api_message_stamped(message("third"), third);
-    assert_eq!(app.api_message_stamps.len(), 3);
-    assert_eq!(app.api_message_stamps[0], first);
-    assert_eq!(app.api_message_stamps[2], third);
+    app.api_messages =
+        std::sync::Arc::new(vec![message("first"), message("second"), message("third")]);
+    app.api_message_stamps = vec![first, first + chrono::Duration::minutes(1), third];
     app.truncate_api_messages(2);
     assert_eq!(app.api_messages.len(), 2);
     assert_eq!(app.api_message_stamps.len(), 2);

@@ -521,7 +521,7 @@ fn steps_from_messages(messages: &[Message]) -> (Vec<ToolStep>, Vec<TurnPosture>
 
 /// The prompt a user message carries: its text blocks, less the
 /// `<turn_meta>` block the engine appends.
-fn prompt_text(message: &Message) -> Option<String> {
+pub(crate) fn prompt_text(message: &Message) -> Option<String> {
     let meta_index = crate::runtime_handoff::turn_metadata_text(message).map(|(index, _)| index);
     message
         .content

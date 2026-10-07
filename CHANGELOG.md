@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `/undo` takes back your last request in one step, in every access mode:
+  every file the request changed, plus the request and its reply. It lists
+  the files it put back and no longer asks for `/trust on`. It changes nothing
+  if one of those files was edited after the request, and it asks for
+  `/undo force` before undoing a request whose end was never recorded.
+  `/undo` no longer steps back one tool call at a time; `/restore` still
+  reaches those points.
+- `/trust on` and `/trust off` leave a line in the transcript saying what
+  changed. Esc Esc says that files were not changed and names `/undo`.
+- `/diff` outside a git repository reports that, instead of "No changes since
+  session start".
+
 ## [0.10.1] - 2026-10-07
 
 ### Contributor integration and reliability

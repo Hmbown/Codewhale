@@ -677,7 +677,7 @@
   "TranslationFailed": "Terjemahan gagal",
   "CmdTrustDescription": "Ubah kepercayaan berkas untuk sesi ini; --save juga menyimpan kepercayaan untuk keterampilan, perintah, hook, server MCP, dan konteks proyek",
   "CmdWorkspaceDescription": "Tampilkan atau ganti workspace; worktrees membuka pengelola",
-  "CmdUndoDescription": "Hapus pasangan pesan terakhir",
+  "CmdUndoDescription": "Batalkan permintaan terakhir beserta perubahan berkasnya",
   "CmdVerboseDescription": "Alihkan tampilan proses berpikir langsung penuh di transkrip",
   "CmdCacheAdvice": "Rasio hit/miss di atas ~70% setelah giliran ketiga menandakan prefiks cache yang stabil;\nlebih rendah dari itu pada sesi panjang menandakan perubahan prefiks yang perlu diselidiki (#263).",
   "CmdCacheFootnote": "* miss disimpulkan dari input − hit saat penyedia tidak melaporkannya secara eksplisit.\n",

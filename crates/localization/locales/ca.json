@@ -677,7 +677,7 @@
   "TranslationFailed": "La traducció ha fallat",
   "CmdTrustDescription": "Canvia la confiança dels fitxers per a aquesta sessió; --save també desa la confiança en les habilitats, ordres, hooks, servidors MCP i context del projecte",
   "CmdWorkspaceDescription": "Mostra o canvia l'espai de treball; worktrees obre el gestor",
-  "CmdUndoDescription": "Elimina l'últim parell de missatges",
+  "CmdUndoDescription": "Desfà l'última petició i els seus canvis als fitxers",
   "CmdVerboseDescription": "Commuta el pensament en viu complet a la transcripció",
   "CmdCacheAdvice": "Unes taxes de hit/miss per sobre del ~70% a partir del tercer torn indiquen un prefix de memòria cau estable;\nvalors més baixos en sessions llargues suggereixen una rotació del prefix que val la pena investigar (#263).",
   "CmdCacheFootnote": "* miss inferit a partir de l'entrada − hit quan el proveïdor no el reporta explícitament.\n",

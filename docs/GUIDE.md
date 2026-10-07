@@ -507,8 +507,16 @@ Codewhale keeps these records on your machine, under `~/.codewhale/`:
   in their event log. A call that ran without asking (Full Access, an allow
   rule, a remembered grant) has no approval record; the posture each turn
   ran under is saved with the turn.
-- **Undo points.** Workspace snapshots let `/undo` and `/restore` roll files
-  back.
+- **Undo points.** Workspace snapshots let you go back. `/undo` takes back
+  your last request in one step: every file it changed, plus the request and
+  its reply. It works in every access mode and lists the files it put back.
+  If one of those files changed after the request, `/undo` changes nothing
+  and says which file. If a request was cut off before Codewhale recorded
+  where its changes end, `/undo` says so; `/undo force` undoes it anyway,
+  including edits made to those files since it started. `/restore` rolls the
+  whole folder back to a point you pick, overwriting later edits, so it
+  needs `/trust on` or Full Access. Esc Esc rewinds the conversation only;
+  `/undo` afterwards puts the files back.
 - **Security events.** `audit.log` records credential changes, hook
   environment key names, compaction passes, the terminal's approval
   routing, and Auto-Review verdicts. It is not a list of what a session did.

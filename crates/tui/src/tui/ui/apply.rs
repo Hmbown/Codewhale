@@ -1762,6 +1762,11 @@ async fn apply_command_result_inner(
                             StatusToastLevel::Info,
                             None,
                         );
+                        // The toast fades and the footer does not show trust
+                        // mode: leave a line that says what changed.
+                        app.add_message(HistoryCell::System {
+                            content: crate::commands::trust_change_note(trusted, save),
+                        });
                     }
                     Err(error) => app.push_status_toast(
                         tr(app.ui_locale, MessageId::AutomationEditorSaveFailed)
@@ -3481,8 +3486,10 @@ pub(crate) fn apply_backtrack(app: &mut App, depth: usize) {
     if app.view_stack.top_kind() == Some(ModalKind::LiveTranscript) {
         app.view_stack.pop();
     }
+    // Backtrack rewinds the conversation only. State the file fact first,
+    // and name the command that puts the files back.
     app.status_message =
-        Some("Rewound to previous user message — edit and Enter to resend".to_string());
+        Some("Files not changed; conversation rewound. /undo puts files back".to_string());
     app.scroll_to_bottom();
     app.mark_history_updated();
     app.needs_redraw = true;

@@ -116,13 +116,16 @@ fn restore(group: &mut dyn CommandSkillGroupContext, arg: Option<&str>) -> Comma
 
     // Sessions without trusted/full access get a confirmation gate. We don't have a true
     // modal-confirmation path inside slash commands today, so the gate
-    // is "require trust mode" — `/trust on` or Full Access. Users in plain
-    // Agent mode get a clear message explaining how to proceed.
+    // is "require trust mode" — `/trust on` or Full Access. Unlike `/undo`,
+    // which only reverses what the last request changed, this is a
+    // whole-folder rollback to a point the user picks from every session's
+    // snapshots, so it overwrites later edits. Users in plain Agent mode get
+    // a clear message naming both ways to proceed.
     let approval = group.approval_state();
     if !(approval.yolo || approval.trust_mode) {
         return CommandResult::message(format!(
-            "Refusing to restore snapshot #{n} ('{}') outside trusted mode.\n\
-             Run `/trust on` or select Full Access with Shift+Tab, then re-run `/restore {n}`.",
+            "Did not restore #{n} ('{}'): `/restore` rolls every file in this folder back to that point, including edits made after it. Nothing was changed.\n\
+             To take back only your last request, use `/undo`. To roll everything back, run `/trust on` or select Full Access with Shift+Tab, then re-run `/restore {n}`.",
             snapshots[n - 1].label,
         ));
     }
@@ -390,8 +393,12 @@ mod tests {
         };
         let result = restore(&mut group, Some("1"));
         let msg = result.message.expect("expected message");
-        assert!(msg.contains("Refusing"));
+        assert!(msg.starts_with("Did not restore #1"), "{msg}");
         assert!(msg.contains("/trust on"));
+        assert!(
+            msg.contains("/undo"),
+            "the untrusted way back is named: {msg}"
+        );
     }
 
     #[test]
