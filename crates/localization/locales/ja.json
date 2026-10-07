@@ -1212,6 +1212,7 @@
   "ApprovalControlsHintChild": "  ·  Pg↑/↓ 履歴  ·  {details} 詳細  ·  Esc 隠す",
   "PendingApprovalInAgent": "{agent} で承認が必要です — /agents",
   "ApprovalTruncationHint": "  … 省略 · {details} で詳細を表示",
+  "ApprovalAsksWithoutGit": "ここには Git リポジトリがないため、編集の前に確認します。",
   "ApprovalFullAccessPolicyBlocked": "{tool} をブロック: Full Access ではこのポリシーを回避できません",
   "ApprovalChooseHint": "選択：",
   "ApprovalChooseAction": "Enterで選択、または y/a/d を直接入力",

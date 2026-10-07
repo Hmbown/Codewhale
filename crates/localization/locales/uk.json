@@ -1191,6 +1191,7 @@
   "ApprovalControlsHintChild": "  ·  Pg↑/↓ перегляд  ·  {details} деталі  ·  Esc сховати",
   "PendingApprovalInAgent": "Потрібне схвалення в {agent} — /agents",
   "ApprovalTruncationHint": "  … обрізано · натисніть {details} для повних деталей",
+  "ApprovalAsksWithoutGit": "Тут немає репозиторію Git, тому перед змінами запитується підтвердження.",
   "ApprovalFullAccessPolicyBlocked": "Заблоковано {tool}: Full Access не може обійти цю політику",
   "ApprovalChooseHint": "Виберіть: ",
   "ApprovalChooseAction": "Enter — вибрати опцію, або натисніть y/a/d напряму",

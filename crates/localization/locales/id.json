@@ -1191,6 +1191,7 @@
   "ApprovalControlsHintChild": "  ·  Pg↑/↓ tinjau  ·  {details} detail  ·  Esc sembunyikan",
   "PendingApprovalInAgent": "Persetujuan diperlukan di {agent} — /agents",
   "ApprovalTruncationHint": "  … terpotong · tekan {details} untuk detail lengkap",
+  "ApprovalAsksWithoutGit": "Tidak ada repositori Git di sini, jadi perubahan meminta izin dulu.",
   "ApprovalFullAccessPolicyBlocked": "Diblokir {tool}: Full Access tidak dapat melewati kebijakan ini",
   "ApprovalChooseHint": "Pilih: ",
   "ApprovalChooseAction": "Enter untuk opsi terpilih, atau tekan y/a/d langsung",

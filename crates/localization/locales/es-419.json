@@ -1212,6 +1212,7 @@
   "ApprovalControlsHintChild": "  ·  Pg↑/↓ revisar  ·  {details} detalles  ·  Esc ocultar",
   "PendingApprovalInAgent": "Se necesita aprobación en {agent} — /agents",
   "ApprovalTruncationHint": "  … truncado · presiona {details} para ver todos los detalles",
+  "ApprovalAsksWithoutGit": "Aquí no hay un repositorio Git, así que las ediciones piden permiso antes.",
   "ApprovalFullAccessPolicyBlocked": "Bloqueado {tool}: Full Access no puede omitir esta política",
   "ApprovalChooseHint": "Elegir: ",
   "ApprovalChooseAction": "Enter para seleccionar, o presione y/a/d directamente",

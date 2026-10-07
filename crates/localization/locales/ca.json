@@ -1191,6 +1191,7 @@
   "ApprovalControlsHintChild": "  ·  Pg↑/↓ revisa  ·  {details} detalls  ·  Esc amaga",
   "PendingApprovalInAgent": "Cal una aprovació a {agent} — /agents",
   "ApprovalTruncationHint": "  … truncat · prem {details} per a tots els detalls",
+  "ApprovalAsksWithoutGit": "Aquí no hi ha cap repositori Git, així que les edicions demanen permís abans.",
   "ApprovalFullAccessPolicyBlocked": "{tool} blocat: Full Access no pot evitar aquesta política",
   "ApprovalChooseHint": "Tria: ",
   "ApprovalChooseAction": "Enter per a l'opció seleccionada, o prem y/a/d directament",

@@ -1861,7 +1861,7 @@ fn approval_control_facts(
     Line<'static>,
     Option<Span<'static>>,
 ) {
-    let question = Line::from(vec![
+    let mut question = Line::from(vec![
         Span::raw("  "),
         Span::styled(
             approval_proceed_question(locale),
@@ -1870,6 +1870,14 @@ fn approval_control_facts(
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
+    // On the question row, which is never cut, so the reason costs the
+    // change preview no rows.
+    if request.asks_without_git {
+        question.spans.push(Span::styled(
+            format!("  ·  {}", tr(locale, MessageId::ApprovalAsksWithoutGit)),
+            Style::default().fg(palette::TEXT_HINT),
+        ));
+    }
     let mut actions = Vec::new();
     let options = approval_options_for_request(request, risk, locale);
     for (i, opt) in options.iter().enumerate() {
@@ -8466,6 +8474,50 @@ diff --git a/src/b.rs b/src/b.rs\n\
         assert!(rendered.contains("always allow"), "{rendered}");
         assert!(rendered.contains("change src/a.rs"), "{rendered}");
         assert!(rendered.contains("change src/b.rs"), "{rendered}");
+    }
+
+    /// Lesson 1, plain folder, 110x32: the card read "edit 1 / replace this
+    /// / … truncated" and never showed the change it asked about.
+    #[test]
+    fn approval_card_shows_a_one_line_edit_and_why_a_plain_folder_asks() {
+        let old = "export function formatDuration(totalMinutes) {\n  const hours = Math.floor(totalMinutes / 60);\n  return `${hours}h ${totalMinutes}m`;\n}";
+        let new = "export function formatDuration(totalMinutes) {\n  const hours = Math.floor(totalMinutes / 60);\n  return `${hours}h ${totalMinutes % 60}m`;\n}";
+        let mut request = crate::tui::approval::ApprovalRequest::new(
+            "approval-1",
+            "edit_file",
+            "Edit a file on disk",
+            &serde_json::json!({
+                "path": "duration.mjs",
+                "edits": [{ "oldText": old, "newText": new }]
+            }),
+            "tool:edit_file",
+        );
+
+        let in_repo = render_approval_request(&request, Rect::new(0, 0, 110, 32));
+        assert!(
+            in_repo.contains("-   return `${hours}h ${totalMinutes}m`;"),
+            "{in_repo}"
+        );
+        assert!(
+            in_repo.contains("+   return `${hours}h ${totalMinutes % 60}m`;"),
+            "{in_repo}"
+        );
+        assert!(!in_repo.contains("truncated"), "{in_repo}");
+        assert!(!in_repo.contains("replace this"), "{in_repo}");
+        assert!(!in_repo.contains("No Git repository"), "{in_repo}");
+
+        request.asks_without_git = true;
+        let plain = render_approval_request(&request, Rect::new(0, 0, 110, 32));
+        assert!(
+            plain.contains("proceed?  ·  No Git repository here, so edits ask first."),
+            "{plain}"
+        );
+        // The reason sits on the question row and takes nothing from the change.
+        assert!(
+            plain.contains("+   return `${hours}h ${totalMinutes % 60}m`;"),
+            "{plain}"
+        );
+        assert!(!plain.contains("truncated"), "{plain}");
     }
 
     #[test]

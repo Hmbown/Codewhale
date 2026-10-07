@@ -1212,6 +1212,7 @@
   "ApprovalControlsHintChild": "  ·  Pg↑/↓ 回看  ·  {details} 詳情  ·  Esc 隱藏",
   "PendingApprovalInAgent": "{agent} 需要核准 — /agents",
   "ApprovalTruncationHint": "  … 已截斷 · 按 {details} 查看完整內容",
+  "ApprovalAsksWithoutGit": "此資料夾沒有 Git 儲存庫，因此編輯前會先詢問。",
   "ApprovalFullAccessPolicyBlocked": "已阻止 {tool}：Full Access 無法繞過此政策",
   "ApprovalChooseHint": "選擇： ",
   "ApprovalChooseAction": "Enter 執行選中項，或直接按 y/a/d",

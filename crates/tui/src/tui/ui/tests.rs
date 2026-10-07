@@ -8539,6 +8539,56 @@ fn child_approval_card_hides_always_allow_in_repo() {
     }
 }
 
+/// Lesson 1: the same edit asked in a plain folder and ran unasked in a
+/// repository, and nothing on screen said why.
+#[test]
+fn file_edit_card_says_when_it_asks_for_lack_of_a_git_repository() {
+    let plain = tempfile::tempdir().expect("plain folder");
+    let repo = tempfile::tempdir().expect("repository");
+    std::fs::create_dir(repo.path().join(".git")).expect("git marker");
+    let edit = serde_json::json!({"path": "duration.mjs", "search": "a", "replace": "b"});
+    let shell = serde_json::json!({"command": "npm test"});
+    for (workspace, tool, input, expected) in [
+        (plain.path(), "edit_file", &edit, true),
+        // A card that still opens in a repository asks for another reason.
+        (repo.path(), "edit_file", &edit, false),
+        // Git never changes whether a command asks.
+        (plain.path(), "exec_shell", &shell, false),
+    ] {
+        let mut app = create_test_app();
+        app.mode = AppMode::Agent;
+        app.approval_mode = ApprovalMode::Suggest;
+        app.workspace = workspace.to_path_buf();
+        push_approval_request_view(
+            &mut app,
+            "call-1",
+            tool,
+            "Needs approval",
+            input,
+            "approval-key",
+            "",
+            None,
+            crate::config::ApprovalDefaultSelection::Deny,
+            None,
+        );
+        let mut view = app.view_stack.pop().expect("approval view");
+        let approval = view
+            .as_any_mut()
+            .downcast_mut::<ApprovalView>()
+            .expect("approval view");
+        let area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        approval.render(area, &mut buf);
+        let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
+        assert_eq!(
+            text.contains("No Git repository here, so edits ask first."),
+            expected,
+            "{tool} in {}:\n{text}",
+            workspace.display()
+        );
+    }
+}
+
 #[test]
 fn app_auto_approval_helper_covers_bypass_only() {
     let mut app = create_test_app();

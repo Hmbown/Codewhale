@@ -531,6 +531,17 @@ pub(crate) fn push_approval_request_view(
         if let Some(agent_id) = crate::tui::pending_requests::child_agent_id(id) {
             request.owner = Some(crate::tui::pending_requests::owner_for(app, agent_id));
         }
+    } else if !request.is_repo_law_prompt() {
+        // The same edit runs without a card inside a git repository. Say why
+        // this folder asks, so two folders behaving differently is explained
+        // on the card. The engine already decided to ask; this only labels it.
+        request.asks_without_git = crate::core::authority::file_write_asks_without_git(
+            app.mode,
+            app.approval_mode,
+            &app.workspace,
+            tool_name,
+            tool_input,
+        );
     }
     app.view_stack.push(
         ApprovalView::new_with_default_selection(request, app.ui_locale, default_selection)

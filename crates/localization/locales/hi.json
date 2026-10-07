@@ -1191,6 +1191,7 @@
   "ApprovalControlsHintChild": "  ·  Pg↑/↓ समीक्षा  ·  {details} विवरण  ·  Esc छिपाएँ",
   "PendingApprovalInAgent": "{agent} में स्वीकृति चाहिए — /agents",
   "ApprovalTruncationHint": "  … छाँटा गया · पूरा विवरण के लिए {details} दबाएँ",
+  "ApprovalAsksWithoutGit": "यहाँ कोई Git रिपॉज़िटरी नहीं है, इसलिए बदलाव से पहले पूछा जाता है।",
   "ApprovalFullAccessPolicyBlocked": "{tool} अवरुद्ध: Full Access इस नीति को दरकिनार नहीं कर सकता",
   "ApprovalChooseHint": "चुनें: ",
   "ApprovalChooseAction": "चुना विकल्प भेजें, या सीधे y/a/d दबाएँ",

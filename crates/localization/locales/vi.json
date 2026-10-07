@@ -1212,6 +1212,7 @@
   "ApprovalControlsHintChild": "  ·  Pg↑/↓ xem lại  ·  {details} chi tiết  ·  Esc ẩn",
   "PendingApprovalInAgent": "Cần phê duyệt trong {agent} — /agents",
   "ApprovalTruncationHint": "  … đã rút gọn · nhấn {details} để xem đầy đủ",
+  "ApprovalAsksWithoutGit": "Ở đây không có kho Git nên các chỉnh sửa sẽ hỏi trước.",
   "ApprovalFullAccessPolicyBlocked": "Đã chặn {tool}: Full Access không thể bỏ qua chính sách này",
   "ApprovalChooseHint": "Chọn: ",
   "ApprovalChooseAction": "Enter để chọn, hoặc nhấn y/a/d trực tiếp",
