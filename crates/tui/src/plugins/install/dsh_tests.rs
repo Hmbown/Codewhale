@@ -134,6 +134,48 @@ fn a_relative_entry_missing_from_the_package_is_skipped_not_searched_for() {
 }
 
 #[test]
+fn a_package_with_nothing_portable_is_refused_naming_its_skipped_rows() {
+    let extra: String = (1..=6)
+        .map(|n| format!("  - {{id: extra-{n}, name: '@demo/extra-{n}'}}\n"))
+        .collect();
+    let f = fixture(
+        Some(&format!(
+            "- insert:\n  - {{id: skin, name: '@deepseek-ai/dsh-client-ui-theme'}}\n{extra}"
+        )),
+        None,
+    );
+    refused(&f, "No portable components in this package");
+    let error = convert_package(&f.bundle, &f.output)
+        .unwrap_err()
+        .to_string();
+    for fact in [
+        "skin (@deepseek-ai/dsh-client-ui-theme): ",
+        "has no portable representation",
+        "extra-4 (@demo/extra-4)",
+        "; and 2 more",
+    ] {
+        assert!(error.contains(fact), "{fact}: {error}");
+    }
+    assert!(!error.contains("extra-5"), "{error}");
+    assert!(!error.contains('\n'), "{error}");
+}
+
+#[test]
+fn refusal_text_is_bounded_and_shows_control_and_bidi_characters_as_escapes() {
+    assert_eq!(
+        refusal_text("a\u{202e}b\nc\u{1b}[31m it's"),
+        "a\\u{202e}b\\nc\\u{1b}[31m it's"
+    );
+    let long = refusal_text(&"x".repeat(MAX_REFUSAL_TEXT + 40));
+    assert_eq!(long.chars().count(), MAX_REFUSAL_TEXT + 1);
+    assert!(long.ends_with('…'));
+    assert_eq!(
+        refusal_list((1..=7).map(|n| n.to_string())),
+        "1; 2; 3; 4; 5; and 2 more"
+    );
+}
+
+#[test]
 fn disabled_ancestry_disables_children_and_is_receipted() {
     let f = fixture(
         Some(&format!(
@@ -804,7 +846,7 @@ fn contained_bare_native_row_imports_but_an_unresolved_sibling_never_installs_a_
         )
         .is_ok()
     );
-    refused(&build(true), "no partial graph");
+    refused(&build(true), "module (absent-package); no partial graph");
 }
 
 #[test]
