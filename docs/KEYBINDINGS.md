@@ -165,7 +165,7 @@ When `[memory] enabled = true`, typing `# foo` and pressing `Enter` appends `foo
 | `Alt-G` / `Alt-Shift-G` | Jump to top / bottom                            |
 | `Ctrl-Home` / `Ctrl-End` | Jump to top / bottom (also works from the composer)  |
 | `Alt-[` / `Alt-]`    | Jump between tool output blocks                     |
-| `Esc Esc`            | Backtrack to a previous user message (`←`/`→` steps, `Enter` rewinds) |
+| `Esc Esc`            | Backtrack to a previous user message (`←`/`→` steps, `Enter` rewinds). Rewinds the conversation only; files are not changed, and `/undo` puts them back |
 | `Esc`                | Return focus to composer                           |
 | `Ctrl-Y`             | With an empty composer, copy the focused transcript cell |
 | `Alt-V`              | Open raw detail for the focused tool or message    |
