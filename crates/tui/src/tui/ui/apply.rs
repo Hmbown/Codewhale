@@ -2883,18 +2883,23 @@ async fn apply_command_result_inner(
                                 })
                                 .await;
                         }
-                        app.add_message(HistoryCell::System {
-                            content: format!(
-                                "Switched to profile '{profile}'. Model: {new_model}, Provider: {}",
-                                app.provider_identity_for_persistence()
-                            ),
-                        });
-                        app.status_message = Some(format!("Profile: {profile}"));
+                        let provider = app.provider_identity_for_persistence();
+                        let content = app
+                            .tr(MessageId::ProfileSwitched)
+                            .replace("{model}", &new_model)
+                            .replace("{provider}", provider)
+                            .replace("{name}", &profile);
+                        app.add_message(HistoryCell::System { content });
+                        app.status_message =
+                            Some(app.tr(MessageId::ProfileStatus).replace("{name}", &profile));
                     }
                     Err(err) => {
                         app.config_profile = previous_profile;
-                        app.status_message =
-                            Some(format!("Failed to switch to profile '{profile}': {err}"));
+                        app.status_message = Some(
+                            app.tr(MessageId::ProfileSwitchFailed)
+                                .replace("{name}", &profile)
+                                .replace("{error}", &err.to_string()),
+                        );
                     }
                 }
             }
