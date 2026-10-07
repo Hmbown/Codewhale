@@ -108,6 +108,34 @@ pub fn is_output_limit_stop_reason(reason: Option<&str>) -> bool {
     })
 }
 
+/// Stop reason recorded for a response that reported `stop` while its own usage
+/// shows it ran to the requested output ceiling (#6889). The Chat Completions
+/// spelling, so every existing output-limit path treats it as a `length` stop.
+pub const OUTPUT_CEILING_STOP_REASON: &str = "length";
+
+/// True when a Chat Completions `stop` is contradicted by the provider's own
+/// usage: the completion tokens it reported equal the output ceiling the
+/// request asked for (#6889). A finished answer leaves the allowance unfilled,
+/// so this response was cut at the ceiling, typically by reasoning that used
+/// the allowance before or during the answer.
+///
+/// `reported_output_tokens` is `None` when the provider reported no usage; no
+/// inference is made then. The match is exact: a provider that does not count
+/// reasoning against the cap can report more than the ceiling on a finished
+/// answer. Only `stop` is second-guessed. The Anthropic and Responses wires
+/// report a limit stop through typed fields of their own, and one Responses
+/// route sends no ceiling at all.
+#[must_use]
+pub fn stop_contradicts_output_ceiling(
+    reason: Option<&str>,
+    reported_output_tokens: Option<u32>,
+    requested_max_tokens: u32,
+) -> bool {
+    requested_max_tokens > 0
+        && reported_output_tokens == Some(requested_max_tokens)
+        && reason.is_some_and(|reason| reason.trim().eq_ignore_ascii_case("stop"))
+}
+
 /// True when the provider explicitly reported that it did not complete the
 /// response. Responses API reasons carry an `incomplete:` prefix so unknown
 /// future reasons cannot accidentally be accepted as a finished answer.
@@ -689,6 +717,49 @@ mod tests {
         }
         for reason in [None, Some("end_turn"), Some("tool_use"), Some("")] {
             assert!(!is_output_limit_stop_reason(reason), "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn stop_at_the_requested_ceiling_is_an_output_limit_stop() {
+        // #6889: 16000 requested, 16000 reported, `finish_reason: stop`.
+        assert!(stop_contradicts_output_ceiling(
+            Some("stop"),
+            Some(16_000),
+            16_000
+        ));
+        assert!(stop_contradicts_output_ceiling(
+            Some(" STOP "),
+            Some(50),
+            50
+        ));
+        assert!(is_output_limit_stop_reason(Some(
+            OUTPUT_CEILING_STOP_REASON
+        )));
+        assert!(is_incomplete_stop_reason(Some(OUTPUT_CEILING_STOP_REASON)));
+
+        // A finished answer leaves the allowance unfilled.
+        assert!(!stop_contradicts_output_ceiling(
+            Some("stop"),
+            Some(15_999),
+            16_000
+        ));
+        // Reasoning the provider does not count against the cap.
+        assert!(!stop_contradicts_output_ceiling(
+            Some("stop"),
+            Some(20_000),
+            16_000
+        ));
+        // No usage reported: nothing to compare.
+        assert!(!stop_contradicts_output_ceiling(Some("stop"), None, 16_000));
+        // No ceiling requested.
+        assert!(!stop_contradicts_output_ceiling(Some("stop"), Some(0), 0));
+        // Other wires and other stops keep their own reporting.
+        for reason in [None, Some("end_turn"), Some("tool_calls"), Some("length")] {
+            assert!(
+                !stop_contradicts_output_ceiling(reason, Some(16_000), 16_000),
+                "{reason:?}"
+            );
         }
     }
 

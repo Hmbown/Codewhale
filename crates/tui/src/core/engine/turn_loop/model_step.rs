@@ -387,6 +387,26 @@ impl Engine {
             visible_text_chars = current_text_visible.chars().count(),
             "parent model response settled"
         );
+        // #6889: a Chat Completions `stop` whose own usage equals the output
+        // ceiling this request asked for was cut at that ceiling. From here
+        // on it is the `length` stop it should have been, so it takes the
+        // one output-limit path below (continue from the partial answer, or
+        // fail by name when there is none) instead of passing for a finished
+        // answer or being re-requested unchanged. The diagnostics above keep
+        // the reason the provider sent.
+        let stop_reason = if stop_contradicts_output_ceiling(
+            stop_reason.as_deref(),
+            usage_reported.then_some(usage.output_tokens),
+            stream_request.max_tokens,
+        ) {
+            crate::logging::warn(format!(
+                "Provider reported stop reason `stop`, but its usage shows the whole requested output allowance was used ({} tokens, reasoning tokens: {:?}); treating the response as cut at the output limit.",
+                usage.output_tokens, usage.reasoning_tokens
+            ));
+            Some(OUTPUT_CEILING_STOP_REASON.to_string())
+        } else {
+            stop_reason
+        };
         // These belong to post-stream response assembly, not stream
         // consumption: blocks are built from the completed stream state,
         // and truncation is derived from its terminal stop reason below.

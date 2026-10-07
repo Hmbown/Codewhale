@@ -68,8 +68,9 @@ use codewhale_execpolicy::ApprovalMode;
 #[cfg(test)]
 use codewhale_models::ToolCaller;
 use codewhale_models::{
-    ContentBlock, ContentBlockStart, Delta, Message, StreamEvent, SystemPrompt, Tool, Usage,
-    is_incomplete_stop_reason, is_output_limit_stop_reason, stop_reason_detail,
+    ContentBlock, ContentBlockStart, Delta, Message, OUTPUT_CEILING_STOP_REASON, StreamEvent,
+    SystemPrompt, Tool, Usage, is_incomplete_stop_reason, is_output_limit_stop_reason,
+    stop_contradicts_output_ceiling, stop_reason_detail,
 };
 
 #[cfg(test)]
