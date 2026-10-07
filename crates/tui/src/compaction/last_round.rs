@@ -1151,6 +1151,68 @@ mod tests {
     }
 
     #[test]
+    fn compaction_replaces_v0_10_0_operate_contract_with_current() {
+        // A v0.10.0 session that entered Operate after a tool round, resumed on
+        // a later build: the protected round reaches back past both contracts.
+        let shipped = crate::runtime_handoff::v0_10_0_operate_contract_runtime_message();
+        let current = crate::runtime_handoff::operate_contract_runtime_message();
+        let original = vec![
+            msg("user", "Run the failing test."),
+            tool_use("live", "Bash", json!({"command": "cargo test"})),
+            tool_result("live", "test session_store::roundtrip ... FAILED"),
+            shipped.clone(),
+            msg("user", "Fix it."),
+            msg("assistant", "Fixed."),
+            current.clone(),
+            msg("user", "Continue"),
+            msg("assistant", "Working"),
+        ];
+        assert_eq!(last_round_start(&original), 0);
+        let replaced = build_replacement_history(
+            &original,
+            &format!("{COMPACTION_SUMMARY_MARKER}: work continues"),
+            None,
+            1,
+        )
+        .expect("current contract must survive compaction");
+        assert_eq!(replaced.first(), Some(&current));
+        assert!(
+            !replaced.contains(&shipped),
+            "the v0.10.0 contract contradicts the current one about goals"
+        );
+        assert_eq!(
+            replaced
+                .iter()
+                .filter(|message| crate::runtime_handoff::is_operate_contract_message(message))
+                .count(),
+            1
+        );
+
+        // Until an Operate turn on the new build appends the current wording,
+        // the saved contract is the only one and is kept once, at the front.
+        let only_shipped = vec![
+            shipped.clone(),
+            msg("user", "Continue"),
+            msg("assistant", "Working"),
+        ];
+        let replaced = build_replacement_history(
+            &only_shipped,
+            &format!("{COMPACTION_SUMMARY_MARKER}: work continues"),
+            None,
+            1,
+        )
+        .expect("saved contract must survive compaction");
+        assert_eq!(replaced.first(), Some(&shipped));
+        assert_eq!(
+            replaced
+                .iter()
+                .filter(|message| **message == shipped)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn last_round_walks_back_through_toolless_tails_to_the_tool_round() {
         let original = vec![
             msg("user", "Run the failing test."),

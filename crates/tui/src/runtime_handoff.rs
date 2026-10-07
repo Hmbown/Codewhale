@@ -121,8 +121,12 @@ const MAX_AGENT_TOPOLOGY_ROWS: usize = 24;
 /// Same tools, same authority. The difference is that a durable request is
 /// worked until verified: `create_goal` when it will outlast this turn,
 /// parallel children for separable work, evidence before a claim of done.
-/// A session that already holds an older wording gets this text once; older
-/// wordings stay recognizable as legacy.
+/// A session that already holds an older wording gets this text once. Every
+/// wording that reached a saved session stays recognizable: the pre-0.10.0
+/// one ([`LEGACY_OPERATE_CONTRACT_EVENT`]) and the one v0.10.0 shipped
+/// ([`LEGACY_V0_10_0_OPERATE_CONTRACT_EVENT`]). Rewording this constant means
+/// moving the outgoing text into a new legacy constant in the same change, or
+/// a resumed session keeps the old contract as if the user had typed it.
 const OPERATE_CONTRACT_EVENT: &str = concat!(
     "<codewhale:runtime_event kind=\"operate_contract\" visibility=\"internal\">\n",
     "This is an internal runtime event, not user input. This session is in Operate: ",
@@ -142,7 +146,8 @@ const OPERATE_CONTRACT_EVENT: &str = concat!(
     "</codewhale:runtime_event>",
 );
 // Keep old persisted runtime messages recognizable for restore/display while
-// allowing the Engine to append the current scheduling contract once.
+// allowing the Engine to append the current scheduling contract once. This is
+// the pre-0.10.0 wording.
 const LEGACY_OPERATE_CONTRACT_EVENT: &str = concat!(
     "<codewhale:runtime_event kind=\"operate_contract\" visibility=\"internal\">\n",
     "This is an internal runtime event, not user input. This session is in Operate and you ",
@@ -154,6 +159,29 @@ const LEGACY_OPERATE_CONTRACT_EVENT: &str = concat!(
     "VERDICT with real verification evidence; inspect that evidence before trusting it. ",
     "Dispatch is not completion: dispatched ≠ settled ≠ verified. Synthesize the receipts ",
     "and stay free for the next ask.\n",
+    "</codewhale:runtime_event>",
+);
+// The wording v0.10.0 shipped, byte for byte. It tells the model the host
+// creates the goal, the opposite of the current contract, so a v0.10.0 Operate
+// session resumed on a later build must have it recognized and replaced.
+const LEGACY_V0_10_0_OPERATE_CONTRACT_EVENT: &str = concat!(
+    "<codewhale:runtime_event kind=\"operate_contract\" visibility=\"internal\">\n",
+    "This is an internal runtime event, not user input. This session is in Operate and you ",
+    "are the operator. The host turns the user's prompt into the session goal; do not ",
+    "create a second one. Keep small, chat, one-file, or tightly coupled work in the parent. ",
+    "For multi-step delegation, first state a compact plan with named steps, dependencies, ",
+    "bounded file scopes and a completion check. Use `workflow` with its structured `plan` ",
+    "argument to run those phases through the existing sub-agent runtime. Fleet configures ",
+    "these same sub-agents and roles. Inspect `agent(action=\"roster\")` before assigning ",
+    "steps; choose from its saved models or role/profile assignments and respect unavailable ",
+    "routes. Parallelize only independent steps; pass completed ",
+    "results into dependent steps and inspect failures before continuing. Use one direct ",
+    "`agent` call for a single bounded independent task when a workflow adds no value. ",
+    "Reuse an existing worker with followup for corrections; do not spawn replacements or ",
+    "extra reviewers merely to stay busy. Every write-capable child must return a VERDICT ",
+    "with real verification evidence. Inspect and integrate those results before marking ",
+    "the step complete. Dispatch is not completion: dispatched ≠ settled ≠ verified. ",
+    "Report progress by completed, blocked and next steps, then synthesize the receipts.\n",
     "</codewhale:runtime_event>",
 );
 const RUNTIME_TURN_META: &str = concat!(
@@ -393,9 +421,18 @@ pub(crate) fn legacy_operate_contract_runtime_message() -> Message {
     runtime_handoff_message_with_meta(LEGACY_OPERATE_CONTRACT_EVENT.to_string(), RUNTIME_TURN_META)
 }
 
-/// True when `message` is the runtime-owned Operate contract. Recognition is
-/// structural (exact envelope text plus the runtime provenance line) so a
-/// person quoting the envelope is never matched.
+#[cfg(test)]
+pub(crate) fn v0_10_0_operate_contract_runtime_message() -> Message {
+    runtime_handoff_message_with_meta(
+        LEGACY_V0_10_0_OPERATE_CONTRACT_EVENT.to_string(),
+        RUNTIME_TURN_META,
+    )
+}
+
+/// True when `message` is the runtime-owned Operate contract in its current
+/// wording or any wording an earlier build saved. Recognition is structural
+/// (exact envelope text plus the runtime provenance line) so a person quoting
+/// the envelope is never matched.
 pub(crate) fn is_operate_contract_message(message: &Message) -> bool {
     if message.role != Role::User {
         return false;
@@ -415,7 +452,9 @@ pub(crate) fn is_operate_contract_message(message: &Message) -> bool {
     };
     matches!(
         text.as_str(),
-        OPERATE_CONTRACT_EVENT | LEGACY_OPERATE_CONTRACT_EVENT
+        OPERATE_CONTRACT_EVENT
+            | LEGACY_V0_10_0_OPERATE_CONTRACT_EVENT
+            | LEGACY_OPERATE_CONTRACT_EVENT
     ) && is_handoff_turn_meta(turn_meta, "runtime")
 }
 
@@ -1499,6 +1538,39 @@ mod tests {
         quoted.content.pop();
         assert!(!is_operate_contract_message(&quoted));
         assert!(!is_current_operate_contract_message(&quoted));
+    }
+
+    #[test]
+    fn v0_10_0_operate_contract_is_recognized_as_legacy() {
+        // A v0.10.0 Operate session holds this exact message. Unrecognized, it
+        // is restored as if the user had typed it and survives compaction next
+        // to the current contract with the opposite instruction about goals.
+        let shipped = v0_10_0_operate_contract_runtime_message();
+        assert!(is_operate_contract_message(&shipped));
+        assert!(is_internal_runtime_handoff(&shipped));
+        assert!(!is_current_operate_contract_message(&shipped));
+        let text = match shipped.content.first() {
+            Some(ContentBlock::Text { text, .. }) => text.as_str(),
+            other => panic!("operate contract must be text, got {other:?}"),
+        };
+        // Pin the wording to v0.10.0: its opening, a sentence only that
+        // release carried, and its close.
+        assert!(text.starts_with(concat!(
+            "<codewhale:runtime_event kind=\"operate_contract\" visibility=\"internal\">\n",
+            "This is an internal runtime event, not user input. This session is in Operate and you ",
+            "are the operator. The host turns the user's prompt into the session goal; do not ",
+            "create a second one. Keep small, chat, one-file, or tightly coupled work in the parent. ",
+        )));
+        assert!(text.contains("Inspect `agent(action=\"roster\")` before assigning steps;"));
+        assert!(text.ends_with(concat!(
+            "Report progress by completed, blocked and next steps, then synthesize the receipts.\n",
+            "</codewhale:runtime_event>",
+        )));
+        assert_ne!(text, LEGACY_OPERATE_CONTRACT_EVENT);
+        assert_ne!(text, OPERATE_CONTRACT_EVENT);
+        let mut quoted = shipped;
+        quoted.content.pop();
+        assert!(!is_operate_contract_message(&quoted));
     }
 
     fn topology_snapshot(agent_id: &str, name: &str, status: SubAgentStatus) -> SubAgentResult {

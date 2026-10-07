@@ -4395,8 +4395,25 @@ fn test_parse_spawn_request_rejects_invalid_child_thinking() {
     });
     let err = parse_spawn_request(&input).expect_err("invalid thinking should fail");
     assert!(
-        err.to_string()
-            .contains("thinking must be one of: inherit, auto, off, low, medium, high, max")
+        err.to_string().contains(
+            "thinking must be one of: inherit, auto, off, low, medium, high, xhigh, max, ultra"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn thinking_schema_values_all_parse() {
+    // The rejection message and the schema enum both read this list. A value
+    // listed there and refused by the parser would send the model in a loop.
+    for value in SUBAGENT_THINKING_SCHEMA_VALUES {
+        SubAgentThinking::parse(value)
+            .unwrap_or_else(|err| panic!("advertised thinking value {value:?} is refused: {err}"));
+    }
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(PathBuf::from("."), 1)));
+    assert_eq!(
+        AgentTool::new(manager, stub_runtime()).input_schema()["properties"]["thinking"]["enum"],
+        json!(SUBAGENT_THINKING_SCHEMA_VALUES)
     );
 }
 
@@ -26084,6 +26101,18 @@ async fn scout_activation_makes_grep_files_dispatchable() {
         )
         .await
         .expect("grep_files must dispatch through the real tool after the taught activation");
+}
+
+#[test]
+fn agent_tool_description_states_the_operate_child_approval_rule() {
+    // `apply_session_spawn_defaults` delegates edits and the bounded Run
+    // checks to a root Operate child; other shell follows the session.
+    let text = super::AGENT_TOOL_DESCRIPTION.as_str();
+    assert!(!text.contains("arbitrary shell remains gated"), "{text}");
+    assert!(
+        text.contains("any other shell command follows the session's approval settings"),
+        "{text}"
+    );
 }
 
 #[test]

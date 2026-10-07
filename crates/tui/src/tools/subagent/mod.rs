@@ -1911,6 +1911,13 @@ pub(crate) enum SubAgentThinking {
     Effort(ReasoningEffort),
 }
 
+/// The `thinking` values the `agent` schema advertises. The schema enum and
+/// the rejection message both read this list, so they cannot name different
+/// levels. Every entry must parse; `thinking_schema_values_all_parse` pins it.
+const SUBAGENT_THINKING_SCHEMA_VALUES: [&str; 9] = [
+    "inherit", "auto", "off", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
 impl SubAgentThinking {
     fn parse(value: &str) -> Result<Self, ToolError> {
         let normalized = value.trim().to_ascii_lowercase();
@@ -1922,10 +1929,10 @@ impl SubAgentThinking {
                     effort => Self::Effort(effort),
                 })
                 .map_err(|_| {
-                    ToolError::invalid_input(
-                        "thinking must be one of: inherit, auto, off, low, medium, high, max"
-                            .to_string(),
-                    )
+                    ToolError::invalid_input(format!(
+                        "thinking must be one of: {}",
+                        SUBAGENT_THINKING_SCHEMA_VALUES.join(", ")
+                    ))
                 }),
         }
     }
@@ -11162,7 +11169,7 @@ static AGENT_TOOL_DESCRIPTION: std::sync::LazyLock<String> = std::sync::LazyLock
         "Prefer type=implement for write work and type=test (or the Run tool with action=\"verifiers\") after writes settle — dispatch is not completion. ",
         "action=claim widens your own enforced write scope: pass write_roots (and optionally exact_files, coordination_contracts) before mutating anything a fail-closed write refusal named. It records a durable claim receipt and fails on contention with a peer claim; it never touches another agent's scope. ",
         "Action contract: start requires prompt; message/followup require targets and a message; followup accepts one id, agent_ids or all_parked=true and returns continuation mappings. peek/interrupt/cancel require a target; claim requires scope entries; status is compact and paginated unless an addressed detail is requested. ",
-        "In Operate, arbitrary shell remains gated. ",
+        "In Operate, a child the main session starts edits files and runs the Run tool's built-in checks without a second approval; any other shell command follows the session's approval settings. ",
         "Legacy action=status|peek|cancel remain for compatibility."
     );
     format!("{description} {}", subagent_followup_recovery("<agent_id>"))
@@ -11294,7 +11301,7 @@ impl ToolSpec for AgentTool {
                 },
                 "thinking": {
                     "type": "string",
-                    "enum": ["inherit", "auto", "off", "low", "medium", "high", "xhigh", "max", "ultra"],
+                    "enum": SUBAGENT_THINKING_SCHEMA_VALUES,
                     "description": "Requested reasoning effort, normalized to the selected route's supported values. inherit uses role defaults then session effort; auto considers this task."
                 },
                 "worktree": {
