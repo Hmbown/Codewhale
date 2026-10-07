@@ -486,9 +486,11 @@ something asks for it — a turn whose `allowed_tools`/`tools.always_load`
 selection covers its `mcp_<server>_*` names, a model call that resolves to
 one of its tools, or an explicit `/mcp retry <name>`. Servers marked
 `required` still connect eagerly at boot so their failure surfaces before the
-first turn. A configured-but-unstarted server shows as `configured`, never
-`connecting`; the connecting label only describes handshakes actually in
-flight.
+first turn. A configured-but-unstarted server shows as `not connected` in
+`/mcp`, never `connecting`; the connecting label only describes handshakes
+actually in flight. `codewhale mcp tools` and `codewhale mcp connect` run in
+their own process, so a server they just reached from the shell still reads
+`not connected` inside a running session until that session needs it.
 
 An MCP-focused `tool_search` is also explicit discovery intent: search a
 configured server name (for example `engram`), an exact `mcp_<server>_...`

@@ -611,6 +611,7 @@ pub enum MessageId {
     ExtensionsMcpBrowse,
     ExtensionsMcpDetail,
     ExtensionsMcpNotInspected,
+    ExtensionsMcpNotConnectedYet,
     ExtensionsMcpRefresh,
     ExtensionsMcpSummary,
     ExtensionsNoItems,
@@ -3214,6 +3215,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ExtensionsMcpBrowse,
     MessageId::ExtensionsMcpDetail,
     MessageId::ExtensionsMcpNotInspected,
+    MessageId::ExtensionsMcpNotConnectedYet,
     MessageId::ExtensionsMcpRefresh,
     MessageId::ExtensionsMcpSummary,
     MessageId::ExtensionsNoItems,
@@ -6753,7 +6755,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             keys.len(),
-            100,
+            101,
             "the complete extensions locale set changed"
         );
 
@@ -6762,6 +6764,7 @@ mod tests {
             "ExtensionsMcpBrowse",
             "ExtensionsMarketplaceUnavailable",
             "ExtensionsMcpNotInspected",
+            "ExtensionsMcpNotConnectedYet",
             "ExtensionsMcpRefresh",
             "ExtensionsNoItems",
             "ExtensionsNoMatches",

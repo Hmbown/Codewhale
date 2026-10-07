@@ -87,6 +87,7 @@
   "ExtensionsMcpBrowse": "Переглянути рекомендовані сервери",
   "ExtensionsMcpDetail": "інструменти: {tools} · ресурси: {resources} · промпти: {prompts}",
   "ExtensionsMcpNotInspected": "Не перевірено в цьому знімку · Enter перезавантажить і підключить налаштовані сервери",
+  "ExtensionsMcpNotConnectedYet": "У цьому сеансі ще не підключено. Підключиться, коли знадобиться інструмент, або підключіть зараз.",
   "ExtensionsMcpRefresh": "Налаштовано серверів MCP: {count}; відкрийте /mcp, щоб оновити знімок",
   "ExtensionsMcpSummary": "{transport} · інструменти: {tools} · ресурси: {resources}",
   "ExtensionsNoItems": "На цій вкладці немає елементів",

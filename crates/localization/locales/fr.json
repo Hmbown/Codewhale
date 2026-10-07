@@ -87,6 +87,7 @@
   "ExtensionsMcpBrowse": "Voir les serveurs suggérés",
   "ExtensionsMcpDetail": "outils : {tools} · ressources : {resources} · prompts : {prompts}",
   "ExtensionsMcpNotInspected": "Non inspecté dans cet instantané · Entrée recharge et connecte les serveurs configurés",
+  "ExtensionsMcpNotConnectedYet": "Pas encore connecté dans cette session. Se connecte dès qu'un outil est nécessaire, ou connectez-le maintenant.",
   "ExtensionsMcpRefresh": "{count} serveurs MCP sont configurés ; ouvrez /mcp pour actualiser cet instantané",
   "ExtensionsMcpSummary": "{transport} · outils : {tools} · ressources : {resources}",
   "ExtensionsNoItems": "Aucun élément dans cet onglet",

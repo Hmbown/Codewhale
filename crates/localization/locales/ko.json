@@ -87,6 +87,7 @@
   "ExtensionsMcpBrowse": "추천 서버 보기",
   "ExtensionsMcpDetail": "도구: {tools} · 리소스: {resources} · 프롬프트: {prompts}",
   "ExtensionsMcpNotInspected": "이 스냅샷에서 검사하지 않음 · Enter를 누르면 다시 로드하고 구성된 서버에 연결",
+  "ExtensionsMcpNotConnectedYet": "이 세션에서는 아직 연결되지 않았습니다. 도구가 필요해지면 연결되며, 지금 연결할 수도 있습니다.",
   "ExtensionsMcpRefresh": "MCP 서버 {count}개가 구성되었습니다. /mcp를 열어 이 스냅샷을 새로 고치세요",
   "ExtensionsMcpSummary": "{transport} · 도구: {tools} · 리소스: {resources}",
   "ExtensionsNoItems": "이 탭에 항목이 없습니다",

@@ -87,6 +87,7 @@
   "ExtensionsMcpBrowse": "Browse server suggestions",
   "ExtensionsMcpDetail": "tools: {tools} · resources: {resources} · prompts: {prompts}",
   "ExtensionsMcpNotInspected": "Not inspected yet · reload to connect your servers",
+  "ExtensionsMcpNotConnectedYet": "Not connected in this session yet. Connects when a tool is needed, or connect it now.",
   "ExtensionsMcpRefresh": "{count} MCP servers set up; open /mcp to refresh",
   "ExtensionsMcpSummary": "{transport} · tools: {tools} · resources: {resources}",
   "ExtensionsNoItems": "Nothing on this tab",

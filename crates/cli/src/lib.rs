@@ -309,6 +309,10 @@ lifecycle generation you observed.
     /// Run the offline evaluation harness.
     Eval(TuiPassthroughArgs),
     /// Manage MCP servers.
+    #[command(
+        override_usage = "codewhale mcp [OPTIONS] <COMMAND>",
+        after_help = codewhale_tui::mcp_subcommand_help()
+    )]
     Mcp(TuiPassthroughArgs),
     /// Run the shared ambient pet owner (`pet serve`). Internal: spawned
     /// lazily by clients when no owner is running.
@@ -13087,6 +13091,33 @@ verbosity = "concise"
         assert!(exec.contains("codewhale exec --model MODEL"), "{exec}");
         let rc = help_for(&["codewhale", "rc", "--help"]);
         assert!(rc.contains("hand it to the Codewhale web app"), "{rc}");
+    }
+
+    /// `codewhale mcp --help` printed `Usage: codewhale mcp [OPTIONS]
+    /// [ARGS]...` and nothing else, so `add`, `list`, `tools`, `connect` and
+    /// `remove` could only be found by already knowing them.
+    #[test]
+    fn mcp_help_lists_its_subcommands() {
+        for flag in ["--help", "-h"] {
+            let help = help_for(&["codewhale", "mcp", flag]);
+            assert!(
+                help.contains("Usage: codewhale mcp [OPTIONS] <COMMAND>"),
+                "{help}"
+            );
+            for subcommand in [
+                "list", "init", "connect", "tools", "add", "login", "logout", "remove", "enable",
+                "disable", "validate", "add-self",
+            ] {
+                assert!(
+                    help.lines().any(|line| line
+                        .strip_prefix("  ")
+                        .and_then(|line| line.strip_prefix(subcommand))
+                        .is_some_and(|rest| rest.starts_with("  "))),
+                    "mcp help must list `{subcommand}` with its description:\n{help}"
+                );
+            }
+            assert!(help.contains("codewhale mcp <COMMAND> --help"), "{help}");
+        }
     }
 
     #[test]

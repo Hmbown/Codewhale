@@ -87,6 +87,7 @@
   "ExtensionsMcpBrowse": "浏览推荐服务器",
   "ExtensionsMcpDetail": "工具：{tools} · 资源：{resources} · 提示词：{prompts}",
   "ExtensionsMcpNotInspected": "此快照中尚未检查 · 按 Enter 重新加载并连接已配置的服务器",
+  "ExtensionsMcpNotConnectedYet": "此会话中尚未连接。需要用到工具时会自动连接，也可以现在连接。",
   "ExtensionsMcpRefresh": "已配置 {count} 个 MCP 服务器；打开 /mcp 刷新此快照",
   "ExtensionsMcpSummary": "{transport} · 工具：{tools} · 资源：{resources}",
   "ExtensionsNoItems": "此标签页没有项目",

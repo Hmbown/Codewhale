@@ -87,6 +87,7 @@
   "ExtensionsMcpBrowse": "Xem các máy chủ được gợi ý",
   "ExtensionsMcpDetail": "công cụ: {tools} · tài nguyên: {resources} · lời nhắc: {prompts}",
   "ExtensionsMcpNotInspected": "Chưa kiểm tra trong bản chụp này · Enter tải lại và kết nối các máy chủ đã cấu hình",
+  "ExtensionsMcpNotConnectedYet": "Chưa kết nối trong phiên này. Sẽ kết nối khi cần đến công cụ, hoặc kết nối ngay bây giờ.",
   "ExtensionsMcpRefresh": "Đã cấu hình {count} máy chủ MCP; mở /mcp để làm mới ảnh chụp này",
   "ExtensionsMcpSummary": "{transport} · công cụ: {tools} · tài nguyên: {resources}",
   "ExtensionsNoItems": "Không có mục nào trong thẻ này",

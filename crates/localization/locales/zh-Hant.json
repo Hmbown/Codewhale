@@ -87,6 +87,7 @@
   "ExtensionsMcpBrowse": "瀏覽推薦伺服器",
   "ExtensionsMcpDetail": "工具：{tools} · 資源：{resources} · 提示詞：{prompts}",
   "ExtensionsMcpNotInspected": "此快照中尚未檢查 · 按 Enter 重新載入並連線已設定的伺服器",
+  "ExtensionsMcpNotConnectedYet": "此工作階段中尚未連線。需要用到工具時會自動連線，也可以現在連線。",
   "ExtensionsMcpRefresh": "已設定 {count} 個 MCP 伺服器；開啟 /mcp 重新整理此快照",
   "ExtensionsMcpSummary": "{transport} · 工具：{tools} · 資源：{resources}",
   "ExtensionsNoItems": "此分頁沒有項目",

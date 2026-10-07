@@ -1635,6 +1635,35 @@ enum McpCommand {
     },
 }
 
+/// The `codewhale mcp` subcommands with their one-line descriptions, for the
+/// dispatcher's `codewhale mcp --help`.
+///
+/// That help exits in the dispatcher's parser, before this crate's parser
+/// runs, and the dispatcher only sees forwarded arguments. Reading the list
+/// off `McpCommand` keeps it from naming a subcommand that does not exist
+/// or missing one that does.
+#[must_use]
+pub fn mcp_subcommand_help() -> String {
+    use std::fmt::Write as _;
+
+    let command = McpCommand::augment_subcommands(clap::Command::new("mcp"));
+    let width = command
+        .get_subcommands()
+        .map(|subcommand| subcommand.get_name().len())
+        .max()
+        .unwrap_or(0);
+    let mut help = String::from("Commands:\n");
+    for subcommand in command.get_subcommands() {
+        let about = subcommand
+            .get_about()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let _ = writeln!(help, "  {:<width$}  {about}", subcommand.get_name());
+    }
+    help.push_str("\nRun `codewhale mcp <COMMAND> --help` for a command's options.");
+    help
+}
+
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum IntegrationsCommand {
     /// Official DeepSeek Harness (`dsh`) connected through Codewhale

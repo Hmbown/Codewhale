@@ -87,6 +87,7 @@
   "ExtensionsMcpBrowse": "Ver sugestões de servidores",
   "ExtensionsMcpDetail": "ferramentas: {tools} · recursos: {resources} · prompts: {prompts}",
   "ExtensionsMcpNotInspected": "Não inspecionado neste snapshot · Enter recarrega e conecta os servidores configurados",
+  "ExtensionsMcpNotConnectedYet": "Ainda não conectado nesta sessão. Conecta quando uma ferramenta for necessária, ou conecte agora.",
   "ExtensionsMcpRefresh": "{count} servidores MCP configurados; abra /mcp para atualizar este retrato",
   "ExtensionsMcpSummary": "{transport} · ferramentas: {tools} · recursos: {resources}",
   "ExtensionsNoItems": "Nenhum item nesta aba",

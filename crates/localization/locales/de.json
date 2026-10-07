@@ -87,6 +87,7 @@
   "ExtensionsMcpBrowse": "Servervorschläge ansehen",
   "ExtensionsMcpDetail": "Werkzeuge: {tools} · Ressourcen: {resources} · Prompts: {prompts}",
   "ExtensionsMcpNotInspected": "In diesem Snapshot nicht geprüft · Eingabetaste lädt neu und verbindet konfigurierte Server",
+  "ExtensionsMcpNotConnectedYet": "In dieser Sitzung noch nicht verbunden. Verbindet sich, sobald ein Tool gebraucht wird, oder jetzt verbinden.",
   "ExtensionsMcpRefresh": "{count} MCP-Server sind konfiguriert; /mcp öffnen, um diesen Stand zu aktualisieren",
   "ExtensionsMcpSummary": "{transport} · Werkzeuge: {tools} · Ressourcen: {resources}",
   "ExtensionsNoItems": "Keine Einträge in diesem Tab",

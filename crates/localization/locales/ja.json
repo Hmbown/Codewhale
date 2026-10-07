@@ -87,6 +87,7 @@
   "ExtensionsMcpBrowse": "おすすめのサーバーを見る",
   "ExtensionsMcpDetail": "ツール: {tools} · リソース: {resources} · プロンプト: {prompts}",
   "ExtensionsMcpNotInspected": "このスナップショットでは未確認 · Enter で再読み込みし、設定済みサーバーへ接続",
+  "ExtensionsMcpNotConnectedYet": "このセッションではまだ未接続です。ツールが必要になると接続します。今すぐ接続することもできます。",
   "ExtensionsMcpRefresh": "MCP サーバーが {count} 件設定されています。/mcp を開いてスナップショットを更新してください",
   "ExtensionsMcpSummary": "{transport} · ツール: {tools} · リソース: {resources}",
   "ExtensionsNoItems": "このタブに項目はありません",

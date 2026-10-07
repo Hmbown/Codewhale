@@ -87,6 +87,7 @@
   "ExtensionsMcpBrowse": "Lihat saran server",
   "ExtensionsMcpDetail": "alat: {tools} · sumber daya: {resources} · prompt: {prompts}",
   "ExtensionsMcpNotInspected": "Belum diperiksa dalam snapshot ini · Enter memuat ulang dan menghubungkan server terkonfigurasi",
+  "ExtensionsMcpNotConnectedYet": "Belum terhubung di sesi ini. Terhubung saat sebuah alat diperlukan, atau hubungkan sekarang.",
   "ExtensionsMcpRefresh": "{count} server MCP dikonfigurasi; buka /mcp untuk menyegarkan cuplikan ini",
   "ExtensionsMcpSummary": "{transport} · alat: {tools} · sumber daya: {resources}",
   "ExtensionsNoItems": "Tidak ada item di tab ini",

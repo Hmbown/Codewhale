@@ -87,6 +87,7 @@
   "ExtensionsMcpBrowse": "Explora els servidors suggerits",
   "ExtensionsMcpDetail": "eines: {tools} · recursos: {resources} · indicacions: {prompts}",
   "ExtensionsMcpNotInspected": "No inspeccionat en aquesta instantània · prem Retorn per tornar a carregar i connectar els servidors configurats",
+  "ExtensionsMcpNotConnectedYet": "Encara no s'ha connectat en aquesta sessió. Es connecta quan cal una eina, o connecta'l ara.",
   "ExtensionsMcpRefresh": "Hi ha {count} servidors MCP configurats; obre /mcp per actualitzar aquesta instantània",
   "ExtensionsMcpSummary": "{transport} · eines: {tools} · recursos: {resources}",
   "ExtensionsNoItems": "No hi ha elements en aquesta pestanya",

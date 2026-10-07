@@ -87,6 +87,7 @@
   "ExtensionsMcpBrowse": "सुझाए गए सर्वर देखें",
   "ExtensionsMcpDetail": "टूल: {tools} · संसाधन: {resources} · प्रॉम्प्ट: {prompts}",
   "ExtensionsMcpNotInspected": "इस स्नैपशॉट में जाँच नहीं हुई · Enter कॉन्फ़िगर किए सर्वर पुनः लोड करके कनेक्ट करता है",
+  "ExtensionsMcpNotConnectedYet": "इस सत्र में अभी कनेक्ट नहीं है। किसी टूल की ज़रूरत पड़ने पर कनेक्ट होता है, या अभी कनेक्ट करें।",
   "ExtensionsMcpRefresh": "{count} MCP सर्वर कॉन्फ़िगर हैं; यह स्नैपशॉट ताज़ा करने के लिए /mcp खोलें",
   "ExtensionsMcpSummary": "{transport} · टूल: {tools} · संसाधन: {resources}",
   "ExtensionsNoItems": "इस टैब पर कोई आइटम नहीं",
