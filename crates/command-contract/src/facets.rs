@@ -1457,6 +1457,10 @@ pub struct RelayProjection {
     /// Authoritative compact-template text (`COMPACT_TEMPLATE`), echoed with
     /// a trailing trim by the handler exactly as today.
     pub compact_template: String,
+    /// Workspace-relative path the relay is written to. The host supplies
+    /// the same path its startup loader reads first, so the writer and the
+    /// loader cannot drift.
+    pub handoff_path: String,
     pub workspace: String,
     pub mode: String,
     pub model: String,

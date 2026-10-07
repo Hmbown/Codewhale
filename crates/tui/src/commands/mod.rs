@@ -837,14 +837,18 @@ mod tests {
                 .message
                 .as_deref()
                 .unwrap_or_default()
-                .contains(".deepseek/handoff.md")
+                .contains(crate::prompts::HANDOFF_RELATIVE_PATH)
         );
         let Some(AppAction::SendMessage(message)) = result.action else {
             panic!("expected SendMessage action");
         };
         assert!(message.contains("session relay"));
         assert!(message.contains("接力"));
-        assert!(message.contains("Write or update `.deepseek/handoff.md`"));
+        // The relay is written where the next session reads it first.
+        assert!(message.contains(&format!(
+            "Write or update `{}`",
+            crate::prompts::HANDOFF_RELATIVE_PATH
+        )));
         assert!(message.contains("# Session relay"));
         assert!(message.contains("Requested relay focus: verify install"));
         assert!(message.contains("Goal objective: Unify the work surface"));
@@ -2949,7 +2953,7 @@ mod tests {
         let relay = execute("/relay handoff notes", &mut app);
         assert_eq!(
             relay.message.as_deref(),
-            Some("Preparing session relay at .deepseek/handoff.md...")
+            Some("Preparing session relay at .codewhale/handoff.md...")
         );
         let relay_message = match relay.action {
             Some(AppAction::SendMessage(message)) => message,

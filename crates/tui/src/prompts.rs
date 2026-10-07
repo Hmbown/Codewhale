@@ -90,6 +90,21 @@ pub const HANDOFF_RELATIVE_PATH: &str = ".codewhale/handoff.md";
 /// Legacy handoff path for reading from existing installs.
 const LEGACY_HANDOFF_RELATIVE_PATH: &str = ".deepseek/handoff.md";
 
+/// The relay artifact a new session reads: the primary path when a file
+/// exists there, otherwise the legacy fallback. Returns the file to read and
+/// its workspace-relative name, so every caller names the path actually read.
+pub(crate) fn resolve_handoff_path(workspace: &Path) -> (PathBuf, &'static str) {
+    let primary = workspace.join(HANDOFF_RELATIVE_PATH);
+    if primary.exists() {
+        (primary, HANDOFF_RELATIVE_PATH)
+    } else {
+        (
+            workspace.join(LEGACY_HANDOFF_RELATIVE_PATH),
+            LEGACY_HANDOFF_RELATIVE_PATH,
+        )
+    }
+}
+
 /// Per-file size cap for `instructions = [...]` entries (#454). Mirrors
 /// the existing project-context cap in `project_context::load_context_file`
 /// so a malicious / oversized include can't blow the prompt budget on
@@ -412,12 +427,7 @@ fn render_instructions_block(sources: &[InstructionSource]) -> Option<String> {
 /// system-prompt block. Returns `None` when the file is absent or empty so
 /// callers can keep the default-uncluttered prompt for fresh workspaces.
 fn load_handoff_block(workspace: &Path) -> Option<String> {
-    let primary = workspace.join(HANDOFF_RELATIVE_PATH);
-    let path = if primary.exists() {
-        primary
-    } else {
-        workspace.join(LEGACY_HANDOFF_RELATIVE_PATH)
-    };
+    let (path, shown) = resolve_handoff_path(workspace);
     // The relay is workspace-writable, so it gets the same per-file cap as
     // an instructions file rather than an unbounded read into the prompt.
     let (raw, full_len) = read_prompt_file_bounded(&path, INSTRUCTIONS_FILE_MAX_BYTES).ok()?;
@@ -437,7 +447,7 @@ fn load_handoff_block(workspace: &Path) -> Option<String> {
         "shorten the relay artifact",
     );
     Some(format!(
-        "## Previous Session Relay\n\nThe previous session in this workspace left a relay artifact at `{HANDOFF_RELATIVE_PATH}`. Consider it the first artifact to read on this turn — open blockers, in-flight changes, and recent decisions live there. Update or rewrite it before exiting if state changes materially.\n\n{relay}"
+        "## Previous Session Relay\n\nThe previous session in this workspace left a relay artifact at `{shown}`. Consider it the first artifact to read on this turn — open blockers, in-flight changes, and recent decisions live there. Update or rewrite it before exiting if state changes materially.\n\n{relay}"
     ))
 }
 
@@ -1476,8 +1486,10 @@ mod tests {
     use tempfile::tempdir;
 
     /// Discriminator unique to the injected relay block (not present in the
-    /// agent prompt's own discussion of the convention).
-    const HANDOFF_BLOCK_MARKER: &str = "left a relay artifact at `.codewhale/handoff.md`";
+    /// agent prompt's own discussion of the convention). It stops before the
+    /// path because the block names whichever file was read; the tests that
+    /// care about the path assert it themselves.
+    const HANDOFF_BLOCK_MARKER: &str = "left a relay artifact at `";
 
     // Config-directory prompt override resolution (#3638). These exercise the
     // pure file resolver only; the global install path is intentionally not
@@ -2953,6 +2965,30 @@ mod tests {
         assert!(prompt.contains(HANDOFF_BLOCK_MARKER));
         assert!(prompt.contains("Finish #32."));
         assert!(prompt.contains("write the basic version"));
+        // Only the legacy file exists, so the block must name it rather
+        // than send the model to a primary file that is not there.
+        assert!(prompt.contains("left a relay artifact at `.deepseek/handoff.md`"));
+        assert!(!prompt.contains("left a relay artifact at `.codewhale/handoff.md`"));
+    }
+
+    #[test]
+    fn primary_handoff_wins_over_legacy_and_is_named() {
+        let tmp = tempdir().expect("tempdir");
+        let workspace = tmp.path();
+        for (dir, body) in [
+            (".codewhale", "# Session relay\n\nprimary relay body\n"),
+            (".deepseek", "# Session relay\n\nlegacy relay body\n"),
+        ] {
+            std::fs::create_dir_all(workspace.join(dir)).unwrap();
+            std::fs::write(workspace.join(dir).join("handoff.md"), body).unwrap();
+        }
+
+        let prompt = system_prompt_flat_text(&system_prompt_for_mode_with_context(workspace, None));
+
+        assert!(prompt.contains("left a relay artifact at `.codewhale/handoff.md`"));
+        assert!(prompt.contains("primary relay body"));
+        assert!(!prompt.contains("legacy relay body"));
+        assert!(!prompt.contains("left a relay artifact at `.deepseek/handoff.md`"));
     }
 
     #[test]

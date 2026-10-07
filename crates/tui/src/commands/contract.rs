@@ -1075,6 +1075,7 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
         };
         RelayProjection {
             compact_template: crate::prompts::COMPACT_TEMPLATE.to_string(),
+            handoff_path: crate::prompts::HANDOFF_RELATIVE_PATH.to_string(),
             workspace: app.workspace.display().to_string(),
             mode: app.mode.label().to_string(),
             model: app.model_display_label(),
@@ -7081,6 +7082,10 @@ mod tests {
             assert_eq!(
                 projection.compact_template.trim(),
                 crate::prompts::COMPACT_TEMPLATE.trim()
+            );
+            assert_eq!(
+                projection.handoff_path,
+                crate::prompts::HANDOFF_RELATIVE_PATH
             );
             assert!(matches!(projection.todos, TodoProjection::Absent));
             assert!(matches!(projection.plan, PlanProjection::Absent));
