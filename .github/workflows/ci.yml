@@ -464,12 +464,7 @@ jobs:
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
       - name: Install Linux system dependencies
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config bubblewrap apparmor-profiles
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config bubblewrap apparmor-profiles
           sh scripts/prepare-linux-test-sandbox.sh
       - name: Ubuntu build headroom
         shell: bash
@@ -530,12 +525,7 @@ jobs:
       - name: Install Linux system dependencies
         if: needs.changes.outputs.heavy == 'true'
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
       - name: Ubuntu build headroom
         if: needs.changes.outputs.heavy == 'true'
         shell: bash
@@ -754,12 +744,7 @@ jobs:
           toolchain: "1.89"
       - name: Install Linux system dependencies
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -897,12 +882,7 @@ jobs:
       - name: Install Linux system dependencies
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config bubblewrap apparmor-profiles
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config bubblewrap apparmor-profiles
           sh scripts/prepare-linux-test-sandbox.sh
       - name: Ubuntu build headroom
         # Reuse the same fixed hosted-runner provisioning as Safety and Lint.
@@ -1336,12 +1316,7 @@ jobs:
       - name: Install Linux system dependencies
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         with:
@@ -1399,12 +1374,7 @@ jobs:
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
       - name: Install Linux system dependencies
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -1452,12 +1422,7 @@ jobs:
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
