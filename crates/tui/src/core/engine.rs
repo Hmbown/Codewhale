@@ -962,6 +962,10 @@ pub struct Engine {
     /// The local-fallback notice for an unavailable account profile is shown
     /// once per engine; later turns only log it.
     profile_constitution_fallback_noticed: bool,
+    /// Model requests in a row that failed with the same upstream HTTP
+    /// status on the same model (#6889). Cleared when a request opens its
+    /// stream or fails some other way.
+    repeated_upstream_failure: Option<streaming::RepeatedUpstreamFailure>,
     api_provider: ProviderKind,
     /// One captured admitted route. Presentation snapshots derive strings from
     /// it; a changed table cannot be blessed by reinterpreting those strings.
@@ -2241,6 +2245,7 @@ impl Engine {
             extension_prompt_block: None,
             constitution_block: None,
             profile_constitution_fallback_noticed: false,
+            repeated_upstream_failure: None,
             api_provider,
             api_provider_identity,
             active_route_limits,

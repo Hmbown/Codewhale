@@ -368,6 +368,101 @@ impl StreamRetryBudget {
     }
 }
 
+/// Failures in a row, on one model with one upstream HTTP status, at which the
+/// error starts saying so (#6889). Every counted failure has already spent its
+/// transport retries, so two means two full rounds of them.
+pub(super) const REPEATED_UPSTREAM_FAILURE_NOTICE_AT: u32 = 2;
+
+/// Model requests that failed the same way with nothing succeeding in
+/// between: same model, same upstream HTTP status (#6889). One 502 is a
+/// transient fault worth retrying. The same 502 on every request is a model
+/// that is listed but not serving, and no amount of retrying fixes that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RepeatedUpstreamFailure {
+    model: String,
+    status: u16,
+    count: u32,
+}
+
+/// Record one upstream failure for `model`. Returns the line to add to its
+/// error once the same failure has repeated
+/// [`REPEATED_UPSTREAM_FAILURE_NOTICE_AT`] times. A different model or status
+/// starts a new count; the caller clears the streak when a request succeeds
+/// or fails some other way.
+pub(super) fn note_upstream_failure(
+    streak: &mut Option<RepeatedUpstreamFailure>,
+    model: &str,
+    status: u16,
+) -> Option<String> {
+    let count = match streak {
+        Some(prior) if prior.model == model && prior.status == status => {
+            prior.count = prior.count.saturating_add(1);
+            prior.count
+        }
+        _ => {
+            *streak = Some(RepeatedUpstreamFailure {
+                model: model.to_string(),
+                status,
+                count: 1,
+            });
+            1
+        }
+    };
+    (count >= REPEATED_UPSTREAM_FAILURE_NOTICE_AT).then(|| {
+        format!(
+            "`{model}` has now failed {count} times in a row with HTTP {status}, after retries each time. A provider can list a model that is not serving requests. If this keeps happening, choose another model with /model."
+        )
+    })
+}
+
+#[cfg(test)]
+mod repeated_upstream_failure_tests {
+    use super::{REPEATED_UPSTREAM_FAILURE_NOTICE_AT, note_upstream_failure};
+
+    #[test]
+    fn the_same_upstream_failure_is_named_once_it_repeats() {
+        let mut streak = None;
+        for _ in 1..REPEATED_UPSTREAM_FAILURE_NOTICE_AT {
+            assert_eq!(note_upstream_failure(&mut streak, "model-a", 502), None);
+        }
+        let notice = note_upstream_failure(&mut streak, "model-a", 502)
+            .expect("a repeated identical failure is named");
+        assert!(notice.contains("`model-a`"), "{notice}");
+        assert!(notice.contains("HTTP 502"), "{notice}");
+        assert!(
+            notice.contains(&format!(
+                "{REPEATED_UPSTREAM_FAILURE_NOTICE_AT} times in a row"
+            )),
+            "{notice}"
+        );
+        assert!(notice.contains("/model"), "{notice}");
+
+        // It keeps counting while nothing changes.
+        let next = note_upstream_failure(&mut streak, "model-a", 502).expect("still repeating");
+        assert!(
+            next.contains(&format!(
+                "{} times in a row",
+                REPEATED_UPSTREAM_FAILURE_NOTICE_AT + 1
+            )),
+            "{next}"
+        );
+    }
+
+    #[test]
+    fn a_different_model_or_status_or_a_success_starts_over() {
+        let mut streak = None;
+        assert_eq!(note_upstream_failure(&mut streak, "model-a", 502), None);
+        // Another status is another failure, not a repeat of the first.
+        assert_eq!(note_upstream_failure(&mut streak, "model-a", 503), None);
+        // So is another model.
+        assert_eq!(note_upstream_failure(&mut streak, "model-b", 503), None);
+        // The caller clears the streak on a success.
+        streak = None;
+        assert_eq!(note_upstream_failure(&mut streak, "model-b", 503), None);
+        assert!(note_upstream_failure(&mut streak, "model-b", 503).is_some());
+    }
+}
+
 /// Wall-clock vs monotonic divergence above which we conclude the host slept
 /// mid-stream (#2990). `Instant` pauses during system sleep (CLOCK_UPTIME_RAW
 /// on macOS, CLOCK_MONOTONIC on Linux) while `SystemTime` keeps advancing, so

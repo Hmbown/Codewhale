@@ -107,6 +107,9 @@ impl Engine {
                     job.provider_responded();
                 }
                 progress.context_recovery_attempts = 0;
+                // The route answered, so any run of identical upstream
+                // failures is over (#6889).
+                self.repeated_upstream_failure = None;
                 // A model has the question now; a later credential
                 // failure in this turn (a token expiring mid-turn, say)
                 // must not take it back (#6566).
@@ -225,6 +228,15 @@ impl Engine {
                 // and a provider's HTTP rejection must not pass for one
                 // because its body text mentions a timeout (#6711).
                 let open_transport_failure = crate::client::is_stream_open_transport_failure(&e);
+                // #6889: read the upstream status before `e` moves, so a 5xx
+                // that keeps repeating on this model can be told apart from
+                // a transient one below.
+                let upstream_status =
+                    e.chain()
+                        .find_map(|cause| match cause.downcast_ref::<LlmError>() {
+                            Some(LlmError::ServerError { status, .. }) => Some(*status),
+                            _ => None,
+                        });
                 let mut envelope =
                     crate::error_taxonomy::envelope_for_llm_error(e, message.clone());
                 // #6699: the request never became a stream (connect
@@ -260,6 +272,23 @@ impl Engine {
                         progress.stream_retry_budget.spent()
                     )).await;
                 }
+                // #6889: this request is not being re-issued. When the same
+                // model has now failed the same way more than once, say so
+                // and name the way out; the provider's own text stays first.
+                let display_message = match upstream_status {
+                    Some(status) => match super::streaming::note_upstream_failure(
+                        &mut self.repeated_upstream_failure,
+                        &stream_request.model,
+                        status,
+                    ) {
+                        Some(notice) => format!("{display_message}\n{notice}"),
+                        None => display_message,
+                    },
+                    None => {
+                        self.repeated_upstream_failure = None;
+                        display_message
+                    }
+                };
                 envelope.message = display_message.clone();
                 // #6566: no model saw the question. Take it back out of
                 // the session before reporting, so the next request does
