@@ -116,8 +116,38 @@ pub(crate) async fn capture(
         return snapshot.render().map(Some);
     }
     #[cfg(test)]
-    let _ = profile;
+    {
+        let _ = profile;
+        if let Some(message) = TEST_ACCOUNT_LOAD_FAILURE.get() {
+            anyhow::bail!(message);
+        }
+    }
     Ok(crate::prompts::load_user_constitution_block())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ACCOUNT_LOAD_FAILURE: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Make the account profile that `capture` would load itself fail on this
+/// thread until the guard drops, as an expired sign-in or unreachable account
+/// service does in a real build. A supplied snapshot never reaches it.
+#[cfg(test)]
+pub(crate) fn fail_account_load_for_test(message: &'static str) -> AccountLoadFailureGuard {
+    TEST_ACCOUNT_LOAD_FAILURE.set(Some(message));
+    AccountLoadFailureGuard
+}
+
+#[cfg(test)]
+pub(crate) struct AccountLoadFailureGuard;
+
+#[cfg(test)]
+impl Drop for AccountLoadFailureGuard {
+    fn drop(&mut self) {
+        TEST_ACCOUNT_LOAD_FAILURE.set(None);
+    }
 }
 
 #[cfg(test)]

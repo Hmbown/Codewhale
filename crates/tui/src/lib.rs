@@ -8422,14 +8422,36 @@ fn doctor_search_provider_line(config: &Config) -> String {
     } else {
         ""
     };
+    // Firecrawl search works without a key. Say so, or a default with no
+    // credential reads as a broken setup. Stdout-only, like the missing-key note.
+    let keyless = if search_provider.provider == crate::config::SearchProvider::Firecrawl
+        && !search_provider_has_firecrawl_key(config)
+    {
+        "; works without an API key (limited quota; set FIRECRAWL_API_KEY or [search] api_key to raise it)"
+    } else {
+        ""
+    };
 
     format!(
-        "search_provider: {} (source: {}{}){}",
+        "search_provider: {} (source: {}{}){}{}",
         search_provider.provider.as_str(),
         search_provider.source.as_str(),
         switch_hint,
-        missing_key
+        missing_key,
+        keyless
     )
+}
+
+/// Whether `web_search` would send a Firecrawl key. Mirrors the adapter:
+/// `[search] api_key` shadows `FIRECRAWL_API_KEY`, and a blank value is no key.
+fn search_provider_has_firecrawl_key(config: &Config) -> bool {
+    let env_key = std::env::var("FIRECRAWL_API_KEY").ok();
+    config
+        .search
+        .as_ref()
+        .and_then(|search| search.api_key.as_deref())
+        .or(env_key.as_deref())
+        .is_some_and(|key| !key.trim().is_empty())
 }
 
 /// Whether *any* Tavily key is reachable: the dedicated env var, or a
@@ -16718,6 +16740,51 @@ mod doctor_endpoint_tests {
         assert_eq!(report["provider"], "tavily");
         assert_eq!(report["source"], "env override");
         assert_eq!(report["reachability"], "not_checked");
+    }
+
+    #[test]
+    fn doctor_search_provider_line_says_firecrawl_needs_no_key_until_one_is_set() {
+        use crate::test_support::EnvVarGuard;
+        let _guard = crate::test_support::lock_test_env();
+        let _env = [
+            "CODEWHALE_SEARCH_PROVIDER",
+            "DEEPSEEK_SEARCH_PROVIDER",
+            "TAVILY_API_KEY",
+            "FIRECRAWL_API_KEY",
+        ]
+        .map(EnvVarGuard::remove);
+        let with_config_key = |api_key: &str| Config {
+            search: Some(crate::config::SearchConfig {
+                provider: Some(crate::config::SearchProvider::Firecrawl),
+                base_url: None,
+                api_key: Some(api_key.to_string()),
+                native: None,
+            }),
+            ..Default::default()
+        };
+
+        let keyless = doctor_search_provider_line(&Config::default());
+        let config_key = doctor_search_provider_line(&with_config_key("fc-test"));
+        let env_key = {
+            let _key = EnvVarGuard::set("FIRECRAWL_API_KEY", "fc-test");
+            // web_search lets a blank `[search] api_key` shadow the env key.
+            let shadowed = doctor_search_provider_line(&with_config_key(" "));
+            assert!(shadowed.contains("without an API key"), "got `{shadowed}`");
+            doctor_search_provider_line(&Config::default())
+        };
+
+        assert_eq!(
+            keyless,
+            "search_provider: firecrawl (source: default; set [search] provider = \"baidu\" | \"metaso\" | \"volcengine\" for China); works without an API key (limited quota; set FIRECRAWL_API_KEY or [search] api_key to raise it)"
+        );
+        assert_eq!(config_key, "search_provider: firecrawl (source: config)");
+        assert!(!env_key.contains("without an API key"), "got `{env_key}`");
+        assert!(
+            doctor_search_provider_json(&Config::default())
+                .get("keyless")
+                .is_none(),
+            "the note is stdout-only"
+        );
     }
 
     #[test]
