@@ -1001,7 +1001,10 @@ jobs:
           RUSTC_WRAPPER: ${{ matrix.os != 'windows-latest' && env.RUSTC_WRAPPER || '' }}
       - name: Windows Terminal clipboard acceptance
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'windows-latest'
-        timeout-minutes: 5
+        # The script bounds itself: every desktop stage has a 45 s deadline and
+        # reports its own failure with a desktop capture. This limit only has
+        # to stay above the sum of those stages (about 10 minutes worst case).
+        timeout-minutes: 12
         shell: pwsh
         run: node scripts/release/windows-terminal-clipboard.mjs target/debug/codewhale.exe "${{ runner.temp }}/windows-clipboard"
       - name: Retain Windows Terminal clipboard evidence
