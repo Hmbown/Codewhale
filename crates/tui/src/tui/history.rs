@@ -1127,8 +1127,8 @@ impl ExecCell {
             return wrap_card_rail(lines, self.status);
         }
 
-        // Routine successes get a three-row glimpse (two opening rows plus
-        // the tail) so they take less space in the live transcript. Failures
+        // Routine successes get a three-row glimpse (the opening row plus
+        // two closing rows) so they take less space in the live transcript. Failures
         // keep their larger preview, and Transcript mode retains the full
         // result for the pager and clipboard.
         if mode == RenderMode::Live

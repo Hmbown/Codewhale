@@ -545,6 +545,102 @@ fn whatever_live_truncates_the_transcript_still_holds() {
     assert!(transcript_text.contains("row 23 plain content"));
 }
 
+/// A successful run shows three rows of output. They used to be the first two
+/// and the very last, so `npm test` showed a blank row, the script banner and
+/// a timing line, and hid whether the tests passed. The rows that say how the
+/// run went must be among the three, blank rows must not take a slot, and
+/// every hidden row must be announced, including rows after the last one shown.
+#[test]
+fn a_successful_run_preview_shows_how_the_run_ended() {
+    let node_test = "\n> trip-timer@1.0.0 test\n> node --test\n\n\
+                     ✔ formats minutes (0.5ms)\n\
+                     ✔ trips over an hour show remainder minutes (0.1ms)\n\
+                     ℹ tests 2\nℹ suites 0\nℹ pass 2\nℹ fail 0\nℹ cancelled 0\n\
+                     ℹ skipped 0\nℹ todo 0\nℹ duration_ms 57.924542";
+    let cargo_test = "   Compiling demo v0.1.0\n     Running unittests src/lib.rs\n\n\
+                      running 2 tests\ntest a ... ok\ntest b ... ok\n\n\
+                      test result: ok. 2 passed; 0 failed; finished in 0.00s\n\n";
+    let plain = numbered_output(30);
+
+    // (case, output, rows that must be shown, omission markers in order)
+    let cases: [(&str, &str, &[&str], &[&str]); 3] = [
+        (
+            "totals followed by other lines",
+            node_test,
+            &["> trip-timer@1.0.0 test", "ℹ pass 2", "ℹ fail 0"],
+            &["5 lines omitted", "4 lines omitted"],
+        ),
+        (
+            "result followed by blank lines",
+            cargo_test,
+            &[
+                "Compiling demo v0.1.0",
+                "test b ... ok",
+                "test result: ok. 2 passed; 0 failed",
+            ],
+            &["3 lines omitted"],
+        ),
+        (
+            "nothing states an outcome",
+            &plain,
+            &[
+                "row 00 plain content",
+                "row 28 plain content",
+                "row 29 plain content",
+            ],
+            &["27 lines omitted"],
+        ),
+    ];
+
+    for (case, output, shown, markers) in cases {
+        let cell = {
+            let mut exec = exec_tool("npm test", ToolStatus::Success);
+            exec.output = Some(output.to_string());
+            exec.duration_ms = Some(120);
+            HistoryCell::Tool(ToolCell::Exec(exec))
+        };
+        let live = cell.lines_with_options(80, calm_options());
+        let live_text = lines_text(&live);
+
+        for row in shown {
+            assert!(
+                live_text.contains(row),
+                "[{case}] `{row}` hidden: {live_text}"
+            );
+        }
+        let source_rows_shown = output
+            .lines()
+            .filter(|line| !line.trim().is_empty() && live_text.contains(line.trim()))
+            .count();
+        assert_eq!(
+            source_rows_shown,
+            shown.len(),
+            "[{case}] the preview keeps its three-row budget: {live_text}"
+        );
+        let announced: Vec<String> = live
+            .iter()
+            .map(line_text)
+            .filter(|line| line.contains("lines omitted"))
+            .collect();
+        assert_eq!(
+            announced.len(),
+            markers.len(),
+            "[{case}] every gap is announced once: {live_text}"
+        );
+        for (line, marker) in announced.iter().zip(markers) {
+            assert!(line.contains(marker), "[{case}] `{marker}`: {live_text}");
+        }
+
+        let transcript_text = lines_text(&cell.transcript_lines(80));
+        for line in output.lines() {
+            assert!(
+                transcript_text.contains(line.trim()),
+                "[{case}] the transcript keeps `{line}`: {transcript_text}"
+            );
+        }
+    }
+}
+
 /// Repro for #80: a `git diff --stat`-shaped result must keep its newlines on
 /// the transcript surface — one file per row, not squashed into one line.
 #[test]

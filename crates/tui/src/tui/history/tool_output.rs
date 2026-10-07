@@ -404,20 +404,24 @@ fn render_preserved_output_mode(
         line_limit,
         || selected_output_indices(&all_lines, line_limit),
     );
-    let mut previous: Option<usize> = None;
+    // Blank rows are dropped without a marker, so the count is of rows that
+    // carry text. Rows hidden after the last one shown are announced too: the
+    // tail can stop short of the end when it keeps a result row instead.
+    let omitted_line = |hidden: &[OutputRow]| {
+        let omitted = hidden.iter().filter(|row| !is_blank_row(row)).count();
+        (omitted > 0).then(|| {
+            details_affordance_line(
+                &format!(
+                    "{omitted} lines omitted; {}",
+                    crate::tui::key_shortcuts::tool_details_shortcut_action_hint("output")
+                ),
+                Style::default().fg(palette::TEXT_MUTED),
+            )
+        })
+    };
+    let mut next = 0usize;
     for (rendered_idx, idx) in selected.iter().copied().enumerate() {
-        if let Some(prev) = previous {
-            let omitted = idx.saturating_sub(prev + 1);
-            if omitted > 0 {
-                lines.push(details_affordance_line(
-                    &format!(
-                        "{omitted} lines omitted; {}",
-                        crate::tui::key_shortcuts::tool_details_shortcut_action_hint("output")
-                    ),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ));
-            }
-        }
+        lines.extend(omitted_line(&all_lines[next..idx]));
 
         let row = &all_lines[idx];
         render_output_row(
@@ -430,8 +434,9 @@ fn render_preserved_output_mode(
             row,
             width,
         );
-        previous = Some(idx);
+        next = idx + 1;
     }
+    lines.extend(omitted_line(&all_lines[next..]));
 
     lines
 }
@@ -557,32 +562,41 @@ pub(super) fn split_segments(
         .collect()
 }
 
+fn is_blank_row(row: &OutputRow) -> bool {
+    row.text.trim().is_empty()
+}
+
 fn selected_output_indices(rows: &[OutputRow], line_limit: usize) -> Vec<usize> {
-    let total = rows.len();
-    if total <= line_limit || line_limit == 0 {
-        return (0..total).collect();
+    if rows.len() <= line_limit || line_limit == 0 {
+        return (0..rows.len()).collect();
     }
 
-    // Small previews must retain the result/error at the tail as well as
-    // the opening context. The usual 20-row budget still keeps 10 + 6.
-    let head = TOOL_OUTPUT_HEAD_LINES
-        .min(line_limit.div_ceil(2))
-        .min(total);
-    let tail = TOOL_OUTPUT_TAIL_LINES
-        .min(line_limit.saturating_sub(head))
-        .min(total.saturating_sub(head));
+    // Once rows have to go, blank ones go first. Commands open and close
+    // with blank lines (`npm test` starts with one, `cargo test` ends with
+    // one), and a three-row preview that spends a row on one shows nothing.
+    let visible: Vec<usize> = (0..rows.len())
+        .filter(|&idx| !is_blank_row(&rows[idx]))
+        .collect();
+    if visible.len() <= line_limit {
+        return visible;
+    }
+
+    // A tight preview gives the larger share to the tail: one opening row
+    // says what ran, the end says how it went. The usual 20-row budget still
+    // keeps 10 + 6.
+    let head = TOOL_OUTPUT_HEAD_LINES.min(line_limit / 2).max(1);
+    let tail = TOOL_OUTPUT_TAIL_LINES.min(line_limit.saturating_sub(head));
     let mut selected = std::collections::BTreeSet::new();
-    selected.extend(0..head);
-    selected.extend(total.saturating_sub(tail)..total);
+    selected.extend(visible[..head].iter().copied());
+    selected.extend(tail_output_indices(rows, &visible[head..], tail));
 
     let budget = line_limit.saturating_sub(selected.len());
     if budget > 0 {
-        let mut important: Vec<(usize, usize)> = rows
+        let mut important: Vec<(usize, usize)> = visible[head..]
             .iter()
-            .enumerate()
-            .skip(head)
-            .take(total.saturating_sub(head + tail))
-            .filter_map(|(idx, row)| output_importance_rank(&row.text).map(|rank| (idx, rank)))
+            .copied()
+            .filter(|idx| !selected.contains(idx))
+            .filter_map(|idx| output_importance_rank(&rows[idx].text).map(|rank| (idx, rank)))
             .collect();
         important.sort_by_key(|(idx, rank)| (*rank, *idx));
         for (idx, _) in important.into_iter().take(budget) {
@@ -597,13 +611,57 @@ fn selected_output_indices(rows: &[OutputRow], line_limit: usize) -> Vec<usize> 
     // 20-line command then rendered 16 rows and claimed the other four were
     // "omitted". Spend whatever is left by growing the head downward, which
     // keeps the shown region contiguous and readable top-down.
-    let mut next = head;
-    while selected.len() < line_limit.min(total) && next < total {
-        selected.insert(next);
-        next += 1;
+    for &idx in &visible[head..] {
+        if selected.len() >= line_limit {
+            break;
+        }
+        selected.insert(idx);
     }
 
     selected.into_iter().collect()
+}
+
+/// Choose `tail` rows from the closing `TOOL_OUTPUT_TAIL_LINES` of
+/// `candidates` (non-blank row indices, in order).
+///
+/// With the full tail budget that is simply the closing rows. A tight preview
+/// has fewer slots than the closing block has rows, and a run's totals are
+/// often not its very last lines (a timing line follows them), so rows that
+/// state an outcome take the slots first and the last rows fill the rest.
+fn tail_output_indices(rows: &[OutputRow], candidates: &[usize], tail: usize) -> Vec<usize> {
+    let window_len = TOOL_OUTPUT_TAIL_LINES.max(tail).min(candidates.len());
+    let window = &candidates[candidates.len() - window_len..];
+    let mut picked: Vec<usize> = window
+        .iter()
+        .rev()
+        .copied()
+        .filter(|&idx| states_outcome(&rows[idx].text))
+        .take(tail)
+        .collect();
+    for &idx in window.iter().rev() {
+        if picked.len() >= tail {
+            break;
+        }
+        if !picked.contains(&idx) {
+            picked.push(idx);
+        }
+    }
+    picked
+}
+
+/// Does the row say that something passed or failed? Plain words only, the
+/// same way `output_importance_rank` spots errors — no tool's format is parsed.
+fn states_outcome(line: &str) -> bool {
+    const OUTCOME_WORDS: [&str; 10] = [
+        "pass", "passed", "passes", "passing", "fail", "failed", "fails", "failing", "failure",
+        "failures",
+    ];
+    line.split(|ch: char| !ch.is_ascii_alphabetic())
+        .any(|word| {
+            OUTCOME_WORDS
+                .iter()
+                .any(|outcome| word.eq_ignore_ascii_case(outcome))
+        })
 }
 
 fn output_importance_rank(line: &str) -> Option<usize> {
