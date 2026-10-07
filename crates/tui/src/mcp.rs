@@ -4406,6 +4406,27 @@ impl McpPool {
             .collect()
     }
 
+    /// Configured servers a turn may name to the model, sorted: enabled,
+    /// allowed and `permitted`, the same fail-closed gates
+    /// [`Self::configured_servers_for_search`] applies before a handshake.
+    /// Names only — nothing is connected and no schema is read.
+    pub(crate) fn discoverable_configured_servers(
+        &self,
+        permitted: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .config
+            .servers
+            .iter()
+            .filter(|(name, config)| {
+                config.is_enabled() && self.server_allowed(name) && permitted(name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Match discovery intent against actual configured server identities only.
     /// No guessed tool/schema is inserted; the caller still obtains tools/list.
     pub(crate) fn configured_servers_for_search(

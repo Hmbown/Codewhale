@@ -10841,4 +10841,10 @@ fn configured_mcp_search_excludes_disabled_and_namespace_denied_servers() {
             .unwrap(),
         ["enabled"]
     );
+    // The list named to the model passes the same gates, plus the turn's.
+    assert_eq!(pool.discoverable_configured_servers(|_| true), ["enabled"]);
+    assert!(
+        pool.discoverable_configured_servers(|name| name != "enabled")
+            .is_empty()
+    );
 }

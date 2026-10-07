@@ -8404,6 +8404,56 @@ impl Engine {
         let _ = self.send_event(Event::status(status)).await;
     }
 
+    /// Name the configured MCP servers this turn may load, in session history
+    /// before a model request (KV-cache effect: append-only user history).
+    ///
+    /// Session boot is lazy and MCP tools are deferred, so a server the user
+    /// added is otherwise invisible to the model until the user names it. The
+    /// list is exactly what an MCP-focused `tool_search` may connect under
+    /// this turn's ceiling ([`Self::discover_mcp_for_tool_search`]): enabled,
+    /// allowed servers, and none when `tool_search` is not in `catalog`.
+    /// Names only — nothing is connected and no schema is loaded. Derived
+    /// from the session log like the guidance above, so an unchanged list is
+    /// recorded once, a changed one supersedes it, and one a compaction
+    /// dropped is recorded again. Child and RLM hosts get none: their tool
+    /// surface is fixed by their parent.
+    pub(super) async fn record_mcp_configured_servers(
+        &mut self,
+        policy: &ToolSurfacePolicy,
+        catalog: &[Tool],
+    ) {
+        if self.child_host.is_some()
+            || self.rlm_host.is_some()
+            || self.is_acp_turn()
+            || self.api_config.runtime_chat_isolated
+            || !self.config.features.enabled(Feature::Mcp)
+        {
+            return;
+        }
+        let servers = match self.mcp_pool.as_ref() {
+            Some(pool) if catalog.iter().any(|tool| is_tool_search_tool(&tool.name)) => {
+                // Never stall a model request behind a pool busy with a
+                // handshake; the next request boundary records it instead.
+                let Ok(pool) = pool.try_lock() else {
+                    return;
+                };
+                pool.discoverable_configured_servers(|server| policy.permits_mcp_discovery(server))
+            }
+            _ => Vec::new(),
+        };
+        let previous = self.session.messages.iter().rev().find(|message| {
+            crate::runtime_handoff::mcp_configured_servers_display(message).is_some()
+        });
+        if servers.is_empty() && previous.is_none() {
+            return;
+        }
+        let message = crate::runtime_handoff::mcp_configured_servers_runtime_message(&servers);
+        if previous == Some(&message) {
+            return;
+        }
+        self.add_session_message(message).await;
+    }
+
     /// Record the entire bounded mod snapshot in the existing session history.
     /// The latest snapshot supersedes earlier ones; an empty capture withdraws
     /// them. Comparing the log also re-delivers instructions after compaction

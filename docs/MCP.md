@@ -500,6 +500,15 @@ force. General searches do not boot all optional servers. Only actual
 revoked servers do not acquire fabricated tools. Narrow a broad search by
 server name when more than eight configured servers match.
 
+So that a plain question can reach a server the user never names, each turn
+tells the model which configured servers it may load: one short runtime note
+in session history listing the enabled, allowed server names (at most 24) and
+asking it to `tool_search` a name before searching files or reporting that no
+tool exists. The note is appended to history, never to the cached system
+prompt, and is repeated only when the list changes or a compaction dropped
+it. It carries names only — no server is started and no schema is loaded
+until the model searches. Disabled or denied servers are never named.
+
 `codewhale mcp connect`, `validate`, and `tools` inspect their own process's
 pool. They do not attach transports to a running TUI or exec session. Use
 in-session discovery or explicit tool selection. In the TUI,

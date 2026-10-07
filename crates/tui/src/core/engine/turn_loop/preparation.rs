@@ -35,6 +35,8 @@ impl Engine {
         .await;
         self.record_mcp_server_instructions(&progress.tool_catalog)
             .await;
+        self.record_mcp_configured_servers(tool_policy, &progress.tool_catalog)
+            .await;
         self.record_current_constitution().await;
         self.record_current_extension_prompt_contributions().await;
 
