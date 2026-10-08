@@ -93,6 +93,11 @@ export const SURFACES = [
   "web-app",
   "desktop",
   "control-plane",
+  // A VS Code-family extension client: deliberately generic, the way "web-app"
+  // and "desktop" are. The editor's own name and version are not collected.
+  // Appended, never inserted: `LEGACY_SURFACES` below is `slice(0, 6)`, and v1
+  // must keep refusing every surface that was not in the runtime whitelist.
+  "vscode-extension",
 ] as const;
 
 const LEGACY_SURFACES = SURFACES.slice(0, 6);

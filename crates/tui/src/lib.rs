@@ -2151,6 +2151,19 @@ fn tokio_runtime_builder() -> tokio::runtime::Builder {
 /// binary serves at least five surfaces, so `current_exe()` would label all of
 /// them the same.
 fn telemetry_surface(command: Option<&Commands>) -> codewhale_telemetry::Surface {
+    telemetry_surface_with(command, embedded_surface_override())
+}
+
+/// The injectable form of [`telemetry_surface`].
+///
+/// The declared surface is a parameter rather than an environment read inside
+/// the match, so the "only the server branch consults it" rule can be proven
+/// without a test mutating process-wide environment — which would race every
+/// other test in this binary.
+fn telemetry_surface_with(
+    command: Option<&Commands>,
+    declared: Option<codewhale_telemetry::Surface>,
+) -> codewhale_telemetry::Surface {
     use codewhale_telemetry::Surface;
     match command {
         None | Some(Commands::Resume { .. } | Commands::Fork { .. } | Commands::Pr { .. }) => {
@@ -2161,11 +2174,53 @@ fn telemetry_surface(command: Option<&Commands>) -> codewhale_telemetry::Surface
             if args.mcp {
                 Surface::McpServer
             } else {
-                Surface::Serve
+                declared.unwrap_or(Surface::Serve)
             }
         }
         Some(_) => Surface::Cli,
     }
+}
+
+/// The surface name an embedding client declared for a server it started.
+///
+/// An API server is the one surface a third party legitimately *starts*, so it
+/// is the one surface an embedder may name. The editor extension, for instance,
+/// runs `codewhale serve --http` and declares itself, so its sessions are not
+/// counted as anonymous `serve` traffic from nobody in particular.
+///
+/// Three properties are deliberate:
+///
+/// 1. **`serve` only.** The variable is inherited by any process this one
+///    starts, and an agent running a shell command is running `codewhale`
+///    descendants with this environment. A nested `codewhale exec` that
+///    inherited the label would report itself as the embedder — wrong, and
+///    invisible. Consulting it only in the branch that *is* the embedder's own
+///    server bounds that to a process the embedder actually started.
+/// 2. **`tui` is refused.** Nothing starts the interactive terminal UI on a
+///    user's behalf, and reporting a server as `tui` would put it in the one
+///    surface whose numbers are the terminal's. `mcp` is decided before this is
+///    consulted, so a server that *is* an MCP server still says so.
+/// 3. **Unrecognised is not an error.** A name outside [`Surface::ALL`] is
+///    ignored and the caller falls back, rather than failing a startup over a
+///    field that is only a label. The value is not "sanitised" into a variant
+///    it resembles; it is dropped.
+fn embedded_surface_override() -> Option<codewhale_telemetry::Surface> {
+    embedded_surface_override_from(std::env::var("CODEWHALE_TELEMETRY_SURFACE").ok())
+}
+
+/// The injectable form of [`embedded_surface_override`], used by tests.
+///
+/// Separate from the environment read for the same reason
+/// `load_setup_state_for_decision_at` is separate from
+/// `load_setup_state_for_decision`: a test that mutated process-wide
+/// environment for this would race every other test in the binary.
+fn embedded_surface_override_from(raw: Option<String>) -> Option<codewhale_telemetry::Surface> {
+    use codewhale_telemetry::Surface;
+    let surface = Surface::parse(raw?.trim())?;
+    if surface == Surface::Tui {
+        return None;
+    }
+    Some(surface)
 }
 
 /// How this session was started, for `session_start`.
