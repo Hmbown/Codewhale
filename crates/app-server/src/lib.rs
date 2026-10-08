@@ -56,16 +56,8 @@ mod daemon_windows;
 /// coordinated migration touches exactly one place (repo policy: preserve
 /// legacy migration care).
 mod legacy_deepseek_compat {
-    use std::path::PathBuf;
-
     /// Service name advertised by the HTTP and stdio health probes.
     pub(crate) const SERVICE_NAME: &str = "deepseek-app-server";
-
-    /// Fallback hook-event log location used when no config path is
-    /// provided (legacy `.deepseek/` dot-directory layout).
-    pub(crate) fn default_events_log_path() -> PathBuf {
-        PathBuf::from(".deepseek/events.jsonl")
-    }
 }
 
 /// Upper bound on JSON request bodies accepted by the HTTP app-server.
@@ -1259,10 +1251,14 @@ fn build_state_with_transport(
     if transport == AppTransport::Http {
         hooks.add_sink(Arc::new(StdoutHookSink));
     }
-    let hook_log_path = config_path
-        .as_ref()
-        .and_then(|p| p.parent().map(|parent| parent.join("events.jsonl")))
-        .unwrap_or_else(legacy_deepseek_compat::default_events_log_path);
+    // The hook log sits beside the state database: next to an explicit
+    // config, otherwise in the directory the state store resolved under the
+    // Codewhale home. Never relative to the process cwd (#6513).
+    let hook_log_path = state_store
+        .db_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("events.jsonl");
     hooks.add_sink(Arc::new(JsonlHookSink::new(hook_log_path)));
 
     if let Some(socket_path) = config
@@ -3686,6 +3682,60 @@ mod tests {
             stdio_sinks + 1,
             "HTTP mode keeps StdoutHookSink + JsonlHookSink; stdio must drop the stdout sink (#5165)"
         );
+    }
+
+    // Points CODEWHALE_HOME at a temp dir for one test and restores it after.
+    // The variable is process-global, so these tests hold a lock.
+    static CODEWHALE_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct CodewhaleHomeGuard {
+        prior: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CodewhaleHomeGuard {
+        fn set(value: &Path) -> Self {
+            let lock = CODEWHALE_HOME_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prior = std::env::var_os("CODEWHALE_HOME");
+            // SAFETY: serialised by CODEWHALE_HOME_TEST_LOCK.
+            unsafe { std::env::set_var("CODEWHALE_HOME", value) };
+            Self { prior, _lock: lock }
+        }
+    }
+
+    impl Drop for CodewhaleHomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialised by CODEWHALE_HOME_TEST_LOCK.
+            unsafe {
+                match &self.prior {
+                    Some(value) => std::env::set_var("CODEWHALE_HOME", value),
+                    None => std::env::remove_var("CODEWHALE_HOME"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_log_without_config_path_goes_beside_state_db_not_cwd() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = CodewhaleHomeGuard::set(home.path());
+
+        let state = build_state_with_transport(None, None, AppTransport::Stdio).expect("state");
+        state
+            .runtime
+            .read()
+            .await
+            .hooks
+            .emit(codewhale_hooks::HookEvent::ResponseStart {
+                response_id: "resp-6513".to_string(),
+            })
+            .await;
+
+        let log = fs::read_to_string(home.path().join("events.jsonl"))
+            .expect("hook log beside state.db in CODEWHALE_HOME");
+        assert!(log.contains("resp-6513"), "{log}");
     }
 
     async fn response_body_json(response: Response) -> Value {
