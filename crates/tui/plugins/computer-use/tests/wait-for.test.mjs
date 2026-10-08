@@ -112,6 +112,20 @@ test("wait_for absent is satisfied immediately when nothing matches", async () =
   assert.equal(r.timed_out, undefined);
 });
 
+test("wait_for rechecks its condition on the observation returned for targeting", async () => {
+  setControl({ observations: [
+    { elements: [{ index: 0, path: [0], windowIndex: 0, role: "AXButton", label: "flashing" }] },
+    { elements: [] },
+  ] });
+  try {
+    const result = await tool("wait_for", { query: "flashing", timeout: 0.5, interval: 100 });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.matched, false, "a vanished control must not satisfy a wait");
+    assert.equal(result.timed_out, true);
+    assert.equal(result.state_id, undefined);
+  } finally { setControl(null); }
+});
+
 test("wait_for times out honestly when the predicate never holds", async () => {
   const before = calls("get_app_state").length;
   const r = await tool("wait_for", { query: "never-present-label", timeout: 0.6, interval: 150 });

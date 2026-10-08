@@ -23,12 +23,12 @@ export function containsRasterPin(args) {
   if (!args || typeof args !== "object") return false;
   return args.raster_id !== undefined
     || ["target", "from_target", "to"].some(slot => args[slot]?.raster_id !== undefined)
-    || (Array.isArray(args.steps) && args.steps.some(step => containsRasterPin(step?.arguments)));
+    || (Array.isArray(args.steps) && args.steps.some(step => containsRasterPin(step?.arguments) || containsRasterPin(step?.args)));
 }
 
 /** Argument fields that carry entered text, per tool. */
 const TEXT_FIELDS = {
-  type: ["text"], set_value: ["value"], browser_type: ["text"],
+  type: ["text"], set_value: ["value"], browser_type: ["text"], browser: ["text"],
   clipboard: ["text"], write_clipboard: ["text"],
 };
 export const REDACTED = "[redacted]";
@@ -47,7 +47,10 @@ export function redactCall(tool, args) {
       if (out[field] !== undefined) { out[field] = REDACTED; redacted = true; }
     }
     if (name === "run_actions" && Array.isArray(out.steps)) {
-      out.steps = out.steps.map((step) => step && typeof step === "object" ? { ...step, arguments: scrub(step.tool, step.arguments) } : step);
+      out.steps = out.steps.map((step) => step && typeof step === "object" ? { ...step,
+        ...(step.arguments !== undefined ? { arguments: scrub(step.tool, step.arguments) } : {}),
+        ...(step.args !== undefined ? { args: scrub(step.tool, step.args) } : {}),
+      } : step);
     }
     return out;
   };

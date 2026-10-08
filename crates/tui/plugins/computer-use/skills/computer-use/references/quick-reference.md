@@ -11,8 +11,9 @@ no better interface.
 - `request_access` — permissions + capabilities; call once per session.
 - `list_apps {all?}` — running apps (names, pids). Default: user-facing apps.
 - `list_windows {app_ref?}` — windows with indices for `window_id`.
-- `get_app_state {app_ref?, query?, role?, limit?, detail?}` — elements +
-  `state_id`. The targeting tree.
+- `get_app_state {app_ref?, query?, role?, limit?, detail?, since?}` — elements +
+  `state_id`. `since` takes an earlier state ID or `"latest"`; same complete
+  view returns changed rows and `removed_indices`, otherwise a full baseline.
 - `find_elements {state_id?, query?, role?}` — filter a cached observation.
 - `wait_for {query|role, state, timeout?}` — poll until UI appears/disappears.
 - `screenshot {app_ref?|region?|display?}` — raster geometry and `raster_id` for visual work.
@@ -34,6 +35,10 @@ a raster ID. Browser viewport points use the browser's separate contract.
 - `type {text, target?, press_enter?}` — unicode-safe; verifies by read-back where possible.
 - `key {text, repeat?|duration?}` — chords like `cmd+s`; `duration` holds the key.
 - `set_value {target, value}` — semantic write with read-back.
+- `run_actions {steps, observe?}` — 1–8 `{tool,arguments}` steps (`args` is an
+  alias). `find:{query,role,app_ref?,window_id?}` resolves a fresh unique element
+  for that step. `observe:true` adds compact final state. Stop on failure; read
+  completed steps and delivery uncertainty before continuing.
 - `select_text {target, text_range?}` · `focus {target}` · `perform_action {target, action}`
 - `scroll {target, direction, amount?}` · `left_click_drag {from_target, to}`
 - `invoke_menu {path}` — app menu items through accessibility (exact for app-level commands like New/Save/Quit; see the close recipe for windows).

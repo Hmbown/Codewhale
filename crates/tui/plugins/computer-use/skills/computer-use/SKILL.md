@@ -16,10 +16,12 @@ Prefer the host's files, shell and app connectors for work that does not need a 
 ## Observe, act, verify
 
 1. `list_apps` finds targets. If a named app is absent, try `open_application` once with the user's exact spelling, then report the result; do not guess names. Pass `computer` explicitly when switching machines. Read each receipt's computer identity.
-2. Start with `get_app_state` for text, controls, element indices and `state_id`. Use `query`, `role`, `limit` or `find_elements` to narrow. Missing labels are unknown; do not guess them. Re-observe shallow/loading trees.
+2. Start with `get_app_state` for text, controls, element indices and `state_id`. Use `query`, `role`, `limit` or `find_elements` to narrow. Repeat the same view with `since:state_id` (or `"latest"`) for changed rows; `resync_required:true` supplies a new full baseline. `removed_indices` left that view. Missing labels are unknown; do not guess them. Re-observe shallow/loading trees.
 3. Prefer element targets, `set_value`, or `focus` then `type`/`key`. Newlines and `press_enter` send Return. `wait_for` handles UI transitions. Re-observe after stale targets or a timeout; never replay an action whose receipt says `action_sent:true`.
 4. Use screenshots/zoom only when the tree cannot answer the task. Coordinates are pixels in the returned raster unless explicitly `space:"screen"`. Pass its `raster_id` in every raster coordinate target and as the parent of `zoom`; use the zoom's new ID for child-image points. OCR targets already carry it. `raster_stale` means observe again; never drop the ID to retry. A pin detects capture replacement, not a changed UI. Never calculate from a file path, omitted image, stale raster or invented state. Text-only models may use macOS OCR, not infer graphical meaning.
 5. Verify with fresh state, field readback or an observed task result. A sent action is not proof of success. When typing says `verified:false`, inspect the requested screenshot before relying on it.
+
+`run_actions` groups 1–8 `{tool,arguments}` steps (`args` is an alias). `find:{query,role,app_ref?,window_id?}` observes a unique target immediately before a step; ambiguity or staleness stops input. `wait_for` timeout stops later steps. `observe:true` adds compact final state; an object supplies its arguments. Inspect `completed_steps`, `action_sent`, `outcome_unknown`: failure never authorizes replaying earlier input.
 
 ## Consent and stop rules
 

@@ -79,3 +79,12 @@ test("named grant admits exactly the named wires and their parents", async (t) =
   assert.equal((await s.tool("computer", { action: "switch", id: "local" })).error?.code, "not_granted", "computer_switch is not granted");
   assert.equal((await s.tool("stop_computer_control", {})).ok, true, "the safety valve always works");
 });
+
+test("named batch lookup cannot widen a launch-time observation grant", async (t) => {
+  const s = await boot(t, "run_actions,type");
+  const result = await s.tool("run_actions", { steps: [{ tool: "type", find: { role: "AXTextField" }, args: { text: "must not send" } }] });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "not_granted");
+  assert.equal(result.completed_steps, 0);
+  assert.equal(result.action_sent, false);
+});

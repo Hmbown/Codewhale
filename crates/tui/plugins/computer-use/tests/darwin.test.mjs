@@ -190,11 +190,19 @@ test('macOS backend binds native input to the opened process and reports denied 
     if(cmd==='open')return {code:0,stdout:'',stderr:''};
     if(cmd==='screencapture')return {code:1,stdout:'',stderr:'denied'};
     const request=JSON.parse(args[0]);calls.push(request);
-    return {code:0,stderr:'',stdout:JSON.stringify(request.tool==='app_info'?{found:true,pid:123,bundle_id:'test.app'}:request.tool==='permissions'?{trusted:false}:{action_sent:true})};
+    return {code:0,stderr:'',stdout:JSON.stringify(request.tool==='app_info'?{found:true,pid:123,bundle_id:'test.app'}:request.tool==='get_app_state'?{found:true,pid:123,elements:[]}:request.tool==='permissions'?{trusted:false}:{action_sent:true})};
   })});
   await backend.open_application({name:'TextEdit',activate:false});await backend.key({text:'return'});await backend.type({text:'Hello 世界 🐋'});
   const events=calls.filter(c=>c.tool==='key_event');assert.equal(events.length,2);assert.equal(events[0].args.code,36);assert.equal(events[0].args.flags,0);assert.equal(events[0].args.input_app_ref.pid,123);assert.equal(events[1].args.down,false);
   assert.equal(calls.find(c=>c.tool==='type').args.text,'Hello 世界 🐋');
+  for (const [text,code] of [['Page_Down',121],['page-down',121],['PgDn',121],['PgUp',116],['ArrowLeft',123],['Forward_Delete',117],['KP_Enter',36],['-',27]]) {
+    await backend.key({text});
+    assert.equal(calls.filter(c=>c.tool==='key_event' && c.args.down).at(-1).args.code,code,text);
+  }
+  await backend.get_app_state({query:' Field ',role:'AXTextField',detail:'compact'});
+  const search=calls.find(c=>c.tool==='get_app_state').args;
+  assert.equal(search.query,'Field');assert.equal(search.role,'AXTextField');
+  assert.equal(search.app_ref.pid,123);
   const probe=await backend.probe();assert.equal(probe.permissions.accessibility,'denied');assert.equal(probe.capabilities.raw_input,false);assert.equal(probe.capabilities.screenshot,false);
 });
 

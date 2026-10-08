@@ -45,6 +45,7 @@ export function create() {
   // One backend instance owns this binding; serve-mode tests read it back to
   // prove state survives between requests on the same agent process.
   let boundApp = null;
+  let observationNumber = 0;
 
   return {
     platform: "fake",
@@ -77,6 +78,13 @@ export function create() {
     },
     async get_app_state({ app_ref, detail, include_ocr } = {}) {
       record("get_app_state", { app_ref, detail, include_ocr });
+      let control;
+      try { control = JSON.parse(fs.readFileSync(controlFile, "utf8")); } catch {}
+      if (control?.observation || control?.observations) {
+        const observation = control.observation ?? control.observations[Math.min(observationNumber++, control.observations.length - 1)];
+        return { found: true, name: app_ref?.name ?? "FakeApp", ...observation };
+      }
+      observationNumber = 0;
       return { found: true, name: app_ref?.name ?? "FakeApp", elements: ELEMENTS, ...(include_ocr ? { ocr: {
         status: app_ref?.name === "OCR unavailable" ? "unavailable" : "ok",
         raster: { file: "/fixture/ocr.png", points: { x: 100, y: 50, w: 200, h: 100 }, pixels: { w: 400, h: 200 }, scale: 2 },

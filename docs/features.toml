@@ -422,6 +422,15 @@ docs = "docs/PLUGINS.md"
 owner = "crates/tui/src/plugins"
 
 [[feature]]
+id = "computer-use"
+name = "Computer Use"
+summary = "Reviewed app control with consent, fresh element targets, observation diffs and bounded named action batches."
+status = "experimental"
+surfaces = { tui = "preview", api = "preview" }
+docs = "docs/PLUGIN_BUNDLES.md"
+owner = "crates/tui/plugins/computer-use"
+
+[[feature]]
 id = "script-tools"
 name = "Script tools"
 summary = "Scripts in ~/.codewhale/tools become approval-gated tools; [tools.overrides] disables built-ins, never replaces them."
