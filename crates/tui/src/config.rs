@@ -2595,6 +2595,13 @@ pub struct Config {
     #[serde(skip)]
     pub loaded_config_path: Option<PathBuf>,
 
+    /// Runtime-only receipt that a higher-precedence layer supplied `[network]`
+    /// — a managed overlay. The resolved policy is then not the user
+    /// document's to replace: a mid-session re-read of that document must not
+    /// widen what the higher layer set.
+    #[serde(skip)]
+    pub(crate) network_layer_is_managed: bool,
+
     /// A resolved startup snapshot never reads remembered route choices again.
     /// False means an explicit config/profile owns the route instead.
     #[serde(skip)]
@@ -10474,6 +10481,8 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         notifications: override_cfg.notifications.or(base.notifications),
         approval: override_cfg.approval.or(base.approval),
         network: override_cfg.network.or(base.network),
+        network_layer_is_managed: override_cfg.network_layer_is_managed
+            || base.network_layer_is_managed,
         verifier: override_cfg.verifier.or(base.verifier),
         advisor: override_cfg.advisor.or(base.advisor),
         skills: merge_skills_config(base.skills, override_cfg.skills),
@@ -10998,6 +11007,12 @@ fn apply_managed_overrides(config: &mut Config) -> Result<()> {
             merged.provider_config_for_mut(&owner)?.base_url = None;
         }
         merged.base_url_env_receipt = BaseUrlEnvReceipt::NoOwner;
+    }
+    // A managed `[network]` table outranks the user document. Record that the
+    // resolved policy is not the document's to replace, so a mid-session
+    // re-read of that document folds onto it instead of widening it.
+    if managed.network.is_some() {
+        merged.network_layer_is_managed = true;
     }
     *config = merged;
     Ok(())

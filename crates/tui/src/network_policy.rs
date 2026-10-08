@@ -122,6 +122,23 @@ fn default_decision() -> DecisionToml {
     DecisionToml::Prompt
 }
 
+/// The stricter of two fallback decisions, ordering `Deny` < `Prompt` < `Allow`.
+/// Used when a lower-precedence layer is folded onto a policy an authority set.
+fn stricter_decision(left: DecisionToml, right: DecisionToml) -> DecisionToml {
+    fn rank(decision: DecisionToml) -> u8 {
+        match decision {
+            DecisionToml::Deny => 0,
+            DecisionToml::Prompt => 1,
+            DecisionToml::Allow => 2,
+        }
+    }
+    if rank(left) <= rank(right) {
+        left
+    } else {
+        right
+    }
+}
+
 fn default_audit() -> bool {
     true
 }
@@ -171,6 +188,33 @@ impl From<Decision> for DecisionToml {
 }
 
 impl NetworkPolicy {
+    /// Fold a lower-precedence layer (the user's config document) onto this
+    /// policy without letting it widen what a higher authority set.
+    ///
+    /// A `deny` entry is never dropped, and the fallback keeps the stricter of
+    /// the two decisions. The lower layer's `allow` list is adopted, so it can
+    /// grant hosts that the fallback would otherwise prompt for — which is what
+    /// `/network allow <host>` writes — but it cannot make an unlisted host
+    /// more permissive than the authority already decided, and it cannot lift a
+    /// denial.
+    #[must_use]
+    pub fn folded_with_lower_layer(&self, lower: Self) -> Self {
+        let mut deny = self.deny.clone();
+        for entry in lower.deny {
+            if !deny.iter().any(|existing| existing == &entry) {
+                deny.push(entry);
+            }
+        }
+        Self {
+            default: stricter_decision(self.default, lower.default),
+            allow: lower.allow,
+            deny,
+            proxy: lower.proxy,
+            proxy_fake_ip_cidrs: lower.proxy_fake_ip_cidrs,
+            audit: lower.audit,
+        }
+    }
+
     /// Decide what to do for a single outbound call to `host`.
     ///
     /// **Deny-wins precedence**: if `host` matches any entry in `deny`, the
@@ -461,6 +505,12 @@ pub struct NetworkPolicyDecider {
     /// A resolved IP inside one of these ranges bypasses the restricted-IP SSRF
     /// block; real private/loopback/link-local/metadata IPs are unaffected.
     trusted_fakeip_cidrs: Vec<(Ipv4Addr, u8)>,
+    /// The policy was produced by an authority the user's config document may
+    /// not override — a managed layer, or a Fleet denial the user is not
+    /// allowed to widen. A mid-session re-read of that document then folds onto
+    /// this policy instead of replacing it. See
+    /// [`NetworkPolicy::folded_with_lower_layer`].
+    authoritative: bool,
 }
 
 impl NetworkPolicyDecider {
@@ -477,7 +527,22 @@ impl NetworkPolicyDecider {
             cache: NetworkSessionCache::new(),
             auditor,
             trusted_fakeip_cidrs,
+            authoritative: false,
         }
+    }
+
+    /// Mark this policy as set by an authority the user document may not
+    /// override. See the `authoritative` field.
+    #[must_use]
+    pub fn with_authoritative(mut self) -> Self {
+        self.authoritative = true;
+        self
+    }
+
+    /// Whether an authority set this policy rather than the user document.
+    #[must_use]
+    pub fn is_authoritative(&self) -> bool {
+        self.authoritative
     }
 
     /// Register IPv4 CIDR ranges to treat as benign fake-IP placeholders.
@@ -557,6 +622,7 @@ impl NetworkPolicyDecider {
             policy,
             cache: self.cache.clone(),
             auditor,
+            authoritative: self.authoritative,
         }
     }
 
@@ -922,6 +988,67 @@ mod tests {
             refreshed.evaluate("evil.example.com", "fetch_url"),
             Decision::Deny,
             "a deny entry written after spawn is enforced without a restart"
+        );
+    }
+
+    #[test]
+    fn refreshed_policy_keeps_the_authority_marking() {
+        let decider =
+            NetworkPolicyDecider::new(mk(Decision::Deny, &[], &[]), None).with_authoritative();
+        assert!(decider.is_authoritative());
+        let refreshed = decider.with_policy_refreshed(mk(Decision::Allow, &[], &[]));
+        assert!(
+            refreshed.is_authoritative(),
+            "a refreshed authority is still an authority"
+        );
+    }
+
+    #[test]
+    fn folding_a_document_never_widens_an_authority() {
+        // What a Fleet denial or a managed overlay resolved to.
+        let authority = NetworkPolicy {
+            default: DecisionToml::Deny,
+            deny: vec!["blocked.example.com".to_string()],
+            ..NetworkPolicy::default()
+        };
+        // What the user's document asks for on a mid-session re-read.
+        let document = NetworkPolicy {
+            default: DecisionToml::Allow,
+            allow: vec!["api.github.com".to_string()],
+            ..NetworkPolicy::default()
+        };
+
+        let folded = authority.folded_with_lower_layer(document);
+
+        assert_eq!(
+            folded.default,
+            DecisionToml::Deny,
+            "the document must not widen an authority's fallback"
+        );
+        assert!(
+            folded.deny.iter().any(|host| host == "blocked.example.com"),
+            "a denial the authority set survives the fold"
+        );
+        assert!(
+            folded.allow.iter().any(|host| host == "api.github.com"),
+            "the document may still name hosts the authority did not deny"
+        );
+
+        // The fold is conservative by construction; that is why it is used only
+        // when an authority owns the policy. The plain user path replaces the
+        // policy outright, so `/network default allow` still lands there.
+        let plain = NetworkPolicy {
+            default: DecisionToml::Prompt,
+            ..NetworkPolicy::default()
+        };
+        assert_eq!(
+            plain
+                .folded_with_lower_layer(NetworkPolicy {
+                    default: DecisionToml::Allow,
+                    ..NetworkPolicy::default()
+                })
+                .default,
+            DecisionToml::Prompt
         );
     }
 
