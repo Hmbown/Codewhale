@@ -2473,12 +2473,21 @@ mod tests {
         }
     }
 
+    /// Deadline for the extension-turn harness helpers below.
+    ///
+    /// A hang guard, not a performance assertion: a Windows runner under
+    /// full-suite load has stalled this harness past 10 s (0.10.2 run
+    /// 37723960348 failed `an_invocation_has_one_outstanding_approval_at_a_time`
+    /// with `turn deadline: Elapsed(())`), so allow generous headroom while
+    /// still failing a genuinely stuck turn.
+    const EXTENSION_HARNESS_DEADLINE: Duration = Duration::from_secs(30);
+
     /// The next approval request, whole.
     async fn next_approval_event(
         events: &Arc<tokio::sync::RwLock<tokio::sync::mpsc::Receiver<Event>>>,
         seen: &mut Vec<Event>,
     ) -> Event {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(EXTENSION_HARNESS_DEADLINE, async {
             let mut events = events.write().await;
             while let Some(event) = events.recv().await {
                 if matches!(event, Event::ApprovalRequired { .. }) {
@@ -2494,7 +2503,7 @@ mod tests {
 
     /// Finish the turn; the extension tool's JSON result, and every event.
     async fn finish_extension_turn(turn: &mut ExtensionTurn, seen: &mut Vec<Event>) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), &mut turn.task)
+        tokio::time::timeout(EXTENSION_HARNESS_DEADLINE, &mut turn.task)
             .await
             .expect("turn deadline")
             .expect("turn");
