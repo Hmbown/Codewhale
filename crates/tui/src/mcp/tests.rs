@@ -7782,7 +7782,7 @@ async fn needs_auth_server_advertises_synthetic_authenticate_tool() {
         auth_tool.description
     );
     assert!(
-        auth_tool.description.contains("blocks (up to 5 minutes)"),
+        auth_tool.description.contains("blocks (up to 15 minutes)"),
         "{}",
         auth_tool.description
     );

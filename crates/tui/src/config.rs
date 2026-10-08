@@ -1390,12 +1390,10 @@ pub struct GoalConfig {
     #[serde(default)]
     pub max_continuations: Option<u32>,
 
-    /// Per-engine-turn step allowance while a goal is active (#5994). Goal
-    /// work gets a larger but still finite budget than an ordinary
-    /// interactive turn: `None` or `0` resolves to
-    /// [`crate::goal_loop::DEFAULT_GOAL_MAX_STEPS`] (1,000); values clamp to
-    /// `1..=100,000`. This bounds each turn, never the number of
-    /// continuation passes; explicit per-invocation ceilings
+    /// Optional per-engine-turn step ceiling while a goal is active (#6512).
+    /// Like ordinary turns, `None` or `0` leaves model steps uncapped;
+    /// positive values clamp to `1..=100,000`. This bounds each turn, never
+    /// the number of continuation passes; explicit per-invocation ceilings
     /// (`exec --max-turns`, child-worker caps) still win.
     #[serde(default)]
     pub max_steps: Option<u32>,
@@ -7048,22 +7046,20 @@ impl Config {
             .unwrap_or(crate::goal_loop::DEFAULT_MAX_GOAL_CONTINUATIONS)
     }
 
-    /// Per-engine-turn step allowance while a goal is active (#5994). Goal
-    /// turns get [`crate::goal_loop::DEFAULT_GOAL_MAX_STEPS`] by default —
-    /// five times the ordinary interactive allowance — while staying finite.
+    /// Per-engine-turn model-step budget while a goal is active (#6512).
+    /// Uses the ordinary turn resolver: omitted or zero is uncapped, and
+    /// explicit positive ceilings are clamped to its supported range.
     #[must_use]
     pub fn goal_max_steps(&self) -> u32 {
         let configured = self.goal.as_ref().and_then(|goal| goal.max_steps);
-        match configured {
-            None | Some(0) => crate::goal_loop::DEFAULT_GOAL_MAX_STEPS,
-            Some(steps) => {
-                let clamped = steps.clamp(1, 100_000);
-                if clamped != steps {
-                    tracing::warn!("[goal] max_steps={steps} out of range; clamping to {clamped}");
-                }
-                clamped
-            }
+        let resolved = crate::core::engine::turn_budget::resolve_max_model_steps(configured);
+        if let Some(steps) = configured
+            && steps > 0
+            && resolved != steps
+        {
+            tracing::warn!("[goal] max_steps={steps} out of range; clamping to {resolved}");
         }
+        resolved
     }
 
     /// Whether a goal's `token_budget` is a hard stop (#6013). Default `false`

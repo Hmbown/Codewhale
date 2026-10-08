@@ -1383,7 +1383,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 
 - `tui.osc8_links`(bool，可选，macOS/Linux 默认开启，Windows 默认关闭)：在转录输出的 URL 周围发出 OSC 8 转义序列，这样支持的终端(iTerm2、Terminal.app 13+、Ghostty、Kitty、WezTerm、Alacritty、较新的 gnome-terminal/konsole)可以用终端的链接手势打开它们——通常是 macOS 上的 Cmd-click,Linux/Windows 上的 Ctrl-click。没有 OSC 8 支持的终端渲染普通标签并忽略转义。转义带外发出(不在缓冲区单元格内)，所以列损坏不是问题；只在终端错误渲染 OSC 8 终止符本身时设 `false`。Windows 旧控制台默认关闭；用 `true` 选择加入。
 
-- `tui.max_model_steps`（int，可选，默认不设上限）：单个普通回合的可选模型步数上限。省略或为 `0` 表示模型步数不设上限；显式的正值会被钳制到 `1..=100000`。无头 `exec` 和 Fleet worker 同样没有隐含的模型步数上限；`exec --max-turns N` 和正数的 worker 预算仍然适用。当用完显式步数预算的约 80% 时，模型会收到一次软着陆通知；步数耗尽时，回合以 `Failed` 结束，信息为 `Maximum model steps reached before completion (limit: N)`，必要时会先有一次有界的最终报告响应。累计的墙钟时间和逐流的限制保持独立。处于活动状态的交互式目标回合改用 `goal.max_steps`（默认 `1000`）；见下文的目标循环一节。
+- `tui.max_model_steps`（int，可选，默认不设上限）：单个普通回合的可选模型步数上限。省略或为 `0` 表示模型步数不设上限；显式的正值会被钳制到 `1..=100000`。无头 `exec` 和 Fleet worker 同样没有隐含的模型步数上限；`exec --max-turns N` 和正数的 worker 预算仍然适用。当用完显式步数预算的约 80% 时，模型会收到一次软着陆通知；步数耗尽时，回合以 `Failed` 结束，信息为 `Maximum model steps reached before completion (limit: N)`，必要时会先有一次有界的最终报告响应。累计的墙钟时间和逐流的限制保持独立。处于活动状态的交互式目标回合改用 `goal.max_steps`（同样默认不设上限）；见下文的目标循环一节。
 
 - `tui.turn_wall_clock_secs`（int，可选，默认不设限）：每个回合累计的墙钟预算，单位为秒，跨一个回合的每个模型步骤度量（不是按请求）。等待人工审批所阻塞的时间不计入。省略或为 `0` 表示不设限；正值会钳制到 `30..=86400`（上限为 24 小时）。耗尽时，回合会在授权下一次计费请求之前停止，并给出一条指明该限制及要调高的键的信息。
 
@@ -1497,19 +1497,17 @@ max_continuations = 100
 # provider turn open. Default: 0 (continue immediately).
 continuation_delay_seconds = 300
 
-# Per-turn step allowance while a goal is active (#5994). Goal turns get a
-# larger but still finite budget than an ordinary interactive turn.
-# Default: 1000 (0 or absent resolves to 1000, never unlimited). Range:
-# 1..=100,000. This bounds each provider turn, never the number of
-# continuation passes.
-max_steps = 1000
+# Optional per-turn model-step ceiling while a goal is active (#6512).
+# Default: uncapped (0 or absent). Positive values clamp to 1..=100,000.
+# This bounds each provider turn, never the number of continuation passes.
+max_steps = 0
 ```
 
 有效延迟上限为 86,400 秒（24 小时）；比每天一次更不频繁的调度，请使用自动化。
 
 显式的兜底触发时，目标会以一条点名 `[goal] max_continuations` 的状态消息暂停，并记录一条警告；检查进度后再恢复目标，或者调高/禁用该兜底。
 
-`[goal] max_steps` 一次只约束一个引擎回合：普通的交互式回合没有隐含的模型步数上限。显式的逐次调用上限——`exec --max-turns N`、子 worker 的上限——始终优先于它。当所选预算用到约 80% 时，会告知模型着陆；耗尽时，它会得到一次有界的最终报告，并且该回合被归类为预算耗尽。未完成的目标随后会以 BudgetLimit 原因暂停，而不是重新启动下一个目标回合——请在审阅报告之后显式恢复它。墙钟时间和流保护是独立的，仍然适用。
+`[goal] max_steps` 一次只约束一个引擎回合。与普通的交互式回合一样，省略或设为 `0` 表示模型步数不设上限。显式的逐次调用上限——`exec --max-turns N`、子 worker 的上限——始终优先于它。当显式正数预算用到约 80% 时，会告知模型着陆；耗尽时，它会得到一次有界的最终报告，并且该回合被归类为预算耗尽。未完成的目标随后会以 BudgetLimit 原因暂停，而不是重新启动下一个目标回合——请在审阅报告之后显式恢复它。墙钟时间和流保护是独立的，仍然适用。
 
 延迟只在显式创建的目标仍然活动、且在一个成功回合之后才开始。`/goal pause`、`/goal done`、`/goal blocked`、`/goal clear`、Esc 或 Ctrl+C 会在下一次 provider 请求开始之前取消待定的继续。失败的回合和策略/路由失败绝不会安排下一个回合。配置中只存储数字形式的节奏；该循环不会持久化任何提示、凭据或机密。
 

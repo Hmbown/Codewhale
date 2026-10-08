@@ -2075,43 +2075,51 @@ fn user_input_limits_read_from_tools_table_and_clamp() {
 }
 
 #[test]
-fn goal_max_steps_resolves_default_zero_and_clamps() {
-    let parsed: ConfigFile = toml::from_str("").expect("empty config");
-    assert_eq!(
-        parsed.base.goal_max_steps(),
-        crate::goal_loop::DEFAULT_GOAL_MAX_STEPS
-    );
+fn goal_max_steps_default_and_zero_are_uncapped() {
+    for source in ["", "[goal]", "[goal]\nmax_steps = 0\n"] {
+        let parsed: ConfigFile = toml::from_str(source).expect("goal config");
+        let resolved = parsed.base.goal_max_steps();
+        assert_eq!(resolved, u32::MAX, "{source:?}");
 
-    // An explicit 0 is the goal default (1,000), never unlimited.
-    let parsed: ConfigFile = toml::from_str(
-        r#"
-        [goal]
-        max_steps = 0
-        "#,
-    )
-    .expect("goal config");
-    assert_eq!(
-        parsed.base.goal_max_steps(),
-        crate::goal_loop::DEFAULT_GOAL_MAX_STEPS
-    );
+        // Hosts pass this resolved value directly to the goal turn. It must
+        // remain uncapped beyond the old 1,000-step ceiling and at saturation.
+        let mut turn = crate::core::turn::TurnContext::with_budget_source(
+            resolved,
+            crate::core::turn::StepBudgetSource::Goal,
+        );
+        assert_eq!(turn.step_limit(), None);
+        turn.step = 1_000;
+        assert!(turn.next_step(), "{source:?}");
+        assert!(!turn.at_max_steps(), "{source:?}");
+        turn.step = u32::MAX;
+        assert!(turn.next_step(), "{source:?}");
+        assert!(!turn.at_max_steps(), "{source:?}");
+    }
+}
 
-    let parsed: ConfigFile = toml::from_str(
-        r#"
-        [goal]
-        max_steps = 50
-        "#,
-    )
-    .expect("goal config");
-    assert_eq!(parsed.base.goal_max_steps(), 50);
+#[test]
+fn goal_max_steps_preserves_positive_limits_and_clamps() {
+    for (configured, expected) in [
+        (1, 1),
+        (50, 50),
+        (100_000, 100_000),
+        (500_000, 100_000),
+        (u32::MAX, 100_000),
+    ] {
+        let source = format!("[goal]\nmax_steps = {configured}\n");
+        let parsed: ConfigFile = toml::from_str(&source).expect("goal config");
+        let resolved = parsed.base.goal_max_steps();
+        assert_eq!(resolved, expected, "{source:?}");
 
-    let parsed: ConfigFile = toml::from_str(
-        r#"
-        [goal]
-        max_steps = 500000
-        "#,
-    )
-    .expect("goal config");
-    assert_eq!(parsed.base.goal_max_steps(), 100_000);
+        let mut turn = crate::core::turn::TurnContext::with_budget_source(
+            resolved,
+            crate::core::turn::StepBudgetSource::Goal,
+        );
+        assert_eq!(turn.step_limit(), Some(expected));
+        turn.step = expected;
+        assert!(turn.at_max_steps(), "{source:?}");
+        assert!(!turn.next_step(), "{source:?}");
+    }
 }
 
 #[test]
