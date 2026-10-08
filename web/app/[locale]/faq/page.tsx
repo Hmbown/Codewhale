@@ -35,7 +35,7 @@ const faqEn = (p: SitePath): FaqItem[] => [
     q: "What is Codewhale?",
     a: (
       <>
-        Codewhale is an open-source agent for building apps and tools, automating workflows, and working across files, terminal commands and connected apps. Connect tools like Gmail and Slack through plugins, MCP servers or APIs, and use the model APIs you already have or local and self-hosted inference. Start it with <code className="inline">codewhale</code> and choose the access and approvals for its work. DeepSeek is the bundled default route; the model and provider are yours to choose.
+        Codewhale is an open-source agent for building apps and tools, automating workflows, and working across files, terminal commands and connected apps. Add tools through plugins and MCP servers, or use APIs from your own scripts. Each service needs its own setup and authentication. Use the model APIs you already have or local and self-hosted inference. Start it with <code className="inline">codewhale</code> and choose the access and approvals for its work. DeepSeek is the bundled default route; the model and provider are yours to choose.
       </>
     ),
     sources: ["README.md", "docs/GUIDE.md", "docs/PLUGINS.md", "docs/MCP.md", "docs/PROVIDERS.md"],
@@ -411,7 +411,7 @@ const faqZh = (p: SitePath): FaqItem[] => [
     q: "Codewhale 是什么？",
     a: (
       <>
-        Codewhale 是一个开源智能体，用于构建应用和工具、自动化工作流，并在文件、终端命令和已连接的应用之间完成任务。通过插件、MCP 服务或 API 连接 Gmail、Slack 等工具，使用你已有的模型 API，或连接本地、自托管推理服务。运行 <code className="inline">codewhale</code> 启动，并设定访问范围和审批方式。DeepSeek 是内置默认路由，模型与提供商仍由你选择。
+        Codewhale 是一个开源智能体，用于构建应用和工具、自动化工作流，并在文件、终端命令和已连接的应用之间完成任务。通过插件和 MCP 服务添加工具，或在自己的脚本中使用 API。每项服务都需要单独配置并完成身份验证。使用你已有的模型 API，或连接本地、自托管推理服务。运行 <code className="inline">codewhale</code> 启动，并设定访问范围和审批方式。DeepSeek 是内置默认路由，模型与提供商仍由你选择。
       </>
     ),
     sources: ["README.md", "docs/GUIDE.md", "docs/PLUGINS.md", "docs/MCP.md", "docs/PROVIDERS.md"],

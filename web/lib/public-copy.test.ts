@@ -16,7 +16,7 @@ describe("public website copy contracts", () => {
     expect(layout).toContain("docs-portal-band");
     // The hero copy is dictionary-driven now (#5337), so assert it where the
     // string actually lives rather than in the TSX.
-    expect(EN_DOCS_SHELL.heroTitle).toBe("Get something done with Codewhale.");
+    expect(EN_DOCS_SHELL.heroTitle).toBe("Install and use Codewhale");
     expect(layout).not.toContain("Section 02");
     expect(layout).not.toContain("How Codewhale works: ego");
     expect(layout).not.toContain("<Seal");

@@ -31,7 +31,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Ejecuta la comprobación en segundo plano", body: "El asistente abre una ventana de práctica desechable, escribe texto y captura esa ventana. Comprueba si el puntero o la aplicación activa cambiaron durante la ejecución." },
     { title: "Conéctalo con Codewhale", body: "Revisa, marca como de confianza y activa Computer Use en el mercado de plugins de Codewhale. Usa el plugin 0.3.1 o posterior para que las acciones locales pasen por los controles Pause y Stop del asistente." },
   ],
-  controlsTitle: "Sigue trabajando. Mantén el control.",
+  controlsTitle: "Pausa o detén el control de las aplicaciones",
   controlsBody: "Las acciones compatibles se ejecutan en segundo plano sobre la aplicación seleccionada. Las aplicaciones y los gestos que requieren control en primer plano necesitan tu autorización. El menú muestra el destino y el modo de entrada; Pause (pausar) suspende la entrada del asistente y Stop (detener) finaliza sus sesiones existentes.",
   updateTitle: "Actualizaciones cuando tú quieras",
   updateBody: "Elige Check for updates (buscar actualizaciones) en la aplicación. Antes de instalar una actualización, comprueba la descarga, la firma de Codewhale y la notarización de Apple, y conserva la versión anterior por si necesitas recuperarla.",

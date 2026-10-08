@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale：用自己的模型和工具，把想法做出来",
   metaDescription:
     "用 Codewhale 构建应用、自动处理工作，并连接你常用的工具。开源，支持你已有的模型 API、本地模型和自托管推理服务。",
-  heroTitle: "在你电脑上工作的开源智能体。",
+  heroTitle: "构建应用，让你的工作自动运行。",
   heroIntro:
-    "构建应用、自动化工作流，并使用 Slack、Gmail 和其他已连接的工具。{brand} 使用你已有的模型 API，或本地及自托管推理服务。",
+    "{brand} 是一个开源智能体，可以编写代码、运行命令，并使用你连接的工具。你可以使用已有的模型 API，也可以在本地或自己的服务器上运行模型。",
   getCodewhale: "安装 Codewhale",
   heroInstallAria: "安装命令",
   exploreProduct: "探索 Codewhale",
@@ -21,25 +21,25 @@ export const home: HomeDict = {
   sourceCandidate: "未发布",
   publishedRelease: "已发布",
   gainHeading: "你可以做什么",
-  gainLede: "从你想要的结果开始。Codewhale 使用文件、命令和已连接的工具完成工作，由你决定访问范围和审批方式。",
+  gainLede: "描述你想构建或自动完成的工作。Codewhale 可以编辑文件、运行命令并检查结果，访问权限由你控制。",
   gain: [
     [
       "构建应用和工具",
-      "把一个想法做成能运行的应用、实用脚本，或现有项目中的新功能。让智能体和你一起编写、运行并测试。"
+      "创建应用、添加功能或编写脚本。Codewhale 可以处理项目文件、运行代码并测试构建结果。"
     ],
     [
       "让重复工作自动完成",
-      "把反复要做的事变成工作流，从终端、脚本或 CI 中运行。需要并行推进时，让 Fleet 智能体团队分工完成。"
+      "从终端、脚本或 CI 中运行工作流。任务较大时，可以把部分工作交给使用不同模型的 Fleet 智能体团队。"
     ],
     [
       "连接你常用的工具",
-      "通过插件、MCP 服务或 API 连接 Gmail、Slack 等工具。让这些服务与文件和命令一起参与同一项任务。"
+      "通过插件和 MCP 服务器添加工具，或在自己的脚本中调用 API。每项服务都需要单独配置和身份验证。"
     ]
   ],
   chapterModels: "你的模型",
-  modelsHeading: "继续用你选择的模型。",
+  modelsHeading: "使用你选择的模型",
   modelsBody:
-    "连接你已经在用的模型 API，使用兼容网关，或在自己的硬件上运行推理。为每个会话选择模型，也能为 Fleet 中的不同智能体分配不同模型。",
+    "连接你的提供商账户、OpenAI 兼容端点，或本地及自托管模型。为会话选择模型，也可以为 Fleet 中的每个智能体分别选择模型。",
   modelsFacts: [
     [
       "你的 API 账户",
@@ -55,12 +55,12 @@ export const home: HomeDict = {
     ]
   ],
   modelsLink: "浏览模型与提供商",
-  startHeading: "带上任务，开始动手。",
-  startLede: "安装 Codewhale，连接模型，交给它一件值得做的事。先从一个智能体开始，需要时再添加工具或团队。",
+  startHeading: "开始使用",
+  startLede: "安装 Codewhale，连接模型，然后打开项目文件夹。需要时，再添加插件或更多智能体。",
   startGuideLink: "按照新手指引操作",
   startVocabularyLink: "查名词",
   chapterAvailability: "在哪里运行",
-  availabilityHeading: "从终端开始。",
+  availabilityHeading: "当前可用与开发中的功能",
   availabilityLede: "终端和本地浏览器客户端现已可用。原生桌面应用与重建中的托管网页应用正在开发。",
   availability: [
     [
@@ -92,7 +92,7 @@ export const home: HomeDict = {
   ],
   availabilityNote: "终端、本地浏览器和 GUI 无需 Codewhale 账户。托管网页和桌面端使用账户。使用你自己的提供商密钥时，相应用量由该提供商计费。",
   accountLink: "创建账户",
-  surfacesHeading: "一项任务，连接文件、应用和智能体。",
+  surfacesHeading: "使用文件和工具开展工作",
   surfaces: [
     [
       "文件与终端",
@@ -115,15 +115,15 @@ export const home: HomeDict = {
       "用 Fleet 将大任务分配给不同角色和模型的智能体，在一处查看它们的进度。"
     ]
   ],
-  runtimeLink: "查看全部集成",
+  runtimeLink: "探索工具与集成",
   installBandHeading: "在 macOS 或 Linux 上安装",
   copy: "复制",
   copied: "已复制 ✓",
   binaries: "预编译包",
   chinaMirrors: "中国镜像",
   installGuideLink: "阅读安装指南",
-  communityHeading: "把 Codewhale 变成你想要的样子。",
-  communityBody: "Codewhale 是开源的。读源码、做插件、分享工作流，或一起把下一个版本做得更好。",
+  communityHeading: "为 Codewhale 做贡献",
+  communityBody: "在 GitHub 上报告问题、改进文档或贡献代码。你也可以构建插件，与其他用户分享工作流。",
   communityLinksAria: "社区链接",
   contribute: "在 GitHub 上参与贡献",
 };

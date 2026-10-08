@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaDescription:
     "Build apps, automate workflows, and work across connected tools with Codewhale. Open source, with your own model APIs or local and self-hosted inference.",
 
-  heroTitle: "An open-source agent for your computer.",
+  heroTitle: "Build apps and automate your work.",
   heroIntro:
-    "Build apps, automate workflows, and work with Slack, Gmail and other connected tools. {brand} uses your existing model APIs or local and self-hosted inference.",
+    "{brand} is an open-source agent that writes code, runs commands and works with the tools you connect. Use your existing model APIs, or run models locally and on your own servers.",
   getCodewhale: "Install Codewhale",
   heroInstallAria: "Install command",
   exploreProduct: "Explore Codewhale",
@@ -25,26 +25,26 @@ export const home: HomeDict = {
 
   gainHeading: "What you can do",
   gainLede:
-    "Start with the result you want. Codewhale works through the files, commands and connected tools, while you choose its access and approvals.",
+    "Describe what you want to build or automate. Codewhale can edit files, run commands and check the result, with access you control.",
   gain: [
     [
       "Build apps and tools",
-      "Go from an idea to a working app, a useful script, or a feature in an existing project. Let the agent write, run and test the pieces with you."
+      "Create an app, add a feature or write a script. Codewhale can work through the project files, run the code and test what it builds."
     ],
     [
       "Automate the work you repeat",
-      "Turn a recurring task into a workflow. Run it from your terminal, scripts or CI, and bring in a Fleet of agents when the work can happen in parallel."
+      "Run workflows from your terminal, scripts or CI. For larger tasks, delegate parts of the work to a Fleet of agents with different models."
     ],
     [
       "Connect the tools you use",
-      "Connect tools like Gmail and Slack through plugins, MCP servers or APIs. Work across those services alongside your files and commands."
+      "Add tools through plugins and MCP servers, or use APIs from your own scripts. Each service needs its own setup and authentication."
     ]
   ],
 
   chapterModels: "Your models",
-  modelsHeading: "Keep using your models.",
+  modelsHeading: "Use the models you choose",
   modelsBody:
-    "Connect the model APIs you already pay for, use a compatible gateway, or run inference on your own hardware. Choose a model for each session—and different models for the agents in a Fleet.",
+    "Connect your provider accounts, an OpenAI-compatible endpoint, or local and self-hosted models. Pick a model for the session and for each agent in a Fleet.",
   modelsFacts: [
     [
       "Your API accounts",
@@ -61,14 +61,14 @@ export const home: HomeDict = {
   ],
   modelsLink: "Browse models and providers",
 
-  startHeading: "Bring a task. Get started.",
+  startHeading: "Get started",
   startLede:
-    "Install Codewhale, connect a model and give it something worth doing. Start with one agent; add tools or a team when you need them.",
+    "Install Codewhale, connect a model and open a project folder. You can add plugins and more agents as you need them.",
   startGuideLink: "Follow the getting-started guide",
   startVocabularyLink: "Look up a term",
 
   chapterAvailability: "Where it runs",
-  availabilityHeading: "Start in the terminal.",
+  availabilityHeading: "Available now and in development",
   availabilityLede:
     "The terminal and local browser client are available now. A native desktop app and a rebuilt hosted web app are in development.",
   availability: [
@@ -103,7 +103,7 @@ export const home: HomeDict = {
     "The terminal, local browser, and GUI need no Codewhale account. Hosted web and desktop use an account. When you use your own provider key, your provider bills that usage.",
   accountLink: "Create an account",
 
-  surfacesHeading: "One task. Your files, apps and agents.",
+  surfacesHeading: "Work across files and tools",
   surfaces: [
     [
       "Files and terminal",
@@ -126,7 +126,7 @@ export const home: HomeDict = {
       "Use Fleet to split a larger job between agents with different roles and models, and follow their progress in one place."
     ]
   ],
-  runtimeLink: "See all integrations",
+  runtimeLink: "Explore tools and integrations",
 
   installBandHeading: "Install on macOS or Linux",
   copy: "Copy",
@@ -135,9 +135,9 @@ export const home: HomeDict = {
   chinaMirrors: "China mirrors",
   installGuideLink: "Read the install guide",
 
-  communityHeading: "Make Codewhale your own.",
+  communityHeading: "Contribute to Codewhale",
   communityBody:
-    "Codewhale is open source. Read the code, build a plugin, share a workflow, or help make the next release better.",
+    "Report a bug, improve the docs or contribute code on GitHub. You can also build plugins and share workflows with other users.",
   communityLinksAria: "Community links",
   contribute: "Contribute on GitHub",
 };

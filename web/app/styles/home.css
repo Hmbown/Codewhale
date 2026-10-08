@@ -46,6 +46,8 @@
   color: var(--text);
 }
 
+:lang(en) .home-title { hyphens: none; }
+
 .home-lede {
   max-width: var(--home-measure);
   color: var(--muted);

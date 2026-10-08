@@ -47,8 +47,8 @@ export const GETTING_STARTED_STEPS: GuideStep[] = [
     id: "connect-provider",
     title: { en: "Connect your model", zh: "连接你的模型" },
     body: {
-      en: "Use a model API you already have, or connect local or self-hosted inference. The command below saves a DeepSeek key; Ollama also works locally without one. Your provider account stays yours.",
-      zh: "使用你已有的模型 API，或连接本地、自托管推理服务。下方命令用于保存 DeepSeek 密钥；本地 Ollama 也可使用，无需密钥。提供商账户仍由你掌握。",
+      en: "Use a model API you already have, or connect local or self-hosted inference. The command below saves a DeepSeek key; local Ollama models do not need an API key.",
+      zh: "使用你已有的模型 API，或连接本地、自托管推理服务。下方命令用于保存 DeepSeek 密钥；本地 Ollama 模型无需 API 密钥。",
     },
     commands: ["codewhale auth set --provider deepseek"],
     link: {
@@ -58,7 +58,7 @@ export const GETTING_STARTED_STEPS: GuideStep[] = [
   },
   {
     id: "first-session",
-    title: { en: "Give it something to build", zh: "交给它一件想做的事" },
+    title: { en: "Describe your first task", zh: "描述第一个任务" },
     body: {
       en: "Start Codewhale and describe the result: a small app, a script that saves you time, or a report from your data. Choose its permissions, review what it does and steer it as you go.",
       zh: "启动 Codewhale，说出你想要的结果：一个小应用、节省时间的脚本，或一份根据数据生成的报告。设定权限、查看它的工作，并随时调整方向。",
@@ -71,7 +71,7 @@ export const GETTING_STARTED_STEPS: GuideStep[] = [
   },
   {
     id: "fleet-workflow",
-    title: { en: "Add a team when you need one", zh: "需要时，让团队一起做" },
+    title: { en: "Use multiple agents", zh: "使用多个智能体" },
     body: {
       en: "Split a larger job across agents with different roles and models. Inside Codewhale, save your team with /fleet setup, then check its runs with /fleet status.",
       zh: "把较大的任务分配给不同角色、不同模型的智能体。在 Codewhale 中用 /fleet setup 保存团队，再用 /fleet status 查看运行状态。",

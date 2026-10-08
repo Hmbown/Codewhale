@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale: xây dựng với mô hình và công cụ của bạn",
   metaDescription:
     "Tạo ứng dụng, tự động hóa quy trình và làm việc với công cụ đã kết nối bằng Codewhale. Mã nguồn mở, dùng API mô hình của bạn hoặc suy luận cục bộ và tự lưu trữ.",
-  heroTitle: "Một tác nhân mã nguồn mở cho máy tính của bạn.",
+  heroTitle: "Tạo ứng dụng và tự động hóa công việc của bạn.",
   heroIntro:
-    "Tạo ứng dụng, tự động hóa quy trình và làm việc với Slack, Gmail cùng các công cụ được kết nối khác. {brand} sử dụng API mô hình bạn đang dùng, hoặc suy luận cục bộ và trên hạ tầng bạn tự vận hành.",
+    "{brand} là tác nhân mã nguồn mở có thể viết mã, chạy lệnh và làm việc với các công cụ bạn kết nối. Sử dụng API mô hình bạn đang dùng, hoặc chạy mô hình cục bộ và trên máy chủ của riêng bạn.",
   getCodewhale: "Cài đặt Codewhale",
   heroInstallAria: "Lệnh cài đặt",
   exploreProduct: "Khám phá Codewhale",
@@ -22,25 +22,25 @@ export const home: HomeDict = {
   publishedRelease: "đã phát hành",
   gainHeading: "Bạn có thể làm gì",
   gainLede:
-    "Bắt đầu từ kết quả bạn muốn. Codewhale làm việc với tệp, lệnh và công cụ đã kết nối; bạn quyết định quyền truy cập và phê duyệt.",
+    "Mô tả những gì bạn muốn xây dựng hoặc tự động hóa. Codewhale có thể chỉnh sửa tệp, chạy lệnh và kiểm tra kết quả, với quyền truy cập do bạn kiểm soát.",
   gain: [
     [
       "Tạo ứng dụng và công cụ",
-      "Biến ý tưởng thành ứng dụng chạy được, script hữu ích hoặc tính năng trong dự án có sẵn. Để tác tử cùng bạn viết, chạy và kiểm thử."
+      "Tạo ứng dụng, thêm tính năng hoặc viết tập lệnh. Codewhale có thể làm việc với các tệp dự án, chạy mã và kiểm thử những gì nó tạo ra."
     ],
     [
       "Tự động hóa việc lặp lại",
-      "Biến tác vụ định kỳ thành quy trình chạy từ terminal, script hoặc CI. Dùng đội tác tử Fleet khi công việc có thể chạy song song."
+      "Chạy quy trình từ terminal, tập lệnh hoặc CI. Với những tác vụ lớn hơn, giao từng phần công việc cho một Fleet tác nhân sử dụng các mô hình khác nhau."
     ],
     [
       "Kết nối công cụ bạn dùng",
-      "Kết nối công cụ như Gmail và Slack qua plugin, máy chủ MCP hoặc API. Làm việc với các dịch vụ đó cùng tệp và lệnh của bạn."
+      "Thêm công cụ qua plugin và máy chủ MCP, hoặc sử dụng API từ các tập lệnh của riêng bạn. Mỗi dịch vụ cần được thiết lập và xác thực riêng."
     ]
   ],
   chapterModels: "Mô hình của bạn",
-  modelsHeading: "Tiếp tục dùng mô hình bạn chọn.",
+  modelsHeading: "Sử dụng mô hình bạn chọn",
   modelsBody:
-    "Kết nối API mô hình bạn đang trả phí, dùng gateway tương thích hoặc chạy suy luận trên phần cứng riêng. Chọn mô hình cho từng phiên và từng tác tử trong Fleet.",
+    "Kết nối tài khoản nhà cung cấp, endpoint tương thích với OpenAI, hoặc mô hình cục bộ và mô hình trên hạ tầng tự quản. Chọn mô hình cho phiên làm việc và cho từng tác nhân trong Fleet.",
   modelsFacts: [
     [
       "Tài khoản API của bạn",
@@ -56,13 +56,13 @@ export const home: HomeDict = {
     ]
   ],
   modelsLink: "Xem mô hình và nhà cung cấp",
-  startHeading: "Mang theo tác vụ. Bắt đầu thôi.",
+  startHeading: "Bắt đầu sử dụng",
   startLede:
-    "Cài Codewhale, kết nối mô hình và giao một việc đáng làm. Bắt đầu với một tác tử; thêm công cụ hoặc đội khi cần.",
+    "Cài đặt Codewhale, kết nối một mô hình và mở thư mục dự án. Bạn có thể thêm plugin và tác nhân khi cần.",
   startGuideLink: "Làm theo hướng dẫn bắt đầu",
   startVocabularyLink: "Xem thuật ngữ sản phẩm",
   chapterAvailability: "Chạy ở đâu",
-  availabilityHeading: "Bắt đầu trong terminal.",
+  availabilityHeading: "Đã có và đang phát triển",
   availabilityLede:
     "Terminal và client trình duyệt cục bộ đã có sẵn. Ứng dụng desktop gốc và ứng dụng web lưu trữ trực tuyến đang được phát triển.",
   availability: [
@@ -96,7 +96,7 @@ export const home: HomeDict = {
   availabilityNote:
     "Terminal, trình duyệt cục bộ và GUI không cần tài khoản Codewhale. Web lưu trữ trực tuyến và ứng dụng desktop dùng tài khoản. Khi bạn dùng khóa riêng của mình từ nhà cung cấp, nhà cung cấp đó tính phí phần sử dụng này.",
   accountLink: "Tạo tài khoản",
-  surfacesHeading: "Một tác vụ. Tệp, ứng dụng và tác tử của bạn.",
+  surfacesHeading: "Làm việc với tệp và công cụ",
   surfaces: [
     [
       "Tệp và terminal",
@@ -119,16 +119,16 @@ export const home: HomeDict = {
       "Dùng Fleet chia công việc lớn cho tác tử có vai trò và mô hình khác nhau, rồi theo dõi tiến độ ở một nơi."
     ]
   ],
-  runtimeLink: "Xem tất cả tích hợp",
+  runtimeLink: "Khám phá công cụ và tích hợp",
   installBandHeading: "Cài đặt trên macOS hoặc Linux",
   copy: "Sao chép",
   copied: "Đã sao chép ✓",
   binaries: "Bản nhị phân",
   chinaMirrors: "Mirror Trung Quốc",
   installGuideLink: "Đọc hướng dẫn cài đặt",
-  communityHeading: "Biến Codewhale thành công cụ của bạn.",
+  communityHeading: "Đóng góp cho Codewhale",
   communityBody:
-    "Codewhale là mã nguồn mở. Đọc mã, tạo plugin, chia sẻ quy trình hoặc giúp cải thiện bản phát hành tiếp theo.",
+    "Báo lỗi, cải thiện tài liệu hoặc đóng góp mã trên GitHub. Bạn cũng có thể tạo plugin và chia sẻ quy trình với những người dùng khác.",
   communityLinksAria: "Liên kết cộng đồng",
   contribute: "Đóng góp trên GitHub",
 };

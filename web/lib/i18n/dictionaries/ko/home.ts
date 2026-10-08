@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale: 내 모델과 도구로 원하는 것을 만들기",
   metaDescription:
     "Codewhale로 앱을 만들고, 업무를 자동화하고, 연결된 도구로 작업하세요. 오픈 소스로, 기존 모델 API와 로컬 또는 자체 호스팅 추론을 사용할 수 있습니다.",
-  heroTitle: "여러분의 컴퓨터를 위한 오픈 소스 에이전트.",
+  heroTitle: "앱을 만들고 작업을 자동화하세요.",
   heroIntro:
-    "앱을 만들고, 워크플로를 자동화하고, Slack, Gmail 등 연결된 도구로 작업하세요. {brand}는 기존에 사용하는 모델 API나 로컬 및 자체 호스팅 추론을 사용합니다.",
+    "{brand}는 코드를 작성하고, 명령을 실행하고, 연결한 도구로 작업하는 오픈 소스 에이전트입니다. 기존에 사용하는 모델 API를 쓰거나, 로컬과 자체 서버에서 모델을 실행하세요.",
   getCodewhale: "Codewhale 설치",
   heroInstallAria: "설치 명령",
   exploreProduct: "Codewhale 둘러보기",
@@ -21,25 +21,25 @@ export const home: HomeDict = {
   sourceCandidate: "미공개",
   publishedRelease: "공개됨",
   gainHeading: "할 수 있는 일",
-  gainLede: "원하는 결과부터 정하세요. Codewhale은 파일, 명령, 연결된 도구로 작업하고, 접근 범위와 승인 방식은 사용자가 결정합니다.",
+  gainLede: "만들거나 자동화하고 싶은 작업을 설명하세요. Codewhale은 사용자가 제어하는 접근 권한 안에서 파일을 편집하고, 명령을 실행하고, 결과를 확인할 수 있습니다.",
   gain: [
     [
       "앱과 도구 만들기",
-      "아이디어를 작동하는 앱, 유용한 스크립트, 기존 프로젝트의 새 기능으로 만드세요. 에이전트가 함께 작성하고 실행하며 테스트합니다."
+      "앱을 만들거나, 기능을 추가하거나, 스크립트를 작성하세요. Codewhale은 프로젝트 파일을 다루고, 코드를 실행하고, 만든 결과물을 테스트할 수 있습니다."
     ],
     [
       "반복하는 업무 자동화",
-      "반복 작업을 터미널, 스크립트, CI에서 실행하는 워크플로로 바꾸세요. 병렬로 진행할 수 있는 일에는 Fleet 에이전트 팀을 활용하세요."
+      "터미널, 스크립트 또는 CI에서 워크플로를 실행하세요. 작업이 크다면 서로 다른 모델을 사용하는 Fleet 에이전트 팀에 일부 작업을 맡길 수 있습니다."
     ],
     [
       "쓰고 있는 도구 연결",
-      "플러그인, MCP 서버 또는 API로 Gmail과 Slack 같은 도구를 연결하세요. 이 서비스를 파일과 명령과 함께 같은 작업에 활용하세요."
+      "플러그인과 MCP 서버를 통해 도구를 추가하거나, 자신의 스크립트에서 API를 사용하세요. 각 서비스에는 개별 설정과 인증이 필요합니다."
     ]
   ],
   chapterModels: "당신의 모델",
-  modelsHeading: "내가 선택한 모델을 그대로.",
+  modelsHeading: "원하는 모델을 사용하세요",
   modelsBody:
-    "이미 결제하는 모델 API, 호환 게이트웨이, 내 하드웨어의 추론을 사용하세요. 세션마다, Fleet의 각 에이전트마다 모델을 선택할 수 있습니다.",
+    "제공업체 계정, OpenAI 호환 엔드포인트 또는 로컬 및 자체 호스팅 모델을 연결하세요. 세션과 Fleet의 각 에이전트에 사용할 모델을 선택하세요.",
   modelsFacts: [
     [
       "내 API 계정",
@@ -55,12 +55,12 @@ export const home: HomeDict = {
     ]
   ],
   modelsLink: "모델과 제공업체 둘러보기",
-  startHeading: "할 일을 가져오세요. 시작하세요.",
-  startLede: "Codewhale을 설치하고 모델을 연결한 뒤, 해 볼 만한 일을 맡기세요. 에이전트 하나로 시작하고, 필요할 때 도구나 팀을 추가하세요.",
+  startHeading: "시작하기",
+  startLede: "Codewhale을 설치하고, 모델을 연결하고, 프로젝트 폴더를 여세요. 필요에 따라 플러그인과 더 많은 에이전트를 추가할 수 있습니다.",
   startGuideLink: "시작 가이드 따라 하기",
   startVocabularyLink: "제품 용어 보기",
   chapterAvailability: "실행 환경",
-  availabilityHeading: "터미널에서 시작하세요.",
+  availabilityHeading: "현재 제공되는 기능과 개발 중인 기능",
   availabilityLede: "터미널과 로컬 브라우저 클라이언트는 지금 사용할 수 있습니다. 네이티브 데스크톱 앱과 새로 구축하는 호스팅 웹 앱은 개발 중입니다.",
   availability: [
     [
@@ -92,7 +92,7 @@ export const home: HomeDict = {
   ],
   availabilityNote: "터미널, 로컬 브라우저, GUI는 Codewhale 계정이 필요 없습니다. 호스팅 웹과 데스크톱은 계정을 사용합니다. 본인의 제공업체 키를 사용하는 경우, 해당 사용 요금은 그 제공업체가 청구합니다.",
   accountLink: "계정 만들기",
-  surfacesHeading: "하나의 작업에 파일, 앱, 에이전트까지.",
+  surfacesHeading: "파일과 도구로 작업하세요",
   surfaces: [
     [
       "파일과 터미널",
@@ -115,15 +115,15 @@ export const home: HomeDict = {
       "Fleet으로 큰 일을 역할과 모델이 다른 에이전트에게 나누고, 한곳에서 진행 상황을 확인하세요."
     ]
   ],
-  runtimeLink: "모든 연동 기능 보기",
+  runtimeLink: "도구와 통합 살펴보기",
   installBandHeading: "macOS 또는 Linux에 설치하세요",
   copy: "복사",
   copied: "복사됨 ✓",
   binaries: "바이너리",
   chinaMirrors: "중국 미러",
   installGuideLink: "설치 가이드 읽기",
-  communityHeading: "Codewhale을 나만의 도구로.",
-  communityBody: "Codewhale은 오픈 소스입니다. 코드를 읽고, 플러그인을 만들고, 워크플로를 공유하며 다음 버전을 함께 개선하세요.",
+  communityHeading: "Codewhale에 기여하세요",
+  communityBody: "GitHub에서 버그를 신고하거나, 문서를 개선하거나, 코드를 기여하세요. 플러그인을 만들고 다른 사용자와 워크플로를 공유할 수도 있습니다.",
   communityLinksAria: "커뮤니티 링크",
   contribute: "GitHub에서 기여하기",
 };

@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale: berkarya dengan model dan alat pilihanmu",
   metaDescription:
     "Buat aplikasi, otomatisasikan alur kerja, dan gunakan alat terhubung dengan Codewhale. Sumber terbuka, dengan API model milikmu atau inferensi lokal dan mandiri.",
-  heroTitle: "Agen sumber terbuka untuk komputermu.",
+  heroTitle: "Buat aplikasi dan otomatisasikan pekerjaanmu.",
   heroIntro:
-    "Buat aplikasi, otomatisasikan alur kerja, dan bekerja dengan Slack, Gmail serta alat terhubung lainnya. {brand} menggunakan API model yang sudah kamu pakai, atau inferensi lokal maupun yang kamu host sendiri.",
+    "{brand} adalah agen sumber terbuka yang menulis kode, menjalankan perintah, dan bekerja dengan alat yang kamu hubungkan. Gunakan API model yang sudah kamu pakai, atau jalankan model secara lokal dan di servermu sendiri.",
   getCodewhale: "Instal Codewhale",
   heroInstallAria: "Perintah instalasi",
   exploreProduct: "Jelajahi Codewhale",
@@ -22,25 +22,25 @@ export const home: HomeDict = {
   publishedRelease: "dirilis",
   gainHeading: "Yang bisa kamu lakukan",
   gainLede:
-    "Mulai dari hasil yang kamu inginkan. Codewhale bekerja dengan berkas, perintah, dan alat terhubung; kamu menentukan akses dan persetujuannya.",
+    "Jelaskan apa yang ingin kamu buat atau otomatisasikan. Codewhale dapat mengedit berkas, menjalankan perintah, dan memeriksa hasilnya, dengan akses yang kamu kendalikan.",
   gain: [
     [
       "Buat aplikasi dan alat",
-      "Ubah ide menjadi aplikasi yang berjalan, skrip berguna, atau fitur dalam proyek yang ada. Biarkan agen menulis, menjalankan, dan menguji bersamamu."
+      "Buat aplikasi, tambahkan fitur, atau tulis skrip. Codewhale dapat mengerjakan berkas proyek, menjalankan kode, dan menguji hasil yang dibuatnya."
     ],
     [
       "Otomatiskan pekerjaan berulang",
-      "Ubah tugas berulang menjadi alur kerja dari terminal, skrip, atau CI. Gunakan tim agen Fleet saat pekerjaan bisa berjalan paralel."
+      "Jalankan alur kerja dari terminal, skrip, atau CI. Untuk tugas yang lebih besar, delegasikan sebagian pekerjaan ke Fleet agen dengan model yang berbeda."
     ],
     [
       "Hubungkan alat yang kamu pakai",
-      "Hubungkan alat seperti Gmail dan Slack melalui plugin, server MCP, atau API. Gunakan layanan tersebut bersama berkas dan perintahmu."
+      "Tambahkan alat melalui plugin dan server MCP, atau gunakan API dari skripmu sendiri. Setiap layanan memerlukan penyiapan dan autentikasi tersendiri."
     ]
   ],
   chapterModels: "Model Anda",
-  modelsHeading: "Tetap gunakan model pilihanmu.",
+  modelsHeading: "Gunakan model pilihanmu",
   modelsBody:
-    "Hubungkan API model yang sudah kamu bayar, gunakan gateway yang kompatibel, atau jalankan inferensi di perangkat kerasmu. Pilih model per sesi dan untuk setiap agen dalam Fleet.",
+    "Hubungkan akun penyedia, endpoint yang kompatibel dengan OpenAI, atau model lokal dan yang kamu host sendiri. Pilih model untuk sesi dan untuk setiap agen dalam Fleet.",
   modelsFacts: [
     [
       "Akun API milikmu",
@@ -56,13 +56,13 @@ export const home: HomeDict = {
     ]
   ],
   modelsLink: "Lihat model dan penyedia",
-  startHeading: "Bawa tugasmu. Mulai bekerja.",
+  startHeading: "Mulai menggunakan",
   startLede:
-    "Pasang Codewhale, hubungkan model, dan beri pekerjaan yang berguna. Mulai dengan satu agen; tambahkan alat atau tim saat diperlukan.",
+    "Instal Codewhale, hubungkan model, dan buka folder proyek. Kamu bisa menambahkan plugin dan agen lain saat membutuhkannya.",
   startGuideLink: "Ikuti panduan memulai",
   startVocabularyLink: "Lihat kosakata produk",
   chapterAvailability: "Tempat menjalankan",
-  availabilityHeading: "Mulai dari terminal.",
+  availabilityHeading: "Tersedia sekarang dan sedang dikembangkan",
   availabilityLede:
     "Terminal dan klien peramban lokal sudah tersedia. Aplikasi desktop native dan aplikasi web yang dihosting sedang dikembangkan ulang.",
   availability: [
@@ -96,7 +96,7 @@ export const home: HomeDict = {
   availabilityNote:
     "Terminal, peramban lokal, dan GUI tidak memerlukan akun Codewhale. Web hosted dan aplikasi desktop menggunakan akun. Jika Anda memakai kunci penyedia milik Anda sendiri, penyedia tersebut menagih penggunaan itu.",
   accountLink: "Buat akun",
-  surfacesHeading: "Satu tugas. Berkas, aplikasi, dan agenmu.",
+  surfacesHeading: "Bekerja dengan berkas dan alat",
   surfaces: [
     [
       "Berkas dan terminal",
@@ -119,16 +119,16 @@ export const home: HomeDict = {
       "Gunakan Fleet untuk membagi pekerjaan besar ke agen dengan peran dan model berbeda, lalu ikuti kemajuannya di satu tempat."
     ]
   ],
-  runtimeLink: "Lihat semua integrasi",
+  runtimeLink: "Jelajahi alat dan integrasi",
   installBandHeading: "Instal di macOS atau Linux",
   copy: "Salin",
   copied: "Tersalin ✓",
   binaries: "Biner",
   chinaMirrors: "Mirror Tiongkok",
   installGuideLink: "Baca panduan instalasi",
-  communityHeading: "Jadikan Codewhale milikmu.",
+  communityHeading: "Berkontribusi pada Codewhale",
   communityBody:
-    "Codewhale bersumber terbuka. Baca kodenya, buat plugin, bagikan alur kerja, atau bantu memperbaiki rilis berikutnya.",
+    "Laporkan bug, perbaiki dokumentasi, atau sumbangkan kode di GitHub. Kamu juga bisa membuat plugin dan berbagi alur kerja dengan pengguna lain.",
   communityLinksAria: "Tautan komunitas",
   contribute: "Berkontribusi di GitHub",
 };

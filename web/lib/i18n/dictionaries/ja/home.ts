@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale：自分のモデルとツールで、作りたいものを形に",
   metaDescription:
     "Codewhale でアプリを作り、仕事を自動化し、接続したツールを活用。オープンソースで、手持ちのモデル API やローカル・自己ホスト型の推論に対応。",
-  heroTitle: "あなたのコンピューターのためのオープンソースエージェント。",
+  heroTitle: "アプリを作り、仕事を自動化しましょう。",
   heroIntro:
-    "アプリを作り、ワークフローを自動化し、Slack、Gmail などの接続済みツールで作業できます。{brand} は、既存のモデル API、ローカル推論、セルフホストの推論を利用します。",
+    "{brand} は、コードを書き、コマンドを実行し、接続したツールを使って作業するオープンソースのエージェントです。既存のモデル API を使うことも、ローカルや自分のサーバーでモデルを動かすこともできます。",
   getCodewhale: "Codewhale をインストール",
   heroInstallAria: "インストールコマンド",
   exploreProduct: "Codewhale を見る",
@@ -21,25 +21,25 @@ export const home: HomeDict = {
   sourceCandidate: "未リリース",
   publishedRelease: "リリース済み",
   gainHeading: "できること",
-  gainLede: "欲しい結果から始めましょう。Codewhale がファイル、コマンド、接続したツールで作業し、アクセス範囲と承認方法はあなたが決めます。",
+  gainLede: "作りたいものや自動化したい作業を伝えてください。Codewhale は、あなたが指定したアクセス権限の範囲で、ファイルを編集し、コマンドを実行して結果を確認できます。",
   gain: [
     [
       "アプリやツールを作る",
-      "アイデアを動くアプリや便利なスクリプト、既存プロジェクトの新機能に。エージェントと一緒に書き、実行し、テストできます。"
+      "アプリを作る、機能を追加する、スクリプトを書くといった作業に使えます。Codewhale は、プロジェクトのファイルを扱い、コードを実行して、作成したものをテストできます。"
     ],
     [
       "繰り返す仕事を自動化",
-      "定期的な作業を、ターミナルやスクリプト、CI から実行するワークフローに。並行して進められる仕事には Fleet のチームを使えます。"
+      "ターミナル、スクリプト、CI からワークフローを実行できます。大きなタスクでは、異なるモデルを使うエージェントの Fleet に作業の一部を任せられます。"
     ],
     [
       "いつものツールをつなぐ",
-      "プラグイン、MCP サーバー、API を通じて Gmail や Slack などのツールを接続できます。ファイルやコマンドと同じタスクで活用できます。"
+      "プラグインや MCP サーバーからツールを追加したり、自分のスクリプトから API を利用したりできます。サービスごとに設定と認証が必要です。"
     ]
   ],
   chapterModels: "あなたのモデル",
-  modelsHeading: "使うモデルは、自分で選ぶ。",
+  modelsHeading: "使いたいモデルを選ぶ",
   modelsBody:
-    "契約済みのモデル API、互換ゲートウェイ、自分のハードウェアでの推論を使えます。セッションごとにも、Fleet 内のエージェントごとにもモデルを選べます。",
+    "プロバイダーのアカウント、OpenAI 互換のエンドポイント、ローカルやセルフホストのモデルを接続できます。セッションと Fleet の各エージェントに、それぞれモデルを選べます。",
   modelsFacts: [
     [
       "自分の API アカウント",
@@ -55,12 +55,12 @@ export const home: HomeDict = {
     ]
   ],
   modelsLink: "モデルとプロバイダーを見る",
-  startHeading: "やりたい仕事から、始めよう。",
-  startLede: "Codewhale をインストールし、モデルを接続して、役立つ仕事を任せましょう。まずは一つのエージェントから。必要に応じてツールやチームを加えられます。",
+  startHeading: "使い始める",
+  startLede: "Codewhale をインストールし、モデルを接続して、プロジェクトフォルダーを開いてください。必要に応じて、プラグインやエージェントを追加できます。",
   startGuideLink: "はじめかたガイドに沿って進める",
   startVocabularyLink: "製品用語を見る",
   chapterAvailability: "動作環境",
-  availabilityHeading: "ターミナルから始める。",
+  availabilityHeading: "現在利用できる機能と開発中の機能",
   availabilityLede: "ターミナルとローカルブラウザクライアントは利用可能です。ネイティブのデスクトップアプリと再構築中のホスト型ウェブアプリは開発中です。",
   availability: [
     [
@@ -92,7 +92,7 @@ export const home: HomeDict = {
   ],
   availabilityNote: "ターミナル、ローカルブラウザー、GUI は Codewhale のアカウントなしで使えます。ホスト型 Web とデスクトップはアカウントを使います。自分のプロバイダーキーを使う場合、その利用料金はプロバイダーから請求されます。",
   accountLink: "アカウントを作成",
-  surfacesHeading: "一つのタスクに、ファイルもアプリもエージェントも。",
+  surfacesHeading: "ファイルやツールを使って作業する",
   surfaces: [
     [
       "ファイルとターミナル",
@@ -115,15 +115,15 @@ export const home: HomeDict = {
       "Fleet で大きな仕事を、役割やモデルの異なるエージェントに分担。進捗を一か所で確認できます。"
     ]
   ],
-  runtimeLink: "すべての連携機能を見る",
+  runtimeLink: "ツールと連携機能を見る",
   installBandHeading: "macOS または Linux にインストールする",
   copy: "コピー",
   copied: "コピー済み ✓",
   binaries: "バイナリ",
   chinaMirrors: "中国ミラー",
   installGuideLink: "インストールガイドを読む",
-  communityHeading: "Codewhale を、自分の道具に。",
-  communityBody: "Codewhale はオープンソースです。コードを読む、プラグインを作る、ワークフローを共有する。次のリリースを一緒に良くしましょう。",
+  communityHeading: "Codewhale に貢献する",
+  communityBody: "GitHub でバグを報告したり、ドキュメントを改善したり、コードを提供したりできます。プラグインを作り、他のユーザーとワークフローを共有することもできます。",
   communityLinksAria: "コミュニティリンク",
   contribute: "GitHub で参加",
 };

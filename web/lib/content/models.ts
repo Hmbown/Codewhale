@@ -9,7 +9,7 @@ export const MODELS_COPY = {
   providerDocs: { en: "Provider setup guides", zh: "提供商配置指南" },
   install: { en: "Install Codewhale", zh: "安装 Codewhale" },
   setupLabel: { en: "Get connected", zh: "建立连接" },
-  setupTitle: { en: "Connect a provider in one command.", zh: "一条命令连接提供商。" },
+  setupTitle: { en: "Set up your model connection", zh: "配置模型连接" },
   setupLead: { en: "Save your key with codewhale auth set --provider <id>. In a session, pick the provider with /provider and the model with /model; local servers use the endpoint and authentication you configure.", zh: "用 codewhale auth set --provider <id> 保存密钥。在会话中，用 /provider 选择提供商，用 /model 选择模型；本地服务使用你配置的端点与认证方式。" },
   patterns: [
     {

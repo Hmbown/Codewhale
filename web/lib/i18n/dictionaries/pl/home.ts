@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale: twórz z własnymi modelami i narzędziami",
   metaDescription:
     "Twórz aplikacje, automatyzuj pracę i korzystaj z połączonych narzędzi w Codewhale. Otwarty kod, własne API modeli oraz lokalne lub samodzielnie hostowane wnioskowanie.",
-  heroTitle: "Agent open source dla Twojego komputera.",
+  heroTitle: "Twórz aplikacje i automatyzuj swoją pracę.",
   heroIntro:
-    "Twórz aplikacje, automatyzuj procesy i korzystaj ze Slacka, Gmaila oraz innych połączonych narzędzi. {brand} korzysta z używanych przez Ciebie API modeli lub z wnioskowania lokalnego i na własnej infrastrukturze.",
+    "{brand} to agent open source, który pisze kod, uruchamia polecenia i pracuje z narzędziami, które podłączysz. Korzystaj z używanych już API modeli lub uruchamiaj modele lokalnie i na własnych serwerach.",
   getCodewhale: "Zainstaluj Codewhale",
   heroInstallAria: "Polecenie instalacji",
   exploreProduct: "Poznaj Codewhale",
@@ -22,25 +22,25 @@ export const home: HomeDict = {
   publishedRelease: "wydane",
   gainHeading: "Co możesz zrobić",
   gainLede:
-    "Zacznij od oczekiwanego wyniku. Codewhale pracuje z plikami, poleceniami i połączonymi narzędziami; Ty wybierasz dostęp i zasady zatwierdzania.",
+    "Opisz, co chcesz stworzyć lub zautomatyzować. Codewhale może edytować pliki, uruchamiać polecenia i sprawdzać wyniki, a Ty kontrolujesz jego dostęp.",
   gain: [
     [
       "Twórz aplikacje i narzędzia",
-      "Zamień pomysł w działającą aplikację, przydatny skrypt lub funkcję istniejącego projektu. Agent pisze, uruchamia i testuje razem z Tobą."
+      "Stwórz aplikację, dodaj funkcję lub napisz skrypt. Codewhale może pracować z plikami projektu, uruchamiać kod i testować to, co tworzy."
     ],
     [
       "Automatyzuj powtarzalną pracę",
-      "Zamień cykliczne zadanie w proces uruchamiany z terminala, skryptów lub CI. Użyj Fleet, gdy kilku agentów może pracować równolegle."
+      "Uruchamiaj przepływy pracy z terminala, skryptów lub CI. Przy większych zadaniach deleguj części pracy zespołowi Fleet złożonemu z agentów korzystających z różnych modeli."
     ],
     [
       "Połącz swoje narzędzia",
-      "Połącz narzędzia takie jak Gmail i Slack przez wtyczki, serwery MCP lub API. Korzystaj z tych usług razem z plikami i poleceniami."
+      "Dodawaj narzędzia przez wtyczki i serwery MCP lub korzystaj z API we własnych skryptach. Każda usługa wymaga osobnej konfiguracji i uwierzytelnienia."
     ]
   ],
   chapterModels: "Twoje modele",
-  modelsHeading: "Korzystaj dalej ze swoich modeli.",
+  modelsHeading: "Używaj wybranych przez siebie modeli",
   modelsBody:
-    "Podłącz API modeli, za które już płacisz, użyj zgodnej bramy lub uruchom wnioskowanie na własnym sprzęcie. Wybieraj modele dla sesji i poszczególnych agentów Fleet.",
+    "Połącz konta dostawców, endpoint zgodny z OpenAI albo modele lokalne i utrzymywane na własnej infrastrukturze. Wybierz model dla sesji i dla każdego agenta w zespole Fleet.",
   modelsFacts: [
     [
       "Twoje konta API",
@@ -56,13 +56,13 @@ export const home: HomeDict = {
     ]
   ],
   modelsLink: "Przeglądaj modele i dostawców",
-  startHeading: "Przynieś zadanie. Zacznij.",
+  startHeading: "Jak zacząć",
   startLede:
-    "Zainstaluj Codewhale, połącz model i daj mu coś wartego zrobienia. Zacznij od jednego agenta; dodawaj narzędzia lub zespół, gdy ich potrzebujesz.",
+    "Zainstaluj Codewhale, połącz model i otwórz folder projektu. W razie potrzeby możesz dodać wtyczki i kolejnych agentów.",
   startGuideLink: "Skorzystaj z przewodnika na start",
   startVocabularyLink: "Zobacz słownik produktu",
   chapterAvailability: "Gdzie działa",
-  availabilityHeading: "Zacznij od terminala.",
+  availabilityHeading: "Dostępne teraz i w fazie rozwoju",
   availabilityLede:
     "Terminal i lokalny klient przeglądarkowy są dostępne. Natywna aplikacja desktopowa i przebudowana aplikacja webowa są w trakcie rozwoju.",
   availability: [
@@ -96,7 +96,7 @@ export const home: HomeDict = {
   availabilityNote:
     "Terminal, lokalna przeglądarka i GUI nie wymagają konta Codewhale. Hostowana wersja webowa i aplikacja desktopowa korzystają z konta. Jeśli używasz własnego klucza dostawcy, opłaty za to użycie nalicza ten dostawca.",
   accountLink: "Załóż konto",
-  surfacesHeading: "Jedno zadanie. Twoje pliki, aplikacje i agenci.",
+  surfacesHeading: "Pracuj z plikami i narzędziami",
   surfaces: [
     [
       "Pliki i terminal",
@@ -119,16 +119,16 @@ export const home: HomeDict = {
       "Podziel duże zadanie w Fleet między agentów z różnymi rolami i modelami. Śledź ich postępy w jednym miejscu."
     ]
   ],
-  runtimeLink: "Zobacz wszystkie integracje",
+  runtimeLink: "Poznaj narzędzia i integracje",
   installBandHeading: "Zainstaluj w systemie macOS lub Linux",
   copy: "Kopiuj",
   copied: "Skopiowano ✓",
   binaries: "Binarki",
   chinaMirrors: "Mirrory w Chinach",
   installGuideLink: "Przeczytaj przewodnik instalacji",
-  communityHeading: "Dopasuj Codewhale do siebie.",
+  communityHeading: "Współtwórz Codewhale",
   communityBody:
-    "Codewhale ma otwarty kod. Czytaj go, stwórz wtyczkę, udostępnij proces pracy lub pomóż ulepszyć kolejną wersję.",
+    "Zgłoś błąd, popraw dokumentację lub dodaj kod na GitHubie. Możesz też tworzyć wtyczki i dzielić się przepływami pracy z innymi użytkownikami.",
   communityLinksAria: "Linki społeczności",
   contribute: "Współtwórz na GitHubie",
 };

@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale: Bauen mit deinen Modellen und Werkzeugen",
   metaDescription:
     "Baue Apps, automatisiere Abläufe und arbeite mit verbundenen Werkzeugen. Codewhale ist Open Source und nutzt deine Modell-APIs oder lokale und selbst gehostete Inferenz.",
-  heroTitle: "Ein Open-Source-Agent für deinen Computer.",
+  heroTitle: "Erstelle Apps und automatisiere deine Arbeit.",
   heroIntro:
-    "Erstelle Apps, automatisiere Abläufe und arbeite mit Slack, Gmail und anderen verbundenen Tools. {brand} nutzt die Modell-APIs, die du bereits verwendest, oder lokale und selbst gehostete Inferenz.",
+    "{brand} ist ein Open-Source-Agent, der Code schreibt, Befehle ausführt und mit den Tools arbeitet, die du verbindest. Nutze deine vorhandenen Modell-APIs oder führe Modelle lokal und auf deinen eigenen Servern aus.",
   getCodewhale: "Codewhale installieren",
   heroInstallAria: "Installationsbefehl",
   exploreProduct: "Codewhale entdecken",
@@ -22,25 +22,25 @@ export const home: HomeDict = {
   publishedRelease: "veröffentlicht",
   gainHeading: "Was du tun kannst",
   gainLede:
-    "Beginne mit dem gewünschten Ergebnis. Codewhale arbeitet mit Dateien, Befehlen und verbundenen Werkzeugen; Zugriff und Freigaben bestimmst du.",
+    "Beschreibe, was du erstellen oder automatisieren möchtest. Codewhale kann Dateien bearbeiten, Befehle ausführen und das Ergebnis prüfen. Du bestimmst, worauf es zugreifen darf.",
   gain: [
     [
       "Apps und Werkzeuge bauen",
-      "Mache aus einer Idee eine funktionierende App, ein nützliches Skript oder eine neue Projektfunktion. Lass den Agenten mit dir schreiben, ausführen und testen."
+      "Erstelle eine App, füge eine Funktion hinzu oder schreibe ein Skript. Codewhale kann mit den Projektdateien arbeiten, den Code ausführen und testen, was es erstellt."
     ],
     [
       "Wiederkehrende Arbeit automatisieren",
-      "Mache aus einer wiederkehrenden Aufgabe einen Ablauf für Terminal, Skripte oder CI. Nutze Fleet, wenn mehrere Agenten parallel arbeiten können."
+      "Führe Workflows über dein Terminal, Skripte oder CI aus. Bei größeren Aufgaben kannst du Teile der Arbeit an eine Fleet von Agenten mit unterschiedlichen Modellen delegieren."
     ],
     [
       "Deine Werkzeuge verbinden",
-      "Verbinde Werkzeuge wie Gmail und Slack über Plugins, MCP-Server oder APIs. Nutze diese Dienste zusammen mit deinen Dateien und Befehlen."
+      "Füge Tools über Plugins und MCP-Server hinzu oder nutze APIs in deinen eigenen Skripten. Jeder Dienst benötigt eine eigene Einrichtung und Authentifizierung."
     ]
   ],
   chapterModels: "Deine Modelle",
-  modelsHeading: "Nutze deine Modelle weiter.",
+  modelsHeading: "Nutze die Modelle deiner Wahl",
   modelsBody:
-    "Verbinde deine bisherigen Modell-APIs, nutze ein kompatibles Gateway oder betreibe Inferenz auf eigener Hardware. Wähle Modelle pro Sitzung und für einzelne Agenten in Fleet.",
+    "Verbinde deine Anbieterkonten, einen OpenAI-kompatiblen Endpunkt oder lokale und selbst gehostete Modelle. Wähle ein Modell für die Sitzung und für jeden Agenten in einer Fleet.",
   modelsFacts: [
     [
       "Deine API-Konten",
@@ -56,13 +56,13 @@ export const home: HomeDict = {
     ]
   ],
   modelsLink: "Modelle und Anbieter durchsuchen",
-  startHeading: "Bring eine Aufgabe mit. Leg los.",
+  startHeading: "Erste Schritte",
   startLede:
-    "Installiere Codewhale, verbinde ein Modell und gib ihm eine sinnvolle Aufgabe. Beginne mit einem Agenten und ergänze bei Bedarf Werkzeuge oder ein Team.",
+    "Installiere Codewhale, verbinde ein Modell und öffne einen Projektordner. Plugins und weitere Agenten kannst du nach Bedarf hinzufügen.",
   startGuideLink: "Dem Leitfaden für die ersten Schritte folgen",
   startVocabularyLink: "Produktvokabular ansehen",
   chapterAvailability: "Wo es läuft",
-  availabilityHeading: "Starte im Terminal.",
+  availabilityHeading: "Jetzt verfügbar und in Entwicklung",
   availabilityLede:
     "Terminal und lokaler Browser-Client sind verfügbar. Eine native Desktop-App und eine neu aufgebaute gehostete Web-App sind in Entwicklung.",
   availability: [
@@ -96,7 +96,7 @@ export const home: HomeDict = {
   availabilityNote:
     "Terminal, lokaler Browser und GUI brauchen kein Codewhale-Konto. Gehostetes Web und Desktop nutzen ein Konto. Wenn du deinen eigenen Anbieterschlüssel verwendest, rechnet der Anbieter diese Nutzung ab.",
   accountLink: "Konto erstellen",
-  surfacesHeading: "Eine Aufgabe. Deine Dateien, Apps und Agenten.",
+  surfacesHeading: "Arbeite mit Dateien und Tools",
   surfaces: [
     [
       "Dateien und Terminal",
@@ -119,16 +119,16 @@ export const home: HomeDict = {
       "Verteile größere Aufgaben mit Fleet auf Agenten mit verschiedenen Rollen und Modellen. Verfolge ihren Fortschritt an einem Ort."
     ]
   ],
-  runtimeLink: "Alle Integrationen ansehen",
+  runtimeLink: "Tools und Integrationen entdecken",
   installBandHeading: "Installation unter macOS oder Linux",
   copy: "Kopieren",
   copied: "Kopiert ✓",
   binaries: "Binärdateien",
   chinaMirrors: "China-Mirrors",
   installGuideLink: "Installationsleitfaden lesen",
-  communityHeading: "Mach Codewhale zu deinem Werkzeug.",
+  communityHeading: "Trage zu Codewhale bei",
   communityBody:
-    "Codewhale ist Open Source. Lies den Code, baue ein Plugin, teile einen Ablauf oder hilf, die nächste Version zu verbessern.",
+    "Melde einen Fehler, verbessere die Dokumentation oder steuere Code auf GitHub bei. Du kannst auch Plugins entwickeln und Workflows mit anderen Nutzern teilen.",
   communityLinksAria: "Community-Links",
   contribute: "Auf GitHub mitwirken",
 };

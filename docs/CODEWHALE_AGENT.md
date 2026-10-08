@@ -10,7 +10,14 @@ the rules that keep them one product instead of several.
 |---|---|---|---|
 | GitHub PR review | GitHub App bot `codewhale-agent[bot]` | GitHub org settings; repo variable `CODEWHALE_APP_ID` + secret `CODEWHALE_APP_PRIVATE_KEY` | `codewhale review --pr N --post` ships with the `codewhale-review.yml` workflow; it no-ops green until the App is configured (founder-gated), then posts as the App instead of the workflow token. Posting is always opt-in via `--post`. |
 | Commit co-author | `.github/AUTHOR_MAP` | repo | existing; harvested co-author credit lands in the contributor graph |
-| Chat channels (Telegram today; Slack/Feishu/Lark next; Discord/WeCom to come) | per-user bot registration bound to a Codewhale membership | CWC control-plane `services/control-plane/src` BotGateway + `integrations/chat/`; contracts in `packages/contracts` | Telegram pairing end-to-end (token → vault `credentialRef` → one-time code → `/start` binds chat↔membership). Default read-only command allowlist; opt-in write verbs; approve/deny keyboards route as permission decisions. |
+| Chat channels | per-user bot registration bound to a Codewhale membership | control-plane `services/control-plane/src/integrations/chat/` BotGateway and adapters; contracts in `packages/contracts` | Source includes Telegram and Slack bot pairing and commands. Default read-only command allowlist; opt-in write verbs; approve/deny keyboards route as permission decisions. Availability depends on the deployed gateway and configured bot credentials. |
+
+Slack bot commands control Codewhale; they do not give an agent tools to search
+or read a Slack workspace. The Slack bot requires a user-managed Slack app,
+credentials and webhook setup. Hosted Slack delivery and a real authenticated
+Slack task have not been qualified, so this source implementation is not a
+ready-to-use Slack integration claim. External Slack tools require a separately
+configured and authenticated MCP server or API integration.
 
 ## Rules that make it one identity
 
@@ -39,8 +46,8 @@ Per-channel command allowlists (default read-only: `status`, `jobs`,
 `receipts`, `help`; opt-in: `new task`, `approve`, `deny`), inline
 approve/deny keyboards routed as permission decisions, `assistant_changes`
 reply mode (message only when something changed), per-channel message
-format adapters (Telegram markdown today; Slack blocks, Feishu/Lark cards,
-WeCom markdown planned), quiet hours + digest, automation output routable
+format adapters (including Telegram markdown and Slack blocks in source),
+quiet hours + digest, automation output routable
 to any paired channel, one pairing code bound inside the authenticated
 app, unbind revokes instantly.
 

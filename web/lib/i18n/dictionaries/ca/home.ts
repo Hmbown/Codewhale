@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale: crea amb els teus models i eines",
   metaDescription:
     "Crea aplicacions, automatitza fluxos de treball i utilitza eines connectades amb Codewhale. Codi obert, amb les teves API de models o inferència local i autoallotjada.",
-  heroTitle: "Un agent de codi obert per al teu ordinador.",
+  heroTitle: "Crea aplicacions i automatitza la teva feina.",
   heroIntro:
-    "Crea aplicacions, automatitza fluxos de treball i treballa amb Slack, Gmail i altres eines connectades. {brand} fa servir les API de models que ja utilitzes o inferència local i autoallotjada.",
+    "{brand} és un agent de codi obert que escriu codi, executa ordres i treballa amb les eines que connectes. Fes servir les API de models que ja utilitzes o executa models localment i als teus propis servidors.",
   getCodewhale: "Instal·lar Codewhale",
   heroInstallAria: "Ordre d'instal·lació",
   exploreProduct: "Explora Codewhale",
@@ -22,25 +22,25 @@ export const home: HomeDict = {
   publishedRelease: "publicada",
   gainHeading: "Què pots fer",
   gainLede:
-    "Comença pel resultat que vols. Codewhale treballa amb fitxers, ordres i eines connectades; tu decideixes els accessos i les aprovacions.",
+    "Descriu què vols crear o automatitzar. Codewhale pot editar fitxers, executar ordres i comprovar el resultat, amb un accés que tu controles.",
   gain: [
     [
       "Crea aplicacions i eines",
-      "Converteix una idea en una aplicació que funcioni, un script útil o una funció d’un projecte existent. Deixa que l’agent escrigui, executi i provi amb tu."
+      "Crea una aplicació, afegeix una funció o escriu un script. Codewhale pot treballar amb els fitxers del projecte, executar el codi i provar el que crea."
     ],
     [
       "Automatitza la feina repetitiva",
-      "Converteix una tasca recurrent en un flux de treball per al terminal, els scripts o CI. Fes servir un Fleet d’agents quan la feina es pugui fer en paral·lel."
+      "Executa fluxos de treball des del terminal, scripts o CI. Per a tasques més grans, delega parts de la feina a una Fleet d’agents amb models diferents."
     ],
     [
       "Connecta les eines que fas servir",
-      "Connecta eines com Gmail i Slack mitjançant plugins, servidors MCP o API. Treballa amb aquests serveis al costat dels teus fitxers i ordres."
+      "Afegeix eines mitjançant plugins i servidors MCP, o utilitza API des dels teus propis scripts. Cada servei requereix la seva pròpia configuració i autenticació."
     ]
   ],
   chapterModels: "Els teus models",
-  modelsHeading: "Continua fent servir els teus models.",
+  modelsHeading: "Fes servir els models que triïs",
   modelsBody:
-    "Connecta les API de models que ja pagues, utilitza una passarel·la compatible o executa inferència al teu maquinari. Tria un model per sessió i per cada agent d’un Fleet.",
+    "Connecta els teus comptes de proveïdors, un endpoint compatible amb OpenAI o models locals i autoallotjats. Tria un model per a la sessió i per a cada agent d’una Fleet.",
   modelsFacts: [
     [
       "Els teus comptes d’API",
@@ -56,13 +56,13 @@ export const home: HomeDict = {
     ]
   ],
   modelsLink: "Consulta els models i els proveïdors",
-  startHeading: "Porta una tasca. Comença.",
+  startHeading: "Primers passos",
   startLede:
-    "Instal·la Codewhale, connecta un model i dona-li una tasca que valgui la pena. Comença amb un agent; afegeix eines o un equip quan calgui.",
+    "Instal·la Codewhale, connecta un model i obre una carpeta de projecte. Pots afegir plugins i més agents quan els necessitis.",
   startGuideLink: "Segueix la guia d’inici",
   startVocabularyLink: "Consulta el vocabulari del producte",
   chapterAvailability: "On funciona",
-  availabilityHeading: "Comença al terminal.",
+  availabilityHeading: "Disponible ara i en desenvolupament",
   availabilityLede:
     "El terminal i el client de navegador local ja estan disponibles. L’aplicació nativa d’escriptori i la nova aplicació web allotjada estan en desenvolupament.",
   availability: [
@@ -96,7 +96,7 @@ export const home: HomeDict = {
   availabilityNote:
     "El terminal, el navegador local i la GUI no necessiten cap compte de Codewhale. La web allotjada i l’aplicació d’escriptori fan servir un compte. Si fas servir la teva pròpia clau de proveïdor, aquest et factura l’ús.",
   accountLink: "Crear un compte",
-  surfacesHeading: "Una tasca. Els teus fitxers, aplicacions i agents.",
+  surfacesHeading: "Treballa amb fitxers i eines",
   surfaces: [
     [
       "Fitxers i terminal",
@@ -119,16 +119,16 @@ export const home: HomeDict = {
       "Reparteix una feina gran entre agents amb rols i models diferents mitjançant Fleet i segueix-ne el progrés en un sol lloc."
     ]
   ],
-  runtimeLink: "Consulta totes les integracions",
+  runtimeLink: "Explora eines i integracions",
   installBandHeading: "Instal·la a macOS o Linux",
   copy: "Copia",
   copied: "Copiat ✓",
   binaries: "Binaris",
   chinaMirrors: "Mirrors a la Xina",
   installGuideLink: "Llegeix la guia d’instal·lació",
-  communityHeading: "Fes teu Codewhale.",
+  communityHeading: "Contribueix a Codewhale",
   communityBody:
-    "Codewhale és de codi obert. Llegeix el codi, crea un plugin, comparteix un flux de treball o ajuda a millorar la pròxima versió.",
+    "Informa d’un error, millora la documentació o contribueix amb codi a GitHub. També pots crear plugins i compartir fluxos de treball amb altres usuaris.",
   communityLinksAria: "Enllaços de la comunitat",
   contribute: "Contribueix a GitHub",
 };

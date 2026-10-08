@@ -38,15 +38,15 @@ export const PRODUCT_COPY = {
     },
   },
   title: {
-    en: "Put your models to work.",
-    zh: "让你的模型，真正做事。",
+    en: "Build apps and automate workflows",
+    zh: "构建应用，自动化工作流",
   },
   lede: {
-    en: "Build an app, automate your reporting, or connect the tools behind a recurring workflow. Codewhale is an open-source agent that works across your files, terminal and connected services, using your existing model APIs or your own inference.",
-    zh: "构建一个应用，让报表自动生成，或把重复工作涉及的工具连接起来。Codewhale 是一个开源智能体，使用你已有的模型 API 或自己的推理服务，在文件、终端和已连接的服务之间完成工作。",
+    en: "Codewhale is an open-source agent that writes code, runs commands and works with the tools you connect. Use your existing model APIs, or run models locally and on your own servers.",
+    zh: "Codewhale 是一个开源智能体，可以编写代码、运行命令，并使用你连接的工具。使用已有的模型 API，或在本地和自己的服务器上运行模型。",
   },
 
-  gainHeading: { en: "Bring it a real task.", zh: "交给它一件实实在在的事。" },
+  gainHeading: { en: "What you can build and automate", zh: "可以构建与自动化的工作" },
   gain: [
     {
       title: { en: "Build apps and useful tools", zh: "构建应用和实用工具" },
@@ -58,8 +58,8 @@ export const PRODUCT_COPY = {
     {
       title: { en: "Work across your apps", zh: "让应用一起参与工作" },
       body: {
-        en: "Connect services such as Gmail and Slack through plugins, MCP servers or APIs. Bring what the task needs into the same session as your files and commands.",
-        zh: "通过插件、MCP 服务或 API 连接 Gmail、Slack 等服务。让任务所需的工具与文件、命令在同一个会话中协作。",
+        en: "Add tools through plugins and MCP servers, or use APIs from your own scripts. Each service needs its own setup and authentication.",
+        zh: "通过插件和 MCP 服务添加工具，或在自己的脚本中使用 API。每项服务都需要单独配置并完成身份验证。",
       },
     },
     {
@@ -71,7 +71,7 @@ export const PRODUCT_COPY = {
     },
   ] satisfies ProductRow[],
 
-  availabilityHeading: { en: "Use it in your terminal today", zh: "现在就在终端中使用" },
+  availabilityHeading: { en: "Available now and in development", zh: "已可使用和正在开发的版本" },
   availabilityLede: {
     en: "The terminal, local browser client, and community CodeWhale GUI are available now and need no Codewhale account. The desktop and hosted web apps are in development, share the same session model, and use an account; your model connection stays your choice.",
     zh: "终端、本地浏览器客户端与社区维护的 CodeWhale GUI 现已可用，无需 Codewhale 账户。桌面和托管网页应用正在开发，共用同一会话模型，需要使用账户；模型连接仍由你选择。",
@@ -139,7 +139,7 @@ export const PRODUCT_COPY = {
     },
   ] satisfies ProductAvailabilityRow[],
 
-  controlHeading: { en: "Choose the access. Keep control.", zh: "访问范围你来定，控制权在你手里。" },
+  controlHeading: { en: "Set permissions and approvals", zh: "设置权限与审批方式" },
   controlLede: {
     en: "Use Plan to explore, Work to carry out a task, and Operate to coordinate larger jobs. Approval settings decide which actions wait for you.",
     zh: "用 Plan 探索方案、Work 执行任务、Operate 协调较大的工作。审批设置决定哪些操作需要等你确认。",
@@ -155,7 +155,7 @@ export const PRODUCT_COPY = {
     { title: { en: "Full Access", zh: "Full Access" }, body: { en: "Reduces approval prompts. It does not bypass hard policy boundaries or grant access outside the allowed scope.", zh: "减少审批提示，但不会绕过强制策略边界，也不会授予允许范围之外的访问权限。" } },
   ] satisfies ProductRow[],
 
-  surfacesHeading: { en: "Files, apps and agents in one task.", zh: "一项任务，连接文件、应用和智能体。" },
+  surfacesHeading: { en: "Work across files and tools", zh: "在文件与工具之间完成工作" },
   surfacesLede: {
     en: "Work with your project, connected services, browser tools and agent teams from one session. Choose the model, add the connections you need, and return to the work without starting over.",
     zh: "在同一个会话中使用项目文件、已连接的服务、浏览器工具和智能体团队。选择模型，添加所需的连接，之后随时接着做，无需从头开始。",

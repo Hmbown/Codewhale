@@ -33,8 +33,10 @@ accounts, compatible gateways, or local and self-hosted inference, with a
 different model per role. The user's model inventory is the
 **Fleet** (`codewhale fleet`, `/fleet`; `pod` remains a compatibility alias).
 Modes are Plan, Work, Operate; permission levels are Ask, Auto-Review, Full
-Access. Plugins, MCP servers and APIs connect the tools the user chooses,
-including services such as Gmail and Slack. Terminal, local browser, native
+Access. Plugins and MCP servers add tools; scripts can use service APIs.
+Each external service requires its own setup and authentication. General MCP
+support does not establish that a particular service has been connected or
+qualified with Codewhale. Terminal, local browser, native
 app and hosted product availability must be stated separately from the common
 Runtime model: source readiness is not deployment or customer acceptance.
 
@@ -70,6 +72,10 @@ Runtime model: source readiness is not deployment or customer acceptance.
   sample reports and terminal view galleries do not belong on the homepage.
   Show one actual native TUI capture below the introduction. The product page
   and component explorer can show the other views.
+- Use plain, concrete marketing copy about what people can build and do.
+  Headings name the benefit or action. Avoid robot jokes, choppy slogan
+  fragments, vague promises and internal agent-verification language in the
+  public interface. Keep service claims tied to actual setup and qualification.
 - `web/lib/media-manifest.ts` records the exact captured native build and
   shared README image. Native views on the product page and getting-started
   guide retain their original PTY text and colors. An isolated local demo may

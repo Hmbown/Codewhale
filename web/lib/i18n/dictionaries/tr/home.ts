@@ -6,9 +6,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale: kendi modellerin ve araçlarınla geliştir",
   metaDescription:
     "Codewhale ile uygulamalar geliştir, iş akışlarını otomatikleştir ve bağlı araçlarla çalış. Açık kaynak; kendi model API’lerin, yerel veya kendi barındırdığın çıkarımla.",
-  heroTitle: "Bilgisayarın için açık kaynaklı bir ajan.",
+  heroTitle: "Uygulamalar geliştir ve işlerini otomatikleştir.",
   heroIntro:
-    "Uygulamalar geliştir, iş akışlarını otomatikleştir ve Slack, Gmail ve diğer bağlı araçlarla çalış. {brand}, mevcut model API’lerini veya yerel ve kendi barındırdığın çıkarım altyapısını kullanır.",
+    "{brand}, kod yazan, komut çalıştıran ve bağladığın araçlarla çalışan açık kaynaklı bir ajandır. Mevcut model API’lerini kullan veya modelleri yerel olarak ve kendi sunucularında çalıştır.",
   getCodewhale: "Codewhale'i kur",
   heroInstallAria: "Kurulum komutu",
   exploreProduct: "Codewhale’i keşfet",
@@ -23,25 +23,25 @@ export const home: HomeDict = {
   gainHeading:
     "Neler yapabilirsin",
   gainLede:
-    "İstediğin sonuçla başla. Codewhale dosyalar, komutlar ve bağlı araçlarla çalışır; erişimi ve onayları sen belirlersin.",
+    "Ne geliştirmek veya otomatikleştirmek istediğini anlat. Codewhale, erişimini senin belirlediğin sınırlar içinde dosyaları düzenleyebilir, komut çalıştırabilir ve sonucu kontrol edebilir.",
   gain: [
     [
       "Uygulamalar ve araçlar geliştir",
-      "Bir fikri çalışan uygulamaya, faydalı bir betiğe veya mevcut projede yeni bir özelliğe dönüştür. Ajan seninle birlikte yazsın, çalıştırsın ve test etsin."
+      "Bir uygulama geliştir, bir özellik ekle veya bir betik yaz. Codewhale proje dosyaları üzerinde çalışabilir, kodu çalıştırabilir ve geliştirdiği şeyi test edebilir."
     ],
     [
       "Tekrarlanan işleri otomatikleştir",
-      "Tekrarlanan bir görevi terminalden, betiklerden veya CI’dan çalıştırılan iş akışına dönüştür. İş paralel yürüyebiliyorsa Fleet ile ajan ekibi kullan."
+      "İş akışlarını terminalinden, betiklerden veya CI üzerinden çalıştır. Daha büyük görevlerde işin bölümlerini farklı modeller kullanan bir Fleet ajan ekibine devret."
     ],
     [
       "Kullandığın araçları bağla",
-      "Gmail ve Slack gibi araçları eklentiler, MCP sunucuları veya API’lerle bağla. Bu hizmetlerle dosya ve komutlarını aynı görevde kullan."
+      "Eklentiler ve MCP sunucuları aracılığıyla araçlar ekle veya kendi betiklerinden API’leri kullan. Her hizmet kendi kurulumunu ve kimlik doğrulamasını gerektirir."
     ]
   ],
   chapterModels: "Senin modellerin",
-  modelsHeading: "Kendi modellerini kullanmaya devam et.",
+  modelsHeading: "Seçtiğin modelleri kullan",
   modelsBody:
-    "Zaten ödeme yaptığın model API’lerini bağla, uyumlu bir ağ geçidi kullan veya kendi donanımında çıkarım çalıştır. Her oturum ve Fleet içindeki her ajan için model seç.",
+    "Sağlayıcı hesaplarını, OpenAI uyumlu bir uç noktayı veya yerel ve kendi barındırdığın modelleri bağla. Oturum ve Fleet içindeki her ajan için bir model seç.",
   modelsFacts: [
     [
       "API hesapların",
@@ -57,13 +57,13 @@ export const home: HomeDict = {
     ]
   ],
   modelsLink: "Modellere ve sağlayıcılara göz at",
-  startHeading: "Bir görev getir. Başla.",
+  startHeading: "Başlarken",
   startLede:
-    "Codewhale’i kur, bir model bağla ve ona yapmaya değer bir iş ver. Bir ajanla başla; gerektiğinde araçlar veya bir ekip ekle.",
+    "Codewhale’i yükle, bir model bağla ve bir proje klasörü aç. İhtiyaç duydukça eklentiler ve daha fazla ajan ekleyebilirsin.",
   startGuideLink: "Başlangıç kılavuzunu takip et",
   startVocabularyLink: "Ürün sözlüğünü gör",
   chapterAvailability: "Nerede çalışır",
-  availabilityHeading: "Terminalden başla.",
+  availabilityHeading: "Şimdi kullanılabilenler ve geliştirilmekte olanlar",
   availabilityLede:
     "Terminal ve yerel tarayıcı istemcisi hazır. Yerel masaüstü uygulaması ve yeniden kurulan barındırılmış web uygulaması geliştiriliyor.",
   availability: [
@@ -97,7 +97,7 @@ export const home: HomeDict = {
   availabilityNote:
     "Terminal, yerel tarayıcı ve GUI için Codewhale hesabı gerekmez. Barındırılan web ve masaüstü uygulaması bir hesap kullanır. Kendi sağlayıcı anahtarını kullanırsan, bu kullanımı sağlayıcın faturalandırır.",
   accountLink: "Hesap oluştur",
-  surfacesHeading: "Tek görev. Dosyaların, uygulamaların ve ajanların.",
+  surfacesHeading: "Dosyalar ve araçlarla çalış",
   surfaces: [
     [
       "Dosyalar ve terminal",
@@ -120,16 +120,16 @@ export const home: HomeDict = {
       "Büyük bir işi Fleet ile farklı rol ve modellerdeki ajanlara böl, ilerlemelerini tek yerde izle."
     ]
   ],
-  runtimeLink: "Tüm entegrasyonları gör",
+  runtimeLink: "Araçları ve entegrasyonları keşfet",
   installBandHeading: "macOS veya Linux üzerine kur",
   copy: "Kopyala",
   copied: "Kopyalandı ✓",
   binaries: "İkililer",
   chinaMirrors: "Çin yansıları",
   installGuideLink: "Kurulum kılavuzunu oku",
-  communityHeading: "Codewhale’i kendine göre şekillendir.",
+  communityHeading: "Codewhale’e katkıda bulun",
   communityBody:
-    "Codewhale açık kaynak. Kodu oku, bir eklenti geliştir, iş akışı paylaş veya sonraki sürümü iyileştirmeye yardım et.",
+    "GitHub’da bir hata bildir, belgeleri iyileştir veya kod katkısı yap. Ayrıca eklentiler geliştirebilir ve iş akışlarını diğer kullanıcılarla paylaşabilirsin.",
   communityLinksAria: "Topluluk bağlantıları",
   contribute: "GitHub’da katkıda bulun",
 };

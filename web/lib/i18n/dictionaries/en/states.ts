@@ -9,10 +9,10 @@ import type { StatesDict } from "../types";
 export const states: StatesDict = {
   loadingLabel: "Loading…",
   emptyTitle: "Nothing here yet",
-  emptyBody: "There is no record to show. Nothing has been invented to fill the space.",
+  emptyBody: "There are no records to show yet.",
   errorTitle: "This page did not finish loading",
   errorBody:
-    "Something failed on the way here. Nothing you did was lost; try again, and if it keeps failing, report it.",
+    "Something went wrong. Try again, or report the problem if it continues.",
   retry: "Try again",
   reload: "Reload the page",
   homeLink: "Back to the home page",
@@ -25,7 +25,7 @@ export const states: StatesDict = {
     "A blue whale in tactical gear on the fictional Codwhale: Modern Whalefare game poster.",
   unavailableTitle: "The live record has not loaded",
   unavailableBody:
-    "The source did not answer the last refresh, or this page has not refreshed since it was built. Nothing is shown in its place.",
+    "The latest information is unavailable. Try refreshing this page.",
 
   offlineTitle: "You are offline",
   offlineBody: "Actions are paused until the connection returns. Nothing shown here is refreshing.",
