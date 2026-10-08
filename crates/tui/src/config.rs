@@ -3059,6 +3059,33 @@ impl NetworkPolicyToml {
     }
 }
 
+/// Re-read the `[network]` table from a configuration document.
+///
+/// Deliberately narrower than [`Config::load`]: this runs on the tool-context
+/// build path, where re-applying the environment, managed, and credential
+/// layers would be both wasteful and wrong. Only the document's own table comes
+/// back — the same table `/network allow <host>` edits.
+///
+/// `None` means there is nothing usable to adopt: the document is missing,
+/// unreadable, unparseable, or carries no `[network]` table. Callers keep the
+/// policy they already hold, which is the conservative direction for an
+/// allow/deny gate.
+///
+/// Known limitation: `[profiles.<name>.network]` is not consulted. `/network`
+/// does not write it either, so a live session and the command agree on this
+/// base table.
+#[must_use]
+pub fn network_policy_from_document(path: &Path) -> Option<crate::network_policy::NetworkPolicy> {
+    #[derive(Deserialize)]
+    struct NetworkTable {
+        network: Option<NetworkPolicyToml>,
+    }
+
+    let contents = fs::read_to_string(path).ok()?;
+    let parsed: NetworkTable = toml::from_str(&contents).ok()?;
+    parsed.network.map(NetworkPolicyToml::into_runtime)
+}
+
 /// `[lsp]` table — mirrors [`crate::lsp::LspConfig`]. Documented in
 /// `config.example.toml`. When omitted, defaults from `LspConfig::default()`
 /// apply (enabled, 5 s poll, 20 diagnostics/file, errors only, no overrides).

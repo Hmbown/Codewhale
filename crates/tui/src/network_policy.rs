@@ -524,6 +524,42 @@ impl NetworkPolicyDecider {
         Self::new(policy, auditor)
     }
 
+    /// Rebuild this decider against a policy re-read from disk, keeping the
+    /// session cache so an approval already granted in this session survives
+    /// the refresh.
+    ///
+    /// The engine snapshots its policy when it is spawned, and `/network allow
+    /// <host>` only edits the configuration document — it cannot reach that
+    /// snapshot. Callers hand the re-read table here instead of waiting for a
+    /// restart. The auditor keeps its log path and follows the new policy's
+    /// `audit` switch.
+    ///
+    /// Extra CIDRs registered through [`Self::with_trusted_fakeip_cidrs`] are
+    /// not carried over; the refresh re-derives them from `policy`. Configured
+    /// fake-IP ranges already ride in the policy, and no production caller
+    /// registers extras.
+    #[must_use]
+    pub fn with_policy_refreshed(&self, policy: NetworkPolicy) -> Self {
+        let auditor = match self.auditor.as_ref() {
+            Some(existing) => Some(NetworkAuditor::new(
+                existing.path().to_path_buf(),
+                policy.audit_enabled(),
+            )),
+            None if policy.audit_enabled() => NetworkAuditor::default_path(true),
+            None => None,
+        };
+        Self {
+            trusted_fakeip_cidrs: policy
+                .proxy_fake_ip_cidrs
+                .iter()
+                .filter_map(|cidr| parse_trusted_fakeip_cidr(cidr))
+                .collect(),
+            policy,
+            cache: self.cache.clone(),
+            auditor,
+        }
+    }
+
     /// Inspect the policy.
     #[must_use]
     pub fn policy(&self) -> &NetworkPolicy {
@@ -841,6 +877,51 @@ mod tests {
         assert_eq!(
             decider.evaluate("api.example.com", "fetch_url"),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn refreshed_policy_adopts_new_table_without_retracting_session_approvals() {
+        let decider = NetworkPolicyDecider::new(mk(Decision::Prompt, &[], &[]), None);
+        decider.approve_session("approved.example.com", "fetch_url");
+
+        // Mid-session `/network allow api.github.com` reaches the session as a
+        // re-read table rather than a restart.
+        let refreshed =
+            decider.with_policy_refreshed(mk(Decision::Prompt, &["api.github.com"], &[]));
+
+        assert_eq!(
+            refreshed.evaluate("api.github.com", "Bash"),
+            Decision::Allow,
+            "the re-read table is in force"
+        );
+        assert_eq!(
+            refreshed.evaluate("approved.example.com", "fetch_url"),
+            Decision::Allow,
+            "an approval already granted this session survives the refresh"
+        );
+        assert_eq!(
+            refreshed.evaluate("unlisted.example.com", "Bash"),
+            Decision::Prompt,
+            "hosts the table does not name keep the default"
+        );
+    }
+
+    #[test]
+    fn refreshed_policy_honours_a_new_deny_list() {
+        let decider = NetworkPolicyDecider::new(mk(Decision::Allow, &[], &[]), None);
+        assert_eq!(
+            decider.evaluate("evil.example.com", "fetch_url"),
+            Decision::Allow
+        );
+
+        let refreshed =
+            decider.with_policy_refreshed(mk(Decision::Allow, &[], &["evil.example.com"]));
+
+        assert_eq!(
+            refreshed.evaluate("evil.example.com", "fetch_url"),
+            Decision::Deny,
+            "a deny entry written after spawn is enforced without a restart"
         );
     }
 
