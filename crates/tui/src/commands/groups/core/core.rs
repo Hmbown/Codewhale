@@ -870,6 +870,51 @@ mod tests {
     }
 
     #[test]
+    fn profile_command_localizes_replies_and_preserves_switch_action() {
+        let _env = crate::test_support::lock_test_env();
+        for (locale, usage, switching) in [
+            (
+                Locale::En,
+                "Usage: /profile <name>",
+                "Switching to profile 'work'...",
+            ),
+            (
+                Locale::ZhHans,
+                "用法: /profile <name>",
+                "正在切换到配置文件 'work'...",
+            ),
+            (
+                Locale::De,
+                "Verwendung: /profile <name>",
+                "Wechsle zum Profil 'work'...",
+            ),
+        ] {
+            let mut app = create_test_app();
+            app.ui_locale = locale;
+            let previous_profile = app.config_profile.clone();
+
+            for command in ["/profile", "/profile   "] {
+                let result = crate::commands::execute(command, &mut app);
+                assert!(result.is_error, "{locale:?}: {command:?}");
+                assert!(result.action.is_none(), "{locale:?}: {command:?}");
+                let message = result.message.expect("profile usage");
+                assert!(message.contains(usage), "{locale:?}: {message}");
+                assert!(message.contains("~/.codewhale/config.toml"), "{message}");
+                assert!(message.contains("[profiles]"), "{message}");
+            }
+
+            let result = crate::commands::execute("/profile   work  ", &mut app);
+            assert!(!result.is_error, "{locale:?}");
+            assert_eq!(result.message.as_deref(), Some(switching), "{locale:?}");
+            assert!(matches!(
+                result.action,
+                Some(AppAction::SwitchProfile { profile }) if profile == "work"
+            ));
+            assert_eq!(app.config_profile, previous_profile, "{locale:?}");
+        }
+    }
+
+    #[test]
     fn test_help_unknown_command() {
         let mut app = create_test_app();
         let result = help(&mut app, Some("nonexistent"));
