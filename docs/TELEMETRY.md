@@ -197,7 +197,7 @@ new fields, surfaces, and `product_usage` events.
 | `install_id` | uuid v4 | `crates/telemetry/src/envelope.rs` | Random, never derived, rotated every 90 days. See "Where it lives" above. |
 | `app_version` | string | `env!("CARGO_PKG_VERSION")`, as at `crates/telemetry/src/lib.rs:112` | Must match `^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$`. |
 | `git_sha` | string \| null | `option_env!("CODEWHALE_RELEASE_BUILD_SHA")` — a **new** rustc-env | First 12 hex chars. Emitted **only** when `codewhale_build_support::release_build_sha` saw a valid full SHA in `CODEWHALE_BUILD_SHA`, the legacy `DEEPSEEK_BUILD_SHA`, or `GITHUB_SHA`, in that precedence order. `null` for every unstamped build, with no runtime lookup of any kind. **Never** `CODEWHALE_BUILD_COMMIT` — that falls back to `git_commit` and is the builder's private HEAD. **Never** `Thread.git_sha` (`crates/state/src/lib.rs:93`) — that is the user's workspace commit and a red line, one identifier away by name. |
-| `surface` | enum | explicitly set by the emitting client | `tui \| exec \| cli \| app-server \| mcp-server \| serve \| website \| web-app \| desktop \| control-plane`. Runtime metrics keep their existing collector. Browser product counts use the same closed envelope. A declared surface is not proof its client is deployed. |
+| `surface` | enum | explicitly set by the emitting client | `tui \| exec \| cli \| app-server \| mcp-server \| serve \| website \| web-app \| desktop \| control-plane \| vscode-extension`. Runtime metrics keep their existing collector. Browser product counts use the same closed envelope. A declared surface is not proof its client is deployed. `vscode-extension` is an extension client of this schema, deliberately generic the way `web-app` and `desktop` are: the editor's own name and version are **not** collected. Widening this whitelist changes no field, so the schema version is unchanged. |
 | `os` | enum | `std::env::consts::OS`, as at `crates/cli/src/update.rs:41` | Whitelist: `linux \| macos \| windows \| freebsd \| android \| other`. |
 | `arch` | enum | `std::env::consts::ARCH` | `x86_64 \| aarch64 \| other`. |
 | `libc` | enum | `cfg!(target_env)` — **compile time** | `gnu \| musl \| none`. Runtime detection reads distro vendor strings; compile-time is free and leaks nothing. |
@@ -213,6 +213,46 @@ state, resolvable home, valid endpoint, and no persistent opt-out or run kill
 switch. Missing preferences default on. The interactive TUI shows the disclosure;
 headless commands never synthesize consent. Existing runtime events and counters
 are unchanged; adding PostHog does not add a second runtime collector.
+
+### An embedder declares the server it started
+
+A client that starts `codewhale serve` may name itself, so its sessions are not
+counted as anonymous `serve` traffic from nobody in particular. It sets
+`CODEWHALE_TELEMETRY_SURFACE` to a value in the `surface` whitelist before
+spawning the server; the extension client uses `vscode-extension`.
+
+Three properties of that read are deliberate:
+
+- **`serve` only.** The variable is inherited by descendant processes, and an
+  agent's shell command runs `codewhale` descendants carrying this environment.
+  Only the branch that *is* the embedder's own server consults it, so a nested
+  `codewhale exec` cannot report itself as the embedder.
+- **`tui` is refused**, and `serve --mcp` still reports `mcp-server`: nothing
+  starts the interactive terminal UI on a user's behalf, and a server is not an
+  MCP server because an embedder said so.
+- **An unrecognised name is dropped, not repaired.** A value outside the
+  whitelist falls back to `serve` rather than failing startup or being guessed
+  at; the field is a label, and the default is the honest one.
+
+This changes how an embedder's sessions are *labelled*. It does not change
+whether anything may be collected: the server resolves that itself, from the
+same durable config, the same setup state, and the same `CODEWHALE_TELEMETRY`
+run-scoped kill switch. An embedder cannot enable collection where the user has
+turned it off, and a durable opt-out in one client is a durable opt-out for every
+client on the machine, because they share one home and one install identity.
+
+The extension client is the worked example: it holds a single on/off setting and
+passes `CODEWHALE_TELEMETRY=0` when the user turns reporting off. It contains no
+payload builder, no buffer, and no transport of its own — so its sessions share
+the home's `install_id` rather than minting a second one, and one installation is
+one install in every count derived from that id.
+
+Because that switch is run-scoped rather than a durable opt-out, turning it off
+stops the engine this extension starts and leaves the shared buffer and identity
+alone: those belong to every surface on the machine, not to one window, and
+clearing them would silently change what the user's terminal sessions do. A user
+who wants reporting stopped and cleared everywhere does that once, with
+`codewhale config set telemetry false`.
 
 Website and application clients use `product_usage`, with notice version `5`,
 a random browser-local v4 ID rotated after 90 days, `os = other`, `arch = other`,

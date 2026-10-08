@@ -1,9 +1,11 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 import worker from "../src/index";
 import { INGEST_PATH } from "../src/route";
 import { BLOB_COLUMNS, DOUBLE_COLUMNS } from "../src/datapoint";
-import { MAX_BODY_BYTES } from "../src/schema";
+import { MAX_BODY_BYTES, SURFACES } from "../src/schema";
 import { goldenBatch, harness, post, postJson } from "./support";
 
 describe("method and route", () => {
@@ -382,6 +384,63 @@ describe("rate limiting", () => {
     const response = await worker.fetch(postJson(goldenBatch()), env);
     expect(response.status).toBe(429);
     expect(await response.text()).toBe("");
+    expect(written).toHaveLength(0);
+  });
+});
+
+/**
+ * The surface whitelist is the field that tells one client of this schema from
+ * another, so a value added to it has to be proved *reachable* — not merely
+ * present in a constant that `schema-doc.test.ts` compares against the doc.
+ */
+describe("the v3 surface whitelist", () => {
+  /**
+   * `crates/telemetry/tests/golden/v2.json` is a real client batch, and v3
+   * changed no field: its v3 form is that envelope with the explicit-consent
+   * field swapped for the policy field. Kept local rather than added to
+   * `support.ts`, because v1 is the only golden the endpoint is contractually
+   * welded to.
+   */
+  const v3Batch = (surface: string): Record<string, unknown> => {
+    const batch = JSON.parse(
+      readFileSync(
+        new URL("../../crates/telemetry/tests/golden/v2.json", import.meta.url),
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+    delete batch.consent_version;
+    batch.schema_version = 3;
+    batch.notice_version = 5;
+    batch.surface = surface;
+    // `operations_summary` is accepted only on `control-plane`; the other
+    // values in the whitelist must not be made to fail on an unrelated rule.
+    batch.events = (batch.events as Array<Record<string, unknown>>).filter(
+      (event) => event.event !== "operations_summary" || surface === "control-plane",
+    );
+    return batch;
+  };
+
+  it("accepts every value in the whitelist and stores it in blob2", async () => {
+    for (const surface of SURFACES) {
+      const { env, written } = harness();
+      const response = await worker.fetch(postJson(v3Batch(surface)), env);
+      expect(response.status, surface).toBe(204);
+      expect(written[0]?.blobs[BLOB_COLUMNS.indexOf("surface")]).toBe(surface);
+    }
+  });
+
+  it("rejects a value that is not in the whitelist", async () => {
+    const { env, written } = harness();
+    const response = await worker.fetch(postJson(v3Batch("vscode")), env);
+    expect(response.status).toBe(400);
+    expect(written).toHaveLength(0);
+  });
+
+  it("the v1 contract still refuses the extension surface", async () => {
+    const { env, written } = harness();
+    const batch = goldenBatch();
+    batch.surface = "vscode-extension";
+    expect((await worker.fetch(postJson(batch), env)).status).toBe(400);
     expect(written).toHaveLength(0);
   });
 });

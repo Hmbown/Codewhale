@@ -749,6 +749,31 @@ fn decision_matrix_is_exhaustive() {
 }
 
 #[test]
+fn every_surface_spelling_parses_back_to_its_variant() {
+    // `Surface::parse` is the only place a name becomes a variant, and an
+    // embedder declares itself by name, so the round trip has to be exact in
+    // both directions. A value that can be spelled must parse; a variant must
+    // not be reachable under a second spelling.
+    for surface in Surface::ALL {
+        assert_eq!(
+            Surface::parse(surface.as_str()),
+            Some(*surface),
+            "{surface:?} does not parse back from its own wire spelling"
+        );
+    }
+    assert_eq!(
+        Surface::parse("TUI"),
+        None,
+        "parsing is exact, not case-folded"
+    );
+    assert_eq!(Surface::parse(" vscode-extension "), None, "no trimming");
+    assert_eq!(Surface::parse("vscode"), None);
+    assert_eq!(Surface::parse("ide"), None);
+    assert_eq!(Surface::parse(""), None);
+    assert_eq!(Surface::parse("desktop"), Some(Surface::Desktop));
+}
+
+#[test]
 fn an_unparseable_env_value_forces_off_and_does_not_wipe() {
     // The floor in `codewhale-config` turns an unreadable `CODEWHALE_TELEMETRY`
     // into `telemetry == false` *without* setting `telemetry_explicit_off`. A
