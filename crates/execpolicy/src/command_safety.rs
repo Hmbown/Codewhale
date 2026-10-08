@@ -2018,11 +2018,29 @@ fn split_command_segments(command: &str) -> Vec<String> {
     // Char-based, not byte-indexed: commands carry non-ASCII paths and slicing
     // a multibyte character in half panics. `&&` and `||` are consumed as one
     // unit so `||` cannot leave a stray `|` behind to split again.
+    //
+    // Quotes are tracked so an operator inside them stays data — the same
+    // promise the read-only grammar makes (`rg 'a && b; c' src`). Splitting
+    // regardless of quoting held `git commit -m "fix & feature"` as though it
+    // ran two commands, and invented an `rm` for `echo 'x & rm -rf /etc'` that
+    // the shell never runs.
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut chars = command.chars().peekable();
+    let mut quote: Option<char> = None;
     while let Some(ch) = chars.next() {
+        if let Some(active) = quote {
+            current.push(ch);
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
         match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
             '&' | '|' if chars.peek() == Some(&ch) => {
                 chars.next();
                 segments.push(std::mem::take(&mut current));
@@ -2079,6 +2097,28 @@ pub fn is_literal_rm_invocation(command: &str) -> bool {
 /// Deliberately over-inclusive (`echo rm -rf /etc` yields an `rm` argv too):
 /// callers use it to *hold* catastrophic commands, never to allow anything.
 /// `None` when words nest deeper than `MAX_WRAPPER_DEPTH`: fail closed.
+/// Whether `words[index]` is the script body a shell was asked to run — the
+/// argument after `sh -c`, `bash -lc`, and friends.
+///
+/// Only that position is a nested command line. An ordinary quoted argument
+/// that merely contains an operator (`echo 'x & rm -rf /etc'`) is data, and
+/// re-parsing it invents commands the shell never runs.
+fn is_shell_script_argument(words: &[String], index: usize) -> bool {
+    let Some(flag) = index
+        .checked_sub(1)
+        .and_then(|previous| words.get(previous))
+    else {
+        return false;
+    };
+    let Some(letters) = flag.strip_prefix('-') else {
+        return false;
+    };
+    !letters.is_empty()
+        && !letters.starts_with('-')
+        && letters.chars().all(|ch| ch.is_ascii_alphabetic())
+        && letters.contains('c')
+}
+
 pub fn command_invocations(command: &str) -> Option<Vec<Vec<String>>> {
     fn collect(command: &str, depth: usize, out: &mut Vec<Vec<String>>) -> bool {
         if depth > MAX_WRAPPER_DEPTH {
@@ -2090,13 +2130,14 @@ pub fn command_invocations(command: &str) -> Option<Vec<Vec<String>>> {
                 let mut argv = words[index..].to_vec();
                 argv[0] = command_word(word);
                 out.push(argv);
-                // Re-parse a word only when re-parsing can yield a different
-                // token stream: whitespace separates words, `;` and `|`
-                // separate segments. A `&` that survived segmenting is part of
-                // a redirect (`2>&1`), and re-parsing it reproduces the same
-                // single word until the depth cap — which failed perfectly
-                // readable commands closed as unclassifiable (`git log 2>&1`).
-                if word.contains(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|'))
+                // Re-parse a word only when it can be a command line of its
+                // own: the script body of `sh -c`/`bash -lc`, where nested
+                // whitespace, `;`, and `|` are real separators. Anything else
+                // is an argument — `echo 'x & rm -rf /etc'` names no `rm`, and
+                // re-parsing it both invented one and failed readable commands
+                // closed once a `&` made the word reproduce itself.
+                if is_shell_script_argument(&words, index)
+                    && word.contains(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|'))
                     && !collect(word, depth + 1, out)
                 {
                     return false;
@@ -2982,6 +3023,31 @@ mod tests {
             "curl https://example.com & rm -rf /etc",
         ] {
             assert!(has_rm(command), "second stage must be reached: {command}");
+        }
+    }
+
+    /// A quoted operator is data, which the read-only grammar already promises
+    /// (`rg 'a && b; c' src`). Splitting regardless of quoting held
+    /// `git commit -m "fix & feature"` as though it ran two commands, and
+    /// invented an `rm` for `echo 'x & rm -rf /etc'` that the shell never runs.
+    #[test]
+    fn a_quoted_operator_stays_data() {
+        for command in [
+            r#"git commit -m "fix & feature""#,
+            r#"echo "a & b""#,
+            "echo 'x & rm -rf /etc'",
+            r#"printf 'a;b | c'"#,
+        ] {
+            let invocations = command_invocations(command).expect("readable");
+            assert!(
+                !invocations.iter().any(|argv| argv[0] == "rm"),
+                "a quoted `rm` is data, not a command: {command}"
+            );
+            assert_eq!(
+                invocations.iter().filter(|argv| argv[0] == "git").count(),
+                usize::from(command.starts_with("git")),
+                "quoting must not split one command into two: {command}"
+            );
         }
     }
     use super::*;
