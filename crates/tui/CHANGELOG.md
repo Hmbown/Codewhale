@@ -154,11 +154,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
-- CI and test harness only, no change to the shipped binaries. The Windows
-  Terminal clipboard acceptance gives every desktop stage its own 45-second
-  deadline and records the stage, a desktop capture and the window list when
-  it fails. The persistence backlog budget takes five samples and judges
-  enqueue time on the fastest one. Linux CI jobs install apt packages through
+- CI and test harness only, no change to the shipped binaries. The
+  persistence backlog budget takes five samples and judges enqueue time on the
+  fastest one. Linux CI jobs install apt packages through
   `scripts/ci-apt-install.sh`, which bounds every wait and drops an
   unreachable Azure mirror.
 

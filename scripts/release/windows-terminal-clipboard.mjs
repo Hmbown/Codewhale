@@ -27,18 +27,7 @@ const model = 'gpt-4o-mini';
 const expected = Array.from({ length: 24 }, (_, n) => `cw-clipboard-${String(n + 1).padStart(2, '0')} 漢字 🐳 line ${n + 1}`).join('\n');
 const requests = [];
 const receipt = { source: process.env.GITHUB_SHA, binary, result: 'failed', lineCount: 24, provider: 'loopback fixture', title };
-// One budget per desktop stage, shared with windows-terminal-clipboard.ps1.
-// The deadlines below are backstops for a desktop script that is stuck and
-// cannot report: each is the sum of the stages it covers plus slack, so a
-// stage that runs out always fails first, with its own name and screenshot.
-const stageSeconds = 45;
-// Terminal window, focus, composer, focus; slack for PowerShell start-up.
-const pasteBackstop = (4 * stageSeconds + 60) * 1000;
-// Submit marker seen, focus, rendered reply.
-const completedBackstop = (3 * stageSeconds + 30) * 1000;
-const script = fileURLToPath(new URL('./windows-terminal-clipboard.ps1', import.meta.url));
 let desktop;
-let desktopEnv;
 let desktopExit;
 let desktopError = '';
 const server = http.createServer(async (req, res) => {
@@ -77,37 +66,17 @@ const server = http.createServer(async (req, res) => {
   } catch (error) { desktopError ||= String(error); res.writeHead(500); res.end(); }
 });
 
-const desktopStopped = () => Boolean(desktop) && (desktop.exitCode !== null || desktop.signalCode !== null);
-async function until(check, label, milliseconds) {
+async function until(check, label, milliseconds = 60_000) {
   const deadline = Date.now() + milliseconds;
   while (Date.now() < deadline) {
     const result = await check();
     if (result) return result;
-    if (desktopStopped()) {
-      await desktopExit; // resolves on 'close', after stderr has been read in full
-      throw new Error(`desktop stopped (exit ${desktop.exitCode}) while waiting for ${label}: ${desktopError.trim()}`);
-    }
+    assert.equal(desktop?.exitCode, null, `desktop stopped while waiting for ${label}: ${desktopError}`);
     await delay(100);
   }
-  throw new Error(`backstop deadline (${milliseconds / 1000}s) waiting for ${label}; the desktop script was still running: ${desktopError.trim()}`);
+  throw new Error(`deadline waiting for ${label}: ${desktopError}`);
 }
 const exists = async name => fs.access(path.join(evidence, name)).then(() => true, () => false);
-const readEvidence = async name => (await fs.readFile(path.join(evidence, name), 'utf8')).replace(/^\uFEFF/, '');
-// Runs before the desktop script is stopped, so a stuck desktop is captured
-// as it is. Nothing here can turn a failure into a pass.
-async function diagnose() {
-  try {
-    receipt.desktopStages = (await readEvidence('stages.log')).trim().split(/\r?\n/);
-    receipt.desktopStage = receipt.desktopStages.at(-1);
-  } catch { receipt.desktopStage = 'none reported'; }
-  try { receipt.desktopFailure = JSON.parse(await readEvidence('failure.json')); } catch { /* the script did not get to report */ }
-  if (desktopStopped() && await exists('failure-desktop.png')) return;
-  try {
-    execFileSync('powershell.exe', ['-NoProfile', '-STA', '-File', script, '-Evidence', evidence, '-Title', title, '-DiagnoseOnly', 'backstop'],
-      { env: desktopEnv, timeout: 60_000, stdio: 'ignore' });
-    receipt.backstopDiagnostics = 'backstop-desktop.png, backstop-windows.json';
-  } catch (error) { receipt.backstopDiagnostics = `not captured: ${error}`; }
-}
 try {
   receipt.binarySha256 = createHash('sha256').update(await fs.readFile(binary)).digest('hex');
   receipt.version = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim();
@@ -151,16 +120,16 @@ try {
     CODEWHALE_TELEMETRY: '0', CODEWHALE_NO_UPDATE_CHECK: '1', CODEWHALE_DISABLE_MODELS_DEV_FETCH: '1', CODEWHALE_DISABLE_LOCAL_OLLAMA_PROBE: '1', NO_ANIMATIONS: '1',
   });
   receipt.terminal = { version: '1.25.2733.0', sha256: terminalHash, distribution: 'official portable x64' };
-  desktopEnv = env;
-  desktop = spawn('powershell.exe', ['-NoProfile', '-STA', '-File', script, terminal, binary, workspace, baseUrl, title, evidence, '-StageSeconds', String(stageSeconds)], { env, windowsHide: false, stdio: ['ignore', 'pipe', 'pipe'] });
+  const script = fileURLToPath(new URL('./windows-terminal-clipboard.ps1', import.meta.url));
+  desktop = spawn('powershell.exe', ['-NoProfile', '-STA', '-File', script, terminal, binary, workspace, baseUrl, title, evidence], { env, windowsHide: false, stdio: ['ignore', 'pipe', 'pipe'] });
   desktop.stdout.on('data', data => { void fs.appendFile(path.join(evidence, 'desktop.log'), data); });
   desktop.stderr.on('data', data => { desktopError += data; void fs.appendFile(path.join(evidence, 'desktop-error.log'), data); });
-  desktopExit = new Promise((resolve, reject) => { desktop.once('error', reject); desktop.once('close', resolve); });
-  await until(() => exists('pasted.json'), 'actual clipboard paste', pasteBackstop);
+  desktopExit = new Promise((resolve, reject) => { desktop.once('error', reject); desktop.once('exit', resolve); });
+  await until(() => exists('pasted.json'), 'actual clipboard paste');
   assert.equal(requests.length, 0, 'pasting must not submit any partial turn');
   receipt.requestsBeforeEnter = 0;
   await fs.writeFile(path.join(evidence, 'submit'), 'enter once');
-  await until(() => exists('completed.json'), 'rendered fixture reply', completedBackstop);
+  await until(() => exists('completed.json'), 'rendered fixture reply');
   await delay(1000);
   assert.equal(requests.length, 1, 'one Enter must submit exactly one turn');
   const matching = requests[0].filter(text => text.includes('cw-clipboard-01'));
@@ -174,9 +143,8 @@ try {
   receipt.result = 'passed';
 } catch (error) {
   receipt.error = String(error); process.exitCode = 1;
-  if (desktop) await diagnose();
 } finally {
-  if (desktop && !desktopStopped()) { desktop.kill(); await desktopExit.catch(() => {}); }
+  if (desktop && desktop.exitCode === null) { desktop.kill(); await desktopExit.catch(() => {}); }
   server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
   await fs.writeFile(path.join(evidence, 'receipt.json'), JSON.stringify(receipt, null, 2));
   console.log(JSON.stringify(receipt));
